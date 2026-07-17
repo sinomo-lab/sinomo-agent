@@ -45,8 +45,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         message: format!("unknown intent: {intent_id}"),
                     }
                 })?;
-                let policy =
-                    DfsReplicationPolicy::new(min_commit_replicas, intent.policy.desired_replicas)?;
+                let policy = intent
+                    .policy
+                    .with_counts(min_commit_replicas, intent.policy.desired_replicas)?;
                 let updated_intent = self
                     .coordinator
                     .downgrade_intent_policy(intent_id, policy)?;

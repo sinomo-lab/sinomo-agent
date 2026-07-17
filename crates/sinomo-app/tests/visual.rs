@@ -1047,6 +1047,7 @@ fn capture_files_composed() {
                 created_at_unix_nanos: Some(1_766_000_040_000_000_000),
             }],
             metadata_shard: None,
+            placement: None,
             health: Some(SifsObjectHealth {
                 agent_state: "healthy".to_string(),
                 version_count: 1,

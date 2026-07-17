@@ -1169,25 +1169,24 @@ pub fn default_cluster_sifs_subtree_policies(
 ) -> Vec<DfsSubtreePolicy> {
     let mut policies = stable_dfs_service_node_ids(state)
         .into_iter()
-        .map(|node_id| DfsSubtreePolicy {
-            path_prefix: sifs_node_files_path(&node_id),
-            policy: DfsObjectPolicy::LocalOwned,
+        .map(|node_id| {
+            DfsSubtreePolicy::legacy(sifs_node_files_path(&node_id), DfsObjectPolicy::LocalOwned)
         })
         .collect::<Vec<_>>();
     if policies.is_empty() {
-        policies.push(DfsSubtreePolicy {
-            path_prefix: sifs_node_files_path(&state.local_node_id),
-            policy: DfsObjectPolicy::LocalOwned,
-        });
+        policies.push(DfsSubtreePolicy::legacy(
+            sifs_node_files_path(&state.local_node_id),
+            DfsObjectPolicy::LocalOwned,
+        ));
     }
-    policies.push(DfsSubtreePolicy {
-        path_prefix: SIFS_USERS_PATH.to_string(),
-        policy: DfsObjectPolicy::ReplicatedEventual,
-    });
-    policies.push(DfsSubtreePolicy {
-        path_prefix: SIFS_SERVICES_PATH.to_string(),
-        policy: DfsObjectPolicy::ReplicatedEventual,
-    });
+    policies.push(DfsSubtreePolicy::legacy(
+        SIFS_USERS_PATH,
+        DfsObjectPolicy::ReplicatedEventual,
+    ));
+    policies.push(DfsSubtreePolicy::legacy(
+        SIFS_SERVICES_PATH,
+        DfsObjectPolicy::ReplicatedEventual,
+    ));
     policies
 }
 

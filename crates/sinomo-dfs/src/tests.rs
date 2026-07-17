@@ -8097,6 +8097,7 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
             aborted_superseded_intent_count: 0,
             skipped_fresh_stale_candidate_count: 0,
         },
+        placement_reconciliation: None,
         lifecycle_reports: vec![DfsLifecycleMaintenanceReport {
             anti_entropy: Some(DfsAntiEntropyReport {
                 file_system_id: file_system_id.clone(),
@@ -39680,4 +39681,152 @@ fn sifs_routed_lookup_uses_local_replica_after_authority_redirect_cycle() {
     a_thread.join().expect("primary a thread");
     b_thread.join().expect("primary b thread");
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
+    let root = temp_root("placement-reconciliation-durable-cursor");
+    let local = NodeId::from_legacy_named("node_placement_reconciliation_local").expect("node");
+    let file_system = file_system(local.clone());
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        store
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: local.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("root metadata shard");
+    });
+    let metadata_root = root.join("metadata");
+    let content_root = root.join("content");
+    let mut metadata = open_root_local_metadata_backend(&metadata_root).expect("metadata backend");
+    metadata
+        .put_file_system(&file_system)
+        .expect("seed filesystem");
+    for object in distributed_sifs_bootstrap_objects(file_system.owner_node_id.clone()) {
+        metadata.put_object(&object).expect("seed SIFS namespace");
+    }
+    let mut service = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(local.clone()),
+        LocalContentStore::new(&content_root).expect("content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(metadata)
+    .expect("attach metadata backend");
+    let path = "/services/placement-existing.txt";
+    service.posix_mkdir_all("/services").expect("services");
+    service
+        .posix_write_file(
+            path,
+            b"existing placement content",
+            DfsWriteOptions::replicated_eventual(vec![local.clone()]),
+        )
+        .expect("existing file");
+    assert_eq!(
+        service.posix_stat(path).expect("initial stat").policy,
+        DfsObjectPolicy::ReplicatedEventual
+    );
+
+    let now = dfs_now_unix_nanos();
+    let job = control_plane.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        let expected = store
+            .get_file_system_config(&file_system.file_system_id)
+            .expect("read config")
+            .expect("config");
+        let mut desired = expected.clone();
+        upsert_placement_rule(
+            &mut desired.subtree_policies,
+            normalize_placement_rule(
+                path,
+                DfsPlacementScope::SelfOnly,
+                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 1, 1)
+                    .expect("confirmed policy"),
+            )
+            .expect("placement rule"),
+        );
+        let job = DfsPlacementReconciliationJob {
+            job_id: "placement-durable-job".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            path: path.to_string(),
+            scope: DfsPlacementScope::SelfOnly,
+            state: DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: now,
+            updated_at_unix_nanos: now,
+            last_error: None,
+        };
+        assert!(
+            store
+                .compare_and_put_placement_update(&expected, &desired, &job)
+                .expect("publish placement and job")
+        );
+        job
+    });
+
+    let first_page = service
+        .run_placement_reconciliation_bounded(1)
+        .expect("first reconciliation page")
+        .expect("active job");
+    assert_eq!(first_page.state, DfsPlacementReconciliationState::Scanning);
+    assert!(
+        first_page.cursor.is_some(),
+        "bounded scan must persist its cursor"
+    );
+    drop(service);
+
+    let mut reopened = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(local),
+        LocalContentStore::new(&content_root).expect("reopen content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(
+        open_root_local_metadata_backend(&metadata_root).expect("reopen metadata"),
+    )
+    .expect("attach reopened metadata");
+    let mut completed = None;
+    for _ in 0..32 {
+        let Some(next) = reopened
+            .run_placement_reconciliation_bounded(2)
+            .expect("resume reconciliation")
+        else {
+            break;
+        };
+        if next.state.is_terminal() {
+            completed = Some(next);
+            break;
+        }
+    }
+    let completed = completed.expect("durable reconciliation completes after restart");
+    assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+    assert_eq!(completed.matched_object_count, 1);
+    assert_eq!(
+        reopened.posix_stat(path).expect("reconciled stat").policy,
+        DfsObjectPolicy::ReplicatedConfirmed
+    );
+    control_plane.with_client(|kv| {
+        assert_eq!(
+            DfsControlPlaneStore::new(kv)
+                .placement_reconciliation(&file_system.file_system_id, &job.job_id)
+                .expect("durable job"),
+            Some(completed)
+        );
+    });
 }

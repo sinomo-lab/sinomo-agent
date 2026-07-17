@@ -117,25 +117,20 @@ fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
     matches!(error, DfsPosixError::Dfs(DfsError::Network { .. }))
 }
 
+#[cfg(test)]
 fn select_posix_write_replica_candidates(
     local_node_id: &NodeId,
     replica_candidates: &[NodeId],
     desired_replicas: usize,
 ) -> Vec<NodeId> {
-    let mut selected = Vec::with_capacity(desired_replicas);
-    if desired_replicas == 0 {
-        return selected;
-    }
-    selected.push(local_node_id.clone());
-    for candidate in replica_candidates {
-        if selected.len() >= desired_replicas {
-            break;
-        }
-        if !selected.contains(candidate) {
-            selected.push(candidate.clone());
-        }
-    }
-    selected
+    std::iter::once(local_node_id.clone())
+        .chain(replica_candidates.iter().cloned())
+        .fold(Vec::new(), |mut selected, candidate| {
+            if selected.len() < desired_replicas && !selected.contains(&candidate) {
+                selected.push(candidate);
+            }
+            selected
+        })
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -226,28 +221,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         options: &DfsWriteOptions,
     ) -> std::result::Result<Vec<NodeId>, DfsError> {
-        let mut candidates = select_posix_write_replica_candidates(
-            &self.node_id,
-            &options.replica_candidates,
-            options.policy.desired_replicas,
-        );
+        let mut candidates = options.replica_candidates.clone();
+        if !options.policy.forbidden_node_ids.contains(&self.node_id)
+            && !candidates.contains(&self.node_id)
+        {
+            candidates.insert(0, self.node_id.clone());
+        }
+        for required in &options.policy.required_node_ids {
+            if !candidates.contains(required) {
+                candidates.push(required.clone());
+            }
+        }
+        let request = DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: next_version(&object.version),
+            requesting_node_id: self.node_id.clone(),
+        };
+        let mut plan =
+            self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
 
+        // Strict confirmed writes keep the metadata primary in the synchronous
+        // set when there is an unconstrained slot. Managed required/forbidden
+        // placement remains authoritative over this locality preference.
         if options.policy.is_strict_confirmed()
             && options.policy.desired_replicas >= 2
-            && candidates.len() == options.policy.desired_replicas
-            && candidates.contains(&self.node_id)
             && let Some(shard) = self.select_metadata_shard_for_object(object)?
             && shard.primary_node_id != self.node_id
-            && !candidates.contains(&shard.primary_node_id)
-            && let Some(replica_slot) = candidates
-                .iter_mut()
-                .rev()
-                .find(|node_id| **node_id != self.node_id)
+            && !options
+                .policy
+                .forbidden_node_ids
+                .contains(&shard.primary_node_id)
+            && !plan.desired_replica_nodes.contains(&shard.primary_node_id)
+            && let Some(replica_slot) =
+                plan.desired_replica_nodes.iter_mut().rev().find(|node_id| {
+                    **node_id != self.node_id
+                        && !options.policy.required_node_ids.contains(*node_id)
+                })
         {
             *replica_slot = shard.primary_node_id;
+            crate::validate_replication_plan(&plan.desired_replica_nodes, &options.policy)?;
         }
 
-        Ok(candidates)
+        Ok(plan.desired_replica_nodes)
     }
 
     fn sync_blocking_routed_write_namespace(
@@ -508,6 +524,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.commit_posix_created_directory(object);
         }
         let mut object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::Directory);
+        self.apply_managed_policy_to_new_object(&mut object, 2)?;
         let attrs = self.posix_inherit_create_attrs_from_parent_local(&path, attrs, true)?;
         apply_posix_create_attrs(&mut object, attrs);
         self.commit_posix_created_directory(object)
@@ -1189,7 +1206,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_path = path.clone();
         let trace_bytes = bytes.len();
         let mut transient_create = false;
-        let object = match self.lookup_sifs_path(&path)? {
+        let mut object = match self.lookup_sifs_path(&path)? {
             Some(object) if exclusive_create && object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
@@ -1229,6 +1246,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
+        self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
         if let Some((expected_object_id, expected_version)) = expected_existing {
             if &object.object_id != expected_object_id {
                 return Err(DfsPosixError::Conflict {
@@ -1537,7 +1555,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.ensure_parent_directory(&path)?;
         }
         let mut transient_create = false;
-        let object = match self.lookup_sifs_path(&path)? {
+        let mut object = match self.lookup_sifs_path(&path)? {
             Some(object) if object.kind == DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory { path });
             }
@@ -1566,6 +1584,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
+        self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
         let target_version = next_version(&object.version);
         let target_version_for_stat = target_version.clone();
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;

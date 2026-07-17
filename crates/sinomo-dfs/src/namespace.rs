@@ -20,18 +20,9 @@ pub fn distributed_sifs(owner_node_id: NodeId) -> DfsFileSystem {
         display_name: "sifs".to_string(),
         owner_node_id,
         subtree_policies: vec![
-            DfsSubtreePolicy {
-                path_prefix: node_files_path,
-                policy: DfsObjectPolicy::LocalOwned,
-            },
-            DfsSubtreePolicy {
-                path_prefix: SIFS_USERS_PATH.to_string(),
-                policy: DfsObjectPolicy::ReplicatedEventual,
-            },
-            DfsSubtreePolicy {
-                path_prefix: SIFS_SERVICES_PATH.to_string(),
-                policy: DfsObjectPolicy::ReplicatedEventual,
-            },
+            DfsSubtreePolicy::legacy(node_files_path, DfsObjectPolicy::LocalOwned),
+            DfsSubtreePolicy::legacy(SIFS_USERS_PATH, DfsObjectPolicy::ReplicatedEventual),
+            DfsSubtreePolicy::legacy(SIFS_SERVICES_PATH, DfsObjectPolicy::ReplicatedEventual),
         ],
     }
 }

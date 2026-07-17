@@ -14,7 +14,9 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
-    DfsPinAddRequest, DfsPinMode, DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions,
+    DfsPinAddRequest, DfsPinMode, DfsPlacementPolicy, DfsPlacementPreview,
+    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
+    DfsPosixCreateAttrs, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat, DfsWriteOptions,
     LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
     fallback_dfs_node_id, metadata_shards_prefix,
@@ -374,6 +376,182 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot inspect {path}: {error}"))
     }
 
+    pub(crate) fn resolved_placement(
+        &self,
+        stat: &DfsStat,
+    ) -> Result<DfsResolvedPlacementPolicy, String> {
+        let mut service = self.lock_service()?;
+        service
+            .resolved_placement_policy_for_path(
+                &stat.path,
+                stat.policy.clone(),
+                stat.current_locations.len().max(1),
+            )
+            .map_err(|error| format!("cannot resolve SIFS placement for {}: {error}", stat.path))
+    }
+
+    pub(crate) fn preview_placement(
+        &self,
+        path: &str,
+        policy: Option<DfsPlacementPolicy>,
+        scope: DfsPlacementScope,
+    ) -> Result<DfsPlacementPreview, String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err("managed SIFS placement requires a cluster".to_string());
+        }
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
+        let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
+        let mut config = DfsControlPlaneStore::new(&mut kv)
+            .get_file_system_config(&sifs_file_system_id())
+            .map_err(|error| format!("cannot read SIFS placement policy: {error}"))?
+            .ok_or_else(|| "SIFS cluster policy is unavailable".to_string())?;
+        match policy {
+            Some(policy) => {
+                let rule = sinomo_runtime::dfs::normalize_placement_rule(&path, scope, policy)
+                    .map_err(|error| format!("invalid SIFS placement policy: {error}"))?;
+                sinomo_runtime::dfs::upsert_placement_rule(&mut config.subtree_policies, rule);
+            }
+            None => {
+                sinomo_runtime::dfs::remove_placement_rule(
+                    &mut config.subtree_policies,
+                    &path,
+                    scope,
+                )
+                .map_err(|error| format!("invalid SIFS placement path: {error}"))?;
+            }
+        }
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        let stat = service
+            .posix_stat_distributed(&path)
+            .map_err(|error| format!("cannot inspect {path}: {error}"))?;
+        let candidates = service
+            .placement_content_candidates()
+            .map_err(|error| format!("cannot read SIFS placement candidates: {error}"))?;
+        let coordinator_node_id = service.node_id().clone();
+        sinomo_runtime::dfs::preview_placement(
+            &config,
+            &stat.path,
+            stat.object_id,
+            stat.version,
+            stat.policy,
+            coordinator_node_id,
+            stat.current_locations,
+            candidates,
+            None,
+            scope,
+        )
+        .map_err(|error| format!("cannot preview SIFS placement: {error}"))
+    }
+
+    pub(crate) fn update_placement(
+        &self,
+        path: &str,
+        policy: Option<DfsPlacementPolicy>,
+        scope: DfsPlacementScope,
+    ) -> Result<(DfsPlacementPreview, DfsPlacementReconciliationJob), String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err("managed SIFS placement requires a cluster".to_string());
+        }
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        let stat = service
+            .posix_stat_distributed(&path)
+            .map_err(|error| format!("cannot inspect {path}: {error}"))?;
+        let candidates = service
+            .placement_content_candidates()
+            .map_err(|error| format!("cannot read SIFS placement candidates: {error}"))?;
+        let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        let expected = store
+            .get_file_system_config(&sifs_file_system_id())
+            .map_err(|error| format!("cannot read SIFS placement policy: {error}"))?
+            .ok_or_else(|| "SIFS cluster policy is unavailable".to_string())?;
+        let mut desired = expected.clone();
+        match policy {
+            Some(policy) => {
+                let rule = sinomo_runtime::dfs::normalize_placement_rule(&path, scope, policy)
+                    .map_err(|error| format!("invalid SIFS placement policy: {error}"))?;
+                sinomo_runtime::dfs::upsert_placement_rule(&mut desired.subtree_policies, rule);
+            }
+            None => {
+                sinomo_runtime::dfs::remove_placement_rule(
+                    &mut desired.subtree_policies,
+                    &path,
+                    scope,
+                )
+                .map_err(|error| format!("invalid SIFS placement path: {error}"))?;
+            }
+        }
+        let preview = sinomo_runtime::dfs::preview_placement(
+            &desired,
+            &stat.path,
+            stat.object_id,
+            stat.version,
+            stat.policy,
+            service.node_id().clone(),
+            stat.current_locations,
+            candidates,
+            None,
+            scope,
+        )
+        .map_err(|error| format!("cannot preview SIFS placement: {error}"))?;
+        let now = time::OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .try_into()
+            .unwrap_or(1_000_000_000);
+        let job = DfsPlacementReconciliationJob {
+            job_id: sinomo_runtime::core::Id::generate().to_string(),
+            file_system_id: desired.file_system_id.clone(),
+            path,
+            scope,
+            state: DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: now,
+            updated_at_unix_nanos: now,
+            last_error: None,
+        };
+        if !store
+            .compare_and_put_placement_update(&expected, &desired, &job)
+            .map_err(|error| format!("cannot save SIFS placement policy: {error}"))?
+        {
+            return Err(
+                "SIFS placement policy changed concurrently; refresh the preview and retry"
+                    .to_string(),
+            );
+        }
+        // Make direct/local clients useful even without waiting for the daemon;
+        // the same durable job remains available to mandatory maintenance.
+        let _ = service.run_placement_reconciliation_bounded(256);
+        Ok((preview, job))
+    }
+
+    pub(crate) fn placement_progress(
+        &self,
+        job_id: &str,
+    ) -> Result<DfsPlacementReconciliationJob, String> {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
+        let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
+        DfsControlPlaneStore::new(&mut kv)
+            .placement_reconciliation(&sifs_file_system_id(), job_id)
+            .map_err(|error| format!("cannot read SIFS placement progress: {error}"))?
+            .ok_or_else(|| format!("unknown SIFS placement reconciliation job: {job_id}"))
+    }
+
     pub(crate) fn list_dir_shallow(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
@@ -521,7 +699,10 @@ impl SifsFileManagerBackend {
         };
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        let options = sifs_write_options(&service, &self.replica_candidates);
+        let options = match sifs_write_options(&mut service, &path, &self.replica_candidates) {
+            Ok(options) => options,
+            Err(detail) => return Ok(Outcome::Rejected { detail }),
+        };
         let stat = match service
             .posix_replace_file_if_version(&path, &object_id, &version, bytes, options)
         {
@@ -703,9 +884,9 @@ impl SifsFileManagerBackend {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
             sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
             let mut options = if wait_for_commit {
-                sifs_write_options(&service, &self.replica_candidates)
+                sifs_write_options(&mut service, &path, &self.replica_candidates)?
             } else {
-                sifs_deferred_publish_write_options(&service, &self.replica_candidates)
+                sifs_deferred_publish_write_options(&mut service, &path, &self.replica_candidates)?
             };
             options.foreground_replica_repair = foreground_replica_repair;
             if foreground_replica_repair {
@@ -816,7 +997,7 @@ impl SifsFileManagerBackend {
         let result = (|| {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
             sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
-            let options = sifs_write_options(&service, &self.replica_candidates);
+            let options = sifs_write_options(&mut service, &path, &self.replica_candidates)?;
             service
                 .posix_write_file_with_known_parent(&path, bytes, options)
                 .map(|_| ())
@@ -840,7 +1021,8 @@ impl SifsFileManagerBackend {
         let result = (|| {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
             sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
-            let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
+            let options =
+                sifs_deferred_publish_write_options(&mut service, &path, &self.replica_candidates)?;
             service
                 .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
                 .map(|_| ())
@@ -1319,7 +1501,8 @@ impl FileManagerBackend for SifsFileManagerBackend {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
+        let options =
+            sifs_deferred_publish_write_options(&mut service, &path, &self.replica_candidates)?;
         service
             .posix_write_file(&path, &[], options)
             .map(|_| ())
@@ -1735,17 +1918,22 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
         .collect::<Vec<_>>();
     content_node_ids.sort();
     content_node_ids.dedup();
-    if let Some(remote_node_id) = choose_sifs_remote_replica_candidate(
-        &graph,
-        local_node_id,
-        content_node_ids,
-        &routable_node_ids,
-    ) {
-        candidates.push(remote_node_id);
+    content_node_ids
+        .sort_by_key(|node_id| sifs_replica_candidate_rank(&graph, local_node_id, node_id));
+    for remote_node_id in content_node_ids {
+        if remote_node_id != *local_node_id
+            && routable_node_ids.contains(&remote_node_id)
+            && graph
+                .best_healthy_endpoint(local_node_id, &remote_node_id)
+                .is_some()
+        {
+            candidates.push(remote_node_id);
+        }
     }
     candidates
 }
 
+#[cfg(test)]
 fn choose_sifs_remote_replica_candidate(
     graph: &network::ClusterConnectivityGraph,
     local_node_id: &NodeId,
@@ -2184,14 +2372,40 @@ fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir, timeout: Du
 }
 
 fn sifs_write_options(
-    service: &NetworkedDfsService<DfsNodeTransport>,
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
+    path: &str,
     replica_candidates: &[NodeId],
-) -> DfsWriteOptions {
+) -> Result<DfsWriteOptions, String> {
     let mut candidates = replica_candidates.to_vec();
     if !candidates.contains(service.node_id()) {
         candidates.insert(0, service.node_id().clone());
     }
-    sifs_write_options_for_candidates(candidates)
+    let object_policy = service
+        .posix_stat(path)
+        .map(|stat| stat.policy)
+        .unwrap_or(sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual);
+    let (_, advertisements, policy) = service
+        .managed_replication_policy_for_path(path, object_policy, candidates.len())
+        .map_err(|error| error.to_string())?;
+    let advertised_ids = advertisements
+        .into_iter()
+        .filter(|candidate| candidate.accepts_content)
+        .map(|candidate| candidate.node_id)
+        .collect::<BTreeSet<_>>();
+    candidates.retain(|node_id| advertised_ids.contains(node_id));
+    for required in &policy.required_node_ids {
+        if !candidates.contains(required) {
+            candidates.push(required.clone());
+        }
+    }
+    let mut options = DfsWriteOptions {
+        policy,
+        replica_candidates: candidates,
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
+    options.foreground_replica_repair = false;
+    Ok(options)
 }
 
 fn sifs_write_receipt(stat: &DfsStat) -> sinomo_runtime::api::DaemonDfsBrowserWriteReceipt {
@@ -2222,22 +2436,23 @@ fn sifs_conditional_write_error(
 }
 
 fn sifs_deferred_publish_write_options(
-    service: &NetworkedDfsService<DfsNodeTransport>,
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
+    path: &str,
     replica_candidates: &[NodeId],
-) -> DfsWriteOptions {
-    let mut candidates = replica_candidates.to_vec();
-    if !candidates.contains(service.node_id()) {
-        candidates.insert(0, service.node_id().clone());
-    }
-    sifs_deferred_publish_write_options_for_candidates(candidates)
+) -> Result<DfsWriteOptions, String> {
+    let mut options = sifs_write_options(service, path, replica_candidates)?;
+    options.wait_for_commit = false;
+    Ok(options)
 }
 
+#[cfg(test)]
 fn sifs_write_options_for_candidates(candidates: Vec<NodeId>) -> DfsWriteOptions {
     let mut options = DfsWriteOptions::replicated_eventual(candidates);
     options.foreground_replica_repair = false;
     options
 }
 
+#[cfg(test)]
 fn sifs_deferred_publish_write_options_for_candidates(candidates: Vec<NodeId>) -> DfsWriteOptions {
     let mut options = sifs_write_options_for_candidates(candidates);
     options.wait_for_commit = false;
