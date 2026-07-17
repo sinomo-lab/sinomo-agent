@@ -5648,9 +5648,22 @@ impl Default for SifsListOptions {
 #[derive(Clone, Debug)]
 pub struct SifsEntryPage {
     pub entries: Vec<SifsEntry>,
+    /// Compact visible-version metadata returned alongside the page. Entries may be absent when
+    /// talking to an older daemon or a lightweight local backend.
+    pub metadata: Vec<SifsEntryMetadata>,
     pub total_count: usize,
     pub offset: usize,
     pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsEntryMetadata {
+    pub path: String,
+    pub object_id: String,
+    pub version: String,
+    pub modified_at_unix_nanos: u64,
+    pub policy: String,
+    pub current_locations: Vec<String>,
 }
 
 /// SIFS metadata for a selected object.
@@ -6152,6 +6165,7 @@ impl RemoteSifsBrowser {
                 sort_direction: sinomo_runtime::api::DaemonDfsBrowserSortDirection::Ascending,
                 offset: 0,
                 limit: None,
+                include_metadata: false,
             },
         )?;
         Ok(response
@@ -6178,14 +6192,23 @@ impl RemoteSifsBrowser {
                 sort_direction: daemon_sort_direction_from_sifs(options.sort_direction),
                 offset: options.offset,
                 limit: options.limit,
+                include_metadata: true,
             },
         )?;
+        let mut metadata = Vec::new();
+        let entries = response
+            .entries
+            .into_iter()
+            .map(|entry| {
+                if let Some(summary) = sifs_entry_metadata_from_rpc(&entry) {
+                    metadata.push(summary);
+                }
+                sifs_entry_from_rpc(entry)
+            })
+            .collect();
         Ok(SifsEntryPage {
-            entries: response
-                .entries
-                .into_iter()
-                .map(sifs_entry_from_rpc)
-                .collect(),
+            entries,
+            metadata,
             total_count: response.total_count,
             offset: response.offset,
             limit: response.limit,
@@ -6515,6 +6538,20 @@ fn sifs_entry_from_rpc(entry: sinomo_runtime::api::DaemonDfsBrowserEntry) -> Sif
     }
 }
 
+fn sifs_entry_metadata_from_rpc(
+    entry: &sinomo_runtime::api::DaemonDfsBrowserEntry,
+) -> Option<SifsEntryMetadata> {
+    let metadata = entry.metadata.as_ref()?;
+    Some(SifsEntryMetadata {
+        path: entry.path.clone(),
+        object_id: metadata.object_id.clone(),
+        version: metadata.version.clone(),
+        modified_at_unix_nanos: metadata.modified_at_unix_nanos,
+        policy: sifs_policy_label(&metadata.policy).to_string(),
+        current_locations: metadata.current_locations.clone(),
+    })
+}
+
 fn sifs_details_from_stat(
     stat: sinomo_runtime::dfs::DfsStat,
     local_pins: Vec<sinomo_runtime::dfs::DfsPinRecord>,
@@ -6769,6 +6806,7 @@ fn page_sifs_entries(mut entries: Vec<SifsEntry>, options: SifsListOptions) -> S
     };
     SifsEntryPage {
         entries,
+        metadata: Vec::new(),
         total_count,
         offset,
         limit: options.limit,

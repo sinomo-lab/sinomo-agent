@@ -1951,6 +1951,7 @@ impl DaemonDfsBrowserBackend {
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
+        let include_metadata = request.include_metadata;
         let mut entries: Vec<_> = match service.posix_list_dir_distributed(&path) {
             Ok(entries) => entries,
             Err(sinomo_dfs::DfsPosixError::NotFound { .. }) if request.missing_is_empty => {
@@ -1959,11 +1960,25 @@ impl DaemonDfsBrowserBackend {
             Err(error) => return Err(dfs_browser_service_error(error)),
         }
         .into_iter()
-        .map(|entry| crate::DaemonDfsBrowserEntry {
-            name: entry.name,
-            path: entry.path,
-            kind: entry.kind,
-            size: None,
+        .map(|entry| {
+            let metadata = include_metadata.then(|| crate::DaemonDfsBrowserEntryMetadata {
+                object_id: entry.object_id.to_string(),
+                version: entry.version.to_string(),
+                modified_at_unix_nanos: entry.modified_at_unix_nanos,
+                policy: entry.policy,
+                current_locations: entry
+                    .current_locations
+                    .into_iter()
+                    .map(|node_id| node_id.to_string())
+                    .collect(),
+            });
+            crate::DaemonDfsBrowserEntry {
+                name: entry.name,
+                path: entry.path,
+                kind: entry.kind,
+                size: entry.size_bytes,
+                metadata,
+            }
         })
         .collect();
         sort_daemon_dfs_browser_entries(&mut entries, &request.sort_key, &request.sort_direction);
@@ -2749,74 +2764,131 @@ impl Service for DaemonDfsBrowserService {
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_DELETE_ROUTE, &result.0)?
                 }
                 DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserPinMetadataRequest =
+                        request.decode_body()?;
+                    let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser pin metadata",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
-                                .pin_metadata(payload)
+                            let backend =
+                                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
+                            let result = backend.pin_metadata(payload)?;
+                            Ok((result, backend.event_origin_node_id()?))
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE, &result)?
+                    event_hub.publish_dfs_placement_change(
+                        result.1.clone(),
+                        "pin-metadata",
+                        vec![changed_path],
+                    );
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
+                        &result.0,
+                    )?
                 }
                 DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserUnpinMetadataRequest =
+                        request.decode_body()?;
+                    let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser unpin metadata",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
-                                .unpin_metadata(payload)
+                            let backend =
+                                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
+                            let result = backend.unpin_metadata(payload)?;
+                            Ok((result, backend.event_origin_node_id()?))
                         },
                     )
                     .await?;
+                    if result.0.removed {
+                        event_hub.publish_dfs_placement_change(
+                            result.1.clone(),
+                            "unpin-metadata",
+                            vec![changed_path],
+                        );
+                    }
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-                        &result,
+                        &result.0,
                     )?
                 }
                 DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserPinContentRequest =
+                        request.decode_body()?;
+                    let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser pin content",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
-                                .pin_content(payload)
+                            let backend =
+                                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
+                            let result = backend.pin_content(payload)?;
+                            Ok((result, backend.event_origin_node_id()?))
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, &result)?
+                    event_hub.publish_dfs_placement_change(
+                        result.1.clone(),
+                        "pin-content",
+                        vec![changed_path],
+                    );
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, &result.0)?
                 }
                 DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserUnpinContentRequest =
+                        request.decode_body()?;
+                    let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser unpin content",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
-                                .unpin_content(payload)
+                            let backend =
+                                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
+                            let result = backend.unpin_content(payload)?;
+                            Ok((result, backend.event_origin_node_id()?))
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, &result)?
+                    if result.0.removed {
+                        event_hub.publish_dfs_placement_change(
+                            result.1.clone(),
+                            "unpin-content",
+                            vec![changed_path],
+                        );
+                    }
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+                        &result.0,
+                    )?
                 }
                 DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserTransferMetadataPrimaryRequest =
+                        request.decode_body()?;
+                    let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser metadata primary transfer",
                         move || {
-                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
-                                .transfer_metadata_primary(payload, &runtime)
+                            let backend =
+                                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
+                            let result = backend.transfer_metadata_primary(payload, &runtime)?;
+                            Ok((result, backend.event_origin_node_id()?))
                         },
                     )
                     .await?;
+                    if result.0.changed {
+                        event_hub.publish_dfs_placement_change(
+                            result.1.clone(),
+                            "transfer-metadata-primary",
+                            vec![changed_path],
+                        );
+                    }
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
-                        &result,
+                        &result.0,
                     )?
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -5219,6 +5291,52 @@ mod tests {
     }
 
     #[test]
+    fn dfs_browser_list_can_return_compact_metadata_without_per_entry_stats() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-list-metadata");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let backend = DaemonDfsBrowserBackend::open(SinomoDataDir::new(&root), runtime.handle())
+            .expect("open DFS browser backend");
+        backend
+            .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+                path: "/users/report.txt".to_string(),
+                bytes: b"report body".to_vec(),
+            })
+            .expect("write browser file");
+        let stat = backend
+            .stat(crate::DaemonDfsBrowserStatRequest {
+                path: "/users/report.txt".to_string(),
+            })
+            .expect("stat browser file");
+
+        let response = backend
+            .list(crate::DaemonDfsBrowserListRequest {
+                path: "/users".to_string(),
+                shallow: true,
+                missing_is_empty: false,
+                sort_key: crate::DaemonDfsBrowserSortKey::Name,
+                sort_direction: crate::DaemonDfsBrowserSortDirection::Ascending,
+                offset: 0,
+                limit: Some(32),
+                include_metadata: true,
+            })
+            .expect("list browser directory");
+
+        assert_eq!(response.entries.len(), 1);
+        let entry = &response.entries[0];
+        let metadata = entry.metadata.as_ref().expect("row metadata");
+        assert_eq!(entry.size, Some(11));
+        assert_eq!(metadata.object_id, stat.object_id);
+        assert_eq!(metadata.version, stat.version);
+        assert_eq!(metadata.modified_at_unix_nanos, stat.modified_at_unix_nanos);
+        assert_eq!(metadata.policy, stat.policy);
+        assert_eq!(metadata.current_locations, stat.current_locations);
+    }
+
+    #[test]
     fn dfs_browser_reads_do_not_queue_behind_busy_service() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-read-contention");
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -5246,6 +5364,7 @@ mod tests {
                     sort_direction: crate::DaemonDfsBrowserSortDirection::default(),
                     offset: 0,
                     limit: None,
+                    include_metadata: false,
                 })
                 .map(|_| ())
                 .map_err(|error| error.to_string());

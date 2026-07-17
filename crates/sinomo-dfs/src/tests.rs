@@ -33325,6 +33325,27 @@ fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
 
     for path in [file_a, file_b] {
         let primary_stat = cluster.primary.posix_stat(path).expect("primary stat");
+        let listed = primary_entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .expect("file appears in directory page");
+        assert_eq!(
+            listed.version, primary_stat.version,
+            "listed version {path}"
+        );
+        assert_eq!(
+            listed.size_bytes, primary_stat.size_bytes,
+            "listed size {path}"
+        );
+        assert_eq!(
+            listed.modified_at_unix_nanos, primary_stat.modified_at_unix_nanos,
+            "listed modified time {path}"
+        );
+        assert_eq!(listed.policy, primary_stat.policy, "listed policy {path}");
+        assert_eq!(
+            listed.current_locations, primary_stat.current_locations,
+            "listed placement {path}"
+        );
         for (label, stat) in [
             (
                 "writer",

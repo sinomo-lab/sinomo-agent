@@ -18,7 +18,7 @@
 //! work on the UI path.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,11 +50,18 @@ use sui::{
 };
 
 use sinomo_cli::app_api::{
-    SifsBrowser, SifsEntry, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
-    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
-    SifsObjectHealth, SifsReplaceFileIfVersionOutcome,
+    SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary,
+    SifsListOptions, SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails,
+    SifsObjectDetails, SifsObjectHealth, SifsReplaceFileIfVersionOutcome,
 };
-use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::{
+    api::{
+        DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiError, DaemonEventStreamItem,
+        DaemonEventSubscribeRequest, send_daemon_rpc_stream_from_data_dir_async,
+    },
+    local::SinomoDataDir,
+    network::{DaemonRpcTimeouts, ObjectRpcRequest},
+};
 use time::format_description::well_known::Rfc3339;
 
 use crate::backend::Backend;
@@ -556,6 +563,7 @@ pub struct FilesState {
     history_back: Vec<FilesLocation>,
     history_forward: Vec<FilesLocation>,
     pub entries: Vec<SifsEntry>,
+    entry_metadata: BTreeMap<String, SifsEntryMetadata>,
     pub entries_total_count: usize,
     pub selected: Option<usize>,
     pub selected_details: Option<SifsObjectDetails>,
@@ -565,6 +573,8 @@ pub struct FilesState {
     pub details_error: Option<String>,
     sifs_health: Option<SifsHealthSummary>,
     sifs_health_error: Option<String>,
+    live_updates_connected: bool,
+    live_updates_error: Option<String>,
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
@@ -592,6 +602,8 @@ pub struct FilesState {
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
     worker_waker: Option<sui::UiHandle>,
+    live_event_abort: Option<tokio::task::AbortHandle>,
+    live_refresh_pending: bool,
     worker_cancellations: Arc<Mutex<BTreeSet<u64>>>,
     next_request_id: u64,
     pending_request_id: Option<u64>,
@@ -616,6 +628,7 @@ struct FilesListStructure {
     error: Option<String>,
     list_revision: u64,
     entries: Vec<SifsEntry>,
+    entry_metadata: BTreeMap<String, SifsEntryMetadata>,
     entries_total_count: usize,
     sort_mode: FileSortMode,
     tasks: Vec<FilesTask>,
@@ -657,6 +670,8 @@ struct FilesInspectorStructure {
     details_error: Option<String>,
     sifs_health: Option<SifsHealthSummary>,
     sifs_health_error: Option<String>,
+    live_updates_connected: bool,
+    live_updates_error: Option<String>,
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
@@ -727,6 +742,7 @@ impl FilesStructureKey {
                     error: None,
                     list_revision: 0,
                     entries: Vec::new(),
+                    entry_metadata: BTreeMap::new(),
                     entries_total_count: 0,
                     sort_mode: FileSortMode::default(),
                     tasks: Vec::new(),
@@ -765,6 +781,8 @@ impl FilesStructureKey {
                     details_error: None,
                     sifs_health: None,
                     sifs_health_error: None,
+                    live_updates_connected: false,
+                    live_updates_error: None,
                     selected_preview: None,
                     preview_loading: false,
                     preview_error: None,
@@ -782,6 +800,7 @@ impl FilesStructureKey {
             error: state.error.clone(),
             list_revision: state.list_revision,
             entries: state.entries.clone(),
+            entry_metadata: state.entry_metadata.clone(),
             entries_total_count: state.entries_total_count,
             sort_mode: state.sort_mode,
             tasks: state.tasks.clone(),
@@ -819,6 +838,8 @@ impl FilesStructureKey {
             details_error: state.details_error.clone(),
             sifs_health: state.sifs_health.clone(),
             sifs_health_error: state.sifs_health_error.clone(),
+            live_updates_connected: state.live_updates_connected,
+            live_updates_error: state.live_updates_error.clone(),
             selected_preview: state.selected_preview.clone(),
             preview_loading: state.preview_loading,
             preview_error: state.preview_error.clone(),
@@ -893,6 +914,7 @@ impl FilesState {
             history_back: Vec::new(),
             history_forward: Vec::new(),
             entries: Vec::new(),
+            entry_metadata: BTreeMap::new(),
             entries_total_count: 0,
             selected: None,
             selected_details: None,
@@ -929,6 +951,10 @@ impl FilesState {
             worker_rx: None,
             worker_result_tx: None,
             worker_waker: None,
+            live_event_abort: None,
+            live_updates_connected: false,
+            live_updates_error: None,
+            live_refresh_pending: false,
             worker_cancellations: Arc::new(Mutex::new(BTreeSet::new())),
             next_request_id: 0,
             pending_request_id: None,
@@ -1077,6 +1103,11 @@ impl FilesState {
         match listing {
             Some(Ok(page)) => {
                 self.entries_total_count = page.total_count;
+                self.entry_metadata = page
+                    .metadata
+                    .into_iter()
+                    .map(|metadata| (metadata.path.clone(), metadata))
+                    .collect();
                 self.entries = page.entries;
                 self.error = None;
                 if self.source == FilesSourceKind::Local {
@@ -1107,6 +1138,7 @@ impl FilesState {
             }
             Some(Err(error)) => {
                 self.entries.clear();
+                self.entry_metadata.clear();
                 self.entries_total_count = 0;
                 self.error = Some(error);
             }
@@ -1131,6 +1163,7 @@ impl FilesState {
         self.loading = true;
         self.error = None;
         self.entries.clear();
+        self.entry_metadata.clear();
         self.entries_total_count = 0;
         self.list_revision = self.list_revision.wrapping_add(1);
         let command = FilesWorkerCommand::List {
@@ -1231,6 +1264,7 @@ impl FilesState {
         self.browser = None;
         self.error = None;
         self.entries.clear();
+        self.entry_metadata.clear();
         self.entries_total_count = 0;
         self.selected = None;
         self.marked_entries.clear();
@@ -1267,6 +1301,12 @@ impl FilesState {
         self.worker_rx = None;
         self.worker_result_tx = None;
         self.worker_waker = None;
+        if let Some(abort) = self.live_event_abort.take() {
+            abort.abort();
+        }
+        self.live_updates_connected = false;
+        self.live_updates_error = None;
+        self.live_refresh_pending = false;
         clear_all_cancelled_operations(&self.worker_cancellations);
         self.list_revision = self.list_revision.wrapping_add(1);
     }
@@ -1284,6 +1324,10 @@ impl FilesState {
         let cancellations = self.worker_cancellations.clone();
         let timeout_tx = result_tx.clone();
         let timeout_waker = waker.clone();
+        let live_data_dir = self.data_dir.as_ref().clone();
+        let live_address = self.daemon_address.clone();
+        let live_runtime = self.app_runtime.clone();
+        let live_result_tx = result_tx.clone();
         match thread::Builder::new()
             .name("sinomo-app-files".to_string())
             .spawn(move || {
@@ -1302,7 +1346,16 @@ impl FilesState {
                 self.worker_tx = Some(command_tx);
                 self.worker_rx = Some(result_rx);
                 self.worker_result_tx = Some(timeout_tx);
-                self.worker_waker = Some(timeout_waker);
+                self.worker_waker = Some(timeout_waker.clone());
+                if let Some(address) = live_address {
+                    self.live_event_abort = Some(spawn_files_dfs_event_subscription(
+                        &live_runtime,
+                        live_data_dir,
+                        address,
+                        live_result_tx,
+                        Some(timeout_waker),
+                    ));
+                }
             }
             Err(error) => {
                 self.loaded = true;
@@ -1377,6 +1430,10 @@ impl FilesState {
                     self.worker_tx = None;
                     self.worker_result_tx = None;
                     self.worker_waker = None;
+                    if let Some(abort) = self.live_event_abort.take() {
+                        abort.abort();
+                    }
+                    self.live_updates_connected = false;
                     break;
                 }
             };
@@ -1384,11 +1441,15 @@ impl FilesState {
                 changed = true;
             }
         }
+        if self.flush_live_refresh() {
+            changed = true;
+        }
         changed
     }
 
     fn apply_worker_result(&mut self, result: FilesWorkerResult) -> bool {
         match result {
+            FilesWorkerResult::LiveUpdate(update) => self.apply_live_update(update),
             FilesWorkerResult::List {
                 request_id,
                 source,
@@ -1423,8 +1484,19 @@ impl FilesState {
                         self.sifs_health_error = listing.health_error;
                         self.entries_total_count = listing.total_count;
                         if append {
+                            self.entry_metadata.extend(
+                                listing
+                                    .entry_metadata
+                                    .into_iter()
+                                    .map(|metadata| (metadata.path.clone(), metadata)),
+                            );
                             self.entries.extend(listing.entries);
                         } else {
+                            self.entry_metadata = listing
+                                .entry_metadata
+                                .into_iter()
+                                .map(|metadata| (metadata.path.clone(), metadata))
+                                .collect();
                             self.entries = listing.entries;
                         }
                         self.error = None;
@@ -1452,6 +1524,7 @@ impl FilesState {
                         self.store_active_path();
                         if !append {
                             self.entries.clear();
+                            self.entry_metadata.clear();
                             self.entries_total_count = 0;
                             self.sifs_health = None;
                             self.sifs_health_error = None;
@@ -1725,6 +1798,64 @@ impl FilesState {
         }
     }
 
+    fn apply_live_update(&mut self, update: FilesLiveUpdate) -> bool {
+        match update {
+            FilesLiveUpdate::Item(DaemonEventStreamItem::Ready { .. }) => {
+                let changed = !self.live_updates_connected || self.live_updates_error.is_some();
+                self.live_updates_connected = true;
+                self.live_updates_error = None;
+                // The stream is live now. Reload the durable snapshot once so changes made between
+                // the initial list and subscription readiness cannot be missed.
+                self.live_refresh_pending |= self.source == FilesSourceKind::Sifs;
+                changed || self.source == FilesSourceKind::Sifs
+            }
+            FilesLiveUpdate::Item(DaemonEventStreamItem::Event { event }) => {
+                let status_changed =
+                    !self.live_updates_connected || self.live_updates_error.is_some();
+                self.live_updates_connected = true;
+                self.live_updates_error = None;
+                let selected_path = self.selected_entry().map(|entry| entry.path.as_str());
+                let touches_location = self.source == FilesSourceKind::Sifs
+                    && dfs_event_touches_location(&event.payload, &self.path, selected_path);
+                if touches_location {
+                    self.live_refresh_pending = true;
+                }
+                status_changed || touches_location
+            }
+            FilesLiveUpdate::Item(DaemonEventStreamItem::Lagged { .. }) => {
+                let status_changed =
+                    !self.live_updates_connected || self.live_updates_error.is_some();
+                self.live_updates_connected = true;
+                self.live_updates_error = None;
+                self.live_refresh_pending |= self.source == FilesSourceKind::Sifs;
+                status_changed || self.source == FilesSourceKind::Sifs
+            }
+            FilesLiveUpdate::Disconnected(detail) => {
+                let changed = self.live_updates_connected
+                    || self.live_updates_error.as_deref() != Some(detail.as_str());
+                self.live_updates_connected = false;
+                self.live_updates_error = Some(detail);
+                changed
+            }
+        }
+    }
+
+    fn flush_live_refresh(&mut self) -> bool {
+        if !self.live_refresh_pending
+            || self.source != FilesSourceKind::Sifs
+            || !self.loaded
+            || self.loading
+            || self.pending_request_id.is_some()
+            || self.pending_append_request_id.is_some()
+        {
+            return false;
+        }
+        self.live_refresh_pending = false;
+        self.pending_select_path = self.selected_entry().map(|entry| entry.path.clone());
+        self.reload();
+        true
+    }
+
     fn current_location(&self) -> FilesLocation {
         FilesLocation {
             source: self.source,
@@ -1795,6 +1926,7 @@ impl FilesState {
             self.source = source;
             self.error = None;
             self.entries.clear();
+            self.entry_metadata.clear();
             self.entries_total_count = 0;
             self.selected = None;
             self.clear_selected_details();
@@ -3389,11 +3521,49 @@ impl FilesState {
     }
 }
 
+impl Drop for FilesState {
+    fn drop(&mut self) {
+        if let Some(abort) = self.live_event_abort.take() {
+            abort.abort();
+        }
+    }
+}
+
+fn dfs_event_touches_location(
+    payload: &serde_json::Value,
+    current_path: &str,
+    selected_path: Option<&str>,
+) -> bool {
+    payload
+        .get("paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|changed_path| {
+            dfs_paths_overlap(current_path, changed_path)
+                || selected_path.is_some_and(|selected| dfs_paths_overlap(selected, changed_path))
+        })
+}
+
+fn dfs_paths_overlap(left: &str, right: &str) -> bool {
+    dfs_path_contains(left, right) || dfs_path_contains(right, left)
+}
+
+fn dfs_path_contains(ancestor: &str, candidate: &str) -> bool {
+    ancestor == "/"
+        || ancestor == candidate
+        || candidate
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 struct FilesListing {
     node_id: String,
     health: Option<SifsHealthSummary>,
     health_error: Option<String>,
     entries: Vec<SifsEntry>,
+    entry_metadata: Vec<SifsEntryMetadata>,
     total_count: usize,
 }
 
@@ -3411,6 +3581,7 @@ fn sifs_health_probe(browser: &SifsBrowser) -> (Option<SifsHealthSummary>, Optio
 }
 
 enum FilesWorkerResult {
+    LiveUpdate(FilesLiveUpdate),
     List {
         request_id: u64,
         source: FilesSourceKind,
@@ -3469,6 +3640,11 @@ enum FilesWorkerResult {
         request_id: u64,
         result: FilesOperationResult,
     },
+}
+
+enum FilesLiveUpdate {
+    Item(DaemonEventStreamItem),
+    Disconnected(String),
 }
 
 enum FilesWorkerCommand {
@@ -3549,6 +3725,91 @@ impl FilesOperationProgress<'_> {
     }
 }
 
+fn spawn_files_dfs_event_subscription(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    address: String,
+    tx: Sender<FilesWorkerResult>,
+    waker: Option<sui::UiHandle>,
+) -> tokio::task::AbortHandle {
+    let task = runtime.spawn(async move {
+        let request = match ObjectRpcRequest::encode_body(
+            DAEMON_EVENT_SUBSCRIBE_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &DaemonEventSubscribeRequest::for_dfs_path_prefix("/"),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = tx.send(FilesWorkerResult::LiveUpdate(
+                    FilesLiveUpdate::Disconnected(format!(
+                        "live SIFS updates could not be started: {error}"
+                    )),
+                ));
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                return;
+            }
+        };
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            let mut received_ready = false;
+            let mut consumer_closed = false;
+            let result = send_daemon_rpc_stream_from_data_dir_async(
+                data_dir.clone(),
+                &address,
+                &request,
+                DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
+                |response| {
+                    response.error_detail()?;
+                    let item = response
+                        .decode_body::<DaemonEventStreamItem>()
+                        .map_err(DaemonApiError::from)?;
+                    received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
+                    if tx
+                        .send(FilesWorkerResult::LiveUpdate(FilesLiveUpdate::Item(item)))
+                        .is_err()
+                    {
+                        consumer_closed = true;
+                        return Ok(false);
+                    }
+                    if let Some(waker) = waker.as_ref() {
+                        waker.wake();
+                    }
+                    Ok(true)
+                },
+            )
+            .await;
+            if consumer_closed {
+                return;
+            }
+            if received_ready {
+                retry_delay = Duration::from_millis(250);
+            }
+            let detail = match result {
+                Ok(()) => "daemon closed the event stream".to_string(),
+                Err(error) => error.to_string(),
+            };
+            if tx
+                .send(FilesWorkerResult::LiveUpdate(
+                    FilesLiveUpdate::Disconnected(format!(
+                        "Live SIFS updates disconnected; retrying: {detail}"
+                    )),
+                ))
+                .is_err()
+            {
+                return;
+            }
+            if let Some(waker) = waker.as_ref() {
+                waker.wake();
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+        }
+    });
+    task.abort_handle()
+}
+
 fn files_worker_loop(
     data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
@@ -3598,6 +3859,7 @@ fn files_worker_loop(
                             health: None,
                             health_error: None,
                             entries: page.entries,
+                            entry_metadata: page.metadata,
                             total_count: page.total_count,
                         }
                     });
@@ -3632,6 +3894,7 @@ fn files_worker_loop(
                                     health: None,
                                     health_error: None,
                                     entries: page.entries,
+                                    entry_metadata: page.metadata,
                                     total_count: page.total_count,
                                 });
                             let listed = result.is_ok();
@@ -4426,6 +4689,7 @@ fn list_local_dir_page(
     };
     Ok(SifsEntryPage {
         entries,
+        metadata: Vec::new(),
         total_count,
         offset,
         limit,
@@ -6685,17 +6949,41 @@ fn entry_meta(entry: &SifsEntry) -> String {
     }
 }
 
-fn entry_row_meta(entry: &SifsEntry, files: &FilesState, active: bool) -> String {
-    if active && files.source == FilesSourceKind::Sifs {
-        return sifs_compact_header_line(
-            entry,
-            files.selected_details.as_ref(),
-            files.clustered,
-            files.details_loading,
-            files.details_error.as_deref(),
-        );
+fn entry_row_meta(entry: &SifsEntry, files: &FilesState, _active: bool) -> String {
+    let base = entry_meta(entry);
+    let Some(metadata) = files.entry_metadata.get(&entry.path) else {
+        return base;
+    };
+    let Some(modified) = compact_modified_age(metadata.modified_at_unix_nanos) else {
+        return base;
+    };
+    format!("{base} · {modified}")
+}
+
+fn compact_modified_age(nanos: u64) -> Option<String> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    compact_modified_age_at(nanos, now)
+}
+
+fn compact_modified_age_at(nanos: u64, now_nanos: i128) -> Option<String> {
+    if nanos == 0 {
+        return None;
     }
-    entry_meta(entry)
+    let timestamp = time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok()?;
+    let elapsed_nanos = now_nanos.saturating_sub(nanos as i128).max(0);
+    let elapsed_secs = (elapsed_nanos / 1_000_000_000) as u64;
+    Some(match elapsed_secs {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed_secs / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_secs / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed_secs / 86_400),
+        _ => format!(
+            "{:04}-{:02}-{:02}",
+            timestamp.year(),
+            u8::from(timestamp.month()),
+            timestamp.day()
+        ),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6707,7 +6995,7 @@ struct FileRowPlacementBadge {
 }
 
 fn file_row_placement_badge(
-    _entry: &SifsEntry,
+    entry: &SifsEntry,
     files: &FilesState,
     row_index: usize,
 ) -> FileRowPlacementBadge {
@@ -6742,6 +7030,10 @@ fn file_row_placement_badge(
         return sifs_details_placement_badge(details);
     }
 
+    if let Some(metadata) = files.entry_metadata.get(&entry.path) {
+        return sifs_entry_placement_badge(metadata);
+    }
+
     FileRowPlacementBadge {
         label: if files.clustered {
             "on mesh".to_string()
@@ -6752,6 +7044,38 @@ fn file_row_placement_badge(
             SemanticTone::Info
         } else {
             SemanticTone::Neutral
+        },
+        icon: IconGlyph::Storage,
+        replicas: None,
+    }
+}
+
+fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementBadge {
+    if metadata.policy == "local-owned" || metadata.policy == "ephemeral-local" {
+        return FileRowPlacementBadge {
+            label: "this device".to_string(),
+            tone: SemanticTone::Neutral,
+            icon: IconGlyph::Storage,
+            replicas: None,
+        };
+    }
+
+    let count = metadata.current_locations.len();
+    if count == 0 {
+        return FileRowPlacementBadge {
+            label: "placing".to_string(),
+            tone: SemanticTone::Warning,
+            icon: IconGlyph::Redo,
+            replicas: None,
+        };
+    }
+
+    FileRowPlacementBadge {
+        label: plural(count, "copy"),
+        tone: if count > 1 {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Info
         },
         icon: IconGlyph::Storage,
         replicas: None,
@@ -6850,14 +7174,20 @@ fn details_size(entry: &SifsEntry, details: Option<&SifsObjectDetails>) -> Strin
     )
 }
 
-fn details_locations(details: &SifsObjectDetails) -> String {
+fn details_locations_friendly(details: &SifsObjectDetails, local_node_id: &str) -> String {
     if details.current_locations.is_empty() {
-        "none recorded".to_string()
+        "No durable copy is recorded yet".to_string()
     } else {
         details
             .current_locations
             .iter()
-            .map(|node| short(node, 20))
+            .map(|node| {
+                if !local_node_id.is_empty() && node == local_node_id {
+                    "This device".to_string()
+                } else {
+                    format!("Node {}", short(node, 16))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -6899,15 +7229,24 @@ fn sifs_metadata_shard_detail_summary(shard: &SifsMetadataShardDetails) -> Strin
         shard
             .replica_node_ids
             .iter()
-            .map(|node_id| short(node_id, 18))
+            .map(|node_id| {
+                if node_id == &shard.local_node_id {
+                    "this device".to_string()
+                } else {
+                    format!("node {}", short(node_id, 14))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let primary = if shard.primary_node_id == shard.local_node_id {
+        "this device".to_string()
+    } else {
+        format!("node {}", short(&shard.primary_node_id, 14))
+    };
     format!(
-        "primary {}; replicas {}; epoch {}",
-        short(&shard.primary_node_id, 18),
-        replicas,
-        shard.epoch
+        "{} · primary {} · replicas {} · epoch {}",
+        shard.shard_id, primary, replicas, shard.epoch
     )
 }
 
@@ -8539,9 +8878,9 @@ fn files_list_body_table(
                     .min_width(180.0)
                     .sort_direction(sort_mode.name_sort_direction()),
                 VirtualTableColumn::new("Placement").key(3).width(156.0),
-                VirtualTableColumn::new("Kind / size")
+                VirtualTableColumn::new("Details")
                     .key(4)
-                    .width(128.0)
+                    .width(156.0)
                     .sort_direction(sort_mode.meta_sort_direction()),
             ])
             .collection_window(CollectionWindow::loaded(
@@ -8587,9 +8926,26 @@ fn files_list_body_table(
                 if entry.is_dir {
                     description.push_str(". Single click selects; double click opens the folder");
                 }
-                if files.source == FilesSourceKind::Sifs && files.selected == Some(index) {
-                    description.push_str(". Placement ");
-                    description.push_str(&entry_row_meta(entry, &files, true));
+                if files.source == FilesSourceKind::Sifs {
+                    let placement = file_row_placement_badge(entry, &files, index);
+                    description.push_str(". Placement: ");
+                    description.push_str(&placement.label);
+                    if files.selected == Some(index) {
+                        description.push_str("; ");
+                        description.push_str(&sifs_compact_header_line(
+                            entry,
+                            files.selected_details.as_ref(),
+                            files.clustered,
+                            files.details_loading,
+                            files.details_error.as_deref(),
+                        ));
+                    }
+                    description.push_str(". Details: ");
+                    description.push_str(&entry_row_meta(
+                        entry,
+                        &files,
+                        files.selected == Some(index),
+                    ));
                 }
                 description
             })
@@ -9391,6 +9747,8 @@ fn plural(count: usize, singular: &str) -> String {
         format!("1 {singular}")
     } else if singular == "entry" {
         format!("{count} entries")
+    } else if singular == "copy" {
+        format!("{count} copies")
     } else {
         format!("{count} {singular}s")
     }
@@ -11107,14 +11465,14 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         );
         let placement_rows = vec![
             (
-                "Placement",
+                "Content copies",
                 sifs_replication_summary(details, files.clustered),
             ),
-            ("Metadata", sifs_metadata_shard_summary(details)),
-            ("Health", sifs_health_summary(details)),
-            ("Pin", sifs_pin_summary(details)),
+            ("Metadata home", sifs_metadata_shard_summary(details)),
+            ("Object health", sifs_health_summary(details)),
+            ("This device", sifs_pin_summary(details)),
             (
-                "Next",
+                "Recommended",
                 sifs_inspector_next_step(
                     details,
                     files.clustered,
@@ -11123,6 +11481,13 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                 ),
             ),
         ];
+        let (live_label, live_tone) = if files.live_updates_connected {
+            ("Live changes on", SemanticTone::Success)
+        } else if files.live_updates_error.is_some() {
+            ("Live changes reconnecting", SemanticTone::Warning)
+        } else {
+            ("Snapshot view", SemanticTone::Neutral)
+        };
         let placement_body = Stack::vertical()
             .alignment(Alignment::Stretch)
             .spacing(8.0)
@@ -11137,6 +11502,11 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                     .tone(status_tone)
                     .theme_when(clone_reader(reader)),
             )
+            .with_child(
+                StatusBadge::new(live_label)
+                    .tone(live_tone)
+                    .theme_when(clone_reader(reader)),
+            )
             .with_child(detail_rows_widget(placement_rows, reader));
         content = content.with_child(inspector_card(
             "Placement",
@@ -11147,78 +11517,114 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         ));
 
         if files.inspector_details_open {
-            let policy = details
-                .map(|details| details.policy.clone())
-                .unwrap_or_else(|| "not loaded".to_string());
-            let mut rows = Vec::new();
+            let mut status_rows = Vec::new();
+            if let Some(error) = &files.live_updates_error {
+                status_rows.push(("Live updates", error.clone()));
+            }
             if let Some(error) = &files.details_error {
-                rows.push(("Reason", error.clone()));
-                rows.push(("Authority", "SIFS through daemon".to_string()));
+                status_rows.push(("Reason", error.clone()));
+                status_rows.push(("Source", "SIFS through daemon".to_string()));
             } else if files.details_loading {
-                rows.push(("Status", "Waiting for daemon metadata".to_string()));
+                status_rows.push(("Status", "Reading DFS metadata".to_string()));
             } else if details.is_none() {
-                rows.push((
+                status_rows.push((
                     "Status",
                     "Metadata has not returned for this object yet".to_string(),
                 ));
-                rows.push(("Authority", "SIFS through daemon".to_string()));
+                status_rows.push(("Source", "SIFS through daemon".to_string()));
             }
-            rows.push(("Policy", policy));
-            if let Some(shard) = details.and_then(|details| details.metadata_shard.as_ref()) {
-                rows.push(("Shard", sifs_metadata_shard_detail_summary(shard)));
-            }
-            if let Some(health) = details.and_then(|details| details.health.as_ref()) {
-                rows.push(("Agent state", health.agent_state.clone()));
-                rows.push((
-                    "Operator counts",
-                    format!(
-                        "{} · {} · {}",
-                        plural(health.version_count, "version"),
-                        plural(health.receipt_count, "receipt"),
-                        plural(health.intent_count, "intent")
-                    ),
+            if !status_rows.is_empty() {
+                content = content.with_child(inspector_card(
+                    "DFS details",
+                    detail_rows_widget(status_rows, reader),
+                    reader,
+                    None,
+                    false,
                 ));
-                rows.push((
-                    "Repair backlog",
-                    format!(
-                        "{} · {}",
-                        plural(health.pending_repair_count, "missing replica"),
-                        plural(health.open_conflict_count, "conflict")
-                    ),
-                ));
-                rows.push(("Missing nodes", sifs_missing_replica_summary(health)));
             }
-            rows.push((
-                "Durable nodes",
-                details
-                    .map(details_locations)
-                    .unwrap_or_else(|| "not reported".to_string()),
-            ));
+
             if let Some(details) = details {
-                rows.push(("Local pins", sifs_pin_detail_summary(details)));
-                rows.push(("File system", details.file_system_id.clone()));
-                rows.push(("Object", short(&details.object_id, 28)));
-                rows.push(("Version", short(&details.version, 28)));
-                rows.push((
-                    "Mode",
-                    format!("{:o} · {} links", details.mode, details.link_count),
+                let metadata_rows = vec![
+                    ("Type", details.kind.clone()),
+                    ("Size", details_size(&entry, Some(details))),
+                    ("Modified", unix_nanos_label(details.modified_at_unix_nanos)),
+                    ("Created", unix_nanos_label(details.created_at_unix_nanos)),
+                    ("Accessed", unix_nanos_label(details.accessed_at_unix_nanos)),
+                    (
+                        "Permissions",
+                        format!("{:04o} · {} links", details.mode, details.link_count),
+                    ),
+                    (
+                        "Owner",
+                        format!("uid {} · gid {}", details.uid, details.gid),
+                    ),
+                ];
+                content = content.with_child(inspector_card(
+                    "File metadata",
+                    detail_rows_widget(metadata_rows, reader),
+                    reader,
+                    None,
+                    false,
                 ));
-                rows.push((
-                    "Owner",
-                    format!("uid {} · gid {}", details.uid, details.gid),
-                ));
-                rows.push(("Modified", unix_nanos_label(details.modified_at_unix_nanos)));
+
+                let mut identity_rows = vec![
+                    ("File system", details.file_system_id.clone()),
+                    ("Object ID", details.object_id.clone()),
+                    ("Version", details.version.clone()),
+                ];
                 if let Some(hash) = &details.content_hash {
-                    rows.push(("Content", short(hash, 28)));
+                    identity_rows.push(("Content hash", hash.clone()));
                 }
+                content = content.with_child(inspector_card(
+                    "DFS identity",
+                    detail_rows_widget(identity_rows, reader),
+                    reader,
+                    None,
+                    false,
+                ));
+
+                let mut placement_detail_rows = vec![
+                    ("Policy", details.policy.clone()),
+                    (
+                        "Durable nodes",
+                        details_locations_friendly(details, &files.node_id),
+                    ),
+                    ("Local pins", sifs_pin_detail_summary(details)),
+                ];
+                if let Some(shard) = details.metadata_shard.as_ref() {
+                    placement_detail_rows
+                        .push(("Metadata shard", sifs_metadata_shard_detail_summary(shard)));
+                }
+                if let Some(health) = details.health.as_ref() {
+                    placement_detail_rows.push(("Agent state", health.agent_state.clone()));
+                    placement_detail_rows.push((
+                        "DFS records",
+                        format!(
+                            "{} · {} · {}",
+                            plural(health.version_count, "version"),
+                            plural(health.receipt_count, "receipt"),
+                            plural(health.intent_count, "intent")
+                        ),
+                    ));
+                    placement_detail_rows.push((
+                        "Repair backlog",
+                        format!(
+                            "{} · {}",
+                            plural(health.pending_repair_count, "missing replica"),
+                            plural(health.open_conflict_count, "conflict")
+                        ),
+                    ));
+                    placement_detail_rows
+                        .push(("Missing nodes", sifs_missing_replica_summary(health)));
+                }
+                content = content.with_child(inspector_card(
+                    "Placement internals",
+                    detail_rows_widget(placement_detail_rows, reader),
+                    reader,
+                    None,
+                    false,
+                ));
             }
-            content = content.with_child(inspector_card(
-                "Technical details",
-                detail_rows_widget(rows, reader),
-                reader,
-                None,
-                false,
-            ));
         }
 
         if !files.clustered {
@@ -14551,7 +14957,7 @@ mod tests {
     }
 
     #[test]
-    fn active_sifs_row_meta_surfaces_replica_repair_state() {
+    fn sifs_row_meta_uses_page_metadata_without_selected_object_stat() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.source = FilesSourceKind::Sifs;
@@ -14566,24 +14972,81 @@ mod tests {
             is_link: false,
             size: Some(5),
         }];
-        let mut details = test_sifs_details(Vec::new());
-        details.health = Some(SifsObjectHealth {
-            agent_state: "pending-repair".to_string(),
-            version_count: 1,
-            receipt_count: 1,
-            intent_count: 1,
-            open_conflict_count: 0,
-            pending_repair_count: 1,
-            missing_replica_nodes: vec!["node-b".to_string()],
-        });
-        state.selected_details = Some(details);
+        state.entry_metadata.insert(
+            "/artifact.txt".to_string(),
+            SifsEntryMetadata {
+                path: "/artifact.txt".to_string(),
+                object_id: "object-artifact".to_string(),
+                version: "version-1".to_string(),
+                modified_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+            },
+        );
 
         let entry = state.entries[0].clone();
-        assert_eq!(
-            entry_row_meta(&entry, &state, true),
-            "5 B · 1/2 replicas · 1 repair"
-        );
+        assert_eq!(entry_row_meta(&entry, &state, true), "5 B");
         assert_eq!(entry_row_meta(&entry, &state, false), "5 B");
+
+        state.selected = None;
+        assert_eq!(
+            file_row_placement_badge(&entry, &state, 0),
+            FileRowPlacementBadge {
+                label: "2 copies".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas: None,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_modified_age_stays_readable_for_recent_and_old_files() {
+        let day = 86_400_i128 * 1_000_000_000;
+        let now = 2_000_000_i128 * 1_000_000_000;
+        assert_eq!(
+            compact_modified_age_at((now - 90 * 1_000_000_000) as u64, now),
+            Some("1m ago".to_string())
+        );
+        assert_eq!(
+            compact_modified_age_at((now - 3 * day) as u64, now),
+            Some("3d ago".to_string())
+        );
+        assert_eq!(compact_modified_age_at(0, now), None);
+    }
+
+    #[test]
+    fn dfs_change_paths_match_directory_boundaries_and_selected_descendants() {
+        assert!(dfs_event_touches_location(
+            &serde_json::json!({ "paths": ["/users/project/report.txt"] }),
+            "/users/project",
+            None,
+        ));
+        assert!(dfs_event_touches_location(
+            &serde_json::json!({ "paths": ["/users/project"] }),
+            "/users",
+            Some("/users/project/report.txt"),
+        ));
+        assert!(!dfs_event_touches_location(
+            &serde_json::json!({ "paths": ["/users/project-old/report.txt"] }),
+            "/users/project",
+            None,
+        ));
+    }
+
+    #[test]
+    fn ready_event_marks_sifs_snapshot_for_one_coalesced_refresh() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+
+        assert!(
+            state.apply_live_update(FilesLiveUpdate::Item(DaemonEventStreamItem::Ready {
+                subscription_id: "files-test".to_string(),
+            },))
+        );
+        assert!(state.live_updates_connected);
+        assert!(state.live_refresh_pending);
     }
 
     #[test]
@@ -15260,6 +15723,7 @@ mod tests {
                 health: None,
                 health_error: None,
                 total_count: 1,
+                entry_metadata: Vec::new(),
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),
@@ -15335,6 +15799,7 @@ mod tests {
                 health: None,
                 health_error: None,
                 total_count: 1,
+                entry_metadata: Vec::new(),
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),
@@ -16483,7 +16948,7 @@ mod tests {
         );
         assert!(
             table.description.as_deref().is_some_and(
-                |description| description.starts_with("Columns: Name, Placement, Kind / size")
+                |description| description.starts_with("Columns: Name, Placement, Details")
             ),
             "table semantics should preserve the column description: {:?}",
             table.description
@@ -16782,9 +17247,10 @@ mod tests {
             })
             .expect("artifact row semantics");
         assert!(
-            row.description.as_deref().is_some_and(
-                |description| description.contains("Placement 5 B · 1/2 replicas · 1 repair")
-            ),
+            row.description
+                .as_deref()
+                .is_some_and(|description| description
+                    .contains("Placement: repair; 5 B · 1/2 replicas · 1 repair")),
             "selected SIFS row should expose compact placement metadata, got {:?}",
             row.description
         );

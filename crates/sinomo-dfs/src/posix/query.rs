@@ -242,8 +242,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or("/")
                     .to_string(),
                 path: object_path,
-                kind: target.kind,
-                object_id: target.object_id,
+                kind: target.kind.clone(),
+                object_id: target.object_id.clone(),
+                version: target.version.clone(),
+                // Directory pages stay metadata-only: do not turn a list into one manifest or
+                // version lookup per child. Current writers place the visible size directly on
+                // the object metadata; older objects simply report an unknown size here.
+                size_bytes: target.content_size_bytes,
+                modified_at_unix_nanos: target.modified_at_unix_nanos,
+                policy: target.policy.clone(),
+                current_locations: target.current_locations.clone(),
             });
         }
         Ok(DfsDirEntryPage {
