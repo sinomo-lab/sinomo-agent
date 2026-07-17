@@ -8806,19 +8806,30 @@ fn cluster_raft_append_handler_rejects_unauthorized_leader() {
     write_cluster_state(&paths, &state).expect("write state");
     let mut leader_state = state.clone();
     leader_state.local_node_id = leader_node_id.clone();
+    let unauthorized_key = "/raft/unauthorized-snapshot";
+    let mut unauthorized_store = InProcessKvStore::new();
+    unauthorized_store
+        .put(unauthorized_key, b"must-not-install".to_vec(), None)
+        .expect("build unauthorized snapshot");
 
     let response = handle_cluster_raft_append_request(
         &paths,
         ClusterRaftAppendRequest {
             state: leader_state,
-            snapshot: None,
+            snapshot: Some(RaftSnapshot {
+                last_included_index: 1,
+                last_included_term: 1,
+                kv: unauthorized_store
+                    .snapshot()
+                    .expect("unauthorized snapshot"),
+            }),
             append: RaftAppendEntriesRequest {
                 term: 1,
                 leader_id: leader_node_id.clone(),
-                prev_log_index: 0,
-                prev_log_term: 0,
+                prev_log_index: 1,
+                prev_log_term: 1,
                 entries: Vec::new(),
-                leader_commit: 0,
+                leader_commit: 1,
             },
         },
         &ClusterAuthenticatedPeer {
@@ -8830,6 +8841,13 @@ fn cluster_raft_append_handler_rejects_unauthorized_leader() {
 
     assert!(!response.accepted);
     assert!(response.detail.contains("unauthorized"));
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("read store after unauthorized snapshot")
+            .get(unauthorized_key)
+            .is_none(),
+        "an unauthorized peer must not install a snapshot"
+    );
 }
 
 #[test]
@@ -19036,6 +19054,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
     struct ScriptedAsyncRaftAppendHost {
         last_index: u64,
         next_indexes: Vec<u64>,
+        snapshot_flags: Vec<bool>,
         timeouts: Vec<Duration>,
         sent: usize,
         responses: std::collections::VecDeque<ClusterRaftAppendResponse>,
@@ -19060,10 +19079,17 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
             self.next_indexes.push(next_index);
             let state = state.clone();
             let leader_id = state.local_node_id.clone();
+            let snapshot = (next_index == 1).then(|| RaftSnapshot {
+                last_included_index: 0,
+                last_included_term: 0,
+                kv: InProcessKvStore::new()
+                    .snapshot()
+                    .expect("catch-up snapshot"),
+            });
             Box::pin(async move {
                 Ok(ClusterRaftAppendRequest {
                     state,
-                    snapshot: None,
+                    snapshot,
                     append: RaftAppendEntriesRequest {
                         term: 1,
                         leader_id,
@@ -19079,9 +19105,10 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
         fn send_raft_append_async<'a>(
             &'a mut self,
             _endpoint: &'a ClusterEndpointRecord,
-            _request: &'a ClusterRaftAppendRequest,
+            request: &'a ClusterRaftAppendRequest,
             timeout: Duration,
         ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            self.snapshot_flags.push(request.snapshot.is_some());
             self.timeouts.push(timeout);
             let response = self.responses.pop_front().expect("scripted response");
             Box::pin(async move { Ok(response) })
@@ -19131,6 +19158,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
     let mut host = ScriptedAsyncRaftAppendHost {
         last_index: 5,
         next_indexes: Vec::new(),
+        snapshot_flags: Vec::new(),
         timeouts: Vec::new(),
         sent: 0,
         responses: Vec::from([response(&state, false, 2), response(&state, true, 3)]).into(),
@@ -19164,8 +19192,54 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
 
     assert!(outcome.response.accepted);
     assert_eq!(host.next_indexes, vec![6, 3]);
+    assert_eq!(host.snapshot_flags, vec![false, false]);
     assert_eq!(host.sent, 2);
     assert_eq!(host.timeouts.len(), 2);
+
+    let mut committed_conflict_host = ScriptedAsyncRaftAppendHost {
+        last_index: 5,
+        next_indexes: Vec::new(),
+        snapshot_flags: Vec::new(),
+        timeouts: Vec::new(),
+        sent: 0,
+        responses: Vec::from([
+            response(&state, false, 4),
+            response(&state, false, 4),
+            response(&state, true, 5),
+        ])
+        .into(),
+    };
+    let outcome = runtime
+        .block_on(replicate_cluster_raft_to_endpoint_async_with_host(
+            &paths,
+            &state,
+            &endpoint,
+            &[],
+            ClusterControlPlaneTimeouts {
+                max_raft_append_attempts: 3,
+                tcp_command_timeout: Duration::from_secs(1),
+                iroh_command_timeout: Duration::from_secs(1),
+                tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                public_foreground_attempt_timeout: Duration::from_secs(1),
+                iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                raft_append_timeout: Duration::from_secs(5),
+                rpc_timeout: Duration::from_secs(5),
+                membership_rpc_timeout: Duration::from_secs(5),
+                raft_campaign_jitter_max: Duration::ZERO,
+            },
+            Duration::from_secs(5),
+            &mut committed_conflict_host,
+        ))
+        .expect("async replicate through committed conflict");
+
+    assert!(outcome.response.accepted);
+    assert_eq!(committed_conflict_host.next_indexes, vec![6, 5, 1]);
+    assert_eq!(
+        committed_conflict_host.snapshot_flags,
+        vec![false, false, true]
+    );
+    assert_eq!(committed_conflict_host.sent, 3);
+    assert_eq!(committed_conflict_host.timeouts.len(), 3);
 }
 
 #[test]
