@@ -3,9 +3,10 @@ use crate::{
     normalize_sifs_root, parent_sifs_path, prepare_background_mount_point,
 };
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow,
+    AccessFlags, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags,
+    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use sinomo_runtime::dfs::{
     self, DfsError, DfsObjectKind, DfsPosixCreateAttrs, DfsPosixError, DfsWriteOptions,
@@ -43,6 +44,35 @@ const MAX_DIRTY_WRITE_BYTES_PER_HANDLE: usize = 64 * 1024 * 1024;
 static NEXT_MOUNT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 type SifsService = dfs::MountedSifsService;
 type FuseReadJob = Box<dyn FnOnce() + Send + 'static>;
+
+trait ReplyErrorExt {
+    fn error_from_i32(self, error: libc::c_int);
+}
+
+macro_rules! impl_reply_error_ext {
+    ($($reply:ty),+ $(,)?) => {
+        $(
+            impl ReplyErrorExt for $reply {
+                fn error_from_i32(self, error: libc::c_int) {
+                    self.error(Errno::from_i32(error));
+                }
+            }
+        )+
+    };
+}
+
+impl_reply_error_ext!(
+    ReplyAttr,
+    ReplyCreate,
+    ReplyData,
+    ReplyDirectory,
+    ReplyEmpty,
+    ReplyEntry,
+    ReplyLock,
+    ReplyOpen,
+    ReplyStatfs,
+    ReplyWrite,
+);
 
 struct FuseReadExecutor {
     sender: Option<SyncSender<FuseReadJob>>,
@@ -140,8 +170,8 @@ pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
     let mount_helper = fuse_mount_helper();
     let mount_point = options.mount_point.clone();
     let fs = SifsFuseFileSystem::open(options.clone())?;
-    let mount_options = fuse_mount_options(&options, mount_helper.is_some());
-    fuser::mount2(fs, &mount_point, &mount_options)
+    let mount_config = fuse_mount_config(&options, mount_helper.is_some());
+    fuser::mount2(fs, &mount_point, &mount_config)
         .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))
 }
 
@@ -152,8 +182,8 @@ pub fn mount_sifs_background(mut options: DfsFuseMountOptions) -> Result<DfsFuse
     let mount_point = prepare_background_mount_point(&options.mount_point)?;
     options.mount_point = mount_point.clone();
     let fs = SifsFuseFileSystem::open(options.clone())?;
-    let mount_options = background_fuse_mount_options(&options, mount_helper.is_some());
-    let session = fuser::spawn_mount2(fs, &mount_point, &mount_options)
+    let mount_config = background_fuse_mount_config(&options, mount_helper.is_some());
+    let session = fuser::spawn_mount2(fs, &mount_point, &mount_config)
         .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))?;
     Ok(DfsFuseMountHandle::new(mount_point, session))
 }
@@ -202,10 +232,7 @@ fn is_disconnected_mount_error(source: &io::Error) -> bool {
     source.raw_os_error() == Some(libc::ENOTCONN)
 }
 
-fn fuse_mount_options(
-    options: &DfsFuseMountOptions,
-    mount_helper_available: bool,
-) -> Vec<MountOption> {
+fn fuse_mount_config(options: &DfsFuseMountOptions, mount_helper_available: bool) -> Config {
     let mut mount_options = vec![
         MountOption::FSName(options.mount_name.clone()),
         MountOption::DefaultPermissions,
@@ -219,22 +246,26 @@ fn fuse_mount_options(
     if options.read_only {
         mount_options.push(MountOption::RO);
     }
-    if options.allow_other {
-        mount_options.push(MountOption::AllowOther);
-    }
-    mount_options
+    let mut config = Config::default();
+    config.mount_options = mount_options;
+    config.acl = if options.allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
+    config
 }
 
-fn background_fuse_mount_options(
+fn background_fuse_mount_config(
     options: &DfsFuseMountOptions,
     mount_helper_available: bool,
-) -> Vec<MountOption> {
+) -> Config {
     // BackgroundSession owns the mount and unmounts it when dropped. Do not
     // force AutoUnmount for an owner-only mount: fuser implements that option
     // by implicitly adding allow_other, which fails on standard installations
     // without `user_allow_other` in /etc/fuse.conf and silently widens the
     // kernel mount request beyond the caller's intent.
-    fuse_mount_options(options, mount_helper_available)
+    fuse_mount_config(options, mount_helper_available)
 }
 
 fn fuse_mount_helper() -> Option<PathBuf> {
@@ -572,8 +603,8 @@ impl SifsFuseFileSystem {
 
     fn reply_entry_for_path(&self, reply: ReplyEntry, path: String, stat: dfs::DfsStat) {
         match self.intern_entry(path, &stat.object_id) {
-            Ok(ino) => reply.entry(&self.entry_ttl, &file_attr(ino, &stat), 0),
-            Err(errno) => reply.error(errno),
+            Ok(ino) => reply.entry(&self.entry_ttl, &file_attr(ino, &stat), Generation(0)),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
@@ -761,7 +792,7 @@ impl SifsFuseFileSystem {
     ) {
         let (path, object_id) = match self.handle_lock_identity(ino, fh) {
             Ok(identity) => identity,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let key = (object_id.clone(), lock_owner);
         let (existing, prior_lost_fhs, can_start_lock_key) = match self.lock_state() {
@@ -777,7 +808,7 @@ impl SifsFuseFileSystem {
                     state.can_start_lock_key(&key),
                 )
             }
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         if let Some(existing) = existing {
             let command = if existing.grant.mode == mode {
@@ -814,7 +845,7 @@ impl SifsFuseFileSystem {
                     );
                     let mut state = match self.lock_state() {
                         Ok(state) => state,
-                        Err(errno) => return reply.error(errno),
+                        Err(errno) => return reply.error_from_i32(errno),
                     };
                     if let Some(held) = held {
                         state.held_locks.insert(key.clone(), held);
@@ -823,7 +854,7 @@ impl SifsFuseFileSystem {
                     } else {
                         state.held_locks.remove(&key);
                         state.record_lost_lock(key, associated_fhs);
-                        reply.error(libc::EIO);
+                        reply.error_from_i32(libc::EIO);
                     }
                 }
                 // Two shared holders attempting blocking upgrades would both
@@ -832,7 +863,7 @@ impl SifsFuseFileSystem {
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::WouldBlock { .. },
                     ..
-                }) if blocking => reply.error(libc::EDEADLK),
+                }) if blocking => reply.error_from_i32(libc::EDEADLK),
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::WouldBlock { .. },
                     ..
@@ -840,7 +871,7 @@ impl SifsFuseFileSystem {
                 | Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::AuthorityWarming { .. },
                     ..
-                }) => reply.error(libc::EAGAIN),
+                }) => reply.error_from_i32(libc::EAGAIN),
                 Ok(response) => {
                     let outcome = response.outcome;
                     if lock_outcome_loses_grant(&outcome)
@@ -855,7 +886,7 @@ impl SifsFuseFileSystem {
                         associated_fhs.insert(fh);
                         state.record_lost_lock(key, associated_fhs);
                     }
-                    reply.error(errno_for_unexpected_lock_outcome(&outcome));
+                    reply.error_from_i32(errno_for_unexpected_lock_outcome(&outcome));
                 }
                 Err(errno) => {
                     // After both exact retries fail, a renew or conversion may
@@ -871,14 +902,14 @@ impl SifsFuseFileSystem {
                         associated_fhs.insert(fh);
                         state.record_lost_lock(key, associated_fhs);
                     }
-                    reply.error(errno);
+                    reply.error_from_i32(errno);
                 }
             }
             return;
         }
 
         if !can_start_lock_key {
-            return reply.error(libc::ENOLCK);
+            return reply.error_from_i32(libc::ENOLCK);
         }
 
         let acquire_request_id = self.next_lock_request_id("acquire");
@@ -903,11 +934,11 @@ impl SifsFuseFileSystem {
             match self.lock_state() {
                 Ok(mut state) => {
                     if state.pending_locks.contains_key(&key) {
-                        return reply.error(libc::EDEADLK);
+                        return reply.error_from_i32(libc::EDEADLK);
                     }
                     state.pending_locks.insert(key.clone(), pending);
                 }
-                Err(errno) => return reply.error(errno),
+                Err(errno) => return reply.error_from_i32(errno),
             }
             spawn_blocking_lock_waiter(
                 Arc::downgrade(&self.dfs),
@@ -937,7 +968,7 @@ impl SifsFuseFileSystem {
                 );
                 let mut state = match self.lock_state() {
                     Ok(state) => state,
-                    Err(errno) => return reply.error(errno),
+                    Err(errno) => return reply.error_from_i32(errno),
                 };
                 if let Some(held) = held {
                     state.held_locks.insert(key.clone(), held);
@@ -945,7 +976,7 @@ impl SifsFuseFileSystem {
                     reply.ok();
                 } else {
                     state.record_lost_lock(key, associated_fhs);
-                    reply.error(libc::EIO);
+                    reply.error_from_i32(libc::EIO);
                 }
             }
             Ok(FuseLockCommandResult {
@@ -955,15 +986,17 @@ impl SifsFuseFileSystem {
             | Ok(FuseLockCommandResult {
                 outcome: dfs::DfsAdvisoryLockOutcome::AuthorityWarming { .. },
                 ..
-            }) => reply.error(libc::EAGAIN),
-            Ok(response) => reply.error(errno_for_unexpected_lock_outcome(&response.outcome)),
+            }) => reply.error_from_i32(libc::EAGAIN),
+            Ok(response) => {
+                reply.error_from_i32(errno_for_unexpected_lock_outcome(&response.outcome))
+            }
             Err(errno) => {
                 let mut associated_fhs = prior_lost_fhs;
                 associated_fhs.insert(fh);
                 if let Ok(mut state) = self.lock_state() {
                     state.record_lost_lock(key, associated_fhs);
                 }
-                reply.error(errno);
+                reply.error_from_i32(errno);
             }
         }
     }
@@ -1330,14 +1363,10 @@ impl SifsFuseFileSystem {
 }
 
 impl Filesystem for SifsFuseFileSystem {
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        config: &mut KernelConfig,
-    ) -> std::result::Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         config
-            .add_capabilities(fuser::consts::FUSE_POSIX_LOCKS)
-            .map_err(|_| libc::EIO)
+            .add_capabilities(InitFlags::FUSE_POSIX_LOCKS)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn destroy(&mut self) {
@@ -1345,18 +1374,21 @@ impl Filesystem for SifsFuseFileSystem {
         self.read_cancellation.cancel();
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent = parent.0;
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         match self.stat_path(&path, false) {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = ino.0;
+        let fh = fh.map(|fh| fh.0);
         if let Some(fh) = fh {
             match self.lock_state() {
                 Ok(state) => {
@@ -1364,24 +1396,24 @@ impl Filesystem for SifsFuseFileSystem {
                         return reply.attr(&self.attr_ttl, &file_attr(ino, &stat));
                     }
                 }
-                Err(errno) => return reply.error(errno),
+                Err(errno) => return reply.error_from_i32(errno),
             }
         }
         let path = match self.path_for_ino(ino) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         match self.stat_path(&path, false) {
             Ok(stat) => reply.attr(&self.attr_ttl, &file_attr(ino, &stat)),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -1389,13 +1421,15 @@ impl Filesystem for SifsFuseFileSystem {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let ino = ino.0;
+        let fh = fh.map(|fh| fh.0);
         let changes_metadata =
             mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
         if size.is_none() && changes_metadata {
@@ -1406,17 +1440,17 @@ impl Filesystem for SifsFuseFileSystem {
                     .and_then(|path| self.commit_dirty_handles_for_path(&path, false)),
             };
             if let Err(errno) = commit_result {
-                return reply.error(errno);
+                return reply.error_from_i32(errno);
             }
         }
         if let Some(size) = size
             && let Err(errno) = self.truncate_handle_or_path(ino, fh, size)
         {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let path = match self.path_for_ino(ino) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let mut result = Ok(());
         if let Some(mode) = mode {
@@ -1457,48 +1491,50 @@ impl Filesystem for SifsFuseFileSystem {
             });
         }
         if let Err(errno) = result {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         match self.stat_path(&path, false) {
             Ok(stat) => reply.attr(&self.attr_ttl, &file_attr(ino, &stat)),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let ino = ino.0;
         let path = match self.path_for_ino(ino) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self
             .lock_dfs()
             .and_then(|dfs| dfs.posix_readlink(&path).map_err(errno_for_posix_error));
         match result {
             Ok(target) => reply.data(target.as_bytes()),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn mknod(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let file_type = mode & libc::S_IFMT;
         if file_type != 0 && file_type != libc::S_IFREG {
-            return reply.error(libc::ENOSYS);
+            return reply.error_from_i32(libc::ENOSYS);
         }
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
             let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
@@ -1507,25 +1543,26 @@ impl Filesystem for SifsFuseFileSystem {
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn mkdir(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
             let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
@@ -1534,20 +1571,21 @@ impl Filesystem for SifsFuseFileSystem {
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         if let Err(errno) = self.commit_dirty_handles_for_path(&path, false) {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let result = self
             .lock_dfs()
@@ -1559,17 +1597,18 @@ impl Filesystem for SifsFuseFileSystem {
                 }
                 reply.ok();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self
             .lock_dfs()
@@ -1581,27 +1620,28 @@ impl Filesystem for SifsFuseFileSystem {
                 }
                 reply.ok();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn symlink(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let Some(target) = link.to_str() else {
-            return reply.error(libc::EINVAL);
+            return reply.error_from_i32(libc::EINVAL);
         };
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
             let attrs = DfsPosixCreateAttrs::new(0o777, req.uid(), req.gid());
@@ -1610,33 +1650,35 @@ impl Filesystem for SifsFuseFileSystem {
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        flags: u32,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if flags != 0 {
-            return reply.error(libc::ENOSYS);
+        if !flags.is_empty() {
+            return reply.error_from_i32(libc::ENOSYS);
         }
+        let parent = parent.0;
+        let newparent = newparent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let from = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let to = match self.child_path(newparent, newname) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         // Publish both sides before namespace replacement. Source descriptors
         // then carry the latest stable object version through the rename, and
@@ -1645,7 +1687,7 @@ impl Filesystem for SifsFuseFileSystem {
             .commit_dirty_handles_for_path(&from, true)
             .and_then(|_| self.commit_dirty_handles_for_path(&to, true))
         {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let result = self
             .lock_dfs()
@@ -1657,28 +1699,30 @@ impl Filesystem for SifsFuseFileSystem {
                 }
                 reply.ok();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn link(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        newparent: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let ino = ino.0;
+        let newparent = newparent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let existing = match self.path_for_ino(ino) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let link_path = match self.child_path(newparent, newname) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
             dfs.posix_hardlink(&existing, &link_path)
@@ -1687,53 +1731,58 @@ impl Filesystem for SifsFuseFileSystem {
         match result {
             Ok(stat) => match self.lock_state() {
                 Ok(mut state) => match state.intern_alias_path(ino, link_path, &stat.object_id) {
-                    Ok(link_ino) => reply.entry(&self.entry_ttl, &file_attr(link_ino, &stat), 0),
-                    Err(errno) => reply.error(errno),
+                    Ok(link_ino) => {
+                        reply.entry(&self.entry_ttl, &file_attr(link_ino, &stat), Generation(0))
+                    }
+                    Err(errno) => reply.error_from_i32(errno),
                 },
-                Err(errno) => reply.error(errno),
+                Err(errno) => reply.error_from_i32(errno),
             },
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
+        let flags = flags.0;
         let writable = flags_has_write_access(flags);
         if writable && let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let path = match self.path_for_ino(ino) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         match self.stat_path(&path, true) {
-            Ok(stat) if stat.kind == DfsObjectKind::Directory => reply.error(libc::EISDIR),
+            Ok(stat) if stat.kind == DfsObjectKind::Directory => reply.error_from_i32(libc::EISDIR),
             Ok(stat) => match self.lock_state() {
                 Ok(mut state) => {
                     let fh = state.allocate_handle(path, stat, flags);
-                    reply.opened(fh, 0);
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
-                Err(errno) => reply.error(errno),
+                Err(errno) => reply.error_from_i32(errno),
             },
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn create(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let parent = parent.0;
         if let Err(errno) = self.ensure_writable() {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         let path = match self.child_path(parent, name) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let result = self.lock_dfs().and_then(|mut dfs| {
             let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
@@ -1744,28 +1793,41 @@ impl Filesystem for SifsFuseFileSystem {
                 Ok(mut state) => {
                     let ino = state.intern_entry(path.clone(), stat.object_id.clone());
                     let fh = state.allocate_handle(path, stat.clone(), flags);
-                    reply.created(&self.entry_ttl, &file_attr(ino, &stat), 0, fh, 0);
+                    reply.created(
+                        &self.entry_ttl,
+                        &file_attr(ino, &stat),
+                        Generation(0),
+                        FileHandle(fh),
+                        FopenFlags::empty(),
+                    );
                 }
-                Err(errno) => reply.error(errno),
+                Err(errno) => reply.error_from_i32(errno),
             },
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino = ino.0;
+        let fh = fh.0;
+        let offset = match i64::try_from(offset) {
+            Ok(offset) => offset,
+            Err(_) => return reply.error_from_i32(libc::EOVERFLOW),
+        };
+        let lock_owner = lock_owner.map(|owner| owner.0);
         let plan = match self.plan_read_handle_or_path(ino, fh, offset, size, lock_owner) {
             Ok(plan) => plan,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         match plan {
             FuseReadPlan::Opened(read) => {
@@ -1785,9 +1847,9 @@ impl Filesystem for SifsFuseFileSystem {
                     match base {
                         Ok(base) => match read.finish(base) {
                             Ok(bytes) => reply.data(&bytes),
-                            Err(errno) => reply.error(errno),
+                            Err(errno) => reply.error_from_i32(errno),
                         },
-                        Err(error) => reply.error(errno_for_posix_error(error)),
+                        Err(error) => reply.error_from_i32(errno_for_posix_error(error)),
                     }
                 });
                 if let Err(job) = self.read_executor.submit(job) {
@@ -1808,57 +1870,68 @@ impl Filesystem for SifsFuseFileSystem {
                 });
                 match result {
                     Ok(bytes) => reply.data(&bytes),
-                    Err(errno) => reply.error(errno),
+                    Err(errno) => reply.error_from_i32(errno),
                 }
             }
         }
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let ino = ino.0;
+        let fh = fh.0;
+        let offset = match i64::try_from(offset) {
+            Ok(offset) => offset,
+            Err(_) => return reply.error_from_i32(libc::EOVERFLOW),
+        };
+        let lock_owner = lock_owner.map(|owner| owner.0);
         match self.write_handle(ino, fh, offset, data, lock_owner) {
             Ok(written) => reply.written(written),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        lock_owner: u64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let fh = fh.0;
+        let lock_owner = lock_owner.0;
         let commit_result = self.commit_handle(fh);
         let close_result = self.close_advisory_locks_for_handle(fh, lock_owner);
         let result = commit_result.and(close_result);
         match result {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let fh = fh.0;
+        let lock_owner = lock_owner.map(|owner| owner.0);
         let commit_result = self.commit_handle(fh);
         let commit_succeeded = commit_result.is_ok();
         let close_result = self.close_advisory_locks_for_release(fh, lock_owner);
@@ -1870,18 +1943,27 @@ impl Filesystem for SifsFuseFileSystem {
         }
         match result {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let fh = fh.0;
         match self.sync_handle(fh, datasync) {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
         match self.path_for_ino(ino).and_then(|path| {
             self.stat_path(&path, true).and_then(|stat| {
                 if stat.kind == DfsObjectKind::Directory {
@@ -1891,37 +1973,38 @@ impl Filesystem for SifsFuseFileSystem {
                 }
             })
         }) {
-            Ok(()) => reply.opened(0, 0),
-            Err(errno) => reply.error(errno),
+            Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if offset < 0 {
-            return reply.error(libc::EINVAL);
-        }
+        let ino = ino.0;
         let path = match self.path_for_ino(ino) {
             Ok(path) => path,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let children = match self.lock_dfs().and_then(|mut dfs| {
             dfs.posix_list_dir_distributed(&path)
                 .map_err(errno_for_posix_error)
         }) {
             Ok(children) => children,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
-        let start = offset as usize;
+        let start = match usize::try_from(offset) {
+            Ok(start) => start,
+            Err(_) => return reply.error_from_i32(libc::EOVERFLOW),
+        };
         let parent_ino = match self.lock_state() {
             Ok(mut state) => state.intern_path(parent_sifs_path(&path)),
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         let mut entries = vec![
             (ino, FileType::Directory, ".".to_string()),
@@ -1930,12 +2013,12 @@ impl Filesystem for SifsFuseFileSystem {
         for child in children {
             let child_ino = match self.intern_entry(child.path.clone(), &child.object_id) {
                 Ok(child_ino) => child_ino,
-                Err(errno) => return reply.error(errno),
+                Err(errno) => return reply.error_from_i32(errno),
             };
             entries.push((child_ino, file_type_for_kind(&child.kind), child.name));
         }
         for (index, (entry_ino, kind, name)) in entries.into_iter().enumerate().skip(start) {
-            if reply.add(entry_ino, (index + 1) as i64, kind, name) {
+            if reply.add(INodeNo(entry_ino), (index + 1) as u64, kind, name) {
                 break;
             }
         }
@@ -1943,24 +2026,25 @@ impl Filesystem for SifsFuseFileSystem {
     }
 
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let result = self.path_for_ino(ino).and_then(|path| {
             self.lock_dfs()?
                 .posix_sync_directory(&path)
@@ -1969,28 +2053,31 @@ impl Filesystem for SifsFuseFileSystem {
         });
         match result {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn getlk(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         start: u64,
         end: u64,
         typ: i32,
         _pid: u32,
         reply: ReplyLock,
     ) {
+        let ino = ino.0;
+        let fh = fh.0;
+        let lock_owner = lock_owner.0;
         if !is_whole_file_lock_range(start, end) {
-            return reply.error(libc::EOPNOTSUPP);
+            return reply.error_from_i32(libc::EOPNOTSUPP);
         }
         let mode = match advisory_lock_mode(typ) {
             Ok(mode) => mode,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         match self.query_advisory_lock(ino, fh, lock_owner, mode) {
             Ok(Some(conflict)) => reply.locked(
@@ -2000,16 +2087,16 @@ impl Filesystem for SifsFuseFileSystem {
                 conflict.process_id.unwrap_or(0),
             ),
             Ok(None) => reply.locked(0, end, libc::F_UNLCK, 0),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error_from_i32(errno),
         }
     }
 
     fn setlk(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         start: u64,
         end: u64,
         typ: i32,
@@ -2017,23 +2104,26 @@ impl Filesystem for SifsFuseFileSystem {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
+        let fh = fh.0;
+        let lock_owner = lock_owner.0;
         if !is_whole_file_lock_range(start, end) {
-            return reply.error(libc::EOPNOTSUPP);
+            return reply.error_from_i32(libc::EOPNOTSUPP);
         }
         if typ == libc::F_UNLCK {
             return match self.unlock_advisory_lock(ino, fh, lock_owner) {
                 Ok(()) => reply.ok(),
-                Err(errno) => reply.error(errno),
+                Err(errno) => reply.error_from_i32(errno),
             };
         }
         let mode = match advisory_lock_mode(typ) {
             Ok(mode) => mode,
-            Err(errno) => return reply.error(errno),
+            Err(errno) => return reply.error_from_i32(errno),
         };
         self.set_advisory_lock(ino, fh, lock_owner, mode, pid, sleep, reply);
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         reply.statfs(
             1024 * 1024 * 1024,
             1024 * 1024 * 1024,
@@ -2046,11 +2136,11 @@ impl Filesystem for SifsFuseFileSystem {
         );
     }
 
-    fn access(&mut self, _req: &Request<'_>, _ino: u64, mask: i32, reply: ReplyEmpty) {
-        if mask & libc::W_OK != 0
+    fn access(&self, _req: &Request, _ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        if mask.contains(AccessFlags::W_OK)
             && let Err(errno) = self.ensure_writable()
         {
-            return reply.error(errno);
+            return reply.error_from_i32(errno);
         }
         reply.ok();
     }
@@ -3112,14 +3202,14 @@ fn spawn_blocking_lock_waiter(
                 reply
                     .take()
                     .expect("blocking lock reply")
-                    .error(libc::EINTR);
+                    .error_from_i32(libc::EINTR);
                 return;
             }
             let Some(state_arc) = state.upgrade() else {
                 reply
                     .take()
                     .expect("blocking lock reply")
-                    .error(libc::EINTR);
+                    .error_from_i32(libc::EINTR);
                 return;
             };
             let current_pending = state_arc
@@ -3131,18 +3221,24 @@ fn spawn_blocking_lock_waiter(
                 reply
                     .take()
                     .expect("blocking lock reply")
-                    .error(libc::EINTR);
+                    .error_from_i32(libc::EINTR);
                 return;
             };
             let Some(service_arc) = service.upgrade() else {
                 remove_pending_lock(&state, &key, &acquire_request_id);
-                reply.take().expect("blocking lock reply").error(libc::EIO);
+                reply
+                    .take()
+                    .expect("blocking lock reply")
+                    .error_from_i32(libc::EIO);
                 return;
             };
             let started_at = Instant::now();
             let Some(deadline) = started_at.checked_add(FUSE_LOCK_RPC_TIMEOUT) else {
                 remove_pending_lock(&state, &key, &acquire_request_id);
-                reply.take().expect("blocking lock reply").error(libc::EIO);
+                reply
+                    .take()
+                    .expect("blocking lock reply")
+                    .error_from_i32(libc::EIO);
                 return;
             };
             let mut service_guard = match lock_service_until(&service_arc, deadline) {
@@ -3153,7 +3249,10 @@ fn spawn_blocking_lock_waiter(
                 }
                 Err(errno) => {
                     remove_pending_lock(&state, &key, &acquire_request_id);
-                    reply.take().expect("blocking lock reply").error(errno);
+                    reply
+                        .take()
+                        .expect("blocking lock reply")
+                        .error_from_i32(errno);
                     return;
                 }
             };
@@ -3170,7 +3269,7 @@ fn spawn_blocking_lock_waiter(
                 reply
                     .take()
                     .expect("blocking lock reply")
-                    .error(libc::EINTR);
+                    .error_from_i32(libc::EINTR);
                 return;
             }
             let outcome = run_advisory_lock_command_with_service(
@@ -3198,7 +3297,7 @@ fn spawn_blocking_lock_waiter(
                                 reply
                                     .take()
                                     .expect("blocking lock reply")
-                                    .error(libc::EINTR);
+                                    .error_from_i32(libc::EINTR);
                                 return;
                             };
                             state.pending_locks.remove(&key);
@@ -3225,13 +3324,14 @@ fn spawn_blocking_lock_waiter(
                         FuseLockInstallOutcome::Installed => {
                             reply.take().expect("blocking lock reply").ok()
                         }
-                        FuseLockInstallOutcome::Expired => {
-                            reply.take().expect("blocking lock reply").error(libc::EIO)
-                        }
+                        FuseLockInstallOutcome::Expired => reply
+                            .take()
+                            .expect("blocking lock reply")
+                            .error_from_i32(libc::EIO),
                         FuseLockInstallOutcome::Cancelled => reply
                             .take()
                             .expect("blocking lock reply")
-                            .error(libc::EINTR),
+                            .error_from_i32(libc::EINTR),
                     }
                     return;
                 }
@@ -3260,7 +3360,7 @@ fn spawn_blocking_lock_waiter(
                     reply
                         .take()
                         .expect("blocking lock reply")
-                        .error(libc::EINTR);
+                        .error_from_i32(libc::EINTR);
                     return;
                 }
                 Ok(FuseLockCommandResult {
@@ -3271,7 +3371,7 @@ fn spawn_blocking_lock_waiter(
                     reply
                         .take()
                         .expect("blocking lock reply")
-                        .error(libc::ETIMEDOUT);
+                        .error_from_i32(libc::ETIMEDOUT);
                     return;
                 }
                 Ok(response) => {
@@ -3279,7 +3379,7 @@ fn spawn_blocking_lock_waiter(
                     reply
                         .take()
                         .expect("blocking lock reply")
-                        .error(errno_for_unexpected_lock_outcome(&response.outcome));
+                        .error_from_i32(errno_for_unexpected_lock_outcome(&response.outcome));
                     return;
                 }
                 Err(errno) => {
@@ -3288,7 +3388,10 @@ fn spawn_blocking_lock_waiter(
                     {
                         state.record_lost_lock(key.clone(), pending.associated_fhs);
                     }
-                    reply.take().expect("blocking lock reply").error(errno);
+                    reply
+                        .take()
+                        .expect("blocking lock reply")
+                        .error_from_i32(errno);
                     return;
                 }
             }
@@ -3447,7 +3550,7 @@ fn errno_for_unexpected_lock_outcome(outcome: &dfs::DfsAdvisoryLockOutcome) -> l
 fn file_attr(ino: u64, stat: &dfs::DfsStat) -> FileAttr {
     let size = stat.size_bytes.unwrap_or(0);
     FileAttr {
-        ino,
+        ino: INodeNo(ino),
         size,
         blocks: size.div_ceil(512),
         atime: nanos_to_system_time(stat.accessed_at_unix_nanos),
@@ -3661,13 +3764,21 @@ mod errno_tests {
     fn owner_only_foreground_mount_omits_auto_unmount_and_allow_other() {
         let options = DfsFuseMountOptions::new("/mnt/sinomo");
 
-        let direct_options = fuse_mount_options(&options, false);
-        assert!(!direct_options.contains(&MountOption::AutoUnmount));
-        assert!(!direct_options.contains(&MountOption::AllowOther));
+        let direct_config = fuse_mount_config(&options, false);
+        assert!(
+            !direct_config
+                .mount_options
+                .contains(&MountOption::AutoUnmount)
+        );
+        assert_eq!(direct_config.acl, SessionACL::Owner);
 
-        let helper_options = fuse_mount_options(&options, true);
-        assert!(!helper_options.contains(&MountOption::AutoUnmount));
-        assert!(!helper_options.contains(&MountOption::AllowOther));
+        let helper_config = fuse_mount_config(&options, true);
+        assert!(
+            !helper_config
+                .mount_options
+                .contains(&MountOption::AutoUnmount)
+        );
+        assert_eq!(helper_config.acl, SessionACL::Owner);
     }
 
     #[test]
@@ -3675,22 +3786,34 @@ mod errno_tests {
         let mut options = DfsFuseMountOptions::new("/mnt/sinomo");
         options.allow_other = true;
 
-        let direct_options = fuse_mount_options(&options, false);
-        assert!(!direct_options.contains(&MountOption::AutoUnmount));
-        assert!(direct_options.contains(&MountOption::AllowOther));
+        let direct_config = fuse_mount_config(&options, false);
+        assert!(
+            !direct_config
+                .mount_options
+                .contains(&MountOption::AutoUnmount)
+        );
+        assert_eq!(direct_config.acl, SessionACL::All);
 
-        let helper_options = fuse_mount_options(&options, true);
-        assert!(helper_options.contains(&MountOption::AutoUnmount));
-        assert!(helper_options.contains(&MountOption::AllowOther));
+        let helper_config = fuse_mount_config(&options, true);
+        assert!(
+            helper_config
+                .mount_options
+                .contains(&MountOption::AutoUnmount)
+        );
+        assert_eq!(helper_config.acl, SessionACL::All);
     }
 
     #[test]
     fn owner_only_background_mount_does_not_implicitly_request_allow_other() {
         let options = DfsFuseMountOptions::new("/mnt/sinomo");
 
-        let background_options = background_fuse_mount_options(&options, true);
-        assert!(!background_options.contains(&MountOption::AutoUnmount));
-        assert!(!background_options.contains(&MountOption::AllowOther));
+        let background_config = background_fuse_mount_config(&options, true);
+        assert!(
+            !background_config
+                .mount_options
+                .contains(&MountOption::AutoUnmount)
+        );
+        assert_eq!(background_config.acl, SessionACL::Owner);
     }
 
     #[test]

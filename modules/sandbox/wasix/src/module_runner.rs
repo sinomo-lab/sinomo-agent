@@ -104,7 +104,7 @@ pub fn validate_sinomo_module_v1_component_contract(
             export: run_export.clone(),
         }
     })?;
-    let run_func = match run_item {
+    let run_func = match run_item.ty {
         ComponentItem::ComponentFunc(func) => func,
         other => {
             return Err(SandboxModuleComponentContractError::InvalidExportShape {
@@ -359,12 +359,6 @@ fn run_sinomo_module_v1_component_artifact(
                 artifact.artifact_id
             )
         })?;
-    run.post_return(&mut store).map_err(|source| {
-        format!(
-            "sinomo-module-v1 component artifact {} failed during post-return cleanup: {source:?}",
-            artifact.artifact_id
-        )
-    })?;
     let result = sinomo_module_v1_result_from_component_val(&results[0]).map_err(|detail| {
         format!(
             "sinomo-module-v1 component artifact {} returned invalid module result: {detail}",

@@ -34,7 +34,7 @@ impl Id {
     }
 
     pub fn generate() -> Self {
-        Self(Ulid::new().to_string().to_ascii_lowercase())
+        Self(Ulid::generate().to_string().to_ascii_lowercase())
     }
 
     pub fn derived(namespace: &str, value: impl AsRef<[u8]>) -> Self {

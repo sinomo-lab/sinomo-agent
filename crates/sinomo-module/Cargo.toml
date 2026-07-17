@@ -17,12 +17,12 @@ base64.workspace = true
 blake3.workspace = true
 fs2.workspace = true
 libloading = "0.9.0"
-ring = "0.17"
+ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }

@@ -1136,7 +1136,7 @@ pub fn start_native_microphone_capture(
             })?;
     let stream_config = supported.config();
     let format = NativeRawAudioFormat {
-        sample_rate_hz: stream_config.sample_rate.0,
+        sample_rate_hz: stream_config.sample_rate,
         channels: stream_config.channels.max(1),
         sample_format: native_raw_audio_format(supported.sample_format())?,
     };
@@ -1203,7 +1203,7 @@ pub fn start_native_speaker_playback(
             })?;
     let stream_config = supported.config();
     let format = NativeRawAudioFormat {
-        sample_rate_hz: stream_config.sample_rate.0,
+        sample_rate_hz: stream_config.sample_rate,
         channels: stream_config.channels.max(1),
         sample_format: native_raw_audio_format(supported.sample_format())?,
     };
@@ -1273,12 +1273,11 @@ fn enumerate_cpal_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventor
     let host = cpal::default_host();
     let default_input = host
         .default_input_device()
-        .and_then(|device| device.name().ok());
+        .and_then(|device| cpal_device_name(&device).ok());
     match host.input_devices() {
         Ok(devices) => {
             for (index, device) in devices.enumerate() {
-                let name = device
-                    .name()
+                let name = cpal_device_name(&device)
                     .unwrap_or_else(|_| format!("Microphone {}", index + 1));
                 let native_id = format!("cpal:input:{index}:{}", stable_component(&name));
                 inventory.devices.push(native_descriptor(
@@ -1301,13 +1300,12 @@ fn enumerate_cpal_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventor
 
     let default_output = host
         .default_output_device()
-        .and_then(|device| device.name().ok());
+        .and_then(|device| cpal_device_name(&device).ok());
     match host.output_devices() {
         Ok(devices) => {
             for (index, device) in devices.enumerate() {
-                let name = device
-                    .name()
-                    .unwrap_or_else(|_| format!("Speaker {}", index + 1));
+                let name =
+                    cpal_device_name(&device).unwrap_or_else(|_| format!("Speaker {}", index + 1));
                 let native_id = format!("cpal:output:{index}:{}", stable_component(&name));
                 inventory.devices.push(native_descriptor(
                     node_id,
@@ -1326,6 +1324,13 @@ fn enumerate_cpal_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventor
             .issues
             .push(format!("speaker enumeration failed: {source}")),
     }
+}
+
+#[cfg(feature = "native-devices")]
+fn cpal_device_name(device: &cpal::Device) -> Result<String, cpal::Error> {
+    device
+        .description()
+        .map(|description| description.name().to_owned())
 }
 
 #[cfg(all(feature = "native-devices", target_os = "linux"))]
@@ -1452,7 +1457,7 @@ fn native_descriptor(
 
 #[cfg(feature = "native-devices")]
 fn select_cpal_device<I>(
-    devices: Result<I, cpal::DevicesError>,
+    devices: Result<I, cpal::Error>,
     default_device: Option<cpal::Device>,
     native_id_prefix: &str,
     selector: &Option<String>,
@@ -1474,7 +1479,7 @@ where
     })?;
     let selector_lower = selector.to_ascii_lowercase();
     for (index, device) in devices.enumerate() {
-        let name = device.name().unwrap_or_default();
+        let name = cpal_device_name(&device).unwrap_or_default();
         let component = stable_component(&name);
         let native_id = format!("{native_id_prefix}:{index}:{component}");
         let legacy_native_id = format!("cpal:{index}:{component}");
@@ -1518,7 +1523,7 @@ where
 {
     device
         .build_input_stream(
-            config,
+            *config,
             move |data: &[T], _| {
                 if let Ok(mut state) = state.lock() {
                     state.process_samples(data);
@@ -1550,7 +1555,7 @@ where
 {
     device
         .build_output_stream(
-            config,
+            *config,
             move |data: &mut [T], _| {
                 if let Ok(mut queue) = queue.lock() {
                     queue.fill(data);

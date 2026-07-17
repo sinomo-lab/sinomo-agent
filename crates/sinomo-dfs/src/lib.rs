@@ -381,7 +381,8 @@ pub(crate) use node_transport::{
 pub use node_transport::{
     AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
     DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture,
+    DfsPeerTransportError, DfsPeerTransportFuture, dfs_message_response_from_rpc_session_result,
+    dfs_message_response_from_rpc_session_result_sync, dfs_routed_call_rpc_session_call,
 };
 pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
 #[cfg(test)]

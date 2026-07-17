@@ -255,12 +255,14 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
                     options.with_observe_connectivity(!dfs_message_is_read_only_request(command)),
                 )
                 .await?;
-            decode_dfs_message_session_result(response).await
+            dfs_message_response_from_rpc_session_result(response).await
         })
     })
 }
 
-async fn decode_dfs_message_session_result(
+/// Asynchronously decodes a canonical DFS session response while its network
+/// runtime remains active, including a streamed response attachment.
+pub async fn dfs_message_response_from_rpc_session_result(
     result: ObjectRpcSessionResult,
 ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
     let (response, attachment) = result.into_parts();
@@ -283,6 +285,36 @@ async fn decode_dfs_message_session_result(
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
 }
 
+/// Encodes one routed DFS call as the canonical object-RPC session call.
+///
+/// Attachment sources remain streaming bodies owned by the network layer; this
+/// helper only encodes the request head and never materializes their bytes.
+pub fn dfs_routed_call_rpc_session_call(
+    call: DfsRoutedCall,
+) -> Result<(DfsMessageCommand, ObjectRpcSessionCall), NetworkError> {
+    let DfsRoutedCall {
+        message,
+        attachment,
+    } = call;
+    let command = DfsMessageCommand {
+        request_id: format!("dfs_message_{}", message.frame_id),
+        routed_message: message,
+    };
+    let request = dfs_message_rpc_request(&command)?;
+    let session_call = match attachment {
+        Some(attachment) => {
+            let request = crate::body_rpc::encode_dfs_attachment_message_rpc_request(
+                &request,
+                command.clone(),
+                attachment.descriptor,
+            )?;
+            ObjectRpcSessionCall::new(request, attachment.source)
+        }
+        None => ObjectRpcSessionCall::value(request),
+    };
+    Ok((command, session_call))
+}
+
 fn value_response_from_session_result(
     result: ObjectRpcSessionResult,
 ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
@@ -296,7 +328,9 @@ fn value_response_from_session_result(
     Ok(response)
 }
 
-fn decode_dfs_message_session_result_sync(
+/// Decodes a canonical DFS session response, including a streamed response
+/// attachment when the response head declares one.
+pub fn dfs_message_response_from_rpc_session_result_sync(
     result: ObjectRpcSessionResult,
 ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
     let (response, attachment) = result.into_parts();
@@ -375,7 +409,7 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
             ObjectRpcSessionCall::value(request),
             options.with_observe_connectivity(!dfs_message_is_read_only_request(command)),
         )?;
-        decode_dfs_message_session_result_sync(response)
+        dfs_message_response_from_rpc_session_result_sync(response)
     })
 }
 
@@ -1435,22 +1469,16 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let command = DfsMessageCommand {
-            request_id: format!("dfs_message_{}", routed_message.frame_id),
+        let (command, call) = dfs_routed_call_rpc_session_call(DfsRoutedCall::with_attachment(
             routed_message,
-        };
-        let request = dfs_message_rpc_request(&command)?;
-        let request = crate::body_rpc::encode_dfs_attachment_message_rpc_request(
-            &request,
-            command.clone(),
-            attachment.descriptor,
-        )?;
+            attachment,
+        ))?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         let result = peer_transport
             .call_object_rpc(
                 target_node_id,
-                ObjectRpcSessionCall::new(request, attachment.source),
+                call,
                 options.with_observe_connectivity(!dfs_message_is_read_only_request(&command)),
             )
             .map_err(|source| NetworkError::Io {
@@ -1458,9 +1486,11 @@ impl DfsNodeTransport {
                 detail: source.to_string(),
             })?;
         let returned =
-            decode_dfs_message_session_result_sync(result).map_err(|source| NetworkError::Io {
-                operation: format!("decode DFS attachment response from {target_node_id}"),
-                detail: source.to_string(),
+            dfs_message_response_from_rpc_session_result_sync(result).map_err(|source| {
+                NetworkError::Io {
+                    operation: format!("decode DFS attachment response from {target_node_id}"),
+                    detail: source.to_string(),
+                }
             })?;
         for message in returned.outbound_messages {
             let target = message.target_node_id.clone();
@@ -2213,22 +2243,16 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let command = DfsMessageCommand {
-            request_id: format!("dfs_message_{}", routed_message.frame_id),
+        let (command, call) = dfs_routed_call_rpc_session_call(DfsRoutedCall::with_attachment(
             routed_message,
-        };
-        let request = dfs_message_rpc_request(&command)?;
-        let request = crate::body_rpc::encode_dfs_attachment_message_rpc_request(
-            &request,
-            command.clone(),
-            attachment.descriptor,
-        )?;
+            attachment,
+        ))?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         let result = peer_transport
             .call_object_rpc_async(
                 target_node_id,
-                ObjectRpcSessionCall::new(request, attachment.source),
+                call,
                 options.with_observe_connectivity(!dfs_message_is_read_only_request(&command)),
             )
             .await
@@ -2236,7 +2260,7 @@ impl DfsNodeTransport {
                 operation: format!("send DFS attachment to {target_node_id}"),
                 detail: source.to_string(),
             })?;
-        let returned = decode_dfs_message_session_result(result)
+        let returned = dfs_message_response_from_rpc_session_result(result)
             .await
             .map_err(|source| NetworkError::Io {
                 operation: format!("decode DFS attachment response from {target_node_id}"),
@@ -3242,6 +3266,42 @@ mod tests {
                 DfsOutboundAttachment::from_bytes(bytes, content_hash),
             ),
         )
+    }
+
+    #[test]
+    fn routed_call_session_builder_preserves_value_and_attachment_body_intent() {
+        let source = node_id("session_builder_source");
+        let target = node_id("session_builder_target");
+
+        let value_message = test_message(&source, &target, 6);
+        let (value_command, value_call) =
+            dfs_routed_call_rpc_session_call(DfsRoutedCall::value(value_message))
+                .expect("value session call");
+        assert!(value_call.body.is_empty());
+        assert_eq!(
+            value_call
+                .request
+                .decode_body::<DfsMessageCommand>()
+                .expect("value command"),
+            value_command
+        );
+
+        let attachment_bytes = vec![7_u8; 64];
+        let attachment_send = test_stage_attachment_send(&source, &target, 7, "stage-request");
+        let (attachment_command, attachment_call) =
+            dfs_routed_call_rpc_session_call(attachment_send.call)
+                .expect("attachment session call");
+        assert!(!attachment_call.body.is_empty());
+        let head =
+            crate::body_rpc::decode_dfs_attachment_message_rpc_request(&attachment_call.request)
+                .expect("attachment head");
+        assert_eq!(head.command, attachment_command);
+        assert_eq!(head.attachment.total_size_bytes, 64);
+        assert_eq!(
+            collect_dfs_attachment_source_sync(attachment_call.body, attachment_bytes.len())
+                .expect("attachment body"),
+            attachment_bytes
+        );
     }
 
     fn stage_attachment_rpc_response(

@@ -203,7 +203,7 @@ fn populate_virtual_dev_mount(
     virtual_mount_write_file(dev, "null", [], "/dev")?;
     virtual_mount_write_file(dev, "zero", vec![0; zero_device_bytes], "/dev")?;
     let mut random = vec![0; 64 * 1024];
-    getrandom::getrandom(&mut random).map_err(|error| SandboxWasiError::Runtime {
+    getrandom::fill(&mut random).map_err(|error| SandboxWasiError::Runtime {
         detail: format!("seed sandbox random devices: {error}"),
     })?;
     virtual_mount_write_file(dev, "random", &random, "/dev")?;
@@ -1526,7 +1526,7 @@ fn proc_net_unix() -> String {
 
 fn proc_uuid() -> String {
     let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         return "00000000-0000-4000-8000-000000000000".to_string();
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

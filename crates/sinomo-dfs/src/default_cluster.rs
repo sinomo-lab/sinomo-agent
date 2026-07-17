@@ -2205,6 +2205,7 @@ mod tests {
         let options = DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
             materialize_local_metadata: true,
+            local_zone: None,
         };
 
         let first =

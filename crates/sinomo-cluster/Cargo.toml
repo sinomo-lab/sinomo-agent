@@ -21,7 +21,7 @@ base64.workspace = true
 blake3.workspace = true
 fs2.workspace = true
 metrics.workspace = true
-ring = "0.17"
+ring = "0.17.14"
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
@@ -43,5 +43,5 @@ sinomo-cluster = { path = ".", features = ["test-support"] }
 sinomo-network = { path = "../sinomo-network", features = ["test-support"] }
 sinomo-kv = { path = "../sinomo-kv", features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
-tower-layer = "0.3"
-tower-service = "0.3"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"

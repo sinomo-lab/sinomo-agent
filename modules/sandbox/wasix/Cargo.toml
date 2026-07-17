@@ -40,7 +40,7 @@ wasix-runtime = [
 [dependencies]
 sinomo-sandbox = { path = "../../../crates/sinomo-sandbox" }
 blake3.workspace = true
-getrandom = "0.2"
+getrandom = "0.4.3"
 serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true
@@ -50,17 +50,20 @@ sinomo-core = { path = "../../../crates/sinomo-core" }
 sinomo-dfs = { path = "../../../crates/sinomo-dfs" }
 sinomo-module = { path = "../../../crates/sinomo-module" }
 sinomo-sandbox-wasix-api = { path = "../../../crates/sinomo-sandbox-wasix-api" }
-wasmtime = { version = "41.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"], optional = true }
-tokio = { version = "1.44", features = ["rt-multi-thread", "time"], optional = true }
-virtual-fs = { version = "0.700.0-alpha.2", default-features = false, features = ["host-fs"], optional = true }
-virtual-mio = { version = "0.700.0-alpha.2", default-features = false, optional = true }
+wasmtime = { version = "46.0.1", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"], optional = true }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "time"], optional = true }
+# These patched Wasmer/WASIX crates and the webc type passed into WasiRunner
+# must be rebased as one cohort. virtual-mio 0.700.1 is source-compatible with
+# that cohort and is intentionally allowed to advance independently.
+virtual-fs = { version = "=0.700.0-alpha.2", default-features = false, features = ["host-fs"], optional = true }
+virtual-mio = { version = "0.700.1", default-features = false, optional = true }
 wasmer = { version = "=7.0.0-alpha.2", default-features = false, features = ["sys-default", "cranelift", "experimental-async"], optional = true }
 wasmer-types = { version = "=7.0.0-alpha.2", default-features = false, optional = true }
 wasmer-vm = { version = "=7.0.0-alpha.2", default-features = false, optional = true }
-wasmer-wasix = { version = "0.700.0-alpha.2", default-features = false, features = ["sys-minimal", "host-fs", "host-vnet"], optional = true }
-wasmparser = { version = "0.244.0", default-features = false, optional = true }
-webc = { version = "10.0.1", default-features = false, optional = true }
+wasmer-wasix = { version = "=0.700.0-alpha.2", default-features = false, features = ["sys-minimal", "host-fs", "host-vnet"], optional = true }
+wasmparser = { version = "0.253.0", default-features = false, optional = true }
+webc = { version = "=10.0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../../../crates/sinomo-testdir" }
-wat = "1.248.0"
+wat = "1.253.0"

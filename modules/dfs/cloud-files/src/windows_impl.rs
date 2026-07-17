@@ -1,6 +1,6 @@
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::mem::size_of;
@@ -18,11 +18,10 @@ use std::time::{Duration, Instant};
 use sinomo_dfs_cloud_files_api::{
     CloudFilesModuleError, CloudFilesMountRequest, CloudFilesMountResponse,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsMessageCommand, DfsMessageResponse, DfsMessageTransport,
-    DfsObjectKind, DfsPosixError, DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions,
+    self, DfsControlPlaneKvClient, DfsMessageResponse, DfsMessageTransport, DfsObjectKind,
+    DfsPosixError, DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions,
     LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
@@ -1090,17 +1089,25 @@ fn open_sifs_service(
         .as_ref()
         .map(|state| state.local_node_id.clone())
         .unwrap_or_else(dfs::fallback_dfs_node_id);
-    let endpoints = cluster_state
+    let known_remote_nodes = cluster_state
         .as_ref()
         .map(|state| {
-            network::ClusterEndpointSelector::new(&cluster_paths, state)
-                .select(network::ClusterEndpointSelectionPurpose::MainDaemonDataPlane)
+            state
+                .members
+                .iter()
+                .filter(|member| member.node_id != local_node_id && member.state.is_authorized())
+                .map(|member| member.node_id.clone())
+                .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
     let content =
         LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(error("dfs"))?;
     let mut service = NetworkedDfsService::new(
-        DfsCloudFilesEndpointTransport::new(local_node_id, endpoints),
+        DfsCloudFilesEndpointTransport::new(
+            local_node_id,
+            cluster_paths.clone(),
+            known_remote_nodes,
+        ),
         content,
     );
     if cluster_paths.kv_paths().snapshot.exists() {
@@ -1199,7 +1206,8 @@ impl DfsControlPlaneKvClient for DfsCloudFilesControlPlaneKvClient {
 #[derive(Clone)]
 struct DfsCloudFilesEndpointTransport {
     local_node_id: NodeId,
-    endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
+    cluster_paths: network::ClusterPaths,
+    known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
     operation_deadline: Option<Instant>,
 }
@@ -1209,7 +1217,8 @@ impl std::fmt::Debug for DfsCloudFilesEndpointTransport {
         formatter
             .debug_struct("DfsCloudFilesEndpointTransport")
             .field("local_node_id", &self.local_node_id)
-            .field("endpoints_by_node_id", &self.endpoints_by_node_id)
+            .field("cluster_paths", &self.cluster_paths)
+            .field("known_remote_nodes", &self.known_remote_nodes)
             .field("incoming_messages", &self.incoming_messages)
             .field("operation_deadline", &self.operation_deadline)
             .finish()
@@ -1219,20 +1228,16 @@ impl std::fmt::Debug for DfsCloudFilesEndpointTransport {
 impl DfsCloudFilesEndpointTransport {
     fn new(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        cluster_paths: network::ClusterPaths,
+        known_remote_nodes: impl IntoIterator<Item = NodeId>,
     ) -> Self {
-        let mut endpoints_by_node_id = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
-        for endpoint in endpoints {
-            if endpoint.node_id != local_node_id {
-                endpoints_by_node_id
-                    .entry(endpoint.node_id.clone())
-                    .or_default()
-                    .push(endpoint);
-            }
-        }
         Self {
+            known_remote_nodes: known_remote_nodes
+                .into_iter()
+                .filter(|node_id| node_id != &local_node_id)
+                .collect(),
             local_node_id,
-            endpoints_by_node_id,
+            cluster_paths,
             incoming_messages: VecDeque::new(),
             operation_deadline: None,
         }
@@ -1269,65 +1274,52 @@ impl DfsCloudFilesEndpointTransport {
             self.incoming_messages.push_back(message);
             return Ok(());
         }
-        self.send_routed_message_to_endpoint(&target_node_id, message, false)
+        self.send_routed_call_to_target(&target_node_id, DfsRoutedCall::value(message), false)
     }
 
-    fn send_routed_message_to_endpoint(
+    fn send_routed_call_to_target(
         &mut self,
         target_node_id: &NodeId,
-        message: DfsRoutedMessage,
+        call: DfsRoutedCall,
         require_local_source: bool,
     ) -> std::result::Result<(), NetworkError> {
+        let message = &call.message;
         if require_local_source && message.source_node_id != self.local_node_id {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
-                source_node_id: message.source_node_id,
+                source_node_id: message.source_node_id.clone(),
             });
         }
         if !require_local_source
             && message.source_node_id != self.local_node_id
-            && !self
-                .endpoints_by_node_id
-                .contains_key(&message.source_node_id)
+            && !self.known_remote_nodes.contains(&message.source_node_id)
         {
             return Err(NetworkError::UnknownNode {
-                node_id: message.source_node_id,
+                node_id: message.source_node_id.clone(),
             });
         }
         if &message.target_node_id != target_node_id {
             return Err(NetworkError::FrameTargetMismatch {
                 requested_target_node_id: target_node_id.clone(),
-                frame_target_node_id: message.target_node_id,
+                frame_target_node_id: message.target_node_id.clone(),
             });
         }
-        let endpoints = self
-            .endpoints_by_node_id
-            .get(target_node_id)
-            .cloned()
-            .ok_or_else(|| NetworkError::UnknownNode {
+        if !self.known_remote_nodes.contains(target_node_id) {
+            return Err(NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
-            })?;
-        let request = DfsMessageCommand {
-            request_id: format!("cloud_files_dfs_message_{}", message.frame_id),
-            routed_message: message,
-        };
-        let mut failures = Vec::new();
-        for endpoint in &endpoints {
-            let timeouts = self.send_timeouts()?;
-            match send_dfs_message(endpoint, &request, timeouts) {
-                Ok(response) => {
-                    for returned_message in response.outbound_messages {
-                        self.deliver_returned_message(returned_message)?;
-                    }
-                    return Ok(());
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
-            }
+            });
         }
-        Err(NetworkError::Io {
-            operation: format!("send DFS message to {target_node_id}"),
-            detail: failures.join("; "),
-        })
+        let (_, call) = dfs::dfs_routed_call_rpc_session_call(call)?;
+        let response = send_dfs_session_call(
+            &self.cluster_paths,
+            target_node_id,
+            call,
+            self.send_timeouts()?,
+        )?;
+        for returned_message in response.outbound_messages {
+            self.deliver_returned_message(returned_message)?;
+        }
+        Ok(())
     }
 }
 
@@ -1338,12 +1330,12 @@ impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
 }
 
 impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
-    fn send_routed_message(
+    fn send_routed_call(
         &mut self,
         target_node_id: &NodeId,
-        message: DfsRoutedMessage,
+        call: DfsRoutedCall,
     ) -> std::result::Result<(), NetworkError> {
-        self.send_routed_message_to_endpoint(target_node_id, message, true)
+        self.send_routed_call_to_target(target_node_id, call, true)
     }
 
     fn drain_incoming_messages(
@@ -1361,16 +1353,80 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     }
 }
 
-fn send_dfs_message(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsMessageCommand,
+fn send_dfs_session_call(
+    cluster_paths: &network::ClusterPaths,
+    target_node_id: &NodeId,
+    call: network::ObjectRpcSessionCall,
     timeouts: network::DaemonRpcTimeouts,
-) -> std::result::Result<DfsMessageResponse, CloudFilesModuleError> {
-    let rpc_request = dfs::dfs_message_rpc_request(request).map_err(error("dfs-message"))?;
-    let response =
-        daemon::send_daemon_rpc_to_endpoint_with_timeouts(endpoint, &rpc_request, timeouts)
-            .map_err(error("daemon"))?;
-    dfs::decode_dfs_message_rpc_response(&response).map_err(error("dfs-message"))
+) -> std::result::Result<DfsMessageResponse, NetworkError> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            let runtime = handle.clone();
+            let runtime_for_future = runtime.clone();
+            tokio::task::block_in_place(|| {
+                runtime.block_on(send_dfs_session_call_async(
+                    cluster_paths,
+                    target_node_id,
+                    call,
+                    timeouts,
+                    &runtime_for_future,
+                ))
+            })
+        } else {
+            Err(NetworkError::Io {
+                operation: "send Cloud Files DFS session".to_string(),
+                detail: "Cloud Files DFS sync transport cannot run inside a current-thread Tokio runtime"
+                    .to_string(),
+            })
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| NetworkError::Io {
+            operation: "create Cloud Files DFS client runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let output = runtime.block_on(send_dfs_session_call_async(
+        cluster_paths,
+        target_node_id,
+        call,
+        timeouts,
+        runtime.handle(),
+    ));
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    output
+}
+
+async fn send_dfs_session_call_async(
+    cluster_paths: &network::ClusterPaths,
+    target_node_id: &NodeId,
+    call: network::ObjectRpcSessionCall,
+    timeouts: network::DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+) -> std::result::Result<DfsMessageResponse, NetworkError> {
+    let result = daemon::send_object_rpc_session_to_target_async_with_cluster_paths_and_options(
+        cluster_paths,
+        target_node_id,
+        call,
+        network::ClusterObjectRpcOptions::new(timeouts),
+        runtime,
+        true,
+    )
+    .await
+    .map_err(|source| NetworkError::Io {
+        operation: format!("send Cloud Files DFS call to {target_node_id}"),
+        detail: source.to_string(),
+    })?;
+    dfs::dfs_message_response_from_rpc_session_result(result)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: format!("decode Cloud Files DFS response from {target_node_id}"),
+            detail: source.to_string(),
+        })
 }
 
 fn normalize_sifs_root(path: &str) -> Result<String, CloudFilesModuleError> {
@@ -1452,7 +1508,12 @@ mod tests {
     #[test]
     fn cloud_files_transport_uses_shared_default_health_timeout() {
         let local = NodeId::from_legacy_named("cloud_files_timeout_local").expect("local");
-        let mut transport = DfsCloudFilesEndpointTransport::new(local, Vec::new());
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join("sinomo-cloud-files-timeout"));
+        let mut transport = DfsCloudFilesEndpointTransport::new(
+            local,
+            network::ClusterPaths::new(&data_dir),
+            Vec::new(),
+        );
 
         let ordinary = transport.send_timeouts().expect("ordinary timeouts");
         assert_eq!(
