@@ -88,26 +88,39 @@ pub async fn send_daemon_rpc_async(
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    let call = ObjectRpcSessionCall::value(request.clone());
+    let options = sinomo_core::network::ClusterObjectRpcOptions::new(timeouts);
+    let result = send_daemon_rpc_session_async(address, call, options, runtime).await?;
+    Ok(require_daemon_client_value_response(result)?.response)
+}
+
+/// Send one signed object-RPC session through a daemon address. Loopback
+/// addresses use the local daemon directly; remote addresses retain endpoint
+/// authentication and routing.
+pub async fn send_daemon_rpc_session_async(
+    address: &str,
+    mut call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcSessionResult, DaemonError> {
     let data_dir = local_session_data_dir()?;
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let mut host =
         DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_cluster_paths(&cluster_paths);
-    let mut request = request.clone();
-    request.auth = None;
-    let call = ObjectRpcSessionCall::value(request);
-    let options = sinomo_core::network::ClusterObjectRpcOptions::new(timeouts);
-    let result = if sinomo_core::network::is_loopback_connect_address(address) {
+    call.request.auth = None;
+    if sinomo_core::network::is_loopback_connect_address(address) {
         sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
             .call_loopback(&data_dir, address, call, options)
-            .await?
+            .await
+            .map_err(Into::into)
     } else {
         let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
         let endpoint = local_session_endpoint_for_address(&state, address)?;
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &cluster_paths)
             .call_endpoint(&state, &endpoint, call, options)
-            .await?
-    };
-    Ok(require_daemon_client_value_response(result)?.response)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// Like [`send_daemon_rpc`], but lets callers provide separate connect and idle

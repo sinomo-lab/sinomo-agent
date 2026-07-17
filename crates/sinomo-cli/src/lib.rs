@@ -83,6 +83,7 @@ use sinomo_runtime::api::{
     SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status, daemon_bind_address,
     daemon_connect_address, daemon_options_from_status,
     default_main_daemon_status as daemon_default_main_daemon_status, probe_daemon_status,
+    probe_daemon_status_async,
 };
 #[cfg(test)]
 use sinomo_runtime::api::{daemon_package_version, write_daemon_status};
@@ -146,6 +147,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_native_dylib_module as daemon_send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint as daemon_send_daemon_rollout_native_dylib_module_to_endpoint,
     send_daemon_rpc as daemon_send_daemon_rpc,
+    send_daemon_rpc_session_async as daemon_send_daemon_rpc_session_async,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
@@ -1441,11 +1443,25 @@ fn remote_management_cli_rpc(
         // no-progress policy and is reset by every transferred frame.
         const REMOTE_MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
         const REMOTE_MANAGEMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(310);
-        let status = daemon_default_main_daemon_status(REMOTE_MANAGEMENT_CONNECT_TIMEOUT)
-            .map_err(|source| source.to_string())?
-            .ok_or_else(|| {
-                "remote management requires the local daemon to be running".to_string()
-            })?;
+        let data_dir = SinomoDataDir::from_env_or_home().map_err(|source| source.to_string())?;
+        data_dir
+            .ensure_root_layout()
+            .map_err(|source| source.to_string())?;
+        let paths = DaemonPaths::new(&data_dir);
+        let runtime = tokio::runtime::Handle::current();
+        // This closure already runs inside the remote session runtime. Probe on
+        // that runtime instead of recursively entering the synchronous client.
+        let status =
+            match probe_daemon_status_async(&paths, REMOTE_MANAGEMENT_CONNECT_TIMEOUT, &runtime)
+                .await
+            {
+                DaemonProbeStatus::Running(status) => status,
+                DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => {
+                    return Err(
+                        "remote management requires the local daemon to be running".to_string()
+                    );
+                }
+            };
         let target_node_id = match target_node_id {
             Some(target_node_id) => NodeId::new(target_node_id.clone()).map_err(|source| {
                 format!("invalid remote-management target node id `{target_node_id}`: {source}")
@@ -1462,16 +1478,25 @@ fn remote_management_cli_rpc(
         let timeouts = network::DaemonRpcTimeouts::connect_only(REMOTE_MANAGEMENT_CONNECT_TIMEOUT)
             .with_idle_timeout(Some(REMOTE_MANAGEMENT_IDLE_TIMEOUT));
         let options = network::ClusterObjectRpcOptions::new(timeouts);
-        let runtime = tokio::runtime::Handle::current();
-        daemon_send_object_rpc_session_to_target_async_with_options(
-            &target_node_id,
-            call,
-            options,
-            &runtime,
-            true,
-        )
-        .await
-        .map_err(|source| source.to_string())
+        if status
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.node_id == target_node_id)
+        {
+            daemon_send_daemon_rpc_session_async(&status.address, call, options, &runtime)
+                .await
+                .map_err(|source| source.to_string())
+        } else {
+            daemon_send_object_rpc_session_to_target_async_with_options(
+                &target_node_id,
+                call,
+                options,
+                &runtime,
+                true,
+            )
+            .await
+            .map_err(|source| source.to_string())
+        }
     })
 }
 
