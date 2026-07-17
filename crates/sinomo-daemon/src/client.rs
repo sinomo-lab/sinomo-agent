@@ -3140,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_signed_endpoint_send_never_downgrades_ordinary_auth_denial() {
+    fn daemon_signed_endpoint_application_auth_denial_does_not_retry_or_poison_connectivity() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-auth-denied-observation");
         let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
         let daemon_paths = crate::DaemonPaths::with_root(root.join("daemon"));
@@ -3289,8 +3289,11 @@ mod tests {
             .expect("auth-denied endpoint record");
         assert_eq!(
             record.state,
-            sinomo_core::network::ClusterConnectivityState::Unreachable
+            sinomo_core::network::ClusterConnectivityState::Healthy
         );
+        assert_eq!(record.consecutive_failures, 0);
+        assert!(record.last_success_at.is_some());
+        assert!(record.failure_reason.is_none());
     }
 
     #[test]
