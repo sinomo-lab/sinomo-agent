@@ -4757,7 +4757,7 @@ where
             _ => None,
         };
         if let Some(command) = command {
-            ctx.post_event(field_id, command.into_event());
+            ctx.post_command(field_id, sui::TEXT_COMMAND, command);
         }
     })
 }

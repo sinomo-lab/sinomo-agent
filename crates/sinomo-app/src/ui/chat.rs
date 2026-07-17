@@ -48,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
-    CodeTextPaint, CodeTextSpan, Color, Constraints, ContextMenu, ControlSize, CustomEvent,
+    CodeTextPaint, CodeTextSpan, Color, Command, Constraints, ContextMenu, ControlSize,
     DefaultTheme, Dock, EmptyState, Event, EventCtx, EventPhase, FieldAppearance, Flex, FlexItem,
     FlexWrap, FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle, ImageSource,
     Insets, KeyState, KeyedChildren, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock,
@@ -58,10 +58,10 @@ use sui::{
     SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
     SemanticsValue, Separator, SideSheet, SideSheetPlacement, Signal, SignalMeter, Size, SizedBox,
     SplitView, Stack, StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder,
-    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
-    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
-    TextStyle, TextWrap, Tooltip, TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    SurfaceRole, SwitchView, TEXT_COMMAND, TextArea, TextBlockPaint, TextCellPaint, TextCommand,
+    TextDocument, TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle,
+    TextSpan, TextStyle, TextWrap, Tooltip, TooltipAlignment, TooltipPlacement, TrailingSlotRow,
+    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
     draw_glyph, paint_action_tile, paint_callout, paint_code_lines, paint_code_panel,
     paint_rounded_panel, paint_rounded_rect, paint_section_label_detail, paint_text_block,
     paint_text_cell, wrap_text_lines,
@@ -114,6 +114,9 @@ use crate::ui::media_setup::{
 };
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
+
+/// Typed application-wide notification emitted by chat worker lanes.
+pub const CHAT_WORK_READY: sui::CommandKey<()> = sui::CommandKey::new("sinomo.chat.work-ready");
 
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
@@ -1921,7 +1924,7 @@ impl ChatState {
             .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
         let event_wake: Option<ChatEventWake> = waker.as_ref().map(|waker| {
             let waker = waker.clone();
-            Arc::new(move || waker.wake()) as ChatEventWake
+            Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
         let handle = ChatHandle::spawn(
             (*backend.data_dir).clone(),
@@ -2111,7 +2114,7 @@ impl ChatState {
             .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
         let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
             let waker = waker.clone();
-            Arc::new(move || waker.wake()) as ChatEventWake
+            Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
         let handle = ChatHandle::spawn(
             (*backend.data_dir).clone(),
@@ -12706,7 +12709,7 @@ enum RuntimeTranscriptAction {
 
 /// Custom event posted by the transcript context menu to copy the full raw
 /// text of the message under the right-click.
-const CHAT_COPY_MESSAGE_EVENT: &str = "sinomo.chat.copy-message";
+const CHAT_COPY_MESSAGE: sui::CommandKey<()> = sui::CommandKey::new("sinomo.chat.copy-message");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TranscriptTextPoint {
@@ -15099,28 +15102,31 @@ impl Widget for TranscriptView {
                     _ => {}
                 }
             }
-            Event::Custom(custom) => {
-                if let Some(command) = TextCommand::from_custom_event(custom) {
-                    match command {
-                        TextCommand::Copy => {
-                            if self.copy_selection_to_clipboard(ctx) {
-                                ctx.set_handled();
-                            }
-                        }
-                        TextCommand::SelectAll => {
-                            self.select_all_text(ctx);
-                            ctx.set_handled();
-                        }
-                        // The transcript is read-only.
-                        TextCommand::Cut | TextCommand::Paste => {}
-                    }
-                } else if custom.kind == CHAT_COPY_MESSAGE_EVENT {
-                    if self.copy_message_to_clipboard(ctx) {
-                        ctx.set_handled();
-                    }
+            _ => {}
+        }
+    }
+
+    fn command(&mut self, ctx: &mut EventCtx, command: &Command<'_>) {
+        if command.is(CHAT_COPY_MESSAGE) {
+            if self.copy_message_to_clipboard(ctx) {
+                ctx.set_handled();
+            }
+            return;
+        }
+        let Some(command) = TextCommand::from_command(command) else {
+            return;
+        };
+        match command {
+            TextCommand::Copy => {
+                if self.copy_selection_to_clipboard(ctx) {
+                    ctx.set_handled();
                 }
             }
-            _ => {}
+            TextCommand::SelectAll => {
+                self.select_all_text(ctx);
+                ctx.set_handled();
+            }
+            TextCommand::Cut | TextCommand::Paste => {}
         }
     }
 
@@ -16785,7 +16791,7 @@ fn composer_input_row(
                 _ => None,
             };
             if let Some(command) = command {
-                ctx.post_event(input_id, command.into_event());
+                ctx.post_command(input_id, TEXT_COMMAND, command);
             }
         });
 
@@ -16968,22 +16974,16 @@ fn transcript_with_context_menu(
             ),
         ]
     })
-    .on_activate_with_ctx(move |ctx, _index, item| {
-        let event = match item.label() {
-            "Copy" => Some(TextCommand::Copy.into_event()),
-            "Copy Message" => Some(Event::Custom(CustomEvent::new(CHAT_COPY_MESSAGE_EVENT))),
-            "Select All" => Some(TextCommand::SelectAll.into_event()),
-            _ => None,
-        };
-        if let Some(event) = event {
-            ctx.post_event(transcript_id, event);
-        }
+    .on_activate_with_ctx(move |ctx, _index, item| match item.label() {
+        "Copy" => ctx.post_command(transcript_id, TEXT_COMMAND, TextCommand::Copy),
+        "Copy Message" => ctx.post_command(transcript_id, CHAT_COPY_MESSAGE, ()),
+        "Select All" => ctx.post_command(transcript_id, TEXT_COMMAND, TextCommand::SelectAll),
+        _ => {}
     })
 }
 
-/// The main column: the transcript fills, with the composer docked at the bottom. The streaming
-/// request-animation-frame pump lives on [`ChatView`] (a reliable ancestor of every control), so no
-/// invisible overlay widget is needed here.
+/// The main column: the transcript fills, with the composer docked at the bottom. Worker-driven
+/// updates arrive through the window controller rather than an invisible overlay widget.
 fn main_column(
     shared: &Shared,
     reader: &ThemeReader,
@@ -17181,29 +17181,14 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope)
 /// `measure` (constraints-driven) and cached so `arrange`/`paint`/event routing stay in sync.
 /// Mirrors the Settings / Files hosts.
 ///
-/// `ChatView` additionally owns the streaming **pump**: it is a reliable ancestor of every control
-/// (the sidebar/composer `RebuildOnChange` hosts and the transcript), and it is reliably on the
-/// event path for the pointer / keyboard gestures that start a turn — so it is the right place to
-/// drive the request-animation-frame loop. (A sibling overlay widget could not: in sui an event
-/// only reaches widgets on the `path_to(target)`, and `RedrawRequested` / external wakes route to
-/// the *root* only, so an off-path overlay would never receive the kick.) While a reply streams (or
-/// there was recent activity) the pump drains the worker each frame and applies events to
-/// `ChatState`. The resulting typed projection notifies only retained subscribers whose selected
-/// structural value changed.
+/// Worker results are drained by the window-owned `BackgroundWorkController` through SUI's typed
+/// command plane, so this presentation host no longer doubles as an animation-driven message bus.
 pub struct ChatView {
     shared: Shared,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
-    /// Whether an animation frame is currently requested (so we don't stack duplicate requests).
-    pump_alive: Cell<bool>,
-    /// Frames since the last state change; bounds the idle tail so we stop requesting frames.
-    idle_frames: Cell<u32>,
 }
-
-/// Idle-frame budget: once this many frames pass with no state change (and nothing streaming) the
-/// pump stops requesting animation frames, so an idle tab never busy-loops.
-const PUMP_IDLE_BUDGET: u32 = 90;
 
 impl ChatView {
     pub fn new(shared: Shared) -> Self {
@@ -17223,8 +17208,6 @@ impl ChatView {
             wide,
             narrow,
             use_wide: Cell::new(true),
-            pump_alive: Cell::new(false),
-            idle_frames: Cell::new(0),
         }
     }
 
@@ -17244,91 +17227,16 @@ impl ChatView {
         }
     }
 
-    /// Ensure the request-animation-frame pump is running (idempotent).
-    fn ensure_pump(&self, ctx: &mut EventCtx) {
-        if !self.pump_alive.get() {
-            ctx.request_animation_frame();
-            self.pump_alive.set(true);
-        }
-        // Any fresh gesture resets the idle tail so a just-dispatched command is drained promptly.
-        self.idle_frames.set(0);
-    }
-
     fn request_relayout(&self, ctx: &mut EventCtx) {
         ctx.request_measure();
         ctx.request_arrange();
         ctx.request_paint();
         ctx.request_semantics();
     }
-
-    /// One pump tick: drain the worker, apply events, and relayout/repaint as needed; keep the loop
-    /// alive while streaming or recently active.
-    fn pump(&self, ctx: &mut EventCtx) {
-        self.pump_alive.set(false);
-        let (structural_changed, media_changed) = {
-            let mut chat = self.shared.chat_mut();
-            let worker_changed = chat.pump_worker_events();
-            let provider_changed = chat.pump_provider_list();
-            let list_changed = chat.pump_session_list();
-            let transcript_changed = chat.pump_transcript_load();
-            let delete_changed = chat.pump_delete();
-            let channel_create_changed = chat.pump_channel_create();
-            let media_changed = chat.pump_media_call_runtime();
-            let structural_changed = worker_changed
-                || provider_changed
-                || list_changed
-                || transcript_changed
-                || delete_changed
-                || channel_create_changed;
-            (structural_changed, media_changed)
-        };
-        let changed = structural_changed || media_changed.changed();
-        let streaming = self.shared.chat().streaming;
-        let media_call_active = self.shared.chat().media_call.active;
-        let transcript_pending = self.shared.chat().transcript_load_pending();
-
-        // Structural hosts subscribe to `chat_structure` and invalidate themselves when their
-        // selected projection changes. A bare token only repaints the live transcript.
-        if media_changed.layout {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
-        } else if structural_changed || media_changed.semantics {
-            ctx.request_paint();
-            ctx.request_semantics();
-        } else if media_changed.paint {
-            ctx.request_paint();
-        }
-
-        if changed {
-            self.idle_frames.set(0);
-        } else {
-            self.idle_frames
-                .set(self.idle_frames.get().saturating_add(1));
-        }
-        if streaming
-            || media_call_active
-            || transcript_pending
-            || self.idle_frames.get() < PUMP_IDLE_BUDGET
-        {
-            ctx.request_animation_frame();
-            self.pump_alive.set(true);
-        }
-    }
 }
 
 impl Widget for ChatView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        // The streaming pump: an animation-frame wake drains the worker and relayouts. (The wake
-        // targets `ChatView` because `ChatView` requested it, so it routes here reliably.)
-        if let Event::Wake(sui::WakeEvent::AnimationFrame { .. }) = event {
-            if self.shared.is_ready() {
-                self.pump(ctx);
-            }
-            return;
-        }
-
         if !self.shared.is_ready() {
             return;
         }
@@ -17345,22 +17253,10 @@ impl Widget for ChatView {
         {
             let handled = self.shared.chat_mut().handle_escape();
             if handled {
-                self.ensure_pump(ctx);
                 self.request_relayout(ctx);
                 ctx.set_handled();
                 return;
             }
-        }
-
-        // Any pointer or key activity over the tab is a moment the worker may have pending events:
-        // a turn just started (Send click / Enter submit), a selection changed (sidebar / Select),
-        // or the initial Ready/Models fetch landed in the channel. Make sure the pump is running so
-        // those are drained. (Pointer Move/Enter are plentiful in the live app, so the initial model
-        // fetch is drained promptly without requiring an explicit click.)
-        let pointer_or_key = matches!(event, Event::Pointer(_))
-            || matches!(event, Event::Keyboard(k) if k.state == KeyState::Pressed);
-        if pointer_or_key {
-            self.ensure_pump(ctx);
         }
 
         // A pointer release / key press can also have changed local widget geometry. Reactive

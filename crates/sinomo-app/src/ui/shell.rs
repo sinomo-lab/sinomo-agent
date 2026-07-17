@@ -17,14 +17,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use sui::{
-    Align, Alignment, ArrangeCtx, Button, ButtonAppearance, Constraints, Event, EventCtx,
-    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Image, ImageFit,
-    ImageHandle, Insets, KeyState, Label, MeasureCtx, PaintCtx, PanelSection, Popover,
-    PopoverAlignment, RebuildOnChange, Rect, RichText, ScrollView, SemanticRegion, SemanticTone,
-    SemanticsAction, SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole,
-    SemanticsValue, SingleChild, Size, SizedBox, Spinner, StatusBadge, Surface, SurfaceAppearance,
-    SwitchView, TabBar, TimerToken, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent, WindowRenderOptions,
+    Align, Alignment, ArrangeCtx, Button, ButtonAppearance, Command, CommandController, CommandCtx,
+    Constraints, Event, EventCtx, EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton,
+    IconGlyph, Image, ImageFit, ImageHandle, Insets, KeyState, Label, MeasureCtx, PaintCtx,
+    PanelSection, Popover, PopoverAlignment, RebuildOnChange, Rect, RichText, ScrollView,
+    SemanticRegion, SemanticTone, SemanticsAction, SemanticsActionRequest, SemanticsCtx,
+    SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, SizedBox, Spinner,
+    StatusBadge, Surface, SurfaceAppearance, SwitchView, TabBar, TimerToken, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, WindowRenderOptions,
 };
 
 #[cfg(test)]
@@ -34,6 +34,130 @@ use crate::theme::Palette;
 use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
 pub const TOPBAR_HEIGHT: f32 = 44.0;
+
+/// Application work coordinator owned by the window rather than by the
+/// presentation tree. Bare scheduler wakes keep legacy background lanes alive;
+/// chat workers use the typed `CHAT_WORK_READY` multicast.
+pub struct BackgroundWorkController {
+    shared: Shared,
+}
+
+impl BackgroundWorkController {
+    pub fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+
+    fn pump(&mut self, ctx: &mut CommandCtx) {
+        let (changed, became_ready) = self.shared.pump_connect();
+        if became_ready {
+            let (backend, waker) = {
+                let app = self.shared.borrow();
+                let ready = app.ready.as_ref().expect("ready after connect");
+                (ready.backend.clone(), app.waker.clone())
+            };
+            self.shared
+                .settings_mut()
+                .begin_initial_load(backend.clone(), waker.clone());
+            self.shared
+                .evolution_mut()
+                .begin_dashboard_load(backend.data_dir.clone(), waker.clone());
+            {
+                let mut chat = self.shared.chat_mut();
+                chat.start_provider_list_load(backend.config.clone(), waker.clone());
+                chat.start_agent_list_load(backend.data_dir.clone(), waker.clone());
+                chat.start_session_list_load(waker);
+            }
+            if self.shared.active_tab() == Tab::Cluster {
+                cluster::request_refresh(&self.shared);
+            }
+        }
+
+        let ready = self.shared.is_ready();
+        let device_changed = ready && self.shared.settings_mut().pump_device_login();
+        let settings_changed = ready && self.shared.settings_mut().pump_initial_load();
+        let settings_operations_changed =
+            ready && settings::pump_background_operations(&self.shared);
+        let evolution_changed = ready && self.shared.evolution_mut().pump_dashboard_load();
+        let files_changed = ready && self.shared.files_mut().pump_load();
+        let files_attachment_changed = ready && drain_files_chat_attachment(&self.shared);
+        let connection_changed = self.shared.pump_connection_probe();
+        let cluster_changed = cluster::pump_refresh(&self.shared);
+
+        let chat_visible = self.shared.active_tab() == Tab::Sinomo;
+        let (chat_changed, chat_semantics_changed, chat_layout_changed) = if ready {
+            let mut chat = self.shared.chat_mut();
+            let worker_changed = chat.pump_worker_events();
+            let providers_changed = chat.pump_provider_list();
+            let agents_changed = chat.pump_agent_list();
+            let list_changed = chat.pump_session_list();
+            let transcript_changed = chat.pump_transcript_load();
+            let delete_changed = chat.pump_delete();
+            let channel_create_changed = chat.pump_channel_create();
+            let media_changed = chat.pump_media_call_runtime();
+            let media_visibility_changed = if chat_visible {
+                false
+            } else {
+                chat.sync_media_setup_visibility(false)
+            };
+            let structural_changed = worker_changed
+                || providers_changed
+                || agents_changed
+                || list_changed
+                || transcript_changed
+                || delete_changed
+                || channel_create_changed
+                || media_visibility_changed;
+            (
+                structural_changed || media_changed.paint,
+                structural_changed || media_changed.semantics,
+                structural_changed || media_changed.layout,
+            )
+        } else {
+            (false, false, false)
+        };
+
+        let layout_changed = became_ready
+            || device_changed
+            || files_changed
+            || files_attachment_changed
+            || connection_changed
+            || cluster_changed
+            || chat_layout_changed
+            || settings_changed
+            || settings_operations_changed
+            || evolution_changed;
+        if layout_changed {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_semantics();
+            ctx.request_paint();
+        } else {
+            if chat_semantics_changed {
+                ctx.request_semantics();
+            }
+            if changed || chat_changed {
+                ctx.request_paint();
+            }
+        }
+
+        if let Some(window_id) = ctx.window_id() {
+            sui::set_window_render_options(window_id, self.shared.render_options());
+        }
+    }
+}
+
+impl CommandController for BackgroundWorkController {
+    fn command(&mut self, ctx: &mut CommandCtx, command: &Command<'_>) {
+        if command.is(chat::CHAT_WORK_READY) {
+            self.pump(ctx);
+            ctx.set_handled();
+        }
+    }
+
+    fn wake(&mut self, ctx: &mut CommandCtx) {
+        self.pump(ctx);
+    }
+}
 const LOGO_SIZE: f32 = 24.0;
 const EDGE_PAD: f32 = 18.0;
 const TAB_SEG_HEIGHT: f32 = 32.0;
@@ -227,80 +351,63 @@ impl Shell {
             _ => false,
         }
     }
+}
 
-    /// Move a verified Files snapshot into the current Chat draft. The Files
-    /// worker owns all reads; this bridge only transfers already-validated
-    /// bytes and switches surfaces after the intent is ready.
-    fn drain_files_chat_attachment(&self) -> bool {
-        let intent = self
-            .shared
-            .files_mut_unpublished()
-            .take_ready_attachment_intent();
-        let Some(intent) = intent else {
-            return false;
-        };
-        self.shared.publish_files_signals();
-        let files::FilesAttachmentIntent {
-            file_name,
-            bytes,
-            provenance,
-            is_unsaved_editor_buffer,
-        } = intent;
-        {
-            let mut chat = self.shared.chat_mut();
-            let _ = match provenance {
-                files::FilesAttachmentProvenance::Local {
-                    path,
-                    canonical_path,
+/// Move a verified Files snapshot into the current Chat draft. The Files
+/// worker owns all reads; this bridge only transfers already-validated bytes
+/// and switches surfaces after the intent is ready.
+fn drain_files_chat_attachment(shared: &Shared) -> bool {
+    let intent = shared
+        .files_mut_unpublished()
+        .take_ready_attachment_intent();
+    let Some(intent) = intent else {
+        return false;
+    };
+    shared.publish_files_signals();
+    let files::FilesAttachmentIntent {
+        file_name,
+        bytes,
+        provenance,
+        is_unsaved_editor_buffer,
+    } = intent;
+    {
+        let mut chat = shared.chat_mut();
+        let _ = match provenance {
+            files::FilesAttachmentProvenance::Local {
+                path,
+                canonical_path,
+                modified_at_unix_nanos,
+            } => {
+                let provenance = sinomo_cli::app_api::ChatLocalAttachmentProvenance {
+                    original_path: path,
+                    canonical_path: (!canonical_path.trim().is_empty()).then_some(canonical_path),
                     modified_at_unix_nanos,
-                } => {
-                    let provenance = sinomo_cli::app_api::ChatLocalAttachmentProvenance {
-                        original_path: path,
-                        canonical_path: (!canonical_path.trim().is_empty())
-                            .then_some(canonical_path),
-                        modified_at_unix_nanos,
-                        unsaved_editor_buffer: is_unsaved_editor_buffer,
-                    };
-                    chat.queue_local_attachment_snapshot_with_provenance(
-                        file_name, provenance, bytes,
-                    )
-                }
-                files::FilesAttachmentProvenance::Sifs {
+                    unsaved_editor_buffer: is_unsaved_editor_buffer,
+                };
+                chat.queue_local_attachment_snapshot_with_provenance(file_name, provenance, bytes)
+            }
+            files::FilesAttachmentProvenance::Sifs {
+                path,
+                object_id,
+                version,
+                content_hash,
+                policy,
+            } => {
+                let provenance = sinomo_cli::app_api::ChatSifsAttachmentProvenance {
                     path,
-                    object_id,
-                    version,
+                    object_id: (!object_id.trim().is_empty()).then_some(object_id),
+                    version: (!version.trim().is_empty()).then_some(version),
                     content_hash,
-                    policy,
-                } => {
-                    let provenance = sinomo_cli::app_api::ChatSifsAttachmentProvenance {
-                        path,
-                        object_id: (!object_id.trim().is_empty()).then_some(object_id),
-                        version: (!version.trim().is_empty()).then_some(version),
-                        content_hash,
-                        policy: (!policy.trim().is_empty()).then_some(policy),
-                        unsaved_editor_buffer: is_unsaved_editor_buffer,
-                    };
-                    chat.queue_sifs_attachment_snapshot_with_provenance(
-                        file_name, provenance, bytes,
-                    )
-                }
-            };
-            chat.open_attachment_surface();
-        }
-        self.shared.set_active_tab(Tab::Sinomo);
-        true
+                    policy: (!policy.trim().is_empty()).then_some(policy),
+                    unsaved_editor_buffer: is_unsaved_editor_buffer,
+                };
+                chat.queue_sifs_attachment_snapshot_with_provenance(file_name, provenance, bytes)
+            }
+        };
+        chat.open_attachment_surface();
     }
-
-    fn start_cluster_refresh_if_active(&self) -> bool {
-        if !self.shared.is_ready() || self.shared.active_tab() != Tab::Cluster {
-            return false;
-        }
-        cluster::request_refresh(&self.shared)
-    }
-
-    fn pump_cluster_refresh(&self) -> bool {
-        cluster::pump_refresh(&self.shared)
-    }
+    shared.set_active_tab(Tab::Sinomo);
+    true
 }
 
 fn build_titlebar_surface(shared: &Shared) -> Surface {
@@ -625,104 +732,6 @@ impl Widget for Shell {
                 ctx.request_semantics();
             }
             self.schedule_health_probe_timer(ctx);
-            return;
-        }
-        // The background connect thread wakes us via the sui external-wake mechanism; drain its
-        // progress/result here. The ready signal owns the loading-to-content transition.
-        if let Event::Custom(custom) = event {
-            if custom.kind.as_str() == sui::EXTERNAL_WAKE_KIND {
-                self.schedule_connect_status_timer(ctx);
-                let (_changed, became_ready) = self.shared.pump_connect();
-                if became_ready {
-                    let (backend, waker) = {
-                        let app = self.shared.borrow();
-                        let ready = app.ready.as_ref().expect("ready after connect");
-                        (ready.backend.clone(), app.waker.clone())
-                    };
-                    self.shared
-                        .settings_mut()
-                        .begin_initial_load(backend.clone(), waker.clone());
-                    self.shared
-                        .evolution_mut()
-                        .begin_dashboard_load(backend.data_dir.clone(), waker.clone());
-                    {
-                        let mut chat = self.shared.chat_mut();
-                        chat.start_provider_list_load(backend.config.clone(), waker.clone());
-                        chat.start_agent_list_load(backend.data_dir.clone(), waker.clone());
-                        chat.start_session_list_load(waker);
-                    }
-                    self.schedule_health_probe_timer(ctx);
-                    self.start_cluster_refresh_if_active();
-                }
-                // Drain any in-progress provider device-login (Settings tab).
-                let device_changed = if self.shared.is_ready() {
-                    self.shared.settings_mut_unpublished().pump_device_login()
-                } else {
-                    false
-                };
-                let settings_changed = if self.shared.is_ready() {
-                    self.shared.settings_mut_unpublished().pump_initial_load()
-                } else {
-                    false
-                };
-                let _settings_operations_changed = if self.shared.is_ready() {
-                    settings::pump_background_operations(&self.shared)
-                } else {
-                    false
-                };
-                let evolution_changed = if self.shared.is_ready() {
-                    self.shared
-                        .evolution_mut_unpublished()
-                        .pump_dashboard_load()
-                } else {
-                    false
-                };
-                let files_changed = if self.shared.is_ready() {
-                    self.shared.files_mut_unpublished().pump_load()
-                } else {
-                    false
-                };
-                let _files_attachment_changed =
-                    self.shared.is_ready() && self.drain_files_chat_attachment();
-                let _connection_changed = self.shared.pump_connection_probe();
-                let _cluster_changed = self.pump_cluster_refresh();
-                let chat_visible = self.shared.active_tab() == Tab::Sinomo;
-                let media_changed = if self.shared.is_ready() {
-                    let mut chat = self.shared.chat_mut();
-                    chat.pump_provider_list();
-                    chat.pump_agent_list();
-                    chat.pump_session_list();
-                    chat.pump_delete();
-                    let media_changed = chat.pump_media_call_runtime();
-                    if !chat_visible {
-                        chat.sync_media_setup_visibility(false);
-                    }
-                    media_changed
-                } else {
-                    Default::default()
-                };
-                if device_changed || settings_changed {
-                    self.shared.publish_settings_signals();
-                }
-                if evolution_changed {
-                    self.shared.publish_evolution_signals();
-                }
-                if files_changed {
-                    self.shared.publish_files_signals();
-                }
-                if media_changed.layout {
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_semantics();
-                    ctx.request_paint();
-                } else if media_changed.semantics {
-                    ctx.request_semantics();
-                    ctx.request_paint();
-                } else if media_changed.paint {
-                    ctx.request_paint();
-                }
-                self.sync_render_options(ctx);
-            }
             return;
         }
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {

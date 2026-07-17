@@ -1395,7 +1395,6 @@ fn capture_advanced_settings_schema_expanded() {
 fn capture_connecting_then_ready() {
     use sinomo_app::backend::Backend;
     use sinomo_app::state::{AppState, ConnectEvent, ReadyState, Shared};
-    use sui::{CustomEvent, Event};
 
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -1404,6 +1403,7 @@ fn capture_connecting_then_ready() {
     let shared = Shared::new(AppState::connecting());
     shared.borrow_mut().status = "Starting a local daemon…".to_string();
     let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let commands = runtime.command_sender();
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
     app.run_until_idle().expect("settle connecting layout");
@@ -1415,23 +1415,20 @@ fn capture_connecting_then_ready() {
         println!("wrote {}", path.display());
     }
 
-    // The backend arrives: queue the Connected event and deliver the external wake the connect
-    // thread would send. The shell drains it, builds the tabs, and becomes interactive.
+    // The backend arrives: queue the Connected event and wake the window controller, matching the
+    // scheduler-only signal used by the connect thread.
     let (tx, rx) = std::sync::mpsc::channel();
     shared.borrow_mut().connect_rx = Some(rx);
     tx.send(ConnectEvent::Connected(Box::new(ReadyState::build(
         Backend::local_fallback(),
     ))))
     .expect("queue connected");
-    window
-        .root()
-        .dispatch_event(Event::Custom(CustomEvent::new(sui::EXTERNAL_WAKE_KIND)))
-        .expect("dispatch external wake");
+    commands.wake();
     app.run_until_idle().expect("settle ready layout");
 
     assert!(
         shared.is_ready(),
-        "the external wake should drain the connect channel and make the app ready"
+        "the controller wake should drain the connect channel and make the app ready"
     );
     let shot = window.capture_screenshot().expect("capture screenshot");
     let path = dir.join("sinomo-app-connected.png");

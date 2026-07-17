@@ -31,7 +31,15 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
             let logo = default_sui_logo_image(96)?;
             resources.image(logo_image_handle(), logo)
         })
-        .map(|app| app.window(Window::new("Sinomo").root(Shell::new(shared))))
+        .map(|app| {
+            app.window(
+                Window::new("Sinomo")
+                    .controller(crate::ui::shell::BackgroundWorkController::new(
+                        shared.clone(),
+                    ))
+                    .root(Shell::new(shared)),
+            )
+        })
 }
 
 /// Build a fully-resolved shared state with a starting tab. Uses a synchronous, daemonless
