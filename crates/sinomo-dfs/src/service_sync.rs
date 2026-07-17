@@ -965,11 +965,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(certificate);
             }
 
-            // Issue the frozen-head catch-up before draining unrelated DFS
-            // traffic. Processing a late repair acknowledgement can append
-            // newer metadata locally; that must not make this barrier send a
-            // successor batch and then ask the replica to prove an older head.
-            self.send_metadata_sync_catchup_batches(&target, &probe_barrier_id)?;
+            // Probe replicas already known at the frozen head before spending
+            // this barrier's deadline catching up a lagging member. A reachable
+            // exact quorum can therefore complete around one offline replica;
+            // if it cannot, the catch-up wave below still runs before unrelated
+            // incoming traffic is drained again.
             let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
                 &target,
                 &probe_barrier_id,
@@ -3251,6 +3251,118 @@ mod tests {
                 .routed_fanout_max_inflight
                 .contains(&DFS_METADATA_SYNC_ROUTED_FANOUT_CAP),
             "the routed fallback must keep a second worker available around one offline member"
+        );
+
+        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv);
+            (
+                store
+                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
+                    .expect("active shard"),
+                store
+                    .get_metadata_shard_membership_handoff(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    )
+                    .expect("pending handoff"),
+                store
+                    .get_metadata_shard_membership_handoff_proof(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    )
+                    .expect("handoff proof")
+                    .expect("durable handoff proof"),
+            )
+        });
+        assert_eq!(active, Some(desired));
+        assert!(pending.is_none());
+        let acknowledged_node_ids = proof
+            .acknowledged_node_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            acknowledged_node_ids,
+            BTreeSet::from([retiring.primary_node_id, promoted, healthy])
+        );
+        assert!(!acknowledged_node_ids.contains(&offline));
+    }
+
+    #[test]
+    fn primary_handoff_probes_ready_quorum_before_offline_replica_catchup() {
+        let mut candidates = vec![
+            node("node_sync_handoff_ready_quorum_a"),
+            node("node_sync_handoff_ready_quorum_b"),
+            node("node_sync_handoff_ready_quorum_c"),
+        ];
+        candidates.sort();
+        let promoted = candidates[0].clone();
+        let offline = candidates[1].clone();
+        let healthy = candidates[2].clone();
+        let mut fixture = configured_sync_fixture(
+            "membership_handoff_ready_quorum",
+            vec![promoted.clone(), offline.clone(), healthy.clone()],
+            vec![promoted.clone(), healthy.clone()],
+        );
+        let checkpoint = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture exact checkpoint");
+        for replica_node_id in [&promoted, &healthy] {
+            fixture
+                .service
+                .metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend")
+                .put_metadata_replication_cursor(
+                    replica_node_id,
+                    &checkpoint.shard_id,
+                    checkpoint.journal_sequence,
+                )
+                .expect("seed exact healthy replica cursor");
+        }
+        fixture
+            .service
+            .transport
+            .network_error_nodes
+            .insert(offline.clone());
+        fixture
+            .service
+            .transport
+            .hold_network_errors_until_operation_deadline = true;
+        fixture
+            .service
+            .transport
+            .fail_direct_after_operation_deadline = true;
+        let retiring = fixture.shard.clone();
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: promoted.clone(),
+            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
+                &retiring, &promoted,
+            )
+            .expect("promoted replica preserves the configured node ring"),
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        fixture.control_plane.with_client(|kv| {
+            DfsControlPlaneStore::new(kv)
+                .begin_metadata_shard_membership_handoff(&retiring, &desired)
+                .expect("begin primary handoff")
+                .expect("retiring assignment is exact")
+        });
+
+        assert_eq!(
+            fixture
+                .service
+                .reconcile_pending_metadata_shard_membership_handoffs(
+                    std::slice::from_ref(&retiring),
+                    Duration::from_millis(80),
+                )
+                .expect("ready joint quorum must not wait for offline catch-up"),
+            1
+        );
+        assert!(
+            fixture.service.transport.catchup_rpc_requests.is_empty(),
+            "the offline laggard must not consume the handoff deadline before a ready quorum probe"
         );
 
         let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
