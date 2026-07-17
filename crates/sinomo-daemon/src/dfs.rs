@@ -43,7 +43,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
@@ -378,7 +378,7 @@ static DAEMON_DFS_MUTATION_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<DaemonDfsMutationScheduler>>>,
 > = OnceLock::new();
 static DAEMON_DFS_MESSAGE_EXECUTION_GATES: OnceLock<
-    Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Semaphore>>>,
+    Mutex<BTreeMap<PathBuf, Weak<DaemonDfsMessageExecutionGate>>>,
 > = OnceLock::new();
 static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
     Mutex<
@@ -934,7 +934,7 @@ where
             drop(lifecycle_guard);
             return Err(daemon_dfs_maintenance_lease_error(detail));
         }
-        result = message_execution_gate.acquire_owned() => result.map_err(|_| DaemonError::Network {
+        result = Arc::clone(&message_execution_gate.semaphore).acquire_owned() => result.map_err(|_| DaemonError::Network {
             address: "DFS message execution".to_string(),
             detail: "DFS message execution gate closed".to_string(),
         })?,
@@ -1591,9 +1591,81 @@ fn daemon_dfs_mutation_scheduler(
 /// shard. Keep one foreground service generation live at a time per data root;
 /// the permit moves into `spawn_blocking` so cancellation cannot let a newer
 /// generation overlap work that is still running.
+#[derive(Debug)]
+struct DaemonDfsMessageExecutionGate {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    maintenance_interest_count: AtomicUsize,
+    foreground_generation: AtomicU64,
+    foreground_notify: tokio::sync::Notify,
+}
+
+impl DaemonDfsMessageExecutionGate {
+    fn new() -> Self {
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            maintenance_interest_count: AtomicUsize::new(0),
+            foreground_generation: AtomicU64::new(0),
+            foreground_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn begin_maintenance_interest(self: &Arc<Self>) -> DaemonDfsMaintenanceForegroundPreemption {
+        // Capture the baseline before publishing maintenance interest. Any
+        // foreground waiter that can observe the interest therefore advances
+        // a generation this guard will observe, including while cluster/local
+        // admission is still in progress.
+        let foreground_generation = self.foreground_generation.load(Ordering::Acquire);
+        self.maintenance_interest_count
+            .fetch_add(1, Ordering::AcqRel);
+        DaemonDfsMaintenanceForegroundPreemption {
+            gate: Arc::clone(self),
+            foreground_generation,
+        }
+    }
+
+    fn request_foreground_admission(&self) {
+        if self.maintenance_interest_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.foreground_generation.fetch_add(1, Ordering::AcqRel);
+        self.foreground_notify.notify_waiters();
+    }
+}
+
+#[derive(Debug)]
+struct DaemonDfsMaintenanceForegroundPreemption {
+    gate: Arc<DaemonDfsMessageExecutionGate>,
+    foreground_generation: u64,
+}
+
+impl DaemonDfsMaintenanceForegroundPreemption {
+    async fn requested(&self) {
+        loop {
+            let notified = self.gate.foreground_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.gate.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for DaemonDfsMaintenanceForegroundPreemption {
+    fn drop(&mut self) {
+        let previous = self
+            .gate
+            .maintenance_interest_count
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "DFS maintenance interest underflow");
+    }
+}
+
 fn daemon_dfs_message_execution_gate(
     data_dir: &SinomoDataDir,
-) -> Result<Arc<tokio::sync::Semaphore>, DaemonError> {
+) -> Result<Arc<DaemonDfsMessageExecutionGate>, DaemonError> {
     let key = data_dir.root();
     let mut gates = DAEMON_DFS_MESSAGE_EXECUTION_GATES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1605,9 +1677,31 @@ fn daemon_dfs_message_execution_gate(
     if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
         return Ok(gate);
     }
-    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let gate = Arc::new(DaemonDfsMessageExecutionGate::new());
     gates.insert(key, Arc::downgrade(&gate));
     Ok(gate)
+}
+
+async fn acquire_daemon_dfs_foreground_message_execution(
+    gate: &Arc<DaemonDfsMessageExecutionGate>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, DaemonError> {
+    match Arc::clone(&gate.semaphore).try_acquire_owned() {
+        Ok(permit) => return Ok(permit),
+        Err(tokio::sync::TryAcquireError::NoPermits) => gate.request_foreground_admission(),
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return Err(DaemonError::Network {
+                address: "DFS message execution".to_string(),
+                detail: "DFS message execution gate closed".to_string(),
+            });
+        }
+    }
+    Arc::clone(&gate.semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|_| DaemonError::Network {
+            address: "DFS message execution".to_string(),
+            detail: "DFS message execution gate closed".to_string(),
+        })
 }
 
 fn daemon_default_dfs_lifecycle_gate(
@@ -2365,13 +2459,8 @@ async fn handle_daemon_dfs_message_async(
     // Wait for the metadata-memory bound before acquiring logical mutation
     // authority. Queued work therefore cannot hold a shard/global gate while
     // it waits for the sole backend-bearing service generation.
-    let execution_slot = Arc::clone(&daemon_dfs_message_execution_gate(&data_dir)?)
-        .acquire_owned()
-        .await
-        .map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate closed".to_string(),
-        })?;
+    let execution_gate = daemon_dfs_message_execution_gate(&data_dir)?;
+    let execution_slot = acquire_daemon_dfs_foreground_message_execution(&execution_gate).await?;
     let admission = scheduler.admit(&execution_scope).await?;
     let admission_wait = admission_started.elapsed();
     let process_execution_scope = execution_scope.clone();
@@ -2513,15 +2602,14 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
         );
         return Ok(());
     };
-    let message_execution_guard = Arc::clone(&daemon_dfs_message_execution_gate(
-        &SinomoDataDir::new(data_dir),
-    )?)
-    .acquire_owned()
-    .await
-    .map_err(|_| DaemonError::Network {
-        address: "DFS message execution".to_string(),
-        detail: "DFS message execution gate closed".to_string(),
-    })?;
+    let message_execution_gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(data_dir))?;
+    let message_execution_guard = Arc::clone(&message_execution_gate.semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|_| DaemonError::Network {
+            address: "DFS message execution".to_string(),
+            detail: "DFS message execution gate closed".to_string(),
+        })?;
     // Own the permit inside the blocking task that polls the complete lifecycle
     // future. Cluster phase timeouts drop their JoinHandle but cannot cancel a
     // running blocking task, so synchronous metadata recovery cannot outlive
@@ -2579,6 +2667,34 @@ pub(crate) enum DaemonDfsMaintenanceTickOutcome {
     Deferred,
 }
 
+#[derive(Debug)]
+enum DaemonDfsMaintenancePreemptionOutcome<T> {
+    Finished(T),
+    ForegroundWaiting,
+}
+
+async fn run_daemon_dfs_maintenance_until_foreground_waits<F>(
+    foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
+    maintenance: F,
+) -> DaemonDfsMaintenancePreemptionOutcome<F::Output>
+where
+    F: std::future::Future,
+{
+    let mut maintenance = Box::pin(maintenance);
+    let outcome = tokio::select! {
+        biased;
+        _ = foreground_preemption.requested() => {
+            DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting
+        }
+        result = &mut maintenance => DaemonDfsMaintenancePreemptionOutcome::Finished(result),
+    };
+    // `maintenance` owns the broad tick's `NetworkedDfsService`. Destroy it
+    // here, while the caller still owns the sole message-execution permit, so
+    // foreground admission can never overlap a live maintenance generation.
+    drop(maintenance);
+    outcome
+}
+
 pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -2591,6 +2707,11 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     }
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
+    // Publish maintenance interest before cluster/local admission. A
+    // foreground request that queues anywhere behind this pass can then ask it
+    // to yield once its current synchronous poll reaches an await boundary.
+    let foreground_preemption =
+        daemon_dfs_message_execution_gate(&data_dir)?.begin_maintenance_interest();
     let Some(admission) = acquire_daemon_dfs_maintenance_admission(
         &data_dir,
         &cluster_paths,
@@ -2614,30 +2735,46 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     }
     let mut authority_rx = lease.authority_receiver();
     let mut deferred_work = None;
-    let mut maintenance = Box::pin(run_daemon_dfs_maintenance_tick_with_admission(
-        data_dir,
-        cluster_paths,
-        cluster_state,
-        runtime,
-        &mut deferred_work,
-    ));
-    let maintenance_result = tokio::select! {
-        biased;
-        detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut authority_rx) => {
-            Err(daemon_dfs_maintenance_lease_error(detail))
-        },
-        result = &mut maintenance => result,
-    };
-    drop(maintenance);
+    let maintenance_result =
+        run_daemon_dfs_maintenance_until_foreground_waits(&foreground_preemption, async {
+            let mut maintenance = Box::pin(run_daemon_dfs_maintenance_tick_with_admission(
+                data_dir,
+                cluster_paths,
+                cluster_state,
+                runtime,
+                &mut deferred_work,
+            ));
+            tokio::select! {
+                biased;
+                detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut authority_rx) => {
+                    Err(daemon_dfs_maintenance_lease_error(detail))
+                },
+                result = &mut maintenance => result,
+            }
+        })
+        .await;
+    // The preemption helper has already dropped the entire maintenance future
+    // (and its backend-bearing service) before this permit is released. Local
+    // mutation therefore remains single-generation even when a repair or
+    // metadata RPC is cancelled to admit foreground work. Those sends are
+    // replay-safe; return Deferred below so durable work is retried promptly.
     drop(message_execution_guard);
     drop(lifecycle_guard);
+    drop(foreground_preemption);
     let lease_release_result = lease.release().await;
     if let Some((detached_runtime, worker)) = deferred_work {
         schedule_daemon_dfs_message_deferred_work(runtime, detached_runtime, worker);
     }
     lease_release_result?;
-    maintenance_result?;
-    Ok(DaemonDfsMaintenanceTickOutcome::Completed)
+    match maintenance_result {
+        DaemonDfsMaintenancePreemptionOutcome::Finished(result) => {
+            result?;
+            Ok(DaemonDfsMaintenanceTickOutcome::Completed)
+        }
+        DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
+            Ok(DaemonDfsMaintenanceTickOutcome::Deferred)
+        }
+    }
 }
 
 async fn run_daemon_dfs_maintenance_tick_with_admission(
@@ -2981,18 +3118,96 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first_gate, &same_gate));
         assert!(!Arc::ptr_eq(&first_gate, &other_gate));
-        let first = Arc::clone(&first_gate)
+        let first = Arc::clone(&first_gate.semaphore)
             .try_acquire_owned()
             .expect("first message execution");
         assert!(
-            Arc::clone(&same_gate).try_acquire_owned().is_err(),
+            Arc::clone(&same_gate.semaphore)
+                .try_acquire_owned()
+                .is_err(),
             "same-root message execution must be single flight"
         );
-        let other = Arc::clone(&other_gate)
+        let other = Arc::clone(&other_gate.semaphore)
             .try_acquire_owned()
             .expect("other-root message execution");
         drop(other);
         drop(first);
+    }
+
+    #[test]
+    fn foreground_dfs_preempts_pending_maintenance_before_permit_release() {
+        #[derive(Debug)]
+        struct MaintenanceGenerationDrop(Arc<AtomicBool>);
+
+        impl Drop for MaintenanceGenerationDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let root = temp_root("foreground-preempts-pending-maintenance");
+        let gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(root.path()))
+            .expect("message gate");
+        let runtime = daemon_test_runtime("foreground-preempts-pending-maintenance");
+        runtime.block_on(async {
+            let maintenance_interest = gate.begin_maintenance_interest();
+            let maintenance_permit = Arc::clone(&gate.semaphore)
+                .acquire_owned()
+                .await
+                .expect("maintenance permit");
+            let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+            let generation_dropped = Arc::new(AtomicBool::new(false));
+            let maintenance_gate = Arc::clone(&gate);
+            let pending_maintenance_gate = Arc::clone(&gate);
+            let maintenance_generation_dropped = Arc::clone(&generation_dropped);
+            let observed_generation_dropped = Arc::clone(&generation_dropped);
+            let maintenance_task = tokio::spawn(async move {
+                let outcome = run_daemon_dfs_maintenance_until_foreground_waits(
+                    &maintenance_interest,
+                    async move {
+                        let _generation = MaintenanceGenerationDrop(maintenance_generation_dropped);
+                        assert!(
+                            Arc::clone(&pending_maintenance_gate.semaphore)
+                                .try_acquire_owned()
+                                .is_err(),
+                            "maintenance local work must retain exclusive mutation admission"
+                        );
+                        pending_tx
+                            .send(())
+                            .expect("report outbound maintenance wait");
+                        std::future::pending::<()>().await;
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    outcome,
+                    DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting
+                ));
+                assert!(
+                    observed_generation_dropped.load(Ordering::Acquire),
+                    "the maintenance service generation must be destroyed before admission returns"
+                );
+                assert!(
+                    Arc::clone(&maintenance_gate.semaphore)
+                        .try_acquire_owned()
+                        .is_err(),
+                    "preemption must not release the permit before dropping maintenance state"
+                );
+                drop(maintenance_permit);
+            });
+
+            pending_rx.await.expect("maintenance reached outbound wait");
+            let foreground_permit = tokio::time::timeout(
+                Duration::from_secs(1),
+                acquire_daemon_dfs_foreground_message_execution(&gate),
+            )
+            .await
+            .expect("foreground admission must preempt pending maintenance")
+            .expect("foreground permit");
+            maintenance_task.await.expect("maintenance preemption task");
+            assert!(generation_dropped.load(Ordering::Acquire));
+            drop(foreground_permit);
+        });
     }
 
     #[test]
@@ -3203,6 +3418,7 @@ mod tests {
         runtime.block_on(async {
             let held_lifecycle_gate = lifecycle_gate.clone().lock_owned().await;
             let held_message_gate = message_gate
+                .semaphore
                 .clone()
                 .acquire_owned()
                 .await
@@ -3539,11 +3755,11 @@ mod tests {
             .expect("execution gate");
         let runtime = daemon_test_runtime("daemon-dfs-cancelled-execution-waiter");
         runtime.block_on(async {
-            let first = Arc::clone(&gate)
+            let first = Arc::clone(&gate.semaphore)
                 .acquire_owned()
                 .await
                 .expect("first execution");
-            let queued_gate = Arc::clone(&gate);
+            let queued_gate = Arc::clone(&gate.semaphore);
             let mut queued = tokio::spawn(async move {
                 queued_gate.acquire_owned().await.expect("queued execution")
             });
@@ -3560,7 +3776,7 @@ mod tests {
             );
 
             drop(first);
-            let next = tokio::time::timeout(Duration::from_secs(1), gate.acquire())
+            let next = tokio::time::timeout(Duration::from_secs(1), gate.semaphore.acquire())
                 .await
                 .expect("execution should advance after cancellation")
                 .expect("execution gate remains open");
@@ -3575,7 +3791,7 @@ mod tests {
             .expect("execution gate");
         let runtime = daemon_test_runtime("daemon-dfs-cancelled-blocking-execution");
         let permit = runtime.block_on(async {
-            Arc::clone(&gate)
+            Arc::clone(&gate.semaphore)
                 .acquire_owned()
                 .await
                 .expect("execution permit")
@@ -3595,14 +3811,14 @@ mod tests {
             .expect("blocking task started");
         blocking.abort();
         assert!(
-            Arc::clone(&gate).try_acquire_owned().is_err(),
+            Arc::clone(&gate.semaphore).try_acquire_owned().is_err(),
             "aborting a running JoinHandle must not admit another backend generation"
         );
         release_tx.send(()).expect("release blocking task");
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("blocking task completed");
-        let next = Arc::clone(&gate)
+        let next = Arc::clone(&gate.semaphore)
             .try_acquire_owned()
             .expect("slot released by actual blocking completion");
         drop(next);

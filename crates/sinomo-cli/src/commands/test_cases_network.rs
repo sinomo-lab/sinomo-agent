@@ -23,7 +23,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
-const DEFAULT_REQUESTS_PER_TARGET: usize = 20;
+// Measure long enough that scheduler and timer-boundary noise cannot decide the
+// 50 req/s acceptance gate. With two targets this yields 200 measured RPCs,
+// while still completing comfortably inside the cluster acceptance budget.
+const DEFAULT_REQUESTS_PER_TARGET: usize = 100;
+// Warm the authenticated route and connection pools before starting the timed
+// window, but keep that untimed work explicitly bounded instead of coupling it
+// to the larger measurement sample.
+const DEFAULT_WARMUP_REQUESTS_PER_TARGET: usize = 20;
 // Keep the acceptance default below the daemon's saturation point so the
 // latency gates measure healthy interactive RPC service rather than queueing
 // behind a burst of control connections. Higher-concurrency throughput runs
@@ -69,7 +76,7 @@ impl NetworkPingRunDefaults {
         Self {
             parameter_prefix: None,
             requests_per_target: DEFAULT_REQUESTS_PER_TARGET,
-            warmup_requests_per_target: None,
+            warmup_requests_per_target: Some(DEFAULT_WARMUP_REQUESTS_PER_TARGET),
             concurrency: DEFAULT_CONCURRENCY,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             expected_targets: DEFAULT_EXPECTED_TARGETS,
@@ -2391,6 +2398,16 @@ mod tests {
         ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn ping_benchmark_defaults_use_stable_bounded_measurement_window() {
+        let defaults = NetworkPingRunDefaults::benchmark();
+
+        assert_eq!(defaults.requests_per_target, 100);
+        assert_eq!(defaults.warmup_requests_per_target, Some(20));
+        assert_eq!(defaults.concurrency, 8);
+        assert_eq!(defaults.min_requests_per_second, 50.0);
+    }
 
     #[test]
     fn arbitrary_message_defaults_use_ordinary_size_neutral_parameters() {
