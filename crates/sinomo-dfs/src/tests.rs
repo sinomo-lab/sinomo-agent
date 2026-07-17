@@ -1164,6 +1164,32 @@ impl DfsMessageTransport for CountingFailingSendTransport {
     }
 }
 
+impl AsyncDfsMessageTransport for CountingFailingSendTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    fn send_routed_call_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        call: DfsRoutedCall,
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
+        Box::pin(async move { self.send_routed_call(target_node_id, call) })
+    }
+
+    fn drain_incoming_messages_async<'a>(
+        &'a mut self,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn pending_incoming_count_async<'a>(
+        &'a mut self,
+    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+        Box::pin(async { Ok(Some(0)) })
+    }
+}
+
 struct DroppingSendTransport {
     local_node_id: NodeId,
 }
@@ -15663,6 +15689,123 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
         "background fetch completion must not synchronously send N-W repair"
     );
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+fn counting_failing_pending_stage_service(
+    root: &Path,
+    fixture_name: &str,
+    pending_intent_count: usize,
+) -> (
+    NetworkedDfsService<CountingFailingSendTransport>,
+    Arc<AtomicUsize>,
+) {
+    let owner = NodeId::from_legacy_named(format!("node_{fixture_name}_owner")).expect("owner");
+    let replica =
+        NodeId::from_legacy_named(format!("node_{fixture_name}_replica")).expect("replica");
+    let send_count = Arc::new(AtomicUsize::new(0));
+    let mut dfs = NetworkedDfsService::new(
+        CountingFailingSendTransport {
+            local_node_id: owner.clone(),
+            send_count: Arc::clone(&send_count),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    dfs.add_file_system(file_system(owner.clone()))
+        .expect("filesystem");
+
+    for index in 0..pending_intent_count {
+        let object_id =
+            DfsObjectId::from_legacy_named(format!("obj_{fixture_name}_pending_stage_{index}"))
+                .expect("object");
+        let base_version = DfsVersion::from_legacy_named(format!(
+            "version_{fixture_name}_pending_stage_{index}_base"
+        ))
+        .expect("base version");
+        let target_version = DfsVersion::from_legacy_named(format!(
+            "version_{fixture_name}_pending_stage_{index}_target"
+        ))
+        .expect("target version");
+        let mut metadata = file_metadata(owner.clone());
+        metadata.object_id = object_id.clone();
+        metadata.path = format!("/services/{fixture_name}-{index}.bin");
+        metadata.version = base_version.clone();
+        metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+        dfs.add_object_metadata(metadata).expect("object metadata");
+        let bytes = format!("{fixture_name} pending stage body {index}").into_bytes();
+        let manifest = dfs
+            .content
+            .put_object_version(object_id.as_str(), target_version.as_str(), &bytes)
+            .expect("target content");
+        let intent = dfs
+            .coordinator
+            .create_intent(
+                sifs_file_system_id(),
+                object_id.clone(),
+                Some(base_version),
+                target_version.clone(),
+                owner.clone(),
+                vec![owner.clone(), replica.clone()],
+                DfsReplicationPolicy::new(2, 2).expect("W2 policy"),
+            )
+            .expect("pending intent");
+        let awaiting = dfs
+            .coordinator
+            .record_durable_receipt(&intent.intent_id, owner.clone())
+            .expect("owner receipt");
+        assert!(matches!(
+            awaiting.state,
+            DfsWriteIntentState::AwaitingReceipts
+        ));
+        dfs.pending_writes.insert(
+            intent.intent_id,
+            PendingNetworkedWrite::new(
+                object_id,
+                target_version,
+                manifest.content_hash,
+                manifest.size_bytes,
+            ),
+        );
+    }
+    (dfs, send_count)
+}
+
+#[test]
+fn retry_pending_repairs_bounded_counts_failed_stage_attempts() {
+    let root = temp_root("retry-repairs-bounds-failed-stages");
+    let (mut dfs, send_count) =
+        counting_failing_pending_stage_service(&root, "bounded_sync_stage", 4);
+
+    let scheduled = dfs
+        .retry_pending_repairs_bounded(1)
+        .expect("bounded failed stage retry");
+
+    assert!(scheduled.is_empty());
+    assert_eq!(
+        send_count.load(Ordering::Relaxed),
+        1,
+        "a failed stage send must consume the shared maintenance budget"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn retry_pending_repairs_async_bounded_counts_failed_stage_attempts() {
+    let root = temp_root("retry-repairs-async-bounds-failed-stages");
+    let (mut dfs, send_count) =
+        counting_failing_pending_stage_service(&root, "bounded_async_stage", 4);
+
+    let scheduled = dfs
+        .retry_pending_repairs_async_bounded_with_attempts(1, &[])
+        .await
+        .expect("bounded async failed stage retry");
+
+    assert!(scheduled.is_empty());
+    assert_eq!(
+        send_count.load(Ordering::Relaxed),
+        1,
+        "a failed async stage send must consume the shared maintenance budget"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

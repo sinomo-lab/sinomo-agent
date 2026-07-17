@@ -1997,19 +1997,28 @@ fn open_daemon_dfs_message_service_lane_with_content(
     }))
 }
 
+struct DaemonDfsCommitPromotionRecovery {
+    detached_runtime: Arc<DaemonDfsDetachedSendRuntime>,
+    worker: DfsNodeDetachedSendWorker,
+    scan_result: Result<(), sinomo_dfs::DfsError>,
+}
+
 /// Rebuild the process-local promotion outbox once per observed authority
-/// generation after restart, then drain retained retries without rescanning.
+/// generation after restart, then prepare the detached retry worker.
 ///
 /// This uses a dedicated service that shares only detached identity state with
-/// cached message lanes. Its full metadata scan and every promotion RPC run in
-/// background maintenance, never under a hot primary/read lane or the message
-/// cache lock. An empty committed shard topology is transient bootstrap state,
-/// so it leaves recovery incomplete for the next maintenance tick.
-fn recover_daemon_dfs_commit_promotions(
+/// cached message lanes. The finite metadata scan runs under lifecycle
+/// maintenance, but promotion RPCs are handed to the process-wide detached
+/// worker instead of being drained while the cluster maintenance lease is held.
+/// An offline replica can therefore delay only its own convergence; it cannot
+/// fence another node out of unrelated cluster maintenance. An empty committed
+/// shard topology is transient bootstrap state, so it leaves recovery
+/// incomplete for the next maintenance tick.
+fn prepare_daemon_dfs_commit_promotion_recovery(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     runtime: &tokio::runtime::Handle,
-) -> Result<(), sinomo_dfs::DfsError> {
+) -> Result<DaemonDfsCommitPromotionRecovery, sinomo_dfs::DfsError> {
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(daemon_dfs_network_error)?;
     let detached_send_runtime = daemon_dfs_detached_send_runtime_for_identity(
@@ -2044,12 +2053,11 @@ fn recover_daemon_dfs_commit_promotions(
         Ok::<_, sinomo_dfs::DfsError>(NetworkedDfsService::new(transport, content))
     };
 
-    // Retained ready work is independent of whether a fresh metadata scan can
-    // succeed. Drain it first so unrelated backend/topology errors cannot
-    // head-of-line block already reconstructed promotions or responses.
-    let mut initial_service = open_recovery_service()?;
-    let mut initial_worker = initial_service.prepare_message_deferred_work();
-    let initial_drain_result = initial_worker.drain();
+    // Create the lightweight worker before scanning. It shares the outbox, so
+    // work reconstructed below is visible without retaining the metadata-heavy
+    // recovery service or draining network calls inline.
+    let mut recovery_service = open_recovery_service()?;
+    let worker = recovery_service.prepare_message_deferred_work();
 
     let recovery_scan_started = Instant::now();
     let mut scan_deferred_for_empty_topology = false;
@@ -2082,26 +2090,24 @@ fn recover_daemon_dfs_commit_promotions(
     };
     let recovery_scan_ms = recovery_scan_started.elapsed().as_millis();
 
-    // Drain again even when the scan failed: it may have queued valid work
-    // before encountering a later corrupt/unavailable record, and concurrent
-    // lanes may have published ready work while the scan ran.
-    let mut final_service = open_recovery_service()?;
-    let mut worker = final_service.prepare_message_deferred_work();
-    let recovery_drain_started = Instant::now();
-    let final_drain_result = worker.drain();
+    // Return the worker even when the scan failed: it may have queued valid
+    // work before encountering a later corrupt/unavailable record, and retained
+    // ready work must not depend on a successful fresh scan. The caller drops
+    // local guards and releases the cluster lease before waking the scheduler.
     let pending = worker.has_pending()?;
     daemon_dfs_perf_trace(format_args!(
-        "commit-promotion-recovery generation={} scanned={} scan_deferred_empty_topology={} scan_ms={} drain_ms={} pending={}",
+        "commit-promotion-recovery generation={} scanned={} scan_deferred_empty_topology={} scan_ms={} prepared_pending={}",
         authority_generation,
         recovery_scan_required && !scan_deferred_for_empty_topology,
         scan_deferred_for_empty_topology,
         recovery_scan_ms,
-        recovery_drain_started.elapsed().as_millis(),
         pending
     ));
-    scan_result?;
-    final_drain_result?;
-    initial_drain_result
+    Ok(DaemonDfsCommitPromotionRecovery {
+        detached_runtime: detached_send_runtime,
+        worker,
+        scan_result,
+    })
 }
 
 fn process_daemon_dfs_message_command_on_runtime(
@@ -2607,11 +2613,13 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         return Err(daemon_dfs_maintenance_lease_error(detail));
     }
     let mut authority_rx = lease.authority_receiver();
+    let mut deferred_work = None;
     let mut maintenance = Box::pin(run_daemon_dfs_maintenance_tick_with_admission(
         data_dir,
         cluster_paths,
         cluster_state,
         runtime,
+        &mut deferred_work,
     ));
     let maintenance_result = tokio::select! {
         biased;
@@ -2623,7 +2631,11 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     drop(maintenance);
     drop(message_execution_guard);
     drop(lifecycle_guard);
-    lease.release().await?;
+    let lease_release_result = lease.release().await;
+    if let Some((detached_runtime, worker)) = deferred_work {
+        schedule_daemon_dfs_message_deferred_work(runtime, detached_runtime, worker);
+    }
+    lease_release_result?;
     maintenance_result?;
     Ok(DaemonDfsMaintenanceTickOutcome::Completed)
 }
@@ -2633,6 +2645,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     cluster_paths: ClusterPaths,
     cluster_state: sinomo_core::ClusterBootstrapState,
     runtime: &tokio::runtime::Handle,
+    deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
 ) -> Result<(), DaemonError> {
     evict_daemon_dfs_message_service_cache(&data_dir)?;
     if let Some(stats) = crate::process_idle_stats() {
@@ -2673,8 +2686,8 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
             if authority_generation_after_maintenance == authority_generation_before_maintenance {
                 // The broad maintenance service already performed the explicit
                 // one-pass recovery hydrate into this shared outbox. Mark only
-                // the exact unchanged topology it scanned; the sibling recovery
-                // call below then drains without repeating the full scan.
+                // the exact unchanged topology it scanned; recovery preparation
+                // below can wake the outbox without repeating the full scan.
                 detached_send_runtime
                     .recovery_scan_generation
                     .store(authority_generation_after_maintenance, Ordering::Release);
@@ -2691,10 +2704,24 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         Ok(None) => {}
     }
     let promotion_recovery_started = Instant::now();
-    if let Err(error) = recover_daemon_dfs_commit_promotions(&data_dir, &cluster_paths, runtime) {
-        tracing::warn!(
-            "sinomo daemon DFS commit-promotion recovery remains pending; retrying on maintenance: {error}"
-        );
+    match prepare_daemon_dfs_commit_promotion_recovery(&data_dir, &cluster_paths, runtime) {
+        Ok(DaemonDfsCommitPromotionRecovery {
+            detached_runtime,
+            worker,
+            scan_result,
+        }) => {
+            *deferred_work = Some((detached_runtime, worker));
+            if let Err(error) = scan_result {
+                tracing::warn!(
+                    "sinomo daemon DFS commit-promotion recovery scan remains pending; retrying on maintenance: {error}"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "sinomo daemon DFS commit-promotion recovery remains pending; retrying on maintenance: {error}"
+            );
+        }
     }
     daemon_dfs_perf_trace(format_args!(
         "commit-promotion-recovery maintenance_ms={}",
@@ -3480,12 +3507,18 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(DaemonError::from)?;
-        runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
+        let mut deferred_work = None;
+        let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
             data_dir,
             cluster_paths,
             cluster_state,
             runtime.handle(),
-        ))
+            &mut deferred_work,
+        ));
+        if let Some((detached_runtime, worker)) = deferred_work {
+            schedule_daemon_dfs_message_deferred_work(runtime.handle(), detached_runtime, worker);
+        }
+        result
     }
 
     fn daemon_dfs_test_execution_scope(
