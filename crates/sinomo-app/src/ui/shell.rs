@@ -17,9 +17,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use sui::{
-    Align, Alignment, ArrangeCtx, Button, ButtonAppearance, Constraints, ControlSize, Event,
-    EventCtx, EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Image,
-    ImageFit, ImageHandle, Insets, KeyState, Label, MeasureCtx, PaintCtx, PanelSection, Popover,
+    Align, Alignment, ArrangeCtx, Button, ButtonAppearance, Constraints, Event, EventCtx,
+    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Image, ImageFit,
+    ImageHandle, Insets, KeyState, Label, MeasureCtx, PaintCtx, PanelSection, Popover,
     PopoverAlignment, RebuildOnChange, Rect, RichText, ScrollView, SemanticRegion, SemanticTone,
     SemanticsAction, SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole,
     SemanticsValue, SingleChild, Size, SizedBox, Spinner, StatusBadge, Surface, SurfaceAppearance,
@@ -27,7 +27,9 @@ use sui::{
     WindowEvent, WindowRenderOptions,
 };
 
-use crate::state::{ConnectionPhase, HealthIssue, HealthSurface, Shared, Tab};
+#[cfg(test)]
+use crate::state::ShellStatus;
+use crate::state::{ConnectionPhase, HealthIssue, HealthStructureKey, HealthSurface, Shared, Tab};
 use crate::theme::Palette;
 use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
@@ -70,23 +72,16 @@ pub struct Shell {
     /// Stock text widget for the product wordmark. Hidden at the compact breakpoint.
     wordmark: WidgetPod,
     /// The tab strip, composed from a stock `TabBar`. It drives `shared.active_tab` via
-    /// `on_change`; the Shell relayouts the content on the change (see `event`). The widget
-    /// instance is preserved across tab switches so the stock TabBar owns switch animation.
+    /// `on_change`. Both it and the content switcher subscribe to the same reactive source, so
+    /// the widget instance is preserved across tab switches and owns its selector animation.
     tabs: WidgetPod,
-    /// Centered, semantic launch progress composed from stock SUI controls.
-    loading: WidgetPod,
     /// Focusable status trigger plus the unified health/recovery popover. This is a real child
     /// widget (rather than hand-painted shell chrome), so keyboard focus and UI Automation can
     /// reach the trigger, issue rows, and recovery actions.
     health_center: WidgetPod,
-    /// The switchable tab content — built only once the backend connection resolves. `None`
-    /// while connecting, when a loading screen is shown in its place.
-    content: Option<WidgetPod>,
-    /// The active tab last laid out. The `TabBar` flips `shared.active_tab` and requests only a
-    /// repaint, but the content `SwitchView` only measures/arranges its *active* child — so a tab
-    /// switch needs a fresh measure+arrange for the newly-shown view. We diff on `RedrawRequested`
-    /// to catch it while preserving the TabBar instance and its in-flight selector animation.
-    last_tab: Cell<Tab>,
+    /// Reactive loading-to-connected boundary. Once connected, the retained `SwitchView`
+    /// subscribes directly to the active-tab signal.
+    body: WidgetPod,
     compact_tabs: Cell<bool>,
     last_render_options: Cell<Option<WindowRenderOptions>>,
     tab_strip_rect: Rect,
@@ -111,20 +106,23 @@ impl Shell {
         let wordmark = WidgetPod::new(build_wordmark(&shared));
 
         let tabs = WidgetPod::new(build_tab_bar(&shared, false));
-        let loading = WidgetPod::new(build_loading_view(shared.clone()));
         let health_center = WidgetPod::new(HealthCenter::new(shared.clone(), false));
+        let body = {
+            let ready = shared.signals().ready.clone();
+            let body_shared = shared.clone();
+            WidgetPod::new(RebuildOnChange::new_observable(ready, move |ready| {
+                build_shell_body(body_shared.clone(), *ready)
+            }))
+        };
 
-        let initial_tab = shared.active_tab();
-        let mut shell = Self {
+        let shell = Self {
             shared,
             titlebar,
             logo,
             wordmark,
             tabs,
-            loading,
             health_center,
-            content: None,
-            last_tab: Cell::new(initial_tab),
+            body,
             compact_tabs: Cell::new(false),
             last_render_options: Cell::new(None),
             tab_strip_rect: Rect::ZERO,
@@ -132,29 +130,11 @@ impl Shell {
             health_probe_timer: Cell::new(None),
             body_rect: Rect::ZERO,
         };
-        // Built already-ready (headless tooling / visual tests) → show the tabs immediately. The
-        // interactive app builds content when the connection resolves (see `event`).
         if shell.shared.is_ready() {
-            shell.build_content();
             let waker = { shell.shared.borrow().waker.clone() };
             shell.shared.chat_mut().start_session_list_load(waker);
         }
         shell
-    }
-
-    /// Build the switchable tab content. Called once the backend is ready.
-    fn build_content(&mut self) {
-        let content = SwitchView::new()
-            .with_child(chat::view(self.shared.clone()))
-            .with_child(evolution::view(self.shared.clone()))
-            .with_child(cluster::view(self.shared.clone()))
-            .with_child(files::view(self.shared.clone()))
-            .with_child(settings::view(self.shared.clone()))
-            .selected_when({
-                let shared = self.shared.clone();
-                move || shared.active_tab().index()
-            });
-        self.content = Some(WidgetPod::new(content));
     }
 
     fn schedule_connect_status_timer(&self, ctx: &mut EventCtx) {
@@ -252,9 +232,14 @@ impl Shell {
     /// worker owns all reads; this bridge only transfers already-validated
     /// bytes and switches surfaces after the intent is ready.
     fn drain_files_chat_attachment(&self) -> bool {
-        let Some(intent) = self.shared.files_mut().take_ready_attachment_intent() else {
+        let intent = self
+            .shared
+            .files_mut_unpublished()
+            .take_ready_attachment_intent();
+        let Some(intent) = intent else {
             return false;
         };
+        self.shared.publish_files_signals();
         let files::FilesAttachmentIntent {
             file_name,
             bytes,
@@ -302,26 +287,8 @@ impl Shell {
             };
             chat.open_attachment_surface();
         }
-        self.shared.borrow_mut().active_tab = Tab::Sinomo;
+        self.shared.set_active_tab(Tab::Sinomo);
         true
-    }
-
-    fn sync_active_tab(&mut self, ctx: &mut EventCtx) {
-        let current = self.shared.active_tab();
-        if current == self.last_tab.get() {
-            return;
-        }
-        self.last_tab.set(current);
-        if self.shared.is_ready() {
-            self.shared
-                .chat_mut()
-                .sync_media_setup_visibility(current == Tab::Sinomo);
-        }
-        self.start_cluster_refresh_if_active();
-        ctx.request_measure();
-        ctx.request_arrange();
-        ctx.request_semantics();
-        ctx.request_paint();
     }
 
     fn start_cluster_refresh_if_active(&self) -> bool {
@@ -345,9 +312,11 @@ fn build_titlebar_surface(shared: &Shared) -> Surface {
 }
 
 fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
-    let key_shared = shared.clone();
-    RebuildOnChange::new(
-        move || key_shared.theme(),
+    RebuildOnChange::new_observable(
+        shared
+            .signals()
+            .theme
+            .select_named("shell wordmark theme", |theme| *theme),
         move |theme| {
             let mut style = theme.body_text_style();
             style.font_size = theme.text.base.size;
@@ -371,17 +340,17 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> TabBar {
         let s = shared.clone();
         move |index: usize, _label: String| {
             if let Some(tab) = Tab::ALL.get(index).copied() {
-                s.borrow_mut().active_tab = tab;
+                s.set_active_tab(tab);
             }
         }
     };
-    let selected = {
-        let s = shared.clone();
-        move || Some(s.active_tab().index())
-    };
+    let selected = shared
+        .signals()
+        .active_tab
+        .select_named("shell tab selection", |tab| Some(tab.index()));
     TabBar::new("shell-tabs")
         .tabs(labels)
-        .selected_when(selected)
+        .selected_from(selected)
         .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
         .theme_when(tab_bar_theme(shared, compact))
         .on_change(on_change)
@@ -419,50 +388,44 @@ fn tab_label(tab: Tab, compact: bool) -> &'static str {
     }
 }
 
-#[derive(Clone, PartialEq)]
-struct LoadingViewKey {
-    theme: sui::DefaultTheme,
-    status: String,
-    stall_lines: [Option<String>; 2],
-}
-
-fn loading_view_key(shared: &Shared) -> LoadingViewKey {
-    LoadingViewKey {
-        theme: shared.theme(),
-        status: shared.status_text(),
-        stall_lines: loading_stall_lines_for(shared),
+fn build_shell_body(shared: Shared, ready: bool) -> WidgetPod {
+    if !ready {
+        return WidgetPod::new(build_loading_view(shared));
     }
+
+    let selected = shared
+        .signals()
+        .active_tab
+        .select_named("shell content selection", |tab| tab.index());
+    WidgetPod::new(
+        SwitchView::new()
+            .selected_from(selected)
+            .with_child(chat::view(shared.clone()))
+            .with_child(evolution::view(shared.clone()))
+            .with_child(cluster::view(shared.clone()))
+            .with_child(files::view(shared.clone()))
+            .with_child(settings::view(shared)),
+    )
 }
 
-fn build_loading_view(shared: Shared) -> RebuildOnChange<LoadingViewKey> {
-    let key_shared = shared.clone();
-    RebuildOnChange::new(
-        move || loading_view_key(&key_shared),
-        move |key| {
-            let theme = key.theme;
-            let mut status_style = theme.text_style(theme.palette.text_muted);
-            status_style.font_size = theme.text.base.size;
-            status_style.line_height = theme.text.base.line_height;
-            status_style.weight = FontWeight::MEDIUM;
+fn build_loading_view(shared: Shared) -> Surface {
+    let theme = shared.theme();
+    let mut status_style = theme.text_style(theme.palette.text_muted);
+    status_style.font_size = theme.text.base.size;
+    status_style.line_height = theme.text.base.line_height;
+    status_style.weight = FontWeight::MEDIUM;
 
+    let hint_theme = theme;
+    let hints = RebuildOnChange::new_observable(
+        shared.signals().loading_stall_lines.clone(),
+        move |lines| {
+            let mut hint_style = hint_theme.text_style(hint_theme.palette.text_muted);
+            hint_style.font_size = hint_theme.text.xs.size;
+            hint_style.line_height = hint_theme.text.xs.line_height;
             let mut content = Flex::vertical()
-                .main_gap(10.0)
-                .align_items(Alignment::Center)
-                .with_child(
-                    Spinner::new("shell-connecting")
-                        .size(LOADING_SPINNER_SIZE)
-                        .theme(theme),
-                )
-                .with_child(
-                    Label::new(key.status.clone())
-                        .semantic_name("Connection status")
-                        .style(status_style),
-                );
-
-            let mut hint_style = theme.text_style(theme.palette.text_muted);
-            hint_style.font_size = theme.text.xs.size;
-            hint_style.line_height = theme.text.xs.line_height;
-            for line in key.stall_lines.iter().flatten() {
+                .main_gap(4.0)
+                .align_items(Alignment::Center);
+            for line in lines.iter().flatten() {
                 content = content.with_child(
                     SizedBox::new().width(560.0).with_child(
                         RichText::from_plain_text(line.clone(), hint_style.clone())
@@ -470,18 +433,32 @@ fn build_loading_view(shared: Shared) -> RebuildOnChange<LoadingViewKey> {
                     ),
                 );
             }
-
-            WidgetPod::new(
-                Surface::window(Align::center(
-                    SemanticRegion::new("Sinomo launch progress", content)
-                        .description(key.status.clone())
-                        .role(SemanticsRole::GenericContainer),
-                ))
-                .theme(theme)
-                .fill(),
-            )
+            WidgetPod::new(content)
         },
-    )
+    );
+
+    let content = Flex::vertical()
+        .main_gap(10.0)
+        .align_items(Alignment::Center)
+        .with_child(
+            Spinner::new("shell-connecting")
+                .size(LOADING_SPINNER_SIZE)
+                .theme(theme),
+        )
+        .with_child(
+            Label::new(shared.status_text())
+                .text_from(shared.signals().status_text.clone())
+                .semantic_name("Connection status")
+                .style(status_style),
+        )
+        .with_child(hints);
+
+    Surface::window(Align::center(
+        SemanticRegion::new("Sinomo launch progress", content)
+            .role(SemanticsRole::GenericContainer),
+    ))
+    .theme(theme)
+    .fill()
 }
 
 impl Widget for Shell {
@@ -525,12 +502,8 @@ impl Widget for Shell {
         );
 
         let body_h = (size.height - TOPBAR_HEIGHT).max(0.0);
-        if let Some(content) = &mut self.content {
-            content.measure(ctx, Constraints::tight(Size::new(size.width, body_h)));
-        } else {
-            self.loading
-                .measure(ctx, Constraints::tight(Size::new(size.width, body_h)));
-        }
+        self.body
+            .measure(ctx, Constraints::tight(Size::new(size.width, body_h)));
 
         size
     }
@@ -596,21 +569,13 @@ impl Widget for Shell {
         let body_y = bounds.y() + TOPBAR_HEIGHT;
         let body_h = (bounds.height() - TOPBAR_HEIGHT).max(0.0);
         self.body_rect = Rect::new(bounds.x(), body_y, bounds.width(), body_h);
-        if let Some(content) = &mut self.content {
-            content.arrange(ctx, self.body_rect);
-        } else {
-            self.loading.arrange(ctx, self.body_rect);
-        }
+        self.body.arrange(ctx, self.body_rect);
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
         // Content area background, then either the tab content or a loading screen.
         ctx.fill_bounds(self.shared.theme().surfaces.window);
-        if let Some(content) = &self.content {
-            content.paint(ctx);
-        } else {
-            self.loading.paint(ctx);
-        }
+        self.body.paint(ctx);
 
         self.titlebar.paint(ctx);
         self.logo.paint(ctx);
@@ -646,7 +611,8 @@ impl Widget for Shell {
         {
             self.connect_status_timer.set(None);
             if !self.shared.is_ready() {
-                ctx.request_paint();
+                self.shared
+                    .publish_loading_stall_lines(loading_stall_lines_for(&self.shared));
                 self.schedule_connect_status_timer(ctx);
             }
             return;
@@ -662,13 +628,12 @@ impl Widget for Shell {
             return;
         }
         // The background connect thread wakes us via the sui external-wake mechanism; drain its
-        // progress/result here. When the backend arrives, build the tab content and relayout.
+        // progress/result here. The ready signal owns the loading-to-content transition.
         if let Event::Custom(custom) = event {
             if custom.kind.as_str() == sui::EXTERNAL_WAKE_KIND {
                 self.schedule_connect_status_timer(ctx);
-                let (changed, became_ready) = self.shared.pump_connect();
+                let (_changed, became_ready) = self.shared.pump_connect();
                 if became_ready {
-                    self.build_content();
                     let (backend, waker) = {
                         let app = self.shared.borrow();
                         let ready = app.ready.as_ref().expect("ready after connect");
@@ -688,173 +653,81 @@ impl Widget for Shell {
                     }
                     self.schedule_health_probe_timer(ctx);
                     self.start_cluster_refresh_if_active();
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_semantics();
                 }
                 // Drain any in-progress provider device-login (Settings tab).
                 let device_changed = if self.shared.is_ready() {
-                    self.shared.settings_mut().pump_device_login()
+                    self.shared.settings_mut_unpublished().pump_device_login()
                 } else {
                     false
                 };
                 let settings_changed = if self.shared.is_ready() {
-                    self.shared.settings_mut().pump_initial_load()
+                    self.shared.settings_mut_unpublished().pump_initial_load()
                 } else {
                     false
                 };
-                let settings_operations_changed = if self.shared.is_ready() {
+                let _settings_operations_changed = if self.shared.is_ready() {
                     settings::pump_background_operations(&self.shared)
                 } else {
                     false
                 };
                 let evolution_changed = if self.shared.is_ready() {
-                    self.shared.evolution_mut().pump_dashboard_load()
+                    self.shared
+                        .evolution_mut_unpublished()
+                        .pump_dashboard_load()
                 } else {
                     false
                 };
                 let files_changed = if self.shared.is_ready() {
-                    self.shared.files_mut().pump_load()
+                    self.shared.files_mut_unpublished().pump_load()
                 } else {
                     false
                 };
-                let files_attachment_changed =
+                let _files_attachment_changed =
                     self.shared.is_ready() && self.drain_files_chat_attachment();
-                let connection_changed = self.shared.pump_connection_probe();
-                let cluster_changed = self.pump_cluster_refresh();
+                let _connection_changed = self.shared.pump_connection_probe();
+                let _cluster_changed = self.pump_cluster_refresh();
                 let chat_visible = self.shared.active_tab() == Tab::Sinomo;
-                let (chat_changed, chat_semantics_changed, chat_layout_changed) =
-                    if self.shared.is_ready() {
-                        let mut chat = self.shared.chat_mut();
-                        let worker_changed = chat.pump_worker_events();
-                        let providers_changed = chat.pump_provider_list();
-                        let agents_changed = chat.pump_agent_list();
-                        let list_changed = chat.pump_session_list();
-                        let delete_changed = chat.pump_delete();
-                        let media_changed = chat.pump_media_call_runtime();
-                        let media_visibility_changed = if chat_visible {
-                            false
-                        } else {
-                            chat.sync_media_setup_visibility(false)
-                        };
-                        let structural_changed = worker_changed
-                            || providers_changed
-                            || agents_changed
-                            || list_changed
-                            || delete_changed
-                            || media_visibility_changed;
-                        (
-                            structural_changed || media_changed.paint,
-                            structural_changed || media_changed.semantics,
-                            structural_changed || media_changed.layout,
-                        )
-                    } else {
-                        (false, false, false)
-                    };
-                if device_changed
-                    || files_changed
-                    || files_attachment_changed
-                    || connection_changed
-                    || cluster_changed
-                    || chat_layout_changed
-                    || device_changed
-                    || settings_changed
-                    || settings_operations_changed
-                    || evolution_changed
-                {
+                let media_changed = if self.shared.is_ready() {
+                    let mut chat = self.shared.chat_mut();
+                    chat.pump_provider_list();
+                    chat.pump_agent_list();
+                    chat.pump_session_list();
+                    chat.pump_delete();
+                    let media_changed = chat.pump_media_call_runtime();
+                    if !chat_visible {
+                        chat.sync_media_setup_visibility(false);
+                    }
+                    media_changed
+                } else {
+                    Default::default()
+                };
+                if device_changed || settings_changed {
+                    self.shared.publish_settings_signals();
+                }
+                if evolution_changed {
+                    self.shared.publish_evolution_signals();
+                }
+                if files_changed {
+                    self.shared.publish_files_signals();
+                }
+                if media_changed.layout {
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
-                } else if chat_semantics_changed {
+                    ctx.request_paint();
+                } else if media_changed.semantics {
                     ctx.request_semantics();
-                }
-                if changed
-                    || connection_changed
-                    || device_changed
-                    || settings_changed
-                    || settings_operations_changed
-                    || evolution_changed
-                    || files_changed
-                    || files_attachment_changed
-                    || cluster_changed
-                    || chat_changed
-                {
+                    ctx.request_paint();
+                } else if media_changed.paint {
                     ctx.request_paint();
                 }
-                self.sync_active_tab(ctx);
                 self.sync_render_options(ctx);
             }
             return;
         }
-        // The composed `TabBar` flips `shared.active_tab` and requests only a repaint, but the
-        // content `SwitchView` lays out only its active child — so the newly-shown tab view needs a
-        // fresh measure+arrange. Detect the change on the redraw the TabBar triggered and request
-        // the relayout while preserving the TabBar instance and its selector animation.
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             self.schedule_connect_status_timer(ctx);
             self.schedule_health_probe_timer(ctx);
-            let connection_changed = self.shared.pump_connection_probe();
-            let cluster_changed = self.pump_cluster_refresh();
-            let chat_visible = self.shared.active_tab() == Tab::Sinomo;
-            let (chat_changed, chat_semantics_changed, chat_layout_changed) = if self
-                .shared
-                .is_ready()
-            {
-                let mut chat = self.shared.chat_mut();
-                let providers_changed = chat.pump_provider_list();
-                let agents_changed = chat.pump_agent_list();
-                let list_changed = chat.pump_session_list();
-                let media_changed = chat.pump_media_call_runtime();
-                let media_visibility_changed = if chat_visible {
-                    false
-                } else {
-                    chat.sync_media_setup_visibility(false)
-                };
-                let structural_changed =
-                    providers_changed || agents_changed || list_changed || media_visibility_changed;
-                (
-                    structural_changed || media_changed.paint,
-                    structural_changed || media_changed.semantics,
-                    structural_changed || media_changed.layout,
-                )
-            } else {
-                (false, false, false)
-            };
-            let settings_changed = if self.shared.is_ready() {
-                self.shared.settings_mut().pump_initial_load()
-            } else {
-                false
-            };
-            let settings_operations_changed = if self.shared.is_ready() {
-                settings::pump_background_operations(&self.shared)
-            } else {
-                false
-            };
-            let evolution_changed = if self.shared.is_ready() {
-                self.shared.evolution_mut().pump_dashboard_load()
-            } else {
-                false
-            };
-            if connection_changed
-                || cluster_changed
-                || chat_layout_changed
-                || settings_changed
-                || settings_operations_changed
-                || evolution_changed
-            {
-                ctx.request_measure();
-                ctx.request_arrange();
-                ctx.request_semantics();
-                ctx.request_paint();
-            } else {
-                if chat_semantics_changed {
-                    ctx.request_semantics();
-                }
-                if chat_changed {
-                    ctx.request_paint();
-                }
-            }
-            self.sync_active_tab(ctx);
             self.sync_render_options(ctx);
         }
     }
@@ -871,11 +744,7 @@ impl Widget for Shell {
         }
         self.tabs.semantics(ctx);
         self.health_center.semantics(ctx);
-        if let Some(content) = &self.content {
-            content.semantics(ctx);
-        } else {
-            self.loading.semantics(ctx);
-        }
+        self.body.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
@@ -883,11 +752,7 @@ impl Widget for Shell {
         self.logo.visit_children(visitor);
         visitor.visit(&self.wordmark);
         visitor.visit(&self.tabs);
-        if let Some(content) = &self.content {
-            visitor.visit(content);
-        } else {
-            visitor.visit(&self.loading);
-        }
+        visitor.visit(&self.body);
         // Health is painted last and must also be hit-tested last so its open popover receives
         // actions instead of the tab content visually underneath it.
         visitor.visit(&self.health_center);
@@ -899,12 +764,8 @@ impl Widget for Shell {
         visitor.visit(&mut self.wordmark);
         // Forward to the tab strip so pointer / keyboard / focus reach the tabs.
         visitor.visit(&mut self.tabs);
-        // CRITICAL: forward to the content pod so events/focus reach the active tab.
-        if let Some(content) = &mut self.content {
-            visitor.visit(content);
-        } else {
-            visitor.visit(&mut self.loading);
-        }
+        // CRITICAL: forward to the body pod so events/focus reach the active surface.
+        visitor.visit(&mut self.body);
         visitor.visit(&mut self.health_center);
     }
 }
@@ -953,19 +814,7 @@ struct HealthActionItem {
     enabled: bool,
 }
 
-#[derive(Clone, PartialEq)]
-struct HealthCenterKey {
-    theme: sui::DefaultTheme,
-    status: ShellStatus,
-    issues: Vec<HealthIssue>,
-    connection_label: String,
-    connection_detail: String,
-    connection_phase: ConnectionPhase,
-    connection_pending: bool,
-    _evolution_pending: bool,
-    action_error: Option<String>,
-    ready: bool,
-}
+type HealthCenterKey = HealthStructureKey;
 
 /// Controlled stock-SUI health popover. Recovery authority remains in each owning app surface.
 struct HealthCenter {
@@ -981,25 +830,24 @@ impl HealthCenter {
         let open = Rc::new(Cell::new(false));
         let focused_action = Rc::new(Cell::new(0));
         let action_error = Rc::new(RefCell::new(None));
-        let key_shared = shared.clone();
-        let key_error = Rc::clone(&action_error);
+        let source = shared
+            .signals()
+            .health_structure
+            .select_named("shell health center structure", Clone::clone);
         let build_shared = shared.clone();
         let build_open = Rc::clone(&open);
         let build_focus = Rc::clone(&focused_action);
         let build_error = Rc::clone(&action_error);
-        let child = RebuildOnChange::new(
-            move || health_center_key(&key_shared, &key_error),
-            move |key| {
-                build_health_center_tree(
-                    build_shared.clone(),
-                    key,
-                    compact,
-                    Rc::clone(&build_open),
-                    Rc::clone(&build_focus),
-                    Rc::clone(&build_error),
-                )
-            },
-        );
+        let child = RebuildOnChange::new_observable(source, move |key| {
+            build_health_center_tree(
+                build_shared.clone(),
+                key,
+                compact,
+                Rc::clone(&build_open),
+                Rc::clone(&build_focus),
+                Rc::clone(&build_error),
+            )
+        });
         Self {
             shared,
             open,
@@ -1034,6 +882,7 @@ impl Widget for HealthCenter {
                 self.open.set(false);
                 self.focused_action.set(0);
                 self.action_error.borrow_mut().take();
+                self.shared.publish_health_action_error(None);
             }
             "ArrowDown" | "ArrowRight" => self.move_focus(1, actions.len()),
             "ArrowUp" | "ArrowLeft" => self.move_focus(-1, actions.len()),
@@ -1079,24 +928,6 @@ impl Widget for HealthCenter {
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         self.child.visit_children_mut(visitor);
-    }
-}
-
-fn health_center_key(shared: &Shared, error: &Rc<RefCell<Option<String>>>) -> HealthCenterKey {
-    let ready = shared.is_ready();
-    let health = shared.connection_health();
-    let connection_pending = health.is_pending();
-    HealthCenterKey {
-        theme: shared.theme().with_size(ControlSize::Small),
-        status: shell_status(shared),
-        issues: shared.health_issues(),
-        connection_label: health.label,
-        connection_detail: health.detail,
-        connection_phase: health.phase,
-        connection_pending,
-        _evolution_pending: ready && shared.evolution().dashboard_refresh_pending(),
-        action_error: error.borrow().clone(),
-        ready,
     }
 }
 
@@ -1728,6 +1559,7 @@ fn activate_health_action_with_ctx(
         open.set(false);
         focused.set(0);
     }
+    shared.publish_health_action_error(error.borrow().clone());
     request_health_refresh(ctx);
 }
 
@@ -1768,25 +1600,27 @@ fn activate_health_action(
 }
 
 fn open_health_surface(shared: &Shared, surface: HealthSurface) {
-    let mut app = shared.borrow_mut();
-    match surface {
+    let tab = match surface {
         HealthSurface::Connection => {
-            app.active_tab = Tab::Settings;
-            if let Some(ready) = app.ready.as_mut() {
-                ready.settings.open(settings::SettingsSection::Connection);
+            if shared.is_ready() {
+                shared
+                    .settings_mut()
+                    .open(settings::SettingsSection::Connection);
             }
+            Tab::Settings
         }
-        HealthSurface::Chat => app.active_tab = Tab::Sinomo,
-        HealthSurface::Files => app.active_tab = Tab::Files,
-        HealthSurface::Cluster => app.active_tab = Tab::Cluster,
-        HealthSurface::Evolution => app.active_tab = Tab::Evolution,
+        HealthSurface::Chat => Tab::Sinomo,
+        HealthSurface::Files => Tab::Files,
+        HealthSurface::Cluster => Tab::Cluster,
+        HealthSurface::Evolution => Tab::Evolution,
         HealthSurface::Settings(section) => {
-            app.active_tab = Tab::Settings;
-            if let Some(ready) = app.ready.as_mut() {
-                ready.settings.open(section);
+            if shared.is_ready() {
+                shared.settings_mut().open(section);
             }
+            Tab::Settings
         }
-    }
+    };
+    shared.set_active_tab(tab);
 }
 
 fn retry_health_surface(shared: &Shared, surface: HealthSurface) {
@@ -2146,60 +1980,9 @@ fn brand_word_width() -> f32 {
     84.0
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ShellStatus {
-    label: String,
-    detail: String,
-    degraded: bool,
-    connected_daemon: bool,
-}
-
+#[cfg(test)]
 fn shell_status(shared: &Shared) -> ShellStatus {
-    let state = shared.borrow();
-    let Some(_) = state.ready.as_ref() else {
-        let status = state.status.clone();
-        return ShellStatus {
-            label: status.clone(),
-            detail: status,
-            degraded: false,
-            connected_daemon: false,
-        };
-    };
-    let health = state.connection_health.clone();
-    drop(state);
-    let issues = shared.health_issues();
-
-    if issues.is_empty() {
-        ShellStatus {
-            label: health.label,
-            detail: health.detail,
-            degraded: false,
-            connected_daemon: health.phase.is_connected(),
-        }
-    } else {
-        let count = issues.len();
-        ShellStatus {
-            label: if count == 1 {
-                "Needs attention".to_string()
-            } else {
-                format!("{count} issues")
-            },
-            detail: if count == 1 {
-                issues[0].detail.clone()
-            } else {
-                format!(
-                    "{count} app surfaces need attention: {}",
-                    issues
-                        .iter()
-                        .map(|issue| format!("{}: {}", issue.title, issue.detail))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                )
-            },
-            degraded: true,
-            connected_daemon: health.phase.is_connected(),
-        }
-    }
+    shared.signals().health_structure.get().status
 }
 
 #[cfg(test)]

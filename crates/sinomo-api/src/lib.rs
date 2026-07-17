@@ -43,6 +43,7 @@ pub const DAEMON_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/object-rpc/forward";
 pub const DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/dfs/object-rpc/forward";
 pub const DAEMON_EVENT_SUBSCRIBE_ROUTE: &str = "/daemon/events/subscribe";
 pub const DFS_NAMESPACE_CHANGED_EVENT_KIND: &str = "dfs.namespace.changed";
+pub const DFS_PLACEMENT_CHANGED_EVENT_KIND: &str = "dfs.placement.changed";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
@@ -98,6 +99,14 @@ impl DaemonEventSubscribeRequest {
     pub fn for_path_prefix(path_prefix: impl Into<String>) -> Self {
         Self {
             event_kind_prefixes: vec![DFS_NAMESPACE_CHANGED_EVENT_KIND.to_string()],
+            path_prefixes: vec![path_prefix.into()],
+        }
+    }
+
+    /// Subscribe to namespace and placement changes beneath one DFS path.
+    pub fn for_dfs_path_prefix(path_prefix: impl Into<String>) -> Self {
+        Self {
+            event_kind_prefixes: vec!["dfs.".to_string()],
             path_prefixes: vec![path_prefix.into()],
         }
     }
@@ -250,6 +259,10 @@ pub struct DaemonDfsBrowserListRequest {
     pub offset: usize,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Include compact, row-oriented metadata with each entry. This avoids a stat RPC per visible
+    /// row while keeping filesystem adapters that need only names and kinds lightweight.
+    #[serde(default)]
+    pub include_metadata: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -267,6 +280,19 @@ pub struct DaemonDfsBrowserEntry {
     pub path: String,
     pub kind: sinomo_dfs::DfsObjectKind,
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<DaemonDfsBrowserEntryMetadata>,
+}
+
+/// Compact visible-version metadata suitable for one directory-list row.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserEntryMetadata {
+    pub object_id: String,
+    pub version: String,
+    pub modified_at_unix_nanos: u64,
+    pub policy: sinomo_core::DfsObjectPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_locations: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -548,6 +574,22 @@ pub struct DaemonLocalConnectivityReloadResponse;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dfs_subscription_covers_namespace_and_placement_events() {
+        let request = DaemonEventSubscribeRequest::for_dfs_path_prefix("/users/project");
+        assert_eq!(request.event_kind_prefixes, vec!["dfs."]);
+        assert_eq!(request.path_prefixes, vec!["/users/project"]);
+    }
+
+    #[test]
+    fn older_browser_list_requests_default_to_lightweight_entries() {
+        let request: DaemonDfsBrowserListRequest = serde_json::from_value(serde_json::json!({
+            "path": "/users"
+        }))
+        .expect("decode legacy list request");
+        assert!(!request.include_metadata);
+    }
 
     #[test]
     fn conditional_replace_has_a_dedicated_fail_closed_route() {

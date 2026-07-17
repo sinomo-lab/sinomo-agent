@@ -372,6 +372,7 @@ impl VfsBackend for DaemonSifsVfsBackend {
                 sort_direction: sinomo_api::DaemonDfsBrowserSortDirection::Ascending,
                 offset: 0,
                 limit: None,
+                include_metadata: false,
             },
         )?;
         Ok(response

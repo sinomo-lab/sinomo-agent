@@ -97,6 +97,15 @@ pub struct DfsDirEntry {
     pub path: String,
     pub kind: DfsObjectKind,
     pub object_id: DfsObjectId,
+    /// The visible object version captured with the directory page.
+    pub version: DfsVersion,
+    /// Best-effort visible content length. Directory listing remains available if an older or
+    /// partially repaired version record cannot supply a size yet.
+    pub size_bytes: Option<u64>,
+    pub modified_at_unix_nanos: u64,
+    pub policy: DfsObjectPolicy,
+    /// Nodes with a durable copy of this exact visible version.
+    pub current_locations: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

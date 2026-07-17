@@ -7,24 +7,27 @@
 //! the backend arrives, populates [`ReadyState`] and builds the tab content.
 
 use std::cell::{Ref, RefCell, RefMut};
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Instant;
 
-use sui::{DefaultTheme, WindowRenderOptions};
+use sui::{DefaultTheme, Signal, WindowRenderOptions};
 
 use sinomo_runtime::{api::DaemonStatus, local::SinomoDataDir};
 
 use crate::backend::{Backend, Connection, app_config, probe_runtime_connection};
 use crate::rendering::{AppRenderMode, resolve_render_options};
 use crate::theme::{AppTextScale, AppThemeMode, resolve_theme_with_preferences};
-use crate::ui::chat::ChatState;
-use crate::ui::cluster::ClusterState;
-use crate::ui::evolution::EvolutionState;
-use crate::ui::files::FilesState;
-use crate::ui::settings::{SettingsSection, SettingsState};
+use crate::ui::chat::{ChatState, ChatStructureKey};
+use crate::ui::cluster::{ClusterState, ClusterStructureKey};
+use crate::ui::evolution::{EvolutionState, EvolutionStructureKey};
+use crate::ui::files::{FilesState, FilesStructureKey};
+use crate::ui::settings::{
+    SettingsSection, SettingsState, SettingsStructureKey, settings_structure_key,
+};
 
 /// The top-level destinations shown in the title bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,56 +385,276 @@ impl AppState {
 
 /// Cheap, cloneable handle to the shared application state.
 #[derive(Clone)]
-pub struct Shared(Rc<RefCell<AppState>>);
+pub struct Shared {
+    state: Rc<RefCell<AppState>>,
+    signals: Rc<AppSignals>,
+}
+
+/// Small, equality-deduplicated projections consumed by retained UI widgets.
+///
+/// [`AppState`] remains the domain source of truth. These signals only mirror values that the UI
+/// needs to subscribe to directly, plus typed structural projections for retained surface
+/// boundaries.
+#[derive(Clone)]
+pub struct AppSignals {
+    pub active_tab: Signal<Tab>,
+    pub ready: Signal<bool>,
+    pub status_text: Signal<String>,
+    pub connection: Signal<ConnectionHealthView>,
+    pub theme: Signal<DefaultTheme>,
+    pub health_structure: Signal<HealthStructureKey>,
+    pub loading_stall_lines: Signal<[Option<String>; 2]>,
+    pub cluster_structure: Signal<ClusterStructureKey>,
+    pub evolution_structure: Signal<EvolutionStructureKey>,
+    pub evolution_objective_revision: Signal<u64>,
+    pub evolution_scope_revision: Signal<u64>,
+    pub files_structure: Signal<FilesStructureKey>,
+    pub settings_structure: Signal<SettingsStructureKey>,
+    pub chat_structure: Signal<ChatStructureKey>,
+}
+
+impl AppSignals {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            active_tab: Signal::named("app active tab", state.active_tab),
+            ready: Signal::named("app ready", state.is_ready()),
+            status_text: Signal::named("app status text", status_text_for(state)),
+            connection: Signal::named(
+                "app connection health",
+                ConnectionHealthView::from(&state.connection_health),
+            ),
+            theme: Signal::named("app theme", state.theme()),
+            health_structure: Signal::named(
+                "app health center structure",
+                HealthStructureKey::basic(state),
+            ),
+            loading_stall_lines: Signal::named("app loading stall lines", [None, None]),
+            cluster_structure: Signal::named(
+                "cluster structure",
+                ClusterStructureKey::new(
+                    state.theme(),
+                    state.ready.as_ref().map(|ready| &ready.cluster),
+                ),
+            ),
+            evolution_structure: Signal::named(
+                "evolution structure",
+                EvolutionStructureKey::new(
+                    state.theme_mode,
+                    state.text_scale,
+                    state.ready.as_ref().map(|ready| &ready.evolution),
+                ),
+            ),
+            evolution_objective_revision: Signal::named(
+                "evolution objective replacement",
+                state
+                    .ready
+                    .as_ref()
+                    .map(|ready| ready.evolution.editor_revisions().0)
+                    .unwrap_or_default(),
+            ),
+            evolution_scope_revision: Signal::named(
+                "evolution scope replacement",
+                state
+                    .ready
+                    .as_ref()
+                    .map(|ready| ready.evolution.editor_revisions().1)
+                    .unwrap_or_default(),
+            ),
+            files_structure: Signal::named(
+                "files structure",
+                FilesStructureKey::new(
+                    state.theme_mode,
+                    state.text_scale,
+                    state.ready.as_ref().map(|ready| &ready.files),
+                ),
+            ),
+            settings_structure: Signal::named("settings structure", SettingsStructureKey::empty()),
+            chat_structure: Signal::named(
+                "chat structure",
+                ChatStructureKey::new(
+                    state.theme_mode,
+                    state.text_scale,
+                    state.ready.as_ref().map(|ready| &ready.chat),
+                ),
+            ),
+        }
+    }
+}
+
+/// UI-facing connection snapshot. Timing and request bookkeeping remain in [`ConnectionHealth`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionHealthView {
+    pub phase: ConnectionPhase,
+    pub label: String,
+    pub detail: String,
+    pub pending: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellStatus {
+    pub label: String,
+    pub detail: String,
+    pub degraded: bool,
+    pub connected_daemon: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HealthStructureKey {
+    pub theme: DefaultTheme,
+    pub status: ShellStatus,
+    pub issues: Vec<HealthIssue>,
+    pub connection_label: String,
+    pub connection_detail: String,
+    pub connection_phase: ConnectionPhase,
+    pub connection_pending: bool,
+    pub evolution_pending: bool,
+    pub action_error: Option<String>,
+    pub ready: bool,
+}
+
+impl HealthStructureKey {
+    fn basic(state: &AppState) -> Self {
+        let ready = state.is_ready();
+        let health = &state.connection_health;
+        Self {
+            theme: state.theme().with_size(sui::ControlSize::Small),
+            status: ShellStatus {
+                label: status_text_for(state),
+                detail: if ready {
+                    health.detail.clone()
+                } else {
+                    state.status.clone()
+                },
+                degraded: false,
+                connected_daemon: ready && health.phase.is_connected(),
+            },
+            issues: Vec::new(),
+            connection_label: health.label.clone(),
+            connection_detail: health.detail.clone(),
+            connection_phase: health.phase,
+            connection_pending: health.is_pending(),
+            evolution_pending: false,
+            action_error: None,
+            ready,
+        }
+    }
+}
+
+impl From<&ConnectionHealth> for ConnectionHealthView {
+    fn from(health: &ConnectionHealth) -> Self {
+        Self {
+            phase: health.phase,
+            label: health.label.clone(),
+            detail: health.detail.clone(),
+            pending: health.is_pending(),
+            last_error: health.last_error.clone(),
+        }
+    }
+}
+
+/// Mutable state guard that publishes its UI projection only after releasing the `RefMut`.
+pub struct PublishedRefMut<'a, T> {
+    value: Option<RefMut<'a, T>>,
+    publish: Option<Box<dyn FnOnce() + 'a>>,
+}
+
+impl<'a, T> PublishedRefMut<'a, T> {
+    fn new(value: RefMut<'a, T>, publish: impl FnOnce() + 'a) -> Self {
+        Self {
+            value: Some(value),
+            publish: Some(Box::new(publish)),
+        }
+    }
+}
+
+impl<T> Deref for PublishedRefMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .as_deref()
+            .expect("published state guard is live")
+    }
+}
+
+impl<T> DerefMut for PublishedRefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+            .as_deref_mut()
+            .expect("published state guard is live")
+    }
+}
+
+impl<T> Drop for PublishedRefMut<'_, T> {
+    fn drop(&mut self) {
+        drop(self.value.take());
+        if let Some(publish) = self.publish.take() {
+            publish();
+        }
+    }
+}
 
 impl Shared {
     pub fn new(state: AppState) -> Self {
-        Self(Rc::new(RefCell::new(state)))
+        let signals = Rc::new(AppSignals::from_state(&state));
+        let shared = Self {
+            state: Rc::new(RefCell::new(state)),
+            signals,
+        };
+        if shared.is_ready() {
+            shared.publish_all_surface_signals();
+        }
+        shared.publish_health_signals();
+        shared
     }
 
     pub fn borrow(&self) -> Ref<'_, AppState> {
-        self.0.borrow()
+        self.state.borrow()
     }
 
-    pub fn borrow_mut(&self) -> RefMut<'_, AppState> {
-        self.0.borrow_mut()
+    pub fn borrow_mut(&self) -> PublishedRefMut<'_, AppState> {
+        let shared = self.clone();
+        PublishedRefMut::new(self.state.borrow_mut(), move || {
+            shared.publish_shell_signals();
+        })
+    }
+
+    pub fn signals(&self) -> &AppSignals {
+        &self.signals
     }
 
     pub fn theme(&self) -> DefaultTheme {
-        self.0.borrow().theme()
+        self.state.borrow().theme()
     }
 
     pub fn render_options(&self) -> WindowRenderOptions {
-        self.0.borrow().render_options()
+        self.state.borrow().render_options()
     }
 
     pub fn render_mode(&self) -> AppRenderMode {
-        self.0.borrow().render_mode
+        self.state.borrow().render_mode
     }
 
     pub fn active_tab(&self) -> Tab {
-        self.0.borrow().active_tab
+        self.state.borrow().active_tab
     }
 
     /// Whether the backend connection has resolved (tabs are interactive).
     pub fn is_ready(&self) -> bool {
-        self.0.borrow().is_ready()
+        self.state.borrow().is_ready()
     }
 
     /// Text for the title-bar status indicator: the daemon mode once connected, otherwise the
     /// live connection progress.
     pub fn status_text(&self) -> String {
-        let state = self.0.borrow();
-        match &state.ready {
-            Some(_) => state.connection_health.label.clone(),
-            None => state.status.clone(),
-        }
+        status_text_for(&self.state.borrow())
     }
 
     /// Seconds the current launch step has been in flight (`None` once ready). The
     /// loading screen uses this to surface a stalled step.
     pub fn status_elapsed_secs(&self) -> Option<u64> {
-        let state = self.0.borrow();
+        let state = self.state.borrow();
         if state.ready.is_some() {
             return None;
         }
@@ -440,7 +663,7 @@ impl Shared {
 
     /// One-line connection detail (daemon address/cluster once connected, else progress).
     pub fn status_detail(&self) -> String {
-        let state = self.0.borrow();
+        let state = self.state.borrow();
         match &state.ready {
             Some(_) => state.connection_health.detail.clone(),
             None => state.status.clone(),
@@ -451,63 +674,302 @@ impl Shared {
     /// shell builds the tab views only after the connection resolves, so callers (the views)
     /// never run before then.
     pub fn chat(&self) -> Ref<'_, ChatState> {
-        Ref::map(self.0.borrow(), |s| {
+        Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").chat
         })
     }
 
-    pub fn chat_mut(&self) -> RefMut<'_, ChatState> {
-        RefMut::map(self.0.borrow_mut(), |s| {
-            &mut s.ready.as_mut().expect("app is ready").chat
-        })
+    pub fn chat_mut(&self) -> PublishedRefMut<'_, ChatState> {
+        let shared = self.clone();
+        PublishedRefMut::new(
+            RefMut::map(self.state.borrow_mut(), |s| {
+                &mut s.ready.as_mut().expect("app is ready").chat
+            }),
+            move || shared.publish_chat_signals(),
+        )
     }
 
     pub fn evolution(&self) -> Ref<'_, EvolutionState> {
-        Ref::map(self.0.borrow(), |s| {
+        Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").evolution
         })
     }
 
-    pub fn evolution_mut(&self) -> RefMut<'_, EvolutionState> {
-        RefMut::map(self.0.borrow_mut(), |s| {
-            &mut s.ready.as_mut().expect("app is ready").evolution
+    pub fn evolution_mut(&self) -> PublishedRefMut<'_, EvolutionState> {
+        let shared = self.clone();
+        PublishedRefMut::new(
+            RefMut::map(self.state.borrow_mut(), |s| {
+                &mut s.ready.as_mut().expect("app is ready").evolution
+            }),
+            move || shared.publish_evolution_signals(),
+        )
+    }
+
+    pub(crate) fn evolution_mut_unpublished(&self) -> RefMut<'_, EvolutionState> {
+        RefMut::map(self.state.borrow_mut(), |state| {
+            &mut state.ready.as_mut().expect("app is ready").evolution
         })
     }
 
     pub fn files(&self) -> Ref<'_, FilesState> {
-        Ref::map(self.0.borrow(), |s| {
+        Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").files
         })
     }
 
-    pub fn files_mut(&self) -> RefMut<'_, FilesState> {
-        RefMut::map(self.0.borrow_mut(), |s| {
-            &mut s.ready.as_mut().expect("app is ready").files
+    pub fn files_mut(&self) -> PublishedRefMut<'_, FilesState> {
+        let shared = self.clone();
+        PublishedRefMut::new(
+            RefMut::map(self.state.borrow_mut(), |s| {
+                &mut s.ready.as_mut().expect("app is ready").files
+            }),
+            move || shared.publish_files_signals(),
+        )
+    }
+
+    pub(crate) fn files_mut_unpublished(&self) -> RefMut<'_, FilesState> {
+        RefMut::map(self.state.borrow_mut(), |state| {
+            &mut state.ready.as_mut().expect("app is ready").files
         })
     }
 
     pub fn cluster(&self) -> Ref<'_, ClusterState> {
-        Ref::map(self.0.borrow(), |s| {
+        Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").cluster
         })
     }
 
-    pub fn cluster_mut(&self) -> RefMut<'_, ClusterState> {
-        RefMut::map(self.0.borrow_mut(), |s| {
-            &mut s.ready.as_mut().expect("app is ready").cluster
-        })
+    pub fn cluster_mut(&self) -> PublishedRefMut<'_, ClusterState> {
+        let shared = self.clone();
+        PublishedRefMut::new(
+            RefMut::map(self.state.borrow_mut(), |s| {
+                &mut s.ready.as_mut().expect("app is ready").cluster
+            }),
+            move || shared.publish_cluster_signals(),
+        )
     }
 
     pub fn settings(&self) -> Ref<'_, SettingsState> {
-        Ref::map(self.0.borrow(), |s| {
+        Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").settings
         })
     }
 
-    pub fn settings_mut(&self) -> RefMut<'_, SettingsState> {
-        RefMut::map(self.0.borrow_mut(), |s| {
-            &mut s.ready.as_mut().expect("app is ready").settings
+    pub fn settings_mut(&self) -> PublishedRefMut<'_, SettingsState> {
+        let shared = self.clone();
+        PublishedRefMut::new(
+            RefMut::map(self.state.borrow_mut(), |s| {
+                &mut s.ready.as_mut().expect("app is ready").settings
+            }),
+            move || shared.publish_settings_signals(),
+        )
+    }
+
+    pub(crate) fn settings_mut_unpublished(&self) -> RefMut<'_, SettingsState> {
+        RefMut::map(self.state.borrow_mut(), |state| {
+            &mut state.ready.as_mut().expect("app is ready").settings
         })
+    }
+
+    /// Change the active application surface and perform its activation side effects as one
+    /// action. Signal delivery happens only after every mutable application-state borrow is
+    /// released.
+    pub fn set_active_tab(&self, tab: Tab) -> bool {
+        let changed = {
+            let mut state = self.state.borrow_mut();
+            if state.active_tab == tab {
+                false
+            } else {
+                state.active_tab = tab;
+                true
+            }
+        };
+        if !changed {
+            return false;
+        }
+
+        if self.is_ready() {
+            self.chat_mut()
+                .sync_media_setup_visibility(tab == Tab::Sinomo);
+            if tab == Tab::Cluster {
+                crate::ui::cluster::request_refresh(self);
+            }
+        }
+        self.signals.active_tab.set(tab);
+        true
+    }
+
+    pub fn publish_loading_stall_lines(&self, lines: [Option<String>; 2]) {
+        self.signals.loading_stall_lines.set(lines);
+    }
+
+    pub fn publish_cluster_signals(&self) {
+        let key = {
+            let state = self.state.borrow();
+            ClusterStructureKey::new(
+                state.theme(),
+                state.ready.as_ref().map(|ready| &ready.cluster),
+            )
+        };
+        if self.signals.cluster_structure.set(key) {
+            self.publish_health_signals();
+        }
+    }
+
+    pub fn publish_evolution_signals(&self) {
+        let (objective_revision, scope_revision, structure) = {
+            let state = self.state.borrow();
+            let revisions = state
+                .ready
+                .as_ref()
+                .map(|ready| ready.evolution.editor_revisions())
+                .unwrap_or_default();
+            (
+                revisions.0,
+                revisions.1,
+                EvolutionStructureKey::new(
+                    state.theme_mode,
+                    state.text_scale,
+                    state.ready.as_ref().map(|ready| &ready.evolution),
+                ),
+            )
+        };
+        self.signals
+            .evolution_objective_revision
+            .set(objective_revision);
+        self.signals.evolution_scope_revision.set(scope_revision);
+        if self.signals.evolution_structure.set(structure) {
+            self.publish_health_signals();
+        }
+    }
+
+    pub fn publish_files_signals(&self) {
+        let structure = {
+            let state = self.state.borrow();
+            FilesStructureKey::new(
+                state.theme_mode,
+                state.text_scale,
+                state.ready.as_ref().map(|ready| &ready.files),
+            )
+        };
+        if self.signals.files_structure.set(structure) {
+            self.publish_health_signals();
+        }
+    }
+
+    pub fn publish_settings_signals(&self) {
+        let key = settings_structure_key(self);
+        if self.signals.settings_structure.set(key) {
+            self.publish_health_signals();
+        }
+    }
+
+    pub fn publish_chat_signals(&self) {
+        let key = {
+            let state = self.state.borrow();
+            ChatStructureKey::new(
+                state.theme_mode,
+                state.text_scale,
+                state.ready.as_ref().map(|ready| &ready.chat),
+            )
+        };
+        if self.signals.chat_structure.set(key) {
+            self.publish_health_signals();
+        }
+    }
+
+    pub fn publish_health_action_error(&self, action_error: Option<String>) {
+        self.publish_health_signals_with_error(action_error);
+    }
+
+    fn publish_health_signals(&self) {
+        let action_error = self.signals.health_structure.get().action_error;
+        self.publish_health_signals_with_error(action_error);
+    }
+
+    fn publish_health_signals_with_error(&self, action_error: Option<String>) {
+        let issues = self.health_issues();
+        let (
+            theme,
+            ready,
+            connection_label,
+            connection_detail,
+            connection_phase,
+            connection_pending,
+            evolution_pending,
+            status,
+        ) = {
+            let state = self.state.borrow();
+            let health = &state.connection_health;
+            (
+                state.theme().with_size(sui::ControlSize::Small),
+                state.is_ready(),
+                health.label.clone(),
+                health.detail.clone(),
+                health.phase,
+                health.is_pending(),
+                state
+                    .ready
+                    .as_ref()
+                    .is_some_and(|ready| ready.evolution.dashboard_refresh_pending()),
+                shell_status_for(&state, &issues),
+            )
+        };
+        self.signals.health_structure.set(HealthStructureKey {
+            theme,
+            status,
+            issues,
+            connection_label,
+            connection_detail,
+            connection_phase,
+            connection_pending,
+            evolution_pending,
+            action_error,
+            ready,
+        });
+    }
+
+    fn publish_all_surface_signals(&self) {
+        if !self.is_ready() {
+            return;
+        }
+        self.publish_cluster_signals();
+        self.publish_evolution_signals();
+        self.publish_files_signals();
+        self.publish_settings_signals();
+        self.publish_chat_signals();
+    }
+
+    fn publish_shell_signals(&self) {
+        let (active_tab, ready, status_text, connection, theme) = {
+            let state = self.state.borrow();
+            (
+                state.active_tab,
+                state.is_ready(),
+                status_text_for(&state),
+                ConnectionHealthView::from(&state.connection_health),
+                state.theme(),
+            )
+        };
+        self.signals.active_tab.set(active_tab);
+        self.signals.ready.set(ready);
+        self.signals.status_text.set(status_text);
+        self.signals.connection.set(connection);
+        self.signals.theme.set(theme);
+        self.publish_health_signals();
+    }
+
+    fn publish_connection_signals(&self) {
+        let (status_text, connection) = {
+            let state = self.state.borrow();
+            (
+                status_text_for(&state),
+                ConnectionHealthView::from(&state.connection_health),
+            )
+        };
+        self.signals.status_text.set(status_text);
+        self.signals.connection.set(connection);
+        self.publish_health_signals();
     }
 
     /// Drain pending connect events (called by the shell when the UI is woken). Updates the
@@ -517,7 +979,7 @@ impl Shared {
     pub fn pump_connect(&self) -> (bool, bool) {
         // Drain without holding the borrow across ReadyState construction (which itself borrows).
         let events: Vec<ConnectEvent> = {
-            let state = self.0.borrow();
+            let state = self.state.borrow();
             match &state.connect_rx {
                 Some(rx) => rx.try_iter().collect(),
                 None => Vec::new(),
@@ -529,13 +991,15 @@ impl Shared {
 
         let mut changed = false;
         let mut became_ready = false;
+        let mut loading_step_changed = false;
         for event in events {
             match event {
                 ConnectEvent::Status(status) => {
-                    let mut state = self.0.borrow_mut();
+                    let mut state = self.state.borrow_mut();
                     if state.status != status {
                         state.status = status;
                         state.status_since = Some(Instant::now());
+                        loading_step_changed = true;
                     }
                     changed = true;
                 }
@@ -545,7 +1009,7 @@ impl Shared {
                     let text_scale = app_config::load_text_scale(&data_dir);
                     let render_mode = app_config::load_render_mode(&data_dir);
                     let connection_health = ConnectionHealth::from_backend(&ready.backend);
-                    let mut state = self.0.borrow_mut();
+                    let mut state = self.state.borrow_mut();
                     state.theme_mode = theme_mode;
                     state.text_scale = text_scale;
                     state.render_mode = render_mode;
@@ -560,11 +1024,18 @@ impl Shared {
                 }
             }
         }
+        if became_ready {
+            self.publish_all_surface_signals();
+        }
+        if loading_step_changed {
+            self.publish_loading_stall_lines([None, None]);
+        }
+        self.publish_shell_signals();
         (changed, became_ready)
     }
 
     pub fn connection_health(&self) -> ConnectionHealth {
-        self.0.borrow().connection_health.clone()
+        self.state.borrow().connection_health.clone()
     }
 
     /// Start a short daemon probe on a named background thread. Explicit probes are user-visible
@@ -573,7 +1044,7 @@ impl Shared {
     pub fn request_connection_probe(&self, explicit: bool) -> bool {
         let (tx, rx) = mpsc::channel();
         let (request_id, data_dir, address, waker) = {
-            let mut state = self.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
             if state.ready.is_none()
                 || state.connection_health.pending_request_id.is_some()
                 || (!explicit
@@ -602,6 +1073,7 @@ impl Shared {
             state.connection_probe_rx = Some(rx);
             (request_id, data_dir, address, waker)
         };
+        self.publish_connection_signals();
 
         let spawn = thread::Builder::new()
             .name("sinomo-app-connection-probe".to_string())
@@ -617,16 +1089,19 @@ impl Shared {
 
         if let Err(error) = spawn {
             let detail = format!("could not start connection probe: {error}");
-            let mut state = self.0.borrow_mut();
-            if state.connection_health.pending_request_id == Some(request_id) {
-                state.connection_health.pending_request_id = None;
-                state.connection_health.pending_explicit = false;
-                state.connection_health.phase = ConnectionPhase::Offline;
-                state.connection_health.label = "Reconnect failed".to_string();
-                state.connection_health.detail = detail.clone();
-                state.connection_health.last_error = Some(detail);
-                state.connection_probe_rx = None;
+            {
+                let mut state = self.state.borrow_mut();
+                if state.connection_health.pending_request_id == Some(request_id) {
+                    state.connection_health.pending_request_id = None;
+                    state.connection_health.pending_explicit = false;
+                    state.connection_health.phase = ConnectionPhase::Offline;
+                    state.connection_health.label = "Reconnect failed".to_string();
+                    state.connection_health.detail = detail.clone();
+                    state.connection_health.last_error = Some(detail);
+                    state.connection_probe_rx = None;
+                }
             }
+            self.publish_connection_signals();
             return false;
         }
         true
@@ -637,7 +1112,7 @@ impl Shared {
     /// `Offline`. A later successful probe clears the recoverable error and returns to `Online`.
     pub fn pump_connection_probe(&self) -> bool {
         let event = {
-            let state = self.0.borrow();
+            let state = self.state.borrow();
             let Some(rx) = state.connection_probe_rx.as_ref() else {
                 return false;
             };
@@ -659,79 +1134,89 @@ impl Shared {
     }
 
     fn apply_connection_probe_event(&self, event: ConnectionProbeEvent) -> bool {
-        let mut state = self.0.borrow_mut();
-        if state.connection_health.pending_request_id != Some(event.request_id) {
-            return false;
-        }
-        let explicit = state.connection_health.pending_explicit;
-        state.connection_health.pending_request_id = None;
-        state.connection_health.pending_explicit = false;
-        state.connection_health.last_checked_at = Some(Instant::now());
-        state.connection_probe_rx = None;
+        {
+            let mut state = self.state.borrow_mut();
+            if state.connection_health.pending_request_id != Some(event.request_id) {
+                return false;
+            }
+            let explicit = state.connection_health.pending_explicit;
+            state.connection_health.pending_request_id = None;
+            state.connection_health.pending_explicit = false;
+            state.connection_health.last_checked_at = Some(Instant::now());
+            state.connection_probe_rx = None;
 
-        match event.result {
-            ConnectionProbeResult::Online(status) => {
-                let (label, detail) = {
-                    let waker = state.waker.clone();
-                    let Some(ready) = state.ready.as_mut() else {
-                        return false;
+            match event.result {
+                ConnectionProbeResult::Online(status) => {
+                    let (label, detail) = {
+                        let waker = state.waker.clone();
+                        let Some(ready) = state.ready.as_mut() else {
+                            return false;
+                        };
+                        let binding_changed = ready.backend.apply_live_daemon_status(status);
+                        let backend = ready.backend.clone();
+                        let label = ready.backend.mode_label();
+                        let detail = ready.backend.status_detail();
+                        if binding_changed {
+                            ready.settings.rebind_backend(&backend);
+                            ready
+                                .settings
+                                .begin_initial_load(backend.clone(), waker.clone());
+                            ready.cluster.rebind_backend(backend.clone(), waker.clone());
+                        }
+                        ready.chat.rebind_backend(&backend);
+                        ready.files.rebind_backend(&backend, waker);
+                        // These labels are server-owned summary fields. Drafts and in-progress
+                        // Settings actions stay untouched while the live connection summary
+                        // advances.
+                        ready.settings.mode_label = label.clone();
+                        ready.settings.status_detail = detail.clone();
+                        (label, detail)
                     };
-                    let binding_changed = ready.backend.apply_live_daemon_status(status);
-                    let backend = ready.backend.clone();
-                    let label = ready.backend.mode_label();
-                    let detail = ready.backend.status_detail();
-                    if binding_changed {
-                        ready.settings.rebind_backend(&backend);
-                        ready
-                            .settings
-                            .begin_initial_load(backend.clone(), waker.clone());
-                        ready.cluster.rebind_backend(backend.clone(), waker.clone());
-                    }
-                    ready.chat.rebind_backend(&backend);
-                    ready.files.rebind_backend(&backend, waker);
-                    // These labels are server-owned summary fields. Drafts and in-progress
-                    // Settings actions stay untouched while the live connection summary advances.
-                    ready.settings.mode_label = label.clone();
-                    ready.settings.status_detail = detail.clone();
-                    (label, detail)
-                };
-                state.connection_health.phase = ConnectionPhase::Online;
-                state.connection_health.label = label;
-                state.connection_health.detail = detail;
-                state.connection_health.last_error = None;
-                state.connection_health.consecutive_failures = 0;
-            }
-            ConnectionProbeResult::Unavailable(error) => {
-                state.connection_health.consecutive_failures = state
-                    .connection_health
-                    .consecutive_failures
-                    .saturating_add(1);
-                let offline = explicit || state.connection_health.consecutive_failures >= 2;
-                state.connection_health.phase = if offline {
-                    ConnectionPhase::Offline
-                } else {
-                    ConnectionPhase::Degraded
-                };
-                state.connection_health.label = if offline {
-                    "Offline".to_string()
-                } else {
-                    "Connection interrupted".to_string()
-                };
-                state.connection_health.detail = if offline {
-                    format!("Daemon unavailable: {error}. Reconnect when the service is ready.")
-                } else {
-                    format!("Daemon probe failed: {error}. Sinomo will check again automatically.")
-                };
-                state.connection_health.last_error = Some(error);
+                    state.connection_health.phase = ConnectionPhase::Online;
+                    state.connection_health.label = label;
+                    state.connection_health.detail = detail;
+                    state.connection_health.last_error = None;
+                    state.connection_health.consecutive_failures = 0;
+                }
+                ConnectionProbeResult::Unavailable(error) => {
+                    state.connection_health.consecutive_failures = state
+                        .connection_health
+                        .consecutive_failures
+                        .saturating_add(1);
+                    let offline = explicit || state.connection_health.consecutive_failures >= 2;
+                    state.connection_health.phase = if offline {
+                        ConnectionPhase::Offline
+                    } else {
+                        ConnectionPhase::Degraded
+                    };
+                    state.connection_health.label = if offline {
+                        "Offline".to_string()
+                    } else {
+                        "Connection interrupted".to_string()
+                    };
+                    state.connection_health.detail = if offline {
+                        format!("Daemon unavailable: {error}. Reconnect when the service is ready.")
+                    } else {
+                        format!(
+                            "Daemon probe failed: {error}. Sinomo will check again automatically."
+                        )
+                    };
+                    state.connection_health.last_error = Some(error);
+                }
             }
         }
+        self.publish_connection_signals();
+        self.publish_chat_signals();
+        self.publish_files_signals();
+        self.publish_cluster_signals();
+        self.publish_settings_signals();
         true
     }
 
     /// Current recoverable issues across app surfaces, ordered from the runtime foundation out to
     /// user-facing features. Loading placeholders are intentionally excluded.
     pub fn health_issues(&self) -> Vec<HealthIssue> {
-        let state = self.0.borrow();
+        let state = self.state.borrow();
         let Some(ready) = state.ready.as_ref() else {
             return Vec::new();
         };
@@ -816,7 +1301,7 @@ impl Shared {
 
     pub fn set_theme_mode(&self, mode: AppThemeMode) {
         let data_dir = {
-            let mut state = self.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
             if state.theme_mode == mode {
                 return;
             }
@@ -826,11 +1311,13 @@ impl Shared {
         if let Err(error) = app_config::save_theme(&data_dir, mode) {
             tracing::warn!(%error, "failed to persist app UI theme preference");
         }
+        self.signals.theme.set(self.theme());
+        self.publish_all_surface_signals();
     }
 
     pub fn set_render_mode(&self, mode: AppRenderMode) {
         let data_dir = {
-            let mut state = self.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
             if state.render_mode == mode {
                 return;
             }
@@ -844,7 +1331,7 @@ impl Shared {
 
     pub fn set_text_scale(&self, scale: AppTextScale) {
         let data_dir = {
-            let mut state = self.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
             if state.text_scale == scale {
                 return;
             }
@@ -854,6 +1341,59 @@ impl Shared {
         if let Err(error) = app_config::save_text_scale(&data_dir, scale) {
             tracing::warn!(%error, "failed to persist app text-scale preference");
         }
+        self.signals.theme.set(self.theme());
+        self.publish_all_surface_signals();
+    }
+}
+
+fn status_text_for(state: &AppState) -> String {
+    match &state.ready {
+        Some(_) => state.connection_health.label.clone(),
+        None => state.status.clone(),
+    }
+}
+
+fn shell_status_for(state: &AppState, issues: &[HealthIssue]) -> ShellStatus {
+    if state.ready.is_none() {
+        let status = state.status.clone();
+        return ShellStatus {
+            label: status.clone(),
+            detail: status,
+            degraded: false,
+            connected_daemon: false,
+        };
+    }
+    let health = &state.connection_health;
+    if issues.is_empty() {
+        return ShellStatus {
+            label: health.label.clone(),
+            detail: health.detail.clone(),
+            degraded: false,
+            connected_daemon: health.phase.is_connected(),
+        };
+    }
+
+    let count = issues.len();
+    ShellStatus {
+        label: if count == 1 {
+            "Needs attention".to_string()
+        } else {
+            format!("{count} issues")
+        },
+        detail: if count == 1 {
+            issues[0].detail.clone()
+        } else {
+            format!(
+                "{count} app surfaces need attention: {}",
+                issues
+                    .iter()
+                    .map(|issue| format!("{}: {}", issue.title, issue.detail))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            )
+        },
+        degraded: true,
+        connected_daemon: health.phase.is_connected(),
     }
 }
 

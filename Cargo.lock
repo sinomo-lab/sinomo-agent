@@ -8957,6 +8957,7 @@ dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
  "sinomo-ui-platform",
+ "sinomo-ui-reactive",
  "sinomo-ui-render-wgpu",
  "sinomo-ui-runtime",
  "sinomo-ui-scene",
@@ -8996,9 +8997,11 @@ dependencies = [
 name = "sinomo-ui-lucide"
 version = "1.17.0"
 dependencies = [
+ "roxmltree 0.20.0",
  "sinomo-ui-core",
  "sinomo-ui-runtime",
  "sinomo-ui-scene",
+ "svgtypes",
 ]
 
 [[package]]
@@ -9022,6 +9025,10 @@ dependencies = [
  "windows 0.62.2",
  "winit",
 ]
+
+[[package]]
+name = "sinomo-ui-reactive"
+version = "0.1.0"
 
 [[package]]
 name = "sinomo-ui-render-wgpu"
@@ -9052,6 +9059,7 @@ version = "0.1.0"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
+ "sinomo-ui-reactive",
  "sinomo-ui-scene",
  "sinomo-ui-text",
  "web-time",
@@ -9103,6 +9111,7 @@ dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
  "sinomo-ui-lucide",
+ "sinomo-ui-reactive",
  "sinomo-ui-runtime",
  "sinomo-ui-scene",
  "sinomo-ui-text",

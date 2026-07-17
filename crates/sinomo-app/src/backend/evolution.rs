@@ -9,7 +9,7 @@ use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EvolutionDashboard {
     pub source: String,
     pub jobs: Vec<EvolutionJobSummary>,
@@ -65,7 +65,7 @@ impl Default for EvolutionPhase {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EvolutionJobSummary {
     pub id: String,
     pub short_id: String,
@@ -101,7 +101,7 @@ pub struct EvolutionJobSummary {
     pub decision: Option<EvolutionDecisionSummary>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EvolutionDecisionSummary {
     pub outcome: String,
     pub decided_at: String,

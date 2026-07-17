@@ -18,7 +18,7 @@
 //! work on the UI path.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,35 +28,46 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
-    CheckboxIndicatorState, Color, Constraints, ControlSize, DefaultTheme, DetailRow, Dock,
-    EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight,
-    IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint, ListItem, ListView,
-    MeasureCtx, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, PointerEventKind,
-    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl,
-    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator,
-    SideSheet, SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
-    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
-    TextWrap, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
-    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
-    paint_placement_badge_with, paint_text_cell,
+    CheckboxIndicatorState, CollectionWindow, Color, Constraints, ControlSize, DefaultTheme,
+    DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem,
+    FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint,
+    ListItem, ListView, MeasureCtx, Observable, PaintCtx, PanelSection, PlacementBadge,
+    PlacementBadgePaint, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
+    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx,
+    SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size, SizedBox, Stack,
+    StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface, SurfaceBorder,
+    SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, Tooltip, TooltipPlacement,
+    TrailingSlotRow, VirtualCollectionModel, VirtualList, VirtualListChrome,
+    VirtualListSelectionMode, VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind,
+    VirtualTableRowContext, VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    paint_checkbox_indicator, paint_leading_label_cell, paint_placement_badge_with,
+    paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
-    SifsBrowser, SifsEntry, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
-    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
-    SifsObjectHealth, SifsReplaceFileIfVersionOutcome,
+    SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary,
+    SifsListOptions, SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails,
+    SifsObjectDetails, SifsObjectHealth, SifsReplaceFileIfVersionOutcome,
 };
-use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::{
+    api::{
+        DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiError, DaemonEventStreamItem,
+        DaemonEventSubscribeRequest, send_daemon_rpc_stream_from_data_dir_async,
+    },
+    local::SinomoDataDir,
+    network::{DaemonRpcTimeouts, ObjectRpcRequest},
+};
 use time::format_description::well_known::Rfc3339;
 
 use crate::backend::Backend;
 use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutcome};
 use crate::state::{Shared, Tab};
-use crate::theme::Palette;
+use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -74,8 +85,12 @@ const FULL_HEADER_INNER_MIN_W: f32 = 860.0;
 const FILES_STATUS_H: f32 = 34.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
-const PLACES_W: f32 = 190.0;
-const PLACE_ROW_H: f32 = 38.0;
+const PLACES_W: f32 = 208.0;
+const PLACE_ROW_H: f32 = 46.0;
+const PLACES_HEADER_H: f32 = 42.0;
+const PLACE_SECTION_HEADER_H: f32 = 28.0;
+const PLACE_SECTION_GAP: f32 = 12.0;
+const PLACE_RAIL_BOTTOM_PAD: f32 = 12.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
 /// The text surface keeps the entire accepted document resident. Reject larger files explicitly
@@ -552,6 +567,7 @@ pub struct FilesState {
     history_back: Vec<FilesLocation>,
     history_forward: Vec<FilesLocation>,
     pub entries: Vec<SifsEntry>,
+    entry_metadata: BTreeMap<String, SifsEntryMetadata>,
     pub entries_total_count: usize,
     pub selected: Option<usize>,
     pub selected_details: Option<SifsObjectDetails>,
@@ -561,6 +577,8 @@ pub struct FilesState {
     pub details_error: Option<String>,
     sifs_health: Option<SifsHealthSummary>,
     sifs_health_error: Option<String>,
+    live_updates_connected: bool,
+    live_updates_error: Option<String>,
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
@@ -588,6 +606,8 @@ pub struct FilesState {
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
     worker_waker: Option<sui::UiHandle>,
+    live_event_abort: Option<tokio::task::AbortHandle>,
+    live_refresh_pending: bool,
     worker_cancellations: Arc<Mutex<BTreeSet<u64>>>,
     next_request_id: u64,
     pending_request_id: Option<u64>,
@@ -601,6 +621,279 @@ pub struct FilesState {
     pending_attachment_request_id: Option<u64>,
     pending_attachment_source_path: Option<(FilesSourceKind, String)>,
     pending_import_request_ids: BTreeSet<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesListStructure {
+    theme: (AppThemeMode, AppTextScale),
+    source: FilesSourceKind,
+    loaded: bool,
+    loading: bool,
+    error: Option<String>,
+    list_revision: u64,
+    entries: Vec<SifsEntry>,
+    entry_metadata: BTreeMap<String, SifsEntryMetadata>,
+    entries_total_count: usize,
+    sort_mode: FileSortMode,
+    tasks: Vec<FilesTask>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesHeaderStructure {
+    theme: (AppThemeMode, AppTextScale),
+    source: FilesSourceKind,
+    clustered: bool,
+    loading: bool,
+    path: String,
+    node_id: String,
+    history_back: Vec<FilesLocation>,
+    history_forward: Vec<FilesLocation>,
+    selected: Option<usize>,
+    marked_entries: BTreeSet<usize>,
+    sort_mode: FileSortMode,
+    picker_action: Option<FilesPickerAction>,
+    picker_error: Option<String>,
+    external_file_hovered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesInspectorStructure {
+    theme: (AppThemeMode, AppTextScale),
+    source: FilesSourceKind,
+    clustered: bool,
+    loaded: bool,
+    loading: bool,
+    error: Option<String>,
+    path: String,
+    entries: Vec<SifsEntry>,
+    selected: Option<usize>,
+    selected_details: Option<SifsObjectDetails>,
+    selected_local_details: Option<LocalObjectDetails>,
+    list_slow_after_secs: Option<u64>,
+    details_loading: bool,
+    details_error: Option<String>,
+    sifs_health: Option<SifsHealthSummary>,
+    sifs_health_error: Option<String>,
+    live_updates_connected: bool,
+    live_updates_error: Option<String>,
+    selected_preview: Option<FilesPreview>,
+    preview_loading: bool,
+    preview_error: Option<String>,
+    inspector_details_open: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FilesDialogStructure {
+    Closed {
+        theme: (AppThemeMode, AppTextScale),
+    },
+    DocumentConfirmation {
+        theme: (AppThemeMode, AppTextScale),
+        revision: u64,
+    },
+    Document {
+        theme: (AppThemeMode, AppTextScale),
+        revision: u64,
+    },
+    Action {
+        theme: (AppThemeMode, AppTextScale),
+        source: FilesSourceKind,
+        path: String,
+        kind: FileActionPromptKind,
+        target_path: Option<String>,
+        targets: Vec<FileActionTarget>,
+        error: Option<String>,
+    },
+    Compact {
+        theme: (AppThemeMode, AppTextScale),
+        overlay: CompactFilesOverlay,
+        source: FilesSourceKind,
+        path: String,
+        list_revision: u64,
+        selected: Option<usize>,
+        details_loading: bool,
+        preview_loading: bool,
+        inspector_details_open: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilesStructureKey {
+    theme: (AppThemeMode, AppTextScale),
+    list: FilesListStructure,
+    header: FilesHeaderStructure,
+    places: Vec<FilePlace>,
+    inspector: FilesInspectorStructure,
+    tasks: Vec<FilesTask>,
+    dialog: FilesDialogStructure,
+}
+
+impl FilesStructureKey {
+    pub(crate) fn new(
+        theme_mode: AppThemeMode,
+        text_scale: AppTextScale,
+        state: Option<&FilesState>,
+    ) -> Self {
+        let theme = (theme_mode, text_scale);
+        let Some(state) = state else {
+            return Self {
+                theme,
+                list: FilesListStructure {
+                    theme,
+                    source: FilesSourceKind::Sifs,
+                    loaded: false,
+                    loading: false,
+                    error: None,
+                    list_revision: 0,
+                    entries: Vec::new(),
+                    entry_metadata: BTreeMap::new(),
+                    entries_total_count: 0,
+                    sort_mode: FileSortMode::default(),
+                    tasks: Vec::new(),
+                },
+                header: FilesHeaderStructure {
+                    theme,
+                    source: FilesSourceKind::Sifs,
+                    clustered: false,
+                    loading: false,
+                    path: "/".to_string(),
+                    node_id: String::new(),
+                    history_back: Vec::new(),
+                    history_forward: Vec::new(),
+                    selected: None,
+                    marked_entries: BTreeSet::new(),
+                    sort_mode: FileSortMode::default(),
+                    picker_action: None,
+                    picker_error: None,
+                    external_file_hovered: false,
+                },
+                places: Vec::new(),
+                inspector: FilesInspectorStructure {
+                    theme,
+                    source: FilesSourceKind::Sifs,
+                    clustered: false,
+                    loaded: false,
+                    loading: false,
+                    error: None,
+                    path: "/".to_string(),
+                    entries: Vec::new(),
+                    selected: None,
+                    selected_details: None,
+                    selected_local_details: None,
+                    list_slow_after_secs: None,
+                    details_loading: false,
+                    details_error: None,
+                    sifs_health: None,
+                    sifs_health_error: None,
+                    live_updates_connected: false,
+                    live_updates_error: None,
+                    selected_preview: None,
+                    preview_loading: false,
+                    preview_error: None,
+                    inspector_details_open: false,
+                },
+                tasks: Vec::new(),
+                dialog: FilesDialogStructure::Closed { theme },
+            };
+        };
+        let list = FilesListStructure {
+            theme,
+            source: state.source,
+            loaded: state.loaded,
+            loading: state.loading,
+            error: state.error.clone(),
+            list_revision: state.list_revision,
+            entries: state.entries.clone(),
+            entry_metadata: state.entry_metadata.clone(),
+            entries_total_count: state.entries_total_count,
+            sort_mode: state.sort_mode,
+            tasks: state.tasks.clone(),
+        };
+        let header = FilesHeaderStructure {
+            theme,
+            source: state.source,
+            clustered: state.clustered,
+            loading: state.loading,
+            path: state.path.clone(),
+            node_id: state.node_id.clone(),
+            history_back: state.history_back.clone(),
+            history_forward: state.history_forward.clone(),
+            selected: state.selected,
+            marked_entries: state.marked_entries.clone(),
+            sort_mode: state.sort_mode,
+            picker_action: state.picker_action,
+            picker_error: state.picker_error.clone(),
+            external_file_hovered: state.external_file_hovered,
+        };
+        let inspector = FilesInspectorStructure {
+            theme,
+            source: state.source,
+            clustered: state.clustered,
+            loaded: state.loaded,
+            loading: state.loading,
+            error: state.error.clone(),
+            path: state.path.clone(),
+            entries: state.entries.clone(),
+            selected: state.selected,
+            selected_details: state.selected_details.clone(),
+            selected_local_details: state.selected_local_details.clone(),
+            list_slow_after_secs: state.list_slow_after_secs,
+            details_loading: state.details_loading,
+            details_error: state.details_error.clone(),
+            sifs_health: state.sifs_health.clone(),
+            sifs_health_error: state.sifs_health_error.clone(),
+            live_updates_connected: state.live_updates_connected,
+            live_updates_error: state.live_updates_error.clone(),
+            selected_preview: state.selected_preview.clone(),
+            preview_loading: state.preview_loading,
+            preview_error: state.preview_error.clone(),
+            inspector_details_open: state.inspector_details_open,
+        };
+        let dialog = if state.document_close_confirmation {
+            FilesDialogStructure::DocumentConfirmation {
+                theme,
+                revision: state.document_revision,
+            }
+        } else if state.document.is_some() {
+            FilesDialogStructure::Document {
+                theme,
+                revision: state.document_revision,
+            }
+        } else if let Some(prompt) = &state.action_prompt {
+            FilesDialogStructure::Action {
+                theme,
+                source: state.source,
+                path: state.path.clone(),
+                kind: prompt.kind,
+                target_path: prompt.target_path.clone(),
+                targets: prompt.targets.clone(),
+                error: prompt.error.clone(),
+            }
+        } else if let Some(overlay) = state.compact_overlay {
+            FilesDialogStructure::Compact {
+                theme,
+                overlay,
+                source: state.source,
+                path: state.path.clone(),
+                list_revision: state.list_revision,
+                selected: state.selected,
+                details_loading: state.details_loading,
+                preview_loading: state.preview_loading,
+                inspector_details_open: state.inspector_details_open,
+            }
+        } else {
+            FilesDialogStructure::Closed { theme }
+        };
+        Self {
+            theme,
+            list,
+            header,
+            places: files_places(state),
+            inspector,
+            tasks: state.tasks.clone(),
+            dialog,
+        }
+    }
 }
 
 impl FilesState {
@@ -625,6 +918,7 @@ impl FilesState {
             history_back: Vec::new(),
             history_forward: Vec::new(),
             entries: Vec::new(),
+            entry_metadata: BTreeMap::new(),
             entries_total_count: 0,
             selected: None,
             selected_details: None,
@@ -661,6 +955,10 @@ impl FilesState {
             worker_rx: None,
             worker_result_tx: None,
             worker_waker: None,
+            live_event_abort: None,
+            live_updates_connected: false,
+            live_updates_error: None,
+            live_refresh_pending: false,
             worker_cancellations: Arc::new(Mutex::new(BTreeSet::new())),
             next_request_id: 0,
             pending_request_id: None,
@@ -727,18 +1025,18 @@ impl FilesState {
         true
     }
 
-    fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) {
+    fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) -> bool {
         if self.loaded {
-            self.pump_load();
-            return;
+            return self.pump_load();
         }
         if let Some(waker) = waker {
             self.ensure_worker(waker);
             self.loaded = true;
             self.reload();
-            return;
+            return true;
         }
         self.load_sync();
+        true
     }
 
     fn load_sync(&mut self) {
@@ -809,6 +1107,11 @@ impl FilesState {
         match listing {
             Some(Ok(page)) => {
                 self.entries_total_count = page.total_count;
+                self.entry_metadata = page
+                    .metadata
+                    .into_iter()
+                    .map(|metadata| (metadata.path.clone(), metadata))
+                    .collect();
                 self.entries = page.entries;
                 self.error = None;
                 if self.source == FilesSourceKind::Local {
@@ -839,6 +1142,7 @@ impl FilesState {
             }
             Some(Err(error)) => {
                 self.entries.clear();
+                self.entry_metadata.clear();
                 self.entries_total_count = 0;
                 self.error = Some(error);
             }
@@ -863,6 +1167,7 @@ impl FilesState {
         self.loading = true;
         self.error = None;
         self.entries.clear();
+        self.entry_metadata.clear();
         self.entries_total_count = 0;
         self.list_revision = self.list_revision.wrapping_add(1);
         let command = FilesWorkerCommand::List {
@@ -963,6 +1268,7 @@ impl FilesState {
         self.browser = None;
         self.error = None;
         self.entries.clear();
+        self.entry_metadata.clear();
         self.entries_total_count = 0;
         self.selected = None;
         self.marked_entries.clear();
@@ -999,6 +1305,12 @@ impl FilesState {
         self.worker_rx = None;
         self.worker_result_tx = None;
         self.worker_waker = None;
+        if let Some(abort) = self.live_event_abort.take() {
+            abort.abort();
+        }
+        self.live_updates_connected = false;
+        self.live_updates_error = None;
+        self.live_refresh_pending = false;
         clear_all_cancelled_operations(&self.worker_cancellations);
         self.list_revision = self.list_revision.wrapping_add(1);
     }
@@ -1016,6 +1328,10 @@ impl FilesState {
         let cancellations = self.worker_cancellations.clone();
         let timeout_tx = result_tx.clone();
         let timeout_waker = waker.clone();
+        let live_data_dir = self.data_dir.as_ref().clone();
+        let live_address = self.daemon_address.clone();
+        let live_runtime = self.app_runtime.clone();
+        let live_result_tx = result_tx.clone();
         match thread::Builder::new()
             .name("sinomo-app-files".to_string())
             .spawn(move || {
@@ -1034,7 +1350,16 @@ impl FilesState {
                 self.worker_tx = Some(command_tx);
                 self.worker_rx = Some(result_rx);
                 self.worker_result_tx = Some(timeout_tx);
-                self.worker_waker = Some(timeout_waker);
+                self.worker_waker = Some(timeout_waker.clone());
+                if let Some(address) = live_address {
+                    self.live_event_abort = Some(spawn_files_dfs_event_subscription(
+                        &live_runtime,
+                        live_data_dir,
+                        address,
+                        live_result_tx,
+                        Some(timeout_waker),
+                    ));
+                }
             }
             Err(error) => {
                 self.loaded = true;
@@ -1109,6 +1434,10 @@ impl FilesState {
                     self.worker_tx = None;
                     self.worker_result_tx = None;
                     self.worker_waker = None;
+                    if let Some(abort) = self.live_event_abort.take() {
+                        abort.abort();
+                    }
+                    self.live_updates_connected = false;
                     break;
                 }
             };
@@ -1116,11 +1445,15 @@ impl FilesState {
                 changed = true;
             }
         }
+        if self.flush_live_refresh() {
+            changed = true;
+        }
         changed
     }
 
     fn apply_worker_result(&mut self, result: FilesWorkerResult) -> bool {
         match result {
+            FilesWorkerResult::LiveUpdate(update) => self.apply_live_update(update),
             FilesWorkerResult::List {
                 request_id,
                 source,
@@ -1155,8 +1488,19 @@ impl FilesState {
                         self.sifs_health_error = listing.health_error;
                         self.entries_total_count = listing.total_count;
                         if append {
+                            self.entry_metadata.extend(
+                                listing
+                                    .entry_metadata
+                                    .into_iter()
+                                    .map(|metadata| (metadata.path.clone(), metadata)),
+                            );
                             self.entries.extend(listing.entries);
                         } else {
+                            self.entry_metadata = listing
+                                .entry_metadata
+                                .into_iter()
+                                .map(|metadata| (metadata.path.clone(), metadata))
+                                .collect();
                             self.entries = listing.entries;
                         }
                         self.error = None;
@@ -1184,6 +1528,7 @@ impl FilesState {
                         self.store_active_path();
                         if !append {
                             self.entries.clear();
+                            self.entry_metadata.clear();
                             self.entries_total_count = 0;
                             self.sifs_health = None;
                             self.sifs_health_error = None;
@@ -1457,6 +1802,64 @@ impl FilesState {
         }
     }
 
+    fn apply_live_update(&mut self, update: FilesLiveUpdate) -> bool {
+        match update {
+            FilesLiveUpdate::Item(DaemonEventStreamItem::Ready { .. }) => {
+                let changed = !self.live_updates_connected || self.live_updates_error.is_some();
+                self.live_updates_connected = true;
+                self.live_updates_error = None;
+                // The stream is live now. Reload the durable snapshot once so changes made between
+                // the initial list and subscription readiness cannot be missed.
+                self.live_refresh_pending |= self.source == FilesSourceKind::Sifs;
+                changed || self.source == FilesSourceKind::Sifs
+            }
+            FilesLiveUpdate::Item(DaemonEventStreamItem::Event { event }) => {
+                let status_changed =
+                    !self.live_updates_connected || self.live_updates_error.is_some();
+                self.live_updates_connected = true;
+                self.live_updates_error = None;
+                let selected_path = self.selected_entry().map(|entry| entry.path.as_str());
+                let touches_location = self.source == FilesSourceKind::Sifs
+                    && dfs_event_touches_location(&event.payload, &self.path, selected_path);
+                if touches_location {
+                    self.live_refresh_pending = true;
+                }
+                status_changed || touches_location
+            }
+            FilesLiveUpdate::Item(DaemonEventStreamItem::Lagged { .. }) => {
+                let status_changed =
+                    !self.live_updates_connected || self.live_updates_error.is_some();
+                self.live_updates_connected = true;
+                self.live_updates_error = None;
+                self.live_refresh_pending |= self.source == FilesSourceKind::Sifs;
+                status_changed || self.source == FilesSourceKind::Sifs
+            }
+            FilesLiveUpdate::Disconnected(detail) => {
+                let changed = self.live_updates_connected
+                    || self.live_updates_error.as_deref() != Some(detail.as_str());
+                self.live_updates_connected = false;
+                self.live_updates_error = Some(detail);
+                changed
+            }
+        }
+    }
+
+    fn flush_live_refresh(&mut self) -> bool {
+        if !self.live_refresh_pending
+            || self.source != FilesSourceKind::Sifs
+            || !self.loaded
+            || self.loading
+            || self.pending_request_id.is_some()
+            || self.pending_append_request_id.is_some()
+        {
+            return false;
+        }
+        self.live_refresh_pending = false;
+        self.pending_select_path = self.selected_entry().map(|entry| entry.path.clone());
+        self.reload();
+        true
+    }
+
     fn current_location(&self) -> FilesLocation {
         FilesLocation {
             source: self.source,
@@ -1527,6 +1930,7 @@ impl FilesState {
             self.source = source;
             self.error = None;
             self.entries.clear();
+            self.entry_metadata.clear();
             self.entries_total_count = 0;
             self.selected = None;
             self.clear_selected_details();
@@ -3121,11 +3525,49 @@ impl FilesState {
     }
 }
 
+impl Drop for FilesState {
+    fn drop(&mut self) {
+        if let Some(abort) = self.live_event_abort.take() {
+            abort.abort();
+        }
+    }
+}
+
+fn dfs_event_touches_location(
+    payload: &serde_json::Value,
+    current_path: &str,
+    selected_path: Option<&str>,
+) -> bool {
+    payload
+        .get("paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|changed_path| {
+            dfs_paths_overlap(current_path, changed_path)
+                || selected_path.is_some_and(|selected| dfs_paths_overlap(selected, changed_path))
+        })
+}
+
+fn dfs_paths_overlap(left: &str, right: &str) -> bool {
+    dfs_path_contains(left, right) || dfs_path_contains(right, left)
+}
+
+fn dfs_path_contains(ancestor: &str, candidate: &str) -> bool {
+    ancestor == "/"
+        || ancestor == candidate
+        || candidate
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 struct FilesListing {
     node_id: String,
     health: Option<SifsHealthSummary>,
     health_error: Option<String>,
     entries: Vec<SifsEntry>,
+    entry_metadata: Vec<SifsEntryMetadata>,
     total_count: usize,
 }
 
@@ -3143,6 +3585,7 @@ fn sifs_health_probe(browser: &SifsBrowser) -> (Option<SifsHealthSummary>, Optio
 }
 
 enum FilesWorkerResult {
+    LiveUpdate(FilesLiveUpdate),
     List {
         request_id: u64,
         source: FilesSourceKind,
@@ -3201,6 +3644,11 @@ enum FilesWorkerResult {
         request_id: u64,
         result: FilesOperationResult,
     },
+}
+
+enum FilesLiveUpdate {
+    Item(DaemonEventStreamItem),
+    Disconnected(String),
 }
 
 enum FilesWorkerCommand {
@@ -3281,6 +3729,91 @@ impl FilesOperationProgress<'_> {
     }
 }
 
+fn spawn_files_dfs_event_subscription(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    address: String,
+    tx: Sender<FilesWorkerResult>,
+    waker: Option<sui::UiHandle>,
+) -> tokio::task::AbortHandle {
+    let task = runtime.spawn(async move {
+        let request = match ObjectRpcRequest::encode_body(
+            DAEMON_EVENT_SUBSCRIBE_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &DaemonEventSubscribeRequest::for_dfs_path_prefix("/"),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = tx.send(FilesWorkerResult::LiveUpdate(
+                    FilesLiveUpdate::Disconnected(format!(
+                        "live SIFS updates could not be started: {error}"
+                    )),
+                ));
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                return;
+            }
+        };
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            let mut received_ready = false;
+            let mut consumer_closed = false;
+            let result = send_daemon_rpc_stream_from_data_dir_async(
+                data_dir.clone(),
+                &address,
+                &request,
+                DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
+                |response| {
+                    response.error_detail()?;
+                    let item = response
+                        .decode_body::<DaemonEventStreamItem>()
+                        .map_err(DaemonApiError::from)?;
+                    received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
+                    if tx
+                        .send(FilesWorkerResult::LiveUpdate(FilesLiveUpdate::Item(item)))
+                        .is_err()
+                    {
+                        consumer_closed = true;
+                        return Ok(false);
+                    }
+                    if let Some(waker) = waker.as_ref() {
+                        waker.wake();
+                    }
+                    Ok(true)
+                },
+            )
+            .await;
+            if consumer_closed {
+                return;
+            }
+            if received_ready {
+                retry_delay = Duration::from_millis(250);
+            }
+            let detail = match result {
+                Ok(()) => "daemon closed the event stream".to_string(),
+                Err(error) => error.to_string(),
+            };
+            if tx
+                .send(FilesWorkerResult::LiveUpdate(
+                    FilesLiveUpdate::Disconnected(format!(
+                        "Live SIFS updates disconnected; retrying: {detail}"
+                    )),
+                ))
+                .is_err()
+            {
+                return;
+            }
+            if let Some(waker) = waker.as_ref() {
+                waker.wake();
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+        }
+    });
+    task.abort_handle()
+}
+
 fn files_worker_loop(
     data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
@@ -3330,6 +3863,7 @@ fn files_worker_loop(
                             health: None,
                             health_error: None,
                             entries: page.entries,
+                            entry_metadata: page.metadata,
                             total_count: page.total_count,
                         }
                     });
@@ -3364,6 +3898,7 @@ fn files_worker_loop(
                                     health: None,
                                     health_error: None,
                                     entries: page.entries,
+                                    entry_metadata: page.metadata,
                                     total_count: page.total_count,
                                 });
                             let listed = result.is_ok();
@@ -4158,6 +4693,7 @@ fn list_local_dir_page(
     };
     Ok(SifsEntryPage {
         entries,
+        metadata: Vec::new(),
         total_count,
         offset,
         limit,
@@ -6417,17 +6953,41 @@ fn entry_meta(entry: &SifsEntry) -> String {
     }
 }
 
-fn entry_row_meta(entry: &SifsEntry, files: &FilesState, active: bool) -> String {
-    if active && files.source == FilesSourceKind::Sifs {
-        return sifs_compact_header_line(
-            entry,
-            files.selected_details.as_ref(),
-            files.clustered,
-            files.details_loading,
-            files.details_error.as_deref(),
-        );
+fn entry_row_meta(entry: &SifsEntry, files: &FilesState, _active: bool) -> String {
+    let base = entry_meta(entry);
+    let Some(metadata) = files.entry_metadata.get(&entry.path) else {
+        return base;
+    };
+    let Some(modified) = compact_modified_age(metadata.modified_at_unix_nanos) else {
+        return base;
+    };
+    format!("{base} · {modified}")
+}
+
+fn compact_modified_age(nanos: u64) -> Option<String> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    compact_modified_age_at(nanos, now)
+}
+
+fn compact_modified_age_at(nanos: u64, now_nanos: i128) -> Option<String> {
+    if nanos == 0 {
+        return None;
     }
-    entry_meta(entry)
+    let timestamp = time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok()?;
+    let elapsed_nanos = now_nanos.saturating_sub(nanos as i128).max(0);
+    let elapsed_secs = (elapsed_nanos / 1_000_000_000) as u64;
+    Some(match elapsed_secs {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed_secs / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_secs / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed_secs / 86_400),
+        _ => format!(
+            "{:04}-{:02}-{:02}",
+            timestamp.year(),
+            u8::from(timestamp.month()),
+            timestamp.day()
+        ),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6439,7 +6999,7 @@ struct FileRowPlacementBadge {
 }
 
 fn file_row_placement_badge(
-    _entry: &SifsEntry,
+    entry: &SifsEntry,
     files: &FilesState,
     row_index: usize,
 ) -> FileRowPlacementBadge {
@@ -6474,6 +7034,10 @@ fn file_row_placement_badge(
         return sifs_details_placement_badge(details);
     }
 
+    if let Some(metadata) = files.entry_metadata.get(&entry.path) {
+        return sifs_entry_placement_badge(metadata);
+    }
+
     FileRowPlacementBadge {
         label: if files.clustered {
             "on mesh".to_string()
@@ -6484,6 +7048,38 @@ fn file_row_placement_badge(
             SemanticTone::Info
         } else {
             SemanticTone::Neutral
+        },
+        icon: IconGlyph::Storage,
+        replicas: None,
+    }
+}
+
+fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementBadge {
+    if metadata.policy == "local-owned" || metadata.policy == "ephemeral-local" {
+        return FileRowPlacementBadge {
+            label: "this device".to_string(),
+            tone: SemanticTone::Neutral,
+            icon: IconGlyph::Storage,
+            replicas: None,
+        };
+    }
+
+    let count = metadata.current_locations.len();
+    if count == 0 {
+        return FileRowPlacementBadge {
+            label: "placing".to_string(),
+            tone: SemanticTone::Warning,
+            icon: IconGlyph::Redo,
+            replicas: None,
+        };
+    }
+
+    FileRowPlacementBadge {
+        label: plural(count, "copy"),
+        tone: if count > 1 {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Info
         },
         icon: IconGlyph::Storage,
         replicas: None,
@@ -6582,14 +7178,20 @@ fn details_size(entry: &SifsEntry, details: Option<&SifsObjectDetails>) -> Strin
     )
 }
 
-fn details_locations(details: &SifsObjectDetails) -> String {
+fn details_locations_friendly(details: &SifsObjectDetails, local_node_id: &str) -> String {
     if details.current_locations.is_empty() {
-        "none recorded".to_string()
+        "No durable copy is recorded yet".to_string()
     } else {
         details
             .current_locations
             .iter()
-            .map(|node| short(node, 20))
+            .map(|node| {
+                if !local_node_id.is_empty() && node == local_node_id {
+                    "This device".to_string()
+                } else {
+                    format!("Node {}", short(node, 16))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -6631,15 +7233,24 @@ fn sifs_metadata_shard_detail_summary(shard: &SifsMetadataShardDetails) -> Strin
         shard
             .replica_node_ids
             .iter()
-            .map(|node_id| short(node_id, 18))
+            .map(|node_id| {
+                if node_id == &shard.local_node_id {
+                    "this device".to_string()
+                } else {
+                    format!("node {}", short(node_id, 14))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let primary = if shard.primary_node_id == shard.local_node_id {
+        "this device".to_string()
+    } else {
+        format!("node {}", short(&shard.primary_node_id, 14))
+    };
     format!(
-        "primary {}; replicas {}; epoch {}",
-        short(&shard.primary_node_id, 18),
-        replicas,
-        shard.epoch
+        "{} · primary {} · replicas {} · epoch {}",
+        shard.shard_id, primary, replicas, shard.epoch
     )
 }
 
@@ -6964,6 +7575,7 @@ fn sifs_inspector_next_step(
     sifs_placement_next_step(details, clustered)
 }
 
+#[cfg(test)]
 fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
     details
         .map(|details| {
@@ -7149,6 +7761,7 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
     rows
 }
 
+#[cfg(test)]
 fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
     details
         .map(|details| {
@@ -7166,6 +7779,7 @@ fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn files_preview_signature(preview: Option<&FilesPreview>) -> String {
     preview
         .map(|preview| {
@@ -8206,37 +8820,29 @@ where
     }
 }
 
-fn files_list_body_signature(shared: &Shared) -> (u64, FileSortMode, usize, usize) {
-    let files = shared.files();
-    (
-        files.list_revision,
-        files.sort_mode,
-        files.entries.len(),
-        files.entries_total_count,
-    )
-}
-
 fn files_list_body_rebuild(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files list structure", |key| key.list.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || files_list_body_signature(&s)
-        },
-        move |_key| files_list_body_table(&s, &r, &ss),
-    )
+    let table_state = VirtualTableState::new();
+    RebuildOnChange::new_observable(source, move |_key| {
+        files_list_body_table(&s, &r, &ss, &table_state)
+    })
 }
 
 fn files_list_body_table(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
+    table_state: &VirtualTableState,
 ) -> WidgetPod {
     let _ = scroll_state;
     let (entries, source, sort_mode, total_count) = {
@@ -8268,17 +8874,30 @@ fn files_list_body_table(
         let page_s = shared.clone();
         let description_s = shared.clone();
         VirtualTable::new("files-listing")
+            .state(table_state.clone())
             .columns([
-                VirtualTableColumn::new("").width(36.0),
+                VirtualTableColumn::new("").key(1).width(36.0),
                 VirtualTableColumn::new("Name")
+                    .key(2)
                     .min_width(180.0)
                     .sort_direction(sort_mode.name_sort_direction()),
-                VirtualTableColumn::new("Placement").width(156.0),
-                VirtualTableColumn::new("Kind / size")
-                    .width(128.0)
+                VirtualTableColumn::new("Placement").key(3).width(156.0),
+                VirtualTableColumn::new("Details")
+                    .key(4)
+                    .width(156.0)
                     .sort_direction(sort_mode.meta_sort_direction()),
             ])
+            .collection_window(CollectionWindow::loaded(
+                0..entries.len(),
+                Some(total_count),
+                false,
+                entries.len() < total_count,
+            ))
             .row_count(entries.len())
+            .row_key({
+                let entries = entries.clone();
+                move |index| entries.get(index).map(file_entry_key).unwrap_or_default()
+            })
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -8311,9 +8930,26 @@ fn files_list_body_table(
                 if entry.is_dir {
                     description.push_str(". Single click selects; double click opens the folder");
                 }
-                if files.source == FilesSourceKind::Sifs && files.selected == Some(index) {
-                    description.push_str(". Placement ");
-                    description.push_str(&entry_row_meta(entry, &files, true));
+                if files.source == FilesSourceKind::Sifs {
+                    let placement = file_row_placement_badge(entry, &files, index);
+                    description.push_str(". Placement: ");
+                    description.push_str(&placement.label);
+                    if files.selected == Some(index) {
+                        description.push_str("; ");
+                        description.push_str(&sifs_compact_header_line(
+                            entry,
+                            files.selected_details.as_ref(),
+                            files.clustered,
+                            files.details_loading,
+                            files.details_error.as_deref(),
+                        ));
+                    }
+                    description.push_str(". Details: ");
+                    description.push_str(&entry_row_meta(
+                        entry,
+                        &files,
+                        files.selected == Some(index),
+                    ));
                 }
                 description
             })
@@ -8348,6 +8984,15 @@ fn files_list_body_table(
     };
 
     WidgetPod::new(table)
+}
+
+fn file_entry_key(entry: &SifsEntry) -> u64 {
+    let mut key = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in entry.path.bytes() {
+        key ^= u64::from(byte);
+        key = key.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    key.max(1)
 }
 
 fn paint_file_table_row(
@@ -8456,11 +9101,10 @@ fn request_files_overlay_rebuild(ctx: &mut EventCtx) {
 }
 
 fn open_settings_section(shared: &Shared, section: SettingsSection) {
-    let mut app = shared.borrow_mut();
-    app.active_tab = Tab::Settings;
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.open(section);
+    if shared.is_ready() {
+        shared.settings_mut().open(section);
     }
+    shared.set_active_tab(Tab::Settings);
 }
 
 fn sifs_health_has_attention(health: &SifsHealthSummary) -> bool {
@@ -8782,24 +9426,6 @@ fn files_task_status(files: &FilesState) -> String {
     }
 }
 
-fn files_tasks_signature(tasks: &[FilesTask]) -> String {
-    tasks
-        .iter()
-        .map(|task| {
-            format!(
-                "{:?}:{}:{}:{:?}:{:.2}:{}",
-                task.source,
-                task.id,
-                task.title,
-                task.state,
-                task.progress.unwrap_or(-1.0),
-                task.detail
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 fn files_tasks_have_finished(tasks: &[FilesTask]) -> bool {
     tasks.iter().any(|task| {
         matches!(
@@ -8908,6 +9534,24 @@ fn local_home_path() -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+fn compact_local_place_path(path: &str) -> String {
+    let display = local_home_path()
+        .and_then(|home| {
+            let relative = Path::new(path).strip_prefix(&home).ok()?;
+            if relative.as_os_str().is_empty() {
+                Some("~".to_string())
+            } else {
+                Some(format!(
+                    "~{}{}",
+                    std::path::MAIN_SEPARATOR,
+                    relative.to_string_lossy()
+                ))
+            }
+        })
+        .unwrap_or_else(|| path.to_string());
+    middle_short(&display, 30)
+}
+
 fn local_root_path(path: &str) -> Option<String> {
     let mut root = PathBuf::new();
     let mut saw_prefix = false;
@@ -8982,8 +9626,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     let mut places = Vec::new();
     push_unique_place(
         &mut places,
-        "SIFS root",
-        "cluster namespace",
+        "Root",
+        "Distributed namespace",
         FilesSourceKind::Sifs,
         "/",
         IconGlyph::Storage,
@@ -8991,7 +9635,7 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     push_unique_place(
         &mut places,
         "Services",
-        "service data",
+        "/services",
         FilesSourceKind::Sifs,
         "/services",
         IconGlyph::Storage,
@@ -8999,32 +9643,16 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     push_unique_place(
         &mut places,
         "Users",
-        "user data",
+        "/users",
         FilesSourceKind::Sifs,
         "/users",
         IconGlyph::Folder,
     );
-    push_unique_place(
-        &mut places,
-        "Sinomo",
-        "runtime data",
-        FilesSourceKind::Sifs,
-        "/sinomo",
-        IconGlyph::Folder,
-    );
-    push_unique_place(
-        &mut places,
-        "Cluster nodes",
-        "remote node files",
-        FilesSourceKind::Sifs,
-        "/sinomo/nodes",
-        IconGlyph::Storage,
-    );
     if !files.node_id.trim().is_empty() {
         push_unique_place(
             &mut places,
-            "This node files",
-            "local-owned SIFS",
+            "This node",
+            "Node-local SIFS files",
             FilesSourceKind::Sifs,
             format!("/sinomo/nodes/{}/files", files.node_id),
             IconGlyph::Folder,
@@ -9032,8 +9660,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     }
     push_unique_place_with_action(
         &mut places,
-        "SIFS path",
-        "cluster path",
+        "Go to path…",
+        "Enter a SIFS path",
         FilesSourceKind::Sifs,
         files.sifs_path.clone(),
         IconGlyph::Search,
@@ -9041,45 +9669,50 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     );
     push_unique_place(
         &mut places,
-        "Working folder",
-        "app working dir",
+        if files.source == FilesSourceKind::Local {
+            "Current folder"
+        } else {
+            "Last local folder"
+        },
+        compact_local_place_path(&files.local_path),
         FilesSourceKind::Local,
         files.local_path.clone(),
-        IconGlyph::Folder,
-    );
-    if let Some(root) = local_root_path(&files.local_path) {
-        push_unique_place(
-            &mut places,
-            local_root_label(&root),
-            "current volume",
-            FilesSourceKind::Local,
-            root,
-            IconGlyph::Storage,
-        );
-    }
-    push_unique_place(
-        &mut places,
-        "Sinomo data",
-        "local data dir",
-        FilesSourceKind::Local,
-        files.data_dir.root().to_string_lossy().into_owned(),
         IconGlyph::Folder,
     );
     if let Some(home) = local_home_path() {
         push_unique_place(
             &mut places,
             "Home",
-            "local profile",
+            compact_local_place_path(&home),
             FilesSourceKind::Local,
             home,
             IconGlyph::Folder,
+        );
+    }
+    let data_dir = files.data_dir.root().to_string_lossy().into_owned();
+    push_unique_place(
+        &mut places,
+        "Sinomo data",
+        compact_local_place_path(&data_dir),
+        FilesSourceKind::Local,
+        data_dir,
+        IconGlyph::Folder,
+    );
+    if let Some(root) = local_root_path(&files.local_path) {
+        push_unique_place(
+            &mut places,
+            local_root_label(&root),
+            root.clone(),
+            FilesSourceKind::Local,
+            root,
+            IconGlyph::Storage,
         );
     }
     if let Some(system_drive) = system_drive_path() {
         push_unique_place(
             &mut places,
             local_root_label(&system_drive),
-            "system drive",
+            system_drive.clone(),
             FilesSourceKind::Local,
             system_drive,
             IconGlyph::Storage,
@@ -9087,8 +9720,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     }
     push_unique_place_with_action(
         &mut places,
-        "Other path",
-        "drive, UNC, or mount",
+        "Browse…",
+        "Drive, share, or mount",
         FilesSourceKind::Local,
         files.local_path.clone(),
         IconGlyph::Search,
@@ -9097,10 +9730,22 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     places
 }
 
-fn file_place_active(files: &FilesState, place: &FilePlace) -> bool {
-    place.action == FilePlaceAction::OpenPath
-        && files.source == place.source
-        && files.path == place.path
+fn file_place_active_index(files: &FilesState, places: &[FilePlace]) -> Option<usize> {
+    places
+        .iter()
+        .enumerate()
+        .filter(|(_, place)| {
+            place.action == FilePlaceAction::OpenPath
+                && files.source == place.source
+                && match place.source {
+                    FilesSourceKind::Sifs => dfs_path_contains(&place.path, &files.path),
+                    FilesSourceKind::Local => {
+                        Path::new(&files.path).starts_with(Path::new(&place.path))
+                    }
+                }
+        })
+        .max_by_key(|(_, place)| place.path.len())
+        .map(|(index, _)| index)
 }
 
 fn open_file_place(shared: &Shared, place: FilePlace, ctx: &mut EventCtx) {
@@ -9125,6 +9770,8 @@ fn plural(count: usize, singular: &str) -> String {
         format!("1 {singular}")
     } else if singular == "entry" {
         format!("{count} entries")
+    } else if singular == "copy" {
+        format!("{count} copies")
     } else {
         format!("{count} {singular}s")
     }
@@ -9213,34 +9860,24 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
     SizedBox::new().height(FILES_STATUS_H).with_child(body)
 }
 
-fn files_places_signature(
-    shared: &Shared,
-) -> (FilesSourceKind, String, String, String, String, String) {
-    let files = shared.files();
-    (
-        files.source,
-        files.path.clone(),
-        files.sifs_path.clone(),
-        files.local_path.clone(),
-        files.node_id.clone(),
-        files.data_dir.root().to_string_lossy().into_owned(),
-    )
-}
-
-fn files_places_content_height(count: usize) -> f32 {
-    48.0 + count as f32 * PLACE_ROW_H + 8.0
+fn files_places_content_height(sifs_count: usize, local_count: usize) -> f32 {
+    PLACES_HEADER_H
+        + PLACE_SECTION_HEADER_H * 2.0
+        + (sifs_count + local_count) as f32 * PLACE_ROW_H
+        + PLACE_SECTION_GAP
+        + PLACE_RAIL_BOTTOM_PAD
 }
 
 fn files_places_rail(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files places structure", |key| {
+            (key.theme, key.places.clone())
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || files_places_signature(&s)
-        },
-        move |_key| files_places_rail_rebuild(&s, &r),
-    )
+    RebuildOnChange::new_observable(source, move |_key| files_places_rail_rebuild(&s, &r))
 }
 
 fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -9248,7 +9885,69 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
         let files = shared.files();
         files_places(&files)
     };
-    let content_height = files_places_content_height(places.len());
+    let sifs_places = places
+        .iter()
+        .filter(|place| place.source == FilesSourceKind::Sifs)
+        .cloned()
+        .collect::<Vec<_>>();
+    let local_places = places
+        .iter()
+        .filter(|place| place.source == FilesSourceKind::Local)
+        .cloned()
+        .collect::<Vec<_>>();
+    let content_height = files_places_content_height(sifs_places.len(), local_places.len());
+    let sifs_list = files_place_list(shared, reader, "SIFS locations", sifs_places);
+    let local_list = files_place_list(shared, reader, "Device locations", local_places);
+
+    let heading = SizedBox::new().height(PLACES_HEADER_H).with_child(
+        WidgetPadding::horizontal(
+            14.0,
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .with_child(SectionLabel::new("Locations").theme_when(clone_reader(reader))),
+        )
+        .fill_child_height(),
+    );
+    let sifs_heading = files_place_section_heading("SIFS", reader);
+    let local_heading = files_place_section_heading("This device", reader);
+
+    let content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(heading)
+        .with_child(sifs_heading)
+        .with_child(WidgetPadding::horizontal(8.0, sifs_list).fill_child_width())
+        .with_child(SizedBox::new().height(PLACE_SECTION_GAP))
+        .with_child(local_heading)
+        .with_child(WidgetPadding::horizontal(8.0, local_list).fill_child_width())
+        .with_child(SizedBox::new().height(PLACE_RAIL_BOTTOM_PAD));
+
+    WidgetPod::new(
+        SizedBox::new().height(content_height).with_child(
+            Surface::new(SurfaceRole::Sidebar, content)
+                .theme_when(clone_reader(reader))
+                .fill(),
+        ),
+    )
+}
+
+fn files_place_section_heading(label: &'static str, reader: &ThemeReader) -> impl Widget + use<> {
+    SizedBox::new().height(PLACE_SECTION_HEADER_H).with_child(
+        WidgetPadding::horizontal(
+            14.0,
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .with_child(SectionLabel::new(label).theme_when(clone_reader(reader))),
+        )
+        .fill_child_height(),
+    )
+}
+
+fn files_place_list(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &'static str,
+    places: Vec<FilePlace>,
+) -> impl Widget + use<> {
     let selection_places = places.clone();
     let action_places = places.clone();
     let selection_shared = shared.clone();
@@ -9256,44 +9955,36 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
     let items = places
         .iter()
         .map(|place| {
+            let semantic_description =
+                if place.action == FilePlaceAction::OpenPath && place.detail != place.path {
+                    format!("{}; path {}", place.detail, place.path)
+                } else {
+                    place.detail.clone()
+                };
             ListItem::new(place.label.clone())
                 .detail(place.detail.clone())
+                .description(semantic_description)
                 .leading_icon(place.glyph)
         })
         .collect::<Vec<_>>();
 
-    let list = ListView::new("Files places")
+    let list_reader: ThemeReader = {
+        let reader = Rc::clone(reader);
+        Rc::new(move || reader().with_size(ControlSize::Small))
+    };
+    ListView::new(name)
         .items(items)
         .row_height(PLACE_ROW_H)
-        .theme_when(clone_reader(reader))
+        .theme_when(clone_reader(&list_reader))
         .selected_when(move || {
             let files = selection_shared.files();
-            selection_places
-                .iter()
-                .position(|place| file_place_active(&files, place))
+            file_place_active_index(&files, &selection_places)
         })
         .on_change_with_ctx(move |index, _label, ctx| {
             if let Some(place) = action_places.get(index).cloned() {
                 open_file_place(&action_shared, place, ctx);
             }
-        });
-
-    let header = SizedBox::new().height(36.0).with_child(
-        WidgetPadding::horizontal(
-            CONTENT_PAD,
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .with_child(SectionLabel::new("Places").theme_when(clone_reader(reader))),
-        )
-        .fill_child_height(),
-    );
-
-    WidgetPod::new(SizedBox::new().height(content_height).with_child(
-        Background::new(Color::TRANSPARENT, Dock::new(list).top(36.0, header)).brush_when({
-            let s = shared.clone();
-            move || palette(&s).sidebar
-        }),
-    ))
+        })
 }
 
 fn task_strip_has_recovery(task: &FilesTask) -> bool {
@@ -9547,52 +10238,34 @@ fn files_task_strip(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
 }
 
 struct InspectorTaskQueue {
-    shared: Shared,
-    reader: ThemeReader,
-    signature: String,
     child: WidgetPod,
 }
 
 impl InspectorTaskQueue {
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
-        let (signature, child) = inspector_task_queue_snapshot(&shared, reader);
+        let description_shared = shared.clone();
+        let content = VirtualInspectorTaskContent::new(shared, reader);
         Self {
-            shared,
-            reader: Rc::clone(reader),
-            signature,
-            child,
+            child: WidgetPod::new(
+                SemanticRegion::new(
+                    "File task queue",
+                    Surface::panel(content)
+                        .padding(sui::Insets {
+                            left: 12.0,
+                            right: 12.0,
+                            top: 10.0,
+                            bottom: 12.0,
+                        })
+                        .fill_width()
+                        .theme_when(clone_reader(reader)),
+                )
+                .role(SemanticsRole::Text)
+                .description_when(move || {
+                    files_task_queue_summary(&description_shared.files().tasks)
+                }),
+            ),
         }
     }
-
-    fn refresh(&mut self) -> bool {
-        let signature = {
-            let files = self.shared.files();
-            files_tasks_signature(&files.tasks)
-        };
-        if signature == self.signature {
-            return false;
-        }
-
-        let (signature, child) = inspector_task_queue_snapshot(&self.shared, &self.reader);
-        self.signature = signature;
-        self.child = child;
-        true
-    }
-}
-
-fn inspector_task_queue_snapshot(shared: &Shared, reader: &ThemeReader) -> (String, WidgetPod) {
-    let tasks = shared.files().tasks.clone();
-    let signature = files_tasks_signature(&tasks);
-    let summary = files_task_queue_summary(&tasks);
-    let child = WidgetPod::new(
-        SemanticRegion::new(
-            "File task queue",
-            inspector_task_queue_content(shared, reader, &tasks),
-        )
-        .role(SemanticsRole::Text)
-        .description(summary),
-    );
-    (signature, child)
 }
 
 fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
@@ -9615,11 +10288,11 @@ fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Bu
         })
 }
 
-fn inspector_task_queue_content(
+fn inspector_task_queue_header(
     shared: &Shared,
     reader: &ThemeReader,
     tasks: &[FilesTask],
-) -> impl Widget + use<> {
+) -> WidgetPod {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let summary_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
@@ -9638,14 +10311,14 @@ fn inspector_task_queue_content(
         .trailing_width(if has_finished { 108.0 } else { 0.0 })
         .trailing_height(22.0)
         .gap(8.0);
+    WidgetPod::new(header)
+}
 
-    let mut rows = Flex::vertical()
-        .main_gap(8.0)
-        .align_items(Alignment::Stretch)
-        .with_child(header);
-
-    if tasks.is_empty() {
-        let idle_body = Flex::vertical()
+fn inspector_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    WidgetPod::new(
+        Flex::vertical()
             .main_gap(8.0)
             .align_items(Alignment::Stretch)
             .with_child(
@@ -9669,46 +10342,197 @@ fn inspector_task_queue_content(
                 11.0,
                 FontWeight::NORMAL,
                 pal.text_faint,
-            )));
-        rows = rows.with_child(idle_body);
-    } else {
-        for task in tasks {
-            rows = rows.with_child(
-                SizedBox::new()
-                    .height(31.0)
-                    .with_child(task_strip_row(shared, reader, task)),
-            );
+            ))),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FilesTaskRowsStructure {
+    theme: (AppThemeMode, AppTextScale),
+    tasks: Vec<FilesTask>,
+}
+
+struct VirtualInspectorTaskContent {
+    source: Arc<dyn Observable<FilesTaskRowsStructure>>,
+    model: VirtualCollectionModel<u64, FilesTask>,
+    shared: Shared,
+    reader: ThemeReader,
+    header_key: (AppThemeMode, AppTextScale, String, bool),
+    header: WidgetPod,
+    empty: WidgetPod,
+    list: WidgetPod,
+    is_empty: bool,
+}
+
+impl VirtualInspectorTaskContent {
+    const GAP: f32 = 8.0;
+    const ROW_HEIGHT: f32 = 31.0;
+
+    fn new(shared: Shared, reader: &ThemeReader) -> Self {
+        let current = shared.signals().files_structure.get();
+        let tasks = current.tasks;
+        let model = VirtualCollectionModel::named("File task collection");
+        let header_key = (
+            current.theme.0,
+            current.theme.1,
+            files_task_queue_summary(&tasks),
+            files_tasks_have_finished(&tasks),
+        );
+        let source =
+            shared
+                .signals()
+                .files_structure
+                .select_named("files virtual task rows", |key| FilesTaskRowsStructure {
+                    theme: key.theme,
+                    tasks: key.tasks.clone(),
+                });
+        let row_shared = shared.clone();
+        let row_reader = Rc::clone(reader);
+        let list = VirtualList::new("File task queue", model.clone(), move |_id, task| {
+            let shared = row_shared.clone();
+            let reader = Rc::clone(&row_reader);
+            RebuildOnChange::new_observable(task, move |task| {
+                WidgetPod::new(
+                    SizedBox::new()
+                        .height(Self::ROW_HEIGHT)
+                        .with_child(task_strip_row(&shared, &reader, task)),
+                )
+            })
+        })
+        .estimated_row_height(Self::ROW_HEIGHT)
+        .spacing(Self::GAP)
+        .selection_mode(VirtualListSelectionMode::None)
+        .chrome(VirtualListChrome::Transparent)
+        .overlay_scroll_bars(false)
+        .theme_when(clone_reader(reader))
+        .row_name(|_id, task| task.title.clone())
+        .row_description(|_id, task| format!("{}; {}", task.state.label(), task.detail));
+        Self {
+            source: Arc::new(source),
+            model,
+            header: inspector_task_queue_header(&shared, reader, &tasks),
+            empty: inspector_task_queue_empty(&shared, reader),
+            list: WidgetPod::new(list),
+            shared,
+            reader: Rc::clone(reader),
+            header_key,
+            is_empty: tasks.is_empty(),
         }
     }
 
-    Surface::panel(rows)
-        .padding(sui::Insets {
-            left: 12.0,
-            right: 12.0,
-            top: 10.0,
-            bottom: 12.0,
-        })
-        .fill_width()
-        .theme_when(clone_reader(reader))
+    fn sync(&mut self, structure: FilesTaskRowsStructure) {
+        let header_key = (
+            structure.theme.0,
+            structure.theme.1,
+            files_task_queue_summary(&structure.tasks),
+            files_tasks_have_finished(&structure.tasks),
+        );
+        if header_key != self.header_key {
+            self.header_key = header_key;
+            self.header = inspector_task_queue_header(&self.shared, &self.reader, &structure.tasks);
+            self.empty = inspector_task_queue_empty(&self.shared, &self.reader);
+        }
+        self.is_empty = structure.tasks.is_empty();
+        self.model
+            .replace(structure.tasks.into_iter().map(|task| (task.id, task)))
+            .expect("file task ids must be unique");
+    }
+}
+
+impl Widget for VirtualInspectorTaskContent {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let structure = ctx.observe(self.source.as_ref());
+        self.sync(structure);
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(280.0)
+        };
+        let child_constraints = Constraints::new(Size::ZERO, Size::new(width, f32::INFINITY));
+        let header = self.header.measure(ctx, child_constraints);
+        let body_height = if self.is_empty {
+            self.empty.measure(ctx, child_constraints).height
+        } else {
+            self.empty.measure(ctx, Constraints::tight(Size::ZERO));
+            self.list.measure(ctx, child_constraints).height
+        };
+        if self.is_empty {
+            self.list.measure(ctx, Constraints::tight(Size::ZERO));
+        }
+        constraints.clamp(Size::new(width, header.height + Self::GAP + body_height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let header_height = self.header.measured_size().height;
+        self.header.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), bounds.width(), header_height),
+        );
+        let y = bounds.y() + header_height + Self::GAP;
+        if self.is_empty {
+            self.list.arrange(ctx, Rect::ZERO);
+            self.empty.arrange(
+                ctx,
+                Rect::new(
+                    bounds.x(),
+                    y,
+                    bounds.width(),
+                    self.empty.measured_size().height,
+                ),
+            );
+            return;
+        }
+        self.empty.arrange(ctx, Rect::ZERO);
+        self.list.arrange(
+            ctx,
+            Rect::new(
+                bounds.x(),
+                y,
+                bounds.width(),
+                self.list.measured_size().height,
+            ),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.header.paint(ctx);
+        if self.is_empty {
+            self.empty.paint(ctx);
+        } else {
+            self.list.paint(ctx);
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.header.semantics(ctx);
+        if self.is_empty {
+            self.empty.semantics(ctx);
+        } else {
+            self.list.semantics(ctx);
+        }
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.header);
+        if self.is_empty {
+            visitor.visit(&self.empty);
+        } else {
+            visitor.visit(&self.list);
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.header);
+        if self.is_empty {
+            visitor.visit(&mut self.empty);
+        } else {
+            visitor.visit(&mut self.list);
+        }
+    }
 }
 
 impl Widget for InspectorTaskQueue {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        let pointer_up = matches!(
-            event,
-            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
-        );
-        let redraw = matches!(event, Event::Window(WindowEvent::RedrawRequested));
-        if (pointer_up || redraw) && self.refresh() {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
-        }
-    }
-
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.refresh();
         self.child.measure(ctx, constraints)
     }
 
@@ -9816,7 +10640,7 @@ fn unselected_inspector_actions(files: &FilesState) -> Vec<RootInspectorAction> 
 }
 
 fn open_cluster_tab(shared: &Shared) {
-    shared.borrow_mut().active_tab = Tab::Cluster;
+    shared.set_active_tab(Tab::Cluster);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10069,13 +10893,15 @@ impl InspectorView {
             let s = shared.clone();
             Rc::new(move || s.theme().with_size(ControlSize::Small))
         };
-        let key_shared = shared.clone();
+        let source = shared
+            .signals()
+            .files_structure
+            .select_named("files inspector structure", |key| key.inspector.clone());
         let build_shared = shared.clone();
         let build_reader = Rc::clone(&reader);
-        let child = RebuildOnChange::new(
-            move || inspector_summary(&key_shared),
-            move |_key| composed_inspector_content(&build_shared, &build_reader),
-        );
+        let child = RebuildOnChange::new_observable(source, move |_key| {
+            composed_inspector_content(&build_shared, &build_reader)
+        });
         Self {
             child: WidgetPod::new(child),
         }
@@ -10110,6 +10936,7 @@ impl Widget for InspectorView {
     }
 }
 
+#[cfg(test)]
 fn inspector_summary(shared: &Shared) -> String {
     let files = shared.files();
     if files.loading {
@@ -10719,14 +11546,14 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         );
         let placement_rows = vec![
             (
-                "Placement",
+                "Content copies",
                 sifs_replication_summary(details, files.clustered),
             ),
-            ("Metadata", sifs_metadata_shard_summary(details)),
-            ("Health", sifs_health_summary(details)),
-            ("Pin", sifs_pin_summary(details)),
+            ("Metadata home", sifs_metadata_shard_summary(details)),
+            ("Object health", sifs_health_summary(details)),
+            ("This device", sifs_pin_summary(details)),
             (
-                "Next",
+                "Recommended",
                 sifs_inspector_next_step(
                     details,
                     files.clustered,
@@ -10735,6 +11562,13 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                 ),
             ),
         ];
+        let (live_label, live_tone) = if files.live_updates_connected {
+            ("Live changes on", SemanticTone::Success)
+        } else if files.live_updates_error.is_some() {
+            ("Live changes reconnecting", SemanticTone::Warning)
+        } else {
+            ("Snapshot view", SemanticTone::Neutral)
+        };
         let placement_body = Stack::vertical()
             .alignment(Alignment::Stretch)
             .spacing(8.0)
@@ -10749,6 +11583,11 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                     .tone(status_tone)
                     .theme_when(clone_reader(reader)),
             )
+            .with_child(
+                StatusBadge::new(live_label)
+                    .tone(live_tone)
+                    .theme_when(clone_reader(reader)),
+            )
             .with_child(detail_rows_widget(placement_rows, reader));
         content = content.with_child(inspector_card(
             "Placement",
@@ -10759,78 +11598,114 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         ));
 
         if files.inspector_details_open {
-            let policy = details
-                .map(|details| details.policy.clone())
-                .unwrap_or_else(|| "not loaded".to_string());
-            let mut rows = Vec::new();
+            let mut status_rows = Vec::new();
+            if let Some(error) = &files.live_updates_error {
+                status_rows.push(("Live updates", error.clone()));
+            }
             if let Some(error) = &files.details_error {
-                rows.push(("Reason", error.clone()));
-                rows.push(("Authority", "SIFS through daemon".to_string()));
+                status_rows.push(("Reason", error.clone()));
+                status_rows.push(("Source", "SIFS through daemon".to_string()));
             } else if files.details_loading {
-                rows.push(("Status", "Waiting for daemon metadata".to_string()));
+                status_rows.push(("Status", "Reading DFS metadata".to_string()));
             } else if details.is_none() {
-                rows.push((
+                status_rows.push((
                     "Status",
                     "Metadata has not returned for this object yet".to_string(),
                 ));
-                rows.push(("Authority", "SIFS through daemon".to_string()));
+                status_rows.push(("Source", "SIFS through daemon".to_string()));
             }
-            rows.push(("Policy", policy));
-            if let Some(shard) = details.and_then(|details| details.metadata_shard.as_ref()) {
-                rows.push(("Shard", sifs_metadata_shard_detail_summary(shard)));
-            }
-            if let Some(health) = details.and_then(|details| details.health.as_ref()) {
-                rows.push(("Agent state", health.agent_state.clone()));
-                rows.push((
-                    "Operator counts",
-                    format!(
-                        "{} · {} · {}",
-                        plural(health.version_count, "version"),
-                        plural(health.receipt_count, "receipt"),
-                        plural(health.intent_count, "intent")
-                    ),
+            if !status_rows.is_empty() {
+                content = content.with_child(inspector_card(
+                    "DFS details",
+                    detail_rows_widget(status_rows, reader),
+                    reader,
+                    None,
+                    false,
                 ));
-                rows.push((
-                    "Repair backlog",
-                    format!(
-                        "{} · {}",
-                        plural(health.pending_repair_count, "missing replica"),
-                        plural(health.open_conflict_count, "conflict")
-                    ),
-                ));
-                rows.push(("Missing nodes", sifs_missing_replica_summary(health)));
             }
-            rows.push((
-                "Durable nodes",
-                details
-                    .map(details_locations)
-                    .unwrap_or_else(|| "not reported".to_string()),
-            ));
+
             if let Some(details) = details {
-                rows.push(("Local pins", sifs_pin_detail_summary(details)));
-                rows.push(("File system", details.file_system_id.clone()));
-                rows.push(("Object", short(&details.object_id, 28)));
-                rows.push(("Version", short(&details.version, 28)));
-                rows.push((
-                    "Mode",
-                    format!("{:o} · {} links", details.mode, details.link_count),
+                let metadata_rows = vec![
+                    ("Type", details.kind.clone()),
+                    ("Size", details_size(&entry, Some(details))),
+                    ("Modified", unix_nanos_label(details.modified_at_unix_nanos)),
+                    ("Created", unix_nanos_label(details.created_at_unix_nanos)),
+                    ("Accessed", unix_nanos_label(details.accessed_at_unix_nanos)),
+                    (
+                        "Permissions",
+                        format!("{:04o} · {} links", details.mode, details.link_count),
+                    ),
+                    (
+                        "Owner",
+                        format!("uid {} · gid {}", details.uid, details.gid),
+                    ),
+                ];
+                content = content.with_child(inspector_card(
+                    "File metadata",
+                    detail_rows_widget(metadata_rows, reader),
+                    reader,
+                    None,
+                    false,
                 ));
-                rows.push((
-                    "Owner",
-                    format!("uid {} · gid {}", details.uid, details.gid),
-                ));
-                rows.push(("Modified", unix_nanos_label(details.modified_at_unix_nanos)));
+
+                let mut identity_rows = vec![
+                    ("File system", details.file_system_id.clone()),
+                    ("Object ID", details.object_id.clone()),
+                    ("Version", details.version.clone()),
+                ];
                 if let Some(hash) = &details.content_hash {
-                    rows.push(("Content", short(hash, 28)));
+                    identity_rows.push(("Content hash", hash.clone()));
                 }
+                content = content.with_child(inspector_card(
+                    "DFS identity",
+                    detail_rows_widget(identity_rows, reader),
+                    reader,
+                    None,
+                    false,
+                ));
+
+                let mut placement_detail_rows = vec![
+                    ("Policy", details.policy.clone()),
+                    (
+                        "Durable nodes",
+                        details_locations_friendly(details, &files.node_id),
+                    ),
+                    ("Local pins", sifs_pin_detail_summary(details)),
+                ];
+                if let Some(shard) = details.metadata_shard.as_ref() {
+                    placement_detail_rows
+                        .push(("Metadata shard", sifs_metadata_shard_detail_summary(shard)));
+                }
+                if let Some(health) = details.health.as_ref() {
+                    placement_detail_rows.push(("Agent state", health.agent_state.clone()));
+                    placement_detail_rows.push((
+                        "DFS records",
+                        format!(
+                            "{} · {} · {}",
+                            plural(health.version_count, "version"),
+                            plural(health.receipt_count, "receipt"),
+                            plural(health.intent_count, "intent")
+                        ),
+                    ));
+                    placement_detail_rows.push((
+                        "Repair backlog",
+                        format!(
+                            "{} · {}",
+                            plural(health.pending_repair_count, "missing replica"),
+                            plural(health.open_conflict_count, "conflict")
+                        ),
+                    ));
+                    placement_detail_rows
+                        .push(("Missing nodes", sifs_missing_replica_summary(health)));
+                }
+                content = content.with_child(inspector_card(
+                    "Placement internals",
+                    detail_rows_widget(placement_detail_rows, reader),
+                    reader,
+                    None,
+                    false,
+                ));
             }
-            content = content.with_child(inspector_card(
-                "Technical details",
-                detail_rows_widget(rows, reader),
-                reader,
-                None,
-                false,
-            ));
         }
 
         if !files.clustered {
@@ -10921,24 +11796,14 @@ fn inspector(
 /// The header bar wrapped so it rebuilds (breadcrumb segments and history affordances) whenever
 /// navigation state changes. A fixed-height titlebar surface over a hairline separator.
 fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.source,
-                    files.path.clone(),
-                    files.history_back.len(),
-                    files.history_forward.len(),
-                    files.loading,
-                )
-            }
-        },
-        move |_key| WidgetPod::new(header(&s, &r)),
-    );
+    let rebuilt =
+        RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(header(&s, &r)));
     Surface::window(
         WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
             .fill_child_width()
@@ -10949,24 +11814,15 @@ fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files picker header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.source,
-                    files.path.clone(),
-                    files.history_back.len(),
-                    files.history_forward.len(),
-                    files.loading,
-                )
-            }
-        },
-        move |_key| WidgetPod::new(picker_first_header(&s, &r)),
-    );
+    let rebuilt = RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(picker_first_header(&s, &r))
+    });
     Surface::window(
         WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
             .fill_child_width()
@@ -11042,23 +11898,14 @@ impl Widget for FilesDesktopHeader {
 }
 
 fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files compact header structure", |key| key.header.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.source,
-                    files.path.clone(),
-                    files.history_back.len(),
-                    files.loading,
-                )
-            }
-        },
-        move |_key| WidgetPod::new(compact_header(&s, &r)),
-    );
+    let rebuilt =
+        RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(compact_header(&s, &r)));
     Surface::window(
         WidgetPadding::new(
             Insets {
@@ -11083,19 +11930,14 @@ fn list_column(
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files column structure", |key| key.list.clone());
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (files.path.clone(), files.list_revision, files.tasks.clone())
-            }
-        },
-        move |_key| listing(&s, &r, &ss),
-    )
+    RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss))
 }
 
 /// Wide split: header docked on top, body fills with [ list (flex) | vertical separator |
@@ -11537,6 +12379,7 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
     .viewport_width_hint(true)
 }
 
+#[cfg(test)]
 fn files_action_dialog_signature(shared: &Shared) -> String {
     let files = shared.files();
     match &files.action_prompt {
@@ -12029,35 +12872,6 @@ fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<
     ))
 }
 
-fn files_dialog_signature(shared: &Shared) -> String {
-    let files = shared.files();
-    if files.document_close_confirmation {
-        return format!("document-confirm|{}", files.document_revision);
-    }
-    if files.document.is_some() {
-        return format!("document|{}", files.document_revision);
-    }
-    drop(files);
-    let action = files_action_dialog_signature(shared);
-    if action != "closed" {
-        return format!("action|{action}");
-    }
-    let files = shared.files();
-    let Some(overlay) = files.compact_overlay else {
-        return "closed".to_string();
-    };
-    format!(
-        "compact|{overlay:?}|{:?}|{}|{}|{:?}|{}|{}|{}",
-        files.source,
-        files.path,
-        files.list_revision,
-        files.selected,
-        files.details_loading,
-        files.preview_loading,
-        files.inspector_details_open
-    )
-}
-
 fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let overlay = shared.files().compact_overlay?;
     let (title, description, selected) = match overlay {
@@ -12107,7 +12921,7 @@ struct FilesDialogHost {
     reader: ThemeReader,
     body: WidgetPod,
     dialog: Option<WidgetPod>,
-    dialog_signature: String,
+    dialog_key: FilesDialogStructure,
 }
 
 impl FilesDialogHost {
@@ -12115,23 +12929,22 @@ impl FilesDialogHost {
     where
         W: Widget + 'static,
     {
-        let mut host = Self {
+        let dialog_key = shared.signals().files_structure.get().dialog;
+        let dialog = files_dialog(&shared, &reader);
+        Self {
             shared,
             reader,
             body: WidgetPod::new(body),
-            dialog: None,
-            dialog_signature: String::new(),
-        };
-        host.sync_dialog();
-        host
+            dialog,
+            dialog_key,
+        }
     }
 
-    fn sync_dialog(&mut self) {
-        let signature = files_dialog_signature(&self.shared);
-        if signature == self.dialog_signature {
+    fn sync_dialog(&mut self, key: FilesDialogStructure) {
+        if key == self.dialog_key {
             return;
         }
-        self.dialog_signature = signature;
+        self.dialog_key = key;
         self.dialog = files_dialog(&self.shared, &self.reader);
     }
 }
@@ -12150,17 +12963,16 @@ impl Widget for FilesDialogHost {
             ctx.set_handled();
             request_files_overlay_rebuild(ctx);
         }
-        let signature = files_dialog_signature(&self.shared);
-        if signature != self.dialog_signature {
-            ctx.request_measure();
-            ctx.request_paint();
-            ctx.request_semantics();
-            ctx.request_hit_test();
-        }
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.sync_dialog();
+        let source = self
+            .shared
+            .signals()
+            .files_structure
+            .select_named("files dialog structure", |key| key.dialog.clone());
+        let key = ctx.observe(&source);
+        self.sync_dialog(key);
         let size = constraints.clamp(Size::new(
             if constraints.max.width.is_finite() {
                 constraints.max.width
@@ -12279,24 +13091,14 @@ impl FilesView {
 }
 
 impl Widget for FilesView {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        // Navigation (a directory row / breadcrumb / up button) mutates the path and the inner
-        // `RebuildOnChange` rebuilds the list + breadcrumb, but those nested rebuilds need a fresh
-        // measure+arrange for the host. A pointer release inside the tab is the only moment a
-        // navigation can happen, so request a relayout then (this is the path the headless tests
-        // exercise, since the harness never dispatches RedrawRequested). Matches `SettingsView`.
-        if let Event::Pointer(pointer) = event
-            && matches!(pointer.kind, sui::PointerEventKind::Up)
-        {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        }
-    }
+    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let waker = { self.shared.borrow().waker.clone() };
-        self.shared.files_mut().ensure_loaded(waker);
+        let changed = self.shared.files_mut_unpublished().ensure_loaded(waker);
+        if changed {
+            self.shared.publish_files_signals();
+        }
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
@@ -12761,49 +13563,56 @@ mod tests {
         let places = files_places(&state);
 
         assert!(places.iter().any(|place| {
-            place.label == "SIFS root" && place.source == FilesSourceKind::Sifs && place.path == "/"
+            place.label == "Root" && place.source == FilesSourceKind::Sifs && place.path == "/"
         }));
         assert!(places.iter().any(|place| {
             place.label == "Services"
+                && place.detail == "/services"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/services"
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Cluster nodes"
-                && place.source == FilesSourceKind::Sifs
-                && place.path == "/sinomo/nodes"
-        }));
-        assert!(places.iter().any(|place| {
-            place.label == "This node files"
-                && place.detail == "local-owned SIFS"
+            place.label == "This node"
+                && place.detail == "Node-local SIFS files"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/sinomo/nodes/node-desktop/files"
         }));
         assert!(places.iter().any(|place| {
-            place.label == "SIFS path"
+            place.label == "Go to path…"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/services"
                 && place.action == FilePlaceAction::OpenPathPrompt
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Working folder"
-                && place.detail == "app working dir"
+            place.label == "Last local folder"
                 && place.source == FilesSourceKind::Local
                 && place.path == root.to_string_lossy()
         }));
         let current_root = local_root_path(&state.local_path).expect("temp dir has root");
         assert!(places.iter().any(|place| {
             place.label == local_root_label(&current_root)
-                && place.detail == "current volume"
+                && place.detail == current_root
                 && place.source == FilesSourceKind::Local
                 && place.path == current_root
                 && place.action == FilePlaceAction::OpenPath
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Other path"
+            place.label == "Browse…"
                 && place.source == FilesSourceKind::Local
                 && place.action == FilePlaceAction::OpenPathPrompt
         }));
+
+        state.path = "/services/project".to_string();
+        assert_eq!(
+            file_place_active_index(&state, &places),
+            Some(
+                places
+                    .iter()
+                    .position(|place| place.label == "Services")
+                    .expect("services shortcut")
+            ),
+            "the most specific containing location should stay selected"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12950,19 +13759,25 @@ mod tests {
             }),
             "directory row should explain the select versus open split"
         );
-        let places_list = snapshot
+        let sifs_locations = snapshot
             .accessibility
             .nodes
             .iter()
             .find(|node| {
                 node.role == sui::SemanticsRole::List
-                    && node.name.as_deref() == Some("Files places")
+                    && node.name.as_deref() == Some("SIFS locations")
             })
-            .expect("places rail should be exposed as a navigable list");
+            .expect("SIFS locations should be exposed as a navigable list");
         assert!(
-            places_list.actions.contains(&sui::SemanticsAction::Focus),
-            "places list should be focusable"
+            sifs_locations
+                .actions
+                .contains(&sui::SemanticsAction::Focus),
+            "SIFS locations should be focusable"
         );
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == sui::SemanticsRole::List
+                && node.name.as_deref() == Some("Device locations")
+        }));
         let services_place = snapshot
             .accessibility
             .nodes
@@ -12970,7 +13785,7 @@ mod tests {
             .find(|node| {
                 node.role == sui::SemanticsRole::ListItem
                     && node.name.as_deref() == Some("Services")
-                    && node.description.as_deref() == Some("service data")
+                    && node.description.as_deref() == Some("/services")
             })
             .expect("services place should be exposed as a list item");
         assert!(
@@ -14236,7 +15051,7 @@ mod tests {
     }
 
     #[test]
-    fn active_sifs_row_meta_surfaces_replica_repair_state() {
+    fn sifs_row_meta_uses_page_metadata_without_selected_object_stat() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.source = FilesSourceKind::Sifs;
@@ -14251,24 +15066,81 @@ mod tests {
             is_link: false,
             size: Some(5),
         }];
-        let mut details = test_sifs_details(Vec::new());
-        details.health = Some(SifsObjectHealth {
-            agent_state: "pending-repair".to_string(),
-            version_count: 1,
-            receipt_count: 1,
-            intent_count: 1,
-            open_conflict_count: 0,
-            pending_repair_count: 1,
-            missing_replica_nodes: vec!["node-b".to_string()],
-        });
-        state.selected_details = Some(details);
+        state.entry_metadata.insert(
+            "/artifact.txt".to_string(),
+            SifsEntryMetadata {
+                path: "/artifact.txt".to_string(),
+                object_id: "object-artifact".to_string(),
+                version: "version-1".to_string(),
+                modified_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+            },
+        );
 
         let entry = state.entries[0].clone();
-        assert_eq!(
-            entry_row_meta(&entry, &state, true),
-            "5 B · 1/2 replicas · 1 repair"
-        );
+        assert_eq!(entry_row_meta(&entry, &state, true), "5 B");
         assert_eq!(entry_row_meta(&entry, &state, false), "5 B");
+
+        state.selected = None;
+        assert_eq!(
+            file_row_placement_badge(&entry, &state, 0),
+            FileRowPlacementBadge {
+                label: "2 copies".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas: None,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_modified_age_stays_readable_for_recent_and_old_files() {
+        let day = 86_400_i128 * 1_000_000_000;
+        let now = 2_000_000_i128 * 1_000_000_000;
+        assert_eq!(
+            compact_modified_age_at((now - 90 * 1_000_000_000) as u64, now),
+            Some("1m ago".to_string())
+        );
+        assert_eq!(
+            compact_modified_age_at((now - 3 * day) as u64, now),
+            Some("3d ago".to_string())
+        );
+        assert_eq!(compact_modified_age_at(0, now), None);
+    }
+
+    #[test]
+    fn dfs_change_paths_match_directory_boundaries_and_selected_descendants() {
+        assert!(dfs_event_touches_location(
+            &serde_json::json!({ "paths": ["/users/project/report.txt"] }),
+            "/users/project",
+            None,
+        ));
+        assert!(dfs_event_touches_location(
+            &serde_json::json!({ "paths": ["/users/project"] }),
+            "/users",
+            Some("/users/project/report.txt"),
+        ));
+        assert!(!dfs_event_touches_location(
+            &serde_json::json!({ "paths": ["/users/project-old/report.txt"] }),
+            "/users/project",
+            None,
+        ));
+    }
+
+    #[test]
+    fn ready_event_marks_sifs_snapshot_for_one_coalesced_refresh() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+
+        assert!(
+            state.apply_live_update(FilesLiveUpdate::Item(DaemonEventStreamItem::Ready {
+                subscription_id: "files-test".to_string(),
+            },))
+        );
+        assert!(state.live_updates_connected);
+        assert!(state.live_refresh_pending);
     }
 
     #[test]
@@ -14945,6 +15817,7 @@ mod tests {
                 health: None,
                 health_error: None,
                 total_count: 1,
+                entry_metadata: Vec::new(),
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),
@@ -15020,6 +15893,7 @@ mod tests {
                 health: None,
                 health_error: None,
                 total_count: 1,
+                entry_metadata: Vec::new(),
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),
@@ -16166,9 +17040,12 @@ mod tests {
             table.value,
             Some(sui::SemanticsValue::Text("2 rows".to_string()))
         );
-        assert_eq!(
-            table.description.as_deref(),
-            Some("Columns: Name, Placement, Kind / size")
+        assert!(
+            table.description.as_deref().is_some_and(
+                |description| description.starts_with("Columns: Name, Placement, Details")
+            ),
+            "table semantics should preserve the column description: {:?}",
+            table.description
         );
 
         Ok(())
@@ -16464,9 +17341,10 @@ mod tests {
             })
             .expect("artifact row semantics");
         assert!(
-            row.description.as_deref().is_some_and(
-                |description| description.contains("Placement 5 B · 1/2 replicas · 1 repair")
-            ),
+            row.description
+                .as_deref()
+                .is_some_and(|description| description
+                    .contains("Placement: repair; 5 B · 1/2 replicas · 1 repair")),
             "selected SIFS row should expose compact placement metadata, got {:?}",
             row.description
         );
@@ -17057,7 +17935,7 @@ mod tests {
     }
 
     #[test]
-    fn inspector_task_queue_exposes_all_retained_tasks() -> sui::Result<()> {
+    fn inspector_task_queue_keeps_virtual_collection_actions_live() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -17099,15 +17977,81 @@ mod tests {
             scroll_state.max_offset().y > 0.0,
             "expanded task queue should remain scrollable through the inspector ScrollView"
         );
-
-        window
+        let cancel_visible = window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel Copy batch 6")
-            .click()?;
+            .with_name("Cancel Copy batch 1");
+        cancel_visible.expect().to_be_visible()?;
+        cancel_visible.click()?;
 
         let files = shared.files();
-        assert_eq!(files.tasks[5].state, FilesTaskState::CancelRequested);
-        assert!(operation_cancelled(&files.worker_cancellations, 105));
+        assert_eq!(files.tasks[0].state, FilesTaskState::CancelRequested);
+        assert!(operation_cancelled(&files.worker_cancellations, 100));
+
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_task_reorder_preserves_virtual_row_widget_ids() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.tasks = vec![
+                FilesTask {
+                    id: 41,
+                    source: FilesSourceKind::Sifs,
+                    title: "Copy alpha".to_string(),
+                    detail: "/alpha -> /archive/alpha".to_string(),
+                    state: FilesTaskState::Running,
+                    progress: Some(0.2),
+                },
+                FilesTask {
+                    id: 73,
+                    source: FilesSourceKind::Sifs,
+                    title: "Copy beta".to_string(),
+                    detail: "/beta -> /archive/beta".to_string(),
+                    state: FilesTaskState::Running,
+                    progress: Some(0.6),
+                },
+            ];
+        }
+        let reader: ThemeReader = Rc::new(DefaultTheme::light);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files keyed task rows")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(240.0)
+                            .with_child(InspectorTaskQueue::new(shared.clone(), &reader)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        let row_ids = |snapshot: &sui_testing::WindowSnapshot| {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| node.role == SemanticsRole::ProgressBar)
+                .filter_map(|node| node.name.clone().map(|name| (name, node.id)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = row_ids(&window.snapshot()?);
+        assert_eq!(before.len(), 2);
+
+        shared.files_mut().tasks.swap(0, 1);
+        app.run_until_idle()?;
+        let after = row_ids(&window.snapshot()?);
+        assert_eq!(
+            after, before,
+            "same-key task rows should move without replacing their retained widget pods"
+        );
 
         Ok(())
     }

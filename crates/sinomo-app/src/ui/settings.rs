@@ -14,7 +14,7 @@
 //! snapshot-seed-plus-`on_change` writeback. Async provider device-login status is
 //! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -31,11 +31,11 @@ use sinomo_cli::app_api::{
 use sui::{
     Alignment, ArrangeCtx, Constraints, ContextMenu, ControlSize, DefaultTheme, Event, EventCtx,
     FieldGroup, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconGlyph, Label,
-    ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PointerEventKind, ProgressBar,
+    ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, ProgressBar, RebuildOnChange,
     Rect, ScrollState, ScrollView, Select, SelectionScope, SemanticTone, SemanticsCtx, Separator,
     Size, SizedBox, Spinner, Stack, StatusBadge, Switch, SwitchView, TabBar, TextArea, TextCommand,
-    TextInput, ThemeTextToken, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    TextInput, ThemeTextToken, TrailingSlotRow, VirtualList, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor,
 };
 
 use sinomo_runtime::config::{
@@ -221,6 +221,407 @@ pub struct SettingsState {
     provider_detail_expanded: Vec<String>,
     provider_storage_detail_expanded: bool,
     provider_remove_confirming: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ConfigItemStructure {
+    key: String,
+    owner: String,
+    source: &'static str,
+    module_id: Option<String>,
+    edit_kind: ConfigEditKind,
+    bool_value: Option<bool>,
+    read_only: bool,
+    raw_value: Value,
+    schema: Option<ConfigSchema>,
+}
+
+impl From<&ConfigItem> for ConfigItemStructure {
+    fn from(item: &ConfigItem) -> Self {
+        Self {
+            key: item.key.clone(),
+            owner: item.owner.clone(),
+            source: item.source,
+            module_id: item.module_id.clone(),
+            edit_kind: item.edit_kind,
+            bool_value: item.bool_value,
+            read_only: item.read_only,
+            raw_value: item.raw_value.clone(),
+            schema: item.schema.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsConnectionIssueStructure {
+    title: &'static str,
+    detail: String,
+    tab: Tab,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsConnectionStructure {
+    theme: (AppThemeMode, AppTextScale),
+    mode_label: String,
+    status_detail: String,
+    issues: Vec<SettingsConnectionIssueStructure>,
+    expanded: Vec<Tab>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsNodeStructure {
+    theme: (AppThemeMode, AppTextScale),
+    node_id: String,
+    role: String,
+    mode_label: String,
+    status_detail: String,
+    clustered: bool,
+    cluster_node_id: Option<String>,
+    cluster_summary: Option<String>,
+    expanded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsClusterStructure {
+    theme: (AppThemeMode, AppTextScale),
+    clustered: bool,
+    cluster_summary: Option<String>,
+    invite: Option<(String, String, String, String)>,
+    leave_confirming: bool,
+    join_confirming: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsConfigurationStructure {
+    theme: (AppThemeMode, AppTextScale),
+    items: Vec<ConfigItemStructure>,
+    expanded: Vec<String>,
+    ui_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsProviderStructure {
+    theme: (AppThemeMode, AppTextScale),
+    add_open: bool,
+    add_provider_index: usize,
+    action_error: Option<String>,
+    action_status: Option<ProviderActionStatus>,
+    remove_confirming: Option<(String, String)>,
+    expanded: Vec<String>,
+    storage_expanded: bool,
+    providers: Vec<(ProviderForm, ProviderHealthState)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsAgentsStructure {
+    theme: (AppThemeMode, AppTextScale),
+    agents: Vec<AgentConfigSummary>,
+    error: Option<String>,
+    selected_id: Option<String>,
+    delete_confirming: Option<String>,
+    validation_report: Option<AgentValidationReport>,
+    editor_previous_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsAgentRow {
+    theme: (AppThemeMode, AppTextScale),
+    agent: AgentConfigSummary,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsModuleNodeStructure {
+    node_id: String,
+    display_name: String,
+    availability: String,
+    local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsModuleSummaryStructure {
+    module_id: String,
+    label: String,
+    backend: String,
+    detail: String,
+    desired_enabled: Option<bool>,
+    effective_source: ModuleRuntimeConfigSource,
+    effective_enabled: bool,
+    observed: ModuleObservedState,
+    observed_detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsSelectedModuleNodeStructure {
+    node_id: String,
+    error: Option<String>,
+    config: Vec<(String, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsModulesStructure {
+    theme: (AppThemeMode, AppTextScale),
+    selected_node_id: Option<String>,
+    action_error: Option<String>,
+    action_status: Option<String>,
+    warnings: Vec<String>,
+    config_ui_revision: u64,
+    nodes: Vec<SettingsModuleNodeStructure>,
+    modules: Vec<SettingsModuleSummaryStructure>,
+    cluster_config: Vec<(String, bool)>,
+    selected_node: Option<SettingsSelectedModuleNodeStructure>,
+    module_settings: Vec<ConfigItemStructure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsSkillsStructure {
+    theme: (AppThemeMode, AppTextScale),
+    include_all: bool,
+    selected: Option<(String, String)>,
+    detail_content_hash: Option<String>,
+    text_expanded: bool,
+    skills: Vec<SkillSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsSkillRow {
+    theme: (AppThemeMode, AppTextScale),
+    skill: SkillSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsDeviceLoginStructure {
+    primary: String,
+    prompt_url: Option<String>,
+    error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsStructureSnapshot {
+    selected: Option<SettingsSection>,
+    theme: (AppThemeMode, AppTextScale),
+    connection: SettingsConnectionStructure,
+    node: SettingsNodeStructure,
+    cluster: SettingsClusterStructure,
+    configuration: SettingsConfigurationStructure,
+    providers: SettingsProviderStructure,
+    agents: SettingsAgentsStructure,
+    modules: SettingsModulesStructure,
+    skills: SettingsSkillsStructure,
+    device_logins: Vec<SettingsDeviceLoginStructure>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingsStructureKey(Option<Box<SettingsStructureSnapshot>>);
+
+impl SettingsStructureKey {
+    pub(crate) fn empty() -> Self {
+        Self(None)
+    }
+}
+
+pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
+    let theme = {
+        let app = shared.borrow();
+        (app.theme_mode, app.text_scale)
+    };
+    let issues = connection_issues(shared)
+        .into_iter()
+        .map(|issue| SettingsConnectionIssueStructure {
+            title: issue.title,
+            detail: issue.detail,
+            tab: issue.tab,
+        })
+        .collect();
+    let (
+        selected,
+        connection,
+        node,
+        cluster,
+        configuration,
+        providers,
+        agents,
+        modules,
+        skills,
+        device_login_count,
+    ) = {
+        let settings = shared.settings();
+        let invite = settings.invite_result.as_ref().map(|invite| {
+            (
+                invite.uri.clone(),
+                invite.join_command.clone(),
+                invite.expires_at.to_string(),
+                invite.persisted_key.clone(),
+            )
+        });
+        let configuration = SettingsConfigurationStructure {
+            theme,
+            items: settings
+                .config_items
+                .iter()
+                .map(ConfigItemStructure::from)
+                .collect(),
+            expanded: settings.advanced_detail_expanded.clone(),
+            ui_revision: settings.config_ui_revision,
+        };
+        let providers = SettingsProviderStructure {
+            theme,
+            add_open: settings.provider_add_open,
+            add_provider_index: settings.provider_add_provider_index,
+            action_error: settings.provider_action_error.clone(),
+            action_status: settings.provider_action_status.clone(),
+            remove_confirming: settings.provider_remove_confirming.clone(),
+            expanded: settings.provider_detail_expanded.clone(),
+            storage_expanded: settings.provider_storage_detail_expanded,
+            providers: settings
+                .provider_forms
+                .iter()
+                .map(|form| {
+                    (
+                        form.clone(),
+                        settings
+                            .provider_health(&form.provider, &form.account)
+                            .clone(),
+                    )
+                })
+                .collect(),
+        };
+        let agents = SettingsAgentsStructure {
+            theme,
+            agents: settings.agent_snapshot.agents.clone(),
+            error: settings.agent_snapshot.error.clone(),
+            selected_id: settings.agent_selected_id.clone(),
+            delete_confirming: settings.agent_delete_confirming.clone(),
+            validation_report: settings.agent_validation_report.clone(),
+            editor_previous_id: settings.agent_form.previous_id.clone(),
+        };
+        let snapshot = &settings.module_snapshot;
+        let modules = SettingsModulesStructure {
+            theme,
+            selected_node_id: settings.module_selected_node_id.clone(),
+            action_error: settings.module_action_error.clone(),
+            action_status: settings.module_action_status.clone(),
+            warnings: snapshot.warnings.clone(),
+            config_ui_revision: settings.config_ui_revision,
+            nodes: snapshot
+                .nodes
+                .iter()
+                .map(|node| SettingsModuleNodeStructure {
+                    node_id: node.node_id.clone(),
+                    display_name: node.display_name.clone(),
+                    availability: node.availability.clone(),
+                    local: node.local,
+                })
+                .collect(),
+            modules: snapshot
+                .modules
+                .iter()
+                .map(|module| SettingsModuleSummaryStructure {
+                    module_id: module.module_id.clone(),
+                    label: module.label.clone(),
+                    backend: module.backend.clone(),
+                    detail: module.detail.clone(),
+                    desired_enabled: module.desired_enabled,
+                    effective_source: module.effective_source,
+                    effective_enabled: module.effective_enabled,
+                    observed: module.observed,
+                    observed_detail: module.observed_detail.clone(),
+                })
+                .collect(),
+            cluster_config: snapshot
+                .cluster_config
+                .modules
+                .iter()
+                .map(|(module_id, setting)| (module_id.clone(), setting.enabled))
+                .collect(),
+            selected_node: snapshot.selected_node.as_ref().map(|node| {
+                SettingsSelectedModuleNodeStructure {
+                    node_id: node.summary.node_id.clone(),
+                    error: node.error.clone(),
+                    config: node
+                        .config
+                        .modules
+                        .iter()
+                        .map(|(module_id, setting)| (module_id.clone(), setting.enabled))
+                        .collect(),
+                }
+            }),
+            module_settings: settings
+                .config_items
+                .iter()
+                .filter(|item| item.module_id.is_some())
+                .map(ConfigItemStructure::from)
+                .collect(),
+        };
+        let skills = SettingsSkillsStructure {
+            theme,
+            include_all: settings.skills_include_all,
+            selected: settings.skill_selected.clone(),
+            detail_content_hash: settings
+                .skill_detail
+                .as_ref()
+                .map(|detail| detail.summary.content_hash.clone()),
+            text_expanded: settings.skill_text_expanded,
+            skills: settings.skills.clone(),
+        };
+        (
+            settings.selected,
+            SettingsConnectionStructure {
+                theme,
+                mode_label: settings.mode_label.clone(),
+                status_detail: settings.status_detail.clone(),
+                issues,
+                expanded: settings.connection_detail_expanded.clone(),
+            },
+            SettingsNodeStructure {
+                theme,
+                node_id: settings.node_id.clone(),
+                role: settings.role.clone(),
+                mode_label: settings.mode_label.clone(),
+                status_detail: settings.status_detail.clone(),
+                clustered: settings.clustered,
+                cluster_node_id: settings.cluster_node_id.clone(),
+                cluster_summary: settings.cluster_summary.clone(),
+                expanded: settings.node_detail_expanded,
+            },
+            SettingsClusterStructure {
+                theme,
+                clustered: settings.clustered,
+                cluster_summary: settings.cluster_summary.clone(),
+                invite,
+                leave_confirming: settings.leave_confirming,
+                join_confirming: settings.join_confirming,
+            },
+            configuration,
+            providers,
+            agents,
+            modules,
+            skills,
+            settings.provider_forms.len(),
+        )
+    };
+    let device_logins = (0..device_login_count)
+        .map(|index| {
+            let (primary, prompt_url) = device_login_lines(shared, index);
+            SettingsDeviceLoginStructure {
+                primary,
+                prompt_url,
+                error: device_login_is_error(shared, index),
+            }
+        })
+        .collect();
+    SettingsStructureKey(Some(Box::new(SettingsStructureSnapshot {
+        selected,
+        theme,
+        connection,
+        node,
+        cluster,
+        configuration,
+        providers,
+        agents,
+        modules,
+        skills,
+        device_logins,
+    })))
 }
 
 /// Independent generations keep a slow preload or operation result from replacing newer state in
@@ -598,7 +999,7 @@ pub enum ProviderField {
     VendorOptions,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ProviderHealthState {
     checking: bool,
     last_verified_at_unix: Option<i64>,
@@ -1804,14 +2205,6 @@ impl SettingsState {
         self.provider_storage_detail_expanded = !self.provider_storage_detail_expanded;
     }
 
-    fn selected_agent_index(&self) -> Option<usize> {
-        let selected = self.agent_selected_id.as_ref()?;
-        self.agent_snapshot
-            .agents
-            .iter()
-            .position(|agent| &agent.id == selected)
-    }
-
     fn prepare_agent_selection(&mut self, index: usize) -> Option<String> {
         let id = self.agent_snapshot.agents.get(index)?.id.clone();
         self.agent_selected_id = Some(id.clone());
@@ -2027,13 +2420,6 @@ impl SettingsState {
             .nodes
             .iter()
             .position(|node| &node.node_id == selected)
-    }
-
-    fn selected_skill_index(&self) -> Option<usize> {
-        let (selected_id, selected_version) = self.skill_selected.as_ref()?;
-        self.skills
-            .iter()
-            .position(|skill| &skill.id == selected_id && &skill.version == selected_version)
     }
 
     fn set_skill_import_path(&mut self, value: String) {
@@ -3707,18 +4093,28 @@ fn agent_summary_line(agent: &AgentConfigSummary) -> String {
     parts.join(" · ")
 }
 
-fn agent_list_item(agent: &AgentConfigSummary) -> ListItem {
+fn agent_catalog_row(shared: &Shared, agent: &AgentConfigSummary) -> TrailingSlotRow {
     let title = if agent.name.trim().is_empty() {
         agent.id.clone()
     } else {
         agent.name.clone()
     };
-    ListItem::new(title)
-        .detail(agent_summary_line(agent))
-        .trailing(match agent.readiness {
+    let body = Flex::vertical()
+        .main_gap(2.0)
+        .align_items(Alignment::Stretch)
+        .with_child(primary_label(shared, title))
+        .with_child(muted_meta_label(shared, agent_summary_line(agent)));
+    let trailing = muted_meta_label(
+        shared,
+        match agent.readiness {
             AgentReadiness::Ready => "Ready",
             AgentReadiness::NeedsAttention => "Review",
-        })
+        },
+    );
+    TrailingSlotRow::new(body, trailing)
+        .trailing_width(52.0)
+        .trailing_height(20.0)
+        .gap(8.0)
 }
 
 fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
@@ -3759,13 +4155,21 @@ fn skill_source_label(skill: &SkillSummary) -> String {
     }
 }
 
-fn skill_list_item(skill: &SkillSummary) -> ListItem {
+fn skill_catalog_row(shared: &Shared, skill: &SkillSummary) -> TrailingSlotRow {
     let state = if skill.active {
         "active"
     } else {
-        &skill.status
+        skill.status.as_str()
     };
-    ListItem::new(skill_title(skill)).detail(format!("{} · {}", state, skill_source_label(skill)))
+    let body = Flex::vertical()
+        .main_gap(2.0)
+        .align_items(Alignment::Stretch)
+        .with_child(primary_label(shared, skill_title(skill)))
+        .with_child(muted_meta_label(
+            shared,
+            format!("{} · {}", state, skill_source_label(skill)),
+        ));
+    TrailingSlotRow::new(body, SizedBox::new())
 }
 
 fn provider_model_label(form: &ProviderForm) -> String {
@@ -3929,12 +4333,6 @@ fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
     settings_label(shared, text, token).color_when(move || palette(&s).text)
 }
 
-fn positive_label(shared: &Shared, text: impl Into<String>) -> Label {
-    let s = shared.clone();
-    let token = shared.theme().text.base;
-    settings_label(shared, text, token).color_when(move || palette(&s).good)
-}
-
 /// A read-only value row: `label` on the left, a muted value `Label` on the right.
 fn value_row(
     shared: &Shared,
@@ -4057,6 +4455,8 @@ fn connection_issue_count(shared: &Shared) -> usize {
     connection_issues(shared).len()
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn connection_issue_key(shared: &Shared) -> String {
     let issue_key = connection_issues(shared)
         .into_iter()
@@ -4075,6 +4475,7 @@ fn connection_issue_key(shared: &Shared) -> String {
     format!("{issue_key}\nexpanded:{detail_key}")
 }
 
+#[cfg(test)]
 fn node_detail_key(shared: &Shared) -> String {
     let settings = shared.settings();
     format!(
@@ -4090,6 +4491,7 @@ fn node_detail_key(shared: &Shared) -> String {
     )
 }
 
+#[cfg(test)]
 fn cluster_section_key(shared: &Shared) -> String {
     let settings = shared.settings();
     let invite_key = settings
@@ -4111,6 +4513,8 @@ fn cluster_section_key(shared: &Shared) -> String {
     )
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn configuration_key(shared: &Shared) -> String {
     let settings = shared.settings();
     let item_key = settings
@@ -4131,6 +4535,7 @@ fn configuration_key(shared: &Shared) -> String {
     )
 }
 
+#[cfg(test)]
 fn config_item_rebuild_signature(item: &ConfigItem) -> String {
     format!(
         "{}:{}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}",
@@ -4146,6 +4551,7 @@ fn config_item_rebuild_signature(item: &ConfigItem) -> String {
     )
 }
 
+#[cfg(test)]
 fn skills_section_key(shared: &Shared) -> String {
     let settings = shared.settings();
     let skill_key = settings
@@ -4208,7 +4614,7 @@ fn connection_issue_has_sifs_recovery(issue: &ConnectionIssue) -> bool {
 }
 
 fn open_tab(shared: &Shared, tab: Tab) {
-    shared.borrow_mut().active_tab = tab;
+    shared.set_active_tab(tab);
 }
 
 fn tab_action_icon(tab: Tab) -> sui::IconGlyph {
@@ -4482,7 +4888,7 @@ fn queue_settings_operation(
 
 pub(crate) fn pump_background_operations(shared: &Shared) -> bool {
     let (refresh_providers, invalidate_health) = {
-        let mut settings = shared.settings_mut();
+        let mut settings = shared.settings_mut_unpublished();
         (
             std::mem::take(&mut settings.provider_refresh_needed),
             settings.provider_refresh_health_invalidation.take(),
@@ -4495,7 +4901,7 @@ pub(crate) fn pump_background_operations(shared: &Shared) -> bool {
             SettingsOperation::RefreshProviders { invalidate_health },
         );
     }
-    let effects = { shared.settings_mut().pump_operations() };
+    let effects = { shared.settings_mut_unpublished().pump_operations() };
     if !effects.changed {
         if refresh_providers {
             return true;
@@ -4503,29 +4909,34 @@ pub(crate) fn pump_background_operations(shared: &Shared) -> bool {
         return false;
     }
     let waker = shared.borrow().waker.clone();
-    let mut app = shared.borrow_mut();
-    let Some(ready) = app.ready.as_mut() else {
-        return true;
-    };
-    if let Some(providers) = effects.chat_providers {
-        ready.chat.refresh_providers(providers);
-    }
-    if let Some(agents) = effects.chat_agents {
-        ready.chat.refresh_agents(agents);
-    }
-    if let Some(snapshot) = effects.cluster_snapshot {
-        ready.cluster.snapshot = snapshot;
-    }
-    if let Some((provider, account)) = effects.provider_device_login {
-        let index = ready
-            .settings
-            .provider_forms
-            .iter()
-            .position(|form| form.provider == provider && form.account == account);
-        if let Some(index) = index {
-            ready.settings.begin_device_login(index, waker);
+    {
+        let mut app = shared.borrow_mut();
+        let Some(ready) = app.ready.as_mut() else {
+            return true;
+        };
+        if let Some(providers) = effects.chat_providers {
+            ready.chat.refresh_providers(providers);
+        }
+        if let Some(agents) = effects.chat_agents {
+            ready.chat.refresh_agents(agents);
+        }
+        if let Some(snapshot) = effects.cluster_snapshot {
+            ready.cluster.snapshot = snapshot;
+        }
+        if let Some((provider, account)) = effects.provider_device_login {
+            let index = ready
+                .settings
+                .provider_forms
+                .iter()
+                .position(|form| form.provider == provider && form.account == account);
+            if let Some(index) = index {
+                ready.settings.begin_device_login(index, waker);
+            }
         }
     }
+    shared.publish_settings_signals();
+    shared.publish_chat_signals();
+    shared.publish_cluster_signals();
     true
 }
 
@@ -4700,6 +5111,20 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
 }
 
 fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings connection structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.connection.clone())
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(section_connection_body(&s, &r))
+    })
+}
+
+fn section_connection_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let (mode_label, status_detail) = {
         let s = shared.settings();
         (s.mode_label.clone(), s.status_detail.clone())
@@ -4835,15 +5260,17 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
 }
 
 fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings node structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.node.clone())
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || node_detail_key(&s)
-        },
-        move |_sig| WidgetPod::new(section_node_body(&s, &r)),
-    )
+    RebuildOnChange::new_observable(source, move |_sig| {
+        WidgetPod::new(section_node_body(&s, &r))
+    })
 }
 
 fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -4967,15 +5394,17 @@ fn cluster_join_preview(raw: &str) -> Result<ClusterJoinPreview, String> {
 }
 
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings cluster structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.cluster.clone())
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || cluster_section_key(&s)
-        },
-        move |_key| WidgetPod::new(section_cluster_body(&s, &r)),
-    )
+    RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(section_cluster_body(&s, &r))
+    })
 }
 
 fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -6351,15 +6780,15 @@ fn provider_management_row(
 }
 
 fn section_providers(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings providers structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.providers.clone())
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || provider_section_signature(&s)
-        },
-        move |_sig| provider_section_body(&s, &r),
-    )
+    RebuildOnChange::new_observable(source, move |_sig| provider_section_body(&s, &r))
 }
 
 fn provider_section_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -6370,6 +6799,7 @@ fn provider_section_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     }
 }
 
+#[cfg(test)]
 fn provider_section_signature(shared: &Shared) -> String {
     let settings = shared.settings();
     let mut parts = vec![
@@ -6691,17 +7121,30 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 }
 
 fn section_agents(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || agents_section_key(&s)
-        },
-        move |_key| WidgetPod::new(section_agents_body(&s, &r)),
-    )
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(agent_catalog_section(shared, reader))
+        .with_child(agent_package_management_section(shared, reader))
+        .with_child(agent_details_host(shared, reader))
 }
 
+fn agent_details_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<Option<SettingsAgentsStructure>> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings agent details structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.agents.clone())
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(agent_details(&s, &r)))
+}
+
+#[cfg(test)]
 fn agents_section_key(shared: &Shared) -> String {
     let settings = shared.settings();
     let agents = settings
@@ -6720,37 +7163,73 @@ fn agents_section_key(shared: &Shared) -> String {
     )
 }
 
-fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let snapshot = shared.settings().agent_snapshot.clone();
-    let list = {
-        let s = shared.clone();
-        ListView::new("agent-config-list")
-            .items(
-                snapshot
-                    .agents
-                    .iter()
-                    .map(agent_list_item)
-                    .collect::<Vec<_>>(),
+fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
+    let collection = shared.signals().settings_structure.select_named(
+        "settings virtual agent collection",
+        |key| {
+            let Some(snapshot) = key.0.as_deref() else {
+                return widgets::VirtualCollectionSnapshot::new(Vec::new(), None);
+            };
+            let agents = snapshot.agents.agents.clone();
+            let selected = snapshot.agents.selected_id.clone();
+            let theme = snapshot.agents.theme;
+            widgets::VirtualCollectionSnapshot::new(
+                agents
+                    .into_iter()
+                    .map(|agent| (agent.id.clone(), SettingsAgentRow { theme, agent }))
+                    .collect(),
+                selected,
             )
-            .row_height(MENU_ROW_H)
-            .selected_when({
-                let s = s.clone();
-                move || s.settings().selected_agent_index()
+        },
+    );
+    let row_shared = shared.clone();
+    let action_shared = shared.clone();
+    let list = widgets::VirtualCollectionHost::new(
+        "Settings agent collection",
+        collection,
+        move |model, state| {
+            VirtualList::new("agent-config-list", model, move |_id, agent| {
+                let shared = row_shared.clone();
+                RebuildOnChange::new_observable(agent, move |row| {
+                    WidgetPod::new(agent_catalog_row(&shared, &row.agent))
+                })
             })
+            .state(state)
+            .estimated_row_height(MENU_ROW_H)
             .theme_when(clone_reader(reader))
-            .on_change(move |index, _| {
-                let selected_id = s.settings_mut().prepare_agent_selection(index);
-                if let Some(selected_id) = selected_id {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Agents,
-                        SettingsOperation::RefreshAgents {
-                            selected_id: Some(selected_id),
-                        },
-                    );
+            .row_name(|_id, row| {
+                let agent = &row.agent;
+                if agent.name.trim().is_empty() {
+                    agent.id.clone()
+                } else {
+                    agent.name.clone()
                 }
             })
-    };
+            .row_description(|_id, row| agent_summary_line(&row.agent))
+            .on_change(move |selected_id| {
+                let index = {
+                    let settings = action_shared.settings();
+                    settings
+                        .agent_snapshot
+                        .agents
+                        .iter()
+                        .position(|agent| agent.id == selected_id)
+                };
+                if let Some(index) = index {
+                    let selected_id = action_shared.settings_mut().prepare_agent_selection(index);
+                    if let Some(selected_id) = selected_id {
+                        queue_settings_operation(
+                            &action_shared,
+                            SettingsOperationScope::Agents,
+                            SettingsOperation::RefreshAgents {
+                                selected_id: Some(selected_id),
+                            },
+                        );
+                    }
+                }
+            })
+        },
+    );
     let new_agent = {
         let s = shared.clone();
         sui::Button::new("New agent")
@@ -6788,20 +7267,9 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             })
     };
 
-    let mut summary_body = FieldGroup::new()
+    let summary_body = FieldGroup::new()
         .spacing(8.0)
-        .with_child(value_row(
-            shared,
-            reader,
-            "Catalog",
-            agent_sidebar_preview(&snapshot),
-        ))
-        .with_child(value_row(
-            shared,
-            reader,
-            "Custom agents",
-            format!("{}", agent_custom_count(&snapshot)),
-        ))
+        .with_child(agent_catalog_summary_host(shared, reader))
         .with_child(
             FormRow::new("Agents", SizedBox::new().height(230.0).with_child(list))
                 .stacked()
@@ -6820,28 +7288,69 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             )
             .inline()
             .theme_when(clone_reader(reader)),
-        );
-    if let Some(error) = snapshot.error {
-        summary_body = summary_body.with_child(value_row(shared, reader, "Catalog error", error));
-    }
-    summary_body = summary_body.with_child(feedback_slot(
-        shared,
-        reader,
-        |settings| settings.agent_action_error.clone(),
-        |settings| settings.agent_action_status.clone(),
-    ));
+        )
+        .with_child(feedback_slot(
+            shared,
+            reader,
+            |settings| settings.agent_action_error.clone(),
+            |settings| settings.agent_action_status.clone(),
+        ));
 
+    FormSection::new("Agents", summary_body)
+        .description("Create, inspect, validate, and move agent packages without leaving Settings.")
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_catalog_summary_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<Option<(Vec<AgentConfigSummary>, Option<String>)>> {
+    let source =
+        shared
+            .signals()
+            .settings_structure
+            .select_named("settings agent catalog summary", |key| {
+                key.0.as_deref().map(|snapshot| {
+                    (
+                        snapshot.agents.agents.clone(),
+                        snapshot.agents.error.clone(),
+                    )
+                })
+            });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |snapshot| {
+        let (agents, error) = snapshot.clone().unwrap_or_default();
+        let catalog = AgentConfigSnapshot {
+            agents,
+            selected_agent: None,
+            error,
+        };
+        let mut rows = FieldGroup::new()
+            .spacing(8.0)
+            .with_child(value_row(
+                &s,
+                &r,
+                "Catalog",
+                agent_sidebar_preview(&catalog),
+            ))
+            .with_child(value_row(
+                &s,
+                &r,
+                "Custom agents",
+                format!("{}", agent_custom_count(&catalog)),
+            ));
+        if let Some(error) = catalog.error {
+            rows = rows.with_child(value_row(&s, &r, "Catalog error", error));
+        }
+        WidgetPod::new(rows)
+    })
+}
+
+fn agent_details(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut stack = Stack::vertical()
         .spacing(14.0)
-        .alignment(Alignment::Stretch)
-        .with_child(
-            FormSection::new("Agents", summary_body)
-                .description(
-                    "Create, inspect, validate, and move agent packages without leaving Settings.",
-                )
-                .theme_when(clone_reader(reader)),
-        )
-        .with_child(agent_package_management_section(shared, reader));
+        .alignment(Alignment::Stretch);
 
     let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
     let selected = shared.settings().agent_snapshot.selected_agent.clone();
@@ -7655,17 +8164,21 @@ fn agent_model_summary(definition: &AgentDefinition) -> String {
 const MODULE_OVERRIDE_OPTIONS: &[&str] = &["Inherit", "Enable", "Disable"];
 
 fn section_modules(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings modules structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.modules.clone())
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || module_section_key(&s)
-        },
-        move |_key| WidgetPod::new(section_modules_body(&s, &r)),
-    )
+    RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(section_modules_body(&s, &r))
+    })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn module_section_key(shared: &Shared) -> String {
     let settings = shared.settings();
     let snapshot = &settings.module_snapshot;
@@ -8247,38 +8760,26 @@ fn module_display_id(module_id: &str) -> String {
 }
 
 fn section_skills(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || skills_section_key(&s)
-        },
-        move |_key| WidgetPod::new(section_skills_body(&s, &r)),
-    )
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(skills_summary_section(shared, reader))
+        .with_child(skills_catalog_host(shared, reader))
+        .with_child(skill_detail_host(shared, reader))
 }
 
-fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (skills, include_all, import_path, export_path, detail, text_expanded) = {
+fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
+    let (include_all, import_path) = {
         let settings = shared.settings();
         (
-            settings.skills.clone(),
             settings.skills_include_all,
             settings.skill_import_path.clone(),
-            settings.skill_export_path.clone(),
-            settings.skill_detail.clone(),
-            settings.skill_text_expanded,
         )
     };
 
     let mut summary_body = FieldGroup::new()
         .spacing(8.0)
-        .with_child(value_row(
-            shared,
-            reader,
-            "Catalog",
-            skills_sidebar_preview(&skills),
-        ))
+        .with_child(skills_summary_preview_host(shared, reader))
         .with_child(switch_row(reader, "Show all versions", include_all, {
             let s = shared.clone();
             move |on| {
@@ -8380,102 +8881,185 @@ fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         |settings| settings.skill_action_status.clone(),
     ));
 
-    let summary = FormSection::new("Skills", summary_body)
+    FormSection::new("Skills", summary_body)
         .description("Manage imported and generated SKILL.md files used by agents.")
-        .theme_when(clone_reader(reader));
+        .theme_when(clone_reader(reader))
+}
 
-    let catalog = if skills.is_empty() {
-        let body = FieldGroup::new()
-            .spacing(8.0)
-            .with_child(value_row(
-                shared,
-                reader,
-                "Status",
-                "No skills in the local catalog",
-            ))
-            .with_child(value_row(
-                shared,
-                reader,
-                "Import",
-                "Add a SKILL.md file to make it available to agents.",
-            ));
-        WidgetPod::new(FormSection::new("Catalog", body).theme_when(clone_reader(reader)))
-    } else {
-        let items = skills.iter().map(skill_list_item).collect::<Vec<_>>();
-        let list = {
-            let s = shared.clone();
-            ListView::new("skill-catalog")
-                .items(items)
-                .row_height(MENU_ROW_H)
-                .theme_when(clone_reader(reader))
-                .selected_when({
-                    let s = s.clone();
-                    move || s.settings().selected_skill_index()
-                })
-                .on_change(move |index, _| {
-                    let selected = s
-                        .settings()
-                        .skills
-                        .get(index)
-                        .map(|skill| (skill.id.clone(), skill.version.clone()));
-                    if let Some(selected) = selected {
-                        let include_all = {
-                            let mut settings = s.settings_mut();
-                            settings.skill_selected = Some(selected.clone());
-                            settings.skill_action_error = None;
-                            settings.skill_text_expanded = false;
-                            settings.mark_draft_changed(SettingsOperationDomain::Skills);
-                            settings.skills_include_all
-                        };
-                        queue_settings_operation(
-                            &s,
-                            SettingsOperationScope::Skills,
-                            SettingsOperation::RefreshSkills {
-                                include_all,
-                                selected: Some(selected),
-                            },
-                        );
-                    }
-                })
-        };
-        WidgetPod::new(
-            FormSection::new("Catalog", list)
-                .description("Select a skill version to inspect, activate, or export.")
-                .theme_when(clone_reader(reader)),
-        )
-    };
+fn skills_summary_preview_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<Vec<SkillSummary>> {
+    let source = shared.signals().settings_structure.select_named(
+        "settings skills catalog summary",
+        |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| snapshot.skills.skills.clone())
+                .unwrap_or_default()
+        },
+    );
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |skills| {
+        WidgetPod::new(value_row(&s, &r, "Catalog", skills_sidebar_preview(skills)))
+    })
+}
 
-    let detail = detail
-        .map(|detail| {
-            WidgetPod::new(skill_detail_section(
-                shared,
-                reader,
-                detail,
-                export_path,
-                text_expanded,
-            ))
-        })
-        .unwrap_or_else(|| {
-            WidgetPod::new(
-                FormSection::new(
-                    "Selected skill",
-                    FieldGroup::new().with_child(value_row(
-                        shared,
-                        reader,
-                        "Status",
-                        "Select a skill to view details",
-                    )),
-                )
-                .theme_when(clone_reader(reader)),
+fn skills_catalog_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<bool> {
+    let source = shared.signals().settings_structure.select_named(
+        "settings skills catalog availability",
+        |key| {
+            key.0
+                .as_deref()
+                .is_none_or(|snapshot| snapshot.skills.skills.is_empty())
+        },
+    );
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |empty| {
+        if *empty {
+            let body = FieldGroup::new()
+                .spacing(8.0)
+                .with_child(value_row(
+                    &s,
+                    &r,
+                    "Status",
+                    "No skills in the local catalog",
+                ))
+                .with_child(value_row(
+                    &s,
+                    &r,
+                    "Import",
+                    "Add a SKILL.md file to make it available to agents.",
+                ));
+            WidgetPod::new(FormSection::new("Catalog", body).theme_when(clone_reader(&r)))
+        } else {
+            WidgetPod::new(skill_virtual_catalog(&s, &r))
+        }
+    })
+}
+
+fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> FormSection {
+    let collection = shared.signals().settings_structure.select_named(
+        "settings virtual skill collection",
+        |key| {
+            let Some(snapshot) = key.0.as_deref() else {
+                return widgets::VirtualCollectionSnapshot::new(Vec::new(), None);
+            };
+            let skills = snapshot.skills.skills.clone();
+            let selected = snapshot.skills.selected.clone();
+            let theme = snapshot.skills.theme;
+            widgets::VirtualCollectionSnapshot::new(
+                skills
+                    .into_iter()
+                    .map(|skill| {
+                        (
+                            (skill.id.clone(), skill.version.clone()),
+                            SettingsSkillRow { theme, skill },
+                        )
+                    })
+                    .collect(),
+                selected,
             )
-        });
+        },
+    );
+    let row_shared = shared.clone();
+    let action_shared = shared.clone();
+    let list = widgets::VirtualCollectionHost::new(
+        "Settings skill collection",
+        collection,
+        move |model, state| {
+            VirtualList::new("skill-catalog", model, move |_key, skill| {
+                let shared = row_shared.clone();
+                RebuildOnChange::new_observable(skill, move |row| {
+                    WidgetPod::new(skill_catalog_row(&shared, &row.skill))
+                })
+            })
+            .state(state)
+            .estimated_row_height(MENU_ROW_H)
+            .theme_when(clone_reader(reader))
+            .row_name(|_key, row| skill_title(&row.skill))
+            .row_description(|_key, row| {
+                let skill = &row.skill;
+                let state = if skill.active {
+                    "active"
+                } else {
+                    skill.status.as_str()
+                };
+                format!("{}; {}", state, skill_source_label(skill))
+            })
+            .on_change(move |selected| {
+                let include_all = {
+                    let mut settings = action_shared.settings_mut();
+                    settings.skill_selected = Some(selected.clone());
+                    settings.skill_action_error = None;
+                    settings.skill_text_expanded = false;
+                    settings.mark_draft_changed(SettingsOperationDomain::Skills);
+                    settings.skills_include_all
+                };
+                queue_settings_operation(
+                    &action_shared,
+                    SettingsOperationScope::Skills,
+                    SettingsOperation::RefreshSkills {
+                        include_all,
+                        selected: Some(selected),
+                    },
+                );
+            })
+        },
+    );
+    FormSection::new("Catalog", list)
+        .description("Select a skill version to inspect, activate, or export.")
+        .theme_when(clone_reader(reader))
+}
 
-    Stack::vertical()
-        .spacing(14.0)
-        .alignment(Alignment::Stretch)
-        .with_child(summary)
-        .with_child(PodHost::new(catalog))
-        .with_child(PodHost::new(detail))
+fn skill_detail_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<Option<SettingsSkillsStructure>> {
+    let source = shared
+        .signals()
+        .settings_structure
+        .select_named("settings skill details structure", |key| {
+            key.0.as_deref().map(|snapshot| snapshot.skills.clone())
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        let (detail, export_path, text_expanded) = {
+            let settings = s.settings();
+            (
+                settings.skill_detail.clone(),
+                settings.skill_export_path.clone(),
+                settings.skill_text_expanded,
+            )
+        };
+        detail
+            .map(|detail| {
+                WidgetPod::new(skill_detail_section(
+                    &s,
+                    &r,
+                    detail,
+                    export_path,
+                    text_expanded,
+                ))
+            })
+            .unwrap_or_else(|| {
+                WidgetPod::new(
+                    FormSection::new(
+                        "Selected skill",
+                        FieldGroup::new().with_child(value_row(
+                            &s,
+                            &r,
+                            "Status",
+                            "Select a skill to view details",
+                        )),
+                    )
+                    .theme_when(clone_reader(&r)),
+                )
+            })
+    })
 }
 
 fn skill_detail_section(
@@ -8677,15 +9261,17 @@ fn skill_detail_section(
 }
 
 fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared.signals().settings_structure.select_named(
+        "settings configuration structure",
+        |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| snapshot.configuration.clone())
+        },
+    );
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || configuration_key(&s)
-        },
-        move |_key| configuration_body(&s, &r),
-    )
+    RebuildOnChange::new_observable(source, move |_key| configuration_body(&s, &r))
 }
 
 fn configuration_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -10291,6 +10877,17 @@ fn section_body(
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
+    let selected =
+        shared
+            .signals()
+            .settings_structure
+            .select_named("settings detail selection", |key| {
+                key.0
+                    .as_deref()
+                    .and_then(|snapshot| snapshot.selected)
+                    .unwrap_or(SettingsSection::Appearance)
+                    .index()
+            });
     let switch = SwitchView::new()
         .with_child(section_appearance(shared, reader))
         .with_child(section_connection(shared, reader))
@@ -10302,15 +10899,7 @@ fn section_body(
         .with_child(section_skills(shared, reader))
         .with_child(section_configuration(shared, reader))
         .with_child(section_about(shared, reader))
-        .selected_when({
-            let s = shared.clone();
-            move || {
-                s.settings()
-                    .selected
-                    .unwrap_or(SettingsSection::Appearance)
-                    .index()
-            }
-        });
+        .selected_from(selected);
     // Pad the content so cards don't hug the edges, then make it scrollable.
     let inset = Stack::vertical()
         .spacing(0.0)
@@ -10433,93 +11022,25 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
         .with_child(SizedBox::new().with_child(section_body(shared, reader, scroll_state)));
 
+    let selected =
+        shared
+            .signals()
+            .settings_structure
+            .select_named("settings narrow menu selection", |key| {
+                key.0
+                    .as_deref()
+                    .is_some_and(|snapshot| snapshot.selected.is_some()) as usize
+            });
     let switch = SwitchView::new()
         .with_child(menu(shared, reader))
         .with_child(detail_with_backbar)
-        .selected_when({
-            let s = shared.clone();
-            move || s.settings().selected.is_some() as usize
-        });
+        .selected_from(selected);
     WidgetPod::new(switch)
 }
 
 // ---------------------------------------------------------------------------
 // Tiny layout helpers
 // ---------------------------------------------------------------------------
-
-struct RebuildOnChange<K: PartialEq + Clone> {
-    key_fn: Box<dyn Fn() -> K>,
-    build: Box<dyn Fn(&K) -> WidgetPod>,
-    last_key: K,
-    child: WidgetPod,
-}
-
-impl<K: PartialEq + Clone> RebuildOnChange<K> {
-    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
-    where
-        KF: Fn() -> K + 'static,
-        BF: Fn(&K) -> WidgetPod + 'static,
-    {
-        let last_key = key_fn();
-        let child = build(&last_key);
-        Self {
-            key_fn: Box::new(key_fn),
-            build: Box::new(build),
-            last_key,
-            child,
-        }
-    }
-
-    fn refresh(&mut self) -> bool {
-        let key = (self.key_fn)();
-        if key != self.last_key {
-            self.child = (self.build)(&key);
-            self.last_key = key;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        let pointer_up = matches!(
-            event,
-            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
-        );
-        if pointer_up && self.refresh() {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        }
-    }
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.refresh();
-        self.child.measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
-}
 
 /// A container that hosts a pre-built [`WidgetPod`] (so a section body can be chosen at build time
 /// behind a branch and still be a single widget). Delegates everything to the pod.
@@ -10621,61 +11142,47 @@ impl Widget for InsetX {
 // ---------------------------------------------------------------------------
 
 fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl Widget + use<> {
-    let key_shared = shared.clone();
+    let source = shared.signals().settings_structure.select_named(
+        "settings device login status",
+        move |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| (snapshot.theme, snapshot.device_logins.get(index).cloned()))
+        },
+    );
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || device_login_summary(&key_shared, index),
-        move |_| {
-            let theme = build_reader();
-            let pal = palette(&build_shared);
-            let (primary, prompt_url) = device_login_lines(&build_shared, index);
-            let is_error = device_login_is_error(&build_shared, index);
-            let primary_style = sui::TextStyle {
-                font_size: theme.text.sm.size,
-                line_height: theme.text.sm.line_height,
-                weight: FontWeight::MEDIUM,
-                color: if is_error { pal.danger_text } else { pal.text },
-                ..theme.body_text_style()
+    RebuildOnChange::new_observable(source, move |_| {
+        let theme = build_reader();
+        let pal = palette(&build_shared);
+        let (primary, prompt_url) = device_login_lines(&build_shared, index);
+        let is_error = device_login_is_error(&build_shared, index);
+        let primary_style = sui::TextStyle {
+            font_size: theme.text.sm.size,
+            line_height: theme.text.sm.line_height,
+            weight: FontWeight::MEDIUM,
+            color: if is_error { pal.danger_text } else { pal.text },
+            ..theme.body_text_style()
+        };
+        let mut body = Flex::vertical()
+            .align_items(Alignment::Start)
+            .with_child(sui::Label::new(primary).style(primary_style));
+        if let Some(url) = prompt_url {
+            let link_style = sui::TextStyle {
+                font_size: theme.text.xs.size,
+                line_height: theme.text.xs.line_height,
+                ..theme.text_style(pal.accent_text)
             };
-            let mut body = Flex::vertical()
-                .align_items(Alignment::Start)
-                .with_child(sui::Label::new(primary).style(primary_style));
-            if let Some(url) = prompt_url {
-                let link_style = sui::TextStyle {
-                    font_size: theme.text.xs.size,
-                    line_height: theme.text.xs.line_height,
-                    ..theme.text_style(pal.accent_text)
-                };
-                body = body.with_child(
-                    sui::Link::new(url.clone(), url)
-                        .semantic_name("Open login page")
-                        .text_style(link_style)
-                        .theme_when(clone_reader(&build_reader))
-                        .on_open(open_provider_login_url),
-                );
-            }
-            WidgetPod::new(body)
-        },
-    )
-}
-
-fn device_login_summary(shared: &Shared, index: usize) -> String {
-    let settings = shared.settings();
-    let Some(form) = settings.provider_forms.get(index) else {
-        return String::new();
-    };
-    match device_login_status_for(&settings, index) {
-        Some(DeviceLoginStatus::Starting) => "starting".to_string(),
-        Some(DeviceLoginStatus::Prompt {
-            verification_uri,
-            user_code,
-        }) => format!("prompt:{user_code}:{verification_uri}"),
-        Some(DeviceLoginStatus::Done) => "done".to_string(),
-        Some(DeviceLoginStatus::Failed(error)) => format!("failed:{error}"),
-        None if form.signed_in => "signed-in".to_string(),
-        None => "not-signed-in".to_string(),
-    }
+            body = body.with_child(
+                sui::Link::new(url.clone(), url)
+                    .semantic_name("Open login page")
+                    .text_style(link_style)
+                    .theme_when(clone_reader(&build_reader))
+                    .on_open(open_provider_login_url),
+            );
+        }
+        WidgetPod::new(body)
+    })
 }
 
 fn device_login_lines(shared: &Shared, index: usize) -> (String, Option<String>) {
@@ -10775,21 +11282,9 @@ fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
 /// narrow drill-down) and delegates to the one chosen by the available width. The choice is made in
 /// `measure` (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync.
 pub struct SettingsView {
-    shared: Shared,
-    theme_reader: ThemeReader,
-    scroll_state: ScrollState,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
-    /// The section selection last laid out. The inner `SwitchView`s (section detail, and the narrow
-    /// menu/detail swap) only measure+arrange their *active* child, so a navigation that flips
-    /// `selected` (via a sidebar/menu `ListView`, which requests only a repaint) must trigger a
-    /// re-measure+re-arrange for the newly-active child. We diff on `RedrawRequested` to catch it.
-    last_selected: Cell<Option<SettingsSection>>,
-    /// The Connection attention card is built from app-layer Chat/Files health snapshots. Those can
-    /// change after startup (Files is loaded lazily), so rebuild the composed pods when they do.
-    last_connection_issue_key: RefCell<String>,
-    last_scale_key: Cell<AppTextScale>,
 }
 
 impl SettingsView {
@@ -10802,48 +11297,12 @@ impl SettingsView {
         let scroll_state = ScrollState::new();
         let wide = wide_pod(&shared, &theme_reader, &scroll_state);
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
-        let last_selected = Cell::new(shared.settings().selected);
-        let last_connection_issue_key = RefCell::new(connection_issue_key(&shared));
-        let last_scale_key = Cell::new(settings_scale_key(&shared));
         Self {
-            shared,
-            theme_reader,
-            scroll_state,
             wide,
             narrow,
             // Default to wide before the first measure (matches the old default).
             use_wide: Cell::new(true),
-            last_selected,
-            last_connection_issue_key,
-            last_scale_key,
         }
-    }
-
-    fn rebuild_pods(&mut self) {
-        self.wide = wide_pod(&self.shared, &self.theme_reader, &self.scroll_state);
-        self.narrow = narrow_pod(&self.shared, &self.theme_reader, &self.scroll_state);
-    }
-
-    fn sync_connection_issues(&mut self) -> bool {
-        let current = connection_issue_key(&self.shared);
-        let mut last = self.last_connection_issue_key.borrow_mut();
-        if current == *last {
-            return false;
-        }
-        *last = current;
-        drop(last);
-        self.rebuild_pods();
-        true
-    }
-
-    fn sync_scale(&mut self) -> bool {
-        let current = settings_scale_key(&self.shared);
-        if current == self.last_scale_key.get() {
-            return false;
-        }
-        self.last_scale_key.set(current);
-        self.rebuild_pods();
-        true
     }
 
     fn active(&self) -> &WidgetPod {
@@ -10864,52 +11323,11 @@ impl SettingsView {
 }
 
 impl Widget for SettingsView {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        // The section/menu `ListView`s navigate by mutating `selected` and requesting only a repaint.
-        // The nested `SwitchView`s lay out only their active child, so a navigation needs a fresh
-        // measure+arrange for the newly-shown detail/menu. Detect the change on the redraw the
-        // ListView triggered and request the relayout (diff-on-redraw, like the widget-book pattern).
-        // Navigation (sidebar/menu `ListView`, narrow back `Button`) flips `selected` and requests
-        // only a repaint, but the inner `SwitchView`s lay out only their active child — so the
-        // newly-shown detail/menu needs a fresh measure+arrange. A pointer release inside the tab is
-        // the only moment such a navigation can happen, so request a relayout then. (A pointer up is
-        // rare, so the extra measure is cheap; this matches how the Shell relayouts on tab switch.)
-        if let Event::Pointer(pointer) = event
-            && matches!(pointer.kind, sui::PointerEventKind::Up)
-        {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        }
-        // Belt-and-suspenders: on a redraw, catch any selection change driven from outside a pointer
-        // gesture (e.g. an external wake) and relayout (diff-on-redraw, like the widget-book pattern).
-        if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
-            let operations_changed = pump_background_operations(&self.shared);
-            let current = self.shared.settings().selected;
-            let issues_changed = self.sync_connection_issues();
-            let scale_changed = self.sync_scale();
-            if current != self.last_selected.get()
-                || issues_changed
-                || scale_changed
-                || operations_changed
-            {
-                self.last_selected.set(current);
-                ctx.request_measure();
-                ctx.request_arrange();
-                ctx.request_semantics();
-                ctx.request_paint();
-            }
-        }
-    }
+    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.sync_connection_issues();
-        self.sync_scale();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
-        // A measure pass lays out the currently-active child, so the navigation cache is now
-        // up to date — record it so the next redraw doesn't spuriously re-request a relayout.
-        self.last_selected.set(self.shared.settings().selected);
         self.active_mut().measure(ctx, constraints)
     }
 
@@ -10940,10 +11358,6 @@ impl Widget for SettingsView {
     }
 }
 
-fn settings_scale_key(shared: &Shared) -> AppTextScale {
-    shared.borrow().text_scale
-}
-
 fn settings_control_theme(shared: &Shared) -> DefaultTheme {
     let mut theme = shared.theme().with_size(ControlSize::Small);
     theme.metrics.form_row_label_width = 132.0;
@@ -10972,6 +11386,7 @@ fn app_surface_summary(role: &str) -> String {
 
 /// Build the settings tab content.
 pub fn view(shared: Shared) -> impl Widget {
+    shared.publish_settings_signals();
     SettingsView::new(shared)
 }
 
@@ -11995,6 +12410,73 @@ mod tests {
     }
 
     #[test]
+    fn settings_skill_reorder_preserves_virtual_row_ids() -> sui::Result<()> {
+        let (backend, root) = temp_skill_backend("skills-virtual-reorder");
+        for name in ["virtual-skill-alpha", "virtual-skill-beta"] {
+            let path = write_skill_file(&root, name, "Virtual collection regression fixture.");
+            sinomo_cli::app_api::import_skill(backend.data_dir.as_ref(), &path, None, None, true)
+                .expect("import virtual collection skill");
+        }
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Skills);
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings virtual skills")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let row_ids = |snapshot: &sui_testing::WindowSnapshot| {
+            ["virtual-skill-alpha @ 1.0.0", "virtual-skill-beta @ 1.0.0"]
+                .into_iter()
+                .map(|name| {
+                    let id = snapshot
+                        .accessibility
+                        .nodes
+                        .iter()
+                        .find(|node| {
+                            node.role == sui::SemanticsRole::ListItem
+                                && node.name.as_deref() == Some(name)
+                        })
+                        .expect("virtual skill row")
+                        .id;
+                    (name, id)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = row_ids(&window.snapshot()?);
+        {
+            let mut settings = shared.settings_mut();
+            let alpha = settings
+                .skills
+                .iter()
+                .position(|skill| skill.id == "virtual-skill-alpha")
+                .expect("alpha skill");
+            let beta = settings
+                .skills
+                .iter()
+                .position(|skill| skill.id == "virtual-skill-beta")
+                .expect("beta skill");
+            settings.skills.swap(alpha, beta);
+        }
+        window.run_until_idle()?;
+        assert_eq!(row_ids(&window.snapshot()?), before);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn agent_settings_state_saves_renames_and_deletes_custom_agent() {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
@@ -12219,6 +12701,78 @@ mod tests {
             .expect()
             .to_be_visible()?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn settings_agent_reorder_preserves_virtual_row_ids() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        for (id, name) in [
+            ("virtual-agent-alpha", "Virtual agent alpha"),
+            ("virtual-agent-beta", "Virtual agent beta"),
+        ] {
+            let mut definition = AgentDefinition::custom(id, AgentRole::Main, "Retained row test");
+            definition.name = name.to_string();
+            backend
+                .save_custom_agent_definition(&definition, None)
+                .expect("seed virtual collection agent");
+        }
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Agents);
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings virtual agents")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let row_ids = |snapshot: &sui_testing::WindowSnapshot| {
+            ["Virtual agent alpha", "Virtual agent beta"]
+                .into_iter()
+                .map(|name| {
+                    let id = snapshot
+                        .accessibility
+                        .nodes
+                        .iter()
+                        .find(|node| {
+                            node.role == sui::SemanticsRole::ListItem
+                                && node.name.as_deref() == Some(name)
+                        })
+                        .expect("virtual agent row")
+                        .id;
+                    (name, id)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = row_ids(&window.snapshot()?);
+        {
+            let mut settings = shared.settings_mut();
+            let alpha = settings
+                .agent_snapshot
+                .agents
+                .iter()
+                .position(|agent| agent.id == "virtual-agent-alpha")
+                .expect("alpha agent");
+            let beta = settings
+                .agent_snapshot
+                .agents
+                .iter()
+                .position(|agent| agent.id == "virtual-agent-beta")
+                .expect("beta agent");
+            settings.agent_snapshot.agents.swap(alpha, beta);
+        }
+        window.run_until_idle()?;
+        assert_eq!(row_ids(&window.snapshot()?), before);
         Ok(())
     }
 

@@ -1,13 +1,114 @@
 //! Small reusable widgets and paint helpers shared across the tabs.
 
+use std::hash::Hash;
+use std::sync::Arc;
+
 use sui::prelude::Padding;
 use sui::{
-    Color, Constraints, MeasureCtx, PaintCtx, Path, Point, Rect, SingleChild, Size, TextStyle,
-    Widget, paint_single_line_aligned_text,
+    ArrangeCtx, Color, Constraints, MeasureCtx, Observable, PaintCtx, Path, Point, Rect,
+    SemanticsCtx, SingleChild, Size, TextStyle, VirtualCollectionModel, VirtualListState, Widget,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, paint_single_line_aligned_text,
 };
 
 use crate::state::Shared;
 use crate::theme::Palette;
+
+/// Typed application snapshot consumed by [`VirtualCollectionHost`].
+///
+/// Sinomo keeps domain state in [`Shared`] and publishes narrow reactive projections. This value
+/// lets a projection feed SUI's incremental collection model while keeping selection keyed by the
+/// same durable application identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtualCollectionSnapshot<K, T> {
+    pub items: Vec<(K, T)>,
+    pub selected: Option<K>,
+}
+
+impl<K, T> VirtualCollectionSnapshot<K, T> {
+    pub fn new(items: Vec<(K, T)>, selected: Option<K>) -> Self {
+        Self { items, selected }
+    }
+}
+
+/// Retained bridge from a Sinomo observable snapshot to SUI's virtual collection interfaces.
+///
+/// The host itself never rebuilds its child. It reconciles the model during measurement, so a
+/// same-key reset updates row signals while preserving realized row pods, focus, selection, and
+/// scroll state inside [`sui::VirtualList`].
+pub struct VirtualCollectionHost<K, T> {
+    source: Arc<dyn Observable<VirtualCollectionSnapshot<K, T>>>,
+    model: VirtualCollectionModel<K, T>,
+    state: VirtualListState<K>,
+    child: WidgetPod,
+}
+
+impl<K, T> VirtualCollectionHost<K, T>
+where
+    K: Clone + Eq + Hash + PartialEq + 'static,
+    T: Clone + PartialEq + 'static,
+{
+    pub fn new<O, F, W>(name: &'static str, source: O, build: F) -> Self
+    where
+        O: Observable<VirtualCollectionSnapshot<K, T>> + 'static,
+        F: FnOnce(VirtualCollectionModel<K, T>, VirtualListState<K>) -> W,
+        W: Widget + 'static,
+    {
+        let model = VirtualCollectionModel::named(name);
+        let state = VirtualListState::new();
+        let child = WidgetPod::new(build(model.clone(), state.clone()));
+        Self {
+            source: Arc::new(source),
+            model,
+            state,
+            child,
+        }
+    }
+
+    fn sync(&self, snapshot: VirtualCollectionSnapshot<K, T>) {
+        let selected = snapshot.selected.filter(|selected| {
+            snapshot
+                .items
+                .iter()
+                .any(|(candidate, _)| candidate == selected)
+        });
+        self.model
+            .replace(snapshot.items)
+            .expect("virtual collection projection must contain unique keys");
+        self.state.select(selected);
+    }
+}
+
+impl<K, T> Widget for VirtualCollectionHost<K, T>
+where
+    K: Clone + Eq + Hash + PartialEq + 'static,
+    T: Clone + PartialEq + 'static,
+{
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let snapshot = ctx.observe(self.source.as_ref());
+        self.sync(snapshot);
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
 
 /// A widget that fills its bounds with a solid color. Optional rounded look is
 /// approximated by the caller; this just fills the rect.

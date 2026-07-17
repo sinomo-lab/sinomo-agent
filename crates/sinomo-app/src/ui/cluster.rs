@@ -13,7 +13,7 @@ use sui::{
     PointerEventKind, RebuildOnChange, Rect, ScrollView, SemanticTone, SemanticsAction,
     SemanticsCtx, SemanticsNode, SemanticsRole, Size, StatusBadge, StrokeStyle, Surface,
     SurfaceAppearance, SurfaceBorder, SurfaceElevation, TrailingSlotRow, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    WidgetPodMutVisitor, WidgetPodVisitor,
 };
 
 use crate::backend::Backend;
@@ -47,6 +47,37 @@ pub struct ClusterState {
     pub diagnostics_open: bool,
     pub refreshing: bool,
     refresh_rx: Option<Receiver<ClusterSnapshot>>,
+}
+
+/// Cloneable UI projection shared by the Cluster tab's structural selectors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClusterStructureKey {
+    theme: DefaultTheme,
+    snapshot: ClusterSnapshot,
+    selected: Option<ClusterSelection>,
+    diagnostics_open: bool,
+    refreshing: bool,
+}
+
+impl ClusterStructureKey {
+    pub(crate) fn new(theme: DefaultTheme, cluster: Option<&ClusterState>) -> Self {
+        let Some(cluster) = cluster else {
+            return Self {
+                theme,
+                snapshot: ClusterSnapshot::default(),
+                selected: None,
+                diagnostics_open: false,
+                refreshing: false,
+            };
+        };
+        Self {
+            theme,
+            snapshot: cluster.snapshot.clone(),
+            selected: cluster.selected.clone(),
+            diagnostics_open: cluster.diagnostics_open,
+            refreshing: cluster.refreshing,
+        }
+    }
 }
 
 impl ClusterState {
@@ -358,14 +389,13 @@ impl Widget for ClusterView {
                 ctx.request_semantics();
                 ctx.set_handled();
             }
-            Event::Window(WindowEvent::RedrawRequested) => {
-                ctx.request_paint();
-            }
             _ => {}
         }
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let structure = self.shared.signals().cluster_structure.clone();
+        let _ = ctx.observe(&structure);
         let size = constraints.max;
         let bounds = Rect::new(0.0, 0.0, size.width.max(0.0), size.height.max(0.0));
         let graph = graph_rect(bounds);
@@ -537,25 +567,28 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-fn cluster_theme_signature(shared: &Shared) -> String {
-    let app = shared.borrow();
-    format!("{:?}:{:?}", app.theme_mode, app.text_scale)
+#[derive(Clone, Debug, PartialEq)]
+struct ClusterHeaderKey {
+    theme: DefaultTheme,
+    snapshot: ClusterSnapshot,
+    refreshing: bool,
 }
 
-fn cluster_header_signature(shared: &Shared) -> String {
-    let theme = cluster_theme_signature(shared);
-    let cluster = shared.cluster();
-    format!("{theme}|{:?}|{}", cluster.snapshot, cluster.refreshing)
-}
-
-fn cluster_header_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<String> {
-    let shared = shared.clone();
+fn cluster_header_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<ClusterHeaderKey> {
+    let source =
+        shared
+            .signals()
+            .cluster_structure
+            .select_named("cluster header structure", |key| ClusterHeaderKey {
+                theme: key.theme,
+                snapshot: key.snapshot.clone(),
+                refreshing: key.refreshing,
+            });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || cluster_header_signature(&shared),
-        move |_key| build_cluster_header(&build_shared, &reader),
-    )
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_header(&build_shared, &reader)
+    })
 }
 
 fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -614,20 +647,21 @@ fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn cluster_empty_signature(shared: &Shared) -> String {
-    let theme = cluster_theme_signature(shared);
-    let cluster = shared.cluster();
-    format!("{theme}|{:?}|{}", cluster.snapshot, cluster.refreshing)
-}
-
-fn cluster_empty_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<String> {
-    let shared = shared.clone();
+fn cluster_empty_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<ClusterHeaderKey> {
+    let source =
+        shared
+            .signals()
+            .cluster_structure
+            .select_named("cluster empty structure", |key| ClusterHeaderKey {
+                theme: key.theme,
+                snapshot: key.snapshot.clone(),
+                refreshing: key.refreshing,
+            });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || cluster_empty_signature(&shared),
-        move |_key| build_cluster_empty(&build_shared, &reader),
-    )
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_empty(&build_shared, &reader)
+    })
 }
 
 fn build_cluster_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -873,23 +907,32 @@ fn unknown_node_color(pal: &Palette) -> Color {
     pal.text_disabled
 }
 
-fn cluster_detail_signature(shared: &Shared) -> String {
-    let theme = cluster_theme_signature(shared);
-    let cluster = shared.cluster();
-    format!(
-        "{theme}|{:?}|{:?}|{}|{}",
-        cluster.snapshot, cluster.selected, cluster.diagnostics_open, cluster.refreshing
-    )
+#[derive(Clone, Debug, PartialEq)]
+struct ClusterDetailKey {
+    theme: DefaultTheme,
+    snapshot: ClusterSnapshot,
+    selected: Option<ClusterSelection>,
+    diagnostics_open: bool,
+    refreshing: bool,
 }
 
-fn cluster_detail_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<String> {
-    let shared = shared.clone();
+fn cluster_detail_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<ClusterDetailKey> {
+    let source =
+        shared
+            .signals()
+            .cluster_structure
+            .select_named("cluster detail structure", |key| ClusterDetailKey {
+                theme: key.theme,
+                snapshot: key.snapshot.clone(),
+                selected: key.selected.clone(),
+                diagnostics_open: key.diagnostics_open,
+                refreshing: key.refreshing,
+            });
     let build_shared = shared.clone();
     let reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || cluster_detail_signature(&shared),
-        move |_key| build_cluster_detail(&build_shared, &reader),
-    )
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_detail(&build_shared, &reader)
+    })
 }
 
 fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -1128,11 +1171,10 @@ fn cluster_health_tone(snapshot: &ClusterSnapshot) -> SemanticTone {
 }
 
 fn open_connection_settings(shared: &Shared) {
-    let mut app = shared.borrow_mut();
-    app.active_tab = Tab::Settings;
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.open(SettingsSection::Connection);
+    if shared.is_ready() {
+        shared.settings_mut().open(SettingsSection::Connection);
     }
+    shared.set_active_tab(Tab::Settings);
 }
 
 fn overview_lines(

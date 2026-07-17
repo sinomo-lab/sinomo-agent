@@ -49,21 +49,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sui::{
     ActionTilePaint, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
     CodeTextPaint, CodeTextSpan, Color, Constraints, ContextMenu, ControlSize, CustomEvent,
-    DefaultTheme, Dock, EmptyState, Event, EventCtx, FieldAppearance, Flex, FlexItem, FlexWrap,
-    FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle, ImageSource, Insets,
-    KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock, MenuItem, PaintCtx, Path,
-    Point, PointerButton, PointerEventKind, RebuildOnChange, Rect, RegisteredImage, RichText,
-    RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
-    SideSheet, SideSheetPlacement, SignalMeter, Size, SizedBox, SplitView, Stack, StackHostOptions,
-    StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, SwitchView, TextArea,
-    TextBlockPaint, TextCellPaint, TextCommand, TextDocument, TextInput, TextLayout,
-    TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan, TextStyle, TextWrap, Tooltip,
-    TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
-    paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
-    paint_section_label_detail, paint_text_block, paint_text_cell, wrap_text_lines,
+    DefaultTheme, Dock, EmptyState, Event, EventCtx, EventPhase, FieldAppearance, Flex, FlexItem,
+    FlexWrap, FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle, ImageSource,
+    Insets, KeyState, KeyedChildren, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock,
+    MenuItem, Observable, PaintCtx, Path, Point, PointerButton, PointerEventKind, RebuildOnChange,
+    Rect, RegisteredImage, RichText, RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState,
+    ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SelectionScope,
+    SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
+    SemanticsValue, Separator, SideSheet, SideSheetPlacement, Signal, SignalMeter, Size, SizedBox,
+    SplitView, Stack, StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder,
+    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
+    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
+    TextStyle, TextWrap, Tooltip, TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    draw_glyph, paint_action_tile, paint_callout, paint_code_lines, paint_code_panel,
+    paint_rounded_panel, paint_rounded_rect, paint_section_label_detail, paint_text_block,
+    paint_text_cell, wrap_text_lines,
 };
 
 #[cfg(test)]
@@ -101,7 +102,7 @@ use crate::native_picker::{
     NativePickerKind, NativePickerLane, NativePickerOutcome, NativePickerResult,
 };
 use crate::state::{Shared, Tab};
-use crate::theme::{AppTextScale, Palette};
+use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::chat_render::{
     self, ChatCodeBlock, ChatMarkdownRender, ChatMarkdownStyles, ChatRichRenderBlock,
 };
@@ -417,13 +418,6 @@ fn activate_transcript_runtime_action(shared: &Shared, action: &RuntimeTranscrip
 }
 
 impl RuntimeRecoveryTarget {
-    fn key(self) -> &'static str {
-        match self {
-            RuntimeRecoveryTarget::Providers => "providers",
-            RuntimeRecoveryTarget::Connection => "connection",
-        }
-    }
-
     fn footer_label(self) -> &'static str {
         match self {
             RuntimeRecoveryTarget::Providers => "Provider setup",
@@ -1356,6 +1350,471 @@ pub struct ChatState {
     /// separately from session-edit state so opening a row editor can replace
     /// the drawer without losing the edit request.
     compact_drawer_open: bool,
+}
+
+/// Equality-deduplicated UI projection for Chat's retained structural boundaries.
+///
+/// Draft text and streaming message contents are intentionally absent: the mounted editor and
+/// transcript painter own those high-frequency values. `draft_revision` remains so intentional
+/// programmatic replacement can still rebuild the editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatStructureKey(Option<Box<ChatStructureSnapshot>>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatStructureSnapshot {
+    theme: (AppThemeMode, AppTextScale),
+    chats_heading: String,
+    provider_idx: usize,
+    model_idx: usize,
+    effort_idx: usize,
+    model_count: usize,
+    effort_visible: bool,
+    streaming: bool,
+    draft_revision: u64,
+    attachments: Vec<(String, u64)>,
+    attachment_path_empty: bool,
+    attachment_manual_path_open: bool,
+    attachment_operation_pending: bool,
+    attachment_picker_pending: bool,
+    pending_attachment_validations: usize,
+    attachment_drop_hovered: bool,
+    attachment_picker_error: Option<String>,
+    queued_turn_inputs: Vec<QueuedTurnInput>,
+    models_loading: bool,
+    providers_loading: bool,
+    composer_popup: Option<ComposerPopup>,
+    activity_panel_visible: bool,
+    context: Option<ChatContextStructure>,
+    activity: Vec<ChatActivityStructure>,
+    tool_calls: Vec<ChatToolStructure>,
+    tool_chain_expanded: bool,
+    expanded_tool_details: usize,
+    task_count: usize,
+    active_turn: bool,
+    tasks: Vec<ChatTaskStructure>,
+    output_tokens: Option<u64>,
+    session_id: String,
+    transcript_load_pending: bool,
+    transcript_load_slow_notice_shown: bool,
+    session_list_loading: bool,
+    session_list_slow_notice_shown: bool,
+    session_filter: String,
+    session_kind_filter: SessionKindFilter,
+    session_edit_id: Option<String>,
+    session_delete_confirm_id: Option<String>,
+    pending_delete_id: Option<String>,
+    session_edit_details_open: bool,
+    session_list_details_open: bool,
+    compact_drawer_open: bool,
+    channel_agent_idx: usize,
+    channel_create_pending: bool,
+    visible_session_has_started: bool,
+    recovery_target: Option<RuntimeRecoveryTarget>,
+    providers: Vec<ChatProviderStructure>,
+    sessions: Vec<SessionRef>,
+    agents: Vec<(String, String, String)>,
+    active_agent: String,
+    runtime_agent: String,
+    notice: Option<String>,
+    pending_session_rename: Option<PendingSessionRename>,
+    session_rename_error: Option<SessionRenameError>,
+    pending_channel_config: Option<PendingChannelConfig>,
+    channel_config_error: Option<ChannelConfigError>,
+    media_panel: MediaCallPanelSignature,
+    media_access: MediaSetupAccessSignature,
+    speaker_test: MediaSpeakerTestSignature,
+    voice_link_hint: Option<String>,
+    can_reuse_latest_answer: bool,
+    composer_bar: ComposerBarStructure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatContextStructure {
+    summary: String,
+    total_bytes: usize,
+    included_count: usize,
+    omitted_count: usize,
+    lanes: Vec<(String, String, usize)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatActivityStructure {
+    title: String,
+    detail: String,
+    tone: ActivityTone,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatToolStructure {
+    step_index: usize,
+    tool: String,
+    status: String,
+    input_preview: String,
+    process_status: Option<String>,
+    exit_code: Option<i32>,
+    stdout_len: usize,
+    stderr_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatTaskStructure {
+    summary: String,
+    status: String,
+    progress_summary: Option<String>,
+    result_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatProviderStructure {
+    id: String,
+    account: String,
+    name: String,
+    models: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatSidebarStructure {
+    theme: (AppThemeMode, AppTextScale),
+    agents: Vec<(String, String, String)>,
+    runtime_agent: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatSessionsStructure {
+    theme: (AppThemeMode, AppTextScale),
+    sessions: Vec<SessionRef>,
+    session_id: String,
+    session_filter: String,
+    session_kind_filter: SessionKindFilter,
+    loading: bool,
+    slow_notice_shown: bool,
+    details_open: bool,
+    visible_session_has_started: bool,
+    session_edit_id: Option<String>,
+    session_delete_confirm_id: Option<String>,
+    pending_delete_id: Option<String>,
+    pending_session_rename: Option<PendingSessionRename>,
+    session_rename_error: Option<SessionRenameError>,
+    pending_channel_config: Option<PendingChannelConfig>,
+    channel_config_error: Option<ChannelConfigError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatModelSelectorStructure {
+    theme: (AppThemeMode, AppTextScale),
+    provider_idx: usize,
+    model_idx: usize,
+    effort_idx: usize,
+    effort_visible: bool,
+    models_loading: bool,
+    providers_loading: bool,
+    providers: Vec<ChatProviderStructure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatAttachmentStructure {
+    theme: (AppThemeMode, AppTextScale),
+    attachments: Vec<(String, u64)>,
+    path_empty: bool,
+    manual_path_open: bool,
+    operation_pending: bool,
+    picker_pending: bool,
+    pending_validations: usize,
+    drop_hovered: bool,
+    picker_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatActivityPopupStructure {
+    theme: (AppThemeMode, AppTextScale),
+    activity: Vec<ChatActivityStructure>,
+    tool_calls: Vec<ChatToolStructure>,
+    tool_chain_expanded: bool,
+    expanded_tool_details: usize,
+    task_count: usize,
+    active_turn: bool,
+    tasks: Vec<ChatTaskStructure>,
+    output_tokens: Option<u64>,
+    streaming: bool,
+    recovery_target: Option<RuntimeRecoveryTarget>,
+    notice: Option<String>,
+}
+
+impl ChatStructureSnapshot {
+    fn sidebar_structure(&self) -> ChatSidebarStructure {
+        ChatSidebarStructure {
+            theme: self.theme,
+            agents: self.agents.clone(),
+            runtime_agent: self.runtime_agent.clone(),
+        }
+    }
+
+    fn sessions_structure(&self) -> ChatSessionsStructure {
+        ChatSessionsStructure {
+            theme: self.theme,
+            sessions: self.sessions.clone(),
+            session_id: self.session_id.clone(),
+            session_filter: self.session_filter.clone(),
+            session_kind_filter: self.session_kind_filter,
+            loading: self.session_list_loading,
+            slow_notice_shown: self.session_list_slow_notice_shown,
+            details_open: self.session_list_details_open,
+            visible_session_has_started: self.visible_session_has_started,
+            session_edit_id: self.session_edit_id.clone(),
+            session_delete_confirm_id: self.session_delete_confirm_id.clone(),
+            pending_delete_id: self.pending_delete_id.clone(),
+            pending_session_rename: self.pending_session_rename.clone(),
+            session_rename_error: self.session_rename_error.clone(),
+            pending_channel_config: self.pending_channel_config.clone(),
+            channel_config_error: self.channel_config_error.clone(),
+        }
+    }
+
+    fn model_selector_structure(&self) -> ChatModelSelectorStructure {
+        ChatModelSelectorStructure {
+            theme: self.theme,
+            provider_idx: self.provider_idx,
+            model_idx: self.model_idx,
+            effort_idx: self.effort_idx,
+            effort_visible: self.effort_visible,
+            models_loading: self.models_loading,
+            providers_loading: self.providers_loading,
+            providers: self.providers.clone(),
+        }
+    }
+
+    fn attachment_structure(&self) -> ChatAttachmentStructure {
+        ChatAttachmentStructure {
+            theme: self.theme,
+            attachments: self.attachments.clone(),
+            path_empty: self.attachment_path_empty,
+            manual_path_open: self.attachment_manual_path_open,
+            operation_pending: self.attachment_operation_pending,
+            picker_pending: self.attachment_picker_pending,
+            pending_validations: self.pending_attachment_validations,
+            drop_hovered: self.attachment_drop_hovered,
+            picker_error: self.attachment_picker_error.clone(),
+        }
+    }
+
+    fn activity_popup_structure(&self) -> ChatActivityPopupStructure {
+        ChatActivityPopupStructure {
+            theme: self.theme,
+            activity: self.activity.clone(),
+            tool_calls: self.tool_calls.clone(),
+            tool_chain_expanded: self.tool_chain_expanded,
+            expanded_tool_details: self.expanded_tool_details,
+            task_count: self.task_count,
+            active_turn: self.active_turn,
+            tasks: self.tasks.clone(),
+            output_tokens: self.output_tokens,
+            streaming: self.streaming,
+            recovery_target: self.recovery_target,
+            notice: self.notice.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComposerBarStructure {
+    theme: (AppThemeMode, AppTextScale),
+    streaming: bool,
+    media_active: bool,
+    model_label: String,
+    context_label: String,
+    activity_label: String,
+    activity_description: String,
+    voice_link_hint: Option<String>,
+    can_reuse_latest_answer: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComposerBarLayoutStructure {
+    theme: (AppThemeMode, AppTextScale),
+    streaming: bool,
+    media_active: bool,
+    voice_link_hint: Option<String>,
+    can_reuse_latest_answer: bool,
+}
+
+impl From<&ComposerBarStructure> for ComposerBarLayoutStructure {
+    fn from(structure: &ComposerBarStructure) -> Self {
+        Self {
+            theme: structure.theme,
+            streaming: structure.streaming,
+            media_active: structure.media_active,
+            voice_link_hint: structure.voice_link_hint.clone(),
+            can_reuse_latest_answer: structure.can_reuse_latest_answer,
+        }
+    }
+}
+
+impl ChatStructureKey {
+    pub(crate) fn new(
+        theme_mode: AppThemeMode,
+        text_scale: AppTextScale,
+        chat: Option<&ChatState>,
+    ) -> Self {
+        let Some(chat) = chat else {
+            return Self(None);
+        };
+        let active_agent = chat
+            .agents
+            .iter()
+            .enumerate()
+            .find(|(index, _)| chat.is_active_agent(*index))
+            .map(|(_, agent)| agent.key.clone())
+            .unwrap_or_default();
+        let context = chat.context.as_ref().map(|context| ChatContextStructure {
+            summary: context_overview_summary(chat),
+            total_bytes: context.total_bytes,
+            included_count: context.included_count,
+            omitted_count: context.omitted_count,
+            lanes: context
+                .lanes
+                .iter()
+                .map(|lane| (lane.kind.clone(), lane.label.clone(), lane.bytes))
+                .collect(),
+        });
+        Self(Some(Box::new(ChatStructureSnapshot {
+            theme: (theme_mode, text_scale),
+            chats_heading: chats_heading_text(chat),
+            provider_idx: chat.provider_idx,
+            model_idx: chat.model_idx,
+            effort_idx: chat.effort_idx,
+            model_count: chat.current_models().len(),
+            effort_visible: chat.effort_visible(),
+            streaming: chat.streaming,
+            draft_revision: chat.draft_revision,
+            attachments: chat
+                .attachments
+                .iter()
+                .map(|attachment| (attachment.file_name.clone(), attachment.size_bytes))
+                .collect(),
+            attachment_path_empty: chat.attachment_path_input.is_empty(),
+            attachment_manual_path_open: chat.attachment_manual_path_open,
+            attachment_operation_pending: chat.attachment_operation_pending(),
+            attachment_picker_pending: chat.attachment_picker_lane_pending(),
+            pending_attachment_validations: chat.pending_attachment_validations.len(),
+            attachment_drop_hovered: chat.attachment_drop_hovered,
+            attachment_picker_error: chat.attachment_picker_error.clone(),
+            queued_turn_inputs: chat.queued_turn_inputs.clone(),
+            models_loading: chat.models_loading,
+            providers_loading: chat.providers_loading,
+            composer_popup: chat.composer_popup(),
+            activity_panel_visible: chat.activity_panel_visible(),
+            context,
+            activity: chat
+                .activity
+                .iter()
+                .map(|entry| ChatActivityStructure {
+                    title: entry.title.clone(),
+                    detail: entry.detail.clone(),
+                    tone: entry.tone,
+                })
+                .collect(),
+            tool_calls: chat
+                .tool_calls
+                .iter()
+                .map(|call| ChatToolStructure {
+                    step_index: call.step_index,
+                    tool: call.tool.clone(),
+                    status: call.status.clone(),
+                    input_preview: call.input_preview.clone(),
+                    process_status: call.process_status.clone(),
+                    exit_code: call.exit_code,
+                    stdout_len: call.stdout.len(),
+                    stderr_len: call.stderr.len(),
+                })
+                .collect(),
+            tool_chain_expanded: chat.tool_chain_expanded,
+            expanded_tool_details: chat.expanded_tool_details.len(),
+            task_count: chat.control.task_count,
+            active_turn: chat.control.active_turn,
+            tasks: chat
+                .control
+                .tasks
+                .iter()
+                .map(|task| ChatTaskStructure {
+                    summary: task.summary.clone(),
+                    status: task.status.clone(),
+                    progress_summary: task.progress_summary.clone(),
+                    result_ref: task.result_ref.clone(),
+                })
+                .collect(),
+            output_tokens: chat.usage.as_ref().and_then(|usage| usage.output_tokens),
+            session_id: chat.session_id.clone(),
+            transcript_load_pending: chat.transcript_load_pending(),
+            transcript_load_slow_notice_shown: chat.transcript_load_slow_notice_shown,
+            session_list_loading: chat.session_list_loading,
+            session_list_slow_notice_shown: chat.session_list_slow_notice_shown,
+            session_filter: chat.session_filter.clone(),
+            session_kind_filter: chat.session_kind_filter,
+            session_edit_id: chat.session_edit_id.clone(),
+            session_delete_confirm_id: chat.session_delete_confirm_id.clone(),
+            pending_delete_id: chat.pending_delete_id.clone(),
+            session_edit_details_open: chat.session_edit_details_open,
+            session_list_details_open: chat.session_list_details_open,
+            compact_drawer_open: chat.compact_drawer_open,
+            channel_agent_idx: chat.channel_agent_idx,
+            channel_create_pending: chat.channel_create_rx.is_some(),
+            visible_session_has_started: chat.visible_session_has_started(),
+            recovery_target: chat.runtime_recovery_target(),
+            providers: chat
+                .providers
+                .iter()
+                .map(|provider| ChatProviderStructure {
+                    id: provider.id.clone(),
+                    account: provider.account.clone(),
+                    name: provider.name.clone(),
+                    models: provider.models.clone(),
+                })
+                .collect(),
+            sessions: chat.sessions.clone(),
+            agents: chat
+                .agents
+                .iter()
+                .map(|agent| {
+                    (
+                        agent.key.clone(),
+                        agent.name.clone(),
+                        agent.description.clone(),
+                    )
+                })
+                .collect(),
+            active_agent,
+            runtime_agent: chat.info.agent.clone(),
+            notice: chat.notice.clone(),
+            pending_session_rename: chat.pending_session_rename.clone(),
+            session_rename_error: chat.session_rename_error.clone(),
+            pending_channel_config: chat.pending_channel_config.clone(),
+            channel_config_error: chat.channel_config_error.clone(),
+            media_panel: media_call_panel_signature_for(chat),
+            media_access: MediaSetupAccessSignature {
+                microphone: chat.media_setup.microphone_access.clone(),
+                speaker: chat.media_setup.speaker_access.clone(),
+                camera: chat.media_setup.camera_access.clone(),
+            },
+            speaker_test: MediaSpeakerTestSignature {
+                active: chat.media_call.active,
+                access: chat.media_setup.speaker_access.clone(),
+                state: chat.media_setup.speaker_test.clone(),
+            },
+            voice_link_hint: voice_link_hint(chat),
+            can_reuse_latest_answer: chat.can_reuse_latest_answer(),
+            composer_bar: ComposerBarStructure {
+                theme: (theme_mode, text_scale),
+                streaming: chat.streaming,
+                media_active: chat.media_call.active,
+                model_label: model_button_label(chat),
+                context_label: context_overview_summary(chat),
+                activity_label: activity_button_label(chat).to_string(),
+                activity_description: activity_button_description(chat),
+                voice_link_hint: voice_link_hint(chat),
+                can_reuse_latest_answer: chat.can_reuse_latest_answer(),
+            },
+        })))
+    }
 }
 
 struct DeleteWorkerResult {
@@ -3462,6 +3921,12 @@ impl ChatState {
         match result.result {
             Ok(list_result) => {
                 let session = result.session;
+                // The channel worker's catalog snapshot was taken after the new channel was
+                // persisted. Discard any older catalog read that was already in flight so it
+                // cannot arrive later and temporarily erase the just-created sidebar entry.
+                if self.session_list_loading {
+                    self.reset_session_list_load();
+                }
                 self.apply_session_list_result(list_result);
                 if !self
                     .sessions
@@ -4289,6 +4754,7 @@ impl ChatState {
         self.media_call_details_open
     }
 
+    #[cfg(test)]
     fn media_call_panel_visible(&self) -> bool {
         self.media_call.active || self.media_call_details_open
     }
@@ -5095,6 +5561,7 @@ impl ChatState {
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
+    #[cfg(test)]
     fn attachment_controls_visible(&self) -> bool {
         self.attachment_controls_open
     }
@@ -8843,17 +9310,22 @@ fn heading(shared: &Shared, text: &str) -> Label {
 }
 
 fn chats_heading(shared: &Shared) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .chat_structure
+        .select_named("chat sidebar heading", |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| (snapshot.theme, snapshot.chats_heading.clone()))
+                .unwrap_or((
+                    (AppThemeMode::System, AppTextScale::Standard),
+                    String::new(),
+                ))
+        });
     let s = shared.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let chat = s.chat();
-                chats_heading_text(&chat)
-            }
-        },
-        move |text| WidgetPod::new(heading(&s, text)),
-    )
+    RebuildOnChange::new_observable(source, move |(_theme, text)| {
+        WidgetPod::new(heading(&s, text))
+    })
 }
 
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
@@ -9184,89 +9656,398 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-/// Build the CHATS ListView: stored chats/channels only. Creation actions live
-/// above the scroll area so the list itself behaves like persistent history.
-fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (sessions, filter, kind_filter, loading, empty_copy) = {
-        let chat = shared.chat();
-        let filter = normalized_session_filter(&chat.session_filter);
-        let kind_filter = chat.session_kind_filter;
-        let empty_copy = empty_sessions_copy(&chat, &filter, kind_filter);
-        (
-            chat.sessions.clone(),
-            filter,
-            kind_filter,
-            chat.session_list_loading,
-            empty_copy,
-        )
-    };
-    let visible_indices = filtered_session_indices(&sessions, &filter, kind_filter);
-    let mut items = visible_indices
-        .iter()
-        .map(|index| {
-            let session = sessions[*index].clone();
-            ListItem::new(session.title.clone())
-                .description(session_row_description(&session))
-                .activate_with_child()
-                .with_child(session_row_content(shared, reader, session))
-        })
-        .collect::<Vec<_>>();
-    let slow_loading = loading && sessions.is_empty() && {
-        let chat = shared.chat();
-        chat.session_list_slow_notice_shown
-    };
-    if loading && sessions.is_empty() {
-        let (label, detail, details_open) = {
-            let chat = shared.chat();
-            let (label, detail) = loading_sessions_copy(&chat);
-            (label, detail, chat.session_list_details_open)
-        };
-        let mut item = ListItem::new(label).detail(detail).leading_text("...");
-        if slow_loading {
-            item = item.trailing(if details_open { "Hide" } else { "Details" });
-        } else {
-            item = item.disabled();
+struct RetainedSessionRow {
+    shared: Shared,
+    session_id: String,
+    name: String,
+    description: String,
+    child: WidgetPod,
+    hovered: bool,
+    pressed: bool,
+}
+
+impl RetainedSessionRow {
+    fn new(shared: Shared, reader: &ThemeReader, session: SessionRef) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            name: session.title.clone(),
+            description: session_row_description(&session),
+            child: WidgetPod::new(session_row_content(&shared, reader, session)),
+            shared,
+            hovered: false,
+            pressed: false,
         }
-        items.push(item);
-    } else if visible_indices.is_empty() {
-        let (label, detail) = empty_copy;
-        let mut item = ListItem::new(label).leading_text(" ").disabled();
-        if let Some(detail) = detail {
-            item = item.detail(detail);
-        }
-        items.push(item);
     }
-    let s = shared.clone();
-    ListView::new("chat-sessions")
-        .items(items)
-        .selected_when({
-            let s = s.clone();
-            move || {
-                let chat = s.chat();
-                let filter = normalized_session_filter(&chat.session_filter);
-                filtered_session_indices(&chat.sessions, &filter, chat.session_kind_filter)
-                    .into_iter()
-                    .position(|session_index| chat.sessions[session_index].id == chat.session_id)
-                    .map(|index| index)
-            }
-        })
-        .row_height(SIDEBAR_ROW_H)
-        .theme_when(small_control_reader(reader))
-        .on_change(move |index, _label| {
-            let mut chat = s.chat_mut();
-            if chat.session_list_loading && chat.sessions.is_empty() {
-                if index == 0 && chat.session_list_slow_notice_shown {
-                    chat.toggle_session_list_details();
+
+    fn activate(&self) {
+        let index = self
+            .shared
+            .chat()
+            .sessions
+            .iter()
+            .position(|candidate| candidate.id == self.session_id);
+        if let Some(index) = index {
+            self.shared.chat_mut().open_session(index);
+        }
+    }
+}
+
+impl Widget for RetainedSessionRow {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() == EventPhase::Capture || ctx.is_handled() {
+            return;
+        }
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = ctx.bounds().contains(pointer.position);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
                 }
-                return;
             }
-            let filter = normalized_session_filter(&chat.session_filter);
-            let visible_indices =
-                filtered_session_indices(&chat.sessions, &filter, chat.session_kind_filter);
-            if let Some(session_index) = visible_indices.get(index) {
-                chat.open_session(*session_index);
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary)
+                    && ctx.bounds().contains(pointer.position) =>
+            {
+                self.pressed = true;
+                ctx.request_focus();
+                ctx.request_pointer_capture(pointer.pointer_id);
+                ctx.request_paint();
+                ctx.set_handled();
             }
-        })
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary)
+                    && self.pressed =>
+            {
+                let activate = ctx.bounds().contains(pointer.position);
+                self.pressed = false;
+                ctx.release_pointer_capture(pointer.pointer_id);
+                if activate {
+                    self.activate();
+                }
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                let changed = self.hovered || self.pressed;
+                self.hovered = false;
+                self.pressed = false;
+                if pointer.kind == PointerEventKind::Cancel {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                }
+                if changed {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Keyboard(key)
+                if ctx.is_focused()
+                    && key.state == KeyState::Pressed
+                    && matches!(key.key.as_str(), "Enter" | " ") =>
+            {
+                self.activate();
+                ctx.set_handled();
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let active = self.shared.chat().session_id == self.session_id;
+        if active || self.hovered || self.pressed {
+            let pal = palette(&self.shared);
+            let color = if active { pal.selected } else { pal.hover };
+            paint_rounded_rect(ctx, ctx.bounds(), color, 6.0);
+        }
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::ListItem, ctx.bounds());
+        node.name = Some(self.name.clone());
+        node.description = Some(self.description.clone());
+        node.state.focused = ctx.is_focused();
+        node.state.hovered = self.hovered;
+        node.state.selected = self.shared.chat().session_id == self.session_id;
+        node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+        ctx.push(node);
+        self.child.semantics(ctx);
+    }
+
+    fn accepts_focus(&self) -> bool {
+        true
+    }
+
+    fn focus_changed(&mut self, ctx: &mut EventCtx, _focused: bool) {
+        ctx.request_paint();
+        ctx.request_semantics();
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+fn keyed_session_row(
+    shared: Shared,
+    reader: ThemeReader,
+    session: Signal<SessionRef>,
+) -> impl Widget {
+    let row_shared = shared.clone();
+    let row_reader = Rc::clone(&reader);
+    RebuildOnChange::new_observable(session, move |session| {
+        WidgetPod::new(RetainedSessionRow::new(
+            row_shared.clone(),
+            &row_reader,
+            session.clone(),
+        ))
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatSessionPlaceholder {
+    label: String,
+    detail: Option<String>,
+    loading: bool,
+    slow_loading: bool,
+    details_open: bool,
+}
+
+fn session_placeholder(
+    shared: &Shared,
+    reader: &ThemeReader,
+    placeholder: &ChatSessionPlaceholder,
+) -> WidgetPod {
+    let mut item = ListItem::new(placeholder.label.clone()).leading_text(if placeholder.loading {
+        "..."
+    } else {
+        " "
+    });
+    if let Some(detail) = &placeholder.detail {
+        item = item.detail(detail.clone());
+    }
+    if placeholder.slow_loading {
+        item = item.trailing(if placeholder.details_open {
+            "Hide"
+        } else {
+            "Details"
+        });
+    } else {
+        item = item.disabled();
+    }
+    let action_shared = shared.clone();
+    WidgetPod::new(
+        ListView::new("chat-sessions-placeholder")
+            .item(item)
+            .row_height(SIDEBAR_ROW_H)
+            .theme_when(small_control_reader(reader))
+            .on_change(move |_index, _label| {
+                let should_toggle = {
+                    let chat = action_shared.chat();
+                    chat.session_list_loading
+                        && chat.sessions.is_empty()
+                        && chat.session_list_slow_notice_shown
+                };
+                if should_toggle {
+                    action_shared.chat_mut().toggle_session_list_details();
+                }
+            }),
+    )
+}
+
+/// Retained conversation rows keyed by durable session ID. Reordering or refreshing the
+/// catalog moves existing pods and updates their per-row signals instead of replacing the
+/// complete sidebar list.
+struct KeyedSessionRows {
+    source: Arc<dyn Observable<Option<ChatSessionsStructure>>>,
+    shared: Shared,
+    reader: ThemeReader,
+    children: KeyedChildren<String, SessionRef>,
+    placeholder_key: Option<ChatSessionPlaceholder>,
+    placeholder: Option<WidgetPod>,
+}
+
+impl KeyedSessionRows {
+    fn new(shared: Shared, reader: &ThemeReader) -> Self {
+        let source =
+            shared
+                .signals()
+                .chat_structure
+                .select_named("chat keyed session rows", |key| {
+                    key.0
+                        .as_deref()
+                        .map(ChatStructureSnapshot::sessions_structure)
+                });
+        Self {
+            source: Arc::new(source),
+            shared,
+            reader: Rc::clone(reader),
+            children: KeyedChildren::new(),
+            placeholder_key: None,
+            placeholder: None,
+        }
+    }
+
+    fn sync(&mut self, structure: Option<ChatSessionsStructure>) {
+        let Some(structure) = structure else {
+            self.children.reconcile(
+                Vec::<SessionRef>::new(),
+                |session| session.id.clone(),
+                |_id, _session| SizedBox::new(),
+            );
+            self.placeholder_key = None;
+            self.placeholder = None;
+            return;
+        };
+        let filter = normalized_session_filter(&structure.session_filter);
+        let visible =
+            filtered_session_indices(&structure.sessions, &filter, structure.session_kind_filter)
+                .into_iter()
+                .filter_map(|index| structure.sessions.get(index).cloned())
+                .collect::<Vec<_>>();
+        let placeholder = if visible.is_empty() {
+            if structure.loading && structure.sessions.is_empty() {
+                let (label, detail) = {
+                    let chat = self.shared.chat();
+                    loading_sessions_copy(&chat)
+                };
+                Some(ChatSessionPlaceholder {
+                    label: label.to_string(),
+                    detail: Some(detail.to_string()),
+                    loading: true,
+                    slow_loading: structure.slow_notice_shown,
+                    details_open: structure.details_open,
+                })
+            } else {
+                let (label, detail) = {
+                    let chat = self.shared.chat();
+                    empty_sessions_copy(&chat, &filter, structure.session_kind_filter)
+                };
+                Some(ChatSessionPlaceholder {
+                    label: label.to_string(),
+                    detail: detail.map(str::to_string),
+                    loading: false,
+                    slow_loading: false,
+                    details_open: false,
+                })
+            }
+        } else {
+            None
+        };
+        if placeholder != self.placeholder_key {
+            self.placeholder_key = placeholder.clone();
+            self.placeholder = placeholder
+                .as_ref()
+                .map(|key| session_placeholder(&self.shared, &self.reader, key));
+        }
+
+        let shared = self.shared.clone();
+        let reader = Rc::clone(&self.reader);
+        self.children.reconcile(
+            visible,
+            |session| session.id.clone(),
+            move |_session_id, session| {
+                keyed_session_row(shared.clone(), Rc::clone(&reader), session)
+            },
+        );
+    }
+}
+
+impl Widget for KeyedSessionRows {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let structure = ctx.observe(self.source.as_ref());
+        self.sync(structure);
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(220.0)
+        };
+        let height = if let Some(placeholder) = &mut self.placeholder {
+            placeholder.measure(ctx, Constraints::tight(Size::new(width, SIDEBAR_ROW_H)));
+            SIDEBAR_ROW_H
+        } else {
+            for (_, _, child) in self.children.iter_mut() {
+                child.measure(ctx, Constraints::tight(Size::new(width, SIDEBAR_ROW_H)));
+            }
+            self.children.len() as f32 * SIDEBAR_ROW_H
+        };
+        constraints.clamp(Size::new(width, height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        if let Some(placeholder) = &mut self.placeholder {
+            placeholder.arrange(
+                ctx,
+                Rect::new(bounds.x(), bounds.y(), bounds.width(), SIDEBAR_ROW_H),
+            );
+            return;
+        }
+        let mut y = bounds.y();
+        for (_, _, child) in self.children.iter_mut() {
+            child.arrange(ctx, Rect::new(bounds.x(), y, bounds.width(), SIDEBAR_ROW_H));
+            y += SIDEBAR_ROW_H;
+        }
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        if let Some(placeholder) = &self.placeholder {
+            placeholder.paint(ctx);
+        } else {
+            for (_, _, child) in self.children.iter() {
+                child.paint(ctx);
+            }
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut list = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
+        list.name = Some("chat-sessions".to_string());
+        ctx.push(list);
+        if let Some(placeholder) = &self.placeholder {
+            placeholder.semantics(ctx);
+        } else {
+            for (_, _, child) in self.children.iter() {
+                child.semantics(ctx);
+            }
+        }
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        if let Some(placeholder) = &self.placeholder {
+            visitor.visit(placeholder);
+        } else {
+            self.children.visit_children(visitor);
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        if let Some(placeholder) = &mut self.placeholder {
+            visitor.visit(placeholder);
+        } else {
+            self.children.visit_children_mut(visitor);
+        }
+    }
 }
 
 fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -9307,11 +10088,8 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
 }
 
 fn request_chat_window_relayout(ctx: &mut EventCtx) {
-    use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
-
-    let window = InvalidationTarget::Window(ctx.window_id());
-    ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
-    ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+    ctx.request_measure();
+    ctx.request_arrange();
     ctx.request_paint();
     ctx.request_semantics();
 }
@@ -9329,75 +10107,20 @@ fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         })
 }
 
-fn sessions_scroll_signature(
-    shared: &Shared,
-) -> (
-    String,
-    String,
-    SessionKindFilter,
-    String,
-    String,
-    String,
-    String,
-    usize,
-    bool,
-    bool,
-) {
-    let chat = shared.chat();
-    let sessions = chat
-        .sessions
-        .iter()
-        .map(|s| format!("{}:{:?}:{}:{}", s.id, s.kind, s.title, s.participant_count))
-        .collect::<Vec<_>>()
-        .join("\u{1f}");
-    (
-        sessions,
-        chat.session_filter.clone(),
-        chat.session_kind_filter,
-        chat.session_id.clone(),
-        chat.session_edit_id.clone().unwrap_or_default(),
-        chat.session_delete_confirm_id.clone().unwrap_or_default(),
-        chat.pending_delete_id.clone().unwrap_or_default(),
-        chat.channel_agent_idx,
-        chat.session_list_loading,
-        chat.session_list_slow_notice_shown,
-    )
-}
-
-fn sessions_scroll(
-    shared: &Shared,
-    reader: &ThemeReader,
-    scroll_state: &ScrollState,
-) -> impl Widget + use<> {
-    ScrollView::vertical(sessions_list(shared, reader))
-        .name("chat-sessions-scroll")
-        .state(scroll_state.clone())
-        .theme(shared.theme())
-}
-
 fn sessions_scroll_rebuild(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let sessions_scroll_state = scroll_state.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || sessions_scroll_signature(&s)
-        },
-        move |_sig| WidgetPod::new(sessions_scroll(&s, &r, &sessions_scroll_state)),
-    )
+    ScrollView::vertical(KeyedSessionRows::new(shared.clone(), reader))
+        .name("chat-sessions-scroll")
+        .state(scroll_state.clone())
+        .theme(shared.theme())
 }
 
 fn request_session_filter_refresh(ctx: &mut EventCtx) {
-    use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
-
-    let window = InvalidationTarget::Window(ctx.window_id());
-    ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
-    ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+    ctx.request_measure();
+    ctx.request_arrange();
     ctx.request_paint();
     ctx.request_semantics();
 }
@@ -9467,7 +10190,6 @@ fn session_row_content(
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let active = shared.chat().session_id == session.id;
-    let editing = shared.chat().session_edit_id.as_deref() == Some(session.id.as_str());
     let label_color = if active { pal.text } else { pal.text_muted };
     let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, label_color);
     let meta_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
@@ -9494,10 +10216,14 @@ fn session_row_content(
 
     let s = shared.clone();
     let session_id = session.id.clone();
+    let selected_shared = shared.clone();
+    let selected_id = session.id.clone();
     let edit = IconButton::new(IconGlyph::MoreHorizontal, format!("Edit {}", session.title))
         .size(SIDEBAR_ROW_EDIT_H)
         .icon_size(14.0)
-        .selected(editing)
+        .selected_when(move || {
+            selected_shared.chat().session_edit_id.as_deref() == Some(selected_id.as_str())
+        })
         .theme_when(clone_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
@@ -9523,106 +10249,93 @@ fn sidebar(
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .chat_structure
+        .select_named("chat sidebar structure", |key| {
+            key.0
+                .as_deref()
+                .map(ChatStructureSnapshot::sidebar_structure)
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
     let sessions_scroll_state = scroll_state.clone();
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || sidebar_signature(&s)
-        },
-        move |_sig| {
-            let mut column = Flex::vertical()
-                .main_gap(4.0)
-                .align_items(Alignment::Stretch)
-                .with_child(SizedBox::new().height(18.0))
-                .with_child(
-                    WidgetPadding::horizontal(18.0, heading(&s, "AGENTS")).fill_child_height(),
+    RebuildOnChange::new_observable(source, move |_sig| {
+        let mut column = Flex::vertical()
+            .main_gap(4.0)
+            .align_items(Alignment::Stretch)
+            .with_child(SizedBox::new().height(18.0))
+            .with_child(WidgetPadding::horizontal(18.0, heading(&s, "AGENTS")).fill_child_height())
+            .with_child(SizedBox::new().height(2.0))
+            .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height())
+            .with_child(SizedBox::new().height(16.0))
+            .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height())
+            .with_child(SizedBox::new().height(6.0))
+            .with_child(
+                WidgetPadding::horizontal(
+                    8.0,
+                    SizedBox::new()
+                        .height(28.0)
+                        .with_child(session_kind_filter_control(&s, &r)),
                 )
-                .with_child(SizedBox::new().height(2.0))
-                .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height())
-                .with_child(SizedBox::new().height(16.0))
-                .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height())
-                .with_child(SizedBox::new().height(6.0))
-                .with_child(
-                    WidgetPadding::horizontal(
-                        8.0,
-                        SizedBox::new()
-                            .height(28.0)
-                            .with_child(session_kind_filter_control(&s, &r)),
-                    )
-                    .fill_child_height(),
+                .fill_child_height(),
+            )
+            .with_child(SizedBox::new().height(6.0))
+            .with_child(
+                WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(),
+            )
+            .with_child(SizedBox::new().height(6.0))
+            .with_child(WidgetPadding::horizontal(8.0, session_create_actions(&s, &r)).fill_child())
+            .with_child(SizedBox::new().height(8.0))
+            .with_item(
+                WidgetPadding::horizontal(
+                    8.0,
+                    sessions_scroll_rebuild(&s, &r, &sessions_scroll_state),
                 )
-                .with_child(SizedBox::new().height(6.0))
-                .with_child(
-                    WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(),
-                )
-                .with_child(SizedBox::new().height(6.0))
-                .with_child(
-                    WidgetPadding::horizontal(8.0, session_create_actions(&s, &r)).fill_child(),
-                )
-                .with_child(SizedBox::new().height(8.0))
-                .with_item(
-                    WidgetPadding::horizontal(
-                        8.0,
-                        sessions_scroll_rebuild(&s, &r, &sessions_scroll_state),
-                    )
-                    .fill_child_height(),
-                    FlexItem::flex(1.0).min_height(0.0),
-                );
-            if let Some(actions) = slow_session_load_actions(&s, &r) {
-                column = column
-                    .with_child(SizedBox::new().height(8.0))
-                    .with_child(WidgetPadding::horizontal(8.0, actions).fill_child_height())
-                    .with_child(SizedBox::new().height(8.0));
-            }
-            WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
-        },
-    )
+                .fill_child_height(),
+                FlexItem::flex(1.0).min_height(0.0),
+            );
+        column = column.with_child(slow_session_load_actions_host(&s, &r));
+        WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
+    })
 }
 
-/// A signature of the sidebar's list contents (agents are static; sessions + the active agent
-/// change). Used to drive the sidebar [`RebuildOnChange`].
-fn sidebar_signature(
-    shared: &Shared,
-) -> (
-    String,
-    String,
-    SessionKindFilter,
-    String,
-    String,
-    String,
-    usize,
-    bool,
-    bool,
-    bool,
-) {
-    let chat = shared.chat();
-    let active = chat
-        .agents
-        .iter()
-        .enumerate()
-        .find(|(i, _)| chat.is_active_agent(*i))
-        .map(|(_, a)| a.key.clone())
-        .unwrap_or_default();
-    let sessions = chat
-        .sessions
-        .iter()
-        .map(|s| format!("{}:{:?}:{}:{}", s.id, s.kind, s.title, s.participant_count))
-        .collect::<Vec<_>>()
-        .join("\u{1f}");
-    (
-        active,
-        sessions,
-        chat.session_kind_filter,
-        chat.session_id.clone(),
-        chat.session_edit_id.clone().unwrap_or_default(),
-        chat.session_delete_confirm_id.clone().unwrap_or_default(),
-        chat.channel_agent_idx,
-        chat.session_list_loading,
-        chat.session_list_slow_notice_shown,
-        chat.session_list_details_open,
-    )
+fn slow_session_load_actions_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared.signals().chat_structure.select_named(
+        "chat slow session recovery structure",
+        |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| {
+                    (
+                        snapshot.theme,
+                        snapshot.session_list_loading,
+                        snapshot.session_list_slow_notice_shown,
+                        snapshot.session_list_details_open,
+                    )
+                })
+                .unwrap_or((
+                    (AppThemeMode::System, AppTextScale::Standard),
+                    false,
+                    false,
+                    false,
+                ))
+        },
+    );
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_structure| {
+        let Some(actions) = slow_session_load_actions(&s, &r) else {
+            return WidgetPod::new(SizedBox::new().height(0.0));
+        };
+        WidgetPod::new(
+            Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .with_child(SizedBox::new().height(8.0))
+                .with_child(WidgetPadding::horizontal(8.0, actions).fill_child_height())
+                .with_child(SizedBox::new().height(8.0)),
+        )
+    })
 }
 
 fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<impl Widget + use<>> {
@@ -10357,65 +11070,6 @@ fn channel_agent_row(
     )
 }
 
-fn session_edit_dialog_signature(shared: &Shared) -> String {
-    let chat = shared.chat();
-    let Some(edit_id) = chat.session_edit_id.as_deref() else {
-        return String::new();
-    };
-    let sessions = chat
-        .sessions
-        .iter()
-        .map(|session| {
-            format!(
-                "{}:{:?}:{}:{}",
-                session.id, session.kind, session.title, session.participant_count
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\u{1f}");
-    let pending_rename = chat
-        .pending_session_rename
-        .as_ref()
-        .filter(|pending| pending.session_id == edit_id)
-        .map(|pending| format!("{}:{}", pending.request_id, pending.title))
-        .unwrap_or_default();
-    let rename_error = chat
-        .session_rename_error
-        .as_ref()
-        .filter(|error| error.session_id == edit_id)
-        .map(|error| error.detail.as_str())
-        .unwrap_or_default();
-    let pending_channel_config = chat
-        .pending_channel_config
-        .as_ref()
-        .filter(|pending| pending.channel_id == edit_id)
-        .map(|pending| format!("{}:{}", pending.request_id, pending.action))
-        .unwrap_or_default();
-    let channel_config_error = chat
-        .channel_config_error
-        .as_ref()
-        .filter(|error| error.channel_id == edit_id)
-        .map(|error| error.detail.as_str())
-        .unwrap_or_default();
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        edit_id,
-        chat.session_delete_confirm_id
-            .as_deref()
-            .unwrap_or_default(),
-        chat.session_edit_details_open,
-        chat.channel_agent_idx,
-        chat.agents.len(),
-        chat.channel_create_rx.is_some(),
-        chat.notice.as_deref().unwrap_or_default(),
-        pending_rename,
-        rename_error,
-        pending_channel_config,
-        channel_config_error,
-        sessions
-    )
-}
-
 fn compact_chat_drawer(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     if !shared.chat().compact_drawer_open || shared.chat().session_edit_id.is_some() {
         return None;
@@ -10445,17 +11099,6 @@ fn compact_chat_drawer(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     ))
 }
 
-fn chat_overlay_signature(shared: &Shared) -> String {
-    let edit = session_edit_dialog_signature(shared);
-    if !edit.is_empty() {
-        return format!("edit|{edit}");
-    }
-    if shared.chat().compact_drawer_open {
-        return format!("drawer|{:?}", sidebar_signature(shared));
-    }
-    String::new()
-}
-
 fn chat_overlay(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     if shared.chat().session_edit_id.is_some() {
         session_edit_dialog(shared, reader)
@@ -10469,7 +11112,7 @@ struct ChatDialogHost {
     reader: ThemeReader,
     body: WidgetPod,
     dialog: Option<WidgetPod>,
-    dialog_signature: String,
+    dialog_key: ChatStructureKey,
 }
 
 impl ChatDialogHost {
@@ -10477,39 +11120,31 @@ impl ChatDialogHost {
     where
         W: Widget + 'static,
     {
-        let mut host = Self {
+        let dialog_key = shared.signals().chat_structure.get();
+        let dialog = chat_overlay(&shared, &reader);
+        Self {
             shared,
             reader,
             body: WidgetPod::new(body),
-            dialog: None,
-            dialog_signature: String::new(),
-        };
-        host.sync_dialog();
-        host
+            dialog,
+            dialog_key,
+        }
     }
 
-    fn sync_dialog(&mut self) {
-        let signature = chat_overlay_signature(&self.shared);
-        if signature == self.dialog_signature {
+    fn sync_dialog(&mut self, key: ChatStructureKey) {
+        if key == self.dialog_key {
             return;
         }
-        self.dialog_signature = signature;
+        self.dialog_key = key;
         self.dialog = chat_overlay(&self.shared, &self.reader);
     }
 }
 
 impl Widget for ChatDialogHost {
-    fn event(&mut self, ctx: &mut EventCtx, _event: &Event) {
-        let signature = chat_overlay_signature(&self.shared);
-        if signature != self.dialog_signature {
-            ctx.request_measure();
-            ctx.request_paint();
-            ctx.request_semantics();
-        }
-    }
-
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.sync_dialog();
+        let source = self.shared.signals().chat_structure.clone();
+        let key = ctx.observe(&source);
+        self.sync_dialog(key);
         let size = constraints.clamp(Size::new(
             if constraints.max.width.is_finite() {
                 constraints.max.width
@@ -10603,8 +11238,13 @@ enum MediaCallTile {
     Local,
 }
 
+#[cfg(test)]
 fn media_call_panel_signature(shared: &Shared) -> MediaCallPanelSignature {
     let chat = shared.chat();
+    media_call_panel_signature_for(&chat)
+}
+
+fn media_call_panel_signature_for(chat: &ChatState) -> MediaCallPanelSignature {
     let (selected_provider, selected_model) = chat.current_media_provider_model();
     let call = &chat.media_call;
     let provider = if call.active && !call.provider.trim().is_empty() {
@@ -10631,13 +11271,23 @@ fn media_call_panel_signature(shared: &Shared) -> MediaCallPanelSignature {
 }
 
 fn media_call_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let key_shared = shared.clone();
+    let source = shared
+        .signals()
+        .chat_structure
+        .select_named("chat media call structure", |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| (snapshot.theme, snapshot.media_panel.clone()))
+        });
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || media_call_panel_signature(&key_shared),
-        move |signature| media_call_panel_body(&build_shared, &build_reader, signature),
-    )
+    RebuildOnChange::new_observable(source, move |signature| {
+        let signature = &signature
+            .as_ref()
+            .expect("media panel is built only after chat is ready")
+            .1;
+        media_call_panel_body(&build_shared, &build_reader, signature)
+    })
 }
 
 fn media_call_panel_body(
@@ -11074,26 +11724,28 @@ fn centered_rect(bounds: Rect, size: Size) -> Rect {
 }
 
 fn media_setup_access_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let key_shared = shared.clone();
+    let source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat media access structure", |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.theme, snapshot.media_access.clone()))
+            });
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || {
-            let chat = key_shared.chat();
-            MediaSetupAccessSignature {
-                microphone: chat.media_setup.microphone_access.clone(),
-                speaker: chat.media_setup.speaker_access.clone(),
-                camera: chat.media_setup.camera_access.clone(),
-            }
-        },
-        move |signature| {
-            WidgetPod::new(media_setup_access_row_body(
-                &build_shared,
-                &build_reader,
-                signature,
-            ))
-        },
-    )
+    RebuildOnChange::new_observable(source, move |signature| {
+        let signature = &signature
+            .as_ref()
+            .expect("media access is built only after chat is ready")
+            .1;
+        WidgetPod::new(media_setup_access_row_body(
+            &build_shared,
+            &build_reader,
+            signature,
+        ))
+    })
 }
 
 fn media_setup_access_row_body(
@@ -11297,52 +11949,50 @@ fn media_setup_test_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
 }
 
 fn media_setup_speaker_test_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let key_shared = shared.clone();
+    let source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat speaker test structure", |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.theme, snapshot.speaker_test.clone()))
+            });
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || {
-            let chat = key_shared.chat();
-            MediaSpeakerTestSignature {
-                active: chat.media_call.active,
-                access: chat.media_setup.speaker_access.clone(),
-                state: chat.media_setup.speaker_test.clone(),
+    RebuildOnChange::new_observable(source, move |signature| {
+        let signature = &signature
+            .as_ref()
+            .expect("speaker test is built only after chat is ready")
+            .1;
+        let press_shared = build_shared.clone();
+        let detail = match &signature.state {
+            SpeakerTestState::Failed(detail) => {
+                format!("Speaker test failed: {detail}. Activate to try again.")
             }
-        },
-        move |signature| {
-            let press_shared = build_shared.clone();
-            let detail = match &signature.state {
-                SpeakerTestState::Failed(detail) => {
-                    format!("Speaker test failed: {detail}. Activate to try again.")
-                }
-                SpeakerTestState::Passed => {
-                    "The selected speaker played the test tone.".to_string()
-                }
-                SpeakerTestState::Testing => {
-                    "The test tone is playing through the selected speaker.".to_string()
-                }
-                SpeakerTestState::Idle => {
-                    "Play a short tone through the selected speaker.".to_string()
-                }
-            };
-            WidgetPod::new(
-                sui::Button::new(signature.state.label())
-                    .semantic_name("Test selected speaker")
-                    .description(detail)
-                    .icon(IconGlyph::AudioLines)
-                    .min_height(26.0)
-                    .theme_when(clone_reader(&build_reader))
-                    .appearance(sui::ButtonAppearance::Tonal)
-                    .tone(SemanticTone::Neutral)
-                    .enabled(
-                        !signature.active
-                            && matches!(signature.access, MediaAccessState::Ready)
-                            && !matches!(signature.state, SpeakerTestState::Testing),
-                    )
-                    .on_press(move || press_shared.chat_mut().media_setup.test_speaker()),
-            )
-        },
-    )
+            SpeakerTestState::Passed => "The selected speaker played the test tone.".to_string(),
+            SpeakerTestState::Testing => {
+                "The test tone is playing through the selected speaker.".to_string()
+            }
+            SpeakerTestState::Idle => "Play a short tone through the selected speaker.".to_string(),
+        };
+        WidgetPod::new(
+            sui::Button::new(signature.state.label())
+                .semantic_name("Test selected speaker")
+                .description(detail)
+                .icon(IconGlyph::AudioLines)
+                .min_height(26.0)
+                .theme_when(clone_reader(&build_reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .enabled(
+                    !signature.active
+                        && matches!(signature.access, MediaAccessState::Ready)
+                        && !matches!(signature.state, SpeakerTestState::Testing),
+                )
+                .on_press(move || press_shared.chat_mut().media_setup.test_speaker()),
+        )
+    })
 }
 
 fn media_setup_recovery_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -11642,49 +12292,6 @@ fn activity_detail_entry(chat: &ChatState, health: &RuntimeHealth) -> Option<Cha
         })
 }
 
-fn activity_popup_signature(shared: &Shared, detail_expanded: bool) -> String {
-    let chat = shared.chat();
-    let health = chat.runtime_health();
-    let mut signature = format!(
-        "expanded={detail_expanded}|health={}:{}:{:?}|work={}",
-        health.label,
-        health.detail,
-        health.tone,
-        activity_work_summary(&chat)
-    );
-    for task in chat.control.tasks.iter().take(8) {
-        signature.push_str(&format!(
-            "|task={}:{}:{}:{}",
-            task.summary,
-            task.status,
-            task.progress_summary.as_deref().unwrap_or_default(),
-            task.result_ref.as_deref().unwrap_or_default()
-        ));
-    }
-    for call in chat.tool_calls.iter().rev().take(8) {
-        signature.push_str(&format!(
-            "|tool={}:{}:{}:{}",
-            call.tool, call.status, call.step_index, call.input_preview
-        ));
-    }
-    if let Some(context) = &chat.context {
-        signature.push_str(&format!(
-            "|context={}:{}:{}",
-            context.total_bytes, context.included_count, context.omitted_count
-        ));
-        for lane in context.lanes.iter().filter(|lane| lane.bytes > 0).take(6) {
-            signature.push_str(&format!(":{}:{}:{}", lane.kind, lane.label, lane.bytes));
-        }
-    }
-    for entry in chat.activity.iter().rev().take(16) {
-        signature.push_str(&format!(
-            "|event={}:{}:{:?}",
-            entry.title, entry.detail, entry.tone
-        ));
-    }
-    signature
-}
-
 fn activity_close_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
     let s = shared.clone();
     IconButton::new(IconGlyph::Close, "Close activity")
@@ -11710,7 +12317,7 @@ fn activity_popup_header(shared: &Shared, reader: &ThemeReader) -> impl Widget +
 
 fn activity_detail_toggle_button(
     reader: &ThemeReader,
-    detail_expanded: Rc<Cell<bool>>,
+    detail_expanded: Signal<bool>,
 ) -> impl Widget + use<> {
     let expanded = detail_expanded.get();
     let label = if expanded {
@@ -11718,7 +12325,7 @@ fn activity_detail_toggle_button(
     } else {
         "Show detail"
     };
-    let expanded_state = Rc::clone(&detail_expanded);
+    let expanded_state = detail_expanded.clone();
     sui::Button::new(label)
         .icon(if expanded {
             IconGlyph::ChevronUp
@@ -11739,9 +12346,8 @@ fn activity_detail_toggle_button(
         .theme_when(clone_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
+        .on_press(move || {
             expanded_state.set(!expanded_state.get());
-            request_chat_window_relayout(ctx);
         })
 }
 
@@ -11751,7 +12357,7 @@ fn activity_status_card(
     health: &RuntimeHealth,
     work_summary: String,
     has_detail: bool,
-    detail_expanded: Rc<Cell<bool>>,
+    detail_expanded: Signal<bool>,
 ) -> impl Widget + use<> {
     let s = shared.clone();
     let status = activity_status_summary(&health.detail);
@@ -11872,7 +12478,7 @@ fn activity_item_card(
 fn activity_popup_content(
     shared: &Shared,
     reader: &ThemeReader,
-    detail_expanded: Rc<Cell<bool>>,
+    detail_expanded: Signal<bool>,
 ) -> impl Widget + use<> {
     let chat = shared.chat();
     let health = chat.runtime_health();
@@ -11886,7 +12492,7 @@ fn activity_popup_content(
             &health,
             activity_work_summary(&chat),
             detail_entry.is_some(),
-            Rc::clone(&detail_expanded),
+            detail_expanded.clone(),
         ));
 
     if detail_expanded.get()
@@ -13679,11 +14285,8 @@ impl TranscriptView {
     }
 
     fn request_recovery_action_refresh(ctx: &mut EventCtx) {
-        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
-
-        let window = InvalidationTarget::Window(ctx.window_id());
-        ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
-        ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+        ctx.request_measure();
+        ctx.request_arrange();
         ctx.request_paint();
         ctx.request_semantics();
     }
@@ -14878,31 +15481,6 @@ impl Widget for TranscriptView {
 // `RebuildOnChange` keyed on the selection signature.
 // ---------------------------------------------------------------------------
 
-/// The selector row signature: provider index, model index, model count, effort visibility, and a
-/// loading flag — anything that changes the *set* of options or which selectors are shown. (The
-/// selected-index reactivity is handled by each `Select`'s `selected_when`; this only drives the
-/// rebuild when the option lists themselves change.)
-fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, bool, String, String) {
-    let chat = shared.chat();
-    (
-        chat.provider_idx,
-        chat.providers.len(),
-        chat.current_models().len(),
-        chat.effort_visible(),
-        chat.models_loading,
-        chat.shows_recovery_empty_card(),
-        chat.providers
-            .iter()
-            .map(|provider| format!("{}@{}:{}", provider.id, provider.account, provider.name))
-            .collect::<Vec<_>>()
-            .join("\u{1f}"),
-        chat.runtime_recovery_target()
-            .map(RuntimeRecoveryTarget::key)
-            .unwrap_or("none")
-            .to_string(),
-    )
-}
-
 /// Build the provider / model / effort selector row for the current selection.
 fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     if shared.chat().providers.is_empty() {
@@ -15100,39 +15678,21 @@ fn check_sifs_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> 
 }
 
 fn open_settings_section(shared: &Shared, section: SettingsSection) {
-    let mut app = shared.borrow_mut();
-    app.active_tab = Tab::Settings;
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.open(section);
+    if shared.is_ready() {
+        shared.settings_mut().open(section);
     }
+    shared.set_active_tab(Tab::Settings);
 }
 
 fn open_files_tab(shared: &Shared) {
-    shared.borrow_mut().active_tab = Tab::Files;
+    shared.set_active_tab(Tab::Files);
 }
 
 fn open_provider_setup(shared: &Shared) {
-    let mut app = shared.borrow_mut();
-    app.active_tab = Tab::Settings;
-    if let Some(ready) = app.ready.as_mut() {
-        ready.settings.open_provider_add();
+    if shared.is_ready() {
+        shared.settings_mut().open_provider_add();
     }
-}
-
-fn attachment_signature(
-    shared: &Shared,
-) -> (u64, usize, bool, bool, bool, bool, bool, Option<String>) {
-    let chat = shared.chat();
-    (
-        chat.draft_revision,
-        chat.attachments.len(),
-        chat.attachment_controls_visible(),
-        chat.attachment_manual_path_open,
-        chat.attachment_operation_pending(),
-        chat.attachment_picker_lane_pending(),
-        chat.attachment_drop_hovered,
-        chat.attachment_picker_error.clone(),
-    )
+    shared.set_active_tab(Tab::Settings);
 }
 
 fn attachment_drawer_chip(
@@ -15383,53 +15943,6 @@ fn voice_link_hint(chat: &ChatState) -> Option<String> {
         .then(|| format!("voice link · {}", chat.media_call_elapsed_label()))
 }
 
-/// The action bar rebuild key: the Send<->Stop swap, the quiet-control labels,
-/// and the live voice state (whose hint ticks once a second).
-fn composer_bar_signature(
-    shared: &Shared,
-) -> (
-    bool,
-    String,
-    String,
-    String,
-    bool,
-    Option<String>,
-    bool,
-    bool,
-) {
-    let chat = shared.chat();
-    (
-        chat.streaming,
-        model_button_label(&chat),
-        context_overview_summary(&chat),
-        activity_button_label(&chat).to_string(),
-        chat.media_call.active,
-        voice_link_hint(&chat),
-        chat.can_reuse_latest_answer(),
-        chat.providers.is_empty(),
-    )
-}
-
-fn context_popup_signature(shared: &Shared) -> (String, usize, usize, usize, bool) {
-    let chat = shared.chat();
-    (
-        context_overview_summary(&chat),
-        chat.context
-            .as_ref()
-            .map(|context| context.total_bytes)
-            .unwrap_or_default(),
-        chat.context
-            .as_ref()
-            .map(|context| context.included_count)
-            .unwrap_or_default(),
-        chat.context
-            .as_ref()
-            .map(|context| context.omitted_count)
-            .unwrap_or_default(),
-        chat.streaming,
-    )
-}
-
 fn close_popup_button(shared: &Shared, reader: &ThemeReader, label: &'static str) -> IconButton {
     let s = shared.clone();
     IconButton::new(IconGlyph::Close, label)
@@ -15459,15 +15972,18 @@ fn popup_header(
 
 fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let selector_host = {
+        let source =
+            shared
+                .signals()
+                .chat_structure
+                .select_named("chat model selector structure", |key| {
+                    key.0
+                        .as_deref()
+                        .map(ChatStructureSnapshot::model_selector_structure)
+                });
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || selector_signature(&s)
-            },
-            move |_sig| selectors(&s, &r),
-        )
+        RebuildOnChange::new_observable(source, move |_sig| selectors(&s, &r))
     };
     let detail = {
         let chat = shared.chat();
@@ -15506,53 +16022,56 @@ fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
 fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let content = {
+        let source =
+            shared
+                .signals()
+                .chat_structure
+                .select_named("chat context popup structure", |key| {
+                    key.0
+                        .as_deref()
+                        .map(|snapshot| (snapshot.theme, snapshot.context.clone()))
+                });
         let s = shared.clone();
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || context_popup_signature(&s)
-            },
-            move |_sig| {
-                let chat = s.chat();
-                let mut body = Stack::vertical()
-                    .spacing(5.0)
-                    .alignment(Alignment::Stretch)
-                    .with_child(muted_label(&s, context_overview_summary(&chat)));
-                if let Some(context) = &chat.context {
-                    body = body
-                        .with_child(muted_label(
-                            &s,
-                            format!(
-                                "Step {} · {} / {}",
-                                context.step_index,
-                                compact_line(&context.provider, 18),
-                                compact_line(&context.model, 28)
-                            ),
-                        ))
-                        .with_child(muted_label(
-                            &s,
-                            format!(
-                                "{} included · {} omitted",
-                                context_count_label(context.included_count, "source", "sources"),
-                                context_count_label(context.omitted_count, "source", "sources")
-                            ),
-                        ));
-                    let lane_total: usize = context.lanes.iter().map(|lane| lane.bytes).sum();
-                    for lane in context.lanes.iter().filter(|lane| lane.bytes > 0).take(3) {
-                        let label = if lane.label.trim().is_empty() {
-                            lane.kind.as_str()
-                        } else {
-                            lane.label.as_str()
-                        };
-                        body = body.with_child(muted_label(
-                            &s,
-                            context_lane_summary(label, lane.bytes, lane_total),
-                        ));
-                    }
+        RebuildOnChange::new_observable(source, move |_sig| {
+            let chat = s.chat();
+            let mut body = Stack::vertical()
+                .spacing(5.0)
+                .alignment(Alignment::Stretch)
+                .with_child(muted_label(&s, context_overview_summary(&chat)));
+            if let Some(context) = &chat.context {
+                body = body
+                    .with_child(muted_label(
+                        &s,
+                        format!(
+                            "Step {} · {} / {}",
+                            context.step_index,
+                            compact_line(&context.provider, 18),
+                            compact_line(&context.model, 28)
+                        ),
+                    ))
+                    .with_child(muted_label(
+                        &s,
+                        format!(
+                            "{} included · {} omitted",
+                            context_count_label(context.included_count, "source", "sources"),
+                            context_count_label(context.omitted_count, "source", "sources")
+                        ),
+                    ));
+                let lane_total: usize = context.lanes.iter().map(|lane| lane.bytes).sum();
+                for lane in context.lanes.iter().filter(|lane| lane.bytes > 0).take(3) {
+                    let label = if lane.label.trim().is_empty() {
+                        lane.kind.as_str()
+                    } else {
+                        lane.label.as_str()
+                    };
+                    body = body.with_child(muted_label(
+                        &s,
+                        context_lane_summary(label, lane.bytes, lane_total),
+                    ));
                 }
-                WidgetPod::new(body)
-            },
-        )
+            }
+            WidgetPod::new(body)
+        })
     };
     let body = Stack::vertical()
         .spacing(8.0)
@@ -15576,15 +16095,17 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
 fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let controls = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat attachment popup structure",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(ChatStructureSnapshot::attachment_structure)
+            },
+        );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || attachment_signature(&s)
-            },
-            move |_sig| attachment_controls(&s, &r),
-        )
+        RebuildOnChange::new_observable(source, move |_sig| attachment_controls(&s, &r))
     };
     let body = Stack::vertical()
         .spacing(8.0)
@@ -15654,19 +16175,35 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         );
     }
 
-    let detail_expanded = Rc::new(Cell::new(false));
+    let detail_expanded = Signal::named("chat activity detail expanded", false);
     let activity_content = {
+        let source =
+            shared
+                .signals()
+                .chat_structure
+                .select_named("chat activity popup structure", |key| {
+                    key.0
+                        .as_deref()
+                        .map(ChatStructureSnapshot::activity_popup_structure)
+                });
         let s = shared.clone();
         let r = Rc::clone(reader);
-        let expanded = Rc::clone(&detail_expanded);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                let expanded = Rc::clone(&expanded);
-                move || activity_popup_signature(&s, expanded.get())
-            },
-            move |_sig| WidgetPod::new(activity_popup_content(&s, &r, Rc::clone(&expanded))),
-        )
+        let expanded = detail_expanded.clone();
+        RebuildOnChange::new_observable(source, move |_chat_key| {
+            let content_s = s.clone();
+            let content_r = Rc::clone(&r);
+            let content_expanded = expanded.clone();
+            WidgetPod::new(RebuildOnChange::new_observable(
+                expanded.clone(),
+                move |_expanded| {
+                    WidgetPod::new(activity_popup_content(
+                        &content_s,
+                        &content_r,
+                        content_expanded.clone(),
+                    ))
+                },
+            ))
+        })
     };
     let body = Stack::vertical()
         .spacing(8.0)
@@ -15699,15 +16236,18 @@ fn composer_popup_panel(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 }
 
 fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat composer popup structure", |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.theme, snapshot.composer_popup))
+            });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || s.chat().composer_popup()
-        },
-        move |_popup| composer_popup_panel(&s, &r),
-    )
+    RebuildOnChange::new_observable(source, move |_popup| composer_popup_panel(&s, &r))
 }
 
 /// A pending attachment as a Mesh context chip riding on top of the input:
@@ -15890,16 +16430,15 @@ fn composer_context_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 /// The composer action bar (`.sm-composer-bar`): compact ghost controls on the
 /// left and Send on the right. Detailed state and the keyboard shortcut live in
 /// hover tooltips instead of consuming the writing surface.
-fn composer_bar(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (streaming, media_active, hint, can_reuse) = {
-        let chat = shared.chat();
-        (
-            chat.streaming,
-            chat.media_call.active,
-            voice_link_hint(&chat),
-            chat.can_reuse_latest_answer(),
-        )
-    };
+fn composer_bar(
+    shared: &Shared,
+    reader: &ThemeReader,
+    structure: &ComposerBarLayoutStructure,
+) -> WidgetPod {
+    let streaming = structure.streaming;
+    let media_active = structure.media_active;
+    let hint = structure.voice_link_hint.clone();
+    let can_reuse = structure.can_reuse_latest_answer;
 
     let attach = {
         let s = shared.clone();
@@ -15949,63 +16488,127 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     // Their current state remains available to pointer users via tooltips and to
     // assistive technology through the IconButton semantic name.
     let model = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat composer model button label",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.theme, snapshot.composer_bar.model_label.clone()))
+                    .unwrap_or((
+                        (AppThemeMode::System, AppTextScale::Standard),
+                        "Model".to_string(),
+                    ))
+            },
+        );
         let s = shared.clone();
-        let label = model_button_label(&shared.chat());
-        Tooltip::new(
-            label.clone(),
-            IconButton::new(IconGlyph::Sparkles, label)
-                .size(COMPOSER_GHOST_BUTTON_SIZE)
-                .icon_size(14.0)
-                .theme_when(composer_control_reader(reader))
-                .appearance(sui::ButtonAppearance::Ghost)
-                .tone(SemanticTone::Neutral)
-                .on_press_with_ctx(move |ctx| {
-                    s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
-                    request_chat_window_relayout(ctx);
-                }),
-        )
-        .placement(TooltipPlacement::Above)
-        .theme(reader())
+        let r = Rc::clone(reader);
+        RebuildOnChange::new_observable(source, move |(_theme, label)| {
+            let press_shared = s.clone();
+            WidgetPod::new(
+                Tooltip::new(
+                    label.clone(),
+                    IconButton::new(IconGlyph::Sparkles, label.clone())
+                        .size(COMPOSER_GHOST_BUTTON_SIZE)
+                        .icon_size(14.0)
+                        .theme_when(composer_control_reader(&r))
+                        .appearance(sui::ButtonAppearance::Ghost)
+                        .tone(SemanticTone::Neutral)
+                        .on_press_with_ctx(move |ctx| {
+                            press_shared
+                                .chat_mut()
+                                .toggle_composer_popup(ComposerPopup::Model);
+                            request_chat_window_relayout(ctx);
+                        }),
+                )
+                .placement(TooltipPlacement::Above)
+                .theme(r()),
+            )
+        })
     };
 
     let context = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat composer context button label",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.theme, snapshot.composer_bar.context_label.clone()))
+                    .unwrap_or((
+                        (AppThemeMode::System, AppTextScale::Standard),
+                        String::new(),
+                    ))
+            },
+        );
         let s = shared.clone();
-        let label = context_overview_summary(&shared.chat());
-        Tooltip::new(
-            label.clone(),
-            IconButton::new(IconGlyph::History, label)
-                .size(COMPOSER_GHOST_BUTTON_SIZE)
-                .icon_size(14.0)
-                .theme_when(composer_control_reader(reader))
-                .appearance(sui::ButtonAppearance::Ghost)
-                .tone(SemanticTone::Neutral)
-                .on_press_with_ctx(move |ctx| {
-                    s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
-                    request_chat_window_relayout(ctx);
-                }),
-        )
-        .placement(TooltipPlacement::Above)
-        .theme(reader())
+        let r = Rc::clone(reader);
+        RebuildOnChange::new_observable(source, move |(_theme, label)| {
+            let press_shared = s.clone();
+            WidgetPod::new(
+                Tooltip::new(
+                    label.clone(),
+                    IconButton::new(IconGlyph::History, label.clone())
+                        .size(COMPOSER_GHOST_BUTTON_SIZE)
+                        .icon_size(14.0)
+                        .theme_when(composer_control_reader(&r))
+                        .appearance(sui::ButtonAppearance::Ghost)
+                        .tone(SemanticTone::Neutral)
+                        .on_press_with_ctx(move |ctx| {
+                            press_shared
+                                .chat_mut()
+                                .toggle_composer_popup(ComposerPopup::Context);
+                            request_chat_window_relayout(ctx);
+                        }),
+                )
+                .placement(TooltipPlacement::Above)
+                .theme(r()),
+            )
+        })
     };
 
     let activity = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat composer activity button text",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| {
+                        (
+                            snapshot.theme,
+                            snapshot.composer_bar.activity_label.clone(),
+                            snapshot.composer_bar.activity_description.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            (AppThemeMode::System, AppTextScale::Standard),
+                            "Activity".to_string(),
+                            String::new(),
+                        )
+                    })
+            },
+        );
         let s = shared.clone();
-        let label = activity_button_label(&shared.chat()).to_string();
-        Tooltip::new(
-            activity_button_description(&shared.chat()),
-            IconButton::new(IconGlyph::Hourglass, label)
-                .size(COMPOSER_GHOST_BUTTON_SIZE)
-                .icon_size(14.0)
-                .theme_when(composer_control_reader(reader))
-                .appearance(sui::ButtonAppearance::Ghost)
-                .tone(SemanticTone::Neutral)
-                .on_press_with_ctx(move |ctx| {
-                    s.chat_mut().toggle_activity_panel();
-                    request_chat_window_relayout(ctx);
-                }),
-        )
-        .placement(TooltipPlacement::Above)
-        .theme(reader())
+        let r = Rc::clone(reader);
+        RebuildOnChange::new_observable(source, move |(_theme, label, description)| {
+            let press_shared = s.clone();
+            WidgetPod::new(
+                Tooltip::new(
+                    description.clone(),
+                    IconButton::new(IconGlyph::Hourglass, label.clone())
+                        .size(COMPOSER_GHOST_BUTTON_SIZE)
+                        .icon_size(14.0)
+                        .theme_when(composer_control_reader(&r))
+                        .appearance(sui::ButtonAppearance::Ghost)
+                        .tone(SemanticTone::Neutral)
+                        .on_press_with_ctx(move |ctx| {
+                            press_shared.chat_mut().toggle_activity_panel();
+                            request_chat_window_relayout(ctx);
+                        }),
+                )
+                .placement(TooltipPlacement::Above)
+                .theme(r()),
+            )
+        })
     };
 
     let mut row = Flex::horizontal()
@@ -16097,18 +16700,6 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 fn composer_input_min_height() -> f32 {
     DefaultTheme::default().text.base.line_height * COMPOSER_INPUT_MIN_LINES as f32
         + COMPOSER_INPUT_PAD_Y
-}
-
-/// The input host rebuild key: provider availability (editable <-> setup-required
-/// read-only state) and the draft revision, bumped only by programmatic draft
-/// replacement — normal typing must not rebuild the focused `TextArea`.
-fn composer_input_signature(shared: &Shared) -> (bool, bool, u64) {
-    let chat = shared.chat();
-    (
-        chat.streaming,
-        chat.providers.is_empty(),
-        chat.draft_revision,
-    )
 }
 
 /// The borderless message input. The field frame owns the composer's border and
@@ -16223,64 +16814,83 @@ fn composer_field(
     selection: &SelectionScope,
 ) -> impl Widget + use<> {
     let queue_host = {
+        let source =
+            shared
+                .signals()
+                .chat_structure
+                .select_named("chat queued inputs structure", |key| {
+                    key.0
+                        .as_deref()
+                        .map(|snapshot| (snapshot.theme, snapshot.queued_turn_inputs.clone()))
+                        .unwrap_or(((AppThemeMode::System, AppTextScale::Standard), Vec::new()))
+                });
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || {
-                    s.chat()
-                        .queued_turn_inputs
-                        .iter()
-                        .map(|item| {
-                            (
-                                item.kind == QueuedTurnKind::Steer,
-                                item.text.clone(),
-                                item.input_id.clone(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }
-            },
-            move |_items| composer_queue_row(&s, &r),
-        )
+        RebuildOnChange::new_observable(source, move |_items| composer_queue_row(&s, &r))
     };
 
     let context_host = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat composer attachments structure",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| (snapshot.theme, snapshot.attachments.clone()))
+            },
+        );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || attachment_signature(&s)
-            },
-            move |_sig| composer_context_row(&s, &r),
-        )
+        RebuildOnChange::new_observable(source, move |_sig| composer_context_row(&s, &r))
     };
 
     let input_host = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat composer input replacement",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| {
+                        (
+                            snapshot.theme,
+                            snapshot.streaming,
+                            snapshot.providers.is_empty(),
+                            snapshot.draft_revision,
+                        )
+                    })
+                    .unwrap_or((
+                        (AppThemeMode::System, AppTextScale::Standard),
+                        false,
+                        true,
+                        0,
+                    ))
+            },
+        );
         let s = shared.clone();
         let r = Rc::clone(reader);
         let sel = selection.clone();
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || composer_input_signature(&s)
-            },
-            move |_sig| composer_input_row(&s, &r, &sel),
-        )
+        RebuildOnChange::new_observable(source, move |_sig| composer_input_row(&s, &r, &sel))
     };
 
     let bar_host = {
+        let source = shared.signals().chat_structure.select_named(
+            "chat composer action bar structure",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| ComposerBarLayoutStructure::from(&snapshot.composer_bar))
+            },
+        );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || composer_bar_signature(&s)
-            },
-            move |_sig| composer_bar(&s, &r),
-        )
+        RebuildOnChange::new_observable(source, move |structure| {
+            composer_bar(
+                &s,
+                &r,
+                structure
+                    .as_ref()
+                    .expect("composer bar is built only after chat is ready"),
+            )
+        })
     };
 
     let rows = Stack::vertical()
@@ -16380,40 +16990,44 @@ fn main_column(
     selection: &SelectionScope,
 ) -> impl Widget + use<> {
     let transcript = {
-        let key_shared = shared.clone();
+        let source = shared.signals().chat_structure.select_named(
+            "chat media presentation structure",
+            |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| {
+                        (
+                            snapshot.theme,
+                            snapshot.media_panel.active || snapshot.media_panel.details_open,
+                            snapshot.media_panel.details_open,
+                        )
+                    })
+                    .unwrap_or(((AppThemeMode::System, AppTextScale::Standard), false, false))
+            },
+        );
         let build_shared = shared.clone();
         let build_reader = Rc::clone(reader);
         let build_selection = selection.clone();
-        RebuildOnChange::new(
-            move || {
-                let chat = key_shared.chat();
-                (
-                    chat.media_call_panel_visible(),
-                    chat.media_call_details_visible(),
-                )
-            },
-            move |media_sig| {
-                let (panel_visible, details_open) = *media_sig;
-                let transcript = transcript_with_context_menu(
-                    &build_shared,
-                    &build_reader,
-                    &build_selection,
-                    TranscriptView::new(build_shared.clone(), build_selection.clone()),
-                );
-                if !panel_visible {
-                    return WidgetPod::new(transcript);
-                }
-                let height = if details_open {
-                    MEDIA_CALL_H
-                } else {
-                    MEDIA_CALL_COMPACT_H
-                };
-                WidgetPod::new(
-                    Dock::new(transcript)
-                        .top(height, media_call_panel(&build_shared, &build_reader)),
-                )
-            },
-        )
+        RebuildOnChange::new_observable(source, move |media_sig| {
+            let (_theme, panel_visible, details_open) = *media_sig;
+            let transcript = transcript_with_context_menu(
+                &build_shared,
+                &build_reader,
+                &build_selection,
+                TranscriptView::new(build_shared.clone(), build_selection.clone()),
+            );
+            if !panel_visible {
+                return WidgetPod::new(transcript);
+            }
+            let height = if details_open {
+                MEDIA_CALL_H
+            } else {
+                MEDIA_CALL_COMPACT_H
+            };
+            WidgetPod::new(
+                Dock::new(transcript).top(height, media_call_panel(&build_shared, &build_reader)),
+            )
+        })
     };
     MeasuredBottomDock::new(transcript, composer(shared, reader, selection))
 }
@@ -16573,21 +17187,14 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope)
 /// drive the request-animation-frame loop. (A sibling overlay widget could not: in sui an event
 /// only reaches widgets on the `path_to(target)`, and `RedrawRequested` / external wakes route to
 /// the *root* only, so an off-path overlay would never receive the kick.) While a reply streams (or
-/// there was recent activity) the pump drains the worker each frame, applies events to `ChatState`,
-/// and — when the parts the `RebuildOnChange` hosts key on change — forces a full window relayout so
-/// those hosts rebuild and re-measure (a worker-driven change arrives outside any pointer gesture).
+/// there was recent activity) the pump drains the worker each frame and applies events to
+/// `ChatState`. The resulting typed projection notifies only retained subscribers whose selected
+/// structural value changed.
 pub struct ChatView {
     shared: Shared,
-    theme_reader: ThemeReader,
-    sessions_scroll_state: ScrollState,
-    selection: SelectionScope,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
-    /// Coarse signature of the selection / session / streaming state the inner `RebuildOnChange`
-    /// hosts key on; a change forces a full relayout so they rebuild.
-    last_sig: Cell<u64>,
-    last_scale_key: Cell<AppTextScale>,
     /// Whether an animation frame is currently requested (so we don't stack duplicate requests).
     pump_alive: Cell<bool>,
     /// Frames since the last state change; bounds the idle tail so we stop requesting frames.
@@ -16611,18 +17218,11 @@ impl ChatView {
         let selection = SelectionScope::new();
         let wide = wide_pod(&shared, &theme_reader, &sessions_scroll_state, &selection);
         let narrow = narrow_pod(&shared, &theme_reader, &selection);
-        let last_sig = Cell::new(view_signature(&shared));
-        let last_scale_key = Cell::new(chat_scale_key(&shared));
         Self {
             shared,
-            theme_reader,
-            sessions_scroll_state,
-            selection,
             wide,
             narrow,
             use_wide: Cell::new(true),
-            last_sig,
-            last_scale_key,
             pump_alive: Cell::new(false),
             idle_frames: Cell::new(0),
         }
@@ -16644,22 +17244,6 @@ impl ChatView {
         }
     }
 
-    fn sync_scale(&mut self) -> bool {
-        let current = chat_scale_key(&self.shared);
-        if current == self.last_scale_key.get() {
-            return false;
-        }
-        self.last_scale_key.set(current);
-        self.wide = wide_pod(
-            &self.shared,
-            &self.theme_reader,
-            &self.sessions_scroll_state,
-            &self.selection,
-        );
-        self.narrow = narrow_pod(&self.shared, &self.theme_reader, &self.selection);
-        true
-    }
-
     /// Ensure the request-animation-frame pump is running (idempotent).
     fn ensure_pump(&self, ctx: &mut EventCtx) {
         if !self.pump_alive.get() {
@@ -16670,19 +17254,9 @@ impl ChatView {
         self.idle_frames.set(0);
     }
 
-    /// Force a full window relayout (re-measure + re-arrange + repaint) for this frame.
-    ///
-    /// The streaming worker mutates `ChatState` outside any pointer gesture, and the
-    /// sidebar/composer `RebuildOnChange` hosts only `refresh()` when their `measure()` runs. A
-    /// plain `ctx.request_measure()` here would only invalidate `ChatView`'s own measure path, which
-    /// can short-circuit before reaching those hosts. Targeting the *window* makes sui's
-    /// `build_measure_scope` upgrade the pass to `force_all`, so every pod (including those hosts)
-    /// re-measures and the newly-built option lists / Send<->Interrupt swap take effect.
-    fn force_window_relayout(&self, ctx: &mut EventCtx) {
-        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
-        let window = InvalidationTarget::Window(ctx.window_id());
-        ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
-        ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+    fn request_relayout(&self, ctx: &mut EventCtx) {
+        ctx.request_measure();
+        ctx.request_arrange();
         ctx.request_paint();
         ctx.request_semantics();
     }
@@ -16713,26 +17287,21 @@ impl ChatView {
         let media_call_active = self.shared.chat().media_call.active;
         let transcript_pending = self.shared.chat().transcript_load_pending();
 
-        // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
-        // or a token that resolved the selection) may have changed the selector option lists, the
-        // sidebar sessions, or the streaming flag (Send <-> Interrupt) — anything the inner
-        // `RebuildOnChange` hosts key on. On a signature change, force a full relayout so those hosts
-        // rebuild; on a bare token (same signature) just repaint the live-reading transcript.
-        let sig = view_signature(&self.shared);
-        let sig_changed = sig != self.last_sig.get();
-        if sig_changed || media_changed.layout {
-            self.last_sig.set(sig);
-            self.force_window_relayout(ctx);
+        // Structural hosts subscribe to `chat_structure` and invalidate themselves when their
+        // selected projection changes. A bare token only repaints the live transcript.
+        if media_changed.layout {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
         } else if structural_changed || media_changed.semantics {
             ctx.request_paint();
-            // Transcript rows and the busy indicator are live semantic
-            // content, not paint-only decoration.
             ctx.request_semantics();
         } else if media_changed.paint {
             ctx.request_paint();
         }
 
-        if changed || sig_changed {
+        if changed {
             self.idle_frames.set(0);
         } else {
             self.idle_frames
@@ -16747,107 +17316,6 @@ impl ChatView {
             self.pump_alive.set(true);
         }
     }
-}
-
-/// A coarse signature of the parts of `ChatState` whose change requires a host relayout (the
-/// session/agent lists, provider/model/effort selection, and the streaming flag — anything the
-/// inner `RebuildOnChange` hosts key on). Cheap to compute each redraw.
-fn view_signature(shared: &Shared) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let chat = shared.chat();
-    let mut h = DefaultHasher::new();
-    chat.provider_idx.hash(&mut h);
-    chat.model_idx.hash(&mut h);
-    chat.effort_idx.hash(&mut h);
-    chat.current_models().len().hash(&mut h);
-    chat.effort_visible().hash(&mut h);
-    chat.streaming.hash(&mut h);
-    chat.media_call.active.hash(&mut h);
-    chat.media_call_details_visible().hash(&mut h);
-    voice_link_hint(&chat).hash(&mut h);
-    chat.can_reuse_latest_answer().hash(&mut h);
-    chat.draft_revision.hash(&mut h);
-    chat.attachments.len().hash(&mut h);
-    chat.attachment_path_input.is_empty().hash(&mut h);
-    chat.attachment_manual_path_open.hash(&mut h);
-    chat.attachment_operation_pending().hash(&mut h);
-    chat.attachment_picker_lane_pending().hash(&mut h);
-    chat.pending_attachment_validations.len().hash(&mut h);
-    chat.attachment_drop_hovered.hash(&mut h);
-    chat.attachment_picker_error.hash(&mut h);
-    chat.queued_turn_inputs.len().hash(&mut h);
-    for queued in &chat.queued_turn_inputs {
-        (queued.kind == QueuedTurnKind::Steer).hash(&mut h);
-        queued.text.hash(&mut h);
-        queued.input_id.hash(&mut h);
-    }
-    chat.models_loading.hash(&mut h);
-    chat.composer_popup().hash(&mut h);
-    chat.activity_panel_visible().hash(&mut h);
-    context_overview_summary(&chat).hash(&mut h);
-    chat.activity.len().hash(&mut h);
-    for entry in chat.activity.iter().rev().take(16) {
-        entry.title.hash(&mut h);
-        entry.detail.hash(&mut h);
-        entry.tone.hash(&mut h);
-    }
-    chat.tool_calls.len().hash(&mut h);
-    chat.tool_chain_expanded.hash(&mut h);
-    chat.expanded_tool_details.len().hash(&mut h);
-    for call in &chat.tool_calls {
-        call.status.hash(&mut h);
-        call.input_preview.hash(&mut h);
-        call.process_status.hash(&mut h);
-        call.exit_code.hash(&mut h);
-        call.stdout.len().hash(&mut h);
-        call.stderr.len().hash(&mut h);
-    }
-    chat.control.task_count.hash(&mut h);
-    chat.control.active_turn.hash(&mut h);
-    for task in chat.control.tasks.iter().take(8) {
-        task.summary.hash(&mut h);
-        task.status.hash(&mut h);
-        task.progress_summary.hash(&mut h);
-        task.result_ref.hash(&mut h);
-    }
-    chat.usage
-        .as_ref()
-        .and_then(|usage| usage.output_tokens)
-        .hash(&mut h);
-    chat.session_id.hash(&mut h);
-    chat.transcript_load_pending().hash(&mut h);
-    chat.transcript_load_slow_notice_shown.hash(&mut h);
-    chat.session_list_loading.hash(&mut h);
-    chat.session_list_slow_notice_shown.hash(&mut h);
-    chat.session_kind_filter.hash(&mut h);
-    chat.session_edit_id.hash(&mut h);
-    chat.session_delete_confirm_id.hash(&mut h);
-    chat.session_edit_details_open.hash(&mut h);
-    chat.compact_drawer_open.hash(&mut h);
-    chat.channel_agent_idx.hash(&mut h);
-    chat.channel_create_rx.is_some().hash(&mut h);
-    chat.visible_session_has_started().hash(&mut h);
-    chat.runtime_recovery_target()
-        .map(RuntimeRecoveryTarget::key)
-        .unwrap_or("none")
-        .hash(&mut h);
-    chat.providers.len().hash(&mut h);
-    for provider in &chat.providers {
-        provider.id.hash(&mut h);
-        provider.account.hash(&mut h);
-        provider.name.hash(&mut h);
-    }
-    chat.sessions.len().hash(&mut h);
-    for s in &chat.sessions {
-        s.id.hash(&mut h);
-        s.kind.hash(&mut h);
-        s.title.hash(&mut h);
-        s.participant_count.hash(&mut h);
-        s.participant_names.hash(&mut h);
-    }
-    chat.info.agent.hash(&mut h);
-    h.finish()
 }
 
 impl Widget for ChatView {
@@ -16878,7 +17346,7 @@ impl Widget for ChatView {
             let handled = self.shared.chat_mut().handle_escape();
             if handled {
                 self.ensure_pump(ctx);
-                self.force_window_relayout(ctx);
+                self.request_relayout(ctx);
                 ctx.set_handled();
                 return;
             }
@@ -16895,10 +17363,8 @@ impl Widget for ChatView {
             self.ensure_pump(ctx);
         }
 
-        // A pointer release / key press can also have just rebuilt a `RebuildOnChange` host (a
-        // sidebar/Select on-change fired during this gesture); relayout so it re-measures. The
-        // `measure` pass refreshes `last_sig` to the post-change signature, so the next pump tick
-        // does not redundantly relayout for a change this gesture already handled.
+        // A pointer release / key press can also have changed local widget geometry. Reactive
+        // structural hosts invalidate themselves; this request covers the gesture-local layout.
         let commit = matches!(event, Event::Pointer(p) if matches!(p.kind, PointerEventKind::Up))
             || matches!(event, Event::Keyboard(k) if k.state == KeyState::Pressed);
         if commit {
@@ -16909,13 +17375,11 @@ impl Widget for ChatView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.sync_scale();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         if use_wide && !self.use_wide.get() {
             self.shared.chat_mut().compact_drawer_open = false;
         }
         self.use_wide.set(use_wide);
-        self.last_sig.set(view_signature(&self.shared));
         self.active_mut().measure(ctx, constraints)
     }
 
@@ -16943,10 +17407,6 @@ impl Widget for ChatView {
             visitor.visit(&mut self.narrow);
         }
     }
-}
-
-fn chat_scale_key(shared: &Shared) -> AppTextScale {
-    shared.borrow().text_scale
 }
 
 /// The docked composer panel: an optional popup block above the field surface.
@@ -18180,6 +18640,27 @@ mod tests {
         assert_eq!(
             state.draft_revision, revision,
             "typing must not change the programmatic composer rebuild key"
+        );
+    }
+
+    #[test]
+    fn typing_draft_does_not_publish_chat_structure() {
+        let shared = Shared::new(crate::state::AppState::ready(Backend::local_fallback()));
+        let version = shared.signals().chat_structure.version();
+
+        shared.chat_mut().set_draft("h".to_string());
+        shared.chat_mut().set_draft("hello".to_string());
+
+        assert_eq!(
+            shared.signals().chat_structure.version(),
+            version,
+            "ordinary draft edits must not notify structural subscribers"
+        );
+
+        shared.chat_mut().streaming = true;
+        assert!(
+            shared.signals().chat_structure.version() > version,
+            "a Send-to-Stop structural transition must notify subscribers"
         );
     }
 
@@ -20750,6 +21231,78 @@ mod tests {
     }
 
     #[test]
+    fn chat_session_reorder_preserves_keyed_row_widget_ids() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let alpha = SessionRef {
+            id: SessionId::generate().to_string(),
+            title: "Alpha conversation".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        };
+        let beta = SessionRef {
+            id: SessionId::generate().to_string(),
+            title: "Beta conversation".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 2,
+            participant_count: 2,
+            participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
+        };
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions = vec![alpha, beta];
+            chat.session_id = chat.sessions[0].id.clone();
+            chat.models_loading = false;
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let scroll_state = ScrollState::new();
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat keyed session rows")
+                    .root(
+                        SizedBox::new()
+                            .width(280.0)
+                            .height(160.0)
+                            .with_child(sessions_scroll_rebuild(&shared, &reader, &scroll_state)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let row_ids = |snapshot: &sui_testing::WindowSnapshot| {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| node.role == SemanticsRole::ListItem)
+                .filter_map(|node| {
+                    node.name
+                        .as_ref()
+                        .filter(|name| name.ends_with(" conversation"))
+                        .map(|name| (name.clone(), node.id))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        let before = row_ids(&window.snapshot()?);
+        assert_eq!(before.len(), 2);
+        shared.chat_mut().sessions.swap(0, 1);
+        app.run_until_idle()?;
+        let after = row_ids(&window.snapshot()?);
+        assert_eq!(
+            after, before,
+            "same-key conversation rows should move without replacing their retained widget pods"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn chat_sessions_scroll_state_clamps_after_list_shrinks() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -20814,7 +21367,9 @@ mod tests {
         let before_max = scroll_state.max_offset().y;
         assert!(
             before_offset > 100.0,
-            "test setup should start scrolled away from the top"
+            "test setup should start scrolled away from the top: offset={before_offset}, max={before_max}, content={:?}, viewport={:?}",
+            scroll_state.content_size(),
+            scroll_state.viewport_size(),
         );
 
         window
