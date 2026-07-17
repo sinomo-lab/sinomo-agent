@@ -298,7 +298,7 @@ fn cluster_endpoint_is_probeable(endpoint: &ClusterEndpointRecord) -> bool {
         && cluster_endpoint_is_currently_dialable(endpoint)
 }
 
-fn cluster_endpoint_is_builtin_probe_target(endpoint: &ClusterEndpointRecord) -> bool {
+pub(crate) fn cluster_endpoint_is_builtin_probe_target(endpoint: &ClusterEndpointRecord) -> bool {
     endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
         && matches!(
             endpoint.transport,

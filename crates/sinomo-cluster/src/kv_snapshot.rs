@@ -160,21 +160,28 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
 
     let deadline = Instant::now() + options.refresh_budget(!snapshots.is_empty());
     let mut fetched_remote = false;
-    for target_node_id in &targets {
+    for (index, target_node_id) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
         if remaining.is_zero() {
             break;
         }
+        let remaining_targets = targets.len().saturating_sub(index).max(1);
+        let target_count = remaining_targets.min(u32::MAX as usize) as u32;
+        let fair_share = remaining
+            .checked_div(target_count)
+            .unwrap_or(remaining)
+            .max(Duration::from_millis(1));
         if let Ok(snapshot) = fetch_cluster_kv_snapshot_from_state_authority_node(
             state,
             target_node_id,
-            options.routed_node_attempt_timeout(remaining),
+            options.routed_node_attempt_timeout(fair_share),
             host,
         ) {
             snapshots.push(snapshot);
             fetched_remote = true;
+            break;
         }
     }
     let snapshot = snapshots
@@ -224,4 +231,229 @@ where
         fetch_cluster_kv_snapshot,
     };
     refresh_current_cluster_kv_store_with_host(paths, state, options, &mut host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_base::{CapabilityName, ClusterMemberRecord};
+    use sinomo_kv::KvRevision;
+    use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
+    use std::collections::BTreeMap;
+    use time::OffsetDateTime;
+
+    struct RecordingSnapshotRefreshHost {
+        known_authority: NodeId,
+        snapshots: BTreeMap<NodeId, KvSnapshot>,
+        stalled_target: Option<NodeId>,
+        calls: Vec<(NodeId, Duration)>,
+        cached_snapshot: Option<KvSnapshot>,
+    }
+
+    impl ClusterKvSnapshotRefreshHost for RecordingSnapshotRefreshHost {
+        fn known_kv_state_authority_id(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<NodeId>, NetworkError> {
+            Ok(Some(self.known_authority.clone()))
+        }
+
+        fn cache_cluster_kv_snapshot_if_newer_than_raft(
+            &mut self,
+            _paths: &ClusterPaths,
+            _local_node_id: &NodeId,
+            snapshot: KvSnapshot,
+        ) -> Result<bool, NetworkError> {
+            self.cached_snapshot = Some(snapshot);
+            Ok(true)
+        }
+
+        fn call_node_object_rpc(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            assert_eq!(request.route, sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE);
+            self.calls.push((target_node_id.clone(), timeout));
+            if self.stalled_target.as_ref() == Some(target_node_id) {
+                std::thread::sleep(timeout);
+            }
+            let Some(snapshot) = self.snapshots.get(target_node_id) else {
+                return Err(NetworkError::Io {
+                    operation: "test cluster KV snapshot refresh".to_string(),
+                    detail: format!("node {target_node_id} is unavailable"),
+                });
+            };
+            let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(snapshot)
+                .expect("snapshot response payload");
+            Ok(ObjectRpcResponse::from_encoded_body(
+                payload.route,
+                payload.body,
+            ))
+        }
+    }
+
+    fn snapshot(revision: u64) -> KvSnapshot {
+        KvSnapshot {
+            revision: KvRevision(revision),
+            compacted_revision: KvRevision(0),
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn snapshot_refresh_test_state() -> (
+        sinomo_testdir::TestDir,
+        ClusterPaths,
+        ClusterBootstrapState,
+        Vec<NodeId>,
+    ) {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-kv-snapshot-refresh");
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_kv_snapshot_refresh").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_kv_snapshot_refresh_local").expect("local node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "KV snapshot refresh",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0] = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0].capabilities =
+            vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("daemon capability")];
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+
+        for index in 0..3_u16 {
+            let node_id =
+                NodeId::from_legacy_named(format!("node_kv_snapshot_refresh_remote_{index}"))
+                    .expect("remote node");
+            let mut member = ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id.clone(),
+                format!("remote {index}"),
+                format!("pk-remote-{index}"),
+                now,
+            );
+            member.capabilities =
+                vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("daemon capability")];
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = vec![sinomo_network::daemon_lan_endpoint(
+                &node_id,
+                format!("10.0.0.{}:21353", index + 2),
+                0,
+            )];
+            state.members.push(member);
+        }
+
+        let mut targets = ClusterEndpointSelector::new(&paths, &state)
+            .select_internal_unique_node_ids(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+            );
+        targets.retain(|node_id| node_id != &state.local_node_id);
+        assert_eq!(targets.len(), 3, "test requires three remote authorities");
+        (root, paths, state, targets)
+    }
+
+    fn snapshot_refresh_options(timeout: Duration) -> ClusterKvSnapshotRefreshOptions {
+        ClusterKvSnapshotRefreshOptions {
+            without_local_snapshot_timeout: timeout,
+            with_local_snapshot_timeout: timeout,
+            tcp_command_timeout: timeout,
+            iroh_command_timeout: timeout,
+            tcp_foreground_attempt_timeout: timeout,
+            public_foreground_attempt_timeout: timeout,
+            iroh_foreground_attempt_timeout: timeout,
+        }
+    }
+
+    #[test]
+    fn snapshot_refresh_bounds_stalled_preferred_authority_and_uses_reachable_fallback() {
+        let (_root, paths, state, targets) = snapshot_refresh_test_state();
+        let preferred = targets[2].clone();
+        let fallback = targets[0].clone();
+        let tail = targets[1].clone();
+        let total_budget = Duration::from_millis(300);
+        let mut host = RecordingSnapshotRefreshHost {
+            known_authority: preferred.clone(),
+            snapshots: BTreeMap::from([(fallback.clone(), snapshot(2))]),
+            stalled_target: Some(preferred.clone()),
+            calls: Vec::new(),
+            cached_snapshot: None,
+        };
+
+        let outcome = refresh_current_cluster_kv_store_with_outcome(
+            &paths,
+            &state,
+            snapshot_refresh_options(total_budget),
+            &mut host,
+        )
+        .expect("fallback snapshot refresh");
+
+        assert!(outcome.fetched_remote);
+        assert_eq!(outcome.store.revision(), KvRevision(2));
+        assert_eq!(
+            host.calls
+                .iter()
+                .map(|(node_id, _)| node_id)
+                .collect::<Vec<_>>(),
+            vec![&preferred, &fallback]
+        );
+        assert!(!host.calls.iter().any(|(node_id, _)| node_id == &tail));
+        assert!(
+            host.calls[0].1 <= total_budget / 3,
+            "the preferred authority must receive only its fair share"
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_stops_after_preferred_success_and_keeps_newer_local_snapshot() {
+        let (_root, paths, state, targets) = snapshot_refresh_test_state();
+        let preferred = targets[2].clone();
+        crate::kv_local_store::write_cluster_kv_snapshot(&paths, &snapshot(9))
+            .expect("local snapshot");
+        let mut host = RecordingSnapshotRefreshHost {
+            known_authority: preferred.clone(),
+            snapshots: BTreeMap::from([(preferred.clone(), snapshot(4))]),
+            stalled_target: None,
+            calls: Vec::new(),
+            cached_snapshot: None,
+        };
+
+        let outcome = refresh_current_cluster_kv_store_with_outcome(
+            &paths,
+            &state,
+            snapshot_refresh_options(Duration::from_secs(1)),
+            &mut host,
+        )
+        .expect("preferred snapshot refresh");
+
+        assert!(outcome.fetched_remote);
+        assert_eq!(host.calls.len(), 1);
+        assert_eq!(host.calls[0].0, preferred);
+        assert_eq!(outcome.store.revision(), KvRevision(9));
+        assert_eq!(
+            host.cached_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revision),
+            Some(KvRevision(9)),
+            "the local snapshot must still participate in newest-snapshot selection"
+        );
+    }
 }

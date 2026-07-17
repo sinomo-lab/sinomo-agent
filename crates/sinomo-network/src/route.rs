@@ -20,6 +20,7 @@ use crate::{
 #[cfg(all(feature = "test-support", not(test)))]
 #[cfg(test)]
 use sinomo_local::SinomoDataDir;
+use sinomo_node::cluster_member_is_local_process;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -1248,6 +1249,7 @@ fn cluster_delivery_route_graph_with_members(
                 continue;
             }
             let Some(cost) = cluster_delivery_local_endpoint_cost(
+                state,
                 &local_connectivity,
                 endpoint,
                 target_node_id,
@@ -1279,6 +1281,7 @@ fn cluster_delivery_route_graph_with_members(
                 continue;
             }
             let Some(cost) = cluster_delivery_local_endpoint_cost(
+                state,
                 &local_connectivity,
                 &endpoint,
                 target_node_id,
@@ -1521,6 +1524,7 @@ fn cluster_delivery_shortest_path(
 }
 
 fn cluster_delivery_local_endpoint_cost(
+    state: &ClusterBootstrapState,
     graph: &ClusterConnectivityGraph,
     endpoint: &ClusterEndpointRecord,
     target_node_id: &NodeId,
@@ -1534,8 +1538,16 @@ fn cluster_delivery_local_endpoint_cost(
     let endpoint_priority = u64::from(endpoint.priority);
     match graph.record_for_endpoint(endpoint) {
         Some(record) => {
-            if endpoint.node_id != *target_node_id
-                && matches!(record.state, ClusterConnectivityState::Unreachable)
+            // Known-unreachable relay neighbors are never usable. At the final
+            // target, suppress only built-in endpoints that the active probe
+            // loop can rediscover from membership state; letting every
+            // application RPC reprobe those turns one absent node into
+            // cluster-wide head-of-line blocking. Directory-only and module
+            // endpoints retain the old final-target fallback because the
+            // built-in probe loop cannot establish their recovery yet.
+            if matches!(record.state, ClusterConnectivityState::Unreachable)
+                && (endpoint.node_id != *target_node_id
+                    || cluster_delivery_endpoint_is_active_builtin_probe_target(state, endpoint))
             {
                 return None;
             }
@@ -1554,6 +1566,23 @@ fn cluster_delivery_local_endpoint_cost(
         }
         None => None,
     }
+}
+
+fn cluster_delivery_endpoint_is_active_builtin_probe_target(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    crate::endpoint_selector::cluster_endpoint_is_builtin_probe_target(endpoint)
+        && state.members.iter().any(|member| {
+            member.state.is_authorized()
+                && !cluster_member_is_local_process(state, member)
+                && member.node_id == endpoint.node_id
+                && member.endpoints.iter().any(|advertised| {
+                    advertised.endpoint_id == endpoint.endpoint_id
+                        && advertised.transport == endpoint.transport
+                        && advertised.address == endpoint.address
+                })
+        })
 }
 
 fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_priority: u64) -> u64 {
@@ -3243,6 +3272,7 @@ fn cluster_relay_planned_target_endpoints(
         .filter(|endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint))
     {
         let Some(cost) = cluster_delivery_local_endpoint_cost(
+            state,
             &local_connectivity,
             endpoint,
             target_node_id,
@@ -3265,6 +3295,7 @@ fn cluster_relay_planned_target_endpoints(
         })
     {
         if let Some(cost) = cluster_delivery_local_endpoint_cost(
+            state,
             &local_connectivity,
             &endpoint,
             target_node_id,
@@ -3328,6 +3359,7 @@ fn cluster_relay_planned_next_hop_endpoints(
         .filter(|endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint))
     {
         let Some(cost) = cluster_delivery_local_endpoint_cost(
+            state,
             &local_connectivity,
             endpoint,
             next_hop,
@@ -3350,6 +3382,7 @@ fn cluster_relay_planned_next_hop_endpoints(
         })
     {
         if let Some(cost) = cluster_delivery_local_endpoint_cost(
+            state,
             &local_connectivity,
             &endpoint,
             next_hop,
@@ -4826,8 +4859,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn route_plan_retries_non_identity_unreachable_target_endpoint_as_fallback() {
+    #[tokio::test]
+    async fn async_route_plan_invalidates_cached_target_when_endpoint_becomes_unreachable() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-route-unreachable-fallback");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -4864,7 +4897,70 @@ mod tests {
         );
         target_member.endpoints = vec![stale_endpoint.clone()];
         state.members.push(target_member);
+        assert!(cluster_delivery_endpoint_is_active_builtin_probe_target(
+            &state,
+            &stale_endpoint
+        ));
+        let mut directory_only_state = state.clone();
+        directory_only_state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node)
+            .expect("target member")
+            .endpoints
+            .clear();
+        assert!(
+            !cluster_delivery_endpoint_is_active_builtin_probe_target(
+                &directory_only_state,
+                &stale_endpoint
+            ),
+            "a directory-only endpoint is not rediscoverable by membership maintenance"
+        );
+        let mut local_process_state = state.clone();
+        local_process_state.local_node_id = target_node.clone();
+        assert!(
+            !cluster_delivery_endpoint_is_active_builtin_probe_target(
+                &local_process_state,
+                &stale_endpoint
+            ),
+            "the maintenance loop deliberately omits local-process members"
+        );
 
+        let healthy = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &stale_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            7200,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[healthy],
+        )
+        .expect("write healthy local connectivity");
+
+        let runtime = tokio::runtime::Handle::current();
+        let initial = cluster_delivery_route_plan_async(
+            &runtime,
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            ClusterDeliveryFailedEdges::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("initial route plan")
+        .expect("healthy target route");
+        assert_eq!(initial.next_hop, target_node);
+        assert_eq!(initial.endpoints.len(), 1);
+
+        let failure_now = now + time::Duration::seconds(1);
         let stale_failure = crate::connectivity::cluster_connectivity_record(
             &state,
             &stale_endpoint,
@@ -4872,8 +4968,8 @@ mod tests {
             None,
             3,
             None,
-            Some(now.to_string()),
-            now,
+            Some(failure_now.to_string()),
+            failure_now,
             7200,
         );
         crate::connectivity_store::write_local_cluster_connectivity_records(
@@ -4883,20 +4979,56 @@ mod tests {
         )
         .expect("write local connectivity");
 
-        let plan = cluster_delivery_route_plan(
+        let plan = cluster_delivery_route_plan_async(
+            &runtime,
             &paths,
             &state,
             &local_node,
             &target_node,
-            &ClusterDeliveryFailedEdges::default(),
-            &[],
+            ClusterDeliveryFailedEdges::default(),
+            Vec::new(),
         )
-        .expect("route plan");
+        .await
+        .expect("updated route plan");
 
-        assert_eq!(plan.next_hop, target_node);
-        assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].endpoint_id, stale_endpoint.endpoint_id);
-        assert_eq!(plan.endpoints[0].address, "target:21353");
+        assert!(
+            plan.is_none(),
+            "cached application routes must invalidate when the target becomes unreachable"
+        );
+
+        let recovery_now = failure_now + time::Duration::seconds(1);
+        let recovered = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &stale_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some(recovery_now.to_string()),
+            None,
+            recovery_now,
+            7200,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[recovered],
+        )
+        .expect("write recovered local connectivity");
+
+        let recovered_plan = cluster_delivery_route_plan_async(
+            &runtime,
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            ClusterDeliveryFailedEdges::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("recovered route plan")
+        .expect("rediscovered target route");
+        assert_eq!(recovered_plan.next_hop, target_node);
+        assert_eq!(recovered_plan.endpoints.len(), 1);
     }
 
     #[test]
@@ -5161,7 +5293,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_planned_target_endpoints_prefer_local_connectivity() {
+    fn relay_planned_target_endpoints_exclude_unreachable_builtin_routes() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-target-connectivity");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -5242,10 +5374,8 @@ mod tests {
         )
         .expect("planned target endpoints");
 
-        assert_eq!(planned.len(), 2);
+        assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].endpoint_id, healthy_endpoint.endpoint_id);
         assert_eq!(planned[0].address, "target:21353");
-        assert_eq!(planned[1].endpoint_id, unreachable_endpoint.endpoint_id);
-        assert_eq!(planned[1].address, "unreachable-target.test:21353");
     }
 }

@@ -103,6 +103,9 @@ const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_
 /// only a recovery net for lost pushes and restarts, deliberately slow to keep
 /// an idle cluster quiet.
 pub const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL: Duration = Duration::from_secs(600);
+const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_BACKOFF: Duration =
+    DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration =
     sinomo_core::network::CLUSTER_NETWORK_DISCOVERY_INTERVAL;
 const DAEMON_CLUSTER_STARTUP_SETTLE_DURATION: Duration = Duration::from_secs(8);
@@ -2057,6 +2060,7 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
     pub publish_failure_streak: u32,
+    pub kv_snapshot_pull_failure_streak: u32,
     pub last_kv_snapshot_pull: Instant,
     pub last_publish: Instant,
     pub last_discovery: Instant,
@@ -2113,6 +2117,7 @@ impl ClusterNetworkMaintenance {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now
                 .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
                 .unwrap_or(now),
@@ -2160,10 +2165,13 @@ impl ClusterNetworkMaintenance {
         // and being softened forever. An explicit environment refresh replaces
         // the marker with a new future deadline.
         let due = sinomo_core::network::cluster_network_maintenance_due(now, &self.schedule());
+        let kv_snapshot_pull_retry_due = self
+            .kv_snapshot_pull_retry_due_duration(now)
+            .is_some_and(|duration| duration.is_zero());
         let publish_due = due.publish_due;
         let probe_due = due.probe_due;
         let discovery_due = due.discovery_due;
-        if !(publish_due || probe_due || discovery_due) {
+        if !(publish_due || kv_snapshot_pull_retry_due || probe_due || discovery_due) {
             return Ok(None);
         }
         let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.lock().await;
@@ -2183,6 +2191,7 @@ impl ClusterNetworkMaintenance {
             })?;
         if !state_exists {
             self.solo_cluster_idle = false;
+            self.kv_snapshot_pull_failure_streak = 0;
             if publish_due {
                 self.last_publish = now;
             }
@@ -2196,7 +2205,9 @@ impl ClusterNetworkMaintenance {
         }
 
         let mut discovery_already_processed = false;
-        if self.solo_cluster_idle && (publish_due || probe_due || discovery_due) {
+        if self.solo_cluster_idle
+            && (publish_due || kv_snapshot_pull_retry_due || probe_due || discovery_due)
+        {
             self.idle_stats.incr_disk_reads_cluster_state();
             let mut state =
                 sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
@@ -2224,6 +2235,7 @@ impl ClusterNetworkMaintenance {
                 }
             }
             if !discovered && sinomo_core::network::cluster_is_settled_solo(&state) {
+                self.kv_snapshot_pull_failure_streak = 0;
                 if publish_due {
                     self.last_publish = now;
                 }
@@ -2237,7 +2249,7 @@ impl ClusterNetworkMaintenance {
 
         self.idle_stats.incr_ticks_with_work();
         self.idle_stats.incr_disk_reads_cluster_state();
-        let mut state = if publish_due || probe_due {
+        let mut state = if publish_due || kv_snapshot_pull_retry_due || probe_due {
             sinomo_core::cluster::read_cluster_state_async(&runtime, &cluster_paths).await
         } else {
             sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
@@ -2246,6 +2258,7 @@ impl ClusterNetworkMaintenance {
         .map_err(DaemonError::from)?;
         self.local_node_role = sinomo_core::network::cluster_local_node_role(&state);
         if sinomo_core::network::cluster_state_needs_join_registration(&state) {
+            self.kv_snapshot_pull_failure_streak = 0;
             if publish_due {
                 self.last_publish = now;
             }
@@ -2267,6 +2280,7 @@ impl ClusterNetworkMaintenance {
             self.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
         }
         if daemon_paths_are_shadow(paths) {
+            self.kv_snapshot_pull_failure_streak = 0;
             if publish_due {
                 self.last_publish = now;
                 if let Err(error) = self.reconcile_desired_rollout(paths, &cluster_paths, &state) {
@@ -2331,17 +2345,15 @@ impl ClusterNetworkMaintenance {
         )
         .await?;
 
+        let kv_snapshot_pull_due =
+            self.last_kv_snapshot_pull.elapsed() >= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
+        // Startup settle means connectivity should be probed aggressively,
+        // not that routine publications or learner recovery should inherit a
+        // long formation budget.
+        let use_formation_timeouts = false;
         if publish_due {
             self.last_publish = now;
             let mut publish_failed = false;
-            let kv_snapshot_pull_due =
-                self.last_kv_snapshot_pull.elapsed() >= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
-            // Startup settle means connectivity should be probed aggressively,
-            // not that every routine KV publication gets a long formation
-            // budget. These publishes run continuously after startup; keeping
-            // them on the normal budget prevents stale/offline voters from
-            // starving app-visible status, service, and connectivity updates.
-            let use_formation_timeouts = false;
             if cluster_is_solo {
                 // no-op: nothing to publish to absent peers
             } else if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
@@ -2391,20 +2403,6 @@ impl ClusterNetworkMaintenance {
                         force_kv_snapshot_sync: false,
                         use_formation_timeouts,
                     });
-            }
-            // Snapshot pull is the learner recovery net. Voting authorities own
-            // an authoritative local Raft snapshot; requiring `fetched_remote`
-            // there can never succeed in a single-authority topology and turns
-            // the recovery cadence into a permanent one-second retry loop.
-            if !cluster_is_solo
-                && kv_snapshot_pull_due
-                && !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state)
-            {
-                pending_work.kv_snapshot_pull = Some(ClusterKvSnapshotPendingPull {
-                    paths: cluster_paths.clone(),
-                    state: state.clone(),
-                    use_formation_timeouts,
-                });
             }
             if !cluster_is_solo && !probe_due {
                 pending_work.connectivity_publish = Some(ClusterConnectivityPendingPublish {
@@ -2459,6 +2457,24 @@ impl ClusterNetworkMaintenance {
                     );
             } else {
                 self.publish_failure_streak = 0;
+            }
+        }
+
+        // Snapshot pull is the learner recovery net. A retry-only wake-up must
+        // not enqueue the unrelated member, node, connectivity, or service
+        // publications from the regular publish cadence.
+        if publish_due || kv_snapshot_pull_retry_due {
+            if !cluster_is_solo
+                && kv_snapshot_pull_due
+                && !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state)
+            {
+                pending_work.kv_snapshot_pull = Some(ClusterKvSnapshotPendingPull {
+                    paths: cluster_paths.clone(),
+                    state: state.clone(),
+                    use_formation_timeouts,
+                });
+            } else if cluster_is_solo || sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
+                self.kv_snapshot_pull_failure_streak = 0;
             }
         }
 
@@ -2519,7 +2535,12 @@ impl ClusterNetworkMaintenance {
     }
 
     pub fn next_due_duration(&self, now: Instant) -> Duration {
-        sinomo_core::network::cluster_network_maintenance_next_due_duration(now, &self.schedule())
+        let network_due = sinomo_core::network::cluster_network_maintenance_next_due_duration(
+            now,
+            &self.schedule(),
+        );
+        self.kv_snapshot_pull_retry_due_duration(now)
+            .map_or(network_due, |snapshot_due| network_due.min(snapshot_due))
     }
 
     pub(crate) fn request_network_environment_refresh(&mut self, now: Instant) {
@@ -2770,7 +2791,7 @@ impl ClusterNetworkMaintenance {
             .await
             .is_none()
             {
-                self.record_publish_failure();
+                self.record_kv_snapshot_pull_failure();
             }
         }
         for refresh in node_status_refreshes {
@@ -2867,16 +2888,15 @@ impl ClusterNetworkMaintenance {
             .await;
         match result {
             Ok(Ok(())) => {
-                self.last_kv_snapshot_pull = Instant::now();
-                self.record_publish_success();
+                self.record_kv_snapshot_pull_success();
             }
             Ok(Err(error)) => {
                 tracing::warn!("sinomo daemon cluster KV snapshot pull failed: {error}");
-                self.record_publish_failure();
+                self.record_kv_snapshot_pull_failure();
             }
             Err(error) => {
                 tracing::warn!("sinomo daemon cluster KV snapshot pull task failed: {error}");
-                self.record_publish_failure();
+                self.record_kv_snapshot_pull_failure();
             }
         }
     }
@@ -3017,7 +3037,7 @@ impl ClusterNetworkMaintenance {
         match result {
             Ok(()) => {
                 if pending.force_kv_snapshot_sync {
-                    self.last_kv_snapshot_pull = Instant::now();
+                    self.record_kv_snapshot_pull_success();
                 }
                 self.record_publish_success();
             }
@@ -3083,6 +3103,33 @@ impl ClusterNetworkMaintenance {
         self.defer_probe_retry(now, delay);
     }
 
+    fn record_kv_snapshot_pull_failure(&mut self) {
+        self.kv_snapshot_pull_failure_streak =
+            self.kv_snapshot_pull_failure_streak.saturating_add(1);
+        let delay = self.kv_snapshot_pull_failure_backoff();
+        let now = Instant::now();
+        self.last_kv_snapshot_pull =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL,
+                delay,
+            );
+    }
+
+    fn record_kv_snapshot_pull_success(&mut self) {
+        self.kv_snapshot_pull_failure_streak = 0;
+        self.last_kv_snapshot_pull = Instant::now();
+    }
+
+    fn kv_snapshot_pull_retry_due_duration(&self, now: Instant) -> Option<Duration> {
+        (self.kv_snapshot_pull_failure_streak > 0).then(|| {
+            let elapsed = now
+                .checked_duration_since(self.last_kv_snapshot_pull)
+                .unwrap_or_default();
+            DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL.saturating_sub(elapsed)
+        })
+    }
+
     fn record_publish_failure_delay(&mut self) -> Duration {
         self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
         self.publish_failure_backoff()
@@ -3118,6 +3165,16 @@ impl ClusterNetworkMaintenance {
         DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
             .saturating_mul(1_u32 << exponent)
             .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+    }
+
+    fn kv_snapshot_pull_failure_backoff(&self) -> Duration {
+        let exponent = self
+            .kv_snapshot_pull_failure_streak
+            .saturating_sub(1)
+            .min(10);
+        DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF
+            .saturating_mul(1_u32 << exponent)
+            .min(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_BACKOFF)
     }
 
     fn record_publish_success(&mut self) {
@@ -8720,6 +8777,60 @@ mod tests {
     }
 
     #[test]
+    fn kv_snapshot_pull_backoff_is_independent_from_other_publish_success() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+        ));
+
+        maintenance.record_kv_snapshot_pull_failure();
+        assert_eq!(maintenance.kv_snapshot_pull_failure_streak, 1);
+        assert_eq!(
+            maintenance.kv_snapshot_pull_failure_backoff(),
+            DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF
+        );
+        assert!(
+            maintenance
+                .kv_snapshot_pull_retry_due_duration(Instant::now())
+                .is_some_and(|due| {
+                    due <= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF
+                })
+        );
+
+        maintenance.publish_failure_streak = 3;
+        maintenance.record_publish_success();
+        assert_eq!(maintenance.publish_failure_streak, 0);
+        assert_eq!(
+            maintenance.kv_snapshot_pull_failure_streak, 1,
+            "an unrelated successful publish must not reset snapshot retry state"
+        );
+
+        maintenance.record_kv_snapshot_pull_failure();
+        assert_eq!(maintenance.kv_snapshot_pull_failure_streak, 2);
+        assert_eq!(
+            maintenance.kv_snapshot_pull_failure_backoff(),
+            DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF * 2
+        );
+
+        maintenance.publish_failure_streak = 3;
+        maintenance.record_kv_snapshot_pull_success();
+        assert_eq!(maintenance.kv_snapshot_pull_failure_streak, 0);
+        assert_eq!(
+            maintenance.publish_failure_streak, 3,
+            "a successful snapshot pull must not reset unrelated publish retry state"
+        );
+        assert!(
+            maintenance
+                .kv_snapshot_pull_retry_due_duration(Instant::now())
+                .is_none(),
+            "a successful pull or force-sync publish must clear snapshot retry state"
+        );
+    }
+
+    #[test]
     fn formation_timeouts_preserve_network_transport_policy() {
         let timeouts = cluster_formation_control_plane_timeouts();
         let defaults = cluster_control_plane_timeouts();
@@ -9174,6 +9285,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
@@ -9211,6 +9323,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
@@ -9252,6 +9365,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -9301,6 +9415,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
@@ -9334,6 +9449,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now,
@@ -9365,6 +9481,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now,
@@ -9434,6 +9551,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
@@ -9688,6 +9806,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now
@@ -9741,6 +9860,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -9867,6 +9987,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
@@ -10128,6 +10249,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
@@ -10280,6 +10402,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -10603,6 +10726,7 @@ mod tests {
             ),
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -10671,6 +10795,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
@@ -10793,6 +10918,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -10894,6 +11020,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -10928,7 +11055,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_network_maintenance_keeps_snapshot_pull_due_until_publish_succeeds() {
+    fn cluster_network_maintenance_retries_only_failed_snapshot_pull_work() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11008,6 +11135,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: stale_snapshot_pull,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -11032,7 +11160,38 @@ mod tests {
         assert_eq!(pending.node_status_refreshes.len(), 1);
         assert_eq!(
             maintenance.last_kv_snapshot_pull, stale_snapshot_pull,
-            "failed or still-pending snapshot pulls must remain due for retry"
+            "still-pending snapshot pulls must remain due for retry"
+        );
+
+        maintenance.record_kv_snapshot_pull_failure();
+        let retry_now = Instant::now();
+        maintenance.last_kv_snapshot_pull = retry_now
+            .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
+            .unwrap_or(retry_now);
+        maintenance.last_publish = retry_now;
+        maintenance.last_probe = retry_now;
+        maintenance.last_discovery = retry_now;
+        maintenance.connectivity_converged = true;
+
+        let retry_pending = run_cluster_network_maintenance_tick_for_test(
+            &mut maintenance,
+            &daemon_paths,
+            &DaemonRunOptions::default(),
+            &runtime,
+        )
+        .expect("snapshot retry maintenance tick")
+        .expect("due snapshot retry should produce pending work");
+
+        assert!(retry_pending.kv_snapshot_pull.is_some());
+        assert!(retry_pending.member_publishes.is_empty());
+        assert!(retry_pending.node_status_refreshes.is_empty());
+        assert!(retry_pending.low_priority_node_status_refreshes.is_empty());
+        assert!(retry_pending.connectivity_publish.is_none());
+        assert!(retry_pending.connectivity_probe.is_none());
+        assert!(retry_pending.service_instance_publish.is_none());
+        assert_eq!(
+            maintenance.last_publish, retry_now,
+            "a retry-only tick must not advance the regular publish cadence"
         );
     }
 
@@ -11112,6 +11271,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: stale_snapshot_pull,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -11181,6 +11341,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -12590,6 +12751,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
@@ -12769,6 +12931,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: Instant::now(),
             last_publish: Instant::now(),
             last_discovery: Instant::now(),
@@ -12880,6 +13043,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
@@ -13690,6 +13854,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
@@ -13816,6 +13981,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,

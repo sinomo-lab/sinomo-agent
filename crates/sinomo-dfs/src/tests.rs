@@ -8047,7 +8047,7 @@ fn dfs_metadata_replication_retry_gate_tracks_incomplete_outcomes() {
             ],
         }
     ));
-    assert!(dfs_metadata_replication_report_needs_retry(
+    assert!(!dfs_metadata_replication_report_needs_retry(
         &DfsMetadataJournalReplicationReport {
             outcomes: vec![DfsMetadataJournalReplicationOutcome::Failed {
                 target_node_id: node.clone(),
@@ -8202,7 +8202,7 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
 }
 
 #[test]
-fn metadata_publish_scheduler_on_runtime_retries_incomplete_reports() {
+fn metadata_publish_scheduler_on_runtime_retries_backlog_reports() {
     let scheduler = Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
     let node = NodeId::from_legacy_named("node_dfs_publish_scheduler_runtime").expect("node");
     let shard_id = DfsMetadataShardId::new("root");
@@ -8242,10 +8242,11 @@ fn metadata_publish_scheduler_on_runtime_retries_incomplete_reports() {
             let mut attempts = attempts_for_publish.lock().expect("attempt lock");
             *attempts += 1;
             let outcomes = if *attempts == 1 {
-                vec![DfsMetadataJournalReplicationOutcome::Failed {
+                vec![DfsMetadataJournalReplicationOutcome::BacklogRemaining {
                     target_node_id: node_for_publish.clone(),
                     shard_id: shard_for_publish.clone(),
-                    reason: "simulated transient runtime failure".to_string(),
+                    after_sequence: 1,
+                    max_batches: 1,
                 }]
             } else {
                 vec![DfsMetadataJournalReplicationOutcome::NoChanges {
@@ -8283,7 +8284,7 @@ fn metadata_publish_scheduler_on_runtime_retries_incomplete_reports() {
     let reports = reports.lock().expect("reports lock");
     assert!(matches!(
         reports[0].outcomes.as_slice(),
-        [DfsMetadataJournalReplicationOutcome::Failed { .. }]
+        [DfsMetadataJournalReplicationOutcome::BacklogRemaining { .. }]
     ));
     assert!(matches!(
         reports[1].outcomes.as_slice(),

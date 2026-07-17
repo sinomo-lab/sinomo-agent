@@ -542,11 +542,15 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
 pub fn dfs_metadata_replication_report_needs_retry(
     report: &DfsMetadataJournalReplicationReport,
 ) -> bool {
+    // A target-level failure does not independently drive scheduler retries:
+    // its durable cursor remains behind for periodic DFS maintenance or a new
+    // mutation request. A mixed report can revisit that lane while another
+    // target's confirmed backlog is drained, but those extra rounds stay
+    // bounded by the schedule options.
     report.outcomes.iter().any(|outcome| {
         matches!(
             outcome,
-            DfsMetadataJournalReplicationOutcome::Failed { .. }
-                | DfsMetadataJournalReplicationOutcome::BacklogRemaining { .. }
+            DfsMetadataJournalReplicationOutcome::BacklogRemaining { .. }
         )
     })
 }
@@ -1138,6 +1142,155 @@ impl DfsMetadataPublishScheduler {
 mod publish_scheduler_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn failed_publish_report() -> DfsMetadataJournalReplicationReport {
+        DfsMetadataJournalReplicationReport {
+            outcomes: vec![DfsMetadataJournalReplicationOutcome::Failed {
+                target_node_id: NodeId::from_legacy_named("node_metadata_publish_scheduler_failed")
+                    .expect("target node"),
+                shard_id: DfsMetadataShardId::new("services"),
+                reason: "target unavailable".to_string(),
+            }],
+        }
+    }
+
+    fn backlog_publish_report() -> DfsMetadataJournalReplicationReport {
+        DfsMetadataJournalReplicationReport {
+            outcomes: vec![DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id: NodeId::from_legacy_named(
+                    "node_metadata_publish_scheduler_backlog",
+                )
+                .expect("target node"),
+                shard_id: DfsMetadataShardId::new("services"),
+                after_sequence: 7,
+                max_batches: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn retry_classifier_defers_target_failures_to_periodic_maintenance() {
+        assert!(!dfs_metadata_replication_report_needs_retry(
+            &failed_publish_report()
+        ));
+        assert!(!dfs_metadata_replication_report_needs_retry(
+            &DfsMetadataJournalReplicationReport {
+                outcomes: vec![DfsMetadataJournalReplicationOutcome::MissingRoute {
+                    target_node_id: NodeId::from_legacy_named(
+                        "node_metadata_publish_scheduler_missing",
+                    )
+                    .expect("target node"),
+                    shard_id: DfsMetadataShardId::new("services"),
+                    after_sequence: 7,
+                }],
+            }
+        ));
+        assert!(dfs_metadata_replication_report_needs_retry(
+            &backlog_publish_report()
+        ));
+        let mut mixed = failed_publish_report();
+        mixed.outcomes.extend(backlog_publish_report().outcomes);
+        assert!(
+            dfs_metadata_replication_report_needs_retry(&mixed),
+            "confirmed backlog keeps the bounded report-wide retry active"
+        );
+    }
+
+    #[test]
+    fn failed_target_report_is_deferred_without_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let scheduler: &'static DfsMetadataPublishScheduler =
+            Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
+        scheduler.running.store(true, Ordering::Release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+
+        runtime.block_on(scheduler.run_publish_loop_async(
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 3,
+                retry_delay: Duration::ZERO,
+            },
+            move || {
+                publish_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(failed_publish_report()))
+            },
+            |_| {},
+            |_| {},
+            DfsMetadataPublishRunGuard::new(scheduler),
+        ));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!scheduler.running.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn backlog_report_runs_initial_plus_configured_retry_rounds() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let scheduler: &'static DfsMetadataPublishScheduler =
+            Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
+        scheduler.running.store(true, Ordering::Release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+
+        runtime.block_on(scheduler.run_publish_loop_async(
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 3,
+                retry_delay: Duration::ZERO,
+            },
+            move || {
+                publish_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(backlog_publish_report()))
+            },
+            |_| {},
+            |_| {},
+            DfsMetadataPublishRunGuard::new(scheduler),
+        ));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(!scheduler.running.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pending_request_after_deferred_failure_runs_one_fresh_publish() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let scheduler: &'static DfsMetadataPublishScheduler =
+            Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
+        scheduler.running.store(true, Ordering::Release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+
+        runtime.block_on(scheduler.run_publish_loop_async(
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 3,
+                retry_delay: Duration::ZERO,
+            },
+            move || {
+                let call = publish_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    assert_eq!(
+                        scheduler.claim_publish_start(),
+                        DfsMetadataPublishScheduleStart::AlreadyRunning
+                    );
+                }
+                std::future::ready(Ok(failed_publish_report()))
+            },
+            |_| {},
+            |_| {},
+            DfsMetadataPublishRunGuard::new(scheduler),
+        ));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!scheduler.running.load(Ordering::Acquire));
+    }
 
     #[test]
     fn unconditional_publish_runs_and_coalesces_pending_requests() {

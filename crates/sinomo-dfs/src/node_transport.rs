@@ -55,10 +55,19 @@ const DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT: usize = 2;
 const DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
 /// Refinement of retry cooling in `replica_promotion_outbox.qnt`.
 ///
-/// Failed replay-safe post-response work is intentionally ineligible for one
-/// bounded interval. New healthy work remains ready and bypasses this cooling
-/// queue, so a poison target cannot turn retry pacing into global idleness.
+/// Failed replay-safe post-response work is intentionally ineligible for a
+/// bounded exponential interval. New healthy work remains ready and bypasses
+/// this cooling queue, so a poison target cannot turn retry pacing into global
+/// idleness.
 const DFS_DETACHED_SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
+const DFS_DETACHED_SEND_RETRY_MAX_EXPONENT: u32 = 6;
+
+fn dfs_detached_send_retry_delay(retry_attempts: u32) -> Duration {
+    let exponent = retry_attempts
+        .saturating_sub(1)
+        .min(DFS_DETACHED_SEND_RETRY_MAX_EXPONENT);
+    DFS_DETACHED_SEND_RETRY_DELAY.saturating_mul(1_u32 << exponent)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsPeerTransportError {
@@ -431,6 +440,9 @@ struct DeferredDfsPeerSend {
     target_node_id: NodeId,
     routed_message: DfsRoutedMessage,
     promotion_sequence: Option<u64>,
+    // Process-local pacing only. Durable intent/receipt hydration reconstructs
+    // outstanding promotions at tier zero after restart.
+    retry_attempts: u32,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -581,6 +593,11 @@ impl DfsCommitPromotionIdentity {
 }
 
 impl DeferredDfsPeerSend {
+    fn record_retry_failure(&mut self) -> Duration {
+        self.retry_attempts = self.retry_attempts.saturating_add(1);
+        dfs_detached_send_retry_delay(self.retry_attempts)
+    }
+
     fn is_commit_version_promotion(&self) -> bool {
         matches!(
             &self.routed_message.message,
@@ -1585,6 +1602,7 @@ impl DfsNodeTransport {
             target_node_id: target_node_id.clone(),
             routed_message,
             promotion_sequence: None,
+            retry_attempts: 0,
         };
         let promotion_identity = send.commit_version_promotion_identity();
         let mut outbox = self
@@ -1795,20 +1813,12 @@ impl DfsNodeTransport {
                         }
                         continue;
                     }
-                    self.restore_detached_peer_send_work(
-                        sends,
-                        replay_retries,
-                        now() + DFS_DETACHED_SEND_RETRY_DELAY,
-                    )?;
+                    self.restore_detached_peer_send_work(sends, replay_retries, now())?;
                     return Err(first_replay_error.take().unwrap_or(error));
                 }
             }
 
-            self.restore_detached_peer_send_work(
-                VecDeque::new(),
-                replay_retries,
-                now() + DFS_DETACHED_SEND_RETRY_DELAY,
-            )?;
+            self.restore_detached_peer_send_work(VecDeque::new(), replay_retries, now())?;
             // Recheck the shared ready queue before returning. Work accepted
             // concurrently through another lane is never hidden behind the
             // cooling failures from this round.
@@ -1965,7 +1975,7 @@ impl DfsNodeTransport {
         &mut self,
         mut ready_sends: VecDeque<DeferredDfsPeerSend>,
         mut replay_retries: VecDeque<DeferredDfsPeerSend>,
-        retry_not_before: Instant,
+        retry_started_at: Instant,
     ) -> Result<(), NetworkError> {
         if ready_sends.is_empty() && replay_retries.is_empty() {
             return Ok(());
@@ -1985,12 +1995,13 @@ impl DfsNodeTransport {
             ready_sends.append(&mut outbox.ready_sends);
             outbox.ready_sends = ready_sends;
         }
-        if !replay_retries.is_empty() {
+        while let Some(mut replay_retry) = replay_retries.pop_front() {
+            let retry_not_before = retry_started_at + replay_retry.record_retry_failure();
             outbox
                 .cooling_retries
                 .entry(retry_not_before)
                 .or_default()
-                .append(&mut replay_retries);
+                .push_back(replay_retry);
         }
         drop(outbox);
         if schedule_changed {
@@ -4182,6 +4193,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detached_replay_safe_retry_delay_grows_and_caps_without_settling() {
+        let local = node_id("node_detached_retry_backoff_local");
+        let remote = node_id("node_detached_retry_backoff_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, _command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Err(DfsPeerTransportError::new(
+                "detached retry backoff target offline",
+            ))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue promotion");
+
+        let mut attempted_at = Instant::now();
+        for expected_delay_seconds in [5, 10, 20, 40, 80, 160, 320, 320] {
+            transport
+                .flush_detached_peer_sends_with_now(&|| attempted_at)
+                .expect_err("offline promotion must remain retryable");
+            let retry_not_before = attempted_at + Duration::from_secs(expected_delay_seconds);
+            assert_eq!(
+                transport
+                    .detached_send_scheduling_snapshot_at_for_test(attempted_at)
+                    .1,
+                Some(retry_not_before),
+                "retry delay should grow exponentially and cap at 320 seconds"
+            );
+            assert_eq!(transport.detached_send_count(), 1);
+            assert_eq!(transport.pending_commit_promotion_count(), 1);
+            assert_eq!(transport.settled_commit_promotion_count(), 0);
+            attempted_at = retry_not_before;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn detached_exponential_cooling_preserves_healthy_target_bypass() {
+        let local = node_id("node_detached_retry_bypass_local");
+        let poison = node_id("node_detached_retry_bypass_poison");
+        let healthy = node_id("node_detached_retry_bypass_healthy");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let sender_poison = poison.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("detached retry calls")
+                .push(target.clone());
+            if target == &sender_poison {
+                return Err(DfsPeerTransportError::new(
+                    "detached retry poison target offline",
+                ));
+            }
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [poison.clone(), healthy.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(&poison, test_commit_version_message(&local, &poison, 1))
+            .expect("queue poison promotion");
+
+        let started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect_err("poison promotion enters first cooling tier");
+        let first_retry_at = started + Duration::from_secs(5);
+        transport
+            .flush_detached_peer_sends_with_now(&|| first_retry_at)
+            .expect_err("poison promotion enters second cooling tier");
+        assert_eq!(
+            transport
+                .detached_send_scheduling_snapshot_at_for_test(first_retry_at)
+                .1,
+            Some(first_retry_at + Duration::from_secs(10))
+        );
+
+        transport
+            .send_detached_routed_message(
+                &healthy,
+                test_commit_version_message(&local, &healthy, 2),
+            )
+            .expect("queue healthy promotion");
+        transport
+            .flush_detached_peer_sends_with_now(&|| first_retry_at)
+            .expect("healthy target should bypass poison cooling");
+
+        assert_eq!(
+            calls.lock().expect("detached retry calls").as_slice(),
+            &[poison.clone(), poison.clone(), healthy]
+        );
+        assert_eq!(transport.detached_send_targets(), vec![poison]);
+        assert_eq!(transport.pending_commit_promotion_count(), 1);
+        assert_eq!(transport.settled_commit_promotion_count(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_ready_enqueue_wakes_cooling_worker_without_retrying_poison() {
         let local = node_id("node_detached_retry_wake_local");
@@ -5294,16 +5412,17 @@ mod tests {
             .expect("queue commit promotion");
 
         let started = Instant::now();
-        for step in 0..3 {
-            let now = started + DFS_DETACHED_SEND_RETRY_DELAY * step;
+        let mut now = started;
+        for retry_attempt in 1..=3 {
             transport
                 .flush_detached_peer_sends_with_now(&|| now)
                 .expect_err("non-exact not-desired reason must remain retryable");
             assert_eq!(transport.detached_send_count(), 1);
             assert_eq!(transport.retired_not_desired_commit_promotion_count(), 0);
+            now += dfs_detached_send_retry_delay(retry_attempt);
         }
         transport
-            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY * 3)
+            .flush_detached_peer_sends_with_now(&|| now)
             .expect("exact requester and intent should retire the promotion");
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
         assert_eq!(transport.detached_send_count(), 0);
@@ -5405,16 +5524,17 @@ mod tests {
             .expect("queue commit promotion");
 
         let started = Instant::now();
-        for step in 0..2 {
-            let now = started + DFS_DETACHED_SEND_RETRY_DELAY * step;
+        let mut now = started;
+        for retry_attempt in 1..=2 {
             transport
                 .flush_detached_peer_sends_with_now(&|| now)
                 .expect_err("non-exact repair-pending reason must remain retryable");
             assert_eq!(transport.detached_send_count(), 1);
             assert_eq!(transport.repair_pending_commit_promotion_count(), 0);
+            now += dfs_detached_send_retry_delay(retry_attempt);
         }
         transport
-            .flush_detached_peer_sends_with_now(&|| started + DFS_DETACHED_SEND_RETRY_DELAY * 2)
+            .flush_detached_peer_sends_with_now(&|| now)
             .expect("exact object/version/hash should terminalize for repair");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert_eq!(transport.detached_send_count(), 0);
