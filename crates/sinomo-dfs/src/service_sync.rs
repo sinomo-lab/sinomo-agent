@@ -3176,6 +3176,23 @@ mod tests {
             vec![promoted.clone(), offline.clone(), healthy.clone()],
             vec![promoted.clone(), healthy.clone()],
         );
+        let checkpoint = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture exact checkpoint");
+        for replica_node_id in [&promoted, &offline, &healthy] {
+            fixture
+                .service
+                .metadata_backend
+                .as_deref_mut()
+                .expect("metadata backend")
+                .put_metadata_replication_cursor(
+                    replica_node_id,
+                    &checkpoint.shard_id,
+                    checkpoint.journal_sequence,
+                )
+                .expect("seed exact replica cursor");
+        }
         fixture
             .service
             .transport
