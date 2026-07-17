@@ -128,12 +128,13 @@ use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
     DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
-    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
-    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
-    DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+    DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
+    DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
+    DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
@@ -2747,6 +2748,38 @@ impl DaemonDfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserPlacementProgressResponse { reconciliation })
     }
 
+    fn placement_activity(
+        &self,
+        request: crate::DaemonDfsBrowserPlacementActivityRequest,
+    ) -> Result<crate::DaemonDfsBrowserPlacementActivityResponse, ServiceError> {
+        if request
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.job_id.trim().is_empty())
+        {
+            return Err(ServiceError::Service(
+                "DFS placement activity cursor has an empty job id".to_string(),
+            ));
+        }
+        let path_prefix = request
+            .path_prefix
+            .as_deref()
+            .map(normalize_sifs_browser_path)
+            .transpose()?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let mut kv = DaemonDfsBrowserControlPlaneKvClient::read_only(&cluster_paths);
+        let page = sinomo_dfs::DfsControlPlaneStore::new(&mut kv)
+            .placement_reconciliation_activity(
+                &sinomo_dfs::sifs_file_system_id(),
+                &request.statuses,
+                path_prefix.as_deref(),
+                request.cursor.as_ref(),
+                request.limit,
+            )
+            .map_err(dfs_browser_service_error)?;
+        Ok(crate::DaemonDfsBrowserPlacementActivityResponse { page })
+    }
+
     fn flush_after_mutation(
         &self,
         service: &mut sinomo_dfs::MountedSifsService,
@@ -3256,6 +3289,22 @@ impl Service for DaemonDfsBrowserService {
                     .await?;
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+                        &result,
+                    )?
+                }
+                DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser placement activity",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
+                                .placement_activity(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
                         &result,
                     )?
                 }
@@ -7221,6 +7270,152 @@ mod tests {
         assert_eq!(aggregate.copies_added, 8);
         assert_eq!(aggregate.copies_removed, 11);
         assert!(!aggregate.complete);
+    }
+
+    #[test]
+    fn dfs_browser_placement_activity_pages_and_filters_compact_cluster_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-placement-activity");
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let owner = placement_test_node("node_dfs_browser_placement_activity_owner");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let base = sinomo_dfs::DfsFileSystemConfig {
+            file_system_id: file_system_id.clone(),
+            display_name: "SIFS".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let policy = sinomo_dfs::DfsPlacementPolicy::new(
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            1,
+        )
+        .expect("activity policy");
+        let mut first_config = base.clone();
+        first_config.subtree_policies.push(
+            sinomo_dfs::normalize_placement_rule(
+                "/team/first",
+                sinomo_dfs::DfsPlacementScope::SelfOnly,
+                policy.clone(),
+            )
+            .expect("first activity rule"),
+        );
+        let mut second_config = first_config.clone();
+        second_config.subtree_policies.push(
+            sinomo_dfs::normalize_placement_rule(
+                "/team/second",
+                sinomo_dfs::DfsPlacementScope::SelfOnly,
+                policy,
+            )
+            .expect("second activity rule"),
+        );
+        let make_job = |job_id: &str, path: &str, created_at_unix_nanos: u64| {
+            sinomo_dfs::DfsPlacementReconciliationJob {
+                schema_version: sinomo_dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
+                job_id: job_id.to_string(),
+                file_system_id: file_system_id.clone(),
+                path: path.to_string(),
+                scope: sinomo_dfs::DfsPlacementScope::SelfOnly,
+                unavailable_node_ids: BTreeSet::new(),
+                candidate_snapshot: vec![sinomo_dfs::DfsNodeAdvertisement::content(owner.clone())],
+                accepted_config: None,
+                state: sinomo_dfs::DfsPlacementReconciliationState::Pending,
+                cursor: None,
+                total_object_count: 0,
+                scanned_object_count: 0,
+                matched_object_count: 0,
+                updated_object_count: 0,
+                scheduled_repair_count: 0,
+                completed_repair_count: 0,
+                pending_repair_count: 0,
+                revision: 0,
+                created_at_unix_nanos,
+                updated_at_unix_nanos: created_at_unix_nanos,
+                last_error: None,
+            }
+        };
+
+        let mut kv = sinomo_core::kv::InProcessKvStore::new();
+        let mut store = sinomo_dfs::DfsControlPlaneStore::new(&mut kv);
+        store
+            .put_file_system_config(&base)
+            .expect("activity base config");
+        let first_job = make_job("activity-first", "/team/first", 10);
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &first_config, &first_job)
+                .expect("first activity Apply")
+        );
+        let durable_first = store
+            .placement_reconciliation(&file_system_id, &first_job.job_id)
+            .expect("first activity read")
+            .expect("durable first activity");
+        let mut completed_first = durable_first.clone();
+        completed_first.state = sinomo_dfs::DfsPlacementReconciliationState::Completed;
+        completed_first.revision = 1;
+        completed_first.updated_at_unix_nanos = 11;
+        assert!(
+            store
+                .compare_and_put_placement_reconciliation(&durable_first, &completed_first)
+                .expect("complete first activity")
+        );
+        let mut second_job = make_job("activity-second", "/team/second", 20);
+        second_job.last_error = Some("temporary route failure".to_string());
+        assert!(
+            store
+                .compare_and_put_placement_update(&first_config, &second_config, &second_job)
+                .expect("second activity Apply")
+        );
+        drop(store);
+        sinomo_core::kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &kv.try_snapshot().expect("activity KV snapshot"),
+        )
+        .expect("write activity KV snapshot");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let backend = DaemonDfsBrowserBackend::open(data_dir, runtime.handle())
+            .expect("open activity browser backend");
+        let retrying = backend
+            .placement_activity(crate::DaemonDfsBrowserPlacementActivityRequest {
+                statuses: vec![sinomo_dfs::DfsPlacementReconciliationActivityStatus::Retrying],
+                path_prefix: Some("/team/../team".to_string()),
+                cursor: None,
+                limit: 10,
+            })
+            .expect("filtered retrying activity")
+            .page;
+        assert_eq!(retrying.activities.len(), 1);
+        assert_eq!(retrying.activities[0].job_id, second_job.job_id);
+        assert!(
+            retrying.partial,
+            "without cluster capability state the endpoint must not claim complete history"
+        );
+        assert!(!retrying.history_truncated);
+
+        let first_page = backend
+            .placement_activity(crate::DaemonDfsBrowserPlacementActivityRequest {
+                limit: 1,
+                ..Default::default()
+            })
+            .expect("first activity page")
+            .page;
+        assert_eq!(first_page.activities[0].job_id, second_job.job_id);
+        let second_page = backend
+            .placement_activity(crate::DaemonDfsBrowserPlacementActivityRequest {
+                cursor: first_page.next_cursor.clone(),
+                limit: 1,
+                ..Default::default()
+            })
+            .expect("second activity page")
+            .page;
+        assert_eq!(second_page.activities.len(), 1);
+        assert_eq!(second_page.activities[0].job_id, first_job.job_id);
+        assert!(second_page.next_cursor.is_none());
     }
 
     #[test]

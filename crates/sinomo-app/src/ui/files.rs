@@ -23,6 +23,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,8 +37,8 @@ use sui::{
     DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem,
     FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint,
     ListItem, ListView, MeasureCtx, NumberInput, Observable, PaintCtx, PanelSection,
-    PlacementBadge, PlacementBadgePaint, RebuildOnChange, Rect, RichText, ScrollState, ScrollView,
-    SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone,
+    PlacementBadge, PlacementBadgePaint, RadioButton, RebuildOnChange, Rect, RichText, ScrollState,
+    ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone,
     SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SideSheet,
     SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
     StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
@@ -52,9 +53,9 @@ use sui::{
 use sinomo_cli::app_api::{
     SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary,
     SifsListOptions, SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails,
-    SifsObjectDetails, SifsObjectHealth, SifsPlacementPolicy, SifsPlacementPreview,
-    SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
-    SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
+    SifsObjectDetails, SifsObjectHealth, SifsPlacementActivityRequest, SifsPlacementPolicy,
+    SifsPlacementPreview, SifsPlacementPreviewToken, SifsPlacementReconciliationJob,
+    SifsPlacementScope, SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
 };
 use sinomo_runtime::{
     api::{
@@ -71,7 +72,7 @@ use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutco
 use crate::state::{Shared, Tab};
 use crate::theme::{AppTextScale, AppThemeMode, Palette};
 use crate::ui::settings::SettingsSection;
-use crate::ui::widgets;
+use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
 
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
 const WIDE_THRESHOLD: f32 = 640.0;
@@ -102,6 +103,8 @@ const FILE_DOCUMENT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const FILE_ATTACHMENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_NAV_HISTORY: usize = 64;
+const PLACEMENT_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PLACEMENT_ACTIVITY_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
@@ -955,6 +958,51 @@ enum CompactFilesOverlay {
     Inspector,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlacementActivityFilter {
+    #[default]
+    All,
+    Active,
+    Failed,
+    Completed,
+}
+
+impl PlacementActivityFilter {
+    fn includes(
+        self,
+        status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
+    ) -> bool {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+        match self {
+            Self::All => true,
+            Self::Active => matches!(status, Status::Running | Status::Retrying),
+            Self::Failed => status == Status::Failed,
+            Self::Completed => status == Status::Completed,
+        }
+    }
+
+    fn request_statuses(
+        self,
+    ) -> Vec<sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus> {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+        match self {
+            Self::All => Vec::new(),
+            Self::Active => vec![Status::Running, Status::Retrying],
+            Self::Failed => vec![Status::Failed],
+            Self::Completed => vec![Status::Completed],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State (data layer) — SIFS-backed browser snapshot + async load worker.
 // ---------------------------------------------------------------------------
@@ -1047,6 +1095,24 @@ pub struct FilesState {
     /// newer preview/Apply failure that the operator still needs to act on.
     placement_error_from_reconciliation: bool,
     pending_placement_request_id: Option<u64>,
+    placement_activity_open: bool,
+    placement_activity_filter: PlacementActivityFilter,
+    placement_activity_loaded_filter: PlacementActivityFilter,
+    placement_activity: Vec<sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary>,
+    placement_activity_head_job_ids: BTreeSet<String>,
+    placement_activity_next_cursor:
+        Option<sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor>,
+    placement_activity_loading: bool,
+    placement_activity_error: Option<String>,
+    placement_activity_partial: bool,
+    placement_activity_history_truncated: bool,
+    placement_activity_refreshed_at_unix_nanos: Option<u64>,
+    placement_activity_origin_daemon_address: Option<String>,
+    pending_placement_activity_request_id: Option<u64>,
+    pending_placement_activity_append: bool,
+    placement_activity_poll_generation: Arc<AtomicU64>,
+    placement_activity_in_flight_generation: Arc<AtomicU64>,
+    placement_activity_refresh_dirty: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1108,6 +1174,19 @@ struct FilesInspectorStructure {
     inspector_details_open: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct FilesPlacementActivityStructure {
+    theme: (AppThemeMode, AppTextScale),
+    filter: PlacementActivityFilter,
+    activities: Vec<sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary>,
+    next_cursor: Option<sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor>,
+    loading: bool,
+    error: Option<String>,
+    partial: bool,
+    history_truncated: bool,
+    refreshed_at_unix_nanos: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FilesDialogStructure {
     Closed {
@@ -1148,6 +1227,9 @@ enum FilesDialogStructure {
         preview_loading: bool,
         inspector_details_open: bool,
     },
+    PlacementActivity {
+        theme: (AppThemeMode, AppTextScale),
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1158,6 +1240,7 @@ pub struct FilesStructureKey {
     places: Vec<FilePlace>,
     inspector: FilesInspectorStructure,
     tasks: Vec<FilesTask>,
+    placement_activity: FilesPlacementActivityStructure,
     dialog: FilesDialogStructure,
 }
 
@@ -1226,6 +1309,17 @@ impl FilesStructureKey {
                     inspector_details_open: false,
                 },
                 tasks: Vec::new(),
+                placement_activity: FilesPlacementActivityStructure {
+                    theme,
+                    filter: PlacementActivityFilter::All,
+                    activities: Vec::new(),
+                    next_cursor: None,
+                    loading: false,
+                    error: None,
+                    partial: false,
+                    history_truncated: false,
+                    refreshed_at_unix_nanos: None,
+                },
                 dialog: FilesDialogStructure::Closed { theme },
             };
         };
@@ -1282,6 +1376,17 @@ impl FilesStructureKey {
             preview_error: state.preview_error.clone(),
             inspector_details_open: state.inspector_details_open,
         };
+        let placement_activity = FilesPlacementActivityStructure {
+            theme,
+            filter: state.placement_activity_filter,
+            activities: state.placement_activity.clone(),
+            next_cursor: state.placement_activity_next_cursor.clone(),
+            loading: state.placement_activity_loading,
+            error: state.placement_activity_error.clone(),
+            partial: state.placement_activity_partial,
+            history_truncated: state.placement_activity_history_truncated,
+            refreshed_at_unix_nanos: state.placement_activity_refreshed_at_unix_nanos,
+        };
         let dialog = if state.document_close_confirmation {
             FilesDialogStructure::DocumentConfirmation {
                 theme,
@@ -1309,6 +1414,8 @@ impl FilesStructureKey {
                 placement_applying: state.placement_applying,
                 placement_error: state.placement_error.clone(),
             }
+        } else if state.placement_activity_open {
+            FilesDialogStructure::PlacementActivity { theme }
         } else if let Some(overlay) = state.compact_overlay {
             FilesDialogStructure::Compact {
                 theme,
@@ -1331,6 +1438,7 @@ impl FilesStructureKey {
             places: files_places(state),
             inspector,
             tasks: state.tasks.clone(),
+            placement_activity,
             dialog,
         }
     }
@@ -1423,6 +1531,23 @@ impl FilesState {
             placement_error: None,
             placement_error_from_reconciliation: false,
             pending_placement_request_id: None,
+            placement_activity_open: false,
+            placement_activity_filter: PlacementActivityFilter::All,
+            placement_activity_loaded_filter: PlacementActivityFilter::All,
+            placement_activity: Vec::new(),
+            placement_activity_head_job_ids: BTreeSet::new(),
+            placement_activity_next_cursor: None,
+            placement_activity_loading: false,
+            placement_activity_error: None,
+            placement_activity_partial: false,
+            placement_activity_history_truncated: false,
+            placement_activity_refreshed_at_unix_nanos: None,
+            placement_activity_origin_daemon_address: None,
+            pending_placement_activity_request_id: None,
+            pending_placement_activity_append: false,
+            placement_activity_poll_generation: Arc::new(AtomicU64::new(0)),
+            placement_activity_in_flight_generation: Arc::new(AtomicU64::new(0)),
+            placement_activity_refresh_dirty: false,
         }
     }
 
@@ -1466,12 +1591,68 @@ impl FilesState {
         }
 
         let reopen_sifs = self.source == FilesSourceKind::Sifs && self.loaded;
+        let placement_activity_was_open = self.placement_activity_open;
+        let placement_activity_filter = self.placement_activity_filter;
+        let placement_activity_loaded_filter = self.placement_activity_loaded_filter;
+        let placement_activity_origin = self.placement_activity_origin_daemon_address.clone();
+        let preserve_placement_activity =
+            placement_activity_origin.as_ref().is_some_and(|origin| {
+                daemon_address
+                    .as_ref()
+                    .is_none_or(|address| address == origin)
+            }) || (placement_activity_origin.is_none() && self.daemon_address == daemon_address);
+        let placement_activity = preserve_placement_activity
+            .then(|| self.placement_activity.clone())
+            .unwrap_or_default();
+        let placement_activity_head_job_ids = preserve_placement_activity
+            .then(|| self.placement_activity_head_job_ids.clone())
+            .unwrap_or_default();
+        let placement_activity_next_cursor = preserve_placement_activity
+            .then(|| self.placement_activity_next_cursor.clone())
+            .flatten();
+        let placement_activity_partial =
+            preserve_placement_activity && self.placement_activity_partial;
+        let placement_activity_history_truncated =
+            preserve_placement_activity && self.placement_activity_history_truncated;
+        let placement_activity_error = preserve_placement_activity
+            .then(|| self.placement_activity_error.clone())
+            .flatten();
+        let placement_activity_refreshed_at_unix_nanos = preserve_placement_activity
+            .then_some(self.placement_activity_refreshed_at_unix_nanos)
+            .flatten();
+        let activity_waker = waker.clone();
         self.daemon_address = daemon_address;
         self.daemon_unavailable_detail = daemon_unavailable_detail;
         self.clustered = clustered;
         self.reset_for_retry();
+        self.placement_activity_open = placement_activity_was_open;
+        self.placement_activity_filter = placement_activity_filter;
+        self.placement_activity_loaded_filter = if preserve_placement_activity {
+            placement_activity_loaded_filter
+        } else {
+            placement_activity_filter
+        };
+        self.placement_activity = placement_activity;
+        self.placement_activity_head_job_ids = placement_activity_head_job_ids;
+        self.placement_activity_next_cursor = placement_activity_next_cursor;
+        self.placement_activity_partial = placement_activity_partial;
+        self.placement_activity_history_truncated = placement_activity_history_truncated;
+        self.placement_activity_error = placement_activity_error;
+        self.placement_activity_refreshed_at_unix_nanos =
+            placement_activity_refreshed_at_unix_nanos;
+        self.placement_activity_origin_daemon_address = if preserve_placement_activity {
+            placement_activity_origin
+        } else {
+            self.daemon_address.clone()
+        };
         if reopen_sifs {
-            self.ensure_loaded(waker);
+            self.ensure_loaded(waker.clone());
+        }
+        if placement_activity_was_open {
+            if let Some(waker) = activity_waker {
+                self.ensure_worker(waker);
+            }
+            self.request_placement_activity(false, Duration::ZERO);
         }
         true
     }
@@ -1752,6 +1933,24 @@ impl FilesState {
         self.placement_error = None;
         self.placement_error_from_reconciliation = false;
         self.pending_placement_request_id = None;
+        self.placement_activity_open = false;
+        self.placement_activity_loaded_filter = PlacementActivityFilter::All;
+        self.placement_activity.clear();
+        self.placement_activity_head_job_ids.clear();
+        self.placement_activity_next_cursor = None;
+        self.placement_activity_loading = false;
+        self.placement_activity_error = None;
+        self.placement_activity_partial = false;
+        self.placement_activity_history_truncated = false;
+        self.placement_activity_refreshed_at_unix_nanos = None;
+        self.placement_activity_origin_daemon_address = None;
+        self.pending_placement_activity_request_id = None;
+        self.pending_placement_activity_append = false;
+        self.placement_activity_poll_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.placement_activity_in_flight_generation
+            .store(0, Ordering::Release);
+        self.placement_activity_refresh_dirty = false;
         self.attachment_loading = false;
         if let Some(document) = self.document.as_mut()
             && document.saving
@@ -1899,6 +2098,17 @@ impl FilesState {
                                 .to_string(),
                         );
                         self.placement_error_from_reconciliation = false;
+                        changed = true;
+                    }
+                    if self.pending_placement_activity_request_id.take().is_some() {
+                        self.placement_activity_loading = false;
+                        self.placement_activity_in_flight_generation
+                            .store(0, Ordering::Release);
+                        self.placement_activity_refresh_dirty = false;
+                        self.placement_activity_error = Some(
+                            "The Files background worker stopped while reading reconciliation activity."
+                                .to_string(),
+                        );
                         changed = true;
                     }
                     self.worker_rx = None;
@@ -2411,6 +2621,166 @@ impl FilesState {
                 }
                 true
             }
+            FilesWorkerResult::PlacementActivity {
+                request_id,
+                filter,
+                append,
+                result,
+            } => {
+                if self.pending_placement_activity_request_id != Some(request_id)
+                    || self.pending_placement_activity_append != append
+                    || self.placement_activity_filter != filter
+                {
+                    return false;
+                }
+                self.pending_placement_activity_request_id = None;
+                self.pending_placement_activity_append = false;
+                self.placement_activity_loading = false;
+                self.placement_activity_in_flight_generation
+                    .store(0, Ordering::Release);
+                let refresh_dirty = std::mem::take(&mut self.placement_activity_refresh_dirty);
+                match result {
+                    Ok(page) => {
+                        let page_has_more = page.next_cursor.is_some();
+                        let page_partial = page.partial;
+                        let page_history_truncated = page.history_truncated;
+                        let next_cursor = page.next_cursor;
+                        let activities = page.activities;
+                        let activity_ids = activities
+                            .iter()
+                            .map(|activity| activity.job_id.clone())
+                            .collect::<BTreeSet<_>>();
+                        let prior_next_cursor = self.placement_activity_next_cursor.clone();
+                        let had_known_head = !self.placement_activity_head_job_ids.is_empty();
+                        let query_changed = self.placement_activity_loaded_filter != filter;
+                        if append {
+                            for activity in activities {
+                                match self
+                                    .placement_activity
+                                    .iter()
+                                    .position(|current| current.job_id == activity.job_id)
+                                {
+                                    Some(index)
+                                        if activity.revision
+                                            >= self.placement_activity[index].revision =>
+                                    {
+                                        self.placement_activity[index] = activity;
+                                    }
+                                    Some(_) => {}
+                                    None => self.placement_activity.push(activity),
+                                }
+                            }
+                            self.placement_activity_next_cursor = next_cursor;
+                        } else if query_changed
+                            || filter == PlacementActivityFilter::Active
+                            || !page_has_more
+                            || self.placement_activity.is_empty()
+                        {
+                            // A complete successful query is authoritative. Replacing the rows
+                            // evicts jobs that left Active/Failed after a state transition; stale
+                            // rows are retained only when the read itself fails.
+                            self.placement_activity = activities;
+                            self.placement_activity_next_cursor = next_cursor;
+                        } else {
+                            // Preserve the loaded terminal window while merging the refreshed
+                            // head. Removing prior head IDs would create a pagination hole whenever
+                            // new jobs push old head rows behind the retained tail cursor.
+                            //
+                            // The All view is different only for active rows: its separately
+                            // queried active head is bounded, so an absent older Running/Retrying
+                            // row cannot be retained as truth. Resetting to the refreshed cursor
+                            // after dropping one lets pagination rediscover its terminal state.
+                            let dropped_stale_active =
+                                filter == PlacementActivityFilter::All
+                                    && self.placement_activity.iter().any(|activity| {
+                                        matches!(
+                                            activity.status,
+                                            sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Running
+                                                | sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Retrying
+                                        ) && !activity_ids.contains(&activity.job_id)
+                                    });
+                            if filter == PlacementActivityFilter::All {
+                                self.placement_activity.retain(|activity| {
+                                    !matches!(
+                                        activity.status,
+                                        sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Running
+                                            | sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Retrying
+                                    )
+                                });
+                            }
+                            for activity in activities {
+                                match self
+                                    .placement_activity
+                                    .iter()
+                                    .position(|current| current.job_id == activity.job_id)
+                                {
+                                    Some(index)
+                                        if activity.revision
+                                            >= self.placement_activity[index].revision =>
+                                    {
+                                        self.placement_activity[index] = activity;
+                                    }
+                                    Some(_) => {}
+                                    None => self.placement_activity.push(activity),
+                                }
+                            }
+                            self.placement_activity_next_cursor = if dropped_stale_active {
+                                next_cursor
+                            } else if had_known_head {
+                                prior_next_cursor
+                            } else {
+                                next_cursor
+                            };
+                        }
+                        if !append {
+                            self.placement_activity_head_job_ids = activity_ids;
+                            self.placement_activity_loaded_filter = filter;
+                        }
+                        self.placement_activity.sort_by(|left, right| {
+                            right
+                                .created_at_unix_nanos
+                                .cmp(&left.created_at_unix_nanos)
+                                .then_with(|| right.job_id.cmp(&left.job_id))
+                        });
+                        self.placement_activity_error = None;
+                        if query_changed {
+                            self.placement_activity_partial = page_partial;
+                            self.placement_activity_history_truncated = page_history_truncated;
+                        } else {
+                            self.placement_activity_partial |= page_partial;
+                            self.placement_activity_history_truncated |= page_history_truncated;
+                        }
+                        if self.placement_activity_origin_daemon_address.is_none() {
+                            self.placement_activity_origin_daemon_address =
+                                self.daemon_address.clone();
+                        }
+                        self.placement_activity_refreshed_at_unix_nanos =
+                            time::OffsetDateTime::now_utc()
+                                .unix_timestamp_nanos()
+                                .try_into()
+                                .ok();
+                        if refresh_dirty && self.placement_activity_open {
+                            self.request_placement_activity(false, Duration::ZERO);
+                        } else {
+                            let poll_interval = if self.placement_activity_has_active_jobs() {
+                                PLACEMENT_ACTIVITY_POLL_INTERVAL
+                            } else {
+                                PLACEMENT_ACTIVITY_IDLE_POLL_INTERVAL
+                            };
+                            self.schedule_placement_activity_poll(poll_interval);
+                        }
+                    }
+                    Err(error) => {
+                        self.placement_activity_error = Some(error);
+                        if refresh_dirty && self.placement_activity_open {
+                            self.request_placement_activity(false, Duration::ZERO);
+                        } else {
+                            self.schedule_placement_activity_poll(Duration::from_secs(5));
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -2418,12 +2788,16 @@ impl FilesState {
         match update {
             FilesLiveUpdate::Item(DaemonEventStreamItem::Ready { .. }) => {
                 let changed = !self.live_updates_connected || self.live_updates_error.is_some();
+                let activity_open = self.placement_activity_open;
                 self.live_updates_connected = true;
                 self.live_updates_error = None;
                 // The stream is live now. Reload the durable snapshot once so changes made between
                 // the initial list and subscription readiness cannot be missed.
                 self.live_refresh_pending |= self.source == FilesSourceKind::Sifs;
-                changed || self.source == FilesSourceKind::Sifs
+                if self.placement_activity_open {
+                    self.refresh_placement_activity();
+                }
+                changed || self.source == FilesSourceKind::Sifs || activity_open
             }
             FilesLiveUpdate::Item(DaemonEventStreamItem::Event { event }) => {
                 let status_changed =
@@ -2436,15 +2810,23 @@ impl FilesState {
                 if touches_location {
                     self.live_refresh_pending = true;
                 }
-                status_changed || touches_location
+                let placement_changed = event.kind.as_str().starts_with("dfs.placement.");
+                if placement_changed && self.placement_activity_open {
+                    self.refresh_placement_activity();
+                }
+                status_changed || touches_location || placement_changed
             }
             FilesLiveUpdate::Item(DaemonEventStreamItem::Lagged { .. }) => {
                 let status_changed =
                     !self.live_updates_connected || self.live_updates_error.is_some();
+                let activity_open = self.placement_activity_open;
                 self.live_updates_connected = true;
                 self.live_updates_error = None;
                 self.live_refresh_pending |= self.source == FilesSourceKind::Sifs;
-                status_changed || self.source == FilesSourceKind::Sifs
+                if self.placement_activity_open {
+                    self.refresh_placement_activity();
+                }
+                status_changed || self.source == FilesSourceKind::Sifs || activity_open
             }
             FilesLiveUpdate::Disconnected(detail) => {
                 let changed = self.live_updates_connected
@@ -3418,6 +3800,174 @@ impl FilesState {
 
     fn close_compact_overlay(&mut self) {
         self.compact_overlay = None;
+    }
+
+    fn open_placement_activity(&mut self, waker: Option<sui::UiHandle>) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.compact_overlay = None;
+        self.placement_activity_open = true;
+        if self.placement_activity_origin_daemon_address.is_none() {
+            self.placement_activity_origin_daemon_address = self.daemon_address.clone();
+        }
+        self.request_placement_activity(false, Duration::ZERO);
+    }
+
+    fn close_placement_activity(&mut self) {
+        self.placement_activity_open = false;
+        self.placement_activity_loading = false;
+        // Invalidates a scheduled or in-flight response. The worker operation
+        // is read-only and may finish, but a closed center must not restart its
+        // polling loop when that stale response arrives.
+        self.pending_placement_activity_request_id = None;
+        self.pending_placement_activity_append = false;
+        self.placement_activity_poll_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.placement_activity_in_flight_generation
+            .store(0, Ordering::Release);
+        self.placement_activity_refresh_dirty = false;
+    }
+
+    fn set_placement_activity_filter(&mut self, filter: PlacementActivityFilter) -> bool {
+        if self.placement_activity_filter == filter {
+            return false;
+        }
+        self.placement_activity_filter = filter;
+        self.placement_activity_head_job_ids.clear();
+        self.placement_activity_next_cursor = None;
+        self.pending_placement_activity_request_id = None;
+        self.pending_placement_activity_append = false;
+        self.placement_activity_poll_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.placement_activity_in_flight_generation
+            .store(0, Ordering::Release);
+        self.placement_activity_refresh_dirty = false;
+        true
+    }
+
+    fn placement_activity_has_active_jobs(&self) -> bool {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+        self.placement_activity
+            .iter()
+            .any(|activity| matches!(activity.status, Status::Running | Status::Retrying))
+    }
+
+    fn request_placement_activity(&mut self, append: bool, delay: Duration) {
+        if delay.is_zero()
+            && self
+                .placement_activity_in_flight_generation
+                .load(Ordering::Acquire)
+                != 0
+        {
+            if append {
+                // An explicit Load older action wins over a background head poll. The worker is
+                // serial, so the already-sent read can finish harmlessly; replacing the pending
+                // id makes its response stale and queues the requested page immediately behind it.
+                self.pending_placement_activity_request_id = None;
+                self.pending_placement_activity_append = false;
+                self.placement_activity_in_flight_generation
+                    .store(0, Ordering::Release);
+            } else {
+                self.placement_activity_refresh_dirty = true;
+                return;
+            }
+        }
+        let poll_generation = self
+            .placement_activity_poll_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let Some(tx) = self.worker_tx.clone() else {
+            self.placement_activity_loading = false;
+            self.placement_activity_error.get_or_insert_with(|| {
+                "Reconciliation activity requires a daemon connection.".to_string()
+            });
+            return;
+        };
+        let cursor = append
+            .then(|| self.placement_activity_next_cursor.clone())
+            .flatten();
+        if append && cursor.is_none() {
+            return;
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_placement_activity_request_id = Some(request_id);
+        self.pending_placement_activity_append = append;
+        self.placement_activity_loading = delay.is_zero();
+        let filter = self.placement_activity_filter;
+        let command = FilesWorkerCommand::PlacementActivity {
+            request_id,
+            filter,
+            cursor,
+            append,
+        };
+        if delay.is_zero() {
+            self.placement_activity_in_flight_generation
+                .store(poll_generation, Ordering::Release);
+            if tx.send(command).is_err() {
+                self.pending_placement_activity_request_id = None;
+                self.placement_activity_loading = false;
+                self.placement_activity_in_flight_generation
+                    .store(0, Ordering::Release);
+                self.placement_activity_error =
+                    Some("The Files background worker stopped.".to_string());
+            }
+            return;
+        }
+
+        let result_tx = self.worker_result_tx.clone();
+        let waker = self.worker_waker.clone();
+        let active_poll_generation = Arc::clone(&self.placement_activity_poll_generation);
+        let in_flight_generation = Arc::clone(&self.placement_activity_in_flight_generation);
+        self.app_runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if active_poll_generation.load(Ordering::Acquire) != poll_generation {
+                return;
+            }
+            if in_flight_generation
+                .compare_exchange(0, poll_generation, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            if tx.send(command).is_err() {
+                in_flight_generation.store(0, Ordering::Release);
+                if let Some(result_tx) = result_tx {
+                    let _ = result_tx.send(FilesWorkerResult::PlacementActivity {
+                        request_id,
+                        filter,
+                        append,
+                        result: Err("The Files background worker stopped.".to_string()),
+                    });
+                }
+            }
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+    }
+
+    fn refresh_placement_activity(&mut self) {
+        self.request_placement_activity(false, Duration::ZERO);
+    }
+
+    fn load_older_placement_activity(&mut self) {
+        self.request_placement_activity(true, Duration::ZERO);
+    }
+
+    fn schedule_placement_activity_poll(&mut self, delay: Duration) {
+        if !self.placement_activity_open {
+            return;
+        }
+        self.request_placement_activity(false, delay);
+    }
+
+    fn reveal_placement_activity_path(&mut self, path: String, waker: Option<sui::UiHandle>) {
+        self.close_placement_activity();
+        let parent = parent_path(&path).unwrap_or_else(|| "/".to_string());
+        self.pending_select_path = (path != "/").then_some(path);
+        self.open_location(FilesSourceKind::Sifs, parent, waker);
     }
 
     fn set_action_prompt_input(&mut self, input: String) {
@@ -4736,6 +5286,12 @@ enum FilesWorkerResult {
         request_id: u64,
         result: Result<SifsPlacementReconciliationJob, String>,
     },
+    PlacementActivity {
+        request_id: u64,
+        filter: PlacementActivityFilter,
+        append: bool,
+        result: Result<sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage, String>,
+    },
 }
 
 enum FilesLiveUpdate {
@@ -4813,6 +5369,12 @@ enum FilesWorkerCommand {
     PlacementProgress {
         request_id: u64,
         job_id: String,
+    },
+    PlacementActivity {
+        request_id: u64,
+        filter: PlacementActivityFilter,
+        cursor: Option<sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor>,
+        append: bool,
     },
 }
 
@@ -5426,6 +5988,73 @@ fn files_worker_loop(
                     (None, None) => Err("SIFS browser did not start".to_string()),
                 };
                 let _ = result_tx.send(FilesWorkerResult::PlacementProgress { request_id, result });
+            }
+            FilesWorkerCommand::PlacementActivity {
+                request_id,
+                filter,
+                cursor,
+                append,
+            } => {
+                ensure_files_worker_browser(
+                    &mut browser,
+                    &mut open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&browser, &open_error) {
+                    (Some(browser), _) => (|| {
+                        let mut page = browser.placement_activity(SifsPlacementActivityRequest {
+                            statuses: filter.request_statuses(),
+                            path_prefix: None,
+                            cursor: cursor.clone(),
+                            limit: sinomo_runtime::dfs::MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE,
+                        })?;
+                        // A newest-first mixed page can be entirely terminal while an older job is
+                        // still running. Merge a separate active-status head into the All view so
+                        // operators never lose current work behind terminal history.
+                        if filter == PlacementActivityFilter::All && cursor.is_none() {
+                            use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+                            let active = browser.placement_activity(SifsPlacementActivityRequest {
+                                statuses: vec![Status::Running, Status::Retrying],
+                                path_prefix: None,
+                                cursor: None,
+                                limit: sinomo_runtime::dfs::MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE,
+                            })?;
+                            page.partial |= active.partial;
+                            page.history_truncated |= active.history_truncated;
+                            for activity in active.activities {
+                                match page
+                                    .activities
+                                    .iter()
+                                    .position(|current| current.job_id == activity.job_id)
+                                {
+                                    Some(index)
+                                        if activity.revision >= page.activities[index].revision =>
+                                    {
+                                        page.activities[index] = activity;
+                                    }
+                                    Some(_) => {}
+                                    None => page.activities.push(activity),
+                                }
+                            }
+                            page.activities.sort_by(|left, right| {
+                                right
+                                    .created_at_unix_nanos
+                                    .cmp(&left.created_at_unix_nanos)
+                                    .then_with(|| right.job_id.cmp(&left.job_id))
+                            });
+                        }
+                        Ok(page)
+                    })(),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("SIFS browser did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::PlacementActivity {
+                    request_id,
+                    filter,
+                    append,
+                    result,
+                });
             }
             FilesWorkerCommand::Operation {
                 request_id,
@@ -9227,6 +9856,21 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let placement_activity = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::History, "Reconciliation activity")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().placement_activity_open
+            })
+            .on_press_with_ctx(move |ctx| {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().open_placement_activity(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
     let go_to = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Search, "Go to path")
@@ -9475,6 +10119,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         )
         .with_item(
+            toolbar_tooltip("Reconciliation activity", placement_activity, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
             toolbar_tooltip("Open local file", open_local_file, reader),
             FlexItem::new().no_shrink(),
         )
@@ -9678,6 +10326,20 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             s.files_mut().refresh(waker);
         })
     };
+    let placement_activity = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::History, "Reconciliation activity")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().placement_activity_open
+            })
+            .on_press_with_ctx(move |ctx| {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().open_placement_activity(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
     let commands = {
         let s = shared.clone();
         IconButton::new(IconGlyph::MoreHorizontal, "More file commands")
@@ -9722,6 +10384,10 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 refresh,
                 reader,
             ),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Reconciliation activity", placement_activity, reader),
             FlexItem::new().no_shrink(),
         )
         .with_item(
@@ -9803,6 +10469,21 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
                 request_files_overlay_rebuild(ctx);
             })
     };
+    let placement_activity = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::History, "Reconciliation activity")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().placement_activity_open
+            })
+            .on_press_with_ctx(move |ctx| {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().open_placement_activity(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
     let inspector = {
         let s = shared.clone();
         IconButton::new(IconGlyph::FileText, "Open file inspector")
@@ -9825,6 +10506,7 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         .with_item(back, FlexItem::new().no_shrink())
         .with_item(up, FlexItem::new().no_shrink())
         .with_item(location, FlexItem::fill().min_width(72.0))
+        .with_item(placement_activity, FlexItem::new().no_shrink())
         .with_item(commands, FlexItem::new().no_shrink())
         .with_item(inspector, FlexItem::new().no_shrink())
 }
@@ -15595,6 +16277,907 @@ fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<
     ))
 }
 
+fn placement_activity_status_label(
+    status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
+) -> &'static str {
+    use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+    match status {
+        Status::Running => "Running",
+        Status::Retrying => "Retrying",
+        Status::Failed => "Failed",
+        Status::Completed => "Completed",
+        Status::Superseded => "Superseded",
+    }
+}
+
+fn placement_activity_status_tone(
+    status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
+) -> SemanticTone {
+    use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+    match status {
+        Status::Running => SemanticTone::Info,
+        Status::Retrying => SemanticTone::Warning,
+        Status::Failed => SemanticTone::Danger,
+        Status::Completed => SemanticTone::Success,
+        Status::Superseded => SemanticTone::Neutral,
+    }
+}
+
+fn placement_activity_phase_label(
+    phase: sinomo_runtime::dfs::DfsPlacementReconciliationState,
+) -> &'static str {
+    use sinomo_runtime::dfs::DfsPlacementReconciliationState as Phase;
+    match phase {
+        Phase::Pending => "Queued",
+        Phase::Scanning => "Scanning objects",
+        Phase::Repairing => "Repairing copies",
+        Phase::Completed => "Finished",
+        Phase::Failed => "Stopped",
+    }
+}
+
+fn placement_activity_relative_time(unix_nanos: u64) -> String {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let elapsed_nanos = now.saturating_sub(unix_nanos as i128);
+    let elapsed_secs = u64::try_from(elapsed_nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    match elapsed_secs {
+        0..=4 => "just now".to_string(),
+        5..=59 => format!("{elapsed_secs}s ago"),
+        60..=3_599 => format!("{}m ago", elapsed_secs / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_secs / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed_secs / 86_400),
+        _ => unix_nanos_label(unix_nanos),
+    }
+}
+
+fn placement_activity_row_description(
+    activity: &sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary,
+) -> String {
+    let phase = if activity.status
+        == sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Superseded
+    {
+        "Replaced"
+    } else {
+        placement_activity_phase_label(activity.phase)
+    };
+    let mut description = format!(
+        "{}; {}; {}; {} of {} progress units; {} of {} objects scanned; {} repairs completed; last cluster update {}",
+        placement_activity_status_label(activity.status),
+        phase,
+        activity.path,
+        activity.progress_completed,
+        activity.progress_total,
+        activity.scanned_object_count,
+        activity.total_object_count,
+        activity.completed_repair_count,
+        placement_activity_relative_time(activity.updated_at_unix_nanos),
+    );
+    if let Some(error) = activity.last_error.as_deref() {
+        description.push_str("; ");
+        description.push_str(error);
+    }
+    description
+}
+
+fn placement_activity_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    activity: &sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary,
+) -> WidgetPod {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let title_style = pal.text_style(&theme, 14.0, FontWeight::SEMIBOLD, pal.text);
+    let detail_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted);
+    let status = StatusBadge::new(placement_activity_status_label(activity.status))
+        .tone(placement_activity_status_tone(activity.status))
+        .theme_when(clone_reader(reader));
+    let phase_label = if activity.status
+        == sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Superseded
+    {
+        "Replaced"
+    } else {
+        placement_activity_phase_label(activity.phase)
+    };
+    let phase = StatusBadge::new(phase_label)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader));
+    let path = activity.path.clone();
+    let reveal = {
+        let shared = shared.clone();
+        sui::Button::new("Show path")
+            .icon(IconGlyph::Folder)
+            .min_width(104.0)
+            .appearance(ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                let waker = { shared.borrow().waker.clone() };
+                shared
+                    .files_mut()
+                    .reveal_placement_activity_path(path.clone(), waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let progress = if activity.progress_total == 0 {
+        0.0
+    } else {
+        (activity.progress_completed as f64 / activity.progress_total as f64).clamp(0.0, 1.0)
+    };
+    let percent = (progress * 100.0).round() as u64;
+    let header = TrailingSlotRow::new(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(5.0)
+            .with_child(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .with_child(status)
+                    .with_child(phase),
+            )
+            .with_child(Label::new(activity.path.clone()).style(title_style)),
+        reveal,
+    )
+    .trailing_width(108.0)
+    .trailing_height(32.0)
+    .gap(12.0);
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(7.0)
+        .with_child(header)
+        .with_child(
+            Label::new(format!(
+                "{percent}% · {}/{} scanned · {} matched · {} updated",
+                activity.scanned_object_count,
+                activity.total_object_count,
+                activity.matched_object_count,
+                activity.updated_object_count,
+            ))
+            .style(detail_style.clone()),
+        )
+        .with_child(
+            SizedBox::new().height(5.0).with_child(
+                sui::ProgressBar::new(format!("Reconciliation progress for {}", activity.path))
+                    .value(progress)
+                    .tone(placement_activity_status_tone(activity.status))
+                    .height(5.0)
+                    .theme_when(clone_reader(reader)),
+            ),
+        )
+        .with_child(
+            Label::new(format!(
+                "Copies: {} scheduled · {} completed · {} pending",
+                activity.scheduled_repair_count,
+                activity.completed_repair_count,
+                activity.pending_repair_count,
+            ))
+            .style(detail_style.clone()),
+        );
+    if let Some(error) = activity.last_error.as_deref() {
+        let superseded = activity.status
+            == sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Superseded;
+        let tone = if superseded {
+            SemanticTone::Neutral
+        } else if activity.status
+            == sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus::Failed
+        {
+            SemanticTone::Danger
+        } else {
+            SemanticTone::Warning
+        };
+        content = content.with_child(
+            Surface::panel(
+                Stack::vertical()
+                    .alignment(Alignment::Stretch)
+                    .spacing(5.0)
+                    .with_child(
+                        StatusBadge::new(if superseded {
+                            "Replacement"
+                        } else {
+                            "Last issue"
+                        })
+                        .icon(if superseded {
+                            IconGlyph::History
+                        } else {
+                            IconGlyph::Alert
+                        })
+                        .tone(tone)
+                        .theme_when(clone_reader(reader)),
+                    )
+                    .with_child(Label::new(error.to_string()).style(detail_style.clone())),
+            )
+            .appearance(sui::SurfaceAppearance::Soft)
+            .padding(Insets::all(9.0))
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    content = content.with_child({
+        let scope = match activity.scope {
+            SifsPlacementScope::SelfOnly => "This object",
+            SifsPlacementScope::Subtree => "Folder subtree",
+        };
+        Label::new(format!(
+            "{} scope · updated {} · job {}",
+            scope,
+            placement_activity_relative_time(activity.updated_at_unix_nanos),
+            middle_short(&activity.job_id, 28),
+        ))
+        .style(detail_style)
+    });
+    WidgetPod::new(
+        Surface::panel(content)
+            .appearance(sui::SurfaceAppearance::Soft)
+            .padding(Insets {
+                left: 14.0,
+                top: 12.0,
+                right: 14.0,
+                bottom: 12.0,
+            })
+            .theme_when(clone_reader(reader))
+            .fill_width(),
+    )
+}
+
+fn placement_activity_virtual_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared.signals().files_structure.select_named(
+        "placement reconciliation activity rows",
+        |key| {
+            let items = key
+                .placement_activity
+                .activities
+                .iter()
+                .filter(|activity| key.placement_activity.filter.includes(activity.status))
+                .cloned()
+                .map(|activity| (activity.job_id.clone(), activity))
+                .collect();
+            VirtualCollectionSnapshot::new(items, None)
+        },
+    );
+    let row_shared = shared.clone();
+    let row_reader = Rc::clone(reader);
+    VirtualCollectionHost::new(
+        "Placement reconciliation activity collection",
+        source,
+        move |model, state| {
+            let shared = row_shared.clone();
+            let reader = Rc::clone(&row_reader);
+            VirtualList::new(
+                "Reconciliation activity",
+                model,
+                move |_job_id, activity| {
+                    let shared = shared.clone();
+                    let reader = Rc::clone(&reader);
+                    RebuildOnChange::new_observable(activity, move |activity| {
+                        placement_activity_row(&shared, &reader, activity)
+                    })
+                },
+            )
+            .state(state)
+            .estimated_row_height(154.0)
+            .spacing(10.0)
+            .padding(Insets {
+                left: 2.0,
+                top: 2.0,
+                right: 10.0,
+                bottom: 10.0,
+            })
+            .selection_mode(VirtualListSelectionMode::None)
+            .chrome(VirtualListChrome::Transparent)
+            .theme_when(clone_reader(&row_reader))
+            .row_name(|_job_id, activity| format!("Reconciliation {}", activity.path))
+            .row_description(|_job_id, activity| placement_activity_row_description(activity))
+        },
+    )
+}
+
+fn placement_activity_count(
+    files: &FilesState,
+    status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
+) -> usize {
+    files
+        .placement_activity
+        .iter()
+        .filter(|activity| activity.status == status)
+        .count()
+}
+
+fn placement_activity_count_badge(
+    shared: &Shared,
+    reader: &ThemeReader,
+    status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
+) -> StatusBadge {
+    let shared = shared.clone();
+    StatusBadge::dynamic(placement_activity_status_label(status), move || {
+        format!(
+            "{} {} loaded",
+            placement_activity_count(&shared.files(), status),
+            placement_activity_status_label(status)
+        )
+    })
+    .tone(placement_activity_status_tone(status))
+    .theme_when(clone_reader(reader))
+}
+
+fn placement_activity_error_notice(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let selected = shared.clone();
+    let detail = shared.clone();
+    let description = shared.clone();
+    let retry_enabled = shared.clone();
+    let retry_action = shared.clone();
+    let retry = sui::Button::new("Retry activity read")
+        .icon(IconGlyph::Redo)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Warning)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || !retry_enabled.files().placement_activity_loading)
+        .on_press(move || {
+            let waker = { retry_action.borrow().waker.clone() };
+            if let Some(waker) = waker {
+                retry_action.files_mut().ensure_worker(waker);
+            }
+            retry_action.files_mut().refresh_placement_activity();
+        });
+    let notice = SemanticRegion::new(
+        "Reconciliation activity read failed",
+        Surface::panel(
+            Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .spacing(7.0)
+                .with_child(
+                    Flex::horizontal()
+                        .wrap(FlexWrap::Wrap)
+                        .gap(7.0)
+                        .align_items(Alignment::Center)
+                        .with_child(
+                            StatusBadge::new("Last cluster read failed")
+                                .icon(IconGlyph::Alert)
+                                .tone(SemanticTone::Danger)
+                                .theme_when(clone_reader(reader)),
+                        )
+                        .with_child(retry),
+                )
+                .with_child(
+                    Label::dynamic("Activity read failed", move || {
+                        detail
+                            .files()
+                            .placement_activity_error
+                            .clone()
+                            .unwrap_or_default()
+                    })
+                    .theme(reader()),
+                ),
+        )
+        .appearance(sui::SurfaceAppearance::Soft)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width(),
+    )
+    .role(SemanticsRole::Status)
+    .description_when(move || {
+        description
+            .files()
+            .placement_activity_error
+            .clone()
+            .unwrap_or_default()
+    });
+    SwitchView::new()
+        .selected_when(move || usize::from(selected.files().placement_activity_error.is_some()))
+        .with_child(SizedBox::new())
+        .with_child(notice)
+}
+
+fn placement_activity_stream_notice(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let selected = shared.clone();
+    let detail = shared.clone();
+    let description = shared.clone();
+    let notice = SemanticRegion::new(
+        "Live reconciliation updates disconnected",
+        Surface::panel(
+            Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .spacing(6.0)
+                .with_child(
+                    StatusBadge::new("Live updates disconnected")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Warning)
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_child(
+                    Label::dynamic("Snapshot polling remains active", move || {
+                        let files = detail.files();
+                        let error = files
+                            .live_updates_error
+                            .as_deref()
+                            .unwrap_or("The daemon event stream is unavailable.");
+                        format!(
+                            "{error} Snapshot polling remains active while this center is open."
+                        )
+                    })
+                    .theme(reader()),
+                ),
+        )
+        .appearance(sui::SurfaceAppearance::Soft)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width(),
+    )
+    .role(SemanticsRole::Status)
+    .description_when(move || {
+        description
+            .files()
+            .live_updates_error
+            .clone()
+            .unwrap_or_default()
+    });
+    SwitchView::new()
+        .selected_when(move || usize::from(selected.files().live_updates_error.is_some()))
+        .with_child(SizedBox::new())
+        .with_child(notice)
+}
+
+fn placement_activity_completeness_notice(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> impl Widget + use<> {
+    let selected = shared.clone();
+    let retained = SemanticRegion::new(
+        "Retained operational history",
+        Surface::panel(
+            Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .spacing(6.0)
+                .with_child(
+                    StatusBadge::new("Retained operational history")
+                        .icon(IconGlyph::History)
+                        .tone(SemanticTone::Info)
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_child(
+                    Label::new("Active jobs are queried separately. Terminal activity written by older daemon versions may be omitted from retained operational history.")
+                        .theme(reader()),
+                ),
+        )
+        .appearance(sui::SurfaceAppearance::Soft)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width(),
+    )
+    .role(SemanticsRole::Status)
+    .description(
+        "Active jobs are queried separately; older-daemon terminal activity may be omitted",
+    );
+    let truncated = SemanticRegion::new(
+        "Reconciliation activity history was truncated",
+        Surface::panel(
+            Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .spacing(6.0)
+                .with_child(
+                    StatusBadge::new("Retained history truncated")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Warning)
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_child(
+                    Label::new("Older terminal jobs have fallen outside retained activity history. Active jobs are still queried separately, but terminal history can have gaps.")
+                        .theme(reader()),
+                ),
+        )
+        .appearance(sui::SurfaceAppearance::Soft)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width(),
+    )
+    .role(SemanticsRole::Status)
+    .description("Older terminal reconciliation activity has fallen outside retained history");
+    SwitchView::new()
+        .selected_when(move || {
+            let files = selected.files();
+            if files.placement_activity_history_truncated {
+                2
+            } else if files.placement_activity_partial {
+                1
+            } else {
+                0
+            }
+        })
+        .with_child(SizedBox::new())
+        .with_child(retained)
+        .with_child(truncated)
+}
+
+fn placement_activity_body_index(files: &FilesState) -> usize {
+    let visible = files
+        .placement_activity
+        .iter()
+        .filter(|activity| files.placement_activity_filter.includes(activity.status))
+        .count();
+    if visible > 0 {
+        6
+    } else if files.placement_activity_loading {
+        0
+    } else if files.placement_activity_error.is_some() {
+        1
+    } else if files.placement_activity_next_cursor.is_some() {
+        2
+    } else if files.placement_activity_history_truncated {
+        3
+    } else if files.placement_activity_partial {
+        4
+    } else {
+        5
+    }
+}
+
+fn apply_placement_activity_filter(shared: &Shared, filter: PlacementActivityFilter) {
+    if !shared.files_mut().set_placement_activity_filter(filter) {
+        return;
+    }
+    let waker = { shared.borrow().waker.clone() };
+    if let Some(waker) = waker {
+        shared.files_mut().ensure_worker(waker);
+    }
+    shared
+        .files_mut()
+        .request_placement_activity(false, Duration::ZERO);
+}
+
+fn placement_activity_filter_radio(
+    shared: &Shared,
+    reader: &ThemeReader,
+    selected: PlacementActivityFilter,
+    filter: PlacementActivityFilter,
+    label: &'static str,
+) -> RadioButton {
+    let changed = shared.clone();
+    RadioButton::new(label)
+        .framed()
+        .selected(selected == filter)
+        .theme_when(clone_reader(reader))
+        .on_select(move || apply_placement_activity_filter(&changed, filter))
+}
+
+fn placement_activity_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("placement reconciliation activity filter", |key| {
+            key.placement_activity.filter
+        });
+    let filter_shared = shared.clone();
+    let filter_reader = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |selected| {
+        WidgetPod::new(
+            SemanticRegion::new(
+                "Reconciliation activity filter",
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .with_child(placement_activity_filter_radio(
+                        &filter_shared,
+                        &filter_reader,
+                        *selected,
+                        PlacementActivityFilter::All,
+                        "All",
+                    ))
+                    .with_child(placement_activity_filter_radio(
+                        &filter_shared,
+                        &filter_reader,
+                        *selected,
+                        PlacementActivityFilter::Active,
+                        "Active",
+                    ))
+                    .with_child(placement_activity_filter_radio(
+                        &filter_shared,
+                        &filter_reader,
+                        *selected,
+                        PlacementActivityFilter::Failed,
+                        "Failed",
+                    ))
+                    .with_child(placement_activity_filter_radio(
+                        &filter_shared,
+                        &filter_reader,
+                        *selected,
+                        PlacementActivityFilter::Completed,
+                        "Done",
+                    )),
+            )
+            .role(SemanticsRole::RadioGroup)
+            .description("Filter reconciliation jobs by durable status"),
+        )
+    })
+}
+
+fn scroll_placement_activity_summary(state: &ScrollState, delta: f32, ctx: &mut EventCtx) {
+    let current = state.current_offset();
+    let max = state.max_offset();
+    let next = sui::Vector::new(current.x, (current.y + delta).clamp(0.0, max.y));
+    if state.set_offset(next) {
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_paint();
+        ctx.request_semantics();
+    }
+}
+
+fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+    let counts = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(placement_activity_count_badge(
+            shared,
+            reader,
+            Status::Running,
+        ))
+        .with_child(placement_activity_count_badge(
+            shared,
+            reader,
+            Status::Retrying,
+        ))
+        .with_child(placement_activity_count_badge(
+            shared,
+            reader,
+            Status::Failed,
+        ))
+        .with_child(placement_activity_count_badge(
+            shared,
+            reader,
+            Status::Completed,
+        ))
+        .with_child(placement_activity_count_badge(
+            shared,
+            reader,
+            Status::Superseded,
+        ));
+    let filter = placement_activity_filter_control(shared, reader);
+    let connection = {
+        let label_shared = shared.clone();
+        let tone_shared = shared.clone();
+        StatusBadge::dynamic("Reading cluster activity", move || {
+            let files = label_shared.files();
+            if files.placement_activity_loading {
+                "Refreshing cluster activity".to_string()
+            } else if let Some(error) = files.placement_activity_error.as_deref() {
+                format!("Last cluster read failed · {}", middle_short(error, 48))
+            } else if files.live_updates_error.is_some() {
+                "Polling snapshots · live updates disconnected".to_string()
+            } else if files.placement_activity_history_truncated {
+                "Monitoring available cluster activity".to_string()
+            } else if files.placement_activity_partial {
+                "Monitoring active jobs and retained history".to_string()
+            } else if files.placement_activity_has_active_jobs() {
+                "Monitoring active reconciliation jobs".to_string()
+            } else {
+                "Latest retained activity loaded".to_string()
+            }
+        })
+        .icon(IconGlyph::Storage)
+        .tone_when(move || {
+            let files = tone_shared.files();
+            if files.placement_activity_error.is_some()
+                || files.live_updates_error.is_some()
+                || files.placement_activity_history_truncated
+            {
+                SemanticTone::Warning
+            } else if files.placement_activity_loading
+                || files.placement_activity_partial
+                || files.placement_activity_has_active_jobs()
+            {
+                SemanticTone::Info
+            } else {
+                SemanticTone::Success
+            }
+        })
+        .theme_when(clone_reader(reader))
+    };
+    let refreshed = {
+        let shared = shared.clone();
+        Label::dynamic("Waiting for the first cluster snapshot", move || {
+            let files = shared.files();
+            files
+                .placement_activity_refreshed_at_unix_nanos
+                .map(|time| {
+                    let history = if files.placement_activity_next_cursor.is_some() {
+                        "older matching activity is available"
+                    } else if files.placement_activity_history_truncated {
+                        "older terminal history is truncated"
+                    } else if files.placement_activity_partial {
+                        "retained operational history is loaded"
+                    } else {
+                        "all available matching activity is loaded"
+                    };
+                    format!(
+                        "Last snapshot {} · {} loaded {} jobs · {history}",
+                        placement_activity_relative_time(time),
+                        files.placement_activity.len(),
+                        files.placement_activity_filter.label(),
+                    )
+                })
+                .unwrap_or_else(|| "Waiting for the first cluster snapshot".to_string())
+        })
+        .theme(reader())
+    };
+    let header = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(8.0)
+        .with_child(placement_activity_error_notice(shared, reader))
+        .with_child(placement_activity_stream_notice(shared, reader))
+        .with_child(placement_activity_completeness_notice(shared, reader))
+        .with_child(counts)
+        .with_child(connection)
+        .with_child(refreshed);
+
+    let body_shared = shared.clone();
+    let content = SwitchView::new()
+        .selected_when(move || placement_activity_body_index(&body_shared.files()))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Hourglass,
+            "Loading reconciliation activity",
+            "Reading recent durable placement jobs from the cluster control plane.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Alert,
+            "Activity temporarily unavailable",
+            "The full cluster error is shown above. Retry after the daemon or cluster connection recovers.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::History,
+            "No matching jobs in loaded activity",
+            "Load older activity to search earlier jobs, or change the status filter.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Alert,
+            "Available activity history is incomplete",
+            "The cluster cannot prove that no matching job exists. See the retained-history notice above.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::History,
+            "No matching jobs in retained operational history",
+            "Active jobs are queried separately. Older-daemon terminal activity may not appear in retained history.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Check,
+            "No matching reconciliation jobs",
+            "Change the filter or apply a placement policy to create a durable reconciliation job.",
+        ))
+        .with_child(placement_activity_virtual_list(shared, reader));
+
+    let load_older = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        sui::Button::new("Load older activity")
+            .appearance(ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || {
+                let files = enabled.files();
+                files.placement_activity_next_cursor.is_some() && !files.placement_activity_loading
+            })
+            .on_press(move || action.files_mut().load_older_placement_activity())
+    };
+    let summary_scroll_state = ScrollState::new();
+    let summary_scroll = ScrollView::vertical(
+        WidgetPadding::new(
+            Insets {
+                left: 2.0,
+                top: 2.0,
+                right: 10.0,
+                bottom: 12.0,
+            },
+            header,
+        )
+        .fill_child_width(),
+    )
+    .state(summary_scroll_state.clone())
+    .name("Reconciliation activity summary");
+    let previous_summary = {
+        let enabled = summary_scroll_state.clone();
+        let action = summary_scroll_state.clone();
+        IconButton::new(IconGlyph::ChevronUp, "Previous activity summary")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || enabled.current_offset().y > 0.5)
+            .on_press_with_ctx(move |ctx| scroll_placement_activity_summary(&action, -140.0, ctx))
+    };
+    let next_summary = {
+        let enabled = summary_scroll_state.clone();
+        let action = summary_scroll_state.clone();
+        IconButton::new(IconGlyph::ChevronDown, "Next activity summary")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || enabled.current_offset().y + 0.5 < enabled.max_offset().y)
+            .on_press_with_ctx(move |ctx| scroll_placement_activity_summary(&action, 140.0, ctx))
+    };
+    let summary = Flex::horizontal()
+        .align_items(Alignment::Stretch)
+        .with_item(summary_scroll, FlexItem::fill().min_width(0.0))
+        .with_item(
+            Stack::vertical()
+                .alignment(Alignment::Center)
+                .spacing(6.0)
+                .with_child(previous_summary)
+                .with_child(next_summary),
+            FlexItem::new().no_shrink(),
+        );
+    let header_with_filter = Dock::new(summary).bottom(
+        44.0,
+        WidgetPadding::new(
+            Insets {
+                left: 2.0,
+                top: 4.0,
+                right: 2.0,
+                bottom: 4.0,
+            },
+            filter,
+        )
+        .fill_child_width(),
+    );
+    let body = Dock::new(content)
+        .top(204.0, header_with_filter)
+        .bottom(
+            44.0,
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .with_item(load_older, FlexItem::new().no_shrink()),
+        )
+        .fallback_width(720.0)
+        .fallback_body_height(650.0);
+    let refresh = {
+        let shared = shared.clone();
+        sui::Button::new("Refresh")
+            .icon(IconGlyph::Redo)
+            .appearance(ButtonAppearance::Tonal)
+            .tone(SemanticTone::Accent)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let shared = shared.clone();
+                move || !shared.files().placement_activity_loading
+            })
+            .on_press(move || {
+                let waker = { shared.borrow().waker.clone() };
+                if let Some(waker) = waker {
+                    shared.files_mut().ensure_worker(waker);
+                }
+                shared.files_mut().refresh_placement_activity();
+            })
+    };
+    let close = {
+        let shared = shared.clone();
+        sui::Button::new("Close")
+            .appearance(ButtonAppearance::Outline)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                shared.files_mut().close_placement_activity();
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let dismiss = shared.clone();
+    WidgetPod::new(
+        SideSheet::new("Reconciliation activity", body)
+            .theme_when(clone_reader(reader))
+            .description("Cluster DFS placement jobs and repair progress")
+            .placement(SideSheetPlacement::Right)
+            .width(780.0)
+            .modal(true)
+            .dismiss_on_scrim(true)
+            .action(refresh)
+            .action(close)
+            .on_dismiss(move || dismiss.files_mut().close_placement_activity()),
+    )
+}
+
 fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let overlay = shared.files().compact_overlay?;
     let (title, description, selected) = match overlay {
@@ -15634,6 +17217,8 @@ fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
         files_document_sheet(shared, reader)
     } else if shared.files().action_prompt.is_some() {
         files_action_dialog(shared, reader)
+    } else if shared.files().placement_activity_open {
+        Some(files_placement_activity_sheet(shared, reader))
     } else {
         compact_files_dialog(shared, reader)
     }
@@ -16557,6 +18142,573 @@ mod tests {
         }
     }
 
+    fn placement_activity_summary(
+        job_id: &str,
+        status: sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus,
+        created_at_unix_nanos: u64,
+    ) -> sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary {
+        use sinomo_runtime::dfs::{
+            DfsPlacementReconciliationActivityStatus as Status,
+            DfsPlacementReconciliationState as Phase,
+        };
+        let mut job = pending_placement_job();
+        job.job_id = job_id.to_string();
+        job.path = format!("/datasets/{job_id}");
+        job.created_at_unix_nanos = created_at_unix_nanos;
+        job.updated_at_unix_nanos = created_at_unix_nanos.saturating_add(1);
+        match status {
+            Status::Running => {
+                job.state = Phase::Scanning;
+                job.last_error = None;
+            }
+            Status::Retrying => {
+                job.state = Phase::Repairing;
+                job.last_error = Some("node-b is temporarily unreachable".to_string());
+            }
+            Status::Failed => {
+                job.state = Phase::Failed;
+                job.last_error = Some("placement policy became invalid".to_string());
+            }
+            Status::Completed => {
+                job.state = Phase::Completed;
+                job.scanned_object_count = job.total_object_count;
+                job.completed_repair_count = job.scheduled_repair_count;
+                job.pending_repair_count = 0;
+                job.last_error = None;
+            }
+            Status::Superseded => {
+                job.state = Phase::Failed;
+                job.last_error = Some("superseded by a newer placement policy".to_string());
+            }
+        }
+        let mut summary =
+            sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary::from(&job);
+        summary.status = status;
+        summary
+    }
+
+    #[test]
+    fn reconciliation_activity_uses_an_independent_request_lane_and_preserves_history() {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        state.pending_placement_request_id = Some(91);
+
+        state.open_placement_activity(None);
+        let command = rx.recv().expect("activity request");
+        let request_id = match command {
+            FilesWorkerCommand::PlacementActivity {
+                request_id,
+                filter,
+                cursor,
+                append,
+            } => {
+                assert_eq!(filter, PlacementActivityFilter::All);
+                assert!(cursor.is_none());
+                assert!(!append);
+                request_id
+            }
+            _ => panic!("expected placement activity request"),
+        };
+        assert_eq!(state.pending_placement_request_id, Some(91));
+
+        let completed = placement_activity_summary("completed-job", Status::Completed, 20);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id,
+                filter: PlacementActivityFilter::All,
+                append: false,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![completed.clone()],
+                        next_cursor: None,
+                        ..Default::default()
+                    }
+                ),
+            })
+        );
+        assert_eq!(state.placement_activity, vec![completed]);
+        assert!(state.placement_activity_error.is_none());
+        assert_eq!(state.pending_placement_request_id, Some(91));
+
+        state.pending_placement_activity_request_id = Some(72);
+        let newer = placement_activity_summary("newer-job", Status::Completed, 30);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: 72,
+                filter: PlacementActivityFilter::All,
+                append: false,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![newer.clone()],
+                        next_cursor: None,
+                        ..Default::default()
+                    }
+                ),
+            })
+        );
+        assert_eq!(state.placement_activity[0], newer);
+        assert_eq!(state.placement_activity.len(), 1);
+
+        state.close_placement_activity();
+        assert!(!state.placement_activity_open);
+        assert_eq!(state.placement_activity.len(), 1);
+    }
+
+    #[test]
+    fn reconciliation_activity_append_deduplicates_by_job_revision() {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let mut current = placement_activity_summary("same-job", Status::Completed, 10);
+        current.revision = 8;
+        state.placement_activity = vec![current.clone()];
+        state.placement_activity_open = true;
+        state.pending_placement_activity_request_id = Some(44);
+        state.pending_placement_activity_append = true;
+
+        let mut stale = current.clone();
+        stale.revision = 7;
+        stale.updated_object_count = 999;
+        let older = placement_activity_summary("older-job", Status::Failed, 5);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: 44,
+                filter: PlacementActivityFilter::All,
+                append: true,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![stale, older.clone()],
+                        next_cursor: None,
+                        ..Default::default()
+                    }
+                ),
+            })
+        );
+
+        assert_eq!(state.placement_activity.len(), 2);
+        assert_eq!(state.placement_activity[0], current);
+        assert_eq!(state.placement_activity[1], older);
+        assert_eq!(state.placement_activity[0].updated_object_count, 1);
+    }
+
+    #[test]
+    fn reconciliation_activity_filter_groups_running_and_retrying_as_active() {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        assert!(PlacementActivityFilter::Active.includes(Status::Running));
+        assert!(PlacementActivityFilter::Active.includes(Status::Retrying));
+        assert!(!PlacementActivityFilter::Active.includes(Status::Failed));
+        assert!(!PlacementActivityFilter::Active.includes(Status::Completed));
+        assert!(!PlacementActivityFilter::Active.includes(Status::Superseded));
+        assert!(PlacementActivityFilter::Failed.includes(Status::Failed));
+        assert!(!PlacementActivityFilter::Failed.includes(Status::Superseded));
+        assert!(PlacementActivityFilter::Completed.includes(Status::Completed));
+        assert!(PlacementActivityFilter::All.includes(Status::Superseded));
+    }
+
+    #[test]
+    fn reconciliation_activity_filter_queries_the_server_and_evicts_finished_active_jobs() {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        state.placement_activity_open = true;
+
+        assert!(state.set_placement_activity_filter(PlacementActivityFilter::Active));
+        state.refresh_placement_activity();
+        let (first_request_id, first_filter) = match rx.recv().expect("active activity request") {
+            FilesWorkerCommand::PlacementActivity {
+                request_id,
+                filter,
+                cursor,
+                append,
+            } => {
+                assert!(cursor.is_none());
+                assert!(!append);
+                (request_id, filter)
+            }
+            _ => panic!("expected placement activity request"),
+        };
+        assert_eq!(first_filter, PlacementActivityFilter::Active);
+        assert_eq!(
+            first_filter.request_statuses(),
+            vec![Status::Running, Status::Retrying]
+        );
+
+        let running = placement_activity_summary("active-job", Status::Running, 20);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: first_request_id,
+                filter: first_filter,
+                append: false,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![running.clone()],
+                        ..Default::default()
+                    },
+                ),
+            })
+        );
+        assert_eq!(state.placement_activity, vec![running]);
+
+        // A later successful Active head is authoritative: once the job completes, the daemon
+        // omits it from this server-side query and the UI must evict the stale running row.
+        state.refresh_placement_activity();
+        let second_request_id = match rx.recv().expect("authoritative activity refresh") {
+            FilesWorkerCommand::PlacementActivity {
+                request_id,
+                filter,
+                cursor,
+                append,
+            } => {
+                assert_eq!(filter, PlacementActivityFilter::Active);
+                assert!(cursor.is_none());
+                assert!(!append);
+                request_id
+            }
+            _ => panic!("expected placement activity request"),
+        };
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: second_request_id,
+                filter: PlacementActivityFilter::Active,
+                append: false,
+                result: Ok(Default::default()),
+            })
+        );
+        assert!(state.placement_activity.is_empty());
+        state.close_placement_activity();
+    }
+
+    #[test]
+    fn reconciliation_activity_active_head_refresh_evicts_stale_paginated_rows() {
+        use sinomo_runtime::dfs::{
+            DfsPlacementReconciliationActivityCursor as Cursor,
+            DfsPlacementReconciliationActivityStatus as Status,
+        };
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.placement_activity_open = true;
+        state.placement_activity_filter = PlacementActivityFilter::Active;
+        state.placement_activity_loaded_filter = PlacementActivityFilter::Active;
+        let head = placement_activity_summary("head-active", Status::Running, 30);
+        let paginated = placement_activity_summary("older-active", Status::Retrying, 10);
+        state.placement_activity = vec![head.clone(), paginated];
+        state
+            .placement_activity_head_job_ids
+            .insert(head.job_id.clone());
+        state.placement_activity_next_cursor = Some(Cursor {
+            created_at_unix_nanos: 10,
+            job_id: "older-active".to_string(),
+        });
+        state.pending_placement_activity_request_id = Some(77);
+
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: 77,
+                filter: PlacementActivityFilter::Active,
+                append: false,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![head.clone()],
+                        next_cursor: Some(Cursor {
+                            created_at_unix_nanos: 20,
+                            job_id: "head-active".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            })
+        );
+        assert_eq!(state.placement_activity, vec![head]);
+        assert_eq!(
+            state.placement_activity_next_cursor,
+            Some(Cursor {
+                created_at_unix_nanos: 20,
+                job_id: "head-active".to_string(),
+            })
+        );
+        state.close_placement_activity();
+    }
+
+    #[test]
+    fn reconciliation_activity_all_head_refresh_drops_only_stale_paginated_active_rows() {
+        use sinomo_runtime::dfs::{
+            DfsPlacementReconciliationActivityCursor as Cursor,
+            DfsPlacementReconciliationActivityStatus as Status,
+        };
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.placement_activity_open = true;
+        let old_head = placement_activity_summary("old-terminal-head", Status::Completed, 40);
+        let new_head = placement_activity_summary("new-terminal-head", Status::Completed, 50);
+        let stale_active = placement_activity_summary("older-active", Status::Retrying, 20);
+        let retained_terminal = placement_activity_summary("older-terminal", Status::Failed, 10);
+        state.placement_activity = vec![old_head.clone(), stale_active, retained_terminal.clone()];
+        state
+            .placement_activity_head_job_ids
+            .insert(old_head.job_id.clone());
+        state.placement_activity_next_cursor = Some(Cursor {
+            created_at_unix_nanos: 10,
+            job_id: "older-terminal".to_string(),
+        });
+        state.pending_placement_activity_request_id = Some(88);
+
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: 88,
+                filter: PlacementActivityFilter::All,
+                append: false,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![new_head.clone()],
+                        next_cursor: Some(Cursor {
+                            created_at_unix_nanos: 30,
+                            job_id: "refreshed-tail".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            })
+        );
+        assert_eq!(
+            state.placement_activity,
+            vec![new_head, old_head, retained_terminal]
+        );
+        assert_eq!(
+            state.placement_activity_next_cursor,
+            Some(Cursor {
+                created_at_unix_nanos: 30,
+                job_id: "refreshed-tail".to_string(),
+            }),
+            "dropping an absent active row must restart pagination at the refreshed tail"
+        );
+        assert!(!state.placement_activity_has_active_jobs());
+        state.close_placement_activity();
+    }
+
+    #[test]
+    fn reconciliation_activity_terminal_head_shift_preserves_rows_and_loaded_tail_cursor() {
+        use sinomo_runtime::dfs::{
+            DfsPlacementReconciliationActivityCursor as Cursor,
+            DfsPlacementReconciliationActivityStatus as Status,
+        };
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.placement_activity_open = true;
+        state.placement_activity_filter = PlacementActivityFilter::Completed;
+        state.placement_activity_loaded_filter = PlacementActivityFilter::Completed;
+        let old_head = placement_activity_summary("old-head", Status::Completed, 30);
+        let loaded_tail = placement_activity_summary("loaded-tail", Status::Completed, 10);
+        let new_head = placement_activity_summary("new-head", Status::Completed, 40);
+        state.placement_activity = vec![old_head.clone(), loaded_tail.clone()];
+        state
+            .placement_activity_head_job_ids
+            .insert(old_head.job_id.clone());
+        let old_tail_cursor = Cursor {
+            created_at_unix_nanos: 10,
+            job_id: loaded_tail.job_id.clone(),
+        };
+        state.placement_activity_next_cursor = Some(old_tail_cursor.clone());
+        state.pending_placement_activity_request_id = Some(89);
+
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: 89,
+                filter: PlacementActivityFilter::Completed,
+                append: false,
+                result: Ok(
+                    sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage {
+                        activities: vec![new_head.clone()],
+                        next_cursor: Some(Cursor {
+                            created_at_unix_nanos: 35,
+                            job_id: "new-page-tail".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            })
+        );
+        assert_eq!(
+            state.placement_activity,
+            vec![new_head, old_head, loaded_tail]
+        );
+        assert_eq!(state.placement_activity_next_cursor, Some(old_tail_cursor));
+        state.close_placement_activity();
+    }
+
+    #[test]
+    fn reconciliation_activity_open_and_ready_coalesce_to_one_follow_up_read() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+
+        state.open_placement_activity(None);
+        let first_request_id = match rx.recv().expect("initial activity request") {
+            FilesWorkerCommand::PlacementActivity { request_id, .. } => request_id,
+            _ => panic!("expected placement activity request"),
+        };
+        assert!(
+            state.apply_live_update(FilesLiveUpdate::Item(DaemonEventStreamItem::Ready {
+                subscription_id: "activity-test".to_string(),
+            },))
+        );
+        assert!(state.placement_activity_refresh_dirty);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: first_request_id,
+                filter: PlacementActivityFilter::All,
+                append: false,
+                result: Ok(Default::default()),
+            })
+        );
+        let follow_up_request_id = match rx.recv().expect("coalesced follow-up activity request") {
+            FilesWorkerCommand::PlacementActivity {
+                request_id,
+                filter,
+                cursor,
+                append,
+            } => {
+                assert_eq!(filter, PlacementActivityFilter::All);
+                assert!(cursor.is_none());
+                assert!(!append);
+                request_id
+            }
+            _ => panic!("expected placement activity request"),
+        };
+        assert_ne!(first_request_id, follow_up_request_id);
+        assert!(!state.placement_activity_refresh_dirty);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        state.close_placement_activity();
+    }
+
+    #[test]
+    fn reconciliation_activity_load_older_preempts_a_background_poll() {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor as Cursor;
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        state.placement_activity_open = true;
+        state.placement_activity_next_cursor = Some(Cursor {
+            created_at_unix_nanos: 10,
+            job_id: "loaded-tail".to_string(),
+        });
+        state.pending_placement_activity_request_id = Some(40);
+        state
+            .placement_activity_in_flight_generation
+            .store(40, Ordering::Release);
+
+        state.load_older_placement_activity();
+        let append_request_id = match rx.recv().expect("queued explicit older-page request") {
+            FilesWorkerCommand::PlacementActivity {
+                request_id,
+                filter,
+                cursor,
+                append,
+            } => {
+                assert_eq!(filter, PlacementActivityFilter::All);
+                assert_eq!(cursor, state.placement_activity_next_cursor);
+                assert!(append);
+                request_id
+            }
+            _ => panic!("expected placement activity request"),
+        };
+        assert_ne!(append_request_id, 40);
+        assert_eq!(
+            state.pending_placement_activity_request_id,
+            Some(append_request_id)
+        );
+        assert!(state.pending_placement_activity_append);
+
+        assert!(
+            !state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: 40,
+                filter: PlacementActivityFilter::All,
+                append: false,
+                result: Ok(Default::default()),
+            })
+        );
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementActivity {
+                request_id: append_request_id,
+                filter: PlacementActivityFilter::All,
+                append: true,
+                result: Ok(Default::default()),
+            })
+        );
+        state.close_placement_activity();
+    }
+
+    #[test]
+    fn reconciliation_activity_cache_survives_same_endpoint_rebind_but_not_a_new_endpoint() {
+        use sinomo_runtime::api::{DaemonPaths, DaemonRunOptions, DaemonStatus};
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        fn daemon_backend(port: u16) -> Backend {
+            let mut backend = Backend::local_fallback();
+            let options = DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port,
+            };
+            let paths = DaemonPaths::new(backend.data_dir.as_ref());
+            backend.connection =
+                Connection::Daemon(Box::new(DaemonStatus::new(&options, &paths, None)));
+            backend
+        }
+
+        let first_backend = daemon_backend(31_353);
+        let mut state = FilesState::new(&first_backend);
+        let retained = placement_activity_summary("retained-job", Status::Failed, 20);
+        state.placement_activity_open = true;
+        state.placement_activity_filter = PlacementActivityFilter::Failed;
+        state.placement_activity_loaded_filter = PlacementActivityFilter::Failed;
+        state.placement_activity = vec![retained.clone()];
+        state.placement_activity_error = Some("full cached cluster read failure".to_string());
+        state.placement_activity_refreshed_at_unix_nanos = Some(20);
+        state.placement_activity_origin_daemon_address = state.daemon_address.clone();
+        // Force a same-address recovery transition through the rebind path.
+        state.daemon_unavailable_detail = Some("temporarily offline".to_string());
+
+        assert!(state.rebind_backend(&first_backend, None));
+        assert!(state.placement_activity_open);
+        assert_eq!(
+            state.placement_activity_filter,
+            PlacementActivityFilter::Failed
+        );
+        assert_eq!(state.placement_activity, vec![retained]);
+        assert_eq!(
+            state.placement_activity_error.as_deref(),
+            Some("full cached cluster read failure")
+        );
+        assert_eq!(state.placement_activity_refreshed_at_unix_nanos, Some(20));
+
+        state.close_placement_activity();
+        let second_backend = daemon_backend(31_354);
+        assert!(state.rebind_backend(&second_backend, None));
+        assert!(state.placement_activity.is_empty());
+        assert!(state.placement_activity_error.is_none());
+        assert!(state.placement_activity_refreshed_at_unix_nanos.is_none());
+        assert_eq!(
+            state.placement_activity_origin_daemon_address.as_deref(),
+            second_backend.connection.daemon_address()
+        );
+    }
+
     #[test]
     fn placement_editor_allows_safe_override_without_dropping_reconciliation_poll() {
         let backend = Backend::local_fallback();
@@ -17225,6 +19377,306 @@ mod tests {
         assert!(snapshot.accessibility.nodes.iter().any(|node| {
             node.role == sui::SemanticsRole::RadioButton
                 && node.name.as_deref() == Some("Eventual placement")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_activity_sheet_exposes_cluster_statuses_and_virtual_filtering()
+    -> sui::Result<()> {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.clustered = true;
+            files.placement_activity_open = true;
+            files.placement_activity = vec![
+                placement_activity_summary("running-job", Status::Running, 40),
+                placement_activity_summary("retrying-job", Status::Retrying, 30),
+                placement_activity_summary("failed-job", Status::Failed, 20),
+                placement_activity_summary("completed-job", Status::Completed, 10),
+            ];
+            files.placement_activity_refreshed_at_unix_nanos = Some(40);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Reconciliation activity")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(860.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+
+        assert!(window.get_by_text("Reconciliation activity").count()? >= 1);
+        for label in [
+            "1 Running loaded",
+            "1 Retrying loaded",
+            "1 Failed loaded",
+            "1 Completed loaded",
+            "0 Superseded loaded",
+        ] {
+            assert_eq!(window.get_by_text(label).count()?, 1, "missing {label}");
+        }
+        let realized_rows = window.get_by_role(SemanticsRole::ProgressBar).count()?;
+        assert!((2..=4).contains(&realized_rows));
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show path")
+                .count()?,
+            realized_rows
+        );
+
+        let failed_filter = window
+            .get_by_role(SemanticsRole::RadioButton)
+            .with_name("Failed");
+        failed_filter.expect().to_be_visible()?;
+        failed_filter.click()?;
+        app.run_until_idle()?;
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::Failed
+        );
+        assert_eq!(
+            window.get_by_role(SemanticsRole::ProgressBar).count()?,
+            1,
+            "the keyed virtual collection should retain only the failed row after filtering"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::ProgressBar)
+                .with_name("Reconciliation progress for /datasets/failed-job")
+                .count()?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_activity_compact_extra_large_keeps_offline_error_and_history_reachable()
+    -> sui::Result<()> {
+        use sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus as Status;
+
+        let full_error = "The cluster control plane rejected this activity read because the retained projection is temporarily unavailable on node oracle-eu-west-very-long-name.";
+        let live_error =
+            "The daemon event stream disconnected while waiting for DFS placement updates.";
+        let backend = Backend::local_fallback();
+        let mut app_state = AppState::ready(backend);
+        app_state.text_scale = AppTextScale::ExtraLarge;
+        let shared = Shared::new(app_state);
+        {
+            let mut files = shared.files_mut();
+            files.clustered = false;
+            files.loaded = true;
+            files.loading = false;
+            files.placement_activity_filter = PlacementActivityFilter::All;
+            files.placement_activity_loaded_filter = PlacementActivityFilter::All;
+            files.placement_activity = vec![
+                placement_activity_summary("failed-job", Status::Failed, 20),
+                placement_activity_summary("superseded-job", Status::Superseded, 10),
+            ];
+            files.placement_activity_error = Some(full_error.to_string());
+            files.live_updates_error = Some(live_error.to_string());
+            files.placement_activity_partial = true;
+            files.placement_activity_history_truncated = false;
+            files.placement_activity_refreshed_at_unix_nanos = Some(20);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact reconciliation activity")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(360.0, 640.0))))?;
+        app.run_until_idle()?;
+
+        let closed_snapshot = window.snapshot()?;
+        let activity_entrypoint = closed_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Reconciliation activity")
+            })
+            .expect("offline files toolbar keeps the activity center reachable");
+        assert!(!activity_entrypoint.state.disabled);
+
+        shared.files_mut().placement_activity_open = true;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        let dialog = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Dialog
+                    && node.name.as_deref() == Some("Reconciliation activity")
+            })
+            .expect("activity side sheet");
+        assert!(dialog.bounds.x() >= 0.0 && dialog.bounds.y() >= 0.0);
+        assert!(dialog.bounds.max_x() <= 360.0 && dialog.bounds.max_y() <= 640.0);
+
+        let header_bounds = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ScrollView
+                    && node.name.as_deref() == Some("Reconciliation activity summary")
+            })
+            .expect("scrollable activity summary")
+            .bounds;
+        let error_status = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Status
+                    && node.name.as_deref() == Some("Reconciliation activity read failed")
+            })
+            .expect("persistent activity error status");
+        assert_eq!(error_status.description.as_deref(), Some(full_error));
+        assert!(error_status.bounds.y() < header_bounds.max_y());
+
+        for button_name in ["Retry activity read", "Refresh", "Close"] {
+            let button = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(button_name)
+                })
+                .unwrap_or_else(|| panic!("missing {button_name} button"));
+            assert!(!button.state.disabled || button_name == "Refresh");
+            assert!(button.bounds.x() >= 0.0 && button.bounds.y() >= 0.0);
+            assert!(button.bounds.max_x() <= 360.0 && button.bounds.max_y() <= 640.0);
+        }
+
+        let next_summary = window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Next activity summary");
+        next_summary.expect().to_be_visible()?;
+        next_summary.click()?;
+        app.run_until_idle()?;
+        let live_snapshot = window.snapshot()?;
+        let live_status = live_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Status
+                    && node.name.as_deref() == Some("Live reconciliation updates disconnected")
+            })
+            .expect("live-update fallback status");
+        assert_eq!(live_status.description.as_deref(), Some(live_error));
+        assert!(
+            live_status.bounds.y() < header_bounds.max_y()
+                && live_status.bounds.max_y() > header_bounds.y(),
+            "live status {:?} must intersect header viewport {:?}",
+            live_status.bounds,
+            header_bounds
+        );
+
+        next_summary.click()?;
+        app.run_until_idle()?;
+        let retained_snapshot = window.snapshot()?;
+        let retained_status = retained_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Status
+                    && node.name.as_deref() == Some("Retained operational history")
+            })
+            .expect("neutral retained-history status");
+        assert!(
+            retained_status.bounds.y() < header_bounds.max_y()
+                && retained_status.bounds.max_y() > header_bounds.y()
+        );
+        assert_eq!(window.get_by_text("Retained history truncated").count()?, 0);
+
+        let filter_snapshot = window.snapshot()?;
+        let done_filter = filter_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::RadioButton && node.name.as_deref() == Some("Done")
+            })
+            .expect("compact Done filter");
+        assert!(
+            done_filter.bounds.x() >= dialog.bounds.x()
+                && done_filter.bounds.max_x() <= dialog.bounds.max_x()
+                && done_filter.bounds.y() >= dialog.bounds.y()
+                && done_filter.bounds.max_y() <= dialog.bounds.max_y()
+        );
+
+        // Navigating the summary never dismisses or clears the durable read error.
+        let previous_summary = window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Previous activity summary");
+        previous_summary.click()?;
+        previous_summary.click()?;
+        app.run_until_idle()?;
+        let restored_snapshot = window.snapshot()?;
+        let restored_error = restored_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Status
+                    && node.name.as_deref() == Some("Reconciliation activity read failed")
+            })
+            .expect("activity error remains after scrolling");
+        assert_eq!(restored_error.description.as_deref(), Some(full_error));
+        assert!(restored_error.bounds.y() < header_bounds.max_y());
+
+        let realized_rows = restored_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == SemanticsRole::ProgressBar)
+            .count();
+        let list_items = restored_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == SemanticsRole::ListItem)
+            .count();
+        assert!(realized_rows > 0);
+        assert_eq!(
+            list_items, realized_rows,
+            "each virtual row owns one list-item semantic node"
+        );
+        assert!(restored_snapshot.accessibility.nodes.iter().any(|node| {
+            node.name.as_deref() == Some("Replaced")
+                || node
+                    .description
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Replaced"))
         }));
         Ok(())
     }

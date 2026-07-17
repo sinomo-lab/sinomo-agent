@@ -76,6 +76,8 @@ pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE: &str =
     "/daemon/dfs/browser/placement-update-v2";
 pub const DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE: &str =
     "/daemon/dfs/browser/placement-progress";
+pub const DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE: &str =
+    "/daemon/dfs/browser/placement-activity";
 pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
@@ -98,6 +100,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
 ];
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -635,6 +638,41 @@ pub struct DaemonDfsBrowserPlacementProgressResponse {
     pub reconciliation: sinomo_dfs::DfsPlacementReconciliationJob,
 }
 
+fn default_daemon_dfs_browser_placement_activity_limit() -> usize {
+    sinomo_dfs::DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementActivityRequest {
+    /// Empty means every activity status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<sinomo_dfs::DfsPlacementReconciliationActivityStatus>,
+    /// Optional normalized SIFS path boundary. `/team` includes `/team/a` but
+    /// not `/teammate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<sinomo_dfs::DfsPlacementReconciliationActivityCursor>,
+    #[serde(default = "default_daemon_dfs_browser_placement_activity_limit")]
+    pub limit: usize,
+}
+
+impl Default for DaemonDfsBrowserPlacementActivityRequest {
+    fn default() -> Self {
+        Self {
+            statuses: Vec::new(),
+            path_prefix: None,
+            cursor: None,
+            limit: default_daemon_dfs_browser_placement_activity_limit(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementActivityResponse {
+    pub page: sinomo_dfs::DfsPlacementReconciliationActivityPage,
+}
+
 /// Main-daemon-only operator surface for inspecting and recovering a stranded
 /// DFS placement mutation permit. This route is intentionally separate from
 /// the local-command browser API and is cataloged with admin authorization.
@@ -736,6 +774,7 @@ mod tests {
             DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
             DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
             DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
         ] {
             assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&route));
         }
@@ -768,6 +807,43 @@ mod tests {
                 .is_err(),
             "the fail-closed route must not default a missing preview token"
         );
+    }
+
+    #[test]
+    fn placement_activity_request_defaults_to_a_bounded_unfiltered_page() {
+        let request: DaemonDfsBrowserPlacementActivityRequest =
+            serde_json::from_value(serde_json::json!({})).expect("default activity request");
+        assert!(request.statuses.is_empty());
+        assert!(request.path_prefix.is_none());
+        assert!(request.cursor.is_none());
+        assert_eq!(
+            request.limit,
+            sinomo_dfs::DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
+        );
+
+        let encoded = serde_json::to_value(DaemonDfsBrowserPlacementActivityRequest {
+            statuses: vec![sinomo_dfs::DfsPlacementReconciliationActivityStatus::Retrying],
+            path_prefix: Some("/team".to_string()),
+            cursor: Some(sinomo_dfs::DfsPlacementReconciliationActivityCursor {
+                created_at_unix_nanos: 42,
+                job_id: "activity-job".to_string(),
+            }),
+            limit: 25,
+        })
+        .expect("encode activity request");
+        let decoded: DaemonDfsBrowserPlacementActivityRequest =
+            serde_json::from_value(encoded).expect("decode activity request");
+        assert_eq!(decoded.limit, 25);
+        assert_eq!(
+            decoded.statuses,
+            vec![sinomo_dfs::DfsPlacementReconciliationActivityStatus::Retrying]
+        );
+
+        let legacy_page: DaemonDfsBrowserPlacementActivityResponse =
+            serde_json::from_value(serde_json::json!({"page": {"activities": []}}))
+                .expect("activity completeness flags are backward-compatible defaults");
+        assert!(!legacy_page.page.partial);
+        assert!(!legacy_page.page.history_truncated);
     }
 
     #[test]

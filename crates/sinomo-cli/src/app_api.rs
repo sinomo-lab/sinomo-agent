@@ -5697,6 +5697,15 @@ pub type SifsPlacementScope = sinomo_runtime::dfs::DfsPlacementScope;
 pub type SifsPlacementPreview = sinomo_runtime::dfs::DfsPlacementPreview;
 pub type SifsPlacementPreviewToken = sinomo_runtime::dfs::DfsPlacementPreviewToken;
 pub type SifsPlacementReconciliationJob = sinomo_runtime::dfs::DfsPlacementReconciliationJob;
+pub type SifsPlacementActivityStatus =
+    sinomo_runtime::dfs::DfsPlacementReconciliationActivityStatus;
+pub type SifsPlacementActivityCursor =
+    sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor;
+pub type SifsPlacementActivitySummary =
+    sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary;
+pub type SifsPlacementActivityPage = sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage;
+pub type SifsPlacementActivityRequest =
+    sinomo_runtime::api::DaemonDfsBrowserPlacementActivityRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsPlacementUpdateOutcome {
@@ -6156,6 +6165,21 @@ impl SifsBrowser {
         }
     }
 
+    pub fn placement_activity(
+        &self,
+        request: SifsPlacementActivityRequest,
+    ) -> Result<SifsPlacementActivityPage, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.placement_activity(
+                &request.statuses,
+                request.path_prefix.as_deref(),
+                request.cursor.as_ref(),
+                request.limit,
+            ),
+            SifsBrowserBackend::Remote(remote) => remote.placement_activity(request),
+        }
+    }
+
     pub fn parent(&self, path: &str) -> Option<String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.parent_path(path),
@@ -6601,6 +6625,17 @@ impl RemoteSifsBrowser {
             },
         )?;
         Ok(response.reconciliation)
+    }
+
+    fn placement_activity(
+        &self,
+        request: SifsPlacementActivityRequest,
+    ) -> Result<SifsPlacementActivityPage, String> {
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementActivityResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
+            &request,
+        )?;
+        Ok(response.page)
     }
 }
 

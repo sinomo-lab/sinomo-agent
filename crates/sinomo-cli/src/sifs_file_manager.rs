@@ -16,11 +16,13 @@ use sinomo_runtime::dfs::{
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
     DfsPinAddRequest, DfsPinMode, DfsPlacementBlockingDiagnostic, DfsPlacementImpact,
     DfsPlacementNodePreview, DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
-    DfsPlacementPreviewToken, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsPlacementScope, DfsPosixCreateAttrs, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids,
-    content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    default_dfs_pin_root, fallback_dfs_node_id, metadata_shards_prefix,
+    DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
+    DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
+    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
+    DfsPosixCreateAttrs, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
+    fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
     preview_placement_with_unavailable_nodes,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
@@ -683,6 +685,32 @@ impl SifsFileManagerBackend {
             .placement_reconciliation(&sifs_file_system_id(), job_id)
             .map_err(|error| format!("cannot read SIFS placement progress: {error}"))?
             .ok_or_else(|| format!("unknown SIFS placement reconciliation job: {job_id}"))
+    }
+
+    pub(crate) fn placement_activity(
+        &self,
+        statuses: &[DfsPlacementReconciliationActivityStatus],
+        path_prefix: Option<&str>,
+        cursor: Option<&DfsPlacementReconciliationActivityCursor>,
+        limit: usize,
+    ) -> Result<DfsPlacementReconciliationActivityPage, String> {
+        if cursor.is_some_and(|cursor| cursor.job_id.trim().is_empty()) {
+            return Err("SIFS placement activity cursor has an empty job id".to_string());
+        }
+        let path_prefix = path_prefix.map(normalize_sifs_path).transpose()?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
+        let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
+        let page = DfsControlPlaneStore::new(&mut kv)
+            .placement_reconciliation_activity(
+                &sifs_file_system_id(),
+                statuses,
+                path_prefix.as_deref(),
+                cursor,
+                limit,
+            )
+            .map_err(|error| format!("cannot read SIFS placement activity: {error}"))?;
+        Ok(page)
     }
 
     pub(crate) fn list_dir_shallow(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
@@ -3642,6 +3670,112 @@ mod tests {
             ],
             "required or selected unavailable nodes should block without duplicates"
         );
+    }
+
+    #[test]
+    fn placement_activity_rejects_an_empty_cursor_before_cluster_access() {
+        let root = temp_sifs_data_dir("placement-activity-empty-cursor");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let error = backend
+            .placement_activity(
+                &[],
+                None,
+                Some(&DfsPlacementReconciliationActivityCursor {
+                    created_at_unix_nanos: 1,
+                    job_id: "  ".to_string(),
+                }),
+                50,
+            )
+            .expect_err("empty activity cursor must be rejected");
+        assert!(error.contains("empty job id"));
+    }
+
+    #[test]
+    fn placement_activity_local_browser_reads_compact_filtered_state() {
+        let root = temp_sifs_data_dir("placement-activity-local-browser");
+        let data_dir = SinomoDataDir::new(&root);
+        // Open before installing the synthetic cluster snapshot so the test
+        // remains an isolated local browser and never probes a daemon.
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let owner =
+            NodeId::from_legacy_named("placement-activity-local-owner").expect("activity owner");
+        let file_system_id = sifs_file_system_id();
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id.clone(),
+            display_name: "SIFS".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let policy = DfsPlacementPolicy::new(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            1,
+        )
+        .expect("activity policy");
+        let mut desired = base.clone();
+        desired.subtree_policies.push(
+            sinomo_runtime::dfs::normalize_placement_rule(
+                "/team/report.txt",
+                DfsPlacementScope::SelfOnly,
+                policy,
+            )
+            .expect("activity rule"),
+        );
+        let job = DfsPlacementReconciliationJob {
+            schema_version: sinomo_runtime::dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
+            job_id: "placement-activity-local-job".to_string(),
+            file_system_id: file_system_id.clone(),
+            path: "/team/report.txt".to_string(),
+            scope: DfsPlacementScope::SelfOnly,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: vec![DfsNodeAdvertisement::content(owner)],
+            accepted_config: None,
+            state: DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: 10,
+            updated_at_unix_nanos: 10,
+            last_error: Some("temporary route failure".to_string()),
+        };
+        let mut kv = sinomo_runtime::kv::InProcessKvStore::new();
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &desired, &job)
+                .expect("activity Apply")
+        );
+        drop(store);
+        sinomo_runtime::kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &kv.try_snapshot().expect("activity KV snapshot"),
+        )
+        .expect("write activity snapshot");
+
+        let page = backend
+            .placement_activity(
+                &[DfsPlacementReconciliationActivityStatus::Retrying],
+                Some("/team/../team"),
+                None,
+                10,
+            )
+            .expect("local filtered activity");
+        assert_eq!(page.activities.len(), 1);
+        assert_eq!(page.activities[0].job_id, job.job_id);
+        assert!(
+            page.partial,
+            "without cluster capability state the local browser must stay conservative"
+        );
+        assert!(!page.history_truncated);
     }
 
     #[test]

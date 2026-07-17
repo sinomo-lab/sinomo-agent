@@ -9,16 +9,21 @@ use crate::DfsFileSystemId;
 use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
 use crate::placement::{
     DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION, placement_config_remains_authoritative_for_job,
-    scoped_placement_config_for_job,
+    placement_reconciliation_activity_page_from_summaries, scoped_placement_config_for_job,
 };
-use crate::{DfsFileSystem, DfsPlacementReconciliationJob, DfsSubtreePolicy, sifs_file_system_id};
+use crate::{
+    DfsFileSystem, DfsPlacementReconciliationActivityCursor,
+    DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
+    DfsPlacementReconciliationActivitySummary, DfsPlacementReconciliationJob, DfsSubtreePolicy,
+    sifs_file_system_id,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::{NodeId, cluster_member_key};
 use sinomo_core::{ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,8 +33,11 @@ const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
 const METADATA_OPERATION_FLOOR_PUBLISH_RETRIES: usize = 4;
 const METADATA_MEMBERSHIP_HANDOFF_RETRIES: usize = 4;
 const PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION: u32 = 1;
+const PLACEMENT_RECONCILIATION_ACTIVITY_INDEX_SCHEMA_VERSION: u32 = 1;
+const PLACEMENT_RECONCILIATION_ACTIVITY_RECORD_SCHEMA_VERSION: u32 = 1;
 const PLACEMENT_RECONCILIATION_QUEUE_CAS_RETRIES: usize = 8;
 const MAX_ACTIVE_PLACEMENT_RECONCILIATIONS: usize = 1_024;
+const MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES: usize = 256;
 const FILE_SYSTEM_CONFIG_CAS_RETRIES: usize = 8;
 const PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES: usize = 4;
 
@@ -229,6 +237,52 @@ impl Default for DfsPlacementReconciliationQueue {
     }
 }
 
+/// Bounded newest-first activity identity index. Full execution snapshots stay
+/// in their existing per-job records, while the separately keyed compact
+/// records let the operator activity surface avoid decoding candidate and
+/// accepted-config snapshots on every poll.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsPlacementReconciliationActivityIndex {
+    schema_version: u32,
+    recent: Vec<DfsPlacementReconciliationActivityCursor>,
+    #[serde(default)]
+    partial: bool,
+    #[serde(default)]
+    history_truncated: bool,
+}
+
+impl Default for DfsPlacementReconciliationActivityIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: PLACEMENT_RECONCILIATION_ACTIVITY_INDEX_SCHEMA_VERSION,
+            recent: Vec::new(),
+            // The control-plane store cannot prove that every writer in the
+            // cluster has crossed this schema boundary. Keep completeness
+            // monotonic and conservative: an old writer can create and finish
+            // an unindexed job before upgrading, and that historical gap must
+            // not disappear merely because current capabilities later look
+            // homogeneous.
+            partial: true,
+            history_truncated: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsPlacementReconciliationActivityRecord {
+    schema_version: u32,
+    activity: DfsPlacementReconciliationActivitySummary,
+}
+
+impl From<&DfsPlacementReconciliationJob> for DfsPlacementReconciliationActivityRecord {
+    fn from(job: &DfsPlacementReconciliationJob) -> Self {
+        Self {
+            schema_version: PLACEMENT_RECONCILIATION_ACTIVITY_RECORD_SCHEMA_VERSION,
+            activity: DfsPlacementReconciliationActivitySummary::from(job),
+        }
+    }
+}
+
 pub fn file_system_config_key(file_system_id: &DfsFileSystemId) -> String {
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/config")
 }
@@ -251,6 +305,22 @@ pub fn placement_reconciliation_key(file_system_id: &DfsFileSystemId, job_id: &s
 
 fn placement_reconciliation_queue_key(file_system_id: &DfsFileSystemId) -> String {
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-queue-v1")
+}
+
+fn placement_reconciliation_activity_index_key(file_system_id: &DfsFileSystemId) -> String {
+    format!(
+        "{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-activity-index-v1"
+    )
+}
+
+fn placement_reconciliation_activity_record_key(
+    file_system_id: &DfsFileSystemId,
+    job_id: &str,
+) -> String {
+    format!(
+        "{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-activity-v1/{}",
+        normalize_segment(job_id)
+    )
 }
 
 fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> String {
@@ -434,6 +504,130 @@ fn validate_placement_reconciliation_queue(
         });
     }
     Ok(())
+}
+
+fn sort_placement_reconciliation_activity_cursors(
+    cursors: &mut [DfsPlacementReconciliationActivityCursor],
+) {
+    cursors.sort_by(|left, right| {
+        right
+            .created_at_unix_nanos
+            .cmp(&left.created_at_unix_nanos)
+            .then_with(|| right.job_id.cmp(&left.job_id))
+    });
+}
+
+fn validate_placement_reconciliation_activity_index(
+    file_system_id: &DfsFileSystemId,
+    index: &DfsPlacementReconciliationActivityIndex,
+) -> Result<(), KvError> {
+    if index.schema_version != PLACEMENT_RECONCILIATION_ACTIVITY_INDEX_SCHEMA_VERSION {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation activity index for {file_system_id} uses schema version {}, expected {}",
+                index.schema_version, PLACEMENT_RECONCILIATION_ACTIVITY_INDEX_SCHEMA_VERSION
+            ),
+        });
+    }
+    if index.recent.len() > MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES {
+        return Err(KvError::RangeLimit {
+            prefix: placement_reconciliation_activity_index_key(file_system_id),
+            max_entries: MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES,
+        });
+    }
+    if index
+        .recent
+        .iter()
+        .any(|cursor| cursor.job_id.trim().is_empty())
+        || index
+            .recent
+            .iter()
+            .map(|cursor| cursor.job_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != index.recent.len()
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation activity index for {file_system_id} contains empty or duplicate job ids"
+            ),
+        });
+    }
+    let mut sorted = index.recent.clone();
+    sort_placement_reconciliation_activity_cursors(&mut sorted);
+    if sorted != index.recent {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation activity index for {file_system_id} is not newest-first"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placement_reconciliation_activity_record(
+    file_system_id: &DfsFileSystemId,
+    job_id: &str,
+    record: &DfsPlacementReconciliationActivityRecord,
+) -> Result<(), KvError> {
+    if record.schema_version != PLACEMENT_RECONCILIATION_ACTIVITY_RECORD_SCHEMA_VERSION {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation activity record {job_id} uses schema version {}, expected {}",
+                record.schema_version, PLACEMENT_RECONCILIATION_ACTIVITY_RECORD_SCHEMA_VERSION
+            ),
+        });
+    }
+    if record.activity.file_system_id != *file_system_id || record.activity.job_id != job_id {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation activity record {job_id} does not match its filesystem or job key"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn include_placement_reconciliation_activity(
+    index: &mut DfsPlacementReconciliationActivityIndex,
+    job: &DfsPlacementReconciliationJob,
+) -> Result<(bool, Vec<String>), KvError> {
+    let before = index.clone();
+    let cursor = DfsPlacementReconciliationActivityCursor {
+        created_at_unix_nanos: job.created_at_unix_nanos,
+        job_id: job.job_id.clone(),
+    };
+    if let Some(existing) = index
+        .recent
+        .iter()
+        .find(|existing| existing.job_id == cursor.job_id)
+    {
+        if existing != &cursor {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "placement reconciliation activity job {} changed its immutable creation cursor",
+                    job.job_id
+                ),
+            });
+        }
+        return Ok((false, Vec::new()));
+    }
+    index.recent.push(cursor);
+    sort_placement_reconciliation_activity_cursors(&mut index.recent);
+    let mut evicted_job_ids = Vec::new();
+    if index.recent.len() > MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES {
+        evicted_job_ids.extend(
+            index.recent[MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES..]
+                .iter()
+                .map(|cursor| cursor.job_id.clone()),
+        );
+        index
+            .recent
+            .truncate(MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES);
+        index.history_truncated = true;
+    }
+    validate_placement_reconciliation_activity_index(&job.file_system_id, index)?;
+    Ok((index != &before, evicted_job_ids))
 }
 
 fn validate_placement_reconciliation_snapshot_identity(
@@ -1012,6 +1206,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         }
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get(&key)?;
+        let creating = expected.is_none() && current_entry.is_none();
         let config_compare = match (expected, current_entry) {
             (None, None) => KvCompare::Missing { key: key.clone() },
             (Some(expected), Some(entry)) => {
@@ -1027,11 +1222,26 @@ impl<'a> DfsControlPlaneStore<'a> {
         };
         let permit_compare =
             self.placement_authority_permit_missing_compare(&desired.file_system_id)?;
+        let mut compares = vec![config_compare, permit_compare];
+        let mut success = vec![KvOp::put_serde(key, desired, None)?];
+        if creating {
+            let activity_key = placement_reconciliation_activity_index_key(&desired.file_system_id);
+            if self.kv.get(&activity_key)?.is_none() {
+                compares.push(KvCompare::Missing {
+                    key: activity_key.clone(),
+                });
+                success.push(KvOp::put_serde(
+                    activity_key,
+                    &DfsPlacementReconciliationActivityIndex::default(),
+                    None,
+                )?);
+            }
+        }
         Ok(self
             .kv
             .txn(KvTxn {
-                compares: vec![config_compare, permit_compare],
-                success: vec![KvOp::put_serde(key, desired, None)?],
+                compares,
+                success,
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -1479,6 +1689,51 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok((Some(entry), queue))
     }
 
+    fn placement_reconciliation_activity_index_snapshot(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<(Option<KvEntry>, DfsPlacementReconciliationActivityIndex), KvError> {
+        let key = placement_reconciliation_activity_index_key(file_system_id);
+        let Some(entry) = self.kv.get(&key)? else {
+            // An existing filesystem with no index predates this projection.
+            // Do not scan terminal history to migrate it on an operator read;
+            // seed bounded state as jobs are next created or advanced and keep
+            // the compatibility gap explicit on every page.
+            let mut index = DfsPlacementReconciliationActivityIndex::default();
+            index.partial = true;
+            index.history_truncated = true;
+            return Ok((None, index));
+        };
+        let index = entry.decode::<DfsPlacementReconciliationActivityIndex>()?;
+        validate_placement_reconciliation_activity_index(file_system_id, &index)?;
+        Ok((Some(entry), index))
+    }
+
+    fn placement_reconciliation_activity_index_update(
+        &self,
+        job: &DfsPlacementReconciliationJob,
+    ) -> Result<(Option<(KvCompare, KvOp)>, Vec<String>), KvError> {
+        let key = placement_reconciliation_activity_index_key(&job.file_system_id);
+        let (entry, mut index) =
+            self.placement_reconciliation_activity_index_snapshot(&job.file_system_id)?;
+        let (changed, evicted_job_ids) =
+            include_placement_reconciliation_activity(&mut index, job)?;
+        if !changed {
+            return Ok((None, evicted_job_ids));
+        }
+        let compare = match entry {
+            Some(entry) => KvCompare::ValueEquals {
+                key: key.clone(),
+                value: entry.value,
+            },
+            None => KvCompare::Missing { key: key.clone() },
+        };
+        Ok((
+            Some((compare, KvOp::put_serde(key, &index, None)?)),
+            evicted_job_ids,
+        ))
+    }
+
     fn compact_and_prioritize_placement_reconciliation_queue(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1569,28 +1824,52 @@ impl<'a> DfsControlPlaneStore<'a> {
         };
         let permit_compare =
             self.placement_authority_permit_missing_compare(&job.file_system_id)?;
-        let success = vec![
+        let activity_record_key =
+            placement_reconciliation_activity_record_key(&job.file_system_id, &job.job_id);
+        let activity_record = DfsPlacementReconciliationActivityRecord::from(&durable_job);
+        let (activity_index_update, evicted_activity_job_ids) =
+            self.placement_reconciliation_activity_index_update(&durable_job)?;
+        let mut compares = vec![
+            KvCompare::ValueEquals {
+                key: config_key.clone(),
+                value: current_entry.value,
+            },
+            KvCompare::Missing {
+                key: job_key.clone(),
+            },
+            KvCompare::Missing {
+                key: legacy_job_key,
+            },
+            KvCompare::Missing {
+                key: activity_record_key.clone(),
+            },
+            queue_compare,
+            permit_compare,
+        ];
+        let mut success = vec![
             KvOp::put_serde(config_key.clone(), desired, None)?,
             KvOp::put_serde(job_key.clone(), &durable_job, None)?,
+            KvOp::put_serde(activity_record_key, &activity_record, None)?,
             KvOp::put_serde(queue_key.clone(), &queue, None)?,
         ];
+        if let Some((compare, operation)) = activity_index_update {
+            compares.push(compare);
+            success.push(operation);
+        }
+        for evicted_job_id in evicted_activity_job_ids {
+            if !queue.job_ids.contains(&evicted_job_id) {
+                success.push(KvOp::Delete {
+                    key: placement_reconciliation_activity_record_key(
+                        &job.file_system_id,
+                        &evicted_job_id,
+                    ),
+                });
+            }
+        }
         Ok(self
             .kv
             .txn(KvTxn {
-                compares: vec![
-                    KvCompare::ValueEquals {
-                        key: config_key.clone(),
-                        value: current_entry.value,
-                    },
-                    KvCompare::Missing {
-                        key: job_key.clone(),
-                    },
-                    KvCompare::Missing {
-                        key: legacy_job_key,
-                    },
-                    queue_compare,
-                    permit_compare,
-                ],
+                compares,
                 success,
                 failure: Vec::new(),
             })?
@@ -1654,6 +1933,153 @@ impl<'a> DfsControlPlaneStore<'a> {
                 .then_with(|| left.job_id.cmp(&right.job_id))
         });
         Ok(jobs)
+    }
+
+    /// Read a bounded operator activity window without scanning terminal job
+    /// history. The retained recent index is unioned with every id in the
+    /// independently bounded active queue, so a long-running job remains
+    /// discoverable even after newer terminal activity fills the recent cap.
+    ///
+    /// Older daemons do not publish compact activity records. Those active
+    /// jobs are point-read from their execution record and `partial` remains
+    /// set; unindexed terminal history is deliberately not range-scanned.
+    pub fn placement_reconciliation_activity(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        statuses: &[DfsPlacementReconciliationActivityStatus],
+        path_prefix: Option<&str>,
+        after: Option<&DfsPlacementReconciliationActivityCursor>,
+        limit: usize,
+    ) -> Result<DfsPlacementReconciliationActivityPage, KvError> {
+        if after.is_some_and(|cursor| cursor.job_id.trim().is_empty()) {
+            return Err(KvError::Serialization {
+                detail: "placement reconciliation activity cursor has an empty job id".to_string(),
+            });
+        }
+        let (index_entry, index) =
+            self.placement_reconciliation_activity_index_snapshot(file_system_id)?;
+        let mut partial = index.partial || index_entry.is_none();
+        let mut history_truncated = index.history_truncated || index_entry.is_none();
+        let indexed_creation_times = index
+            .recent
+            .iter()
+            .map(|cursor| (cursor.job_id.clone(), cursor.created_at_unix_nanos))
+            .collect::<BTreeMap<_, _>>();
+        let mut job_ids = index
+            .recent
+            .iter()
+            .map(|cursor| cursor.job_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        let include_active_queue = statuses.is_empty()
+            || statuses.iter().any(|status| {
+                matches!(
+                    status,
+                    DfsPlacementReconciliationActivityStatus::Running
+                        | DfsPlacementReconciliationActivityStatus::Retrying
+                )
+            });
+        if include_active_queue {
+            let queue_key = placement_reconciliation_queue_key(file_system_id);
+            if let Some(entry) = self.kv.get(&queue_key)? {
+                let queue = entry.decode::<DfsPlacementReconciliationQueue>()?;
+                validate_placement_reconciliation_queue(file_system_id, &queue)?;
+                job_ids.extend(queue.job_ids);
+            } else if index_entry.is_none() {
+                // A pre-queue/pre-index daemon may still have legacy terminal
+                // or active jobs. Reporting the compatibility gap is safer
+                // than an unbounded history scan on every UI poll.
+                partial = true;
+                history_truncated = true;
+            }
+        }
+
+        let mut activities = Vec::with_capacity(job_ids.len());
+        for job_id in job_ids {
+            let activity_key =
+                placement_reconciliation_activity_record_key(file_system_id, &job_id);
+            let (mut activity, from_compact_record) = match self.kv.get(&activity_key)? {
+                Some(entry) => {
+                    let record = entry.decode::<DfsPlacementReconciliationActivityRecord>()?;
+                    validate_placement_reconciliation_activity_record(
+                        file_system_id,
+                        &job_id,
+                        &record,
+                    )?;
+                    (record.activity, true)
+                }
+                None => {
+                    partial = true;
+                    let Some(job) = self.v1_placement_reconciliation(file_system_id, &job_id)?
+                    else {
+                        history_truncated = true;
+                        continue;
+                    };
+                    validate_v1_placement_reconciliation_job(&job)?;
+                    if job.file_system_id != *file_system_id || job.job_id != job_id {
+                        return Err(KvError::Serialization {
+                            detail: format!(
+                                "placement reconciliation job {job_id} does not match its filesystem or job key"
+                            ),
+                        });
+                    }
+                    (DfsPlacementReconciliationActivitySummary::from(&job), false)
+                }
+            };
+            if from_compact_record && !activity.phase.is_terminal() {
+                // A rolling-upgrade writer can advance the full v1 job without
+                // knowing about compact activity records. Reconcile every
+                // projected nonterminal against that one bounded point read so
+                // stale `Running` cannot survive a terminal transition.
+                let Some(job) = self.v1_placement_reconciliation(file_system_id, &job_id)? else {
+                    partial = true;
+                    history_truncated = true;
+                    continue;
+                };
+                validate_v1_placement_reconciliation_job(&job)?;
+                if job.file_system_id != *file_system_id || job.job_id != job_id {
+                    return Err(KvError::Serialization {
+                        detail: format!(
+                            "placement reconciliation job {job_id} does not match its filesystem or job key"
+                        ),
+                    });
+                }
+                let current = DfsPlacementReconciliationActivitySummary::from(&job);
+                if current.revision < activity.revision {
+                    return Err(KvError::Serialization {
+                        detail: format!(
+                            "placement reconciliation activity record {job_id} is newer than its durable job"
+                        ),
+                    });
+                }
+                if current != activity {
+                    activity = current;
+                    partial = true;
+                }
+            }
+            if indexed_creation_times
+                .get(&job_id)
+                .is_some_and(|created_at| *created_at != activity.created_at_unix_nanos)
+            {
+                return Err(KvError::Serialization {
+                    detail: format!(
+                        "placement reconciliation activity job {job_id} does not match its indexed creation cursor"
+                    ),
+                });
+            }
+            activities.push(activity);
+        }
+
+        let mut page = placement_reconciliation_activity_page_from_summaries(
+            activities,
+            statuses,
+            path_prefix,
+            after,
+            limit,
+        );
+        page.partial = partial;
+        page.history_truncated = history_truncated;
+        Ok(page)
     }
 
     /// Return the next executable v1 placement job without loading terminal
@@ -1726,11 +2152,41 @@ impl<'a> DfsControlPlaneStore<'a> {
         if current_entry.decode::<DfsPlacementReconciliationJob>()? != *expected {
             return Ok(false);
         }
+        let queue_key = placement_reconciliation_queue_key(&desired.file_system_id);
+        let queue_entry = self.kv.get(&queue_key)?;
+        let mut queue = queue_entry
+            .as_ref()
+            .map(KvEntry::decode::<DfsPlacementReconciliationQueue>)
+            .transpose()?;
+        if let Some(queue) = queue.as_ref() {
+            validate_placement_reconciliation_queue(&desired.file_system_id, queue)?;
+        }
+        let queue_len_before = queue.as_ref().map_or(0, |queue| queue.job_ids.len());
+        if desired.state.is_terminal()
+            && let Some(queue) = queue.as_mut()
+        {
+            queue.job_ids.retain(|job_id| job_id != &desired.job_id);
+        }
+        let queue_changed = queue
+            .as_ref()
+            .is_some_and(|queue| queue.job_ids.len() != queue_len_before);
         let mut compares = vec![KvCompare::ValueEquals {
             key: key.clone(),
             value: current_entry.value,
         }];
-        let mut success = vec![KvOp::put_serde(key, desired, None)?];
+        let activity_record_key =
+            placement_reconciliation_activity_record_key(&desired.file_system_id, &desired.job_id);
+        let activity_record = DfsPlacementReconciliationActivityRecord::from(desired);
+        let mut success = vec![
+            KvOp::put_serde(key, desired, None)?,
+            KvOp::put_serde(activity_record_key, &activity_record, None)?,
+        ];
+        let (activity_index_update, evicted_activity_job_ids) =
+            self.placement_reconciliation_activity_index_update(desired)?;
+        if let Some((compare, operation)) = activity_index_update {
+            compares.push(compare);
+            success.push(operation);
+        }
         if desired.state == crate::DfsPlacementReconciliationState::Failed {
             // `Failed` revokes authority for delayed operations and receipts;
             // order that transition after any currently permitted one-object
@@ -1738,21 +2194,33 @@ impl<'a> DfsControlPlaneStore<'a> {
             compares
                 .push(self.placement_authority_permit_missing_compare(&desired.file_system_id)?);
         }
-        if desired.state.is_terminal() {
-            let queue_key = placement_reconciliation_queue_key(&desired.file_system_id);
-            if let Some(queue_entry) = self.kv.get(&queue_key)? {
-                let mut queue = queue_entry.decode::<DfsPlacementReconciliationQueue>()?;
-                validate_placement_reconciliation_queue(&desired.file_system_id, &queue)?;
-                let previous_len = queue.job_ids.len();
-                queue.job_ids.retain(|job_id| job_id != &desired.job_id);
-                if queue.job_ids.len() != previous_len {
-                    compares.push(KvCompare::ValueEquals {
-                        key: queue_key.clone(),
-                        value: queue_entry.value,
-                    });
-                    success.push(KvOp::put_serde(queue_key, &queue, None)?);
-                }
-            }
+        let evicted_terminal_activity_job_ids = queue
+            .as_ref()
+            .map(|queue| {
+                evicted_activity_job_ids
+                    .into_iter()
+                    .filter(|job_id| !queue.job_ids.contains(job_id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if (queue_changed || !evicted_terminal_activity_job_ids.is_empty())
+            && let Some(queue_entry) = queue_entry
+        {
+            compares.push(KvCompare::ValueEquals {
+                key: queue_key.clone(),
+                value: queue_entry.value,
+            });
+        }
+        if queue_changed && let Some(queue) = queue.as_ref() {
+            success.push(KvOp::put_serde(queue_key, queue, None)?);
+        }
+        for evicted_job_id in evicted_terminal_activity_job_ids {
+            success.push(KvOp::Delete {
+                key: placement_reconciliation_activity_record_key(
+                    &desired.file_system_id,
+                    &evicted_job_id,
+                ),
+            });
         }
         Ok(self
             .kv
@@ -2542,6 +3010,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         }
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get_async(&key).await?;
+        let creating = expected.is_none() && current_entry.is_none();
         let config_compare = match (expected, current_entry) {
             (None, None) => KvCompare::Missing { key: key.clone() },
             (Some(expected), Some(entry)) => {
@@ -2558,11 +3027,26 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         let permit_compare = self
             .placement_authority_permit_missing_compare(&desired.file_system_id)
             .await?;
+        let mut compares = vec![config_compare, permit_compare];
+        let mut success = vec![KvOp::put_serde(key, desired, None)?];
+        if creating {
+            let activity_key = placement_reconciliation_activity_index_key(&desired.file_system_id);
+            if self.kv.get_async(&activity_key).await?.is_none() {
+                compares.push(KvCompare::Missing {
+                    key: activity_key.clone(),
+                });
+                success.push(KvOp::put_serde(
+                    activity_key,
+                    &DfsPlacementReconciliationActivityIndex::default(),
+                    None,
+                )?);
+            }
+        }
         Ok(self
             .kv
             .txn_async(KvTxn {
-                compares: vec![config_compare, permit_compare],
-                success: vec![KvOp::put_serde(key, desired, None)?],
+                compares,
+                success,
                 failure: Vec::new(),
             })
             .await?
@@ -4224,6 +4708,27 @@ mod tests {
                 .expect("get job"),
             Some(durable_job.clone())
         );
+        let activity = store
+            .placement_reconciliation_activity(&file_system_id, &[], None, None, 50)
+            .expect("read compact placement activity");
+        assert_eq!(activity.activities.len(), 1);
+        assert_eq!(activity.activities[0].job_id, job.job_id);
+        assert_eq!(
+            activity.activities[0].status,
+            DfsPlacementReconciliationActivityStatus::Running
+        );
+        assert!(
+            activity.partial,
+            "completeness stays monotonic until a future explicit migration proves old history"
+        );
+        assert!(!activity.history_truncated);
+        let compact_record = store
+            .get_serde::<DfsPlacementReconciliationActivityRecord>(
+                &placement_reconciliation_activity_record_key(&file_system_id, &job.job_id),
+            )
+            .expect("read compact activity record")
+            .expect("compact activity record");
+        assert_eq!(compact_record.activity.revision, durable_job.revision);
         assert!(
             placement_reconciliation_key(&file_system_id, &job.job_id)
                 .starts_with(&placement_reconciliations_prefix(&file_system_id))
@@ -4277,6 +4782,15 @@ mod tests {
                 .expect("retained terminal job"),
             Some(completed.clone())
         );
+        let completed_activity = store
+            .placement_reconciliation_activity(&file_system_id, &[], None, None, 50)
+            .expect("read completed activity");
+        assert_eq!(completed_activity.activities.len(), 1);
+        assert_eq!(completed_activity.activities[0].revision, 1);
+        assert_eq!(
+            completed_activity.activities[0].status,
+            DfsPlacementReconciliationActivityStatus::Completed
+        );
 
         // Simulate an interrupted/older writer leaving stale queue ids. The
         // scheduler repairs both without falling back to a history scan.
@@ -4306,6 +4820,471 @@ mod tests {
                 .job_ids
                 .is_empty()
         );
+        let activity = store
+            .placement_reconciliation_activity(&file_system_id, &[], None, None, 50)
+            .expect("activity must not scan placement history");
+        assert_eq!(activity.activities.len(), 1);
+        assert_eq!(activity.activities[0].job_id, completed.job_id);
+    }
+
+    #[test]
+    fn placement_activity_rolling_upgrade_fallback_is_bounded_and_explicitly_partial() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-activity-fallback-owner");
+        let config = placement_authority_test_config(&owner, 1);
+        let mut job = placement_authority_test_job(
+            "placement-activity-fallback-job",
+            &file_system_id,
+            &owner,
+            7,
+        );
+        job.accepted_config = Some(scoped_placement_config_for_job(&config, &job));
+
+        // Model a v1 daemon from before compact activity records. It has the
+        // bounded active queue and full job, but no activity index/record.
+        let mut kv = InProcessKvStore::new();
+        kv.put_serde(file_system_config_key(&file_system_id), &config, None)
+            .expect("put legacy-compatible config");
+        kv.put_serde(
+            placement_reconciliation_key(&file_system_id, &job.job_id),
+            &job,
+            None,
+        )
+        .expect("put legacy-compatible active job");
+        kv.put_serde(
+            placement_reconciliation_queue_key(&file_system_id),
+            &DfsPlacementReconciliationQueue {
+                schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                job_ids: vec![job.job_id.clone()],
+            },
+            None,
+        )
+        .expect("put active queue");
+
+        let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
+        let store = DfsControlPlaneStore::new(&mut kv);
+        let page = store
+            .placement_reconciliation_activity(
+                &file_system_id,
+                &[DfsPlacementReconciliationActivityStatus::Running],
+                Some("/users"),
+                None,
+                10,
+            )
+            .expect("bounded rolling-upgrade activity");
+        assert_eq!(page.activities.len(), 1);
+        assert_eq!(page.activities[0].job_id, job.job_id);
+        assert!(page.partial);
+        assert!(page.history_truncated);
+    }
+
+    #[test]
+    fn placement_activity_prefers_a_newer_full_job_from_an_older_writer() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-activity-mixed-writer-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id.clone(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let desired = placement_authority_test_config(&owner, 1);
+        let job = placement_authority_test_job(
+            "placement-activity-mixed-writer-job",
+            &file_system_id,
+            &owner,
+            9,
+        );
+        let mut kv = InProcessKvStore::new();
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &desired, &job)
+                .expect("new-writer Apply")
+        );
+        let durable = store
+            .placement_reconciliation(&file_system_id, &job.job_id)
+            .expect("durable job read")
+            .expect("durable job");
+        drop(store);
+
+        // Model an older v1 daemon: it knows the full job and active queue but
+        // not the compact activity record introduced by this change.
+        let mut completed = durable;
+        completed.state = DfsPlacementReconciliationState::Completed;
+        completed.revision = 1;
+        completed.updated_at_unix_nanos = 10;
+        kv.put_serde(
+            placement_reconciliation_key(&file_system_id, &completed.job_id),
+            &completed,
+            None,
+        )
+        .expect("older writer completes full job");
+        kv.put_serde(
+            placement_reconciliation_queue_key(&file_system_id),
+            &DfsPlacementReconciliationQueue::default(),
+            None,
+        )
+        .expect("older writer removes active queue id");
+
+        let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
+        let store = DfsControlPlaneStore::new(&mut kv);
+        let page = store
+            .placement_reconciliation_activity(&file_system_id, &[], None, None, 10)
+            .expect("mixed-writer activity");
+        assert_eq!(page.activities.len(), 1);
+        assert_eq!(page.activities[0].revision, 1);
+        assert_eq!(
+            page.activities[0].status,
+            DfsPlacementReconciliationActivityStatus::Completed
+        );
+        assert!(page.partial, "the compact projection was stale");
+    }
+
+    #[test]
+    fn placement_activity_old_writer_gap_remains_partial_after_new_writer_bootstrap() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-activity-monotonic-partial-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id.clone(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let desired = placement_authority_test_config(&owner, 1);
+        let mut old_terminal = placement_authority_test_job(
+            "placement-activity-unindexed-terminal",
+            &file_system_id,
+            &owner,
+            1,
+        );
+        old_terminal.accepted_config = Some(scoped_placement_config_for_job(&base, &old_terminal));
+        old_terminal.state = DfsPlacementReconciliationState::Completed;
+        let new_job = placement_authority_test_job(
+            "placement-activity-post-upgrade",
+            &file_system_id,
+            &owner,
+            2,
+        );
+
+        let mut kv = InProcessKvStore::new();
+        kv.put_serde(file_system_config_key(&file_system_id), &base, None)
+            .expect("put pre-index config");
+        kv.put_serde(
+            placement_reconciliation_key(&file_system_id, &old_terminal.job_id),
+            &old_terminal,
+            None,
+        )
+        .expect("put unindexed terminal job");
+        kv.put_serde(
+            placement_reconciliation_queue_key(&file_system_id),
+            &DfsPlacementReconciliationQueue::default(),
+            None,
+        )
+        .expect("put pre-index empty queue");
+
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &desired, &new_job)
+                .expect("first post-upgrade Apply")
+        );
+        let page = store
+            .placement_reconciliation_activity(&file_system_id, &[], None, None, 10)
+            .expect("post-upgrade activity");
+        assert_eq!(page.activities.len(), 1);
+        assert_eq!(page.activities[0].job_id, new_job.job_id);
+        assert!(
+            page.partial,
+            "current writers becoming capable cannot erase the durable possibility of an older terminal gap"
+        );
+    }
+
+    #[test]
+    fn placement_activity_unions_old_active_jobs_with_the_capped_recent_index() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-activity-cap-owner");
+        let mut kv = InProcessKvStore::new();
+        let mut index = DfsPlacementReconciliationActivityIndex::default();
+        index.history_truncated = true;
+
+        for offset in 0..MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES {
+            let mut job = placement_authority_test_job(
+                &format!("placement-activity-recent-{offset:04}"),
+                &file_system_id,
+                &owner,
+                1_000 + offset as u64,
+            );
+            job.state = DfsPlacementReconciliationState::Completed;
+            let record = DfsPlacementReconciliationActivityRecord::from(&job);
+            index.recent.push(record.activity.cursor());
+            kv.put_serde(
+                placement_reconciliation_activity_record_key(&file_system_id, &job.job_id),
+                &record,
+                None,
+            )
+            .expect("put compact recent activity");
+        }
+        sort_placement_reconciliation_activity_cursors(&mut index.recent);
+        kv.put_serde(
+            placement_reconciliation_activity_index_key(&file_system_id),
+            &index,
+            None,
+        )
+        .expect("put capped recent index");
+
+        let mut active = placement_authority_test_job(
+            "placement-activity-long-running",
+            &file_system_id,
+            &owner,
+            1,
+        );
+        let active_config = placement_authority_test_config(&owner, 1);
+        active.accepted_config = Some(scoped_placement_config_for_job(&active_config, &active));
+        kv.put_serde(
+            placement_reconciliation_key(&file_system_id, &active.job_id),
+            &active,
+            None,
+        )
+        .expect("put full active execution record");
+        kv.put_serde(
+            placement_reconciliation_activity_record_key(&file_system_id, &active.job_id),
+            &DfsPlacementReconciliationActivityRecord::from(&active),
+            None,
+        )
+        .expect("put compact active activity");
+        kv.put_serde(
+            placement_reconciliation_queue_key(&file_system_id),
+            &DfsPlacementReconciliationQueue {
+                schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                job_ids: vec![active.job_id.clone()],
+            },
+            None,
+        )
+        .expect("put active queue");
+
+        let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
+        let store = DfsControlPlaneStore::new(&mut kv);
+        let active_page = store
+            .placement_reconciliation_activity(
+                &file_system_id,
+                &[DfsPlacementReconciliationActivityStatus::Running],
+                None,
+                None,
+                10,
+            )
+            .expect("active activity outside recent cap");
+        assert_eq!(active_page.activities.len(), 1);
+        assert_eq!(active_page.activities[0].job_id, active.job_id);
+        assert!(active_page.partial);
+        assert!(active_page.history_truncated);
+
+        let first_completed = store
+            .placement_reconciliation_activity(
+                &file_system_id,
+                &[DfsPlacementReconciliationActivityStatus::Completed],
+                None,
+                None,
+                10,
+            )
+            .expect("first completed activity page");
+        assert_eq!(first_completed.activities.len(), 10);
+        assert!(first_completed.next_cursor.is_some());
+        let second_completed = store
+            .placement_reconciliation_activity(
+                &file_system_id,
+                &[DfsPlacementReconciliationActivityStatus::Completed],
+                None,
+                first_completed.next_cursor.as_ref(),
+                10,
+            )
+            .expect("second completed activity page");
+        assert_eq!(second_completed.activities.len(), 10);
+        assert!(
+            second_completed.activities[0].created_at_unix_nanos
+                < first_completed.activities[9].created_at_unix_nanos
+        );
+    }
+
+    #[test]
+    fn placement_activity_index_retention_is_bounded() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-activity-retention-owner");
+        let mut index = DfsPlacementReconciliationActivityIndex::default();
+        for offset in 0..=MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES {
+            let job = placement_authority_test_job(
+                &format!("placement-activity-retention-{offset:04}"),
+                &file_system_id,
+                &owner,
+                offset as u64,
+            );
+            include_placement_reconciliation_activity(&mut index, &job)
+                .expect("include bounded activity identity");
+        }
+        assert_eq!(
+            index.recent.len(),
+            MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES
+        );
+        assert!(index.history_truncated);
+        assert_eq!(
+            index.recent[0].created_at_unix_nanos,
+            MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES as u64
+        );
+        assert_eq!(index.recent.last().unwrap().created_at_unix_nanos, 1);
+    }
+
+    #[test]
+    fn placement_activity_retention_deletes_only_evicted_terminal_records() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-activity-gc-owner");
+        let config = placement_authority_test_config(&owner, 1);
+        let mut kv = InProcessKvStore::new();
+        let mut index = DfsPlacementReconciliationActivityIndex::default();
+        let mut oldest_terminal_job_id = String::new();
+        for offset in 0..MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES {
+            let mut job = placement_authority_test_job(
+                &format!("placement-activity-gc-terminal-{offset:04}"),
+                &file_system_id,
+                &owner,
+                1_000 + offset as u64,
+            );
+            job.state = DfsPlacementReconciliationState::Completed;
+            let record = DfsPlacementReconciliationActivityRecord::from(&job);
+            if offset == 0 {
+                oldest_terminal_job_id = job.job_id.clone();
+            }
+            index.recent.push(record.activity.cursor());
+            kv.put_serde(
+                placement_reconciliation_activity_record_key(&file_system_id, &job.job_id),
+                &record,
+                None,
+            )
+            .expect("put terminal compact record");
+        }
+        sort_placement_reconciliation_activity_cursors(&mut index.recent);
+        kv.put_serde(
+            placement_reconciliation_activity_index_key(&file_system_id),
+            &index,
+            None,
+        )
+        .expect("put full activity index");
+
+        let mut newest_active = placement_authority_test_job(
+            "placement-activity-gc-newest-active",
+            &file_system_id,
+            &owner,
+            2_000,
+        );
+        newest_active.accepted_config =
+            Some(scoped_placement_config_for_job(&config, &newest_active));
+        kv.put_serde(
+            placement_reconciliation_key(&file_system_id, &newest_active.job_id),
+            &newest_active,
+            None,
+        )
+        .expect("put newest active job");
+        kv.put_serde(
+            placement_reconciliation_queue_key(&file_system_id),
+            &DfsPlacementReconciliationQueue {
+                schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                job_ids: vec![newest_active.job_id.clone()],
+            },
+            None,
+        )
+        .expect("put newest active queue");
+        let mut newest_progress = newest_active.clone();
+        newest_progress.state = DfsPlacementReconciliationState::Scanning;
+        newest_progress.revision = 1;
+        newest_progress.updated_at_unix_nanos = 2_001;
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        assert!(
+            store
+                .compare_and_put_placement_reconciliation(&newest_active, &newest_progress)
+                .expect("index newest active job")
+        );
+        assert!(
+            store
+                .kv
+                .get(&placement_reconciliation_activity_record_key(
+                    &file_system_id,
+                    &oldest_terminal_job_id,
+                ))
+                .expect("read evicted terminal record")
+                .is_none(),
+            "an evicted terminal compact record must not grow a second unbounded namespace"
+        );
+
+        let mut oldest_active = placement_authority_test_job(
+            "placement-activity-gc-oldest-active",
+            &file_system_id,
+            &owner,
+            1,
+        );
+        oldest_active.accepted_config =
+            Some(scoped_placement_config_for_job(&config, &oldest_active));
+        store
+            .put_serde(
+                &placement_reconciliation_key(&file_system_id, &oldest_active.job_id),
+                &oldest_active,
+            )
+            .expect("put oldest active job");
+        store
+            .put_serde(
+                &placement_reconciliation_queue_key(&file_system_id),
+                &DfsPlacementReconciliationQueue {
+                    schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                    job_ids: vec![newest_progress.job_id.clone(), oldest_active.job_id.clone()],
+                },
+            )
+            .expect("put both active jobs");
+        let mut oldest_progress = oldest_active.clone();
+        oldest_progress.state = DfsPlacementReconciliationState::Scanning;
+        oldest_progress.revision = 1;
+        oldest_progress.updated_at_unix_nanos = 2;
+        assert!(
+            store
+                .compare_and_put_placement_reconciliation(&oldest_active, &oldest_progress)
+                .expect("advance evicted active job")
+        );
+        assert!(
+            store
+                .kv
+                .get(&placement_reconciliation_activity_record_key(
+                    &file_system_id,
+                    &oldest_progress.job_id,
+                ))
+                .expect("read active compact record")
+                .is_some(),
+            "an active job remains observable even when its creation cursor falls outside the recent cap"
+        );
+        let mut oldest_completed = oldest_progress.clone();
+        oldest_completed.state = DfsPlacementReconciliationState::Completed;
+        oldest_completed.revision = 2;
+        oldest_completed.updated_at_unix_nanos = 3;
+        assert!(
+            store
+                .compare_and_put_placement_reconciliation(&oldest_progress, &oldest_completed)
+                .expect("terminalize evicted active job")
+        );
+        assert!(
+            store
+                .kv
+                .get(&placement_reconciliation_activity_record_key(
+                    &file_system_id,
+                    &oldest_completed.job_id,
+                ))
+                .expect("read terminalized evicted activity")
+                .is_none(),
+            "once the evicted job leaves the active queue its compact record is deleted atomically"
+        );
+        let queue = store
+            .get_serde::<DfsPlacementReconciliationQueue>(&placement_reconciliation_queue_key(
+                &file_system_id,
+            ))
+            .expect("read final active queue")
+            .expect("final active queue");
+        assert!(!queue.job_ids.contains(&oldest_completed.job_id));
     }
 
     #[test]

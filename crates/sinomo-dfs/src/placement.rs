@@ -22,6 +22,10 @@ const PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const PLACEMENT_AUTHORITY_ACQUIRE_RETRIES: usize = 4;
 const PLACEMENT_AUTHORITY_RELEASE_RETRIES: usize = 4;
 pub const DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE: usize = 50;
+pub const MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE: usize = 100;
+const PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR: &str =
+    "superseded because a newer placement configuration is authoritative";
 
 enum PlacementIntentAuthority {
     Ordinary,
@@ -1465,6 +1469,194 @@ impl DfsPlacementReconciliationJob {
             completed_scan.saturating_add(self.completed_repair_count.min(repair_total));
         (completed, total)
     }
+
+    pub fn activity_status(&self) -> DfsPlacementReconciliationActivityStatus {
+        match self.state {
+            DfsPlacementReconciliationState::Completed => {
+                DfsPlacementReconciliationActivityStatus::Completed
+            }
+            DfsPlacementReconciliationState::Failed
+                if self.last_error.as_deref()
+                    == Some(PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR) =>
+            {
+                DfsPlacementReconciliationActivityStatus::Superseded
+            }
+            DfsPlacementReconciliationState::Failed => {
+                DfsPlacementReconciliationActivityStatus::Failed
+            }
+            _ if self.last_error.is_some() => DfsPlacementReconciliationActivityStatus::Retrying,
+            _ => DfsPlacementReconciliationActivityStatus::Running,
+        }
+    }
+}
+
+/// Operator-facing status for placement reconciliation activity. `Retrying` is
+/// derived from a non-terminal job's durable `last_error`: successful pages
+/// clear that field, while transient failures remain queued for the next
+/// maintenance tick.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsPlacementReconciliationActivityStatus {
+    Running,
+    Retrying,
+    Failed,
+    Completed,
+    /// The job became obsolete after a newer overlapping placement policy was
+    /// accepted. This is an expected control-plane outcome, not an execution
+    /// failure; the durable execution enum remains `Failed` for compatibility.
+    Superseded,
+}
+
+/// Stable newest-first activity cursor. Creation time and job id are immutable
+/// job identity fields, so progress updates cannot move an item between pages.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPlacementReconciliationActivityCursor {
+    pub created_at_unix_nanos: u64,
+    pub job_id: String,
+}
+
+/// Compact activity projection that deliberately omits the accepted config and
+/// candidate snapshots retained by the durable execution record.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPlacementReconciliationActivitySummary {
+    pub job_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub path: String,
+    pub scope: DfsPlacementScope,
+    pub status: DfsPlacementReconciliationActivityStatus,
+    pub phase: DfsPlacementReconciliationState,
+    pub progress_completed: usize,
+    pub progress_total: usize,
+    pub total_object_count: usize,
+    pub scanned_object_count: usize,
+    pub matched_object_count: usize,
+    pub updated_object_count: usize,
+    pub scheduled_repair_count: usize,
+    pub completed_repair_count: usize,
+    pub pending_repair_count: usize,
+    pub revision: u64,
+    pub created_at_unix_nanos: u64,
+    pub updated_at_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl DfsPlacementReconciliationActivitySummary {
+    pub fn cursor(&self) -> DfsPlacementReconciliationActivityCursor {
+        DfsPlacementReconciliationActivityCursor {
+            created_at_unix_nanos: self.created_at_unix_nanos,
+            job_id: self.job_id.clone(),
+        }
+    }
+}
+
+impl From<&DfsPlacementReconciliationJob> for DfsPlacementReconciliationActivitySummary {
+    fn from(job: &DfsPlacementReconciliationJob) -> Self {
+        let (progress_completed, progress_total) = job.progress_fraction();
+        Self {
+            job_id: job.job_id.clone(),
+            file_system_id: job.file_system_id.clone(),
+            path: job.path.clone(),
+            scope: job.scope,
+            status: job.activity_status(),
+            phase: job.state,
+            progress_completed,
+            progress_total,
+            total_object_count: job.total_object_count,
+            scanned_object_count: job.scanned_object_count,
+            matched_object_count: job.matched_object_count,
+            updated_object_count: job.updated_object_count,
+            scheduled_repair_count: job.scheduled_repair_count,
+            completed_repair_count: job.completed_repair_count,
+            pending_repair_count: job.pending_repair_count,
+            revision: job.revision,
+            created_at_unix_nanos: job.created_at_unix_nanos,
+            updated_at_unix_nanos: job.updated_at_unix_nanos,
+            last_error: job.last_error.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPlacementReconciliationActivityPage {
+    pub activities: Vec<DfsPlacementReconciliationActivitySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsPlacementReconciliationActivityCursor>,
+    /// Some durable jobs may predate the compact activity projection or may
+    /// have been written by an older daemon. Active jobs are still unioned
+    /// from the bounded execution queue, but terminal history can have gaps.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    /// Older terminal activity has fallen outside the retained recent index.
+    /// `next_cursor` pages only through the records that remain available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_truncated: bool,
+}
+
+/// Build a stable, compact activity page from durable reconciliation records.
+/// The caller owns retrieval; this helper bounds the returned wire projection.
+pub fn placement_reconciliation_activity_page<'a>(
+    jobs: impl IntoIterator<Item = &'a DfsPlacementReconciliationJob>,
+    statuses: &[DfsPlacementReconciliationActivityStatus],
+    path_prefix: Option<&str>,
+    after: Option<&DfsPlacementReconciliationActivityCursor>,
+    limit: usize,
+) -> DfsPlacementReconciliationActivityPage {
+    placement_reconciliation_activity_page_from_summaries(
+        jobs.into_iter()
+            .map(DfsPlacementReconciliationActivitySummary::from),
+        statuses,
+        path_prefix,
+        after,
+        limit,
+    )
+}
+
+pub(crate) fn placement_reconciliation_activity_page_from_summaries(
+    activities: impl IntoIterator<Item = DfsPlacementReconciliationActivitySummary>,
+    statuses: &[DfsPlacementReconciliationActivityStatus],
+    path_prefix: Option<&str>,
+    after: Option<&DfsPlacementReconciliationActivityCursor>,
+    limit: usize,
+) -> DfsPlacementReconciliationActivityPage {
+    let mut activities = activities
+        .into_iter()
+        .filter(|activity| {
+            (statuses.is_empty() || statuses.contains(&activity.status))
+                && path_prefix.is_none_or(|prefix| path_is_within(&activity.path, prefix))
+        })
+        .filter(|activity| {
+            after.is_none_or(|cursor| {
+                activity.created_at_unix_nanos < cursor.created_at_unix_nanos
+                    || (activity.created_at_unix_nanos == cursor.created_at_unix_nanos
+                        && activity.job_id < cursor.job_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    activities.sort_by(|left, right| {
+        right
+            .created_at_unix_nanos
+            .cmp(&left.created_at_unix_nanos)
+            .then_with(|| right.job_id.cmp(&left.job_id))
+    });
+    let limit = limit
+        .max(1)
+        .min(MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE);
+    let has_more = activities.len() > limit;
+    activities.truncate(limit);
+    let next_cursor = has_more
+        .then(|| {
+            activities
+                .last()
+                .map(DfsPlacementReconciliationActivitySummary::cursor)
+        })
+        .flatten();
+    DfsPlacementReconciliationActivityPage {
+        activities,
+        next_cursor,
+        partial: false,
+        history_truncated: false,
+    }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -2363,8 +2555,7 @@ fn mark_placement_reconciliation_superseded(job: &mut DfsPlacementReconciliation
     // distinguishes supersession from an execution failure.
     job.state = DfsPlacementReconciliationState::Failed;
     job.cursor = None;
-    job.last_error =
-        Some("superseded because a newer placement configuration is authoritative".to_string());
+    job.last_error = Some(PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR.to_string());
 }
 
 fn reconciliation_placement_for_object(
@@ -4804,5 +4995,118 @@ mod tests {
         assert_eq!(first_page.impact.affected_object_count, 31);
         assert!(first_page.next_cursor.is_some());
         assert!(first_page.blocking_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn placement_activity_status_distinguishes_retrying_from_terminal_failure() {
+        let mut job = reconciliation_job("/team", DfsPlacementScope::Subtree, BTreeSet::new());
+        assert_eq!(
+            job.activity_status(),
+            DfsPlacementReconciliationActivityStatus::Running
+        );
+
+        job.state = DfsPlacementReconciliationState::Scanning;
+        job.last_error = Some("candidate temporarily unreachable".to_string());
+        assert_eq!(
+            job.activity_status(),
+            DfsPlacementReconciliationActivityStatus::Retrying
+        );
+
+        job.state = DfsPlacementReconciliationState::Failed;
+        assert_eq!(
+            job.activity_status(),
+            DfsPlacementReconciliationActivityStatus::Failed
+        );
+        job.last_error = Some(PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR.to_string());
+        assert_eq!(
+            job.activity_status(),
+            DfsPlacementReconciliationActivityStatus::Superseded,
+            "an expected replacement must not be presented as an operational failure"
+        );
+        job.state = DfsPlacementReconciliationState::Completed;
+        assert_eq!(
+            job.activity_status(),
+            DfsPlacementReconciliationActivityStatus::Completed
+        );
+    }
+
+    #[test]
+    fn placement_activity_page_is_stable_newest_first_and_filterable() {
+        let mut oldest =
+            reconciliation_job("/team/a", DfsPlacementScope::SelfOnly, BTreeSet::new());
+        oldest.job_id = "activity-a".to_string();
+        oldest.created_at_unix_nanos = 1;
+
+        let mut tied = oldest.clone();
+        tied.job_id = "activity-b".to_string();
+        tied.path = "/team/b".to_string();
+        tied.last_error = Some("retry later".to_string());
+
+        let mut newest = oldest.clone();
+        newest.job_id = "activity-c".to_string();
+        newest.path = "/other".to_string();
+        newest.created_at_unix_nanos = 2;
+        newest.state = DfsPlacementReconciliationState::Completed;
+
+        let jobs = vec![oldest, newest, tied];
+        let first = placement_reconciliation_activity_page(jobs.iter(), &[], None, None, 2);
+        assert_eq!(
+            first
+                .activities
+                .iter()
+                .map(|activity| activity.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["activity-c", "activity-b"]
+        );
+        let second = placement_reconciliation_activity_page(
+            jobs.iter(),
+            &[],
+            None,
+            first.next_cursor.as_ref(),
+            2,
+        );
+        assert_eq!(second.activities.len(), 1);
+        assert_eq!(second.activities[0].job_id, "activity-a");
+        assert!(second.next_cursor.is_none());
+
+        let retrying = placement_reconciliation_activity_page(
+            jobs.iter(),
+            &[DfsPlacementReconciliationActivityStatus::Retrying],
+            Some("/team"),
+            None,
+            10,
+        );
+        assert_eq!(retrying.activities.len(), 1);
+        assert_eq!(retrying.activities[0].job_id, "activity-b");
+        assert_eq!(
+            retrying.activities[0].status,
+            DfsPlacementReconciliationActivityStatus::Retrying
+        );
+
+        let boundary =
+            placement_reconciliation_activity_page(jobs.iter(), &[], Some("/tea"), None, 10);
+        assert!(boundary.activities.is_empty());
+    }
+
+    #[test]
+    fn placement_activity_page_enforces_the_wire_limit() {
+        let jobs = (0..(MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE + 1))
+            .map(|index| {
+                let mut job = reconciliation_job(
+                    &format!("/activity/{index}"),
+                    DfsPlacementScope::SelfOnly,
+                    BTreeSet::new(),
+                );
+                job.job_id = format!("activity-{index:04}");
+                job.created_at_unix_nanos = index as u64;
+                job
+            })
+            .collect::<Vec<_>>();
+        let page = placement_reconciliation_activity_page(jobs.iter(), &[], None, None, usize::MAX);
+        assert_eq!(
+            page.activities.len(),
+            MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
+        );
+        assert!(page.next_cursor.is_some());
     }
 }
