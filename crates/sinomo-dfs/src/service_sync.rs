@@ -25,8 +25,8 @@ use crate::{
     DfsMetadataPrefixProbe, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
     DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
     DfsMetadataShardMembershipHandoffProof, DfsMetadataSnapshotInstallCommand, DfsNetworkMessage,
-    DfsObjectMetadata, MetadataBackendError, NetworkedDfsService, NetworkedDfsServiceEvent,
-    PendingMetadataReplication, sifs_file_system_id,
+    DfsObjectMetadata, DfsRoutedCall, DfsRoutedSend, MetadataBackendError, NetworkedDfsService,
+    NetworkedDfsServiceEvent, PendingMetadataReplication, sifs_file_system_id,
 };
 
 /// Default time budget for a foreground POSIX durability barrier.
@@ -37,6 +37,9 @@ const DFS_POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
 /// Raft-backed partition fallback. A caller's shorter timeout remains the
 /// upper bound.
 const DFS_POSIX_FULL_SHARD_ACK_GRACE: Duration = Duration::from_millis(250);
+/// Two canonical routed probes may run at once so one unavailable shard member
+/// cannot prevent every later reachable quorum member from being attempted.
+const DFS_METADATA_SYNC_ROUTED_FANOUT_CAP: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MetadataQuorumSyncPurpose {
@@ -881,6 +884,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
+    fn try_finalize_metadata_sync_progress(
+        &mut self,
+        target: &DfsMetadataQuorumSyncTarget,
+        freshly_acknowledged: &BTreeSet<NodeId>,
+        required_intersection: &BTreeSet<NodeId>,
+        purpose: &MetadataQuorumSyncPurpose,
+        started_at: &Instant,
+        full_shard_grace: Duration,
+    ) -> Result<Option<DfsMetadataQuorumSyncCertificate>, DfsError> {
+        let progress =
+            metadata_sync_progress_from_fresh_acknowledgements(target, freshly_acknowledged);
+        if metadata_sync_progress_is_full_shard(target, &progress)
+            && metadata_sync_progress_satisfies(&progress, required_intersection)
+        {
+            self.clear_pending_metadata_sync_replications(target);
+            return self
+                .finalize_metadata_full_shard_sync(target, progress)
+                .map(Some);
+        }
+        if metadata_sync_progress_satisfies(&progress, required_intersection)
+            && started_at.elapsed() >= full_shard_grace
+            && let Some(certificate) =
+                self.try_finalize_metadata_quorum_sync_fallback(target, progress, purpose)?
+        {
+            self.clear_pending_metadata_sync_replications(target);
+            return Ok(Some(certificate));
+        }
+        Ok(None)
+    }
+
     fn sync_metadata_shard_to_quorum_with_required_intersection_inner(
         &mut self,
         requested_target: &DfsMetadataQuorumSyncTarget,
@@ -921,23 +954,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         loop {
             self.check_cancelled("metadata quorum sync")?;
             self.revalidate_metadata_quorum_sync_authority(&target)?;
-            let progress =
-                metadata_sync_progress_from_fresh_acknowledgements(&target, &freshly_acknowledged);
-            if metadata_sync_progress_is_full_shard(&target, &progress)
-                && metadata_sync_progress_satisfies(&progress, required_intersection)
-            {
-                self.clear_pending_metadata_sync_replications(&target);
-                return self.finalize_metadata_full_shard_sync(&target, progress);
-            }
-            if metadata_sync_progress_satisfies(&progress, required_intersection)
-                && started_at.elapsed() >= full_shard_grace
-                && let Some(certificate) = self.try_finalize_metadata_quorum_sync_fallback(
-                    &target,
-                    progress.clone(),
-                    purpose,
-                )?
-            {
-                self.clear_pending_metadata_sync_replications(&target);
+            if let Some(certificate) = self.try_finalize_metadata_sync_progress(
+                &target,
+                &freshly_acknowledged,
+                required_intersection,
+                purpose,
+                &started_at,
+                full_shard_grace,
+            )? {
                 return Ok(certificate);
             }
 
@@ -971,6 +995,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 freshly_acknowledged.clear();
                 freshly_acknowledged.insert(self.node_id.clone());
             }
+            if let Some(certificate) = self.try_finalize_metadata_sync_progress(
+                &target,
+                &freshly_acknowledged,
+                required_intersection,
+                purpose,
+                &started_at,
+                full_shard_grace,
+            )? {
+                return Ok(certificate);
+            }
             self.send_metadata_sync_checkpoint_snapshots(
                 &target,
                 &probe_barrier_id,
@@ -1001,6 +1035,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
                 freshly_acknowledged.clear();
                 freshly_acknowledged.insert(self.node_id.clone());
+            }
+            if let Some(certificate) = self.try_finalize_metadata_sync_progress(
+                &target,
+                &freshly_acknowledged,
+                required_intersection,
+                purpose,
+                &started_at,
+                full_shard_grace,
+            )? {
+                return Ok(certificate);
             }
             self.send_metadata_sync_checkpoint_snapshots(
                 &target,
@@ -1038,6 +1082,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 freshly_acknowledged.clear();
                 freshly_acknowledged.insert(self.node_id.clone());
             }
+            if let Some(certificate) = self.try_finalize_metadata_sync_progress(
+                &target,
+                &freshly_acknowledged,
+                required_intersection,
+                purpose,
+                &started_at,
+                full_shard_grace,
+            )? {
+                return Ok(certificate);
+            }
             self.send_metadata_sync_checkpoint_snapshots(
                 &target,
                 &probe_barrier_id,
@@ -1047,13 +1101,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
             let progress =
                 metadata_sync_progress_from_fresh_acknowledgements(&target, &freshly_acknowledged);
-            if metadata_sync_progress_is_full_shard(&target, &progress)
-                && metadata_sync_progress_satisfies(&progress, required_intersection)
-            {
-                self.clear_pending_metadata_sync_replications(&target);
-                return self.finalize_metadata_full_shard_sync(&target, progress);
-            }
-
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
                 if metadata_sync_progress_satisfies(&progress, required_intersection)
@@ -1455,6 +1502,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
 
+        let mut routed_probes = Vec::new();
         for (target_node_id, command, required_authority_confirmation_id) in candidates {
             let request_id = command.request_id.clone();
             if required_authority_confirmation_id.is_none()
@@ -1473,12 +1521,61 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     created_at: Instant::now(),
                 },
             );
-            let sent = self.send_best_effort_message_if_routable(
+            let routed_message = self.next_dfs_routed_message(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
-            )?;
-            if sent {
-                pending_prefix_probes.insert(request_id, target_node_id);
+            );
+            routed_probes.push((
+                target_node_id.clone(),
+                request_id,
+                DfsRoutedSend::new(target_node_id, DfsRoutedCall::value(routed_message)),
+            ));
+        }
+
+        // The direct metadata lane above is only a short accelerator. Route
+        // every omitted probe in one bounded fan-out wave so an offline member
+        // cannot consume the operation deadline before a later reachable
+        // quorum member is even attempted. The production node transport
+        // forks one independent send handle per in-flight request; transports
+        // that cannot safely fork retain the trait's sequential fallback.
+        if routed_probes.is_empty() {
+            return Ok(rejected_node_ids);
+        }
+        let max_inflight = routed_probes.len().min(DFS_METADATA_SYNC_ROUTED_FANOUT_CAP);
+        let expected = routed_probes
+            .iter()
+            .map(|(target_node_id, request_id, _)| (target_node_id.clone(), request_id.clone()))
+            .collect::<Vec<_>>();
+        let outcomes = self
+            .transport
+            .send_routed_calls_bounded(
+                routed_probes
+                    .into_iter()
+                    .map(|(_, _, request)| request)
+                    .collect(),
+                max_inflight,
+            )
+            .map_err(DfsError::from_network)?;
+        if outcomes.len() != expected.len() {
+            return Err(DfsError::Network {
+                message: format!(
+                    "metadata prefix probe fan-out returned {} outcomes for {} requests",
+                    outcomes.len(),
+                    expected.len()
+                ),
+            });
+        }
+        for ((expected_target_node_id, request_id), outcome) in expected.into_iter().zip(outcomes) {
+            if outcome.target_node_id != expected_target_node_id {
+                return Err(DfsError::Network {
+                    message: format!(
+                        "metadata prefix probe fan-out expected target {expected_target_node_id}, got {}",
+                        outcome.target_node_id
+                    ),
+                });
+            }
+            if outcome.result.is_ok() {
+                pending_prefix_probes.insert(request_id, expected_target_node_id);
             } else {
                 self.pending_metadata_replications.remove(&request_id);
             }
@@ -2049,12 +2146,16 @@ mod tests {
         direct_catchup_request_count: usize,
         omit_direct_misses: bool,
         routed_prefix_probe_count: usize,
+        routed_fanout_max_inflight: Vec<usize>,
+        routed_fanout_targets: Vec<Vec<NodeId>>,
         catchup_rpc_requests: Vec<(usize, ObjectRpcRequest)>,
         snapshot_install_count: usize,
         reject_prefix_probes: bool,
         reject_snapshot_installs: bool,
         unroutable_nodes: BTreeSet<NodeId>,
         network_error_nodes: BTreeSet<NodeId>,
+        hold_network_errors_until_operation_deadline: bool,
+        fail_direct_after_operation_deadline: bool,
         echoes_prefix_verification: bool,
         response_sequence_override: Option<u64>,
         incoming: VecDeque<DfsRoutedMessage>,
@@ -2077,12 +2178,16 @@ mod tests {
                 direct_catchup_request_count: 0,
                 omit_direct_misses: false,
                 routed_prefix_probe_count: 0,
+                routed_fanout_max_inflight: Vec::new(),
+                routed_fanout_targets: Vec::new(),
                 catchup_rpc_requests: Vec::new(),
                 snapshot_install_count: 0,
                 reject_prefix_probes: false,
                 reject_snapshot_installs: false,
                 unroutable_nodes: BTreeSet::new(),
                 network_error_nodes: BTreeSet::new(),
+                hold_network_errors_until_operation_deadline: false,
+                fail_direct_after_operation_deadline: false,
                 echoes_prefix_verification: true,
                 response_sequence_override: None,
                 incoming: VecDeque::new(),
@@ -2111,6 +2216,15 @@ mod tests {
                 });
             }
             if self.network_error_nodes.contains(target_node_id) {
+                if self.hold_network_errors_until_operation_deadline
+                    && let Some(deadline) = self.operation_deadline
+                {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .saturating_add(Duration::from_millis(1)),
+                    );
+                }
                 return Err(NetworkError::Io {
                     operation: format!("send metadata sync probe to {target_node_id}"),
                     detail: "test peer is offline after route selection".to_string(),
@@ -2213,10 +2327,59 @@ mod tests {
             Ok(())
         }
 
+        fn send_routed_calls_bounded(
+            &mut self,
+            requests: Vec<crate::DfsRoutedSend>,
+            max_inflight: usize,
+        ) -> Result<Vec<crate::DfsRoutedSendOutcome>, NetworkError> {
+            self.routed_fanout_max_inflight.push(max_inflight);
+            self.routed_fanout_targets.push(
+                requests
+                    .iter()
+                    .map(|request| request.target_node_id.clone())
+                    .collect(),
+            );
+            let mut pending = requests.into_iter().enumerate().collect::<Vec<_>>();
+            if self.hold_network_errors_until_operation_deadline && max_inflight > 1 {
+                pending.sort_by_key(|(_, request)| {
+                    self.network_error_nodes.contains(&request.target_node_id)
+                });
+            }
+            let mut outcomes = std::iter::repeat_with(|| None)
+                .take(pending.len())
+                .collect::<Vec<Option<crate::DfsRoutedSendOutcome>>>();
+            for (index, request) in pending {
+                let target_node_id = request.target_node_id;
+                let result = self.send_routed_call(&target_node_id, request.call);
+                outcomes[index] = Some(crate::DfsRoutedSendOutcome {
+                    target_node_id,
+                    result,
+                });
+            }
+            outcomes
+                .into_iter()
+                .map(|outcome| {
+                    outcome.ok_or_else(|| NetworkError::Serialization {
+                        detail: "test routed fan-out omitted an outcome".to_string(),
+                    })
+                })
+                .collect()
+        }
+
         fn send_metadata_journal_batches_direct(
             &mut self,
             requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
         ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+            if self.fail_direct_after_operation_deadline
+                && self
+                    .operation_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(NetworkError::Io {
+                    operation: "send direct test metadata journal batch".to_string(),
+                    detail: "DFS operation deadline expired before routed send".to_string(),
+                });
+            }
             let prefix_only = requests
                 .iter()
                 .all(|(_, command)| command.verify_prefix_only);
@@ -2995,6 +3158,116 @@ mod tests {
             fixture.service.transport.routed_prefix_probe_count, 0,
             "ordinary probes must not consult the stale routed message-lane backend"
         );
+    }
+
+    #[test]
+    fn primary_handoff_routes_quorum_probes_concurrently_around_one_offline_member() {
+        let mut candidates = vec![
+            node("node_sync_handoff_fanout_a"),
+            node("node_sync_handoff_fanout_b"),
+            node("node_sync_handoff_fanout_c"),
+        ];
+        candidates.sort();
+        let promoted = candidates[0].clone();
+        let offline = candidates[1].clone();
+        let healthy = candidates[2].clone();
+        let mut fixture = configured_sync_fixture(
+            "membership_handoff_fanout",
+            vec![promoted.clone(), offline.clone(), healthy.clone()],
+            vec![promoted.clone(), healthy.clone()],
+        );
+        fixture
+            .service
+            .transport
+            .network_error_nodes
+            .insert(offline.clone());
+        fixture
+            .service
+            .transport
+            .hold_network_errors_until_operation_deadline = true;
+        fixture
+            .service
+            .transport
+            .fail_direct_after_operation_deadline = true;
+        let retiring = fixture.shard.clone();
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: promoted.clone(),
+            replica_node_ids: crate::control_plane::topology_preserving_metadata_shard_replicas(
+                &retiring, &promoted,
+            )
+            .expect("promoted replica preserves the configured node ring"),
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        fixture.control_plane.with_client(|kv| {
+            DfsControlPlaneStore::new(kv)
+                .begin_metadata_shard_membership_handoff(&retiring, &desired)
+                .expect("begin primary handoff")
+                .expect("retiring assignment is exact")
+        });
+
+        assert_eq!(
+            fixture
+                .service
+                .reconcile_pending_metadata_shard_membership_handoffs(
+                    std::slice::from_ref(&retiring),
+                    Duration::from_millis(80),
+                )
+                .expect("one offline member must not starve a joint quorum"),
+            1
+        );
+
+        let expected_targets = vec![promoted.clone(), offline.clone(), healthy.clone()];
+        assert!(
+            fixture
+                .service
+                .transport
+                .routed_fanout_targets
+                .iter()
+                .any(|targets| targets == &expected_targets),
+            "all unresolved probes must enter the same bounded routed fan-out"
+        );
+        assert!(
+            fixture
+                .service
+                .transport
+                .routed_fanout_max_inflight
+                .contains(&DFS_METADATA_SYNC_ROUTED_FANOUT_CAP),
+            "the routed fallback must keep a second worker available around one offline member"
+        );
+
+        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
+            let store = DfsControlPlaneStore::new(kv);
+            (
+                store
+                    .get_metadata_shard(&desired.file_system_id, &desired.shard_id)
+                    .expect("active shard"),
+                store
+                    .get_metadata_shard_membership_handoff(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    )
+                    .expect("pending handoff"),
+                store
+                    .get_metadata_shard_membership_handoff_proof(
+                        &desired.file_system_id,
+                        &desired.shard_id,
+                    )
+                    .expect("handoff proof")
+                    .expect("durable handoff proof"),
+            )
+        });
+        assert_eq!(active, Some(desired));
+        assert!(pending.is_none());
+        let acknowledged_node_ids = proof
+            .acknowledged_node_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            acknowledged_node_ids,
+            BTreeSet::from([retiring.primary_node_id, promoted, healthy])
+        );
+        assert!(!acknowledged_node_ids.contains(&offline));
     }
 
     #[test]
