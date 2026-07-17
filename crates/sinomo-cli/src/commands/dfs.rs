@@ -2952,18 +2952,11 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
     let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
     let mut probes = Vec::new();
     for node_id in remote_node_ids {
-        if let Some(error) =
-            dfs_cluster_status_known_unavailable_node_error(&cluster_paths, &state, &node_id)
-        {
-            nodes.push(DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: None,
-                status: None,
-                error: Some(error),
-            });
-            continue;
-        }
+        // Direct connectivity is not route availability: a node that cannot
+        // dial the target transport itself may still have a valid multi-hop
+        // route through another cluster member. Keep topology decisions in
+        // sinomo-network and let the bounded RPC probe report the terminal
+        // routing result.
         probes.push(spawn_dfs_status_probe(
             &cluster_paths,
             &state,
@@ -3014,32 +3007,6 @@ fn dfs_cluster_status_remote_main_node_ids(
         })
         .map(|member| member.node_id.clone())
         .collect()
-}
-
-fn dfs_cluster_status_known_unavailable_node_error(
-    cluster_paths: &ClusterPaths,
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-    node_id: &NodeId,
-) -> Option<String> {
-    let member = state
-        .members
-        .iter()
-        .find(|member| member.node_id == *node_id)?;
-    match sinomo_runtime::network::cluster_member_main_daemon_connectivity(
-        cluster_paths,
-        state,
-        member,
-    ) {
-        sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Healthy
-        | sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Unknown => None,
-        sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Degraded => Some(
-            "node has no currently healthy main-daemon route according to cluster connectivity probes"
-                .to_string(),
-        ),
-        sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Unreachable => Some(
-            "node is currently unavailable according to cluster connectivity probes".to_string(),
-        ),
-    }
 }
 
 struct DfsStatusProbe {

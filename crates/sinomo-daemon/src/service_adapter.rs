@@ -183,8 +183,7 @@ async fn forward_object_rpc_session_from_daemon_control(
     request_body: sinomo_core::network::ObjectRpcIncomingBody,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(crate::DaemonObjectRpcForwardResponse, ObjectRpcBodySource), ServiceError> {
-    let transport_timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
-        .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
+    let transport_timeouts = daemon_object_rpc_forward_transport_timeouts(&payload);
     let mut options = sinomo_core::network::ClusterObjectRpcOptions::new(transport_timeouts);
     if let Some(overall_timeout_millis) = payload.overall_timeout_millis {
         options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
@@ -231,6 +230,17 @@ async fn forward_object_rpc_session_from_daemon_control(
             ObjectRpcBodySource::empty(),
         )),
     }
+}
+
+fn daemon_object_rpc_forward_transport_timeouts(
+    payload: &crate::DaemonObjectRpcForwardRequest,
+) -> sinomo_core::network::DaemonRpcTimeouts {
+    let mut timeouts = sinomo_core::network::DaemonRpcTimeouts::default()
+        .with_connect_timeout(Some(Duration::from_millis(payload.connect_timeout_millis)));
+    if let Some(idle_timeout_millis) = payload.idle_timeout_millis {
+        timeouts = timeouts.with_idle_timeout(Some(Duration::from_millis(idle_timeout_millis)));
+    }
+    timeouts
 }
 
 /// Real cluster-KV access for services that consume it. Reads come from the local
@@ -6415,6 +6425,59 @@ mod tests {
     use sinomo_core::kv::InProcessKvStore;
     use std::time::Duration;
 
+    #[test]
+    fn daemon_forward_transport_preserves_distinct_connect_and_idle_timeouts() {
+        let payload = crate::DaemonObjectRpcForwardRequest {
+            target_node_id: sinomo_core::node::NodeId::from_legacy_named(
+                "node_daemon_forward_timeouts",
+            )
+            .expect("node id"),
+            request: sinomo_core::network::ObjectRpcRequest::encode_body(
+                "/test/daemon-forward-timeouts",
+                "test",
+                &(),
+            )
+            .expect("request"),
+            connect_timeout_millis: 5_000,
+            idle_timeout_millis: Some(310_000),
+            overall_timeout_millis: None,
+            observe_connectivity: true,
+        };
+
+        let timeouts = daemon_object_rpc_forward_transport_timeouts(&payload);
+
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(310)));
+    }
+
+    #[test]
+    fn daemon_forward_transport_uses_default_idle_timeout_when_omitted() {
+        let payload = crate::DaemonObjectRpcForwardRequest {
+            target_node_id: sinomo_core::node::NodeId::from_legacy_named(
+                "node_daemon_forward_default_idle",
+            )
+            .expect("node id"),
+            request: sinomo_core::network::ObjectRpcRequest::encode_body(
+                "/test/daemon-forward-default-idle",
+                "test",
+                &(),
+            )
+            .expect("request"),
+            connect_timeout_millis: 7_000,
+            idle_timeout_millis: None,
+            overall_timeout_millis: None,
+            observe_connectivity: false,
+        };
+
+        let timeouts = daemon_object_rpc_forward_transport_timeouts(&payload);
+
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(
+            timeouts.idle_timeout,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
+    }
+
     async fn call_value_object_rpc_service_async<S>(
         service: &mut S,
         request: sinomo_core::network::ObjectRpcRequest,
@@ -9692,6 +9755,7 @@ mod tests {
                 target_node_id: target_node.clone(),
                 request: inner_request,
                 connect_timeout_millis: 5_000,
+                idle_timeout_millis: Some(310_000),
                 overall_timeout_millis: None,
                 observe_connectivity: false,
             };

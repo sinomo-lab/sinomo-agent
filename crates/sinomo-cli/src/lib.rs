@@ -151,7 +151,6 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
-    send_object_rpc_session_to_target_async_with_options as daemon_send_object_rpc_session_to_target_async_with_options,
     send_object_rpc_to_target_with_timeouts as daemon_send_object_rpc_to_target_with_timeouts,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
@@ -1487,15 +1486,20 @@ fn remote_management_cli_rpc(
                 .await
                 .map_err(|source| source.to_string())
         } else {
-            daemon_send_object_rpc_session_to_target_async_with_options(
-                &target_node_id,
-                call,
-                options,
-                &runtime,
-                true,
-            )
-            .await
-            .map_err(|source| source.to_string())
+            // The running daemon owns the cluster transports and their module
+            // lifecycle. A short-lived CLI process has no active Iroh module,
+            // so forwarding must cross the authenticated loopback daemon
+            // boundary instead of constructing a routed client here.
+            DaemonApiClient::at_address(status.address)
+                .object_rpc_session_to_target_with_transport_timeouts_async(
+                    &target_node_id,
+                    call,
+                    timeouts,
+                    None,
+                    true,
+                )
+                .await
+                .map_err(|source| source.to_string())
         }
     })
 }

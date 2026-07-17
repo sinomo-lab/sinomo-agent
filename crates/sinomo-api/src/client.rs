@@ -259,9 +259,53 @@ impl DaemonApiClient {
             target_node_id,
             call,
             connect_timeout,
+            None,
             overall_timeout,
             observe_connectivity,
             self.object_rpc_forward_control_timeouts(overall_timeout),
+            None,
+            &runtime,
+        )
+        .await
+    }
+
+    /// Sends one canonical object-RPC session through the running local daemon
+    /// with distinct connection and no-progress budgets. Both transport
+    /// limits must be present; `overall_timeout` remains an independent
+    /// semantic deadline and may be unbounded.
+    pub async fn object_rpc_session_to_target_with_transport_timeouts_async(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        transport_timeouts: sinomo_core::network::DaemonRpcTimeouts,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+        let connect_timeout =
+            transport_timeouts
+                .connect_timeout
+                .ok_or_else(|| DaemonApiError::Parse {
+                    detail: "daemon-forwarded object RPC requires a connection timeout".to_string(),
+                })?;
+        let idle_timeout =
+            transport_timeouts
+                .idle_timeout
+                .ok_or_else(|| DaemonApiError::Parse {
+                    detail: "daemon-forwarded object RPC requires a no-progress timeout"
+                        .to_string(),
+                })?;
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let runtime = tokio::runtime::Handle::current();
+        send_daemon_object_rpc_session_async(
+            data_dir,
+            &self.address,
+            target_node_id,
+            call,
+            connect_timeout,
+            Some(idle_timeout),
+            overall_timeout,
+            observe_connectivity,
+            transport_timeouts,
             None,
             &runtime,
         )
@@ -307,6 +351,7 @@ impl DaemonApiClient {
                 &target_node_id,
                 call,
                 options.connect_timeout,
+                None,
                 options.overall_timeout,
                 options.observe_connectivity,
                 outer_timeouts,
@@ -490,6 +535,7 @@ fn object_rpc_forward_request(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
     connect_timeout: Duration,
+    idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
     observe_connectivity: bool,
 ) -> Result<ObjectRpcRequest, DaemonApiError> {
@@ -497,6 +543,8 @@ fn object_rpc_forward_request(
         target_node_id: target_node_id.clone(),
         request: request.clone(),
         connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+        idle_timeout_millis: idle_timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         overall_timeout_millis: overall_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         observe_connectivity,
@@ -636,6 +684,7 @@ async fn send_daemon_object_rpc_session_async(
     target_node_id: &NodeId,
     call: ObjectRpcSessionCall,
     connect_timeout: Duration,
+    forwarded_idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
     observe_connectivity: bool,
     outer_timeouts: sinomo_core::network::DaemonRpcTimeouts,
@@ -663,6 +712,7 @@ async fn send_daemon_object_rpc_session_async(
         target_node_id,
         &call.request,
         connect_timeout,
+        forwarded_idle_timeout,
         overall_timeout,
         observe_connectivity,
     )?;
@@ -740,6 +790,7 @@ impl DaemonDfsPeerTransport {
             target_node_id,
             call,
             options.connect_timeout,
+            None,
             options.overall_timeout,
             options.observe_connectivity,
             sinomo_core::network::DaemonRpcTimeouts::default(),
@@ -1339,6 +1390,7 @@ mod tests {
             &target_node_id,
             &inner_request,
             Duration::from_secs(5),
+            Some(Duration::from_secs(9)),
             Some(Duration::from_secs(30)),
             true,
         )
@@ -1349,6 +1401,7 @@ mod tests {
         assert_eq!(payload.target_node_id, target_node_id);
         assert_eq!(payload.request.route, "/dfs/test/stream");
         assert_eq!(payload.connect_timeout_millis, 5_000);
+        assert_eq!(payload.idle_timeout_millis, Some(9_000));
         assert_eq!(payload.overall_timeout_millis, Some(30_000));
         assert!(payload.observe_connectivity);
     }
@@ -1363,6 +1416,7 @@ mod tests {
             &target_node_id,
             &inner_request,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
             Some(Duration::from_secs(10)),
             true,
         )
@@ -1372,6 +1426,7 @@ mod tests {
 
         assert_eq!(payload.target_node_id, target_node_id);
         assert_eq!(payload.connect_timeout_millis, 5_000);
+        assert_eq!(payload.idle_timeout_millis, Some(5_000));
         assert_eq!(payload.overall_timeout_millis, Some(10_000));
     }
 
@@ -1386,6 +1441,7 @@ mod tests {
             &target_node_id,
             &inner_request,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            Some(Duration::from_secs(310)),
             None,
             true,
         )
@@ -1393,6 +1449,7 @@ mod tests {
         let payload: DaemonObjectRpcForwardRequest =
             request.decode_body().expect("forward payload");
 
+        assert_eq!(payload.idle_timeout_millis, Some(310_000));
         assert_eq!(payload.overall_timeout_millis, None);
     }
 

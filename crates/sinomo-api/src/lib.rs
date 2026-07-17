@@ -157,6 +157,10 @@ pub struct DaemonObjectRpcForwardRequest {
     pub target_node_id: sinomo_core::node::NodeId,
     pub request: sinomo_core::network::ObjectRpcRequest,
     pub connect_timeout_millis: u64,
+    /// Overrides the routed session's no-progress timeout. Missing values from
+    /// older callers retain the daemon's default network timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overall_timeout_millis: Option<u64>,
     #[serde(default)]
