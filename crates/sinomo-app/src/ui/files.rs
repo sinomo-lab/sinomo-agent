@@ -85,8 +85,12 @@ const FULL_HEADER_INNER_MIN_W: f32 = 860.0;
 const FILES_STATUS_H: f32 = 34.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
-const PLACES_W: f32 = 190.0;
-const PLACE_ROW_H: f32 = 38.0;
+const PLACES_W: f32 = 208.0;
+const PLACE_ROW_H: f32 = 46.0;
+const PLACES_HEADER_H: f32 = 42.0;
+const PLACE_SECTION_HEADER_H: f32 = 28.0;
+const PLACE_SECTION_GAP: f32 = 12.0;
+const PLACE_RAIL_BOTTOM_PAD: f32 = 12.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
 /// The text surface keeps the entire accepted document resident. Reject larger files explicitly
@@ -9530,6 +9534,24 @@ fn local_home_path() -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+fn compact_local_place_path(path: &str) -> String {
+    let display = local_home_path()
+        .and_then(|home| {
+            let relative = Path::new(path).strip_prefix(&home).ok()?;
+            if relative.as_os_str().is_empty() {
+                Some("~".to_string())
+            } else {
+                Some(format!(
+                    "~{}{}",
+                    std::path::MAIN_SEPARATOR,
+                    relative.to_string_lossy()
+                ))
+            }
+        })
+        .unwrap_or_else(|| path.to_string());
+    middle_short(&display, 30)
+}
+
 fn local_root_path(path: &str) -> Option<String> {
     let mut root = PathBuf::new();
     let mut saw_prefix = false;
@@ -9604,8 +9626,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     let mut places = Vec::new();
     push_unique_place(
         &mut places,
-        "SIFS root",
-        "cluster namespace",
+        "Root",
+        "Distributed namespace",
         FilesSourceKind::Sifs,
         "/",
         IconGlyph::Storage,
@@ -9613,7 +9635,7 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     push_unique_place(
         &mut places,
         "Services",
-        "service data",
+        "/services",
         FilesSourceKind::Sifs,
         "/services",
         IconGlyph::Storage,
@@ -9621,32 +9643,16 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     push_unique_place(
         &mut places,
         "Users",
-        "user data",
+        "/users",
         FilesSourceKind::Sifs,
         "/users",
         IconGlyph::Folder,
     );
-    push_unique_place(
-        &mut places,
-        "Sinomo",
-        "runtime data",
-        FilesSourceKind::Sifs,
-        "/sinomo",
-        IconGlyph::Folder,
-    );
-    push_unique_place(
-        &mut places,
-        "Cluster nodes",
-        "remote node files",
-        FilesSourceKind::Sifs,
-        "/sinomo/nodes",
-        IconGlyph::Storage,
-    );
     if !files.node_id.trim().is_empty() {
         push_unique_place(
             &mut places,
-            "This node files",
-            "local-owned SIFS",
+            "This node",
+            "Node-local SIFS files",
             FilesSourceKind::Sifs,
             format!("/sinomo/nodes/{}/files", files.node_id),
             IconGlyph::Folder,
@@ -9654,8 +9660,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     }
     push_unique_place_with_action(
         &mut places,
-        "SIFS path",
-        "cluster path",
+        "Go to path…",
+        "Enter a SIFS path",
         FilesSourceKind::Sifs,
         files.sifs_path.clone(),
         IconGlyph::Search,
@@ -9663,45 +9669,50 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     );
     push_unique_place(
         &mut places,
-        "Working folder",
-        "app working dir",
+        if files.source == FilesSourceKind::Local {
+            "Current folder"
+        } else {
+            "Last local folder"
+        },
+        compact_local_place_path(&files.local_path),
         FilesSourceKind::Local,
         files.local_path.clone(),
-        IconGlyph::Folder,
-    );
-    if let Some(root) = local_root_path(&files.local_path) {
-        push_unique_place(
-            &mut places,
-            local_root_label(&root),
-            "current volume",
-            FilesSourceKind::Local,
-            root,
-            IconGlyph::Storage,
-        );
-    }
-    push_unique_place(
-        &mut places,
-        "Sinomo data",
-        "local data dir",
-        FilesSourceKind::Local,
-        files.data_dir.root().to_string_lossy().into_owned(),
         IconGlyph::Folder,
     );
     if let Some(home) = local_home_path() {
         push_unique_place(
             &mut places,
             "Home",
-            "local profile",
+            compact_local_place_path(&home),
             FilesSourceKind::Local,
             home,
             IconGlyph::Folder,
+        );
+    }
+    let data_dir = files.data_dir.root().to_string_lossy().into_owned();
+    push_unique_place(
+        &mut places,
+        "Sinomo data",
+        compact_local_place_path(&data_dir),
+        FilesSourceKind::Local,
+        data_dir,
+        IconGlyph::Folder,
+    );
+    if let Some(root) = local_root_path(&files.local_path) {
+        push_unique_place(
+            &mut places,
+            local_root_label(&root),
+            root.clone(),
+            FilesSourceKind::Local,
+            root,
+            IconGlyph::Storage,
         );
     }
     if let Some(system_drive) = system_drive_path() {
         push_unique_place(
             &mut places,
             local_root_label(&system_drive),
-            "system drive",
+            system_drive.clone(),
             FilesSourceKind::Local,
             system_drive,
             IconGlyph::Storage,
@@ -9709,8 +9720,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     }
     push_unique_place_with_action(
         &mut places,
-        "Other path",
-        "drive, UNC, or mount",
+        "Browse…",
+        "Drive, share, or mount",
         FilesSourceKind::Local,
         files.local_path.clone(),
         IconGlyph::Search,
@@ -9719,10 +9730,22 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     places
 }
 
-fn file_place_active(files: &FilesState, place: &FilePlace) -> bool {
-    place.action == FilePlaceAction::OpenPath
-        && files.source == place.source
-        && files.path == place.path
+fn file_place_active_index(files: &FilesState, places: &[FilePlace]) -> Option<usize> {
+    places
+        .iter()
+        .enumerate()
+        .filter(|(_, place)| {
+            place.action == FilePlaceAction::OpenPath
+                && files.source == place.source
+                && match place.source {
+                    FilesSourceKind::Sifs => dfs_path_contains(&place.path, &files.path),
+                    FilesSourceKind::Local => {
+                        Path::new(&files.path).starts_with(Path::new(&place.path))
+                    }
+                }
+        })
+        .max_by_key(|(_, place)| place.path.len())
+        .map(|(index, _)| index)
 }
 
 fn open_file_place(shared: &Shared, place: FilePlace, ctx: &mut EventCtx) {
@@ -9837,8 +9860,12 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
     SizedBox::new().height(FILES_STATUS_H).with_child(body)
 }
 
-fn files_places_content_height(count: usize) -> f32 {
-    48.0 + count as f32 * PLACE_ROW_H + 8.0
+fn files_places_content_height(sifs_count: usize, local_count: usize) -> f32 {
+    PLACES_HEADER_H
+        + PLACE_SECTION_HEADER_H * 2.0
+        + (sifs_count + local_count) as f32 * PLACE_ROW_H
+        + PLACE_SECTION_GAP
+        + PLACE_RAIL_BOTTOM_PAD
 }
 
 fn files_places_rail(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -9858,7 +9885,69 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
         let files = shared.files();
         files_places(&files)
     };
-    let content_height = files_places_content_height(places.len());
+    let sifs_places = places
+        .iter()
+        .filter(|place| place.source == FilesSourceKind::Sifs)
+        .cloned()
+        .collect::<Vec<_>>();
+    let local_places = places
+        .iter()
+        .filter(|place| place.source == FilesSourceKind::Local)
+        .cloned()
+        .collect::<Vec<_>>();
+    let content_height = files_places_content_height(sifs_places.len(), local_places.len());
+    let sifs_list = files_place_list(shared, reader, "SIFS locations", sifs_places);
+    let local_list = files_place_list(shared, reader, "Device locations", local_places);
+
+    let heading = SizedBox::new().height(PLACES_HEADER_H).with_child(
+        WidgetPadding::horizontal(
+            14.0,
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .with_child(SectionLabel::new("Locations").theme_when(clone_reader(reader))),
+        )
+        .fill_child_height(),
+    );
+    let sifs_heading = files_place_section_heading("SIFS", reader);
+    let local_heading = files_place_section_heading("This device", reader);
+
+    let content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(heading)
+        .with_child(sifs_heading)
+        .with_child(WidgetPadding::horizontal(8.0, sifs_list).fill_child_width())
+        .with_child(SizedBox::new().height(PLACE_SECTION_GAP))
+        .with_child(local_heading)
+        .with_child(WidgetPadding::horizontal(8.0, local_list).fill_child_width())
+        .with_child(SizedBox::new().height(PLACE_RAIL_BOTTOM_PAD));
+
+    WidgetPod::new(
+        SizedBox::new().height(content_height).with_child(
+            Surface::new(SurfaceRole::Sidebar, content)
+                .theme_when(clone_reader(reader))
+                .fill(),
+        ),
+    )
+}
+
+fn files_place_section_heading(label: &'static str, reader: &ThemeReader) -> impl Widget + use<> {
+    SizedBox::new().height(PLACE_SECTION_HEADER_H).with_child(
+        WidgetPadding::horizontal(
+            14.0,
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .with_child(SectionLabel::new(label).theme_when(clone_reader(reader))),
+        )
+        .fill_child_height(),
+    )
+}
+
+fn files_place_list(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &'static str,
+    places: Vec<FilePlace>,
+) -> impl Widget + use<> {
     let selection_places = places.clone();
     let action_places = places.clone();
     let selection_shared = shared.clone();
@@ -9866,44 +9955,36 @@ fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod
     let items = places
         .iter()
         .map(|place| {
+            let semantic_description =
+                if place.action == FilePlaceAction::OpenPath && place.detail != place.path {
+                    format!("{}; path {}", place.detail, place.path)
+                } else {
+                    place.detail.clone()
+                };
             ListItem::new(place.label.clone())
                 .detail(place.detail.clone())
+                .description(semantic_description)
                 .leading_icon(place.glyph)
         })
         .collect::<Vec<_>>();
 
-    let list = ListView::new("Files places")
+    let list_reader: ThemeReader = {
+        let reader = Rc::clone(reader);
+        Rc::new(move || reader().with_size(ControlSize::Small))
+    };
+    ListView::new(name)
         .items(items)
         .row_height(PLACE_ROW_H)
-        .theme_when(clone_reader(reader))
+        .theme_when(clone_reader(&list_reader))
         .selected_when(move || {
             let files = selection_shared.files();
-            selection_places
-                .iter()
-                .position(|place| file_place_active(&files, place))
+            file_place_active_index(&files, &selection_places)
         })
         .on_change_with_ctx(move |index, _label, ctx| {
             if let Some(place) = action_places.get(index).cloned() {
                 open_file_place(&action_shared, place, ctx);
             }
-        });
-
-    let header = SizedBox::new().height(36.0).with_child(
-        WidgetPadding::horizontal(
-            CONTENT_PAD,
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .with_child(SectionLabel::new("Places").theme_when(clone_reader(reader))),
-        )
-        .fill_child_height(),
-    );
-
-    WidgetPod::new(SizedBox::new().height(content_height).with_child(
-        Background::new(Color::TRANSPARENT, Dock::new(list).top(36.0, header)).brush_when({
-            let s = shared.clone();
-            move || palette(&s).sidebar
-        }),
-    ))
+        })
 }
 
 fn task_strip_has_recovery(task: &FilesTask) -> bool {
@@ -13482,49 +13563,56 @@ mod tests {
         let places = files_places(&state);
 
         assert!(places.iter().any(|place| {
-            place.label == "SIFS root" && place.source == FilesSourceKind::Sifs && place.path == "/"
+            place.label == "Root" && place.source == FilesSourceKind::Sifs && place.path == "/"
         }));
         assert!(places.iter().any(|place| {
             place.label == "Services"
+                && place.detail == "/services"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/services"
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Cluster nodes"
-                && place.source == FilesSourceKind::Sifs
-                && place.path == "/sinomo/nodes"
-        }));
-        assert!(places.iter().any(|place| {
-            place.label == "This node files"
-                && place.detail == "local-owned SIFS"
+            place.label == "This node"
+                && place.detail == "Node-local SIFS files"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/sinomo/nodes/node-desktop/files"
         }));
         assert!(places.iter().any(|place| {
-            place.label == "SIFS path"
+            place.label == "Go to path…"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/services"
                 && place.action == FilePlaceAction::OpenPathPrompt
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Working folder"
-                && place.detail == "app working dir"
+            place.label == "Last local folder"
                 && place.source == FilesSourceKind::Local
                 && place.path == root.to_string_lossy()
         }));
         let current_root = local_root_path(&state.local_path).expect("temp dir has root");
         assert!(places.iter().any(|place| {
             place.label == local_root_label(&current_root)
-                && place.detail == "current volume"
+                && place.detail == current_root
                 && place.source == FilesSourceKind::Local
                 && place.path == current_root
                 && place.action == FilePlaceAction::OpenPath
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Other path"
+            place.label == "Browse…"
                 && place.source == FilesSourceKind::Local
                 && place.action == FilePlaceAction::OpenPathPrompt
         }));
+
+        state.path = "/services/project".to_string();
+        assert_eq!(
+            file_place_active_index(&state, &places),
+            Some(
+                places
+                    .iter()
+                    .position(|place| place.label == "Services")
+                    .expect("services shortcut")
+            ),
+            "the most specific containing location should stay selected"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13671,19 +13759,25 @@ mod tests {
             }),
             "directory row should explain the select versus open split"
         );
-        let places_list = snapshot
+        let sifs_locations = snapshot
             .accessibility
             .nodes
             .iter()
             .find(|node| {
                 node.role == sui::SemanticsRole::List
-                    && node.name.as_deref() == Some("Files places")
+                    && node.name.as_deref() == Some("SIFS locations")
             })
-            .expect("places rail should be exposed as a navigable list");
+            .expect("SIFS locations should be exposed as a navigable list");
         assert!(
-            places_list.actions.contains(&sui::SemanticsAction::Focus),
-            "places list should be focusable"
+            sifs_locations
+                .actions
+                .contains(&sui::SemanticsAction::Focus),
+            "SIFS locations should be focusable"
         );
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == sui::SemanticsRole::List
+                && node.name.as_deref() == Some("Device locations")
+        }));
         let services_place = snapshot
             .accessibility
             .nodes
@@ -13691,7 +13785,7 @@ mod tests {
             .find(|node| {
                 node.role == sui::SemanticsRole::ListItem
                     && node.name.as_deref() == Some("Services")
-                    && node.description.as_deref() == Some("service data")
+                    && node.description.as_deref() == Some("/services")
             })
             .expect("services place should be exposed as a list item");
         assert!(
