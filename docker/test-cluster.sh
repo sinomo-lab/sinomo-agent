@@ -39,7 +39,7 @@
 #
 # Env knobs:
 #   SINOMO_TEST_PROJECT         compose project name   (default sinomo-dfs-test)
-#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 30)
+#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 60)
 #   SINOMO_TEST_EXPECT_TIMEOUT  cross-node poll seconds (default 90)
 #   SINOMO_TEST_PERF_FILES      files per bulk-performance leg (default 64)
 #   SINOMO_TEST_PERF_WARMUP_FILES files in the no-threshold warmup leg (default 8)
@@ -127,7 +127,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
 COMPOSE_OVERRIDE_FILE="${SINOMO_TEST_COMPOSE_OVERRIDE:-}"
 
 PROJECT="${SINOMO_TEST_PROJECT:-sinomo-dfs-test}"
-FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-30}"
+FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-60}"
 DFS_READY_WAIT="${SINOMO_TEST_DFS_READY_WAIT:-240}"
 DFS_CONVERGENCE_WAIT="${SINOMO_TEST_DFS_CONVERGENCE_WAIT:-240}"
 EXPECT_TIMEOUT="${SINOMO_TEST_EXPECT_TIMEOUT:-90}"

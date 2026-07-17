@@ -217,8 +217,29 @@ pub fn plan_replicas(
 pub fn explain_replicas(
     request: &DfsReplicaPlacementRequest,
 ) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
+    explain_replicas_with_environment_validation(request, true)
+}
+
+/// Build the most useful deterministic placement explanation possible without
+/// rejecting an otherwise valid policy merely because the current cluster
+/// environment cannot satisfy it. This is intentionally crate-private: write
+/// paths must continue to use [`explain_replicas`] and its strict validation.
+pub(crate) fn explain_replicas_best_effort(
+    request: &DfsReplicaPlacementRequest,
+) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
+    explain_replicas_with_environment_validation(request, false)
+}
+
+fn explain_replicas_with_environment_validation(
+    request: &DfsReplicaPlacementRequest,
+    validate_environment: bool,
+) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
     request.policy.validate()?;
-    validate_candidate_set(&request.candidates, &request.policy)?;
+    if validate_environment {
+        validate_candidate_set(&request.candidates, &request.policy)?;
+    } else {
+        validate_candidate_shape(&request.candidates)?;
+    }
 
     let mut ranked = request
         .candidates
@@ -302,7 +323,9 @@ pub fn explain_replicas(
         desired_replica_nodes,
         preferred_commit_nodes,
     };
-    validate_replication_plan(&plan.desired_replica_nodes, &request.policy)?;
+    if validate_environment {
+        validate_replication_plan(&plan.desired_replica_nodes, &request.policy)?;
+    }
 
     let represented_zone_count = selected
         .iter()
@@ -1253,6 +1276,11 @@ fn validate_candidate_set(
     candidates: &[DfsReplicaCandidate],
     policy: &DfsReplicationPolicy,
 ) -> Result<(), DfsDistributedError> {
+    validate_candidate_shape(candidates)?;
+    validate_candidate_environment(candidates, policy)
+}
+
+fn validate_candidate_shape(candidates: &[DfsReplicaCandidate]) -> Result<(), DfsDistributedError> {
     let unique_nodes = candidates
         .iter()
         .map(|candidate| &candidate.node_id)
@@ -1267,6 +1295,13 @@ fn validate_candidate_set(
             reason: "replica candidate weight must be greater than zero".to_string(),
         });
     }
+    Ok(())
+}
+
+fn validate_candidate_environment(
+    candidates: &[DfsReplicaCandidate],
+    policy: &DfsReplicationPolicy,
+) -> Result<(), DfsDistributedError> {
     let eligible = candidates
         .iter()
         .filter(|candidate| !policy.forbidden_node_ids.contains(&candidate.node_id))

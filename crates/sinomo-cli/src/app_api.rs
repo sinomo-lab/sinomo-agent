@@ -5695,6 +5695,7 @@ pub struct SifsObjectDetails {
 pub type SifsPlacementPolicy = sinomo_runtime::dfs::DfsPlacementPolicy;
 pub type SifsPlacementScope = sinomo_runtime::dfs::DfsPlacementScope;
 pub type SifsPlacementPreview = sinomo_runtime::dfs::DfsPlacementPreview;
+pub type SifsPlacementPreviewToken = sinomo_runtime::dfs::DfsPlacementPreviewToken;
 pub type SifsPlacementReconciliationJob = sinomo_runtime::dfs::DfsPlacementReconciliationJob;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6128,16 +6129,20 @@ impl SifsBrowser {
         path: &str,
         policy: Option<SifsPlacementPolicy>,
         scope: SifsPlacementScope,
+        expected_preview_token: SifsPlacementPreviewToken,
     ) -> Result<SifsPlacementUpdateOutcome, String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => {
-                let (preview, reconciliation) = backend.update_placement(path, policy, scope)?;
+                let (preview, reconciliation) =
+                    backend.update_placement(path, policy, scope, expected_preview_token)?;
                 Ok(SifsPlacementUpdateOutcome {
                     preview,
                     reconciliation,
                 })
             }
-            SifsBrowserBackend::Remote(remote) => remote.update_placement(path, policy, scope),
+            SifsBrowserBackend::Remote(remote) => {
+                remote.update_placement(path, policy, scope, expected_preview_token)
+            }
         }
     }
 
@@ -6571,13 +6576,15 @@ impl RemoteSifsBrowser {
         path: &str,
         policy: Option<SifsPlacementPolicy>,
         scope: SifsPlacementScope,
+        expected_preview_token: SifsPlacementPreviewToken,
     ) -> Result<SifsPlacementUpdateOutcome, String> {
         let response: sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateResponse = self.rpc(
-            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
-            &sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateRequest {
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateV2Request {
                 path: path.to_string(),
                 policy,
                 scope,
+                expected_preview_token,
             },
         )?;
         Ok(SifsPlacementUpdateOutcome {

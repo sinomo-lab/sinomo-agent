@@ -31,30 +31,30 @@ use std::time::Duration;
 #[cfg(test)]
 use sui::WindowEvent;
 use sui::{
-    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
+    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
     CheckboxIndicatorState, CollectionWindow, Color, Constraints, ControlSize, DefaultTheme,
     DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem,
     FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint,
-    ListItem, ListView, MeasureCtx, Observable, PaintCtx, PanelSection, PlacementBadge,
-    PlacementBadgePaint, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx,
-    SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size, SizedBox, Stack,
-    StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface, SurfaceBorder,
-    SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, Tooltip, TooltipPlacement,
-    TrailingSlotRow, VirtualCollectionModel, VirtualList, VirtualListChrome,
-    VirtualListSelectionMode, VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind,
-    VirtualTableRowContext, VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
-    paint_checkbox_indicator, paint_leading_label_cell, paint_placement_badge_with,
-    paint_text_cell,
+    ListItem, ListView, MeasureCtx, NumberInput, Observable, PaintCtx, PanelSection,
+    PlacementBadge, PlacementBadgePaint, RebuildOnChange, Rect, RichText, ScrollState, ScrollView,
+    SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SideSheet,
+    SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
+    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
+    TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualCollectionModel,
+    VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
+    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
+    VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
+    paint_placement_badge_with, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
     SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary,
     SifsListOptions, SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails,
     SifsObjectDetails, SifsObjectHealth, SifsPlacementPolicy, SifsPlacementPreview,
-    SifsPlacementReconciliationJob, SifsPlacementScope, SifsPlacementUpdateOutcome,
-    SifsReplaceFileIfVersionOutcome,
+    SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
+    SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
 };
 use sinomo_runtime::{
     api::{
@@ -285,6 +285,413 @@ struct FileActionPrompt {
     target_is_dir: bool,
     targets: Vec<FileActionTarget>,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlacementEditorConsistency {
+    Eventual,
+    Confirmed,
+    LocalOwned,
+    EphemeralLocal,
+    AppendOnly,
+}
+
+impl PlacementEditorConsistency {
+    fn from_policy(policy: &sinomo_runtime::core::DfsObjectPolicy) -> Self {
+        match policy {
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual => Self::Eventual,
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => Self::Confirmed,
+            sinomo_runtime::core::DfsObjectPolicy::LocalOwned => Self::LocalOwned,
+            sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal => Self::EphemeralLocal,
+            sinomo_runtime::core::DfsObjectPolicy::AppendOnly => Self::AppendOnly,
+        }
+    }
+
+    fn policy(self) -> Result<sinomo_runtime::core::DfsObjectPolicy, String> {
+        match self {
+            Self::Eventual => Ok(sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual),
+            Self::Confirmed => Ok(sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed),
+            Self::LocalOwned => Err(
+                "This object uses local-owned placement. The visual editor cannot convert local-only data to replicated placement."
+                    .to_string(),
+            ),
+            Self::EphemeralLocal => Err(
+                "This object uses ephemeral-local placement. The visual editor cannot make ephemeral data durable or replicated."
+                    .to_string(),
+            ),
+            Self::AppendOnly => Err(
+                "This object uses append-only placement, which is not editable as a complete replica policy."
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eventual => "Eventual",
+            Self::Confirmed => "Confirmed",
+            Self::LocalOwned => "Local owned",
+            Self::EphemeralLocal => "Ephemeral local",
+            Self::AppendOnly => "Append only",
+        }
+    }
+
+    fn is_editable(self) -> bool {
+        matches!(self, Self::Eventual | Self::Confirmed)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlacementEditorPolicyDraft {
+    consistency: PlacementEditorConsistency,
+    min_commit_replicas: usize,
+    desired_replicas: usize,
+    min_distinct_zones: usize,
+    required_node_ids: BTreeSet<sinomo_runtime::node::NodeId>,
+    forbidden_node_ids: BTreeSet<sinomo_runtime::node::NodeId>,
+    inherit: bool,
+}
+
+impl PlacementEditorPolicyDraft {
+    fn from_policy(policy: &SifsPlacementPolicy, inherit: bool) -> Self {
+        let mut draft = Self {
+            consistency: PlacementEditorConsistency::from_policy(&policy.consistency),
+            min_commit_replicas: policy.min_commit_replicas,
+            desired_replicas: policy.desired_replicas.max(1),
+            min_distinct_zones: policy.min_distinct_zones,
+            required_node_ids: policy.required_node_ids.iter().cloned().collect(),
+            forbidden_node_ids: policy.forbidden_node_ids.iter().cloned().collect(),
+            inherit,
+        };
+        draft.normalize();
+        draft
+    }
+
+    fn default_replicated(desired_replicas: usize, inherit: bool) -> Self {
+        let desired_replicas = desired_replicas.max(1);
+        Self {
+            consistency: PlacementEditorConsistency::Eventual,
+            min_commit_replicas: 1,
+            desired_replicas,
+            min_distinct_zones: 0,
+            required_node_ids: BTreeSet::new(),
+            forbidden_node_ids: BTreeSet::new(),
+            inherit,
+        }
+    }
+
+    fn normalize(&mut self) {
+        self.desired_replicas = self
+            .desired_replicas
+            .max(1)
+            .max(self.required_node_ids.len())
+            .max(self.min_distinct_zones);
+        self.min_distinct_zones = self.min_distinct_zones.min(self.desired_replicas);
+        self.min_commit_replicas = self.min_commit_replicas.clamp(1, self.desired_replicas);
+        if self.consistency == PlacementEditorConsistency::Confirmed {
+            self.min_commit_replicas = self.desired_replicas;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlacementEditorScopeDraft {
+    Known {
+        draft: PlacementEditorPolicyDraft,
+        /// The exact policy as loaded from SIFS. `None` means this scope has no rule.
+        original_policy: Option<PlacementEditorPolicyDraft>,
+    },
+    /// Older daemons expose only the winning exact rule. Its sibling may coexist but be hidden,
+    /// so editing that sibling without refreshing through a newer daemon could overwrite it.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlacementInheritanceAction {
+    MakeExplicitHere,
+    UseInheritedPolicy,
+    KeepExplicitRule,
+}
+
+impl PlacementInheritanceAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MakeExplicitHere => "Make explicit here",
+            Self::UseInheritedPolicy => "Use inherited policy",
+            Self::KeepExplicitRule => "Keep explicit rule",
+        }
+    }
+
+    fn inherit(self) -> bool {
+        matches!(self, Self::UseInheritedPolicy)
+    }
+}
+
+impl PlacementEditorScopeDraft {
+    fn known_missing(effective: &PlacementEditorPolicyDraft) -> Self {
+        let mut draft = effective.clone();
+        draft.inherit = true;
+        Self::Known {
+            draft,
+            original_policy: None,
+        }
+    }
+
+    fn known_exact(policy: &SifsPlacementPolicy) -> Self {
+        let draft = PlacementEditorPolicyDraft::from_policy(policy, false);
+        Self::Known {
+            original_policy: Some(draft.clone()),
+            draft,
+        }
+    }
+
+    fn draft(&self) -> Option<&PlacementEditorPolicyDraft> {
+        match self {
+            Self::Known { draft, .. } => Some(draft),
+            Self::Unknown => None,
+        }
+    }
+
+    fn draft_mut(&mut self) -> Option<&mut PlacementEditorPolicyDraft> {
+        match self {
+            Self::Known { draft, .. } => Some(draft),
+            Self::Unknown => None,
+        }
+    }
+
+    fn has_exact_rule(&self) -> bool {
+        matches!(
+            self,
+            Self::Known {
+                original_policy: Some(_),
+                ..
+            }
+        )
+    }
+
+    fn has_actionable_change(&self) -> bool {
+        let Self::Known {
+            draft,
+            original_policy,
+        } = self
+        else {
+            return false;
+        };
+        match (draft.inherit, original_policy) {
+            // There is no exact rule to remove.
+            (true, None) => false,
+            // The operator explicitly chose to remove the loaded exact rule.
+            (true, Some(_)) => true,
+            // Creating a previously absent rule is intentional once any field flips inherit off.
+            (false, None) => true,
+            // Re-applying the exact values is a no-op; require a real policy edit.
+            (false, Some(original)) => draft != original,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlacementEditorDraft {
+    scope: SifsPlacementScope,
+    self_policy: PlacementEditorScopeDraft,
+    subtree_policy: PlacementEditorScopeDraft,
+}
+
+impl PlacementEditorDraft {
+    fn for_details(details: Option<&SifsObjectDetails>, target_is_dir: bool) -> Self {
+        let Some((details, resolved)) =
+            details.zip(details.and_then(|details| details.placement.as_ref()))
+        else {
+            let draft = PlacementEditorPolicyDraft::default_replicated(
+                details.map_or(2, |details| details.current_locations.len().max(2)),
+                false,
+            );
+            return Self {
+                scope: if target_is_dir {
+                    SifsPlacementScope::Subtree
+                } else {
+                    SifsPlacementScope::SelfOnly
+                },
+                self_policy: PlacementEditorScopeDraft::Known {
+                    draft: draft.clone(),
+                    original_policy: None,
+                },
+                subtree_policy: PlacementEditorScopeDraft::Known {
+                    draft,
+                    original_policy: None,
+                },
+            };
+        };
+
+        let effective = PlacementEditorPolicyDraft::from_policy(&resolved.policy, true);
+        let exact_source = resolved.source_path.as_deref() == Some(details.path.as_str());
+        let exact_policy_for = |scope| {
+            resolved
+                .exact_policies
+                .iter()
+                .find(|exact| exact.scope == scope)
+                .map(|exact| &exact.policy)
+        };
+        let scope_state = |scope| {
+            if let Some(resolution) = resolved
+                .scope_resolutions
+                .iter()
+                .find(|resolution| resolution.scope == scope)
+            {
+                if resolution.exact {
+                    return PlacementEditorScopeDraft::known_exact(&resolution.policy);
+                }
+                let fallback = PlacementEditorPolicyDraft::from_policy(&resolution.policy, true);
+                return PlacementEditorScopeDraft::known_missing(&fallback);
+            }
+            if let Some(policy) = exact_policy_for(scope) {
+                PlacementEditorScopeDraft::known_exact(policy)
+            } else if !resolved.exact_policies.is_empty() || !exact_source {
+                PlacementEditorScopeDraft::known_missing(&effective)
+            } else if resolved.source_scope == Some(scope) {
+                // Compatibility with an older daemon: reconstruct only the winner it exposed.
+                PlacementEditorScopeDraft::known_exact(&resolved.policy)
+            } else {
+                PlacementEditorScopeDraft::Unknown
+            }
+        };
+        let scope = if target_is_dir && exact_source {
+            resolved.source_scope.unwrap_or(SifsPlacementScope::Subtree)
+        } else {
+            SifsPlacementScope::SelfOnly
+        };
+        Self {
+            scope,
+            self_policy: scope_state(SifsPlacementScope::SelfOnly),
+            subtree_policy: scope_state(SifsPlacementScope::Subtree),
+        }
+    }
+
+    fn scope_draft(&self, scope: SifsPlacementScope) -> &PlacementEditorScopeDraft {
+        match scope {
+            SifsPlacementScope::SelfOnly => &self.self_policy,
+            SifsPlacementScope::Subtree => &self.subtree_policy,
+        }
+    }
+
+    fn scope_draft_mut(&mut self, scope: SifsPlacementScope) -> &mut PlacementEditorScopeDraft {
+        match scope {
+            SifsPlacementScope::SelfOnly => &mut self.self_policy,
+            SifsPlacementScope::Subtree => &mut self.subtree_policy,
+        }
+    }
+
+    fn active_policy(&self) -> Option<&PlacementEditorPolicyDraft> {
+        self.scope_draft(self.scope).draft()
+    }
+
+    fn active_policy_mut(&mut self) -> Option<&mut PlacementEditorPolicyDraft> {
+        self.scope_draft_mut(self.scope).draft_mut()
+    }
+
+    fn scope_is_known(&self, scope: SifsPlacementScope) -> bool {
+        self.scope_draft(scope).draft().is_some()
+    }
+
+    fn active_has_exact_rule(&self) -> bool {
+        self.scope_draft(self.scope).has_exact_rule()
+    }
+
+    fn inheritance_action(&self) -> Option<PlacementInheritanceAction> {
+        let policy = self.active_policy()?;
+        Some(match (self.active_has_exact_rule(), policy.inherit) {
+            (false, true) => PlacementInheritanceAction::MakeExplicitHere,
+            (true, true) => PlacementInheritanceAction::KeepExplicitRule,
+            (_, false) => PlacementInheritanceAction::UseInheritedPolicy,
+        })
+    }
+
+    fn has_actionable_change(&self) -> bool {
+        self.scope_draft(self.scope).has_actionable_change()
+    }
+
+    /// Make the successfully accepted exact rule the new editing baseline without disturbing the
+    /// sibling scope. The returned preview is built from the config committed with the durable
+    /// reconciliation job, so its exact-policy projection is the authoritative value to rebase to.
+    fn rebase_accepted_scope(
+        &mut self,
+        scope: SifsPlacementScope,
+        resolved: &sinomo_runtime::dfs::DfsResolvedPlacementPolicy,
+    ) {
+        let resolution = resolved
+            .scope_resolutions
+            .iter()
+            .find(|resolution| resolution.scope == scope);
+        let exact_policy = resolved
+            .exact_policies
+            .iter()
+            .find(|exact| exact.scope == scope)
+            .map(|exact| &exact.policy)
+            .or_else(|| {
+                resolution
+                    .filter(|resolution| resolution.exact)
+                    .map(|resolution| &resolution.policy)
+            })
+            .or_else(|| {
+                (resolved.source_path.as_deref() == Some(resolved.path.as_str())
+                    && resolved.source_scope == Some(scope)
+                    && !resolved.inherited)
+                    .then_some(&resolved.policy)
+            });
+        let PlacementEditorScopeDraft::Known {
+            draft,
+            original_policy,
+        } = self.scope_draft_mut(scope)
+        else {
+            return;
+        };
+
+        if let Some(policy) = exact_policy {
+            let accepted = PlacementEditorPolicyDraft::from_policy(policy, false);
+            *draft = accepted.clone();
+            *original_policy = Some(accepted);
+            return;
+        }
+
+        // A successful removal has no exact rule. Prefer the scope-specific fallback returned by
+        // the daemon; if a compatibility payload omitted it, retain the displayed values but mark
+        // them inherited. Either form correctly records that there is no exact rule to re-apply.
+        if let Some(resolution) = resolution {
+            *draft = PlacementEditorPolicyDraft::from_policy(&resolution.policy, true);
+        } else {
+            draft.inherit = true;
+        }
+        *original_policy = None;
+    }
+
+    fn normalize(&mut self) {
+        if let Some(draft) = self.active_policy_mut() {
+            draft.normalize();
+        }
+    }
+
+    fn policy_and_scope(
+        &self,
+    ) -> Result<(Option<SifsPlacementPolicy>, SifsPlacementScope), String> {
+        let draft = self.active_policy().ok_or_else(|| {
+            "Policy values for this scope are unavailable from the connected daemon; refresh after upgrading the daemon before editing this scope"
+                .to_string()
+        })?;
+        if draft.inherit {
+            return Ok((None, self.scope));
+        }
+        let mut policy = SifsPlacementPolicy::new(
+            draft.consistency.policy()?,
+            draft.min_commit_replicas,
+            draft.desired_replicas,
+        )
+        .map_err(|error| error.to_string())?;
+        policy.min_distinct_zones = draft.min_distinct_zones;
+        policy.required_node_ids = draft.required_node_ids.iter().cloned().collect();
+        policy.forbidden_node_ids = draft.forbidden_node_ids.iter().cloned().collect();
+        policy.validate().map_err(|error| error.to_string())?;
+        Ok((Some(policy), self.scope))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -626,10 +1033,19 @@ pub struct FilesState {
     pending_attachment_request_id: Option<u64>,
     pending_attachment_source_path: Option<(FilesSourceKind, String)>,
     pending_import_request_ids: BTreeSet<u64>,
+    placement_draft: Option<PlacementEditorDraft>,
+    placement_edit_revision: u64,
+    placement_preview_revision: Option<u64>,
+    pending_placement_preview_revision: Option<u64>,
     placement_preview: Option<SifsPlacementPreview>,
     placement_reconciliation: Option<SifsPlacementReconciliationJob>,
     placement_loading: bool,
+    placement_applying: bool,
     placement_error: Option<String>,
+    /// Whether `placement_error` came from observing an already-accepted reconciliation job.
+    /// A progress result may replace or clear another progress error, but must never erase a
+    /// newer preview/Apply failure that the operator still needs to act on.
+    placement_error_from_reconciliation: bool,
     pending_placement_request_id: Option<u64>,
 }
 
@@ -713,9 +1129,12 @@ enum FilesDialogStructure {
         target_path: Option<String>,
         targets: Vec<FileActionTarget>,
         error: Option<String>,
+        placement_edit_revision: u64,
+        placement_preview_revision: Option<u64>,
         placement_preview: Option<SifsPlacementPreview>,
         placement_reconciliation: Option<SifsPlacementReconciliationJob>,
         placement_loading: bool,
+        placement_applying: bool,
         placement_error: Option<String>,
     },
     Compact {
@@ -882,9 +1301,12 @@ impl FilesStructureKey {
                 target_path: prompt.target_path.clone(),
                 targets: prompt.targets.clone(),
                 error: prompt.error.clone(),
+                placement_edit_revision: state.placement_edit_revision,
+                placement_preview_revision: state.placement_preview_revision,
                 placement_preview: state.placement_preview.clone(),
                 placement_reconciliation: state.placement_reconciliation.clone(),
                 placement_loading: state.placement_loading,
+                placement_applying: state.placement_applying,
                 placement_error: state.placement_error.clone(),
             }
         } else if let Some(overlay) = state.compact_overlay {
@@ -990,10 +1412,16 @@ impl FilesState {
             pending_attachment_request_id: None,
             pending_attachment_source_path: None,
             pending_import_request_ids: BTreeSet::new(),
+            placement_draft: None,
+            placement_edit_revision: 0,
+            placement_preview_revision: None,
+            pending_placement_preview_revision: None,
             placement_preview: None,
             placement_reconciliation: None,
             placement_loading: false,
+            placement_applying: false,
             placement_error: None,
+            placement_error_from_reconciliation: false,
             pending_placement_request_id: None,
         }
     }
@@ -1314,10 +1742,15 @@ impl FilesState {
         self.pending_attachment_request_id = None;
         self.pending_attachment_source_path = None;
         self.pending_import_request_ids.clear();
+        self.placement_draft = None;
+        self.placement_preview_revision = None;
+        self.pending_placement_preview_revision = None;
         self.placement_preview = None;
         self.placement_reconciliation = None;
         self.placement_loading = false;
+        self.placement_applying = false;
         self.placement_error = None;
+        self.placement_error_from_reconciliation = false;
         self.pending_placement_request_id = None;
         self.attachment_loading = false;
         if let Some(document) = self.document.as_mut()
@@ -1460,10 +1893,12 @@ impl FilesState {
                     }
                     if self.pending_placement_request_id.take().is_some() {
                         self.placement_loading = false;
+                        self.placement_applying = false;
                         self.placement_error = Some(
                             "The Files background worker stopped while managing placement."
                                 .to_string(),
                         );
+                        self.placement_error_from_reconciliation = false;
                         changed = true;
                     }
                     self.worker_rx = None;
@@ -1844,25 +2279,39 @@ impl FilesState {
                     return false;
                 }
                 self.pending_placement_request_id = None;
+                let preview_revision = self.pending_placement_preview_revision.take();
                 self.placement_loading = false;
+                if preview_revision != Some(self.placement_edit_revision) {
+                    self.resume_placement_progress_poll();
+                    return false;
+                }
                 if self
                     .action_prompt
                     .as_ref()
                     .and_then(|prompt| prompt.target_path.as_deref())
                     != Some(path.as_str())
                 {
+                    self.resume_placement_progress_poll();
                     return false;
                 }
                 match result {
                     Ok(preview) => {
                         self.placement_preview = Some(preview);
+                        self.placement_preview_revision = preview_revision;
                         self.placement_error = None;
+                        self.placement_error_from_reconciliation = false;
                     }
                     Err(error) => {
-                        self.placement_preview = None;
+                        self.placement_preview_revision = None;
                         self.placement_error = Some(error);
+                        self.placement_error_from_reconciliation = false;
                     }
                 }
+                // Previewing a replacement temporarily owns the placement
+                // request slot. Resume observation of the accepted job once
+                // that bounded request finishes so its progress never becomes
+                // stale while the operator considers a superseding policy.
+                self.resume_placement_progress_poll();
                 true
             }
             FilesWorkerResult::PlacementUpdate {
@@ -1874,14 +2323,39 @@ impl FilesState {
                     return false;
                 }
                 self.pending_placement_request_id = None;
+                self.pending_placement_preview_revision = None;
                 self.placement_loading = false;
+                self.placement_applying = false;
                 match result {
                     Ok(outcome) => {
+                        let accepted_resolved = outcome.preview.resolved.clone();
+                        if let Some(draft) = self.placement_draft.as_mut() {
+                            draft.rebase_accepted_scope(
+                                outcome.reconciliation.scope,
+                                &accepted_resolved,
+                            );
+                        }
+                        // Keep the selected-object cache aligned with the policy that was
+                        // atomically accepted alongside this reconciliation job. Otherwise,
+                        // closing and reopening the editor before reconciliation finishes would
+                        // rebuild from the pre-Apply details and misclassify an exact reversion as
+                        // an unchanged policy. The resolved projection includes both exact scopes,
+                        // so a subtree update does not erase a coexisting self-only rule (or vice
+                        // versa).
+                        if let Some(details) = self
+                            .selected_details
+                            .as_mut()
+                            .filter(|details| details.path == path)
+                        {
+                            details.placement = Some(accepted_resolved);
+                        }
                         let terminal = outcome.reconciliation.state.is_terminal();
                         let job_id = outcome.reconciliation.job_id.clone();
                         self.placement_preview = Some(outcome.preview);
+                        self.placement_preview_revision = Some(self.placement_edit_revision);
                         self.placement_reconciliation = Some(outcome.reconciliation);
                         self.placement_error = None;
+                        self.placement_error_from_reconciliation = false;
                         self.pending_select_path = Some(path);
                         if terminal {
                             self.refresh(None);
@@ -1889,8 +2363,12 @@ impl FilesState {
                             self.schedule_placement_progress_poll(job_id);
                         }
                     }
-                    Err(error) => self.placement_error = Some(error),
+                    Err(error) => {
+                        self.placement_error = Some(error);
+                        self.placement_error_from_reconciliation = false;
+                    }
                 }
+                self.resume_placement_progress_poll();
                 true
             }
             FilesWorkerResult::PlacementProgress { request_id, result } => {
@@ -1898,19 +2376,38 @@ impl FilesState {
                     return false;
                 }
                 self.pending_placement_request_id = None;
+                self.pending_placement_preview_revision = None;
                 match result {
                     Ok(job) => {
                         let terminal = job.state.is_terminal();
                         let job_id = job.job_id.clone();
                         self.placement_reconciliation = Some(job);
-                        self.placement_error = None;
+                        if self.placement_error_from_reconciliation {
+                            self.placement_error = None;
+                            self.placement_error_from_reconciliation = false;
+                        }
                         if terminal {
                             self.refresh(None);
                         } else {
                             self.schedule_placement_progress_poll(job_id);
                         }
                     }
-                    Err(error) => self.placement_error = Some(error),
+                    Err(error) => {
+                        if self.placement_error.is_none()
+                            || self.placement_error_from_reconciliation
+                        {
+                            self.placement_error = Some(error);
+                            self.placement_error_from_reconciliation = true;
+                        }
+                        if let Some(job_id) = self
+                            .placement_reconciliation
+                            .as_ref()
+                            .filter(|job| !job.state.is_terminal())
+                            .map(|job| job.job_id.clone())
+                        {
+                            self.schedule_placement_progress_poll(job_id);
+                        }
+                    }
                 }
                 true
             }
@@ -2777,6 +3274,28 @@ impl FilesState {
             Some(entry) => (Some(entry.path), entry.name, entry.is_dir),
             None => (None, String::new(), false),
         };
+        let placement_draft = if kind == FileActionPromptKind::Placement {
+            self.selected_details
+                .as_ref()
+                .filter(|details| {
+                    Some(details.path.as_str()) == target_path.as_deref()
+                        && details.placement.is_some()
+                })
+                .map(|details| PlacementEditorDraft::for_details(Some(details), target_is_dir))
+        } else {
+            None
+        };
+        let continuing_reconciliation_job = (kind == FileActionPromptKind::Placement)
+            .then(|| {
+                self.placement_reconciliation
+                    .as_ref()
+                    .filter(|job| {
+                        !job.state.is_terminal()
+                            && Some(job.path.as_str()) == target_path.as_deref()
+                    })
+                    .map(|job| job.job_id.clone())
+            })
+            .flatten();
         let input = match kind {
             FileActionPromptKind::GoTo => self.path.clone(),
             FileActionPromptKind::NewFile => "untitled.txt".to_string(),
@@ -2804,13 +3323,7 @@ impl FilesState {
             FileActionPromptKind::Move => target_name.clone(),
             FileActionPromptKind::Rename => target_name.clone(),
             FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => String::new(),
-            FileActionPromptKind::Placement => self
-                .selected_details
-                .as_ref()
-                .map(placement_editor_spec)
-                .unwrap_or_else(|| {
-                    "eventual W=1 N=2 zones=0 scope=self required= forbidden=".to_string()
-                }),
+            FileActionPromptKind::Placement => String::new(),
         };
         let error = match kind {
             FileActionPromptKind::Copy
@@ -2836,11 +3349,25 @@ impl FilesState {
             {
                 Some("select a SIFS file or folder first".to_string())
             }
+            FileActionPromptKind::Placement if placement_draft.is_none() => Some(
+                "Wait for this object's resolved placement metadata, then reopen the editor"
+                    .to_string(),
+            ),
             _ => None,
         };
         if kind == FileActionPromptKind::Placement {
+            self.placement_draft = placement_draft;
+            self.placement_edit_revision = self.placement_edit_revision.wrapping_add(1);
+            self.placement_preview_revision = None;
+            self.pending_placement_preview_revision = None;
+            if continuing_reconciliation_job.is_none() {
+                self.pending_placement_request_id = None;
+            }
             self.placement_preview = None;
             self.placement_error = None;
+            self.placement_error_from_reconciliation = false;
+            self.placement_loading = false;
+            self.placement_applying = false;
             if self
                 .placement_reconciliation
                 .as_ref()
@@ -2858,13 +3385,30 @@ impl FilesState {
             targets,
             error,
         });
+        if let Some(job_id) = continuing_reconciliation_job
+            && self.pending_placement_request_id.is_none()
+        {
+            self.schedule_placement_progress_poll(job_id);
+        }
     }
 
     fn close_action_prompt(&mut self) {
+        if self.placement_applying {
+            return;
+        }
+        let reconciliation_in_flight = self.placement_reconciliation_in_flight();
         self.action_prompt = None;
+        self.placement_draft = None;
+        self.placement_preview_revision = None;
+        self.pending_placement_preview_revision = None;
+        if !reconciliation_in_flight {
+            self.pending_placement_request_id = None;
+        }
         self.placement_preview = None;
         self.placement_error = None;
+        self.placement_error_from_reconciliation = false;
         self.placement_loading = false;
+        self.placement_applying = false;
     }
 
     fn open_compact_overlay(&mut self, overlay: CompactFilesOverlay) {
@@ -2880,11 +3424,223 @@ impl FilesState {
         if let Some(prompt) = &mut self.action_prompt {
             prompt.input = input;
             prompt.error = None;
-            if prompt.kind == FileActionPromptKind::Placement {
-                self.placement_preview = None;
-                self.placement_error = None;
-            }
         }
+    }
+
+    fn mutate_placement_draft(&mut self, mutate: impl FnOnce(&mut PlacementEditorDraft)) -> bool {
+        if self.placement_editor_locked() {
+            return false;
+        }
+        let Some(draft) = self.placement_draft.as_mut() else {
+            return false;
+        };
+        let before = draft.clone();
+        mutate(draft);
+        draft.normalize();
+        if *draft == before {
+            return false;
+        }
+        let preserves_reconciliation_poll = self.pending_placement_request_id.is_some()
+            && self.pending_placement_preview_revision.is_none()
+            && !self.placement_loading
+            && self.placement_reconciliation_in_flight();
+        self.placement_edit_revision = self.placement_edit_revision.wrapping_add(1);
+        if !preserves_reconciliation_poll {
+            self.pending_placement_request_id = None;
+        }
+        self.pending_placement_preview_revision = None;
+        self.placement_loading = false;
+        self.placement_error = None;
+        self.placement_error_from_reconciliation = false;
+        if let Some(prompt) = self.action_prompt.as_mut() {
+            prompt.error = None;
+        }
+        self.resume_placement_progress_poll();
+        true
+    }
+
+    fn mutate_placement_policy(
+        &mut self,
+        mutate: impl FnOnce(&mut PlacementEditorPolicyDraft),
+    ) -> bool {
+        if !self
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .is_some_and(|policy| policy.consistency.is_editable())
+        {
+            return false;
+        }
+        self.mutate_placement_draft(|draft| {
+            if let Some(policy) = draft.active_policy_mut() {
+                mutate(policy);
+            }
+        })
+    }
+
+    fn set_placement_consistency(&mut self, consistency: PlacementEditorConsistency) -> bool {
+        if self
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .is_some_and(|draft| !draft.consistency.is_editable())
+        {
+            if let Some(prompt) = self.action_prompt.as_mut() {
+                prompt.error = Some(
+                    "Local-only placement cannot be converted in the visual editor".to_string(),
+                );
+            }
+            return false;
+        }
+        self.mutate_placement_policy(|policy| {
+            policy.inherit = false;
+            policy.consistency = consistency;
+        })
+    }
+
+    fn set_placement_min_commit_replicas(&mut self, replicas: usize) -> bool {
+        self.mutate_placement_policy(|policy| {
+            policy.inherit = false;
+            if policy.consistency == PlacementEditorConsistency::Eventual {
+                policy.min_commit_replicas = replicas.clamp(1, policy.desired_replicas);
+            }
+        })
+    }
+
+    fn set_placement_desired_replicas(&mut self, replicas: usize) -> bool {
+        self.mutate_placement_policy(|policy| {
+            policy.inherit = false;
+            policy.desired_replicas = replicas.max(1);
+        })
+    }
+
+    fn set_placement_min_distinct_zones(&mut self, zones: usize) -> bool {
+        self.mutate_placement_policy(|policy| {
+            policy.inherit = false;
+            policy.min_distinct_zones = zones.min(policy.desired_replicas);
+        })
+    }
+
+    fn set_placement_scope(&mut self, scope: SifsPlacementScope) -> bool {
+        let target_is_dir = self
+            .action_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.target_is_dir);
+        let scope = if target_is_dir {
+            scope
+        } else {
+            SifsPlacementScope::SelfOnly
+        };
+        if self
+            .placement_draft
+            .as_ref()
+            .is_some_and(|draft| !draft.scope_is_known(scope))
+        {
+            if let Some(prompt) = self.action_prompt.as_mut() {
+                prompt.error = Some(
+                    "This daemon did not return the exact policy for that scope. Refresh after upgrading the daemon before switching scopes."
+                        .to_string(),
+                );
+            }
+            return false;
+        }
+        self.mutate_placement_draft(|draft| draft.scope = scope)
+    }
+
+    fn set_placement_inherit(&mut self, inherit: bool) -> bool {
+        self.mutate_placement_draft(|draft| {
+            if let Some(policy) = draft.active_policy_mut() {
+                policy.inherit = inherit;
+            }
+        })
+    }
+
+    fn set_placement_node_required(
+        &mut self,
+        node_id: sinomo_runtime::node::NodeId,
+        required: bool,
+    ) -> bool {
+        self.mutate_placement_policy(|policy| {
+            policy.inherit = false;
+            if required {
+                policy.forbidden_node_ids.remove(&node_id);
+                policy.required_node_ids.insert(node_id);
+            } else {
+                policy.required_node_ids.remove(&node_id);
+            }
+        })
+    }
+
+    fn set_placement_node_forbidden(
+        &mut self,
+        node_id: sinomo_runtime::node::NodeId,
+        forbidden: bool,
+    ) -> bool {
+        self.mutate_placement_policy(|policy| {
+            policy.inherit = false;
+            if forbidden {
+                policy.required_node_ids.remove(&node_id);
+                policy.forbidden_node_ids.insert(node_id);
+            } else {
+                policy.forbidden_node_ids.remove(&node_id);
+            }
+        })
+    }
+
+    fn placement_preview_is_current(&self) -> bool {
+        self.placement_preview.is_some()
+            && self.placement_preview_revision == Some(self.placement_edit_revision)
+    }
+
+    fn placement_reconciliation_in_flight(&self) -> bool {
+        self.placement_reconciliation
+            .as_ref()
+            .is_some_and(|job| !job.state.is_terminal())
+    }
+
+    fn placement_editor_locked(&self) -> bool {
+        // An accepted reconciliation keeps its immutable policy/candidate
+        // snapshot, but it must not trap the editor if one of those candidates
+        // later becomes unavailable. A freshly previewed, explicit edit can
+        // atomically supersede the old job; only the short Apply request itself
+        // is non-detachable.
+        self.placement_applying
+    }
+
+    fn placement_apply_allowed(&self) -> bool {
+        self.placement_preview_is_current()
+            && !self.placement_loading
+            && !self.placement_editor_locked()
+            && self.placement_error.is_none()
+            && self.placement_draft.as_ref().is_some_and(|draft| {
+                draft.has_actionable_change()
+                    && draft
+                        .active_policy()
+                        .is_some_and(|policy| policy.consistency.is_editable())
+            })
+            && self
+                .placement_preview
+                .as_ref()
+                .is_some_and(SifsPlacementPreview::is_satisfiable)
+    }
+
+    fn placement_candidate_limit(&self) -> usize {
+        let draft_count = self
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .map_or(1, |draft| draft.desired_replicas);
+        self.placement_preview
+            .as_ref()
+            .map_or(draft_count, |preview| {
+                preview
+                    .nodes
+                    .iter()
+                    .filter(|node| node.accepts_content)
+                    .count()
+                    .max(draft_count)
+            })
+            .max(1)
     }
 
     fn set_sort_mode(&mut self, mode: FileSortMode) {
@@ -2978,6 +3734,9 @@ impl FilesState {
     }
 
     fn start_placement_preview(&mut self, waker: Option<sui::UiHandle>) {
+        if self.placement_editor_locked() {
+            return;
+        }
         let Some(prompt) = self.action_prompt.clone() else {
             return;
         };
@@ -2990,7 +3749,12 @@ impl FilesState {
             }
             return;
         };
-        let (policy, scope) = match parse_placement_editor_spec(&prompt.input) {
+        let (policy, scope) = match self
+            .placement_draft
+            .as_ref()
+            .ok_or_else(|| "placement editor is unavailable".to_string())
+            .and_then(PlacementEditorDraft::policy_and_scope)
+        {
             Ok(parsed) => parsed,
             Err(error) => {
                 if let Some(current) = self.action_prompt.as_mut() {
@@ -3008,8 +3772,10 @@ impl FilesState {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_placement_request_id = Some(request_id);
+        self.pending_placement_preview_revision = Some(self.placement_edit_revision);
         self.placement_loading = true;
         self.placement_error = None;
+        self.placement_error_from_reconciliation = false;
         if tx
             .send(FilesWorkerCommand::PlacementPreview {
                 request_id,
@@ -3020,19 +3786,36 @@ impl FilesState {
             .is_err()
         {
             self.pending_placement_request_id = None;
+            self.pending_placement_preview_revision = None;
             self.placement_loading = false;
             self.placement_error = Some("SIFS browser worker stopped".to_string());
+            self.placement_error_from_reconciliation = false;
+            self.resume_placement_progress_poll();
         }
     }
 
     fn start_placement_update(&mut self, prompt: &FileActionPrompt, waker: Option<sui::UiHandle>) {
+        if !self.placement_apply_allowed() {
+            if let Some(current) = self.action_prompt.as_mut() {
+                current.error = Some(
+                    "Preview the current policy and resolve blocking warnings before applying"
+                        .to_string(),
+                );
+            }
+            return;
+        }
         let Some(path) = prompt.target_path.clone() else {
             if let Some(current) = self.action_prompt.as_mut() {
                 current.error = Some("select a SIFS file or folder first".to_string());
             }
             return;
         };
-        let (policy, scope) = match parse_placement_editor_spec(&prompt.input) {
+        let (policy, scope) = match self
+            .placement_draft
+            .as_ref()
+            .ok_or_else(|| "placement editor is unavailable".to_string())
+            .and_then(PlacementEditorDraft::policy_and_scope)
+        {
             Ok(parsed) => parsed,
             Err(error) => {
                 if let Some(current) = self.action_prompt.as_mut() {
@@ -3040,6 +3823,16 @@ impl FilesState {
                 }
                 return;
             }
+        };
+        let Some(expected_preview_token) = self
+            .placement_preview
+            .as_ref()
+            .map(|preview| preview.preview_token.clone())
+        else {
+            if let Some(current) = self.action_prompt.as_mut() {
+                current.error = Some("Preview the current placement before applying".to_string());
+            }
+            return;
         };
         if let Some(waker) = waker {
             self.ensure_worker(waker);
@@ -3050,20 +3843,28 @@ impl FilesState {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_placement_request_id = Some(request_id);
+        self.pending_placement_preview_revision = None;
         self.placement_loading = true;
+        self.placement_applying = true;
         self.placement_error = None;
+        self.placement_error_from_reconciliation = false;
         if tx
             .send(FilesWorkerCommand::PlacementUpdate {
                 request_id,
                 path,
                 policy,
                 scope,
+                expected_preview_token,
             })
             .is_err()
         {
             self.pending_placement_request_id = None;
+            self.pending_placement_preview_revision = None;
             self.placement_loading = false;
+            self.placement_applying = false;
             self.placement_error = Some("SIFS browser worker stopped".to_string());
+            self.placement_error_from_reconciliation = false;
+            self.resume_placement_progress_poll();
         }
     }
 
@@ -3074,6 +3875,7 @@ impl FilesState {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_placement_request_id = Some(request_id);
+        self.pending_placement_preview_revision = None;
         let waker = self.worker_waker.clone();
         let _ = thread::Builder::new()
             .name("sinomo-app-files-placement-progress".to_string())
@@ -3084,6 +3886,21 @@ impl FilesState {
                     waker.wake();
                 }
             });
+    }
+
+    fn resume_placement_progress_poll(&mut self) {
+        if self.pending_placement_request_id.is_some() {
+            return;
+        }
+        let Some(job_id) = self
+            .placement_reconciliation
+            .as_ref()
+            .filter(|job| !job.state.is_terminal())
+            .map(|job| job.job_id.clone())
+        else {
+            return;
+        };
+        self.schedule_placement_progress_poll(job_id);
     }
 
     fn operation_from_prompt(
@@ -3991,6 +4808,7 @@ enum FilesWorkerCommand {
         path: String,
         policy: Option<SifsPlacementPolicy>,
         scope: SifsPlacementScope,
+        expected_preview_token: SifsPlacementPreviewToken,
     },
     PlacementProgress {
         request_id: u64,
@@ -4574,6 +5392,7 @@ fn files_worker_loop(
                 path,
                 policy,
                 scope,
+                expected_preview_token,
             } => {
                 ensure_files_worker_browser(
                     &mut browser,
@@ -4582,7 +5401,9 @@ fn files_worker_loop(
                     &app_runtime,
                 );
                 let result = match (&browser, &open_error) {
-                    (Some(browser), _) => browser.update_placement(&path, policy, scope),
+                    (Some(browser), _) => {
+                        browser.update_placement(&path, policy, scope, expected_preview_token)
+                    }
                     (None, Some(error)) => Err(error.clone()),
                     (None, None) => Err("SIFS browser did not start".to_string()),
                 };
@@ -4778,141 +5599,6 @@ fn normalize_path(path: &str) -> String {
     } else {
         format!("/{}", parts.join("/"))
     }
-}
-
-fn placement_editor_spec(details: &SifsObjectDetails) -> String {
-    let Some(resolved) = details.placement.as_ref() else {
-        return "eventual W=1 N=2 zones=0 scope=self required= forbidden=".to_string();
-    };
-    let consistency = match &resolved.policy.consistency {
-        sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => "confirmed",
-        _ => "eventual",
-    };
-    let scope = if resolved.source_path.as_deref() == Some(details.path.as_str()) {
-        match resolved.source_scope {
-            Some(SifsPlacementScope::Subtree) => "subtree",
-            _ => "self",
-        }
-    } else {
-        "self"
-    };
-    let required = resolved
-        .policy
-        .required_node_ids
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let forbidden = resolved
-        .policy
-        .forbidden_node_ids
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{consistency} W={} N={} zones={} scope={scope} required={required} forbidden={forbidden}",
-        resolved.policy.min_commit_replicas,
-        resolved.policy.desired_replicas,
-        resolved.policy.min_distinct_zones,
-    )
-}
-
-fn parse_placement_editor_spec(
-    input: &str,
-) -> Result<(Option<SifsPlacementPolicy>, SifsPlacementScope), String> {
-    let mut tokens = input.split_whitespace();
-    let mode = tokens
-        .next()
-        .ok_or_else(|| "enter eventual, confirmed, or inherit".to_string())?
-        .to_ascii_lowercase();
-    let mut scope = SifsPlacementScope::SelfOnly;
-    if mode == "inherit" {
-        for token in tokens {
-            let (key, value) = token
-                .split_once('=')
-                .ok_or_else(|| format!("expected key=value, found {token}"))?;
-            if key.eq_ignore_ascii_case("scope") {
-                scope = parse_placement_scope(value)?;
-            } else {
-                return Err(format!("inherit accepts only scope=, found {key}"));
-            }
-        }
-        return Ok((None, scope));
-    }
-    let consistency = match mode.as_str() {
-        "eventual" | "replicated-eventual" => {
-            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual
-        }
-        "confirmed" | "replicated-confirmed" => {
-            sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed
-        }
-        _ => return Err("placement must start with eventual, confirmed, or inherit".to_string()),
-    };
-    let mut min_commit_replicas = 1usize;
-    let mut desired_replicas = 2usize;
-    let mut w_explicit = false;
-    let mut min_distinct_zones = 0usize;
-    let mut required_node_ids = Vec::new();
-    let mut forbidden_node_ids = Vec::new();
-    for token in tokens {
-        let (key, value) = token
-            .split_once('=')
-            .ok_or_else(|| format!("expected key=value, found {token}"))?;
-        match key.to_ascii_lowercase().as_str() {
-            "w" => {
-                min_commit_replicas = parse_placement_count("W", value)?;
-                w_explicit = true;
-            }
-            "n" => desired_replicas = parse_placement_count("N", value)?,
-            "zones" => {
-                min_distinct_zones = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid zone count: {value}"))?;
-            }
-            "scope" => scope = parse_placement_scope(value)?,
-            "required" => required_node_ids = parse_placement_nodes(value)?,
-            "forbidden" => forbidden_node_ids = parse_placement_nodes(value)?,
-            _ => return Err(format!("unknown placement field: {key}")),
-        }
-    }
-    if consistency == sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed && !w_explicit {
-        min_commit_replicas = desired_replicas;
-    }
-    let mut policy = SifsPlacementPolicy::new(consistency, min_commit_replicas, desired_replicas)
-        .map_err(|error| error.to_string())?;
-    policy.required_node_ids = required_node_ids;
-    policy.forbidden_node_ids = forbidden_node_ids;
-    policy.min_distinct_zones = min_distinct_zones;
-    policy.validate().map_err(|error| error.to_string())?;
-    Ok((Some(policy), scope))
-}
-
-fn parse_placement_count(label: &str, value: &str) -> Result<usize, String> {
-    value
-        .parse::<usize>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| format!("{label} must be a positive integer"))
-}
-
-fn parse_placement_scope(value: &str) -> Result<SifsPlacementScope, String> {
-    match value.to_ascii_lowercase().as_str() {
-        "self" | "self-only" => Ok(SifsPlacementScope::SelfOnly),
-        "subtree" => Ok(SifsPlacementScope::Subtree),
-        _ => Err(format!("scope must be self or subtree, found {value}")),
-    }
-}
-
-fn parse_placement_nodes(value: &str) -> Result<Vec<sinomo_runtime::node::NodeId>, String> {
-    value
-        .split(',')
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            sinomo_runtime::node::NodeId::from_legacy_named(value.trim())
-                .map_err(|error| format!("invalid node id {value}: {error}"))
-        })
-        .collect()
 }
 
 fn default_local_path(fallback: impl AsRef<Path>) -> String {
@@ -11293,7 +11979,13 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
         if metadata_needs_connection {
             actions.push(InspectorAction::ConnectionSettings);
         }
-        actions.push(InspectorAction::EditPlacement);
+        if files
+            .selected_details
+            .as_ref()
+            .is_some_and(|details| details.path == entry.path && details.placement.is_some())
+        {
+            actions.push(InspectorAction::EditPlacement);
+        }
         actions.push(InspectorAction::RefreshPlacement);
         if !metadata_needs_connection && !files.details_loading {
             if let Some(details) = files.selected_details.as_ref() {
@@ -11791,8 +12483,14 @@ fn activate_inspector_action(
                 ctx.set_clipboard_text(value);
             }
         }
+        InspectorAction::EditPlacement => {
+            shared
+                .files_mut()
+                .open_action_prompt(FileActionPromptKind::Placement);
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_placement_preview(waker);
+        }
         InspectorAction::Copy
-        | InspectorAction::EditPlacement
         | InspectorAction::CopyToSifs
         | InspectorAction::CopyToLocal
         | InspectorAction::Move
@@ -12939,12 +13637,15 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
     let files = shared.files();
     match &files.action_prompt {
         Some(prompt) => format!(
-            "{:?}|{}|{}|{}|{}|{}|{}|{}",
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             prompt.kind,
             prompt.target_path.as_deref().unwrap_or(""),
             prompt.targets.len(),
             prompt.error.as_deref().unwrap_or(""),
+            files.placement_edit_revision,
+            files.placement_preview_revision.unwrap_or_default(),
             files.placement_loading,
+            files.placement_applying,
             files
                 .placement_reconciliation
                 .as_ref()
@@ -12978,29 +13679,12 @@ fn placement_preview_rows(preview: &SifsPlacementPreview) -> Vec<(&'static str, 
     let policy = &preview.resolved.policy;
     let consistency = match &policy.consistency {
         sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => "replicated-confirmed",
-        _ => "replicated-eventual",
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual => "replicated-eventual",
+        sinomo_runtime::core::DfsObjectPolicy::LocalOwned => "local-owned",
+        sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal => "ephemeral-local",
+        sinomo_runtime::core::DfsObjectPolicy::AppendOnly => "append-only",
     };
-    let desired = preview
-        .placement
-        .plan
-        .desired_replica_nodes
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let changes = format!(
-        "+{} / -{}",
-        preview.added_replica_node_ids.len(),
-        preview.removed_replica_node_ids.len()
-    );
-    let decisions = preview
-        .placement
-        .decisions
-        .iter()
-        .map(|decision| format!("{}: {}", decision.node_id, decision.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let mut rows = vec![
+    vec![
         (
             "Resolved",
             format!(
@@ -13009,14 +13693,46 @@ fn placement_preview_rows(preview: &SifsPlacementPreview) -> Vec<(&'static str, 
             ),
         ),
         ("Inheritance", preview.resolved.explanation.clone()),
-        ("Desired nodes", desired),
-        ("Changes", changes),
-        ("Explanation", decisions),
-    ];
-    if !preview.warnings.is_empty() {
-        rows.push(("Warning", preview.warnings.join("; ")));
-    }
-    rows
+    ]
+}
+
+fn placement_draft_rows(draft: &PlacementEditorDraft) -> Vec<(&'static str, String)> {
+    let scope = match draft.scope {
+        SifsPlacementScope::SelfOnly => "This object",
+        SifsPlacementScope::Subtree => "This folder and descendants",
+    };
+    let Some(policy) = draft.active_policy() else {
+        return vec![
+            ("Selected scope", scope.to_string()),
+            (
+                "Draft",
+                "Exact values unavailable from the connected daemon".to_string(),
+            ),
+        ];
+    };
+    let action = if policy.inherit && draft.active_has_exact_rule() {
+        "Remove the exact rule and inherit"
+    } else if policy.inherit {
+        "No exact rule; inherits effective values"
+    } else if draft.has_actionable_change() {
+        "Create or update the exact rule"
+    } else {
+        "Existing exact rule; no changes yet"
+    };
+    vec![
+        ("Selected scope", scope.to_string()),
+        (
+            "Draft policy",
+            format!(
+                "{} · W={} · N={} · zones≥{}",
+                policy.consistency.label(),
+                policy.min_commit_replicas,
+                policy.desired_replicas,
+                policy.min_distinct_zones
+            ),
+        ),
+        ("On Apply", action.to_string()),
+    ]
 }
 
 fn placement_reconciliation_rows(
@@ -13046,13 +13762,1329 @@ fn placement_reconciliation_rows(
         ),
     ];
     if let Some(error) = job.last_error.as_ref() {
-        rows.push(("Retrying", error.clone()));
+        rows.push((
+            if job.state.is_terminal() {
+                "Result"
+            } else {
+                "Retrying"
+            },
+            error.clone(),
+        ));
     }
     rows
 }
 
+/// Retained checkbox whose model can also be changed by its mutually-exclusive sibling.
+struct PlacementSyncedCheckbox {
+    inner: Checkbox,
+    checked_reader: Box<dyn Fn() -> bool>,
+    semantic_name: String,
+}
+
+impl PlacementSyncedCheckbox {
+    fn new(
+        inner: Checkbox,
+        checked_reader: impl Fn() -> bool + 'static,
+        semantic_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            checked_reader: Box::new(checked_reader),
+            semantic_name: semantic_name.into(),
+        }
+    }
+
+    fn sync_checked(&mut self) {
+        let checked = (self.checked_reader)();
+        if self.inner.is_checked() != checked {
+            self.inner.set_checked(checked);
+        }
+    }
+}
+
+impl Widget for PlacementSyncedCheckbox {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        self.sync_checked();
+        self.inner.event(ctx, event);
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_checked();
+        self.inner.measure(ctx, constraints)
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.inner.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::CheckBox, ctx.bounds());
+        node.name = Some(self.semantic_name.clone());
+        node.state.focused = ctx.is_focused();
+        node.state.checked = Some(if self.inner.is_checked() {
+            ToggleState::Checked
+        } else {
+            ToggleState::Unchecked
+        });
+        node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+        ctx.push(node);
+    }
+
+    fn accepts_focus(&self) -> bool {
+        self.inner.accepts_focus()
+    }
+
+    fn focus_changed(&mut self, ctx: &mut EventCtx, focused: bool) {
+        self.inner.focus_changed(ctx, focused);
+    }
+}
+
+fn placement_impact_widget(preview: &SifsPlacementPreview, reader: &ThemeReader) -> Stack {
+    if !preview.supports_safe_apply() {
+        return Stack::vertical().with_child(
+            StatusBadge::new(
+                "Impact totals are unavailable because the connected daemon returned a legacy placement preview",
+            )
+            .icon(IconGlyph::Alert)
+            .tone(SemanticTone::Danger)
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    let impact = &preview.impact;
+    let byte_value = if impact.unknown_size_object_count == 0 {
+        human_size(Some(impact.affected_bytes))
+    } else {
+        format!(
+            "{} + {} unknown",
+            human_size(Some(impact.affected_bytes)),
+            impact.unknown_size_object_count
+        )
+    };
+    let cards = [
+        ("Affected objects", impact.affected_object_count.to_string()),
+        ("Affected bytes", byte_value),
+        ("Copies added", impact.copies_added.to_string()),
+        ("Copies removed", impact.copies_removed.to_string()),
+    ]
+    .into_iter()
+    .fold(
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(10.0)
+            .align_items(Alignment::Stretch),
+        |row, (label, value)| {
+            row.with_item(
+                Surface::panel(
+                    DetailRow::new(label, value)
+                        .theme_when(clone_reader(reader))
+                        .max_value_lines(2),
+                )
+                .padding(Insets::all(10.0))
+                .theme_when(clone_reader(reader))
+                .fill_width(),
+                FlexItem::flex(1.0).basis(170.0).min_width(150.0),
+            )
+        },
+    );
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(8.0)
+        .with_child(cards);
+    if !impact.complete {
+        content = content.with_child(
+            StatusBadge::new(
+                "Impact totals are partial because at least one policy cannot currently be satisfied",
+            )
+            .icon(IconGlyph::Alert)
+            .tone(SemanticTone::Warning)
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    content
+}
+
+fn placement_node_status(
+    node: &sinomo_runtime::dfs::DfsPlacementNodePreview,
+) -> (&'static str, SemanticTone) {
+    match (node.current_replica, node.desired_replica) {
+        (true, true) => ("Keep", SemanticTone::Success),
+        (false, true) => ("Add", SemanticTone::Accent),
+        (true, false) => ("Remove", SemanticTone::Warning),
+        (false, false) => ("Standby", SemanticTone::Neutral),
+    }
+}
+
+fn placement_current_status(
+    node: &sinomo_runtime::dfs::DfsPlacementNodePreview,
+) -> (&'static str, SemanticTone) {
+    if node.current_replica {
+        ("Stored", SemanticTone::Success)
+    } else {
+        ("Not stored", SemanticTone::Neutral)
+    }
+}
+
+fn placement_reachability(
+    reachability: sinomo_runtime::dfs::DfsPlacementNodeReachability,
+) -> (&'static str, SemanticTone) {
+    match reachability {
+        sinomo_runtime::dfs::DfsPlacementNodeReachability::Local => {
+            ("This node", SemanticTone::Success)
+        }
+        sinomo_runtime::dfs::DfsPlacementNodeReachability::Reachable => {
+            ("Reachable", SemanticTone::Success)
+        }
+        sinomo_runtime::dfs::DfsPlacementNodeReachability::Unreachable => {
+            ("Unavailable", SemanticTone::Danger)
+        }
+        sinomo_runtime::dfs::DfsPlacementNodeReachability::Unknown => {
+            ("Unknown", SemanticTone::Neutral)
+        }
+    }
+}
+
+fn placement_node_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    node: &sinomo_runtime::dfs::DfsPlacementNodePreview,
+) -> SemanticRegion {
+    let node_id_text = node.node_id.to_string();
+    let constraints_locked = {
+        let files = shared.files();
+        files.placement_editor_locked()
+            || !files
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .is_some_and(|policy| policy.consistency.is_editable())
+    };
+    let required_action_id = node.node_id.clone();
+    let required_reader_id = node.node_id.clone();
+    let required = {
+        let checked = shared.clone();
+        let changed = shared.clone();
+        let checkbox = Checkbox::new("Required")
+            .checked(node.required)
+            .theme_when(clone_reader(reader))
+            .on_toggle(move |on| {
+                let waker = { changed.borrow().waker.clone() };
+                changed
+                    .files_mut()
+                    .set_placement_node_required(required_action_id.clone(), on);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        PlacementSyncedCheckbox::new(
+            checkbox,
+            move || {
+                checked
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .is_some_and(|draft| draft.required_node_ids.contains(&required_reader_id))
+            },
+            format!("Require node {node_id_text}"),
+        )
+    };
+    let forbidden_action_id = node.node_id.clone();
+    let forbidden_reader_id = node.node_id.clone();
+    let forbidden = {
+        let checked = shared.clone();
+        let changed = shared.clone();
+        let checkbox = Checkbox::new("Forbidden")
+            .checked(node.forbidden)
+            .theme_when(clone_reader(reader))
+            .on_toggle(move |on| {
+                let waker = { changed.borrow().waker.clone() };
+                changed
+                    .files_mut()
+                    .set_placement_node_forbidden(forbidden_action_id.clone(), on);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        PlacementSyncedCheckbox::new(
+            checkbox,
+            move || {
+                checked
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .is_some_and(|draft| draft.forbidden_node_ids.contains(&forbidden_reader_id))
+            },
+            format!("Forbid node {node_id_text}"),
+        )
+    };
+    let (reachability, reachability_tone) = placement_reachability(node.reachability);
+    let (current, current_tone) = placement_current_status(node);
+    let (desired, desired_tone) = placement_node_status(node);
+    let capacity = if node.capacity_weight == 0 {
+        "—".to_string()
+    } else {
+        format!("{}× weight", node.capacity_weight)
+    };
+    let theme = reader();
+    let mut explanation_style = theme.text_style(theme.palette.text_muted);
+    explanation_style.font_size = theme.text.xs.size;
+    explanation_style.line_height = theme.text.xs.line_height;
+    let mut row = Flex::horizontal()
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_item(
+            Stack::vertical()
+                .spacing(2.0)
+                .with_child(Label::new(short_node_label(&node_id_text)).theme(reader()))
+                .with_child(
+                    Label::new(if node.accepts_content {
+                        "Content eligible"
+                    } else {
+                        "Not content eligible"
+                    })
+                    .theme(reader()),
+                ),
+            FlexItem::fixed(140.0),
+        )
+        .with_item(
+            Label::new(
+                node.zone
+                    .clone()
+                    .unwrap_or_else(|| "Unassigned".to_string()),
+            )
+            .theme(reader()),
+            FlexItem::fixed(80.0),
+        )
+        .with_item(
+            StatusBadge::new(reachability)
+                .tone(reachability_tone)
+                .theme_when(clone_reader(reader)),
+            FlexItem::fixed(104.0),
+        )
+        .with_item(
+            Label::new(capacity.clone()).theme(reader()),
+            FlexItem::fixed(78.0),
+        )
+        .with_item(
+            StatusBadge::new(current)
+                .tone(current_tone)
+                .theme_when(clone_reader(reader)),
+            FlexItem::fixed(88.0),
+        )
+        .with_item(
+            StatusBadge::new(desired)
+                .tone(desired_tone)
+                .theme_when(clone_reader(reader)),
+            FlexItem::fixed(84.0),
+        );
+    if constraints_locked {
+        row = row
+            .with_item(
+                Label::new(if node.required { "Required" } else { "—" }).theme(reader()),
+                FlexItem::fixed(92.0),
+            )
+            .with_item(
+                Label::new(if node.forbidden { "Forbidden" } else { "—" }).theme(reader()),
+                FlexItem::fixed(98.0),
+            );
+    } else {
+        row = row
+            .with_item(required, FlexItem::fixed(92.0))
+            .with_item(forbidden, FlexItem::fixed(98.0));
+    }
+    row = row.with_item(
+        RichText::from_plain_text(node.explanation.clone(), explanation_style),
+        FlexItem::flex(1.0).basis(190.0).min_width(150.0),
+    );
+    let description = format!(
+        "Node {node_id_text}; zone {}; {reachability}; capacity {capacity}; current {current}; desired {desired}; required {}; forbidden {}; {}",
+        node.zone.as_deref().unwrap_or("unassigned"),
+        node.required,
+        node.forbidden,
+        node.explanation
+    );
+    SemanticRegion::new(
+        format!("Placement node {node_id_text}"),
+        Surface::panel(WidgetPadding::new(Insets::all(8.0), row))
+            .theme_when(clone_reader(reader))
+            .fill_width(),
+    )
+    .role(SemanticsRole::ListItem)
+    .description(description)
+}
+
+fn placement_node_table(
+    shared: &Shared,
+    reader: &ThemeReader,
+    preview: &SifsPlacementPreview,
+) -> SemanticRegion {
+    let editor_nodes = placement_editor_nodes(shared, preview);
+    let header = WidgetPadding::new(
+        Insets {
+            left: 8.0,
+            right: 8.0,
+            top: 2.0,
+            bottom: 2.0,
+        },
+        Flex::horizontal()
+            .gap(8.0)
+            .align_items(Alignment::Center)
+            .with_item(
+                SectionLabel::new("Node").theme_when(clone_reader(reader)),
+                FlexItem::fixed(140.0),
+            )
+            .with_item(
+                SectionLabel::new("Zone").theme_when(clone_reader(reader)),
+                FlexItem::fixed(80.0),
+            )
+            .with_item(
+                SectionLabel::new("Reachability").theme_when(clone_reader(reader)),
+                FlexItem::fixed(104.0),
+            )
+            .with_item(
+                SectionLabel::new("Capacity").theme_when(clone_reader(reader)),
+                FlexItem::fixed(78.0),
+            )
+            .with_item(
+                SectionLabel::new("Current").theme_when(clone_reader(reader)),
+                FlexItem::fixed(88.0),
+            )
+            .with_item(
+                SectionLabel::new("Desired").theme_when(clone_reader(reader)),
+                FlexItem::fixed(84.0),
+            )
+            .with_item(
+                SectionLabel::new("Required").theme_when(clone_reader(reader)),
+                FlexItem::fixed(92.0),
+            )
+            .with_item(
+                SectionLabel::new("Forbidden").theme_when(clone_reader(reader)),
+                FlexItem::fixed(98.0),
+            )
+            .with_item(
+                SectionLabel::new("Explanation").theme_when(clone_reader(reader)),
+                FlexItem::flex(1.0).basis(190.0).min_width(150.0),
+            ),
+    );
+    let mut rows = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(4.0)
+        .with_child(header);
+    for node in &editor_nodes {
+        rows = rows.with_child(placement_node_row(shared, reader, node));
+    }
+    SemanticRegion::new("Placement nodes", rows)
+        .role(SemanticsRole::List)
+        .description(format!("{} placement candidate nodes", editor_nodes.len()))
+}
+
+fn placement_editor_nodes(
+    shared: &Shared,
+    preview: &SifsPlacementPreview,
+) -> Vec<sinomo_runtime::dfs::DfsPlacementNodePreview> {
+    let active_constraints = {
+        let files = shared.files();
+        files
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .map(|policy| {
+                (
+                    policy.required_node_ids.clone(),
+                    policy.forbidden_node_ids.clone(),
+                )
+            })
+    };
+    let mut nodes = preview.nodes.clone();
+    let Some((required_node_ids, forbidden_node_ids)) = active_constraints else {
+        return nodes;
+    };
+
+    let mut visible_node_ids = BTreeSet::new();
+    for node in &mut nodes {
+        visible_node_ids.insert(node.node_id.clone());
+        // Current/desired columns describe the selected path object, while the
+        // constraint columns always describe the scope being edited.
+        node.required = required_node_ids.contains(&node.node_id);
+        node.forbidden = forbidden_node_ids.contains(&node.node_id);
+    }
+    let referenced_node_ids = required_node_ids
+        .union(&forbidden_node_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for node_id in referenced_node_ids {
+        if !visible_node_ids.insert(node_id.clone()) {
+            continue;
+        }
+        let required = required_node_ids.contains(&node_id);
+        let forbidden = forbidden_node_ids.contains(&node_id);
+        let constraint = if required { "required" } else { "forbidden" };
+        nodes.push(sinomo_runtime::dfs::DfsPlacementNodePreview {
+            node_id,
+            zone: None,
+            capacity_weight: 0,
+            accepts_content: false,
+            reachability: sinomo_runtime::dfs::DfsPlacementNodeReachability::Unknown,
+            current_replica: false,
+            desired_replica: false,
+            preferred_for_commit: false,
+            required,
+            forbidden,
+            explanation: format!(
+                "{constraint} by the selected scope; this preview has no content advertisement or replica metadata for the node"
+            ),
+        });
+    }
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    nodes
+}
+
+fn placement_diagnostics_widget(
+    preview: &SifsPlacementPreview,
+    preview_is_current: bool,
+    reader: &ThemeReader,
+) -> Option<SemanticRegion> {
+    let legacy_preview = !preview.supports_safe_apply();
+    if !legacy_preview && preview.blocking_diagnostics.is_empty() && preview.warnings.is_empty() {
+        return None;
+    }
+    let mut rows = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
+    if legacy_preview {
+        let message = "This daemon returned a legacy preview without reachability, policy-diagnostic, and impact safety data. Upgrade or restart the daemon before applying placement.";
+        rows = rows.with_child(
+            StatusBadge::new(if preview_is_current {
+                message.to_string()
+            } else {
+                format!("Previous preview (stale): {message}")
+            })
+            .icon(IconGlyph::Alert)
+            .tone(if preview_is_current {
+                SemanticTone::Danger
+            } else {
+                SemanticTone::Warning
+            })
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    for diagnostic in &preview.blocking_diagnostics {
+        let message = diagnostic.message();
+        rows = rows.with_child(
+            StatusBadge::new(if preview_is_current {
+                message
+            } else {
+                format!("Previous preview (stale): {message}")
+            })
+            .icon(IconGlyph::Alert)
+            .tone(if preview_is_current {
+                SemanticTone::Danger
+            } else {
+                SemanticTone::Warning
+            })
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    for warning in &preview.warnings {
+        rows = rows.with_child(
+            StatusBadge::new(if preview_is_current {
+                warning.clone()
+            } else {
+                format!("Previous preview (stale): {warning}")
+            })
+            .icon(IconGlyph::Alert)
+            .tone(if preview_is_current {
+                SemanticTone::Warning
+            } else {
+                SemanticTone::Neutral
+            })
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    Some(
+        SemanticRegion::new(
+            if preview_is_current {
+                "Placement policy warnings"
+            } else {
+                "Previous placement policy warnings"
+            },
+            rows,
+        )
+        .role(SemanticsRole::Text)
+        .description(if preview_is_current {
+            "Resolve blocking placement policy warnings before applying"
+        } else {
+            "Warnings from a stale placement preview; preview the current draft before applying"
+        }),
+    )
+}
+
+fn placement_scope_control(
+    shared: &Shared,
+    reader: &ThemeReader,
+    target_is_dir: bool,
+) -> SegmentedControl {
+    let selected = shared.clone();
+    let changed = shared.clone();
+    let (self_known, subtree_known) =
+        shared
+            .files()
+            .placement_draft
+            .as_ref()
+            .map_or((false, false), |draft| {
+                (
+                    draft.scope_is_known(SifsPlacementScope::SelfOnly),
+                    draft.scope_is_known(SifsPlacementScope::Subtree),
+                )
+            });
+    let mut self_item = SegmentedControlItem::new("This object")
+        .semantic_name("Self placement scope")
+        .description("Inspect or edit the rule applying only to the selected object");
+    if !self_known {
+        self_item = self_item
+            .description(
+                "Exact self-only values were not returned by this daemon; refresh after upgrading the daemon",
+            )
+            .disabled();
+    }
+    let subtree = if target_is_dir && subtree_known {
+        SegmentedControlItem::new("This folder + descendants")
+            .semantic_name("Subtree placement scope")
+            .description("Inspect or edit the rule applying to this folder and descendants")
+    } else if target_is_dir {
+        SegmentedControlItem::new("This folder + descendants")
+            .semantic_name("Subtree placement scope")
+            .description(
+                "Exact subtree values were not returned by this daemon; refresh after upgrading the daemon",
+            )
+            .disabled()
+    } else {
+        SegmentedControlItem::new("This folder + descendants")
+            .semantic_name("Subtree placement scope")
+            .description("Subtree scope is available only for folders")
+            .disabled()
+    };
+    SegmentedControl::new("Placement scope")
+        .items([self_item, subtree])
+        .selected_when(move || {
+            Some(
+                selected
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .map_or(0, |draft| {
+                        usize::from(draft.scope == SifsPlacementScope::Subtree)
+                    }),
+            )
+        })
+        .theme_when(clone_reader(reader))
+        .on_change_with_ctx(move |index, _label, ctx| {
+            changed.files_mut().set_placement_scope(if index == 1 {
+                SifsPlacementScope::Subtree
+            } else {
+                SifsPlacementScope::SelfOnly
+            });
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
+fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, target_is_dir: bool) -> Stack {
+    if shared.files().placement_editor_locked() {
+        let applying = shared.files().placement_applying;
+        let rows = shared
+            .files()
+            .placement_draft
+            .as_ref()
+            .and_then(|draft| draft.active_policy().map(|policy| (draft, policy)))
+            .map(|(draft, policy)| {
+                vec![
+                    ("Consistency", policy.consistency.label().to_string()),
+                    (
+                        "W / N / zones",
+                        format!(
+                            "{} / {} / {}",
+                            policy.min_commit_replicas,
+                            policy.desired_replicas,
+                            policy.min_distinct_zones
+                        ),
+                    ),
+                    (
+                        "Scope",
+                        match draft.scope {
+                            SifsPlacementScope::SelfOnly => "This object".to_string(),
+                            SifsPlacementScope::Subtree => {
+                                "This folder and descendants".to_string()
+                            }
+                        },
+                    ),
+                ]
+            })
+            .unwrap_or_default();
+        return Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(8.0)
+            .with_child(
+                StatusBadge::new(if applying {
+                    "Policy controls are locked until Apply finishes"
+                } else {
+                    "Policy controls are locked while SIFS reconciles existing objects"
+                })
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+            )
+            .with_child(detail_rows_widget(rows, reader));
+    }
+
+    if let Some(reason) = shared
+        .files()
+        .placement_draft
+        .as_ref()
+        .and_then(PlacementEditorDraft::active_policy)
+        .and_then(|draft| draft.consistency.policy().err())
+    {
+        return Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(8.0)
+            .with_child(
+                StatusBadge::new(reason)
+                    .icon(IconGlyph::Alert)
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                Label::new(
+                    "The current non-replicated policy is shown read-only. Use the DFS administration surface for an explicit data migration.",
+                )
+                .theme(reader()),
+            )
+            .with_child(placement_scope_control(shared, reader, target_is_dir));
+    }
+
+    let consistency = {
+        let selected = shared.clone();
+        let changed = shared.clone();
+        SegmentedControl::new("Placement consistency")
+            .items([
+                SegmentedControlItem::new("Eventual")
+                    .semantic_name("Eventual placement")
+                    .description(
+                        "A write is visible after W durable copies; repair continues toward N",
+                    ),
+                SegmentedControlItem::new("Confirmed")
+                    .semantic_name("Confirmed placement")
+                    .description("A write is visible only after all N desired copies are durable"),
+            ])
+            .selected_when(move || {
+                Some(
+                    selected
+                        .files()
+                        .placement_draft
+                        .as_ref()
+                        .and_then(PlacementEditorDraft::active_policy)
+                        .map_or(0, |draft| {
+                            usize::from(draft.consistency == PlacementEditorConsistency::Confirmed)
+                        }),
+                )
+            })
+            .theme_when(clone_reader(reader))
+            .on_change_with_ctx(move |index, _label, ctx| {
+                changed
+                    .files_mut()
+                    .set_placement_consistency(if index == 1 {
+                        PlacementEditorConsistency::Confirmed
+                    } else {
+                        PlacementEditorConsistency::Eventual
+                    });
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
+    let candidate_limit = shared.files().placement_candidate_limit();
+    let (confirmed, desired_limit, desired_minimum) = shared
+        .files()
+        .placement_draft
+        .as_ref()
+        .and_then(PlacementEditorDraft::active_policy)
+        .map_or((false, 1, 1), |draft| {
+            (
+                draft.consistency == PlacementEditorConsistency::Confirmed,
+                draft.desired_replicas.max(1),
+                1_usize
+                    .max(draft.required_node_ids.len())
+                    .max(draft.min_distinct_zones),
+            )
+        });
+    let min_commit = {
+        let value = shared.clone();
+        let changed = shared.clone();
+        NumberInput::new("Minimum write replicas W")
+            .range(1.0, desired_limit as f64)
+            .step(1.0)
+            .precision(0)
+            .value_when(move || {
+                value
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .map_or(1.0, |draft| draft.min_commit_replicas as f64)
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                let waker = { changed.borrow().waker.clone() };
+                changed
+                    .files_mut()
+                    .set_placement_min_commit_replicas(value.round().max(1.0) as usize);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })
+    };
+    let desired = {
+        let value = shared.clone();
+        let changed = shared.clone();
+        NumberInput::new("Desired replicas N")
+            .range(
+                desired_minimum as f64,
+                candidate_limit.max(desired_minimum) as f64,
+            )
+            .step(1.0)
+            .precision(0)
+            .value_when(move || {
+                value
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .map_or(1.0, |draft| draft.desired_replicas as f64)
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                let waker = { changed.borrow().waker.clone() };
+                changed.files_mut().set_placement_desired_replicas(
+                    value.round().max(desired_minimum as f64) as usize,
+                );
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })
+    };
+    let zones = {
+        let value = shared.clone();
+        let changed = shared.clone();
+        NumberInput::new("Minimum distinct zones")
+            .range(0.0, desired_limit as f64)
+            .step(1.0)
+            .precision(0)
+            .value_when(move || {
+                value
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .map_or(0.0, |draft| draft.min_distinct_zones as f64)
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                let waker = { changed.borrow().waker.clone() };
+                changed
+                    .files_mut()
+                    .set_placement_min_distinct_zones(value.round().max(0.0) as usize);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })
+    };
+    let write_threshold = if confirmed {
+        Stack::vertical()
+            .spacing(4.0)
+            .with_child(Label::new("Write threshold (W)").theme(reader()))
+            .with_child(
+                SizedBox::new().width(152.0).with_child(
+                    StatusBadge::new(format!("W = {desired_limit}"))
+                        .tone(SemanticTone::Accent)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .with_child(Label::new("Confirmed keeps W equal to N").theme(reader()))
+    } else {
+        Stack::vertical()
+            .spacing(4.0)
+            .with_child(Label::new("Write threshold (W)").theme(reader()))
+            .with_child(SizedBox::new().width(152.0).with_child(min_commit))
+            .with_child(Label::new("Copies required before visibility").theme(reader()))
+    };
+    let counts = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(12.0)
+        .align_items(Alignment::Start)
+        .with_item(write_threshold, FlexItem::fixed(230.0))
+        .with_item(
+            Stack::vertical()
+                .spacing(4.0)
+                .with_child(Label::new("Desired copies (N)").theme(reader()))
+                .with_child(SizedBox::new().width(152.0).with_child(desired))
+                .with_child(Label::new("Durable target after repair").theme(reader())),
+            FlexItem::fixed(230.0),
+        )
+        .with_item(
+            Stack::vertical()
+                .spacing(4.0)
+                .with_child(Label::new("Zone diversity").theme(reader()))
+                .with_child(SizedBox::new().width(152.0).with_child(zones))
+                .with_child(Label::new("0 disables the zone constraint").theme(reader())),
+            FlexItem::fixed(230.0),
+        );
+
+    let scope = placement_scope_control(shared, reader, target_is_dir);
+
+    let inheritance = StatusBadge::dynamic("Explicit override", {
+        let shared = shared.clone();
+        move || {
+            let files = shared.files();
+            let Some(draft) = files.placement_draft.as_ref() else {
+                return "Placement policy unavailable".to_string();
+            };
+            let Some(policy) = draft.active_policy() else {
+                return "Exact policy unavailable from this daemon".to_string();
+            };
+            if policy.inherit && draft.active_has_exact_rule() {
+                "Will remove this scope's explicit rule".to_string()
+            } else if policy.inherit {
+                "No explicit rule for this scope · showing inherited values".to_string()
+            } else if draft.has_actionable_change() {
+                "Edited explicit override".to_string()
+            } else {
+                "Existing explicit rule · change a field or choose inheritance".to_string()
+            }
+        }
+    })
+    .tone_when({
+        let shared = shared.clone();
+        move || {
+            if shared
+                .files()
+                .placement_draft
+                .as_ref()
+                .is_some_and(|draft| draft.active_policy().is_some_and(|policy| policy.inherit))
+            {
+                SemanticTone::Neutral
+            } else {
+                SemanticTone::Accent
+            }
+        }
+    })
+    .theme_when(clone_reader(reader));
+
+    Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(10.0)
+        .with_child(consistency)
+        .with_child(counts)
+        .with_child(scope)
+        .with_child(inheritance)
+}
+
+fn placement_preview_status(shared: &Shared, reader: &ThemeReader) -> StatusBadge {
+    StatusBadge::dynamic("Preview required", {
+        let shared = shared.clone();
+        move || {
+            let files = shared.files();
+            if files.placement_applying {
+                "Applying policy".to_string()
+            } else if files.placement_loading {
+                if files.placement_reconciliation_in_flight() {
+                    "Checking replacement policy".to_string()
+                } else {
+                    "Checking policy".to_string()
+                }
+            } else if files.placement_reconciliation_in_flight()
+                && files
+                    .placement_draft
+                    .as_ref()
+                    .is_some_and(PlacementEditorDraft::has_actionable_change)
+            {
+                if files.placement_preview_is_current()
+                    && files
+                        .placement_preview
+                        .as_ref()
+                        .is_some_and(|preview| !preview.supports_safe_apply())
+                {
+                    "Replacement preview requires a newer daemon".to_string()
+                } else if files.placement_preview_is_current()
+                    && files
+                        .placement_preview
+                        .as_ref()
+                        .is_some_and(|preview| !preview.is_satisfiable())
+                {
+                    "Replacement policy cannot be satisfied".to_string()
+                } else if files.placement_preview_is_current() {
+                    "Replacement preview is current".to_string()
+                } else {
+                    "Preview the replacement policy".to_string()
+                }
+            } else if files.placement_reconciliation_in_flight() {
+                "Reconciling existing objects · edit to replace this plan".to_string()
+            } else if files.placement_preview_is_current()
+                && files
+                    .placement_preview
+                    .as_ref()
+                    .is_some_and(|preview| !preview.supports_safe_apply())
+            {
+                "Preview requires a newer daemon".to_string()
+            } else if files.placement_preview_is_current()
+                && files
+                    .placement_preview
+                    .as_ref()
+                    .is_some_and(|preview| !preview.is_satisfiable())
+            {
+                "Policy cannot be satisfied".to_string()
+            } else if files.placement_preview_is_current() {
+                "Preview is current".to_string()
+            } else if files.placement_preview.is_some() {
+                "Preview out of date".to_string()
+            } else {
+                "Preview required".to_string()
+            }
+        }
+    })
+    .tone_when({
+        let shared = shared.clone();
+        move || {
+            let files = shared.files();
+            if files.placement_applying || files.placement_loading {
+                SemanticTone::Info
+            } else if files.placement_preview_is_current()
+                && files
+                    .placement_preview
+                    .as_ref()
+                    .is_some_and(|preview| !preview.supports_safe_apply())
+            {
+                SemanticTone::Danger
+            } else if files.placement_preview_is_current()
+                && files
+                    .placement_preview
+                    .as_ref()
+                    .is_some_and(|preview| !preview.is_satisfiable())
+            {
+                SemanticTone::Danger
+            } else if files.placement_reconciliation_in_flight() {
+                SemanticTone::Info
+            } else if files.placement_preview_is_current() {
+                SemanticTone::Success
+            } else {
+                SemanticTone::Warning
+            }
+        }
+    })
+    .theme_when(clone_reader(reader))
+}
+
+fn files_placement_dialog(
+    shared: &Shared,
+    reader: &ThemeReader,
+    prompt: &FileActionPrompt,
+) -> WidgetPod {
+    let target = prompt
+        .target_path
+        .as_deref()
+        .unwrap_or("selected SIFS object");
+    let draft_rows = shared
+        .files()
+        .placement_draft
+        .as_ref()
+        .map(placement_draft_rows)
+        .unwrap_or_default();
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(12.0)
+        .with_child(
+            Label::new(format!(
+                "Choose how SIFS keeps {target} durable. W controls when writes become visible; N is the repaired copy target."
+            ))
+            .theme(reader()),
+        )
+        .with_child(PanelSection::new(
+            "Policy",
+            placement_policy_controls(shared, reader, prompt.target_is_dir),
+        ).theme_when(clone_reader(reader)))
+        .with_child(
+            PanelSection::new(
+                "Selected scope draft",
+                detail_rows_widget(draft_rows, reader),
+            )
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(placement_preview_status(shared, reader));
+
+    if let Some(error) = prompt.error.as_ref() {
+        content = content.with_child(
+            StatusBadge::new(error.clone())
+                .tone(SemanticTone::Warning)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    {
+        let files = shared.files();
+        if let Some(preview) = files.placement_preview.as_ref() {
+            let preview_is_current = files.placement_preview_is_current();
+            if !preview_is_current {
+                content = content.with_child(
+                    StatusBadge::new(
+                        "Previous preview — its warnings, impact totals, and desired node states are out of date. Preview changes to refresh them.",
+                    )
+                    .icon(IconGlyph::Alert)
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+                );
+            }
+            if let Some(diagnostics) =
+                placement_diagnostics_widget(preview, preview_is_current, reader)
+            {
+                content = content.with_child(diagnostics);
+            }
+            let draft_has_actionable_change = files
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change);
+            content = content
+                .with_child(
+                    PanelSection::new(
+                        if preview_is_current {
+                            "Selected object's resolved placement"
+                        } else {
+                            "Previous resolved placement"
+                        },
+                        detail_rows_widget(placement_preview_rows(preview), reader),
+                    )
+                    .theme_when(clone_reader(reader)),
+                )
+                .with_child(
+                    PanelSection::new(
+                        if preview_is_current {
+                            if draft_has_actionable_change {
+                                "Before you apply"
+                            } else {
+                                "Current placement impact"
+                            }
+                        } else {
+                            "Previous impact estimate"
+                        },
+                        placement_impact_widget(preview, reader),
+                    )
+                    .theme_when(clone_reader(reader)),
+                );
+            if preview.supports_safe_apply() {
+                content = content.with_child(
+                    PanelSection::new(
+                        if preview_is_current {
+                            "Selected path object's node placement"
+                        } else {
+                            "Previous path-object node placement"
+                        },
+                        Stack::vertical()
+                            .alignment(Alignment::Stretch)
+                            .spacing(6.0)
+                            .with_child(
+                                Label::new(if files
+                                    .placement_draft
+                                    .as_ref()
+                                    .is_some_and(|draft| {
+                                        draft.scope == SifsPlacementScope::Subtree
+                                    }) {
+                                    "This table is the selected folder object's plan. Descendants are evaluated individually during the subtree scan."
+                                } else {
+                                    "This table is the selected object's current and desired plan."
+                                })
+                                .theme(reader()),
+                            )
+                            .with_child(
+                                ScrollView::horizontal(placement_node_table(
+                                    shared, reader, preview,
+                                ))
+                                .name("Placement node table"),
+                            ),
+                    )
+                    .theme_when(clone_reader(reader)),
+                );
+            }
+        }
+        if let Some(job) = files.placement_reconciliation.as_ref() {
+            if !job.state.is_terminal() {
+                content = content.with_child(
+                    StatusBadge::new(
+                        "The accepted plan remains authoritative while this job runs. If a desired node stays unavailable, edit the policy and preview it; Apply replacement will atomically supersede this job.",
+                    )
+                    .icon(IconGlyph::Hourglass)
+                    .tone(SemanticTone::Info)
+                    .theme_when(clone_reader(reader)),
+                );
+            }
+            content = content.with_child(
+                PanelSection::new(
+                    "Reconciliation",
+                    detail_rows_widget(placement_reconciliation_rows(job), reader),
+                )
+                .theme_when(clone_reader(reader)),
+            );
+        }
+        if let Some(error) = files.placement_error.as_ref() {
+            content = content.with_child(
+                StatusBadge::new(error.clone())
+                    .tone(SemanticTone::Danger)
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+    }
+
+    let preview = {
+        let enabled = shared.clone();
+        let shared = shared.clone();
+        sui::Button::new("Preview changes")
+            .appearance(ButtonAppearance::Outline)
+            .tone(SemanticTone::Accent)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || {
+                let files = enabled.files();
+                !files.placement_loading
+                    && !files.placement_editor_locked()
+                    && files
+                        .placement_draft
+                        .as_ref()
+                        .and_then(PlacementEditorDraft::active_policy)
+                        .is_some_and(|policy| policy.consistency.is_editable())
+            })
+            .on_press_with_ctx(move |ctx| {
+                let waker = { shared.borrow().waker.clone() };
+                shared.files_mut().start_placement_preview(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let inherit = {
+        let action = shared
+            .files()
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::inheritance_action);
+        let enabled = shared.clone();
+        let shared = shared.clone();
+        sui::Button::new(
+            action.map_or("Placement inheritance unavailable", |action| action.label()),
+        )
+        .appearance(ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || {
+            let files = enabled.files();
+            !files.placement_loading
+                && !files.placement_editor_locked()
+                && files.placement_draft.as_ref().is_some_and(|draft| {
+                    draft.inheritance_action().is_some()
+                        && draft
+                            .active_policy()
+                            .is_some_and(|policy| policy.consistency.is_editable())
+                })
+        })
+        .on_press_with_ctx(move |ctx| {
+            let inherit = shared
+                .files()
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action)
+                .is_some_and(PlacementInheritanceAction::inherit);
+            shared.files_mut().set_placement_inherit(inherit);
+            request_files_overlay_rebuild(ctx);
+        })
+    };
+    let apply = {
+        let label = if shared.files().placement_reconciliation_in_flight()
+            && shared
+                .files()
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change)
+        {
+            "Apply replacement"
+        } else {
+            "Apply placement"
+        };
+        let enabled = shared.clone();
+        let apply = shared.clone();
+        sui::Button::new(label)
+            .min_width(132.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || enabled.files().placement_apply_allowed())
+            .on_press_with_ctx(move |ctx| {
+                let waker = { apply.borrow().waker.clone() };
+                apply.files_mut().submit_action_prompt(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let cancel = {
+        let label = if shared.files().placement_reconciliation.is_some() {
+            "Close"
+        } else {
+            "Cancel"
+        };
+        let enabled = shared.clone();
+        let shared = shared.clone();
+        sui::Button::new(label)
+            .min_width(112.0)
+            .appearance(ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || !enabled.files().placement_applying)
+            .on_press_with_ctx(move |ctx| {
+                shared.files_mut().close_action_prompt();
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::End)
+        .with_child(preview)
+        .with_child(inherit)
+        .with_child(apply)
+        .with_child(cancel);
+
+    let body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(12.0)
+        .with_child(
+            SizedBox::new().height(580.0).with_child(
+                ScrollView::vertical(WidgetPadding::new(
+                    Insets {
+                        left: 2.0,
+                        top: 2.0,
+                        right: 10.0,
+                        bottom: 8.0,
+                    },
+                    content,
+                ))
+                .name("Placement editor")
+                .viewport_width_hint(true),
+            ),
+        )
+        .with_child(actions);
+    let dismiss = {
+        let shared = shared.clone();
+        move || shared.files_mut().close_action_prompt()
+    };
+    WidgetPod::new(
+        sui::Dialog::new("Edit placement", body)
+            .theme(shared.theme())
+            .description("Visual SIFS placement policy editor")
+            .max_width(1040.0)
+            .dismiss_on_scrim(true)
+            .on_dismiss(dismiss),
+    )
+}
+
 fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let prompt = shared.files().action_prompt.clone()?;
+    if prompt.kind == FileActionPromptKind::Placement {
+        return Some(files_placement_dialog(shared, reader, &prompt));
+    }
     let source = shared.files().source;
     let title = prompt.kind.title();
     let description = match prompt.kind {
@@ -13876,24 +15908,1525 @@ mod tests {
         }
     }
 
+    fn test_placement_policy(
+        consistency: sinomo_runtime::core::DfsObjectPolicy,
+        w: usize,
+        n: usize,
+    ) -> SifsPlacementPolicy {
+        SifsPlacementPolicy::new(consistency, w, n).expect("test placement policy")
+    }
+
+    fn test_resolved_placement(
+        path: &str,
+        policy: SifsPlacementPolicy,
+        source_path: Option<&str>,
+        source_scope: Option<SifsPlacementScope>,
+        exact_policies: Vec<(SifsPlacementScope, SifsPlacementPolicy)>,
+    ) -> sinomo_runtime::dfs::DfsResolvedPlacementPolicy {
+        let exact_policies = exact_policies
+            .into_iter()
+            .map(|(scope, policy)| sinomo_runtime::dfs::DfsExactPlacementPolicy { scope, policy })
+            .collect::<Vec<_>>();
+        let scope_resolutions = exact_policies
+            .iter()
+            .map(|exact| sinomo_runtime::dfs::DfsPlacementScopeResolution {
+                scope: exact.scope,
+                policy: exact.policy.clone(),
+                exact: true,
+                source_path: Some(path.to_string()),
+                source_scope: Some(exact.scope),
+                inherited: false,
+                explanation: "test exact scope".to_string(),
+            })
+            .collect();
+        sinomo_runtime::dfs::DfsResolvedPlacementPolicy {
+            path: path.to_string(),
+            policy,
+            exact_policies,
+            scope_resolutions,
+            source_path: source_path.map(str::to_string),
+            source_scope,
+            inherited: source_path.is_some_and(|source| source != path),
+            explanation: "test resolved placement".to_string(),
+        }
+    }
+
+    fn placement_prompt(path: &str, target_is_dir: bool) -> FileActionPrompt {
+        FileActionPrompt {
+            kind: FileActionPromptKind::Placement,
+            input: String::new(),
+            target_name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            target_path: Some(path.to_string()),
+            target_is_dir,
+            targets: Vec::new(),
+            error: None,
+        }
+    }
+
     #[test]
-    fn placement_editor_parses_constraints_and_inheritance_scope() {
-        let (policy, scope) = parse_placement_editor_spec(
-            "confirmed N=3 zones=2 scope=subtree required=node-a forbidden=node-b",
-        )
-        .expect("placement");
-        let policy = policy.expect("managed policy");
+    fn placement_editor_draft_enforces_confirmed_counts_and_constraints() {
+        let required = sinomo_runtime::node::NodeId::from_legacy_named("node-a").expect("node");
+        let forbidden = sinomo_runtime::node::NodeId::from_legacy_named("node-b").expect("node");
+        let mut draft = PlacementEditorDraft::for_details(None, true);
+        draft.scope = SifsPlacementScope::Subtree;
+        let policy = draft.active_policy_mut().expect("active policy");
+        policy.consistency = PlacementEditorConsistency::Confirmed;
+        policy.desired_replicas = 3;
+        policy.min_commit_replicas = 1;
+        policy.min_distinct_zones = 2;
+        policy.required_node_ids.insert(required.clone());
+        policy.forbidden_node_ids.insert(forbidden.clone());
+        draft.normalize();
+
+        let (policy, scope) = draft.policy_and_scope().expect("valid draft");
+        let policy = policy.expect("explicit policy");
         assert_eq!(scope, SifsPlacementScope::Subtree);
         assert_eq!(policy.min_commit_replicas, 3);
         assert_eq!(policy.desired_replicas, 3);
         assert_eq!(policy.min_distinct_zones, 2);
-        assert_eq!(policy.required_node_ids.len(), 1);
-        assert_eq!(policy.forbidden_node_ids.len(), 1);
+        assert_eq!(policy.required_node_ids, vec![required]);
+        assert_eq!(policy.forbidden_node_ids, vec![forbidden]);
+
+        draft.active_policy_mut().expect("active policy").inherit = true;
+        assert_eq!(
+            draft.policy_and_scope().expect("inherited draft"),
+            (None, SifsPlacementScope::Subtree)
+        );
+    }
+
+    #[test]
+    fn placement_editor_keeps_coexisting_exact_scope_values_independent() {
+        let self_policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        );
+        let subtree_policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed,
+            4,
+            4,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            self_policy.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::SelfOnly),
+            vec![
+                (SifsPlacementScope::SelfOnly, self_policy),
+                (SifsPlacementScope::Subtree, subtree_policy),
+            ],
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+
+        let draft = state.placement_draft.as_ref().expect("placement draft");
+        assert_eq!(draft.scope, SifsPlacementScope::SelfOnly);
+        assert_eq!(
+            draft.active_policy().expect("self policy").desired_replicas,
+            2
+        );
+        assert!(!draft.has_actionable_change());
+
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        let subtree = state
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .expect("subtree policy");
+        assert_eq!(subtree.consistency, PlacementEditorConsistency::Confirmed);
+        assert_eq!(subtree.desired_replicas, 4);
+        assert!(
+            !state
+                .placement_draft
+                .as_ref()
+                .expect("placement draft")
+                .has_actionable_change()
+        );
+
+        assert!(state.set_placement_desired_replicas(5));
+        assert!(state.set_placement_scope(SifsPlacementScope::SelfOnly));
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .expect("self policy")
+                .desired_replicas,
+            2,
+            "editing subtree must not overwrite the coexisting self-only values"
+        );
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        let draft = state.placement_draft.as_ref().expect("placement draft");
+        assert_eq!(
+            draft
+                .active_policy()
+                .expect("subtree policy")
+                .desired_replicas,
+            5
+        );
+        assert!(draft.has_actionable_change());
+    }
+
+    #[test]
+    fn placement_editor_missing_scope_is_explicit_inheritance_until_edited() {
+        let inherited = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            inherited,
+            Some("/parent"),
+            Some(SifsPlacementScope::Subtree),
+            Vec::new(),
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        let draft = state.placement_draft.as_ref().expect("placement draft");
+        assert!(draft.active_policy().expect("subtree policy").inherit);
+        assert!(!draft.active_has_exact_rule());
+        assert!(!draft.has_actionable_change());
+        assert_eq!(
+            draft.policy_and_scope().expect("inherited scope"),
+            (None, SifsPlacementScope::Subtree)
+        );
+        let mut satisfiable_preview = unsatisfiable_placement_preview();
+        satisfiable_preview.blocking_diagnostics.clear();
+        state.placement_edit_revision = 5;
+        state.placement_preview_revision = Some(5);
+        state.placement_preview = Some(satisfiable_preview);
+        assert!(state.placement_preview_is_current());
+        assert!(
+            state
+                .placement_preview
+                .as_ref()
+                .is_some_and(SifsPlacementPreview::is_satisfiable)
+        );
+        assert!(
+            !state.placement_apply_allowed(),
+            "an inherited scope with no exact rule has nothing to remove"
+        );
+
+        assert!(state.set_placement_desired_replicas(4));
+        let draft = state.placement_draft.as_ref().expect("placement draft");
+        assert!(!draft.active_policy().expect("subtree policy").inherit);
+        assert!(draft.has_actionable_change());
+        assert_eq!(
+            draft
+                .policy_and_scope()
+                .expect("explicit subtree")
+                .0
+                .expect("policy")
+                .desired_replicas,
+            4
+        );
+        state.placement_preview_revision = Some(state.placement_edit_revision);
+        assert!(state.placement_apply_allowed());
+    }
+
+    #[test]
+    fn placement_inheritance_action_can_create_remove_and_restore_an_exact_rule() {
+        let inherited = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        );
+        let inherited_resolved = test_resolved_placement(
+            "/folder",
+            inherited,
+            Some("/parent"),
+            Some(SifsPlacementScope::Subtree),
+            Vec::new(),
+        );
+        let mut inherited_details = test_sifs_details(Vec::new());
+        inherited_details.path = "/folder".to_string();
+        inherited_details.kind = "directory".to_string();
+        inherited_details.placement = Some(inherited_resolved);
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(
+            Some(&inherited_details),
+            true,
+        ));
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action),
+            Some(PlacementInheritanceAction::MakeExplicitHere)
+        );
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action)
+                .map(PlacementInheritanceAction::label),
+            Some("Make explicit here")
+        );
+        assert!(state.set_placement_inherit(false));
+        assert!(
+            state
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change)
+        );
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action),
+            Some(PlacementInheritanceAction::UseInheritedPolicy)
+        );
+        assert!(state.set_placement_inherit(true));
+        assert!(
+            !state
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change)
+        );
+
+        let exact = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        );
+        let exact_resolved = test_resolved_placement(
+            "/folder",
+            exact.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::Subtree),
+            vec![(SifsPlacementScope::Subtree, exact)],
+        );
+        let mut exact_details = inherited_details;
+        exact_details.placement = Some(exact_resolved);
+        state.placement_draft = Some(PlacementEditorDraft::for_details(
+            Some(&exact_details),
+            true,
+        ));
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action),
+            Some(PlacementInheritanceAction::UseInheritedPolicy)
+        );
+        assert!(state.set_placement_inherit(true));
+        assert!(
+            state
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change)
+        );
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action),
+            Some(PlacementInheritanceAction::KeepExplicitRule)
+        );
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::inheritance_action)
+                .map(PlacementInheritanceAction::label),
+            Some("Keep explicit rule")
+        );
+        assert!(state.set_placement_inherit(false));
+        assert!(
+            !state
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change)
+        );
+    }
+
+    #[test]
+    fn placement_editor_uses_the_inherited_policy_for_each_scope() {
+        let local_self =
+            test_placement_policy(sinomo_runtime::core::DfsObjectPolicy::LocalOwned, 1, 1);
+        let inherited_subtree = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        );
+        let mut resolved = test_resolved_placement(
+            "/folder",
+            local_self.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::SelfOnly),
+            vec![(SifsPlacementScope::SelfOnly, local_self)],
+        );
+        resolved
+            .scope_resolutions
+            .push(sinomo_runtime::dfs::DfsPlacementScopeResolution {
+                scope: SifsPlacementScope::Subtree,
+                policy: inherited_subtree,
+                exact: false,
+                source_path: Some("/parent".to_string()),
+                source_scope: Some(SifsPlacementScope::Subtree),
+                inherited: true,
+                explanation: "Inherited subtree policy from /parent".to_string(),
+            });
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        let subtree = state
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .expect("subtree policy");
+        assert_eq!(
+            subtree.consistency,
+            PlacementEditorConsistency::Eventual,
+            "a same-path self-only rule must not become the subtree fallback"
+        );
+        assert_eq!(subtree.desired_replicas, 3);
+        assert!(subtree.inherit);
+        assert!(subtree.consistency.is_editable());
+    }
+
+    #[test]
+    fn placement_editor_old_daemon_never_guesses_hidden_sibling_scope() {
+        let self_policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            self_policy,
+            Some("/folder"),
+            Some(SifsPlacementScope::SelfOnly),
+            // This is the backward-compatible shape from a daemon that predates exact_policies.
+            Vec::new(),
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+
+        assert!(!state.set_placement_scope(SifsPlacementScope::Subtree));
+        assert_eq!(
+            state
+                .placement_draft
+                .as_ref()
+                .expect("placement draft")
+                .scope,
+            SifsPlacementScope::SelfOnly
+        );
+        assert!(state.action_prompt.as_ref().is_some_and(|prompt| {
+            prompt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("did not return the exact policy"))
+        }));
+    }
+
+    #[test]
+    fn placement_editor_local_only_policy_is_read_only_but_inherited_replication_is_editable() {
+        for consistency in [
+            sinomo_runtime::core::DfsObjectPolicy::LocalOwned,
+            sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal,
+        ] {
+            let local = test_placement_policy(consistency, 1, 1);
+            let resolved = test_resolved_placement(
+                "/folder",
+                local.clone(),
+                Some("/folder"),
+                Some(SifsPlacementScope::SelfOnly),
+                vec![(SifsPlacementScope::SelfOnly, local)],
+            );
+            let mut details = test_sifs_details(Vec::new());
+            details.path = "/folder".to_string();
+            details.kind = "directory".to_string();
+            details.placement = Some(resolved);
+            let backend = Backend::local_fallback();
+            let mut state = FilesState::new(&backend);
+            state.action_prompt = Some(placement_prompt("/folder", true));
+            state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+
+            assert!(!state.set_placement_desired_replicas(2));
+            assert!(!state.set_placement_consistency(PlacementEditorConsistency::Eventual));
+            assert!(
+                state
+                    .placement_draft
+                    .as_ref()
+                    .expect("placement draft")
+                    .policy_and_scope()
+                    .is_err()
+            );
+            assert!(!state.placement_apply_allowed());
+        }
+
+        let local = test_placement_policy(sinomo_runtime::core::DfsObjectPolicy::LocalOwned, 1, 1);
+        let subtree_replicated = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed,
+            3,
+            3,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            local.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::SelfOnly),
+            vec![
+                (SifsPlacementScope::SelfOnly, local),
+                (SifsPlacementScope::Subtree, subtree_replicated),
+            ],
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        assert!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .is_some_and(|policy| policy.consistency.is_editable())
+        );
+
+        let replicated = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            replicated,
+            Some("/parent"),
+            Some(SifsPlacementScope::Subtree),
+            Vec::new(),
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        // The object may have a local durable policy, but its resolved managed placement is the
+        // replicated inherited policy and is therefore safe for this editor.
+        details.policy = "local-owned".to_string();
+        details.placement = Some(resolved);
+        let draft = PlacementEditorDraft::for_details(Some(&details), true);
+        assert!(
+            draft
+                .active_policy()
+                .is_some_and(|policy| policy.consistency.is_editable())
+        );
+    }
+
+    #[test]
+    fn placement_editor_node_constraints_are_exclusive_and_invalidate_preview() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let node = sinomo_runtime::node::NodeId::from_legacy_named("node-a").expect("node");
+        state.action_prompt = Some(FileActionPrompt {
+            kind: FileActionPromptKind::Placement,
+            input: String::new(),
+            target_name: "folder".to_string(),
+            target_path: Some("/folder".to_string()),
+            target_is_dir: true,
+            targets: Vec::new(),
+            error: Some("stale error".to_string()),
+        });
+        state.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+        state.placement_edit_revision = 7;
+        state.pending_placement_request_id = Some(41);
+        state.pending_placement_preview_revision = Some(7);
+        state.placement_loading = true;
+        state.placement_error = Some("stale preview".to_string());
+
+        assert!(state.set_placement_node_required(node.clone(), true));
+        assert_eq!(state.placement_edit_revision, 8);
+        assert_eq!(state.pending_placement_request_id, None);
+        assert_eq!(state.pending_placement_preview_revision, None);
+        assert!(!state.placement_loading);
+        assert!(state.placement_error.is_none());
+        assert!(
+            state
+                .action_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.error.is_none())
+        );
+        assert!(
+            state
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .is_some_and(|draft| draft.required_node_ids.contains(&node))
+        );
+
+        assert!(state.set_placement_node_forbidden(node.clone(), true));
+        let draft = state.placement_draft.as_ref().expect("placement draft");
+        let policy = draft.active_policy().expect("active policy");
+        assert!(!policy.required_node_ids.contains(&node));
+        assert!(policy.forbidden_node_ids.contains(&node));
+        assert_eq!(state.placement_edit_revision, 9);
+        assert!(!state.placement_preview_is_current());
+        assert!(!state.placement_apply_allowed());
+    }
+
+    #[test]
+    fn placement_editor_cannot_detach_an_in_flight_apply() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let node = sinomo_runtime::node::NodeId::from_legacy_named("node-a").expect("node");
+        state.action_prompt = Some(FileActionPrompt {
+            kind: FileActionPromptKind::Placement,
+            input: String::new(),
+            target_name: "folder".to_string(),
+            target_path: Some("/folder".to_string()),
+            target_is_dir: true,
+            targets: Vec::new(),
+            error: None,
+        });
+        state.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+        state.placement_edit_revision = 4;
+        state.pending_placement_request_id = Some(73);
+        state.placement_loading = true;
+        state.placement_applying = true;
+
+        assert!(!state.set_placement_node_required(node, true));
+        state.close_action_prompt();
+
+        assert_eq!(state.placement_edit_revision, 4);
+        assert_eq!(state.pending_placement_request_id, Some(73));
+        assert!(state.action_prompt.is_some());
+        assert!(state.placement_applying);
+        assert!(state.placement_loading);
+    }
+
+    fn pending_placement_job() -> SifsPlacementReconciliationJob {
+        SifsPlacementReconciliationJob {
+            schema_version: sinomo_runtime::dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
+            job_id: "placement-job".to_string(),
+            file_system_id: sinomo_runtime::dfs::DfsFileSystemId::from_legacy_named("sifs")
+                .expect("filesystem"),
+            path: "/folder".to_string(),
+            scope: SifsPlacementScope::Subtree,
+            state: sinomo_runtime::dfs::DfsPlacementReconciliationState::Scanning,
+            cursor: None,
+            total_object_count: 3,
+            scanned_object_count: 1,
+            matched_object_count: 1,
+            updated_object_count: 1,
+            scheduled_repair_count: 1,
+            completed_repair_count: 0,
+            pending_repair_count: 1,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: Vec::new(),
+            accepted_config: None,
+            revision: 2,
+            created_at_unix_nanos: 1,
+            updated_at_unix_nanos: 2,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn placement_editor_allows_safe_override_without_dropping_reconciliation_poll() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let node = sinomo_runtime::node::NodeId::from_legacy_named("node-a").expect("node");
+        state.action_prompt = Some(FileActionPrompt {
+            kind: FileActionPromptKind::Placement,
+            input: String::new(),
+            target_name: "folder".to_string(),
+            target_path: Some("/folder".to_string()),
+            target_is_dir: true,
+            targets: Vec::new(),
+            error: None,
+        });
+        state.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+        state.placement_reconciliation = Some(pending_placement_job());
+        state.pending_placement_request_id = Some(91);
+
+        assert!(!state.placement_editor_locked());
+        assert!(state.set_placement_node_required(node, true));
+        assert_eq!(
+            state.pending_placement_request_id,
+            Some(91),
+            "editing a replacement must preserve the accepted job's progress poll"
+        );
+        assert!(!state.placement_apply_allowed());
+        let mut replacement_preview = unsatisfiable_placement_preview();
+        replacement_preview.blocking_diagnostics.clear();
+        state.placement_preview = Some(replacement_preview);
+        state.placement_preview_revision = Some(state.placement_edit_revision);
+        assert!(
+            state.placement_apply_allowed(),
+            "an explicit, freshly previewed replacement may supersede the in-flight job"
+        );
+        state.close_action_prompt();
+
+        assert!(state.action_prompt.is_none());
+        assert_eq!(state.pending_placement_request_id, Some(91));
+        assert!(state.placement_reconciliation_in_flight());
+    }
+
+    #[test]
+    fn placement_editor_reopen_same_path_preserves_or_restarts_reconciliation_poll() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+        state.entries = vec![SifsEntry {
+            name: "folder".to_string(),
+            path: "/folder".to_string(),
+            is_dir: true,
+            is_link: false,
+            size: None,
+        }];
+        state.selected = Some(0);
+        let policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            policy.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::Subtree),
+            vec![(SifsPlacementScope::Subtree, policy)],
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+        state.selected_details = Some(details);
+        state.placement_reconciliation = Some(pending_placement_job());
+        state.pending_placement_request_id = Some(91);
+
+        state.open_action_prompt(FileActionPromptKind::Placement);
+        assert_eq!(state.pending_placement_request_id, Some(91));
+        assert!(!state.placement_editor_locked());
+
+        state.action_prompt = None;
+        state.pending_placement_request_id = None;
+        let (tx, _rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        let restarted_request_id = state.next_request_id;
+        state.open_action_prompt(FileActionPromptKind::Placement);
+        assert_eq!(
+            state.pending_placement_request_id,
+            Some(restarted_request_id),
+            "reopening must restart a missing poll while the accepted job remains visible"
+        );
+        assert!(!state.placement_editor_locked());
+    }
+
+    #[test]
+    fn replacement_preview_resumes_the_accepted_job_progress_poll() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+        state.placement_edit_revision = 5;
+        state.placement_reconciliation = Some(pending_placement_job());
+        state.pending_placement_request_id = Some(41);
+        state.pending_placement_preview_revision = Some(5);
+        state.placement_loading = true;
+
+        let mut preview = unsatisfiable_placement_preview();
+        preview.blocking_diagnostics.clear();
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementPreview {
+                request_id: 41,
+                path: "/folder".to_string(),
+                result: Ok(preview),
+            })
+        );
+
+        let command = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement preview must resume progress polling");
+        assert!(matches!(
+            command,
+            FilesWorkerCommand::PlacementProgress { job_id, .. }
+                if job_id == "placement-job"
+        ));
+        assert!(state.pending_placement_request_id.is_some());
+        assert!(!state.placement_loading);
+    }
+
+    #[test]
+    fn reconciliation_progress_never_erases_a_newer_preview_or_apply_error() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.placement_reconciliation = Some(pending_placement_job());
+        state.placement_error = Some("Apply rejected a stale preview".to_string());
+        state.placement_error_from_reconciliation = false;
+        state.pending_placement_request_id = Some(91);
+
+        let mut newer_progress = pending_placement_job();
+        newer_progress.revision += 1;
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementProgress {
+                request_id: 91,
+                result: Ok(newer_progress),
+            })
+        );
+        assert_eq!(
+            state.placement_error.as_deref(),
+            Some("Apply rejected a stale preview")
+        );
+        assert!(!state.placement_error_from_reconciliation);
+
+        state.pending_placement_request_id = Some(92);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementProgress {
+                request_id: 92,
+                result: Err("Accepted-job progress temporarily unavailable".to_string()),
+            })
+        );
+        assert_eq!(
+            state.placement_error.as_deref(),
+            Some("Apply rejected a stale preview"),
+            "an older accepted job must not replace the actionable Apply failure either"
+        );
+        assert!(!state.placement_error_from_reconciliation);
+
+        state.placement_error = Some("Accepted-job progress temporarily unavailable".to_string());
+        state.placement_error_from_reconciliation = true;
+        state.pending_placement_request_id = Some(93);
+        let mut recovered_progress = pending_placement_job();
+        recovered_progress.state = sinomo_runtime::dfs::DfsPlacementReconciliationState::Completed;
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementProgress {
+                request_id: 93,
+                result: Ok(recovered_progress),
+            })
+        );
+        assert!(state.placement_error.is_none());
+        assert!(!state.placement_error_from_reconciliation);
+    }
+
+    #[test]
+    fn placement_update_rebases_only_the_accepted_scope() {
+        let self_policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        );
+        let subtree_policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            self_policy.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::SelfOnly),
+            vec![
+                (SifsPlacementScope::SelfOnly, self_policy.clone()),
+                (SifsPlacementScope::Subtree, subtree_policy),
+            ],
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+        state.entries = vec![SifsEntry {
+            name: "folder".to_string(),
+            path: "/folder".to_string(),
+            is_dir: true,
+            is_link: false,
+            size: None,
+        }];
+        state.selected = Some(0);
+        state.selected_details = Some(details.clone());
+        state.action_prompt = Some(placement_prompt("/folder", true));
+        state.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+        assert!(state.set_placement_desired_replicas(5));
+        let edited_self = state
+            .placement_draft
+            .as_ref()
+            .expect("placement draft")
+            .scope_draft(SifsPlacementScope::SelfOnly)
+            .clone();
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        assert!(state.set_placement_desired_replicas(4));
+
+        let accepted_subtree = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            4,
+        );
+        let accepted_resolved = test_resolved_placement(
+            "/folder",
+            self_policy,
+            Some("/folder"),
+            Some(SifsPlacementScope::SelfOnly),
+            vec![
+                (
+                    SifsPlacementScope::SelfOnly,
+                    test_placement_policy(
+                        sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+                        1,
+                        2,
+                    ),
+                ),
+                (SifsPlacementScope::Subtree, accepted_subtree),
+            ],
+        );
+        let mut preview = unsatisfiable_placement_preview();
+        preview.resolved = accepted_resolved;
+        preview.blocking_diagnostics.clear();
+        let mut reconciliation = pending_placement_job();
+        reconciliation.scope = SifsPlacementScope::Subtree;
+        state.pending_placement_request_id = Some(73);
+        state.placement_loading = true;
+        state.placement_applying = true;
+
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementUpdate {
+                request_id: 73,
+                path: "/folder".to_string(),
+                result: Ok(SifsPlacementUpdateOutcome {
+                    preview,
+                    reconciliation,
+                }),
+            })
+        );
+
+        let draft = state.placement_draft.as_ref().expect("placement draft");
+        assert_eq!(
+            draft.scope_draft(SifsPlacementScope::SelfOnly),
+            &edited_self,
+            "accepting subtree placement must not discard a sibling self-only draft"
+        );
+        let PlacementEditorScopeDraft::Known {
+            draft: subtree,
+            original_policy: Some(original_subtree),
+        } = draft.scope_draft(SifsPlacementScope::Subtree)
+        else {
+            panic!("accepted subtree rule must become the exact editing baseline");
+        };
+        assert_eq!(subtree, original_subtree);
+        assert_eq!(subtree.desired_replicas, 4);
+        assert!(!draft.has_actionable_change());
+        assert!(state.placement_preview_is_current());
+        assert!(state.placement_reconciliation_in_flight());
+        assert!(
+            !state.placement_apply_allowed(),
+            "an unchanged accepted rule must not enqueue a duplicate reconciliation job"
+        );
+
+        state.close_action_prompt();
+        state.open_action_prompt(FileActionPromptKind::Placement);
+        assert!(state.set_placement_scope(SifsPlacementScope::Subtree));
+        let reopened = state
+            .placement_draft
+            .as_ref()
+            .expect("reopened placement draft");
+        assert_eq!(
+            reopened
+                .active_policy()
+                .expect("accepted subtree baseline")
+                .desired_replicas,
+            4,
+            "reopening during reconciliation must use the accepted policy, not cached pre-Apply details"
+        );
+        assert!(!reopened.has_actionable_change());
+
+        assert!(state.set_placement_desired_replicas(3));
+        assert!(
+            state
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change),
+            "reverting exactly to the former policy must be a replacement of the accepted policy"
+        );
+        let mut replacement_preview = unsatisfiable_placement_preview();
+        replacement_preview.blocking_diagnostics.clear();
+        state.placement_preview = Some(replacement_preview);
+        state.placement_preview_revision = Some(state.placement_edit_revision);
+        assert!(
+            state.placement_apply_allowed(),
+            "an exact reversion remains eligible to replace the running reconciliation"
+        );
+    }
+
+    #[test]
+    fn edit_placement_action_waits_for_matching_object_details() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+        let entry = SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        };
+
+        assert!(!inspector_actions(&state, &entry).contains(&InspectorAction::EditPlacement));
+        let mut stale = test_sifs_details(Vec::new());
+        stale.path = "/other.txt".to_string();
+        state.selected_details = Some(stale);
+        assert!(!inspector_actions(&state, &entry).contains(&InspectorAction::EditPlacement));
+
+        let mut ready = test_sifs_details(Vec::new());
+        ready.placement = Some(unsatisfiable_placement_preview().resolved);
+        state.selected_details = Some(ready);
+        assert!(inspector_actions(&state, &entry).contains(&InspectorAction::EditPlacement));
+    }
+
+    fn unsatisfiable_placement_preview() -> SifsPlacementPreview {
+        use sinomo_runtime::dfs::{
+            DfsFileSystemConfig, DfsFileSystemId, DfsNodeAdvertisement, DfsObjectId,
+            DfsPlacementImpact, DfsPlacementPolicy, DfsVersion, preview_placement,
+        };
+
+        let node_a = sinomo_runtime::node::NodeId::from_legacy_named("node-a").expect("node");
+        let node_b = sinomo_runtime::node::NodeId::from_legacy_named("node-b").expect("node");
+        let required =
+            sinomo_runtime::node::NodeId::from_legacy_named("node-required").expect("node");
+        let mut candidate_a = DfsNodeAdvertisement::content(node_a.clone());
+        candidate_a.capacity_weight = 4;
+        candidate_a.zone = Some("east".to_string());
+        let mut candidate_b = DfsNodeAdvertisement::content(node_b.clone());
+        candidate_b.capacity_weight = 2;
+        candidate_b.zone = Some("east".to_string());
+        let mut policy = DfsPlacementPolicy::new(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        )
+        .expect("placement policy");
+        policy.required_node_ids = vec![required];
+        policy.min_distinct_zones = 2;
+        let config = DfsFileSystemConfig {
+            file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
+            display_name: "SIFS".to_string(),
+            owner_node_id: node_a.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let mut preview = preview_placement(
+            &config,
+            "/folder",
+            DfsObjectId::from_legacy_named("object-placement-editor").expect("object"),
+            DfsVersion::from_legacy_named("version-placement-editor").expect("version"),
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            node_a.clone(),
+            vec![node_a],
+            vec![candidate_a, candidate_b],
+            Some(policy),
+            SifsPlacementScope::Subtree,
+        )
+        .expect("best-effort placement preview");
+        preview.impact = DfsPlacementImpact {
+            affected_object_count: 12,
+            affected_bytes: 4_096,
+            unknown_size_object_count: 0,
+            copies_added: 18,
+            copies_removed: 3,
+            metadata_snapshot_digest: String::new(),
+            complete: false,
+        };
+        for node in &mut preview.nodes {
+            if node.node_id == node_b {
+                node.reachability = sinomo_runtime::dfs::DfsPlacementNodeReachability::Unreachable;
+            }
+        }
+        preview
+    }
+
+    #[test]
+    fn placement_editor_keeps_scope_only_constraint_nodes_visible() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let preview = unsatisfiable_placement_preview();
+        let hidden = sinomo_runtime::node::NodeId::from_legacy_named("node-hidden-constraint")
+            .expect("node");
+        {
+            let mut files = shared.files_mut();
+            let mut draft = PlacementEditorDraft::for_details(None, true);
+            draft
+                .active_policy_mut()
+                .expect("active policy")
+                .required_node_ids
+                .insert(hidden.clone());
+            files.placement_draft = Some(draft);
+        }
+
+        let nodes = placement_editor_nodes(&shared, &preview);
+        let hidden_row = nodes
+            .iter()
+            .find(|node| node.node_id == hidden)
+            .expect("active constraint row");
+        assert!(hidden_row.required);
+        assert!(!hidden_row.forbidden);
+        assert_eq!(
+            hidden_row.reachability,
+            sinomo_runtime::dfs::DfsPlacementNodeReachability::Unknown
+        );
+        assert!(hidden_row.explanation.contains("selected scope"));
+    }
+
+    #[test]
+    fn placement_editor_labels_the_entire_previous_preview_as_stale() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let stale_preview = unsatisfiable_placement_preview();
+        let stale_diagnostic = format!(
+            "Previous preview (stale): {}",
+            stale_preview
+                .blocking_diagnostics
+                .first()
+                .expect("blocking placement diagnostic")
+                .message()
+        );
+        {
+            let mut files = shared.files_mut();
+            let mut draft = PlacementEditorDraft::for_details(None, true);
+            draft
+                .active_policy_mut()
+                .expect("active policy")
+                .desired_replicas = 3;
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(draft);
+            files.placement_edit_revision = 12;
+            files.placement_preview_revision = Some(11);
+            files.placement_preview = Some(stale_preview);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Stale placement preview")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared,
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        assert!(window.get_by_text("Previous preview — its warnings, impact totals, and desired node states are out of date. Preview changes to refresh them.").count()? >= 1);
+        assert!(window.get_by_text("Previous impact estimate").count()? >= 1);
+        assert!(window.get_by_text(stale_diagnostic).count()? >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_placement_preview_no_longer_says_before_you_apply() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let policy = test_placement_policy(
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            3,
+        );
+        let resolved = test_resolved_placement(
+            "/folder",
+            policy.clone(),
+            Some("/folder"),
+            Some(SifsPlacementScope::Subtree),
+            vec![(SifsPlacementScope::Subtree, policy)],
+        );
+        let mut details = test_sifs_details(Vec::new());
+        details.path = "/folder".to_string();
+        details.kind = "directory".to_string();
+        details.placement = Some(resolved);
+        {
+            let mut files = shared.files_mut();
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+            files.placement_edit_revision = 4;
+            files.placement_preview_revision = Some(4);
+            files.placement_preview = Some(unsatisfiable_placement_preview());
+            files.placement_reconciliation = Some(pending_placement_job());
+            assert!(
+                !files
+                    .placement_draft
+                    .as_ref()
+                    .is_some_and(PlacementEditorDraft::has_actionable_change)
+            );
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Accepted placement preview")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared,
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        assert!(window.get_by_text("Current placement impact").count()? >= 1);
+        assert_eq!(window.get_by_text("Before you apply").count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn placement_editor_blocks_and_explains_a_legacy_preview() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            let mut draft = PlacementEditorDraft::for_details(None, true);
+            draft
+                .active_policy_mut()
+                .expect("active policy")
+                .desired_replicas = 3;
+            let mut preview = unsatisfiable_placement_preview();
+            preview.schema_version = 0;
+            preview.nodes.clear();
+            preview.blocking_diagnostics.clear();
+            preview.warnings.clear();
+            preview.impact = sinomo_runtime::dfs::DfsPlacementImpact::default();
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(draft);
+            files.placement_edit_revision = 8;
+            files.placement_preview_revision = Some(8);
+            files.placement_preview = Some(preview);
+            assert!(files.placement_preview_is_current());
+            assert!(!files.placement_apply_allowed());
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Legacy placement preview")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared,
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        assert!(
+            window
+                .get_by_text("Preview requires a newer daemon")
+                .count()?
+                >= 1
+        );
+        assert!(window
+            .get_by_text("This daemon returned a legacy preview without reachability, policy-diagnostic, and impact safety data. Upgrade or restart the daemon before applying placement.")
+            .count()?
+            >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn placement_editor_exposes_safe_replacement_while_reconciliation_runs() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            let mut draft = PlacementEditorDraft::for_details(None, true);
+            draft
+                .active_policy_mut()
+                .expect("active policy")
+                .desired_replicas = 3;
+            let mut preview = unsatisfiable_placement_preview();
+            preview.blocking_diagnostics.clear();
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(draft);
+            files.placement_edit_revision = 6;
+            files.placement_preview_revision = Some(6);
+            files.placement_preview = Some(preview);
+            files.placement_reconciliation = Some(pending_placement_job());
+            assert!(files.placement_apply_allowed());
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Placement replacement")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared,
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+
+        assert!(window
+            .get_by_text("The accepted plan remains authoritative while this job runs. If a desired node stays unavailable, edit the policy and preview it; Apply replacement will atomically supersede this job.")
+            .count()?
+            >= 1);
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == sui::SemanticsRole::Button
+                && node.name.as_deref() == Some("Apply replacement")
+                && !node.state.disabled
+        }));
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == sui::SemanticsRole::RadioButton
+                && node.name.as_deref() == Some("Eventual placement")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn placement_number_input_ranges_follow_desired_replica_changes() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut preview = unsatisfiable_placement_preview();
+            preview.blocking_diagnostics.clear();
+            for node in &mut preview.nodes {
+                node.accepts_content = true;
+            }
+            let mut files = shared.files_mut();
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+            files.placement_preview = Some(preview);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Placement count bounds")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        let range_for = |name: &str| -> (f64, f64, f64) {
+            let snapshot = window.snapshot().expect("placement editor snapshot");
+            let node = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == sui::SemanticsRole::SpinBox && node.name.as_deref() == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} spinbox"));
+            let Some(sui::SemanticsValue::Range { value, min, max }) = node.value.as_ref() else {
+                panic!("{name} must expose numeric range semantics");
+            };
+            (*value, *min, *max)
+        };
+
+        assert_eq!(range_for("Desired replicas N"), (2.0, 1.0, 3.0));
+        assert_eq!(range_for("Minimum write replicas W"), (1.0, 1.0, 2.0));
+        assert_eq!(range_for("Minimum distinct zones"), (0.0, 0.0, 2.0));
+
+        window
+            .get_by_role(sui::SemanticsRole::SpinBox)
+            .with_name("Desired replicas N")
+            .press("ArrowUp")?;
+        app.run_until_idle()?;
 
         assert_eq!(
-            parse_placement_editor_spec("inherit scope=self").expect("inherit"),
-            (None, SifsPlacementScope::SelfOnly)
+            shared
+                .files()
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .map(|policy| policy.desired_replicas),
+            Some(3)
         );
+        assert_eq!(range_for("Minimum write replicas W"), (1.0, 1.0, 3.0));
+        assert_eq!(range_for("Minimum distinct zones"), (0.0, 0.0, 3.0));
+        Ok(())
+    }
+
+    #[test]
+    fn placement_editor_exposes_controls_impact_nodes_and_blocking_warnings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let preview = unsatisfiable_placement_preview();
+        let zone_warning = preview
+            .blocking_diagnostics
+            .iter()
+            .find(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    sinomo_runtime::dfs::DfsPlacementBlockingDiagnostic::InsufficientZones { .. }
+                )
+            })
+            .expect("zone warning")
+            .message();
+        let required =
+            sinomo_runtime::node::NodeId::from_legacy_named("node-required").expect("node");
+        {
+            let mut files = shared.files_mut();
+            let mut draft = PlacementEditorDraft::for_details(None, true);
+            draft.scope = SifsPlacementScope::Subtree;
+            let policy = draft.active_policy_mut().expect("active policy");
+            policy.desired_replicas = 3;
+            policy.min_distinct_zones = 2;
+            policy.required_node_ids.insert(required);
+            draft.normalize();
+            files.action_prompt = Some(FileActionPrompt {
+                kind: FileActionPromptKind::Placement,
+                input: String::new(),
+                target_name: "folder".to_string(),
+                target_path: Some("/folder".to_string()),
+                target_is_dir: true,
+                targets: Vec::new(),
+                error: None,
+            });
+            files.placement_draft = Some(draft);
+            files.placement_edit_revision = 11;
+            files.placement_preview_revision = Some(11);
+            files.placement_preview = Some(preview);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime =
+            sui::Application::new()
+                .window(sui::WindowBuilder::new().title("Placement editor").root(
+                    FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared,
+                        Rc::clone(&reader),
+                    ),
+                ))
+                .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+
+        for name in [
+            "Eventual placement",
+            "Confirmed placement",
+            "Self placement scope",
+            "Subtree placement scope",
+        ] {
+            assert!(snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == sui::SemanticsRole::RadioButton && node.name.as_deref() == Some(name)
+            }));
+        }
+        for name in [
+            "Minimum write replicas W",
+            "Desired replicas N",
+            "Minimum distinct zones",
+        ] {
+            assert!(snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == sui::SemanticsRole::SpinBox && node.name.as_deref() == Some(name)
+            }));
+        }
+        assert_eq!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == sui::SemanticsRole::CheckBox
+                        && node
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("Require node "))
+                })
+                .count(),
+            3
+        );
+        assert_eq!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.role == sui::SemanticsRole::CheckBox
+                        && node
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("Forbid node "))
+                })
+                .count(),
+            3
+        );
+        for label in [
+            "Affected objects",
+            "Affected bytes",
+            "Copies added",
+            "Copies removed",
+        ] {
+            assert!(window.get_by_text(label).count()? >= 1, "missing {label}");
+        }
+        assert!(window.get_by_text(zone_warning).count()? >= 1);
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == sui::SemanticsRole::Button
+                && node.name.as_deref() == Some("Apply placement")
+                && node.state.disabled
+        }));
+        Ok(())
     }
 
     #[test]

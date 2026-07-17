@@ -7,6 +7,8 @@ use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const DFS_SMOKE_DAEMON_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(9_500);
+const DFS_PLACEMENT_AUTHORITY_ADMIN_RPC_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {
@@ -38,6 +40,7 @@ pub(crate) enum DfsCliCommand {
         json: bool,
     },
     MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions),
+    PlacementAuthority(DfsPlacementAuthorityCliCommand),
     Mount(DfsMountOptions),
     Services {
         json: bool,
@@ -120,6 +123,32 @@ pub(crate) struct DfsMetadataShardTransferPrimaryOptions {
     pub(crate) new_primary_node_id: NodeId,
     pub(crate) expected_epoch: Option<u64>,
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum DfsPlacementAuthorityCliCommand {
+    Inspect(DfsPlacementAuthorityInspectOptions),
+    Clear(DfsPlacementAuthorityClearOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsPlacementAuthorityInspectOptions {
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsPlacementAuthorityClearOptions {
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) expected_recovery_token: String,
+    pub(crate) recovery: DfsPlacementAuthorityRecovery,
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum DfsPlacementAuthorityRecovery {
+    RemovedNode,
+    BreakGlass { acknowledgement: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -303,6 +332,9 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         Some((command, rest)) if command == "smoke" => parse_dfs_smoke_command(rest),
         Some((command, rest)) if command == "services" => parse_dfs_services_command(rest),
         Some((command, rest)) if command == "metadata" => parse_dfs_metadata_command(rest),
+        Some((command, rest)) if command == "placement-authority" => Ok(
+            DfsCliCommand::PlacementAuthority(parse_dfs_placement_authority_command(rest)?),
+        ),
         Some((command, rest)) if command == "mount" => {
             Ok(DfsCliCommand::Mount(parse_dfs_mount_options(rest)?))
         }
@@ -314,6 +346,115 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         }
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_dfs_placement_authority_command(
+    args: &[String],
+) -> Result<DfsPlacementAuthorityCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "inspect" => {
+            Ok(DfsPlacementAuthorityCliCommand::Inspect(
+                parse_dfs_placement_authority_inspect_options(rest)?,
+            ))
+        }
+        Some((command, rest)) if command == "clear" => Ok(DfsPlacementAuthorityCliCommand::Clear(
+            parse_dfs_placement_authority_clear_options(rest)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_dfs_placement_authority_inspect_options(
+    args: &[String],
+) -> Result<DfsPlacementAuthorityInspectOptions, CliError> {
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut filesystem_seen = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--filesystem" => {
+                if filesystem_seen {
+                    return Err(CliError::Usage);
+                }
+                index += 1;
+                file_system_id = parse_dfs_file_system_id(args.get(index).ok_or(CliError::Usage)?)?;
+                filesystem_seen = true;
+            }
+            "--json" if !json => json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    Ok(DfsPlacementAuthorityInspectOptions {
+        file_system_id,
+        json,
+    })
+}
+
+fn parse_dfs_placement_authority_clear_options(
+    args: &[String],
+) -> Result<DfsPlacementAuthorityClearOptions, CliError> {
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut filesystem_seen = false;
+    let mut expected_recovery_token = None;
+    let mut acknowledge_owner_stopped = false;
+    let mut break_glass_acknowledgement = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--filesystem" => {
+                if filesystem_seen {
+                    return Err(CliError::Usage);
+                }
+                index += 1;
+                file_system_id = parse_dfs_file_system_id(args.get(index).ok_or(CliError::Usage)?)?;
+                filesystem_seen = true;
+            }
+            "--expected-token" => {
+                if expected_recovery_token.is_some() {
+                    return Err(CliError::Usage);
+                }
+                index += 1;
+                let token = args.get(index).ok_or(CliError::Usage)?;
+                if token.trim().is_empty() || token.trim() != token {
+                    return Err(CliError::Usage);
+                }
+                expected_recovery_token = Some(token.clone());
+            }
+            "--acknowledge-owner-stopped" if !acknowledge_owner_stopped => {
+                acknowledge_owner_stopped = true;
+            }
+            "--break-glass-acknowledgement" => {
+                if break_glass_acknowledgement.is_some() {
+                    return Err(CliError::Usage);
+                }
+                index += 1;
+                break_glass_acknowledgement = Some(args.get(index).ok_or(CliError::Usage)?.clone());
+            }
+            "--json" if !json => json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+
+    let recovery = match (acknowledge_owner_stopped, break_glass_acknowledgement) {
+        (true, None) => DfsPlacementAuthorityRecovery::RemovedNode,
+        (false, Some(acknowledgement))
+            if acknowledgement
+                == sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT =>
+        {
+            DfsPlacementAuthorityRecovery::BreakGlass { acknowledgement }
+        }
+        _ => return Err(CliError::Usage),
+    };
+    Ok(DfsPlacementAuthorityClearOptions {
+        file_system_id,
+        expected_recovery_token: expected_recovery_token.ok_or(CliError::Usage)?,
+        recovery,
+        json,
+    })
 }
 
 pub(crate) fn parse_dfs_common_options(args: &[String]) -> Result<DfsCommonOptions, CliError> {
@@ -1593,9 +1734,203 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::MetadataShardTransferPrimary(options) => {
             run_dfs_metadata_shard_transfer_primary(options)
         }
+        DfsCliCommand::PlacementAuthority(command) => run_dfs_placement_authority_command(command),
         DfsCliCommand::Mount(options) => run_dfs_mount_command(options),
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
         DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
+    }
+}
+
+fn run_dfs_placement_authority_command(
+    command: DfsPlacementAuthorityCliCommand,
+) -> Result<(), CliError> {
+    match command {
+        DfsPlacementAuthorityCliCommand::Inspect(options) => {
+            let response = send_dfs_placement_authority_admin_request(
+                &sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest::Inspect {
+                    file_system_id: options.file_system_id.clone(),
+                },
+            )?;
+            let sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminResponse::Inspection {
+                permit,
+            } = &response
+            else {
+                return Err(CliError::Parse {
+                    detail: "main daemon returned an unexpected DFS placement-authority response"
+                        .to_string(),
+                });
+            };
+            if options.json {
+                print_json("<dfs-placement-authority-inspect>", &response)
+            } else {
+                print_dfs_placement_authority_inspection(&options.file_system_id, permit.as_ref());
+                Ok(())
+            }
+        }
+        DfsPlacementAuthorityCliCommand::Clear(options) => {
+            let request = match &options.recovery {
+                DfsPlacementAuthorityRecovery::RemovedNode => {
+                    sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest::RecoverRemovedNode {
+                        file_system_id: options.file_system_id.clone(),
+                        expected_recovery_token: options.expected_recovery_token.clone(),
+                        acknowledge_owner_stopped: true,
+                    }
+                }
+                DfsPlacementAuthorityRecovery::BreakGlass { acknowledgement } => {
+                    sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest::BreakGlassRecover {
+                        file_system_id: options.file_system_id.clone(),
+                        expected_recovery_token: options.expected_recovery_token.clone(),
+                        acknowledgement: acknowledgement.clone(),
+                    }
+                }
+            };
+            let response = send_dfs_placement_authority_admin_request(&request)?;
+            let sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminResponse::Recovery {
+                outcome,
+            } = &response
+            else {
+                return Err(CliError::Parse {
+                    detail: "main daemon returned an unexpected DFS placement-authority response"
+                        .to_string(),
+                });
+            };
+            if options.json {
+                print_json("<dfs-placement-authority-clear>", &response)?;
+            } else {
+                print_dfs_placement_authority_recovery_outcome(&options.file_system_id, outcome);
+            }
+            validate_dfs_placement_authority_recovery_outcome(outcome)
+        }
+    }
+}
+
+fn send_dfs_placement_authority_admin_request(
+    request: &sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest,
+) -> Result<sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminResponse, CliError> {
+    let status = default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
+        detail: "DFS placement-authority administration requires the local main daemon".to_string(),
+    })?;
+    let rpc_request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+        sinomo_runtime::daemon::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+        request,
+    )?;
+    let response = daemon_send_daemon_rpc(
+        &status.address,
+        &rpc_request,
+        DFS_PLACEMENT_AUTHORITY_ADMIN_RPC_TIMEOUT,
+    )?;
+    response.error_detail()?;
+    response.decode_body().map_err(Into::into)
+}
+
+fn print_dfs_placement_authority_inspection(
+    file_system_id: &DfsFileSystemId,
+    permit: Option<&sinomo_runtime::dfs::DfsPlacementAuthorityPermitStatus>,
+) {
+    let Some(permit) = permit else {
+        println!("No DFS placement-authority permit is active for filesystem {file_system_id}.");
+        return;
+    };
+    let holder_kind = match permit.holder_kind {
+        sinomo_runtime::dfs::DfsPlacementAuthorityPermitHolderKind::Identified => "identified",
+        sinomo_runtime::dfs::DfsPlacementAuthorityPermitHolderKind::Partial => "partial",
+        sinomo_runtime::dfs::DfsPlacementAuthorityPermitHolderKind::Legacy => "legacy",
+    };
+    println!("DFS placement-authority permit:");
+    println!("  filesystem: {}", permit.file_system_id);
+    println!("  reconciliation job: {}", permit.job_id);
+    println!("  holder identity: {holder_kind}");
+    println!(
+        "  holder cluster: {}",
+        permit.holder_cluster_id.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  holder node: {}",
+        permit
+            .holder_node_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    println!("  recovery token: {}", permit.recovery_token);
+    println!(
+        "Inspect cluster membership and stop or fence the prior writer before attempting recovery."
+    );
+}
+
+fn print_dfs_placement_authority_recovery_outcome(
+    file_system_id: &DfsFileSystemId,
+    outcome: &sinomo_runtime::dfs::DfsPlacementAuthorityRecoveryOutcome,
+) {
+    use sinomo_runtime::dfs::DfsPlacementAuthorityRecoveryOutcome;
+    match outcome {
+        DfsPlacementAuthorityRecoveryOutcome::Missing => {
+            println!("No DFS placement-authority permit is active for filesystem {file_system_id}.")
+        }
+        DfsPlacementAuthorityRecoveryOutcome::Cleared => {
+            println!("Cleared the DFS placement-authority permit for filesystem {file_system_id}.")
+        }
+        DfsPlacementAuthorityRecoveryOutcome::Changed
+        | DfsPlacementAuthorityRecoveryOutcome::Refused { .. } => {}
+    }
+}
+
+fn validate_dfs_placement_authority_recovery_outcome(
+    outcome: &sinomo_runtime::dfs::DfsPlacementAuthorityRecoveryOutcome,
+) -> Result<(), CliError> {
+    use sinomo_runtime::dfs::DfsPlacementAuthorityRecoveryOutcome;
+    match outcome {
+        DfsPlacementAuthorityRecoveryOutcome::Missing
+        | DfsPlacementAuthorityRecoveryOutcome::Cleared => Ok(()),
+        DfsPlacementAuthorityRecoveryOutcome::Changed => Err(CliError::ClusterReadOnly {
+            detail: "the DFS placement-authority permit changed; inspect it again before retrying"
+                .to_string(),
+        }),
+        DfsPlacementAuthorityRecoveryOutcome::Refused { reason } => {
+            Err(CliError::ClusterReadOnly {
+                detail: format!(
+                    "DFS placement-authority recovery was refused: {}",
+                    dfs_placement_authority_refusal_label(reason)
+                ),
+            })
+        }
+    }
+}
+
+fn dfs_placement_authority_refusal_label(
+    reason: &sinomo_runtime::dfs::DfsPlacementAuthorityRecoveryRefusal,
+) -> String {
+    use sinomo_runtime::dfs::DfsPlacementAuthorityRecoveryRefusal;
+    match reason {
+        DfsPlacementAuthorityRecoveryRefusal::OwnerStoppedAcknowledgementRequired => {
+            "the operator did not acknowledge that the prior owner is stopped or fenced".to_string()
+        }
+        DfsPlacementAuthorityRecoveryRefusal::CurrentLocalNode => {
+            "the current local node still owns the permit; restart its main daemon instead"
+                .to_string()
+        }
+        DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity => {
+            "the permit has incomplete holder identity; use the explicit break-glass procedure"
+                .to_string()
+        }
+        DfsPlacementAuthorityRecoveryRefusal::ForeignCluster => {
+            "the permit belongs to a different cluster; use the explicit break-glass procedure"
+                .to_string()
+        }
+        DfsPlacementAuthorityRecoveryRefusal::HolderMembershipPresent { state } => {
+            format!("the holder remains in cluster membership with state {state:?}")
+        }
+        DfsPlacementAuthorityRecoveryRefusal::InvalidRemovedMembershipEvidence => {
+            "cluster membership does not prove that the holder was removed".to_string()
+        }
+        DfsPlacementAuthorityRecoveryRefusal::BreakGlassAcknowledgementRequired => {
+            "the exact break-glass acknowledgement was not supplied".to_string()
+        }
+        DfsPlacementAuthorityRecoveryRefusal::NormalRecoveryRequired => {
+            "the identified removed-node permit must use normal recovery".to_string()
+        }
     }
 }
 
@@ -2268,6 +2603,7 @@ fn run_local_dfs_smoke(
             bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: false,
                 materialize_local_metadata: false,
+                local_zone: None,
             },
             smoke: foreground_dfs_smoke_options(),
         },

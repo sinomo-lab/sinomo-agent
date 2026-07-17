@@ -3,7 +3,7 @@ use crate::client::{
     send_object_rpc_session_to_target_on_runtime_with_daemon_paths_and_options,
 };
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
-use crate::{DaemonError, DaemonPaths, DaemonRunOptions};
+use crate::{DaemonDataOwnerLock, DaemonError, DaemonPaths, DaemonRunOptions};
 use sinomo_core::ClusterNodeAvailability;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -82,6 +82,14 @@ const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
+
+fn daemon_dfs_local_zone() -> Option<String> {
+    std::env::var(SINOMO_DFS_ZONE_ENV)
+        .ok()
+        .map(|zone| zone.trim().to_string())
+        .filter(|zone| !zone.is_empty())
+}
 
 /// Bootstrap reconciliation and full maintenance both open and recover the
 /// local metadata tables. Keep those mandatory lifecycle paths single-flight
@@ -399,7 +407,43 @@ static DAEMON_DFS_DETACHED_SEND_RUNTIMES: OnceLock<
     Mutex<BTreeMap<DaemonDfsDetachedSendRuntimeKey, Arc<DaemonDfsDetachedSendRuntime>>>,
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
+static DAEMON_DFS_DATA_OWNER_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<DaemonDataOwnerLock>>>> =
+    OnceLock::new();
 static DAEMON_DFS_SMOKE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Publish the process-lifetime main-daemon data lock to DFS blocking work.
+/// The registry stores only a weak reference; the control loop remains the
+/// owner, while each backend-bearing blocking task upgrades and retains its
+/// own `Arc` until the actual synchronous work stops.
+pub(crate) fn register_daemon_dfs_data_owner_lock(
+    paths: &DaemonPaths,
+    lock: &Arc<DaemonDataOwnerLock>,
+) -> Result<(), DaemonError> {
+    DAEMON_DFS_DATA_OWNER_LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "DFS data-owner lock registry".to_string(),
+            detail: "data-owner lock registry is poisoned".to_string(),
+        })?
+        .insert(paths.root.clone(), Arc::downgrade(lock));
+    Ok(())
+}
+
+fn daemon_dfs_data_owner_lock(
+    paths: &DaemonPaths,
+) -> Result<Option<Arc<DaemonDataOwnerLock>>, DaemonError> {
+    Ok(DAEMON_DFS_DATA_OWNER_LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "DFS data-owner lock registry".to_string(),
+            detail: "data-owner lock registry is poisoned".to_string(),
+        })?
+        .get(&paths.root)
+        .and_then(Weak::upgrade))
+}
 
 #[derive(Debug)]
 struct DaemonDfsSmokeInFlightGuard;
@@ -1022,14 +1066,50 @@ async fn acquire_daemon_dfs_maintenance_admission(
 struct DaemonDfsControlPlaneKvClient {
     cluster_paths: ClusterPaths,
     runtime: tokio::runtime::Handle,
+    /// Cached and short-lived services normally retain only a weak capability;
+    /// their surrounding blocking task owns the strong guard. This prevents a
+    /// static message cache from pinning an old daemon's OS lock after shutdown.
+    data_owner_lock: Option<Weak<DaemonDataOwnerLock>>,
+    /// Sandbox services may outlive the handler which opened them, so those
+    /// services explicitly retain the strong capability for their lifetime.
+    _owned_data_owner_lock: Option<Arc<DaemonDataOwnerLock>>,
 }
 
 impl DaemonDfsControlPlaneKvClient {
     fn new_on_runtime(cluster_paths: &ClusterPaths, runtime: &tokio::runtime::Handle) -> Self {
+        let data_owner_lock = Self::discover_data_owner_lock(cluster_paths);
         Self {
             cluster_paths: cluster_paths.clone(),
             runtime: runtime.clone(),
+            data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
+            _owned_data_owner_lock: None,
         }
+    }
+
+    fn new_owned_on_runtime(
+        cluster_paths: &ClusterPaths,
+        runtime: &tokio::runtime::Handle,
+    ) -> Self {
+        let data_owner_lock = Self::discover_data_owner_lock(cluster_paths);
+        Self {
+            cluster_paths: cluster_paths.clone(),
+            runtime: runtime.clone(),
+            data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
+            _owned_data_owner_lock: data_owner_lock,
+        }
+    }
+
+    fn discover_data_owner_lock(cluster_paths: &ClusterPaths) -> Option<Arc<DaemonDataOwnerLock>> {
+        cluster_paths
+            .root
+            .parent()
+            .map(SinomoDataDir::new)
+            .map(|data_dir| DaemonPaths::new(&data_dir))
+            .and_then(|paths| daemon_dfs_data_owner_lock(&paths).ok().flatten())
+    }
+
+    fn data_owner_lock(&self) -> Option<Arc<DaemonDataOwnerLock>> {
+        self.data_owner_lock.as_ref().and_then(Weak::upgrade)
     }
 
     fn daemon_error(&self, source: DaemonError) -> KvError {
@@ -1038,6 +1118,121 @@ impl DaemonDfsControlPlaneKvClient {
             detail: source.to_string(),
         }
     }
+}
+
+fn require_dfs_placement_authority_admin_owner(
+    paths: &DaemonPaths,
+) -> Result<Arc<DaemonDataOwnerLock>, DaemonError> {
+    daemon_dfs_data_owner_lock(paths)?.ok_or_else(|| DaemonError::Parse {
+        detail: "DFS placement-authority administration requires the live exclusive main-daemon data-owner capability"
+            .to_string(),
+    })
+}
+
+pub(crate) fn inspect_dfs_placement_authority_permit(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    file_system_id: &DfsFileSystemId,
+) -> Result<Option<sinomo_dfs::DfsPlacementAuthorityPermitStatus>, DaemonError> {
+    let _data_owner_lock = require_dfs_placement_authority_admin_owner(paths)?;
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime);
+    sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut client)?;
+    sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+        .placement_authority_permit_status(file_system_id)
+        .map_err(Into::into)
+}
+
+pub(crate) fn recover_removed_node_dfs_placement_authority_permit(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    file_system_id: &DfsFileSystemId,
+    expected_recovery_token: &str,
+    acknowledge_owner_stopped: bool,
+) -> Result<sinomo_dfs::DfsPlacementAuthorityRecoveryOutcome, DaemonError> {
+    let _data_owner_lock = require_dfs_placement_authority_admin_owner(paths)?;
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime);
+    sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut client)?;
+    sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+        .recover_removed_node_placement_authority_permit(
+            file_system_id,
+            &state.cluster_id.to_string(),
+            &state.local_node_id,
+            expected_recovery_token,
+            acknowledge_owner_stopped,
+        )
+        .map_err(Into::into)
+}
+
+pub(crate) fn break_glass_recover_dfs_placement_authority_permit(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    file_system_id: &DfsFileSystemId,
+    expected_recovery_token: &str,
+    acknowledgement: &str,
+) -> Result<sinomo_dfs::DfsPlacementAuthorityRecoveryOutcome, DaemonError> {
+    let _data_owner_lock = require_dfs_placement_authority_admin_owner(paths)?;
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime);
+    sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut client)?;
+    sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+        .break_glass_recover_placement_authority_permit(
+            file_system_id,
+            &state.cluster_id.to_string(),
+            expected_recovery_token,
+            acknowledgement,
+        )
+        .map_err(Into::into)
+}
+
+/// Recover only a prior-process placement permit owned by this main daemon's
+/// local cluster node. Callers are required to hold `DaemonLock` and
+/// `DaemonDataOwnerLock`; the control loop acquires both for its full lifetime
+/// before this helper is reachable. Exact-value CAS in the DFS store prevents
+/// deleting a concurrently replaced holder.
+pub(crate) fn recover_prior_process_default_dfs_placement_authority(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
+    let _data_owner_lock = daemon_dfs_data_owner_lock(paths)?.ok_or_else(|| {
+        DaemonError::Parse {
+            detail: "refusing placement-authority recovery without a live exclusive main-daemon data-owner lock"
+                .to_string(),
+        }
+    })?;
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(false);
+    }
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime);
+    let current_process =
+        sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(&client)
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "main daemon has no DFS placement-authority process identity".to_string(),
+            })?;
+    sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut client)?;
+    let recovered = sinomo_dfs::DfsControlPlaneStore::new(&mut client)
+        .recover_prior_process_placement_authority_permit_for_local_node(
+            &sinomo_dfs::sifs_file_system_id(),
+            &state.local_node_id,
+            &current_process,
+        )?;
+    if recovered {
+        tracing::info!(
+            target: "sinomo.dfs.placement",
+            node_id = %state.local_node_id,
+            "recovered exact prior-process SIFS placement authority permit"
+        );
+    }
+    Ok(recovered)
 }
 
 fn daemon_dfs_txn_puts_local_membership_handoff(cluster_paths: &ClusterPaths, txn: &KvTxn) -> bool {
@@ -1081,6 +1276,41 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         )
         .map(drop)
         .map_err(|source| self.daemon_error(source))
+    }
+
+    fn placement_authority_process_identity(
+        &self,
+    ) -> Option<sinomo_dfs::DfsPlacementAuthorityProcessIdentity> {
+        // The shadow daemon shares cluster state but never owns local data.
+        // Only a process which currently retains the main daemon's exclusive
+        // data-owner lock may advertise placement mutation authority.
+        let _data_owner_lock = self.data_owner_lock()?;
+        let state =
+            sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths).ok()?;
+        Some(sinomo_dfs::DfsPlacementAuthorityProcessIdentity {
+            cluster_id: state.cluster_id.to_string(),
+            process_session_id: DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID
+                .get_or_init(|| sinomo_core::Id::generate().to_string())
+                .clone(),
+        })
+    }
+
+    fn authorizes_prior_process_placement_authority_recovery(
+        &self,
+        local_node_id: &NodeId,
+        current_process: &sinomo_dfs::DfsPlacementAuthorityProcessIdentity,
+    ) -> bool {
+        let Some(_data_owner_lock) = self.data_owner_lock() else {
+            return false;
+        };
+        let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths)
+        else {
+            return false;
+        };
+        state.local_node_id == *local_node_id
+            && sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(self)
+                .as_ref()
+                == Some(current_process)
     }
 
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
@@ -1263,6 +1493,26 @@ pub(crate) fn with_daemon_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsMessage
     } else {
         service
     }
+}
+
+/// Attach a control plane which retains the main daemon's ownership proof for
+/// the complete service lifetime. Sandbox services can escape the blocking
+/// handler which creates them; ordinary cached/message services must use the
+/// weak-capability helper above.
+pub(crate) fn with_daemon_owned_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsMessageTransport>(
+    service: NetworkedDfsService<T>,
+    cluster_paths: &ClusterPaths,
+    runtime: Option<&tokio::runtime::Handle>,
+) -> NetworkedDfsService<T> {
+    let Some(runtime) = runtime else {
+        return service;
+    };
+    if !cluster_paths.kv_paths().snapshot.exists() {
+        return service;
+    }
+    service.with_boxed_control_plane(Box::new(
+        DaemonDfsControlPlaneKvClient::new_owned_on_runtime(cluster_paths, runtime),
+    ))
 }
 
 fn daemon_dfs_control_plane_client_on_runtime(
@@ -2189,6 +2439,15 @@ fn evict_daemon_dfs_message_service_cache(data_dir: &SinomoDataDir) -> Result<bo
     Ok(removed)
 }
 
+/// Release the process-global cached lane during main-daemon shutdown. Active
+/// blocking handlers retain both their lane Arc and an explicit data-owner Arc,
+/// so eviction drops only idle cache ownership and cannot shorten live work.
+pub(crate) fn evict_daemon_dfs_message_service_cache_on_shutdown(
+    paths: &DaemonPaths,
+) -> Result<bool, DaemonError> {
+    evict_daemon_dfs_message_service_cache(&SinomoDataDir::new(daemon_data_dir(paths)?))
+}
+
 fn daemon_dfs_mutation_scheduler(
     data_dir: &SinomoDataDir,
 ) -> Result<Arc<DaemonDfsMutationScheduler>, DaemonError> {
@@ -3110,6 +3369,7 @@ async fn handle_daemon_dfs_message_async(
     let process_cluster_paths = cluster_paths.clone();
     let process_runtime = runtime.clone();
     let process_traceparent = traceparent.clone();
+    let process_data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
     let admission_started = Instant::now();
     // Wait for the metadata-memory bound before acquiring logical mutation
@@ -3123,6 +3383,11 @@ async fn handle_daemon_dfs_message_async(
     let spawn_started = Instant::now();
     let blocking_queue_started = spawn_started;
     let (result, blocking_queue, blocking_work) = tokio::task::spawn_blocking(move || {
+        // The async connection task and runtime shutdown may abandon this
+        // JoinHandle while blocking work continues. Retain the OS-backed data
+        // lock inside the blocking closure so no replacement daemon can prove
+        // this placement-authority session dead prematurely.
+        let _data_owner_lock = process_data_owner_lock;
         let blocking_started = Instant::now();
         let blocking_queue = blocking_queue_started.elapsed();
         let result = sinomo_dfs::with_dfs_traceparent(process_traceparent.as_deref(), || {
@@ -3263,8 +3528,10 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
     let task_paths = paths.clone();
     let task_options = options.clone();
     let task_runtime = runtime.clone();
+    let task_data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
     runtime
         .spawn_blocking(move || {
+            let _data_owner_lock = task_data_owner_lock;
             let _lifecycle_guard = lifecycle_guard;
             let _message_execution_guard = message_execution_guard;
             task_runtime.block_on(ensure_default_distributed_dfs_lifecycle_inner(
@@ -3290,6 +3557,15 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
+    // Startup attempts this before accepting control traffic. Retrying here is
+    // safe under the same process-lifetime data-owner lock and lets recovery
+    // converge once cluster quorum becomes reachable after startup.
+    if let Err(error) = recover_prior_process_default_dfs_placement_authority(paths, &runtime) {
+        tracing::warn!(
+            target: "sinomo.dfs.placement",
+            "prior-process SIFS placement authority recovery deferred: {error}"
+        );
+    }
     let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
         &cluster_paths,
         &runtime,
@@ -3301,6 +3577,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control,
             materialize_local_metadata: true,
+            local_zone: daemon_dfs_local_zone(),
         },
     )
     .await?;
@@ -3560,7 +3837,9 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     runtime: tokio::runtime::Handle,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
+    let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
     tokio::task::spawn_blocking(move || {
+        let _data_owner_lock = data_owner_lock;
         runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
             &paths,
             &tick_runtime,
@@ -3737,11 +4016,13 @@ async fn run_daemon_dfs_smoke_async(
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
     let smoke_guard = DaemonDfsSmokeInFlightGuard::acquire()?;
+    let data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let runtime = runtime.clone();
     let smoke_task = tokio::task::spawn_blocking(move || {
+        let _data_owner_lock = data_owner_lock;
         let _smoke_guard = smoke_guard;
         sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
             &data_dir,
@@ -3756,6 +4037,7 @@ async fn run_daemon_dfs_smoke_async(
                 bootstrap: DfsDefaultClusterBootstrapOptions {
                     publish_cluster_control: false,
                     materialize_local_metadata: false,
+                    local_zone: None,
                 },
                 smoke: daemon_dfs_smoke_options(),
             },
@@ -3811,6 +4093,118 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn daemon_dfs_blocking_owner_clone_retains_exclusive_data_lock() {
+        let root = temp_root("blocking-owner-lock");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let control_owner =
+            Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("control loop data-owner lock"));
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner lock");
+        let blocking_owner = daemon_dfs_data_owner_lock(&paths)
+            .expect("read registered lock")
+            .expect("blocking task owner clone");
+
+        drop(control_owner);
+        assert!(
+            DaemonDataOwnerLock::acquire(&paths).is_err(),
+            "a replacement daemon must remain excluded while abandoned blocking DFS work runs"
+        );
+
+        drop(blocking_owner);
+        DaemonDataOwnerLock::acquire(&paths)
+            .expect("data-owner lock is released after blocking work stops");
+    }
+
+    #[test]
+    fn daemon_dfs_placement_identity_requires_live_main_data_owner_lock() {
+        let root = temp_root("placement-identity-owner-lock");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let local_node_id = NodeId::generate();
+        write_test_cluster_state(root.path(), &local_node_id);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("placement-identity-owner-lock");
+        let unowned_client =
+            DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime.handle());
+
+        assert!(
+            sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(
+                &unowned_client
+            )
+            .is_none(),
+            "a shadow or utility process without the main data lock must not acquire placement authority"
+        );
+
+        let owner =
+            Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("main daemon data-owner lock"));
+        register_daemon_dfs_data_owner_lock(&paths, &owner).expect("register main lock");
+        let owned_client =
+            DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime.handle());
+        let owned_identity =
+            sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(
+                &owned_client,
+            )
+            .expect("owned placement identity");
+        assert!(
+            sinomo_dfs::DfsControlPlaneKvClient::authorizes_prior_process_placement_authority_recovery(
+                &owned_client,
+                &local_node_id,
+                &owned_identity,
+            ),
+            "the main daemon may acquire placement authority while its exclusive lock is live"
+        );
+        assert!(
+            !sinomo_dfs::DfsControlPlaneKvClient::authorizes_prior_process_placement_authority_recovery(
+                &owned_client,
+                &NodeId::generate(),
+                &owned_identity,
+            ),
+            "host authorization is bound to the local cluster node"
+        );
+        let forged_identity = sinomo_dfs::DfsPlacementAuthorityProcessIdentity {
+            cluster_id: owned_identity.cluster_id.clone(),
+            process_session_id: "forged-placement-session".to_string(),
+        };
+        assert!(
+            !sinomo_dfs::DfsControlPlaneKvClient::authorizes_prior_process_placement_authority_recovery(
+                &owned_client,
+                &local_node_id,
+                &forged_identity,
+            ),
+            "host authorization is bound to the current process session"
+        );
+        drop(owner);
+        assert!(
+            sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(
+                &owned_client
+            )
+            .is_none(),
+            "an ordinary cached client must not pin the data-owner lock after its task guard exits"
+        );
+        let replacement = DaemonDataOwnerLock::acquire(&paths)
+            .expect("weak cached client released data-owner lock");
+        drop(replacement);
+        drop(owned_client);
+
+        let owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("replacement main owner"));
+        register_daemon_dfs_data_owner_lock(&paths, &owner).expect("register replacement lock");
+        let retained_client =
+            DaemonDfsControlPlaneKvClient::new_owned_on_runtime(&cluster_paths, runtime.handle());
+        drop(owner);
+        assert!(
+            sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(
+                &retained_client
+            )
+            .is_some(),
+            "an explicitly owned sandbox service retains authority for its full lifetime"
+        );
+        assert!(DaemonDataOwnerLock::acquire(&paths).is_err());
+        drop(retained_client);
+        DaemonDataOwnerLock::acquire(&paths).expect("owned sandbox service released lock");
+    }
 
     #[test]
     fn daemon_dfs_message_execution_is_single_flight_per_data_dir() {

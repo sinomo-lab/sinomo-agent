@@ -126,14 +126,17 @@ pub use content_store::{
     ContentStoreVersionGcReport, ContentVersionIdentity, LocalContentStore, ObjectVersionReader,
 };
 pub use control_plane::{
-    AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
-    DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
+    AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
+    DfsControlPlaneAsyncStore, DfsControlPlaneKvClient, DfsControlPlaneKvFuture,
+    DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
     DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
-    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
-    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
-    metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
-    placement_reconciliation_key, placement_reconciliations_prefix,
+    DfsPlacementAuthorityPermitHolderKind, DfsPlacementAuthorityPermitStatus,
+    DfsPlacementAuthorityProcessIdentity, DfsPlacementAuthorityRecoveryOutcome,
+    DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
+    metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
+    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
+    metadata_shards_prefix, placement_reconciliation_key, placement_reconciliations_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -396,9 +399,15 @@ pub use operator::{
     DfsPinStoreError, LocalDfsPinStore, resolve_dfs_conflicts, use_dfs_conflict_version,
 };
 pub use placement::{
-    DfsPlacementPolicy, DfsPlacementPreview, DfsPlacementReconciliationJob,
-    DfsPlacementReconciliationState, DfsResolvedPlacementPolicy, normalize_placement_rule,
-    placement_rule_matches, preview_placement, remove_placement_rule, resolve_placement_policy,
+    DFS_PLACEMENT_PREVIEW_SCHEMA_VERSION, DFS_PLACEMENT_PREVIEW_TOKEN_SCHEMA_VERSION,
+    DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION, DfsExactPlacementPolicy,
+    DfsPlacementBlockingDiagnostic, DfsPlacementImpact, DfsPlacementImpactPage,
+    DfsPlacementNodePreview, DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
+    DfsPlacementPreviewObjectFence, DfsPlacementPreviewToken, DfsPlacementReconciliationJob,
+    DfsPlacementReconciliationState, DfsPlacementScopeResolution, DfsResolvedPlacementPolicy,
+    bind_placement_preview_token, merge_placement_impact, normalize_placement_rule,
+    placement_reconciliation_compatibility_diagnostic, placement_rule_matches, preview_placement,
+    preview_placement_with_unavailable_nodes, remove_placement_rule, resolve_placement_policy,
     upsert_placement_rule,
 };
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};

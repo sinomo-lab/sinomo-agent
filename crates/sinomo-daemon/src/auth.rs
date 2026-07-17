@@ -331,6 +331,9 @@ pub fn authorize_authenticated_daemon_command(
         route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
+        route if route == crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE => {
+            authenticated.signer.can_run_admin_command()
+        }
         route if crate::DAEMON_DFS_BROWSER_ROUTES.contains(&route) => {
             authenticated.signer.can_run_local_command()
         }
@@ -978,7 +981,13 @@ fn authorize_cluster_join_request_signer(
         .members
         .iter()
         .find(|member| member.node_public_key == public_key)
-        .ok_or(DaemonError::AuthDenied)?;
+        .ok_or_else(|| {
+            crate::cluster_join_trace(format_args!(
+                "join auth denied: signer key does not match any of {} requested members",
+                request.members.len()
+            ));
+            DaemonError::AuthDenied
+        })?;
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -987,18 +996,36 @@ fn authorize_cluster_join_request_signer(
     let state = sinomo_core::cluster::read_cluster_state(&cluster_paths)?;
 
     let persisted_invite =
-        read_active_cluster_invite(&cluster_paths, &state, &request.invite.invite_id)?;
+        read_active_cluster_invite(&cluster_paths, &state, &request.invite.invite_id).inspect_err(
+            |error| {
+                crate::cluster_join_trace(format_args!(
+                    "join auth denied: active invite lookup failed: {error}"
+                ));
+            },
+        )?;
     if !persisted_invite
         .allowed_member_roles
         .contains(&requested_member.role)
     {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: requested role {:?} is not allowed",
+            requested_member.role
+        ));
         return Err(DaemonError::AuthDenied);
     }
-    verify_cluster_join_invite_signature(&persisted_invite)?;
+    verify_cluster_join_invite_signature(&persisted_invite).inspect_err(|error| {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: persisted invite signature is invalid: {error}"
+        ));
+    })?;
     if persisted_invite.expires_at <= OffsetDateTime::now_utc() {
+        crate::cluster_join_trace(format_args!("join auth denied: persisted invite expired"));
         return Err(DaemonError::AuthExpired);
     }
     if persisted_invite.cluster_id != state.cluster_id {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: persisted invite cluster does not match local cluster"
+        ));
         return Err(DaemonError::AuthDenied);
     }
     if !state.members.iter().any(|member| {
@@ -1006,17 +1033,30 @@ fn authorize_cluster_join_request_signer(
             && member.node_public_key == persisted_invite.issuer_public_key
             && member.state.is_authorized()
     }) {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: invite issuer is not an authorized local member"
+        ));
         return Err(DaemonError::AuthDenied);
     }
 
     if request.invite.cluster_public_key != persisted_invite.cluster_public_key {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: invite cluster public key does not match persisted invite"
+        ));
         return Err(DaemonError::AuthDenied);
     }
     if request.invitation_secret.trim().is_empty()
         || request.invitation_secret != persisted_invite.invitation_secret
     {
+        crate::cluster_join_trace(format_args!(
+            "join auth denied: invitation secret is empty or does not match"
+        ));
         return Err(DaemonError::AuthDenied);
     }
+    crate::cluster_join_trace(format_args!(
+        "join auth accepted for requested node {}",
+        requested_member.node_id
+    ));
     Ok(())
 }
 
@@ -2080,6 +2120,28 @@ mod tests {
         ] {
             let authenticated =
                 authenticated_command(sinomo_dfs::DFS_SMOKE_ROUTE.to_string(), signer);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn dfs_placement_authority_admin_authorizes_only_local_or_voter() {
+        for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+            authorize_authenticated_daemon_command(&authenticated_command(
+                crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE.to_string(),
+                signer,
+            ))
+            .expect("local operators and state authorities may inspect placement authority");
+        }
+        for signer in [
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+            DaemonSignerAuthority::StatusProbe,
+        ] {
+            let authenticated = authenticated_command(
+                crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE.to_string(),
+                signer,
+            );
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }

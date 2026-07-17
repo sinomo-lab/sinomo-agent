@@ -478,14 +478,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // one-pass recovery algorithm this path exists to provide.
         let object = match self.metadata.object(&intent_record.object_id).cloned() {
             Some(object)
-                if object.owner_node_id == self.node_id
-                    && object.file_system_id == intent_record.file_system_id
+                if object.file_system_id == intent_record.file_system_id
                     && object.version == intent_record.target_version =>
             {
                 object
             }
             _ => return Ok(()),
         };
+        // Replica promotion is an authoritative metadata command. An object
+        // owner is often the original content source, but placement repair can
+        // install a committed intent coordinated by another node. Replaying
+        // that intent from the owner would be rejected by every target and can
+        // leave a detached retry loop alive indefinitely. Only the durable
+        // intent coordinator, or the current metadata primary after failover,
+        // may reconstruct this work.
+        if intent_record.coordinator_node_id != self.node_id
+            && !self.is_local_metadata_primary_for_object(&object)?
+        {
+            return Ok(());
+        }
         let Some(content_hash) = object
             .content_hash
             .as_deref()

@@ -357,6 +357,87 @@ pub(crate) fn send_daemon_rpc_to_endpoint_with_options_on_runtime(
     )
 }
 
+/// Send the two invitation handshake calls over the deliberately narrow raw
+/// bootstrap frame accepted before the introducer can authorize the candidate
+/// as a member. Challenge proof authenticates the issuer; registration is
+/// signed by the candidate's durable node key. This also supports an invite
+/// whose issuer names a bridge introducer that had not joined when the invite
+/// was minted, so no bridge session key could have been embedded yet.
+pub(crate) fn send_daemon_join_bootstrap_to_endpoint_on_runtime(
+    daemon_paths: &DaemonPaths,
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    let runtime_for_future = runtime.clone();
+    block_on_daemon_client_on_owner_runtime(
+        runtime,
+        send_daemon_join_bootstrap_to_endpoint_async(
+            daemon_paths,
+            endpoint,
+            request,
+            timeout,
+            &runtime_for_future,
+        ),
+    )
+}
+
+async fn send_daemon_join_bootstrap_to_endpoint_async(
+    daemon_paths: &DaemonPaths,
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    if request.category != sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+        || !matches!(
+            request.route.as_str(),
+            sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE
+                | sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE
+        )
+    {
+        return Err(DaemonError::Network {
+            address: endpoint.address.clone(),
+            detail: "raw join bootstrap transport only accepts cluster join handshakes".to_string(),
+        });
+    }
+    let mut request = request.clone();
+    if request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE {
+        let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
+        let signed_request = request.clone();
+        request.auth = Some(
+            runtime
+                .spawn_blocking(move || {
+                    sinomo_core::network::sign_daemon_rpc_request_from_data_dir(
+                        &data_dir,
+                        &signed_request,
+                    )
+                })
+                .await
+                .map_err(|source| DaemonError::Network {
+                    address: endpoint.address.clone(),
+                    detail: format!("join registration signing task failed: {source}"),
+                })??,
+        );
+    } else {
+        request.auth = None;
+    }
+    let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_paths(daemon_paths);
+    let mut stream = sinomo_core::network::ClusterSignedObjectRpcAsyncHost::open_object_rpc_session_stream_async(
+        &mut host,
+        endpoint,
+        sinomo_core::network::NetworkHealthPolicy::new(timeout, timeout),
+    )
+    .await?;
+    let io = sinomo_core::network::ObjectFrameIoOptions::idle_timeout(timeout);
+    sinomo_core::network::write_object_frame_async(&mut stream, &request, io).await?;
+    let response: sinomo_core::network::ObjectRpcResponse =
+        sinomo_core::network::read_object_frame_async(&mut stream, io).await?;
+    response.error_detail()?;
+    Ok(response)
+}
+
 async fn send_daemon_rpc_to_endpoint_with_options_async(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,

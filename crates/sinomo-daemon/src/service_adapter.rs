@@ -41,11 +41,13 @@ use sinomo_core::network::{
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
     CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-    CLUSTER_NETWORK_PING_ROUTE, ClusterPaths, DaemonControlRequest, NETWORK_OBJECT_RPC_ROUTES,
-    NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcBodySource,
-    ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    ObjectRpcSessionCall, ObjectRpcSessionRequest, ObjectRpcSessionResponse, ServiceCatalog,
+    CLUSTER_NETWORK_PING_ROUTE, ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths,
+    DaemonControlRequest, NETWORK_OBJECT_RPC_ROUTES, NetworkError, ObjectRouteDescriptor,
+    ObjectRpcAuthorizationLayer, ObjectRpcBodySource, ObjectRpcCancelRequest,
+    ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
+    ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter, ObjectRpcSessionCall,
+    ObjectRpcSessionRequest, ObjectRpcSessionResponse, ServiceCatalog, cluster_directory_for,
+    cluster_route_next_hop,
 };
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceBodyMode, ServiceContext, ServiceDisposition,
@@ -110,8 +112,9 @@ use crate::control::{
     handle_daemon_sandbox_update_on_runtime, handle_daemon_sandbox_write_on_runtime,
 };
 use crate::dfs::{
-    DaemonDfsDataPlaneHost, daemon_dfs_async_peer_transport,
-    daemon_dfs_blocking_peer_transport_on_runtime,
+    DaemonDfsDataPlaneHost, break_glass_recover_dfs_placement_authority_permit,
+    daemon_dfs_async_peer_transport, daemon_dfs_blocking_peer_transport_on_runtime,
+    inspect_dfs_placement_authority_permit, recover_removed_node_dfs_placement_authority_permit,
 };
 use crate::error::DaemonError;
 use crate::event_stream::{DaemonEventHub, DaemonEventService};
@@ -126,16 +129,16 @@ use crate::{
     DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
-    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-    DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
-    DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
-    DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -1819,6 +1822,7 @@ static DAEMON_DFS_BROWSER_BACKENDS: OnceLock<
 // callers retry without building an in-process queue. This is an admission
 // bound only; it does not impose an end-to-end timeout on an admitted DFS read.
 const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+const DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 
 impl DaemonDfsBrowserBackend {
     fn open(
@@ -2472,71 +2476,61 @@ impl DaemonDfsBrowserBackend {
             ));
         }
         let mut kv = DaemonDfsBrowserControlPlaneKvClient::read_only(&cluster_paths);
-        let mut config = sinomo_dfs::DfsControlPlaneStore::new(&mut kv)
+        let base_config = sinomo_dfs::DfsControlPlaneStore::new(&mut kv)
             .get_file_system_config(&sinomo_dfs::sifs_file_system_id())
             .map_err(dfs_browser_service_error)?
             .ok_or_else(|| {
                 ServiceError::Service("SIFS cluster policy is unavailable".to_string())
             })?;
-        match request.policy.clone() {
-            Some(policy) => {
-                let rule = sinomo_dfs::normalize_placement_rule(&path, request.scope, policy)
-                    .map_err(dfs_browser_service_error)?;
-                sinomo_dfs::upsert_placement_rule(&mut config.subtree_policies, rule);
-            }
-            None => {
-                sinomo_dfs::remove_placement_rule(
-                    &mut config.subtree_policies,
-                    &path,
-                    request.scope,
-                )
-                .map_err(dfs_browser_service_error)?;
-            }
-        }
-        let mut service = self.lock_service_for_read()?;
-        self.refresh_peer_targets(&mut service);
-        let stat = service
-            .posix_stat_distributed(&path)
-            .map_err(dfs_browser_service_error)?;
-        let candidates = service
-            .placement_content_candidates()
-            .map_err(dfs_browser_service_error)?;
-        let preview = sinomo_dfs::preview_placement(
-            &config,
-            &stat.path,
-            stat.object_id,
-            stat.version,
-            stat.policy,
-            service.node_id().clone(),
-            stat.current_locations,
-            candidates,
-            None,
+        let mut config = base_config.clone();
+        mutate_daemon_dfs_browser_placement_config(
+            &mut config,
+            &path,
             request.scope,
-        )
-        .map_err(dfs_browser_service_error)?;
+            request.policy.clone(),
+        )?;
+        // `config` already contains the proposed mutation, including a
+        // `policy=None` removal. Passing a materialized config through the
+        // shared helper prevents a second override from restoring that rule.
+        let (preview, _, _) = self.preview_placement_for_config(
+            &cluster_paths,
+            &base_config,
+            &config,
+            &path,
+            request.scope,
+        )?;
         Ok(crate::DaemonDfsBrowserPlacementPreviewResponse { preview })
     }
 
-    fn placement_update(
+    fn placement_update_v2(
         &self,
-        request: crate::DaemonDfsBrowserPlacementUpdateRequest,
+        request: crate::DaemonDfsBrowserPlacementUpdateV2Request,
         runtime: &tokio::runtime::Handle,
     ) -> Result<crate::DaemonDfsBrowserPlacementUpdateResponse, ServiceError> {
-        let path = normalize_sifs_browser_path(&request.path)?;
+        self.placement_update_inner(
+            request.path,
+            request.policy,
+            request.scope,
+            request.expected_preview_token,
+            runtime,
+        )
+    }
+
+    fn placement_update_inner(
+        &self,
+        path: String,
+        policy: Option<sinomo_dfs::DfsPlacementPolicy>,
+        scope: sinomo_dfs::DfsPlacementScope,
+        expected_preview_token: sinomo_dfs::DfsPlacementPreviewToken,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<crate::DaemonDfsBrowserPlacementUpdateResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&path)?;
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         if !cluster_paths.state.exists() {
             return Err(ServiceError::Service(
                 "managed DFS placement requires a cluster".to_string(),
             ));
         }
-        let mut service = self.lock_service()?;
-        self.refresh_peer_targets(&mut service);
-        let stat = service
-            .posix_stat_distributed(&path)
-            .map_err(dfs_browser_service_error)?;
-        let candidates = service
-            .placement_content_candidates()
-            .map_err(dfs_browser_service_error)?;
         let mut kv = DaemonDfsBrowserControlPlaneKvClient::new(&cluster_paths, runtime.clone());
         let mut store = sinomo_dfs::DfsControlPlaneStore::new(&mut kv);
         let expected = store
@@ -2546,43 +2540,27 @@ impl DaemonDfsBrowserBackend {
                 ServiceError::Service("SIFS cluster policy is unavailable".to_string())
             })?;
         let mut desired = expected.clone();
-        match request.policy.clone() {
-            Some(policy) => {
-                let rule = sinomo_dfs::normalize_placement_rule(&path, request.scope, policy)
-                    .map_err(dfs_browser_service_error)?;
-                sinomo_dfs::upsert_placement_rule(&mut desired.subtree_policies, rule);
-            }
-            None => {
-                sinomo_dfs::remove_placement_rule(
-                    &mut desired.subtree_policies,
-                    &path,
-                    request.scope,
-                )
-                .map_err(dfs_browser_service_error)?;
-            }
-        }
-        let preview = sinomo_dfs::preview_placement(
-            &desired,
-            &stat.path,
-            stat.object_id,
-            stat.version,
-            stat.policy,
-            service.node_id().clone(),
-            stat.current_locations,
-            candidates,
-            None,
-            request.scope,
-        )
-        .map_err(dfs_browser_service_error)?;
+        mutate_daemon_dfs_browser_placement_config(&mut desired, &path, scope, policy)?;
+        let (preview, unavailable_node_ids, candidate_snapshot) =
+            self.preview_placement_for_config(&cluster_paths, &expected, &desired, &path, scope)?;
+        require_matching_daemon_dfs_browser_placement_preview_token(
+            &expected_preview_token,
+            &preview.preview_token,
+        )?;
+        require_satisfiable_daemon_dfs_browser_placement(&preview)?;
         let now = time::OffsetDateTime::now_utc()
             .unix_timestamp_nanos()
             .try_into()
             .unwrap_or(1_000_000_000);
         let reconciliation = sinomo_dfs::DfsPlacementReconciliationJob {
+            schema_version: sinomo_dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
             job_id: sinomo_core::Id::generate().to_string(),
             file_system_id: desired.file_system_id.clone(),
             path,
-            scope: request.scope,
+            scope,
+            unavailable_node_ids,
+            candidate_snapshot,
+            accepted_config: Some(desired.clone()),
             state: sinomo_dfs::DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -2606,11 +2584,149 @@ impl DaemonDfsBrowserBackend {
                     .to_string(),
             ));
         }
+        let reconciliation = store
+            .placement_reconciliation(&desired.file_system_id, &reconciliation.job_id)
+            .map_err(dfs_browser_service_error)?
+            .ok_or_else(|| {
+                ServiceError::Service(
+                    "accepted SIFS placement job is missing from the control plane".to_string(),
+                )
+            })?;
         crate::dfs::notify_daemon_dfs_maintenance_work();
         Ok(crate::DaemonDfsBrowserPlacementUpdateResponse {
             preview,
             reconciliation,
         })
+    }
+
+    fn preview_placement_for_config(
+        &self,
+        cluster_paths: &ClusterPaths,
+        base_config: &sinomo_dfs::DfsFileSystemConfig,
+        config: &sinomo_dfs::DfsFileSystemConfig,
+        path: &str,
+        scope: sinomo_dfs::DfsPlacementScope,
+    ) -> Result<
+        (
+            sinomo_dfs::DfsPlacementPreview,
+            BTreeSet<sinomo_core::node::NodeId>,
+            Vec<sinomo_dfs::DfsNodeAdvertisement>,
+        ),
+        ServiceError,
+    > {
+        let (stat, observer_node_id, candidates) = {
+            let mut service = self.lock_service_for_read()?;
+            self.refresh_peer_targets(&mut service);
+            let stat = service
+                .posix_stat_distributed(path)
+                .map_err(dfs_browser_service_error)?;
+            let observer_node_id = service.node_id().clone();
+            let candidates = service
+                .placement_content_candidates()
+                .map_err(dfs_browser_service_error)?;
+            (stat, observer_node_id, candidates)
+        };
+        if candidates.is_empty() {
+            return Err(ServiceError::Service(
+                "cannot apply SIFS placement without content candidates".to_string(),
+            ));
+        }
+        let object_fence = sinomo_dfs::DfsPlacementPreviewObjectFence::from(&stat);
+        let initial_connectivity =
+            daemon_dfs_browser_placement_connectivity_snapshot(cluster_paths);
+        let unavailable_node_ids = initial_connectivity.explicitly_unavailable_node_ids();
+        let mut preview = sinomo_dfs::preview_placement_with_unavailable_nodes(
+            config,
+            &stat.path,
+            stat.object_id.clone(),
+            stat.version.clone(),
+            stat.policy.clone(),
+            observer_node_id,
+            stat.current_locations.clone(),
+            candidates.clone(),
+            None,
+            scope,
+            &unavailable_node_ids,
+        )
+        .map_err(dfs_browser_service_error)?;
+
+        let mut aggregate_impact = sinomo_dfs::DfsPlacementImpact::default();
+        let mut aggregate_diagnostics = Vec::new();
+        let mut cursor = None;
+        loop {
+            // The cached service is shared by all browser calls. Holding its
+            // mutex for one bounded metadata page keeps large subtree previews
+            // from starving unrelated reads and writes.
+            let page = {
+                let service = self.lock_service_for_read()?;
+                service
+                    .placement_impact_page_for_config_with_unavailable_nodes(
+                        config,
+                        &stat.path,
+                        scope,
+                        &candidates,
+                        cursor.as_ref(),
+                        DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE,
+                        &unavailable_node_ids,
+                    )
+                    .map_err(dfs_browser_service_error)?
+            };
+            sinomo_dfs::merge_placement_impact(&mut aggregate_impact, &page.impact);
+            extend_unique_daemon_dfs_browser_placement_diagnostics(
+                &mut aggregate_diagnostics,
+                page.blocking_diagnostics,
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        preview.impact = aggregate_impact;
+        extend_daemon_dfs_browser_preview_diagnostics(&mut preview, aggregate_diagnostics);
+
+        // Connectivity can change while a multi-page impact scan is running.
+        // Re-read it after releasing the final service guard and fail closed if
+        // a node selected by the stable plan has since become explicitly down.
+        let final_connectivity = daemon_dfs_browser_placement_connectivity_snapshot(cluster_paths);
+        enrich_daemon_dfs_browser_placement_connectivity_from_snapshot(
+            &mut preview,
+            &final_connectivity,
+        );
+        let compatibility_state = sinomo_core::cluster::read_cluster_state_without_kv(
+            cluster_paths,
+        )
+        .map_err(|error| {
+            ServiceError::Service(format!(
+                "cannot verify placement daemon compatibility: {error}"
+            ))
+        })?;
+        if let Some(diagnostic) =
+            sinomo_dfs::placement_reconciliation_compatibility_diagnostic(&compatibility_state)
+            && !preview.blocking_diagnostics.contains(&diagnostic)
+        {
+            preview.blocking_diagnostics.push(diagnostic);
+        }
+        if !preview.blocking_diagnostics.is_empty() {
+            preview.impact.complete = false;
+        }
+        // Keep the planning exclusions stable across the scan. A candidate
+        // that recovers before the final observational refresh must not be
+        // silently reintroduced by reconciliation, while newly unavailable
+        // optional candidates should remain excluded as well.
+        let mut reconciliation_unavailable_node_ids = unavailable_node_ids;
+        reconciliation_unavailable_node_ids.extend(preview.unavailable_node_ids());
+        sinomo_dfs::bind_placement_preview_token(
+            &mut preview,
+            base_config,
+            config,
+            path,
+            scope,
+            &object_fence,
+            &candidates,
+            &reconciliation_unavailable_node_ids,
+        )
+        .map_err(dfs_browser_service_error)?;
+        Ok((preview, reconciliation_unavailable_node_ids, candidates))
     }
 
     fn placement_progress(
@@ -3099,16 +3215,20 @@ impl Service for DaemonDfsBrowserService {
                     )?
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE => {
-                    let payload: crate::DaemonDfsBrowserPlacementUpdateRequest =
+                    let _: crate::DaemonDfsBrowserPlacementUpdateRequest = request.decode_body()?;
+                    return Err(legacy_daemon_dfs_browser_placement_update_error());
+                }
+                DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE => {
+                    let payload: crate::DaemonDfsBrowserPlacementUpdateV2Request =
                         request.decode_body()?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
-                        "DFS browser placement update",
+                        "DFS browser placement update v2",
                         move || {
                             let backend =
                                 DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
-                            let result = backend.placement_update(payload, &runtime)?;
+                            let result = backend.placement_update_v2(payload, &runtime)?;
                             Ok((result, backend.event_origin_node_id()?))
                         },
                     )
@@ -3119,7 +3239,7 @@ impl Service for DaemonDfsBrowserService {
                         vec![changed_path],
                     );
                     ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+                        DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
                         &result.0,
                     )?
                 }
@@ -3142,6 +3262,122 @@ impl Service for DaemonDfsBrowserService {
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+struct DaemonDfsPlacementAuthorityAdminService {
+    paths: DaemonPaths,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+fn require_local_dfs_placement_authority_break_glass_signer(
+    signer: &ServiceSigner,
+) -> Result<(), ServiceError> {
+    signer.is_local().then_some(()).ok_or_else(|| {
+        ServiceError::Service(
+            "DFS placement-authority break-glass recovery requires a local signer".to_string(),
+        )
+    })
+}
+
+impl Service for DaemonDfsPlacementAuthorityAdminService {
+    fn name(&self) -> &'static str {
+        "dfs-placement-authority-admin"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE]
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![
+            ServiceRoute::new(
+                DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+                DAEMON_RPC_CATEGORY,
+            )
+            .with_auth_scope("admin")
+            .require_capability("dfs.placement-authority.admin")
+            .with_concurrency_limit(1)
+            .with_timeout(Duration::from_secs(30)),
+        ]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let runtime =
+                require_service_runtime(runtime.as_ref(), "DFS placement authority admin")?.clone();
+            let payload: crate::DaemonDfsPlacementAuthorityAdminRequest = request.decode_body()?;
+            let response = match payload {
+                crate::DaemonDfsPlacementAuthorityAdminRequest::Inspect { file_system_id } => {
+                    let permit = run_blocking_service_task(
+                        DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+                        "DFS placement authority inspection",
+                        move || {
+                            inspect_dfs_placement_authority_permit(
+                                &paths,
+                                &runtime,
+                                &file_system_id,
+                            )
+                            .map_err(|error| ServiceError::Service(error.to_string()))
+                        },
+                    )
+                    .await?;
+                    crate::DaemonDfsPlacementAuthorityAdminResponse::Inspection { permit }
+                }
+                crate::DaemonDfsPlacementAuthorityAdminRequest::RecoverRemovedNode {
+                    file_system_id,
+                    expected_recovery_token,
+                    acknowledge_owner_stopped,
+                } => {
+                    let outcome = run_blocking_service_task(
+                        DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+                        "DFS placement authority removed-node recovery",
+                        move || {
+                            recover_removed_node_dfs_placement_authority_permit(
+                                &paths,
+                                &runtime,
+                                &file_system_id,
+                                &expected_recovery_token,
+                                acknowledge_owner_stopped,
+                            )
+                            .map_err(|error| ServiceError::Service(error.to_string()))
+                        },
+                    )
+                    .await?;
+                    crate::DaemonDfsPlacementAuthorityAdminResponse::Recovery { outcome }
+                }
+                crate::DaemonDfsPlacementAuthorityAdminRequest::BreakGlassRecover {
+                    file_system_id,
+                    expected_recovery_token,
+                    acknowledgement,
+                } => {
+                    require_local_dfs_placement_authority_break_glass_signer(&ctx.signer)?;
+                    let outcome = run_blocking_service_task(
+                        DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+                        "DFS placement authority break-glass recovery",
+                        move || {
+                            break_glass_recover_dfs_placement_authority_permit(
+                                &paths,
+                                &runtime,
+                                &file_system_id,
+                                &expected_recovery_token,
+                                &acknowledgement,
+                            )
+                            .map_err(|error| ServiceError::Service(error.to_string()))
+                        },
+                    )
+                    .await?;
+                    crate::DaemonDfsPlacementAuthorityAdminResponse::Recovery { outcome }
+                }
+            };
+            ctx.respond(ObjectRpcResponse::encode_body(
+                DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+                &response,
+            )?)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -3395,6 +3631,256 @@ fn sifs_browser_write_candidates(
 
 fn dfs_browser_service_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::Service(error.to_string())
+}
+
+fn mutate_daemon_dfs_browser_placement_config(
+    config: &mut sinomo_dfs::DfsFileSystemConfig,
+    path: &str,
+    scope: sinomo_dfs::DfsPlacementScope,
+    policy: Option<sinomo_dfs::DfsPlacementPolicy>,
+) -> Result<(), ServiceError> {
+    match policy {
+        Some(policy) => {
+            let rule = sinomo_dfs::normalize_placement_rule(path, scope, policy)
+                .map_err(dfs_browser_service_error)?;
+            sinomo_dfs::upsert_placement_rule(&mut config.subtree_policies, rule);
+        }
+        None => {
+            sinomo_dfs::remove_placement_rule(&mut config.subtree_policies, path, scope)
+                .map_err(dfs_browser_service_error)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct DaemonDfsBrowserPlacementConnectivitySnapshot {
+    local_node_id: Option<sinomo_core::node::NodeId>,
+    graph: Option<ClusterConnectivityGraph>,
+    advertised_endpoints: Vec<sinomo_core::ClusterEndpointRecord>,
+}
+
+impl DaemonDfsBrowserPlacementConnectivitySnapshot {
+    fn reachability(
+        &self,
+        node_id: &sinomo_core::node::NodeId,
+    ) -> sinomo_dfs::DfsPlacementNodeReachability {
+        let Some(local_node_id) = self.local_node_id.as_ref() else {
+            return sinomo_dfs::DfsPlacementNodeReachability::Unknown;
+        };
+        if node_id == local_node_id {
+            return sinomo_dfs::DfsPlacementNodeReachability::Local;
+        }
+        let Some(graph) = self.graph.as_ref() else {
+            return sinomo_dfs::DfsPlacementNodeReachability::Unknown;
+        };
+        daemon_dfs_browser_placement_node_reachability(
+            local_node_id,
+            node_id,
+            graph,
+            &self.advertised_endpoints,
+        )
+    }
+
+    fn explicitly_unavailable_node_ids(&self) -> BTreeSet<sinomo_core::node::NodeId> {
+        self.advertised_endpoints
+            .iter()
+            .map(|endpoint| endpoint.node_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|node_id| {
+                self.reachability(node_id) == sinomo_dfs::DfsPlacementNodeReachability::Unreachable
+            })
+            .collect()
+    }
+}
+
+fn daemon_dfs_browser_placement_connectivity_snapshot(
+    cluster_paths: &ClusterPaths,
+) -> DaemonDfsBrowserPlacementConnectivitySnapshot {
+    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) else {
+        return DaemonDfsBrowserPlacementConnectivitySnapshot::default();
+    };
+    let mut advertised_endpoints = cluster_directory_for(cluster_paths)
+        .endpoints()
+        .unwrap_or_default();
+    if advertised_endpoints.is_empty() {
+        advertised_endpoints.extend(
+            state
+                .members
+                .iter()
+                .flat_map(|member| member.endpoints.iter().cloned()),
+        );
+    }
+    let graph = ClusterConnectivityGraph::try_read_for_local(cluster_paths, &state).ok();
+    DaemonDfsBrowserPlacementConnectivitySnapshot {
+        local_node_id: Some(state.local_node_id),
+        graph,
+        advertised_endpoints,
+    }
+}
+
+fn enrich_daemon_dfs_browser_placement_connectivity_from_snapshot(
+    preview: &mut sinomo_dfs::DfsPlacementPreview,
+    connectivity: &DaemonDfsBrowserPlacementConnectivitySnapshot,
+) {
+    const DESIRED_BECAME_UNREACHABLE: &str =
+        "blocked: this desired replica became explicitly unreachable before apply";
+
+    let mut new_diagnostics = Vec::new();
+    for node in &mut preview.nodes {
+        node.reachability = connectivity.reachability(&node.node_id);
+        if node.reachability != sinomo_dfs::DfsPlacementNodeReachability::Unreachable {
+            continue;
+        }
+        if node.required {
+            new_diagnostics.push(
+                sinomo_dfs::DfsPlacementBlockingDiagnostic::RequiredNodeUnavailable {
+                    node_id: node.node_id.clone(),
+                },
+            );
+        }
+        if node.desired_replica {
+            new_diagnostics.push(
+                sinomo_dfs::DfsPlacementBlockingDiagnostic::DesiredNodeUnavailable {
+                    node_id: node.node_id.clone(),
+                },
+            );
+            if !node.explanation.contains(DESIRED_BECAME_UNREACHABLE) {
+                if !node.explanation.is_empty() {
+                    node.explanation.push_str("; ");
+                }
+                node.explanation.push_str(DESIRED_BECAME_UNREACHABLE);
+            }
+        }
+    }
+    extend_unique_daemon_dfs_browser_placement_diagnostics(
+        &mut preview.blocking_diagnostics,
+        new_diagnostics,
+    );
+}
+
+#[cfg(test)]
+fn merge_daemon_dfs_browser_placement_impact(
+    aggregate: &mut sinomo_dfs::DfsPlacementImpact,
+    page: &sinomo_dfs::DfsPlacementImpact,
+) {
+    sinomo_dfs::merge_placement_impact(aggregate, page);
+}
+
+fn extend_unique_daemon_dfs_browser_placement_diagnostics(
+    diagnostics: &mut Vec<sinomo_dfs::DfsPlacementBlockingDiagnostic>,
+    additional: impl IntoIterator<Item = sinomo_dfs::DfsPlacementBlockingDiagnostic>,
+) {
+    for diagnostic in additional {
+        if !diagnostics.contains(&diagnostic) {
+            diagnostics.push(diagnostic);
+        }
+    }
+}
+
+fn extend_daemon_dfs_browser_preview_diagnostics(
+    preview: &mut sinomo_dfs::DfsPlacementPreview,
+    additional: impl IntoIterator<Item = sinomo_dfs::DfsPlacementBlockingDiagnostic>,
+) {
+    let anchor_source = preview
+        .resolved
+        .source_path
+        .clone()
+        .zip(preview.resolved.source_scope)
+        .unwrap_or_else(|| {
+            (
+                preview.resolved.path.clone(),
+                sinomo_dfs::DfsPlacementScope::SelfOnly,
+            )
+        });
+    for diagnostic in additional {
+        let duplicates_anchor = matches!(
+            &diagnostic,
+            sinomo_dfs::DfsPlacementBlockingDiagnostic::ScopedPolicy {
+                path,
+                scope,
+                diagnostic,
+            } if path == &anchor_source.0
+                && scope == &anchor_source.1
+                && preview
+                    .blocking_diagnostics
+                    .iter()
+                    .any(|existing| existing == diagnostic.as_ref())
+        );
+        if !duplicates_anchor && !preview.blocking_diagnostics.contains(&diagnostic) {
+            preview.blocking_diagnostics.push(diagnostic);
+        }
+    }
+}
+
+fn daemon_dfs_browser_placement_node_reachability(
+    local_node_id: &sinomo_core::node::NodeId,
+    node_id: &sinomo_core::node::NodeId,
+    graph: &ClusterConnectivityGraph,
+    advertised_endpoints: &[sinomo_core::ClusterEndpointRecord],
+) -> sinomo_dfs::DfsPlacementNodeReachability {
+    use sinomo_dfs::DfsPlacementNodeReachability as Reachability;
+
+    if node_id == local_node_id {
+        return Reachability::Local;
+    }
+    if cluster_route_next_hop(graph, local_node_id, node_id).is_some() {
+        return Reachability::Reachable;
+    }
+    let mut node_endpoints = advertised_endpoints
+        .iter()
+        .filter(|endpoint| &endpoint.node_id == node_id)
+        .peekable();
+    if node_endpoints.peek().is_some()
+        && node_endpoints.all(|endpoint| {
+            matches!(
+                graph.state_for_endpoint(endpoint),
+                Some(ClusterConnectivityState::Unreachable)
+            )
+        })
+    {
+        Reachability::Unreachable
+    } else {
+        Reachability::Unknown
+    }
+}
+
+fn require_satisfiable_daemon_dfs_browser_placement(
+    preview: &sinomo_dfs::DfsPlacementPreview,
+) -> Result<(), ServiceError> {
+    if preview.is_satisfiable() {
+        return Ok(());
+    }
+    let diagnostics = preview
+        .blocking_diagnostics
+        .iter()
+        .map(sinomo_dfs::DfsPlacementBlockingDiagnostic::message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ServiceError::Service(format!(
+        "cannot apply unsatisfiable SIFS placement policy: {diagnostics}"
+    )))
+}
+
+fn legacy_daemon_dfs_browser_placement_update_error() -> ServiceError {
+    ServiceError::Service(
+        "legacy SIFS placement Apply is disabled because it cannot verify the reviewed preview; refresh the preview and retry with a client that uses /daemon/dfs/browser/placement-update-v2"
+            .to_string(),
+    )
+}
+
+fn require_matching_daemon_dfs_browser_placement_preview_token(
+    expected: &sinomo_dfs::DfsPlacementPreviewToken,
+    current: &sinomo_dfs::DfsPlacementPreviewToken,
+) -> Result<(), ServiceError> {
+    if expected.is_well_formed() && current.is_well_formed() && expected == current {
+        return Ok(());
+    }
+    Err(ServiceError::Service(
+        "SIFS placement preview is stale; refresh the preview and review the updated plan before applying"
+            .to_string(),
+    ))
 }
 
 fn daemon_dfs_browser_write_receipt(
@@ -3770,12 +4256,18 @@ fn daemon_service_registry(
             event_hub,
         });
     // Main and shadow share the data-dir build root. Only the main daemon may
-    // own its durable queue, worker, and cache; the shadow keeps rollout
-    // recovery services but must neither serve nor advertise build routes.
+    // own its durable build state or administer DFS placement authority; the
+    // shadow keeps rollout recovery services but must neither serve nor
+    // advertise those main-owner routes.
     let builder = if crate::daemon_paths_are_shadow(paths) {
         builder
     } else {
-        builder.register(crate::build_service::DaemonBuildService::new(paths))
+        builder
+            .register(crate::build_service::DaemonBuildService::new(paths))
+            .register(DaemonDfsPlacementAuthorityAdminService {
+                paths: paths.clone(),
+                runtime: service_runtime.cloned(),
+            })
     };
     let builder = if let Some(runtime) = service_runtime {
         sinomo_dfs::register_data_plane_services(
@@ -6274,6 +6766,463 @@ mod tests {
         assert_eq!(candidates, vec![first, second]);
     }
 
+    fn placement_test_node(name: &str) -> sinomo_core::node::NodeId {
+        sinomo_core::node::NodeId::from_legacy_named(name).expect("placement test node")
+    }
+
+    fn placement_test_endpoint(
+        node_id: sinomo_core::node::NodeId,
+        name: &str,
+        address: &str,
+    ) -> sinomo_core::ClusterEndpointRecord {
+        sinomo_core::ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(name)
+                .expect("placement test endpoint"),
+            node_id,
+            transport: sinomo_core::ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: sinomo_core::ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn dfs_browser_policy_none_removes_only_the_selected_scope() {
+        let local_node_id = placement_test_node("node_dfs_browser_placement_remove_local");
+        let policy = sinomo_dfs::DfsPlacementPolicy::new(
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        )
+        .expect("placement policy");
+        let mut config = sinomo_dfs::DfsFileSystemConfig {
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            display_name: "SIFS".to_string(),
+            owner_node_id: local_node_id,
+            subtree_policies: vec![
+                sinomo_dfs::normalize_placement_rule(
+                    "/projects",
+                    sinomo_dfs::DfsPlacementScope::SelfOnly,
+                    policy.clone(),
+                )
+                .expect("self rule"),
+                sinomo_dfs::normalize_placement_rule(
+                    "/projects",
+                    sinomo_dfs::DfsPlacementScope::Subtree,
+                    policy,
+                )
+                .expect("subtree rule"),
+            ],
+        };
+
+        mutate_daemon_dfs_browser_placement_config(
+            &mut config,
+            "/projects",
+            sinomo_dfs::DfsPlacementScope::SelfOnly,
+            None,
+        )
+        .expect("remove self rule");
+
+        assert_eq!(config.subtree_policies.len(), 1);
+        assert_eq!(
+            config.subtree_policies[0].scope,
+            sinomo_dfs::DfsPlacementScope::Subtree
+        );
+    }
+
+    #[test]
+    fn dfs_browser_legacy_placement_update_route_fails_closed_before_opening_dfs() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-legacy-placement");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let service = DaemonDfsBrowserService {
+            runtime: Some(runtime.handle().clone()),
+            event_hub: Arc::new(DaemonEventHub::new()),
+        };
+        let response = Arc::new(Mutex::new(None));
+        let context = ServiceContext::new(
+            Arc::new(SinomoDataDir::new(&root)),
+            None,
+            ServiceSigner::Local,
+            sinomo_core::network::ObjectRpcIncomingBody::default(),
+            Box::new(BufferSink {
+                response: Arc::clone(&response),
+            }),
+        );
+        let request = ObjectRpcRequest::encode_body(
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &crate::DaemonDfsBrowserPlacementUpdateRequest {
+                path: "/projects".to_string(),
+                policy: None,
+                scope: sinomo_dfs::DfsPlacementScope::SelfOnly,
+            },
+        )
+        .expect("legacy placement request");
+
+        let error = runtime
+            .block_on(service.handle(context, request))
+            .expect_err("legacy placement Apply must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("legacy SIFS placement Apply is disabled")
+        );
+        assert!(error.to_string().contains("placement-update-v2"));
+        assert!(response.lock().expect("response slot").is_none());
+        assert!(
+            !root.join("dfs").exists(),
+            "the fail-closed compatibility route must not even open the DFS backend"
+        );
+    }
+
+    #[test]
+    fn dfs_browser_placement_apply_rejects_a_stale_well_formed_preview_token() {
+        let current = sinomo_dfs::DfsPlacementPreviewToken {
+            schema_version: sinomo_dfs::DFS_PLACEMENT_PREVIEW_TOKEN_SCHEMA_VERSION,
+            digest: format!("dfs-placement-preview-v1:blake3:{}", "a".repeat(64)),
+        };
+        let stale = sinomo_dfs::DfsPlacementPreviewToken {
+            schema_version: sinomo_dfs::DFS_PLACEMENT_PREVIEW_TOKEN_SCHEMA_VERSION,
+            digest: format!("dfs-placement-preview-v1:blake3:{}", "b".repeat(64)),
+        };
+        assert!(current.is_well_formed());
+        assert!(stale.is_well_formed());
+        require_matching_daemon_dfs_browser_placement_preview_token(&current, &current)
+            .expect("the exact reviewed preview token");
+
+        let stale_error =
+            require_matching_daemon_dfs_browser_placement_preview_token(&stale, &current)
+                .expect_err("a stale, otherwise valid token must be rejected");
+        assert!(stale_error.to_string().contains("preview is stale"));
+        assert!(
+            require_matching_daemon_dfs_browser_placement_preview_token(
+                &sinomo_dfs::DfsPlacementPreviewToken::default(),
+                &current,
+            )
+            .is_err(),
+            "an absent or malformed precondition must also fail closed"
+        );
+    }
+
+    #[test]
+    fn dfs_browser_placement_preview_enriches_connectivity_and_blocks_required_unreachable_node() {
+        let local_node_id = placement_test_node("node_dfs_browser_placement_local");
+        let reachable_node_id = placement_test_node("node_dfs_browser_placement_reachable");
+        let unreachable_node_id = placement_test_node("node_dfs_browser_placement_unreachable");
+        let unknown_node_id = placement_test_node("node_dfs_browser_placement_unknown");
+        let reachable_endpoint = placement_test_endpoint(
+            reachable_node_id.clone(),
+            "endpoint_dfs_browser_placement_reachable",
+            "192.0.2.31:21353",
+        );
+        let unreachable_endpoint = placement_test_endpoint(
+            unreachable_node_id.clone(),
+            "endpoint_dfs_browser_placement_unreachable",
+            "192.0.2.32:21353",
+        );
+        let unknown_endpoint = placement_test_endpoint(
+            unknown_node_id.clone(),
+            "endpoint_dfs_browser_placement_unknown",
+            "192.0.2.33:21353",
+        );
+        let now = time::OffsetDateTime::now_utc();
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(
+                "cluster_dfs_browser_placement_connectivity",
+            )
+            .expect("cluster id"),
+            "placement connectivity",
+            local_node_id.clone(),
+            "local",
+            "test-public-key",
+            now,
+        );
+        let graph = ClusterConnectivityGraph::from_records(
+            local_node_id.clone(),
+            [
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    &reachable_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(2),
+                    0,
+                    Some(now.to_string()),
+                    None,
+                    now,
+                    sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+                ),
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    &unreachable_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                    None,
+                    3,
+                    None,
+                    Some(now.to_string()),
+                    now,
+                    sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+                ),
+            ],
+        );
+        let mut policy = sinomo_dfs::DfsPlacementPolicy::new(
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        )
+        .expect("placement policy");
+        policy.required_node_ids = vec![unreachable_node_id.clone()];
+        let config = sinomo_dfs::DfsFileSystemConfig {
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            display_name: "SIFS".to_string(),
+            owner_node_id: local_node_id.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let candidates = [
+            local_node_id.clone(),
+            reachable_node_id.clone(),
+            unreachable_node_id.clone(),
+            unknown_node_id.clone(),
+        ]
+        .into_iter()
+        .map(sinomo_dfs::DfsNodeAdvertisement::content)
+        .collect();
+        let endpoints = vec![reachable_endpoint, unreachable_endpoint, unknown_endpoint];
+        let connectivity = DaemonDfsBrowserPlacementConnectivitySnapshot {
+            local_node_id: Some(local_node_id.clone()),
+            graph: Some(graph),
+            advertised_endpoints: endpoints,
+        };
+        let unavailable_node_ids = connectivity.explicitly_unavailable_node_ids();
+        assert_eq!(
+            unavailable_node_ids,
+            BTreeSet::from([unreachable_node_id.clone()]),
+            "only a node with advertised endpoints that are all explicitly down is unavailable"
+        );
+        let mut preview = sinomo_dfs::preview_placement_with_unavailable_nodes(
+            &config,
+            "/projects/data.bin",
+            sinomo_dfs::DfsObjectId::from_legacy_named("object_dfs_browser_placement_preview")
+                .expect("object id"),
+            sinomo_dfs::DfsVersion::from_legacy_named("version_dfs_browser_placement_preview")
+                .expect("version"),
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            local_node_id.clone(),
+            vec![local_node_id.clone()],
+            candidates,
+            Some(policy),
+            sinomo_dfs::DfsPlacementScope::SelfOnly,
+            &unavailable_node_ids,
+        )
+        .expect("base preview");
+        assert!(!preview.is_satisfiable());
+        assert!(
+            !preview
+                .placement
+                .plan
+                .desired_replica_nodes
+                .contains(&unreachable_node_id),
+            "an explicitly unavailable optional or required node must not satisfy N"
+        );
+        let required_unavailable =
+            sinomo_dfs::DfsPlacementBlockingDiagnostic::RequiredNodeUnavailable {
+                node_id: unreachable_node_id.clone(),
+            };
+        assert!(preview.blocking_diagnostics.contains(&required_unavailable));
+        let anchor_diagnostic_count = preview.blocking_diagnostics.len();
+        extend_daemon_dfs_browser_preview_diagnostics(
+            &mut preview,
+            [sinomo_dfs::DfsPlacementBlockingDiagnostic::ScopedPolicy {
+                path: "/projects/data.bin".to_string(),
+                scope: sinomo_dfs::DfsPlacementScope::SelfOnly,
+                diagnostic: Box::new(required_unavailable),
+            }],
+        );
+        assert_eq!(
+            preview.blocking_diagnostics.len(),
+            anchor_diagnostic_count,
+            "the matching page-level wrapper must not duplicate an anchor diagnostic"
+        );
+
+        enrich_daemon_dfs_browser_placement_connectivity_from_snapshot(&mut preview, &connectivity);
+        // Enrichment may run again after a cached preview refresh; diagnostics
+        // must remain stable rather than accumulating duplicates.
+        enrich_daemon_dfs_browser_placement_connectivity_from_snapshot(&mut preview, &connectivity);
+
+        let reachability = |node_id: &sinomo_core::node::NodeId| {
+            preview
+                .nodes
+                .iter()
+                .find(|node| &node.node_id == node_id)
+                .map(|node| node.reachability)
+                .expect("preview node")
+        };
+        assert_eq!(
+            reachability(&local_node_id),
+            sinomo_dfs::DfsPlacementNodeReachability::Local
+        );
+        assert_eq!(
+            reachability(&reachable_node_id),
+            sinomo_dfs::DfsPlacementNodeReachability::Reachable
+        );
+        assert_eq!(
+            reachability(&unreachable_node_id),
+            sinomo_dfs::DfsPlacementNodeReachability::Unreachable
+        );
+        assert_eq!(
+            reachability(&unknown_node_id),
+            sinomo_dfs::DfsPlacementNodeReachability::Unknown
+        );
+        assert_eq!(
+            preview
+                .blocking_diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    **diagnostic
+                        == sinomo_dfs::DfsPlacementBlockingDiagnostic::RequiredNodeUnavailable {
+                            node_id: unreachable_node_id.clone(),
+                        }
+                })
+                .count(),
+            1
+        );
+        let error = require_satisfiable_daemon_dfs_browser_placement(&preview)
+            .expect_err("unreachable required node must block update");
+        assert!(error.to_string().contains("unsatisfiable"));
+        assert!(error.to_string().contains(unreachable_node_id.as_str()));
+    }
+
+    #[test]
+    fn dfs_browser_placement_enrichment_blocks_a_desired_node_that_became_unreachable() {
+        let local_node_id = placement_test_node("node_dfs_browser_placement_race_local");
+        let remote_node_id = placement_test_node("node_dfs_browser_placement_race_remote");
+        let remote_endpoint = placement_test_endpoint(
+            remote_node_id.clone(),
+            "endpoint_dfs_browser_placement_race_remote",
+            "192.0.2.41:21353",
+        );
+        let now = time::OffsetDateTime::now_utc();
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_browser_placement_race")
+                .expect("cluster id"),
+            "placement race",
+            local_node_id.clone(),
+            "local",
+            "test-public-key",
+            now,
+        );
+        let graph = ClusterConnectivityGraph::from_records(
+            local_node_id.clone(),
+            [sinomo_core::network::cluster_connectivity_record(
+                &state,
+                &remote_endpoint,
+                ClusterConnectivityState::Unreachable,
+                None,
+                1,
+                None,
+                Some(now.to_string()),
+                now,
+                sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+            )],
+        );
+        let config = sinomo_dfs::DfsFileSystemConfig {
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            display_name: "SIFS".to_string(),
+            owner_node_id: local_node_id.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let policy = sinomo_dfs::DfsPlacementPolicy::new(
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            1,
+            2,
+        )
+        .expect("placement policy");
+        let mut preview = sinomo_dfs::preview_placement(
+            &config,
+            "/projects/race.bin",
+            sinomo_dfs::DfsObjectId::from_legacy_named("object_dfs_browser_placement_race")
+                .expect("object id"),
+            sinomo_dfs::DfsVersion::from_legacy_named("version_dfs_browser_placement_race")
+                .expect("version"),
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            local_node_id.clone(),
+            vec![local_node_id.clone()],
+            vec![
+                sinomo_dfs::DfsNodeAdvertisement::content(local_node_id.clone()),
+                sinomo_dfs::DfsNodeAdvertisement::content(remote_node_id.clone()),
+            ],
+            Some(policy),
+            sinomo_dfs::DfsPlacementScope::SelfOnly,
+        )
+        .expect("initial reachable plan");
+        assert!(
+            preview
+                .placement
+                .plan
+                .desired_replica_nodes
+                .contains(&remote_node_id)
+        );
+
+        enrich_daemon_dfs_browser_placement_connectivity_from_snapshot(
+            &mut preview,
+            &DaemonDfsBrowserPlacementConnectivitySnapshot {
+                local_node_id: Some(local_node_id),
+                graph: Some(graph),
+                advertised_endpoints: vec![remote_endpoint],
+            },
+        );
+
+        assert!(preview.blocking_diagnostics.contains(
+            &sinomo_dfs::DfsPlacementBlockingDiagnostic::DesiredNodeUnavailable {
+                node_id: remote_node_id.clone(),
+            }
+        ));
+        let remote = preview
+            .nodes
+            .iter()
+            .find(|node| node.node_id == remote_node_id)
+            .expect("remote node row");
+        assert!(remote.explanation.contains("explicitly unreachable"));
+        assert!(require_satisfiable_daemon_dfs_browser_placement(&preview).is_err());
+    }
+
+    #[test]
+    fn dfs_browser_placement_impact_merge_saturates_and_preserves_incompleteness() {
+        let mut aggregate = sinomo_dfs::DfsPlacementImpact {
+            affected_object_count: u64::MAX - 1,
+            affected_bytes: 5,
+            unknown_size_object_count: 1,
+            copies_added: 2,
+            copies_removed: 3,
+            metadata_snapshot_digest: String::new(),
+            complete: true,
+        };
+        merge_daemon_dfs_browser_placement_impact(
+            &mut aggregate,
+            &sinomo_dfs::DfsPlacementImpact {
+                affected_object_count: 2,
+                affected_bytes: 7,
+                unknown_size_object_count: 4,
+                copies_added: 6,
+                copies_removed: 8,
+                metadata_snapshot_digest: String::new(),
+                complete: false,
+            },
+        );
+
+        assert_eq!(aggregate.affected_object_count, u64::MAX);
+        assert_eq!(aggregate.affected_bytes, 12);
+        assert_eq!(aggregate.unknown_size_object_count, 5);
+        assert_eq!(aggregate.copies_added, 8);
+        assert_eq!(aggregate.copies_removed, 11);
+        assert!(!aggregate.complete);
+    }
+
     #[test]
     fn dfs_browser_list_can_return_compact_metadata_without_per_entry_stats() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-list-metadata");
@@ -8594,7 +9543,27 @@ mod tests {
     }
 
     #[test]
-    fn only_main_registry_hosts_build_routes_while_shadow_keeps_rollout_routes() {
+    fn placement_authority_break_glass_requires_a_local_service_signer() {
+        for signer in [
+            ServiceSigner::Local,
+            ServiceSigner::LocalNode {
+                node_id: "local-node".to_string(),
+                public_key: "local-key".to_string(),
+            },
+        ] {
+            require_local_dfs_placement_authority_break_glass_signer(&signer)
+                .expect("local signer");
+        }
+        let remote = ServiceSigner::Remote {
+            node_id: "remote-voter".to_string(),
+            public_key: "remote-key".to_string(),
+        };
+        assert!(require_local_dfs_placement_authority_break_glass_signer(&remote).is_err());
+    }
+
+    #[test]
+    fn only_main_registry_hosts_build_and_placement_authority_routes_while_shadow_keeps_rollout_routes()
+     {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-main-shadow-build-routes");
         let data_dir = SinomoDataDir::new(&root);
         let main_paths = DaemonPaths::new(&data_dir);
@@ -8617,6 +9586,14 @@ mod tests {
                 "shadow registry must not own {route}"
             );
         }
+        assert!(
+            main_registry.owns(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE),
+            "main registry should own DFS placement-authority administration"
+        );
+        assert!(
+            !shadow_registry.owns(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE),
+            "shadow registry must not own DFS placement-authority administration"
+        );
         for route in [
             sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
             sinomo_rollout::ROLLOUT_BINARY_ROUTE,
@@ -8647,5 +9624,15 @@ mod tests {
                 "shadow host must not advertise {route}"
             );
         }
+        let placement_authority = main_host
+            .object_rpc_route_descriptor(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE)
+            .expect("main placement-authority descriptor");
+        assert_eq!(placement_authority.auth_scope.as_deref(), Some("admin"));
+        assert!(
+            shadow_host
+                .object_rpc_route_descriptor(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE)
+                .is_none(),
+            "shadow host must not advertise DFS placement-authority administration"
+        );
     }
 }

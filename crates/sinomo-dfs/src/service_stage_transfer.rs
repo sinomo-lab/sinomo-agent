@@ -478,48 +478,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         reason: error.to_string(),
                     }));
                 }
-                self.put_metadata_receipt(
-                    &response.file_system_id,
-                    &response.object_id,
-                    &response.version,
-                    &response.replica_node_id,
-                    content_hash,
-                )?;
-                let intent_was_committed = self
-                    .coordinator
-                    .intent(&response.intent_id)
-                    .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed));
-                let updated_intent = self.coordinator.record_durable_receipt(
-                    &response.intent_id,
-                    response.replica_node_id.clone(),
-                )?;
-                let event = NetworkedDfsServiceEvent::BlobStaged {
-                    intent_id: response.intent_id.clone(),
-                    object_id: response.object_id.clone(),
-                    version: response.version.clone(),
-                    replica_node_id: response.replica_node_id.clone(),
-                    content_hash: content_hash.clone(),
-                };
-                if intent_was_committed {
-                    self.finalize_late_committed_stage_receipt(
-                        &updated_intent.intent_id,
-                        &response.replica_node_id,
-                    )?;
-                } else {
-                    self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
-                }
-                self.send_untracked_completed_routed_write_response_if_committed(
-                    &updated_intent.intent_id,
-                    &response.object_id,
-                )?;
-                if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
-                    pending
-                        .stage_inflight_request_ids
-                        .remove(&response.replica_node_id);
-                    pending.stage_retries.remove(&response.replica_node_id);
-                }
-                self.cleanup_committed_pending_write_if_repaired(&response.intent_id);
-                Ok(Some(event))
+                let event =
+                    self.with_placement_intent_authority(&response.intent_id, |service| {
+                        service.put_metadata_receipt(
+                            &response.file_system_id,
+                            &response.object_id,
+                            &response.version,
+                            &response.replica_node_id,
+                            content_hash,
+                        )?;
+                        let intent_was_committed = service
+                            .coordinator
+                            .intent(&response.intent_id)
+                            .is_some_and(|intent| {
+                                matches!(intent.state, DfsWriteIntentState::Committed)
+                            });
+                        let updated_intent = service.coordinator.record_durable_receipt(
+                            &response.intent_id,
+                            response.replica_node_id.clone(),
+                        )?;
+                        let event = NetworkedDfsServiceEvent::BlobStaged {
+                            intent_id: response.intent_id.clone(),
+                            object_id: response.object_id.clone(),
+                            version: response.version.clone(),
+                            replica_node_id: response.replica_node_id.clone(),
+                            content_hash: content_hash.clone(),
+                        };
+                        if intent_was_committed {
+                            service.finalize_late_committed_stage_receipt_under_authority(
+                                &updated_intent.intent_id,
+                                &response.replica_node_id,
+                            )?;
+                        } else {
+                            service
+                                .try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+                        }
+                        service.send_untracked_completed_routed_write_response_if_committed(
+                            &updated_intent.intent_id,
+                            &response.object_id,
+                        )?;
+                        if let Some(pending) = service.pending_writes.get_mut(&response.intent_id) {
+                            pending
+                                .stage_inflight_request_ids
+                                .remove(&response.replica_node_id);
+                            pending.stage_retries.remove(&response.replica_node_id);
+                        }
+                        service.cleanup_committed_pending_write_if_repaired(&response.intent_id);
+                        Ok(event)
+                    })?;
+                Ok(Some(event.unwrap_or_else(|| {
+                    NetworkedDfsServiceEvent::BlobStageRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: "write intent is closed or its placement policy was superseded"
+                            .to_string(),
+                    }
+                })))
             }
             DfsBlobTransferResult::Rejected { ref reason } => {
                 match self.ensure_stage_response_request_matches_pending(&response) {

@@ -445,18 +445,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let local_node_id = self.node_id.clone();
-        self.put_metadata_receipt(
-            &intent.file_system_id,
-            object_id,
-            version,
-            &local_node_id,
-            content_hash,
-        )?;
-        self.coordinator
-            .record_durable_receipt(intent_id, local_node_id)?;
-        self.try_apply_committed_intent_if_ready(intent_id)?;
-        self.send_untracked_completed_routed_write_response_if_committed(intent_id, object_id)?;
-        self.cleanup_committed_pending_write_if_repaired(intent_id);
+        let file_system_id = intent.file_system_id;
+        self.with_placement_intent_authority(intent_id, |service| {
+            service.put_metadata_receipt(
+                &file_system_id,
+                object_id,
+                version,
+                &local_node_id,
+                content_hash,
+            )?;
+            service
+                .coordinator
+                .record_durable_receipt(intent_id, local_node_id)?;
+            service.try_apply_committed_intent_if_ready(intent_id)?;
+            service.send_untracked_completed_routed_write_response_if_committed(
+                intent_id, object_id,
+            )?;
+            service.cleanup_committed_pending_write_if_repaired(intent_id);
+            Ok(())
+        })?;
         Ok(())
     }
 

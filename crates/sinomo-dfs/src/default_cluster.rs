@@ -44,6 +44,11 @@ use crate::{
 pub struct DfsDefaultClusterBootstrapOptions {
     pub publish_cluster_control: bool,
     pub materialize_local_metadata: bool,
+    /// Failure domain advertised for this process's local DFS service.
+    ///
+    /// Remote advertisements retain their previously published zones so a
+    /// bootstrap pass on one node cannot erase topology owned by another.
+    pub local_zone: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +158,14 @@ pub trait DfsDefaultClusterBootstrapHost {
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, DfsError>;
 
+    fn current_file_system_config(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsFileSystemConfig>, DfsError> {
+        let _ = file_system_id;
+        Ok(None)
+    }
+
     fn metadata_shard_primary_transfer_ready(
         &mut self,
         current: &DfsMetadataShardConfig,
@@ -216,6 +229,14 @@ pub trait DfsDefaultClusterAsyncBootstrapHost: Send {
         file_system_id: DfsFileSystemId,
         shard_id: String,
     ) -> DfsDefaultClusterBootstrapFuture<'a, Option<DfsMetadataShardConfig>>;
+
+    fn current_file_system_config_async<'a>(
+        &'a mut self,
+        file_system_id: DfsFileSystemId,
+    ) -> DfsDefaultClusterBootstrapFuture<'a, Option<DfsFileSystemConfig>> {
+        let _ = file_system_id;
+        Box::pin(async { Ok(None) })
+    }
 
     fn metadata_shard_primary_transfer_ready_async<'a>(
         &'a mut self,
@@ -449,6 +470,21 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
             .transpose()
     }
 
+    fn current_file_system_config(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsFileSystemConfig>, DfsError> {
+        let key = file_system_config_key(file_system_id);
+        self.control_plane
+            .get(&key)?
+            .map(|entry| {
+                entry
+                    .decode::<DfsFileSystemConfig>()
+                    .map_err(DfsError::from)
+            })
+            .transpose()
+    }
+
     fn metadata_shard_primary_transfer_ready(
         &mut self,
         current: &DfsMetadataShardConfig,
@@ -484,7 +520,9 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
     }
 
     fn put_file_system_config(&mut self, config: &DfsFileSystemConfig) -> Result<(), DfsError> {
-        self.put_serde_if_changed(file_system_config_key(&config.file_system_id), config)
+        DfsControlPlaneStore::new(self.control_plane.as_mut())
+            .ensure_file_system_config_defaults(config)
+            .map_err(DfsError::from)
     }
 
     fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), DfsError> {
@@ -590,6 +628,24 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         })
     }
 
+    fn current_file_system_config_async<'a>(
+        &'a mut self,
+        file_system_id: DfsFileSystemId,
+    ) -> DfsDefaultClusterBootstrapFuture<'a, Option<DfsFileSystemConfig>> {
+        Box::pin(async move {
+            let key = file_system_config_key(&file_system_id);
+            self.control_plane
+                .get_async(&key)
+                .await?
+                .map(|entry| {
+                    entry
+                        .decode::<DfsFileSystemConfig>()
+                        .map_err(DfsError::from)
+                })
+                .transpose()
+        })
+    }
+
     fn metadata_shard_primary_transfer_ready_async<'a>(
         &'a mut self,
         current: DfsMetadataShardConfig,
@@ -638,8 +694,10 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         config: DfsFileSystemConfig,
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
         Box::pin(async move {
-            self.put_serde_if_changed(file_system_config_key(&config.file_system_id), &config)
+            DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
+                .ensure_file_system_config_defaults(&config)
                 .await
+                .map_err(DfsError::from)
         })
     }
 
@@ -1001,6 +1059,19 @@ fn metadata_shard_primary_route_unhealthy(
     cluster_healthy_route_next_hop(&graph, local_node_id, primary_node_id).is_none()
 }
 
+fn stable_default_file_system_config(
+    file_system: &DfsFileSystem,
+    current: Option<DfsFileSystemConfig>,
+) -> DfsFileSystemConfig {
+    let mut desired = DfsFileSystemConfig::from(file_system);
+    if let Some(current) = current {
+        for rule in current.subtree_policies {
+            crate::placement::upsert_placement_rule(&mut desired.subtree_policies, rule);
+        }
+    }
+    desired
+}
+
 pub fn ensure_default_distributed_dfs_with_host(
     state: &ClusterBootstrapState,
     host: &mut impl DfsDefaultClusterBootstrapHost,
@@ -1009,7 +1080,15 @@ pub fn ensure_default_distributed_dfs_with_host(
     let file_system = default_cluster_sifs(state);
     let mut metadata_shards = Vec::new();
     let local_has_primary_metadata_shards = if options.publish_cluster_control {
-        host.put_file_system_config(&DfsFileSystemConfig::from(&file_system))?;
+        let config = stable_default_file_system_config(
+            &file_system,
+            host.current_file_system_config(&file_system.file_system_id)?,
+        );
+        host.put_file_system_config(&config)?;
+        // Service discovery is independent of metadata-shard handoff. Publish
+        // it first so a fenced or retrying shard transition cannot hide
+        // otherwise eligible content nodes from placement planning.
+        publish_dfs_service_advertisements_with_host(host, state, options.local_zone.as_deref())?;
         metadata_shards = default_cluster_metadata_shards_with_host(host, state, &file_system)?;
         let local_has_primary_metadata_shards = metadata_shards
             .iter()
@@ -1029,9 +1108,15 @@ pub fn ensure_default_distributed_dfs_with_host(
                 state.local_node_id.clone(),
             )?;
         }
-        publish_dfs_service_advertisements_with_host(host, state)?;
         local_has_primary_metadata_shards
     } else {
+        if options.local_zone.is_some() {
+            publish_local_dfs_service_advertisement_with_host(
+                host,
+                state,
+                options.local_zone.as_deref(),
+            )?;
+        }
         default_cluster_sifs_owner(state) == state.local_node_id
     };
     if local_has_primary_metadata_shards
@@ -1060,8 +1145,19 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
     let file_system = default_cluster_sifs(state);
     let mut metadata_shards = Vec::new();
     let local_has_primary_metadata_shards = if options.publish_cluster_control {
-        host.put_file_system_config_async(DfsFileSystemConfig::from(&file_system))
+        let current = host
+            .current_file_system_config_async(file_system.file_system_id.clone())
             .await?;
+        let config = stable_default_file_system_config(&file_system, current);
+        host.put_file_system_config_async(config).await?;
+        // Keep placement discovery available even while metadata membership
+        // is fenced for catch-up or retries a concurrent handoff.
+        publish_dfs_service_advertisements_with_async_host(
+            host,
+            state,
+            options.local_zone.as_deref(),
+        )
+        .await?;
         metadata_shards =
             default_cluster_metadata_shards_with_async_host(host, state, &file_system).await?;
         let local_has_primary_metadata_shards = metadata_shards
@@ -1083,9 +1179,16 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
             )
             .await?;
         }
-        publish_dfs_service_advertisements_with_async_host(host, state).await?;
         local_has_primary_metadata_shards
     } else {
+        if options.local_zone.is_some() {
+            publish_local_dfs_service_advertisement_with_async_host(
+                host,
+                state,
+                options.local_zone.as_deref(),
+            )
+            .await?;
+        }
         default_cluster_sifs_owner(state) == state.local_node_id
     };
     if local_has_primary_metadata_shards
@@ -1620,45 +1723,71 @@ pub fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberR
 fn publish_dfs_service_advertisements_with_host(
     host: &mut impl DfsDefaultClusterBootstrapHost,
     state: &ClusterBootstrapState,
+    local_zone: Option<&str>,
 ) -> Result<(), DfsError> {
     for member in dfs_service_members(state) {
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
-        let metadata = stable_dfs_advertisement(
-            host,
-            &metadata_key,
-            DfsNodeAdvertisement::metadata(member.node_id.clone()),
-        )?;
-        let content = stable_dfs_advertisement(
-            host,
-            &content_key,
-            DfsNodeAdvertisement::content(member.node_id.clone()),
-        )?;
+        let is_local = member.node_id == state.local_node_id;
+        let mut desired_metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
+        let mut desired_content = DfsNodeAdvertisement::content(member.node_id.clone());
+        if is_local {
+            desired_metadata.zone = local_zone.map(str::to_string);
+            desired_content.zone = local_zone.map(str::to_string);
+        }
+        let metadata = stable_dfs_advertisement(host, &metadata_key, desired_metadata, !is_local)?;
+        let content = stable_dfs_advertisement(host, &content_key, desired_content, !is_local)?;
         host.put_node_advertisement(metadata_key, &metadata)?;
         host.put_node_advertisement(content_key, &content)?;
     }
     Ok(())
 }
 
+fn publish_local_dfs_service_advertisement_with_host(
+    host: &mut impl DfsDefaultClusterBootstrapHost,
+    state: &ClusterBootstrapState,
+    local_zone: Option<&str>,
+) -> Result<(), DfsError> {
+    let member = dfs_service_members(state)
+        .into_iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .ok_or_else(|| DfsError::Metadata {
+            message: format!(
+                "local node {} is not an eligible DFS service member",
+                state.local_node_id
+            ),
+        })?;
+    let metadata_key = metadata_service_key(&member.node_id);
+    let content_key = content_service_key(&member.node_id);
+    let mut metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
+    let mut content = DfsNodeAdvertisement::content(member.node_id.clone());
+    metadata.zone = local_zone.map(str::to_string);
+    content.zone = local_zone.map(str::to_string);
+    host.put_node_advertisement(metadata_key, &metadata)?;
+    host.put_node_advertisement(content_key, &content)
+}
+
 async fn publish_dfs_service_advertisements_with_async_host(
     host: &mut impl DfsDefaultClusterAsyncBootstrapHost,
     state: &ClusterBootstrapState,
+    local_zone: Option<&str>,
 ) -> Result<(), DfsError> {
     for member in dfs_service_members(state) {
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
-        let metadata = stable_dfs_advertisement_async(
-            host,
-            metadata_key.clone(),
-            DfsNodeAdvertisement::metadata(member.node_id.clone()),
-        )
-        .await?;
-        let content = stable_dfs_advertisement_async(
-            host,
-            content_key.clone(),
-            DfsNodeAdvertisement::content(member.node_id.clone()),
-        )
-        .await?;
+        let is_local = member.node_id == state.local_node_id;
+        let mut desired_metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
+        let mut desired_content = DfsNodeAdvertisement::content(member.node_id.clone());
+        if is_local {
+            desired_metadata.zone = local_zone.map(str::to_string);
+            desired_content.zone = local_zone.map(str::to_string);
+        }
+        let metadata =
+            stable_dfs_advertisement_async(host, metadata_key.clone(), desired_metadata, !is_local)
+                .await?;
+        let content =
+            stable_dfs_advertisement_async(host, content_key.clone(), desired_content, !is_local)
+                .await?;
         host.put_node_advertisement_async(metadata_key, metadata)
             .await?;
         host.put_node_advertisement_async(content_key, content)
@@ -1667,14 +1796,44 @@ async fn publish_dfs_service_advertisements_with_async_host(
     Ok(())
 }
 
+async fn publish_local_dfs_service_advertisement_with_async_host(
+    host: &mut impl DfsDefaultClusterAsyncBootstrapHost,
+    state: &ClusterBootstrapState,
+    local_zone: Option<&str>,
+) -> Result<(), DfsError> {
+    let member = dfs_service_members(state)
+        .into_iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .ok_or_else(|| DfsError::Metadata {
+            message: format!(
+                "local node {} is not an eligible DFS service member",
+                state.local_node_id
+            ),
+        })?;
+    let metadata_key = metadata_service_key(&member.node_id);
+    let content_key = content_service_key(&member.node_id);
+    let mut metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
+    let mut content = DfsNodeAdvertisement::content(member.node_id.clone());
+    metadata.zone = local_zone.map(str::to_string);
+    content.zone = local_zone.map(str::to_string);
+    host.put_node_advertisement_async(metadata_key, metadata)
+        .await?;
+    host.put_node_advertisement_async(content_key, content)
+        .await
+}
+
 fn stable_dfs_advertisement(
     host: &impl DfsDefaultClusterBootstrapHost,
     key: &str,
-    desired: DfsNodeAdvertisement,
+    mut desired: DfsNodeAdvertisement,
+    preserve_current_zone: bool,
 ) -> Result<DfsNodeAdvertisement, DfsError> {
     let Some(current) = host.current_node_advertisement(key)? else {
         return Ok(desired);
     };
+    if preserve_current_zone {
+        desired.zone.clone_from(&current.zone);
+    }
     if current.node_id == desired.node_id
         && current.accepts_metadata == desired.accepts_metadata
         && current.accepts_content == desired.accepts_content
@@ -1689,11 +1848,15 @@ fn stable_dfs_advertisement(
 async fn stable_dfs_advertisement_async(
     host: &mut impl DfsDefaultClusterAsyncBootstrapHost,
     key: String,
-    desired: DfsNodeAdvertisement,
+    mut desired: DfsNodeAdvertisement,
+    preserve_current_zone: bool,
 ) -> Result<DfsNodeAdvertisement, DfsError> {
     let Some(current) = host.current_node_advertisement_async(key).await? else {
         return Ok(desired);
     };
+    if preserve_current_zone {
+        desired.zone.clone_from(&current.zone);
+    }
     if current.node_id == desired.node_id
         && current.accepts_metadata == desired.accepts_metadata
         && current.accepts_content == desired.accepts_content

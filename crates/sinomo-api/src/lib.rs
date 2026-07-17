@@ -41,6 +41,7 @@ pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
     "/daemon/cluster/local-connectivity-reload";
 pub const DAEMON_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/object-rpc/forward";
 pub const DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/dfs/object-rpc/forward";
+pub const DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE: &str = "/daemon/dfs/placement-authority";
 pub const DAEMON_EVENT_SUBSCRIBE_ROUTE: &str = "/daemon/events/subscribe";
 pub const DFS_NAMESPACE_CHANGED_EVENT_KIND: &str = "dfs.namespace.changed";
 pub const DFS_PLACEMENT_CHANGED_EVENT_KIND: &str = "dfs.placement.changed";
@@ -66,7 +67,13 @@ pub const DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE: &str =
     "/daemon/dfs/browser/transfer-metadata-primary";
 pub const DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE: &str =
     "/daemon/dfs/browser/placement-preview";
+/// Retained only to return an explicit rolling-upgrade error. Apply is disabled
+/// on this legacy route because its request cannot carry a preview token.
 pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE: &str = "/daemon/dfs/browser/placement-update";
+/// Fail-closed placement Apply route. A dedicated route prevents an older
+/// daemon from ignoring the preview precondition during a rolling upgrade.
+pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE: &str =
+    "/daemon/dfs/browser/placement-update-v2";
 pub const DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE: &str =
     "/daemon/dfs/browser/placement-progress";
 pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
@@ -89,6 +96,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
 ];
 
@@ -596,6 +604,21 @@ pub struct DaemonDfsBrowserPlacementUpdateRequest {
     pub scope: sinomo_dfs::DfsPlacementScope,
 }
 
+/// Apply only the exact placement plan returned by the immediately preceding
+/// preview. The token is intentionally required and lives on a versioned route
+/// so missing support can never degrade to an unconditional update.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementUpdateV2Request {
+    pub path: String,
+    /// `None` removes the override for exactly `(path, scope)`, restoring
+    /// inheritance from the nearest matching ancestor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<sinomo_dfs::DfsPlacementPolicy>,
+    #[serde(default)]
+    pub scope: sinomo_dfs::DfsPlacementScope,
+    pub expected_preview_token: sinomo_dfs::DfsPlacementPreviewToken,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserPlacementUpdateResponse {
     pub preview: sinomo_dfs::DfsPlacementPreview,
@@ -610,6 +633,39 @@ pub struct DaemonDfsBrowserPlacementProgressRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserPlacementProgressResponse {
     pub reconciliation: sinomo_dfs::DfsPlacementReconciliationJob,
+}
+
+/// Main-daemon-only operator surface for inspecting and recovering a stranded
+/// DFS placement mutation permit. This route is intentionally separate from
+/// the local-command browser API and is cataloged with admin authorization.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum DaemonDfsPlacementAuthorityAdminRequest {
+    Inspect {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+    },
+    RecoverRemovedNode {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+        expected_recovery_token: String,
+        #[serde(default)]
+        acknowledge_owner_stopped: bool,
+    },
+    BreakGlassRecover {
+        file_system_id: sinomo_dfs::DfsFileSystemId,
+        expected_recovery_token: String,
+        acknowledgement: String,
+    },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum DaemonDfsPlacementAuthorityAdminResponse {
+    Inspection {
+        permit: Option<sinomo_dfs::DfsPlacementAuthorityPermitStatus>,
+    },
+    Recovery {
+        outcome: sinomo_dfs::DfsPlacementAuthorityRecoveryOutcome,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -665,10 +721,20 @@ mod tests {
     }
 
     #[test]
+    fn placement_authority_admin_route_is_not_a_browser_local_command() {
+        assert!(!DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE));
+        assert_eq!(
+            DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+            "/daemon/dfs/placement-authority"
+        );
+    }
+
+    #[test]
     fn placement_routes_are_typed_and_inheritance_is_explicit() {
         for route in [
             DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
             DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
             DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
         ] {
             assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&route));
@@ -683,6 +749,25 @@ mod tests {
             serde_json::from_slice(&encoded).expect("decode placement update");
         assert_eq!(decoded, request);
         assert!(decoded.policy.is_none());
+    }
+
+    #[test]
+    fn placement_update_v2_requires_a_preview_token_on_a_dedicated_route() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE
+        );
+        assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE));
+
+        let missing_token = serde_json::json!({
+            "path": "/users/team",
+            "scope": "self-only"
+        });
+        assert!(
+            serde_json::from_value::<DaemonDfsBrowserPlacementUpdateV2Request>(missing_token)
+                .is_err(),
+            "the fail-closed route must not default a missing preview token"
+        );
     }
 
     #[test]

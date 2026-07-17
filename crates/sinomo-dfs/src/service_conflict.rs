@@ -352,6 +352,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut refreshed_receipts = 0;
         let mut ignored_divergent_manifests = 0usize;
         let mut has_current_manifest = false;
+        let may_refresh_local_replica_receipt = self.local_manifest_receipt_refresh_is_standalone();
 
         for manifest in manifests {
             let manifest_version = DfsVersion::deserialize_migrating_legacy(
@@ -372,22 +373,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .unwrap_or(false)
                     {
                         has_current_manifest = true;
-                        let local_node_id = self.node_id.clone();
-                        let receipt_inserted = self.put_metadata_receipt(
-                            &object.file_system_id,
-                            &object.object_id,
-                            &object.version,
-                            &local_node_id,
-                            &manifest.content_hash,
-                        )?;
-                        self.mark_repaired_location(
-                            &object.object_id,
-                            &object.version,
-                            &local_node_id,
-                            &manifest.content_hash,
-                        )?;
-                        if receipt_inserted {
-                            refreshed_receipts += 1;
+                        if may_refresh_local_replica_receipt {
+                            let local_node_id = self.node_id.clone();
+                            let receipt_inserted = self.put_metadata_receipt(
+                                &object.file_system_id,
+                                &object.object_id,
+                                &object.version,
+                                &local_node_id,
+                                &manifest.content_hash,
+                            )?;
+                            self.mark_repaired_location(
+                                &object.object_id,
+                                &object.version,
+                                &local_node_id,
+                                &manifest.content_hash,
+                            )?;
+                            if receipt_inserted {
+                                refreshed_receipts += 1;
+                            }
                         }
                     }
                 } else {
@@ -409,6 +412,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             conflicts: Vec::new(),
             missing_current: object.content_hash.is_some() && !has_current_manifest,
         })
+    }
+
+    /// Reconnect may rediscover bytes that placement reconciliation deliberately
+    /// removed from the durable replica set. A config read cannot authorize a
+    /// later receipt write because Apply may replace or create a rule between
+    /// those operations. Clustered services therefore keep rediscovered bytes
+    /// as cache only; placement reconciliation remains the sole writer of
+    /// authoritative receipts/locations. Standalone services preserve the
+    /// legacy reconnect behavior.
+    fn local_manifest_receipt_refresh_is_standalone(&self) -> bool {
+        self.control_plane.is_none()
     }
 
     #[cfg(test)]

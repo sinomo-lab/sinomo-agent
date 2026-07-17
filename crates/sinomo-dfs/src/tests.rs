@@ -6826,6 +6826,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
             bootstrap: DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: true,
                 materialize_local_metadata: true,
+                local_zone: None,
             },
             smoke: DfsSmokeOptions {
                 nonce: Some(13579),
@@ -6889,6 +6890,7 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
             materialize_local_metadata: true,
+            local_zone: None,
         },
     )
     .expect("default cluster dfs")
@@ -6936,14 +6938,30 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
     let cluster_id = sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_host")
         .expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_bootstrap_host_local").expect("local");
-    let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-        cluster_id,
+    let remote = (0..128)
+        .map(|index| {
+            NodeId::from_legacy_named(format!("node_dfs_bootstrap_host_remote_{index}"))
+                .expect("remote")
+        })
+        .find(|candidate| candidate > &local)
+        .expect("remote node id ordered after local node id");
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
         "dfs bootstrap host",
         local.clone(),
         "local",
         "pk-local",
         now,
     );
+    state
+        .members
+        .push(sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        ));
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let mut stale_writer = control_plane.clone();
     DfsControlPlaneKvClient::put(
@@ -6958,6 +6976,29 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         b"legacy content advertisement".to_vec(),
     )
     .expect("write stale content advertisement");
+    let mut remote_content = DfsNodeAdvertisement::content(remote.clone());
+    remote_content.zone = Some("zone-b".to_string());
+    DfsControlPlaneKvClient::put(
+        &mut stale_writer,
+        content_service_key(&remote),
+        sinomo_core::kv::encode_kv_value(&remote_content).expect("encode remote advertisement"),
+    )
+    .expect("write remote content advertisement");
+    let managed_rule = normalize_placement_rule(
+        "/managed",
+        DfsPlacementScope::Subtree,
+        DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2)
+            .expect("managed placement policy"),
+    )
+    .expect("managed placement rule");
+    let mut current_config = DfsFileSystemConfig::from(&default_cluster_sifs(&state));
+    upsert_placement_rule(&mut current_config.subtree_policies, managed_rule.clone());
+    DfsControlPlaneKvClient::put(
+        &mut stale_writer,
+        file_system_config_key(&current_config.file_system_id),
+        sinomo_core::kv::encode_kv_value(&current_config).expect("encode filesystem config"),
+    )
+    .expect("write managed filesystem config");
     let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
         data_dir.clone(),
         cluster_paths,
@@ -6971,6 +7012,7 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
             materialize_local_metadata: true,
+            local_zone: Some("zone-a".to_string()),
         },
     )
     .expect("default dfs bootstrap");
@@ -6983,6 +7025,7 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         .expect("filesystem config")
         .expect("filesystem config present");
     assert_eq!(config.owner_node_id, local);
+    assert!(config.subtree_policies.contains(&managed_rule));
     let shards = store
         .list_metadata_shards(&report.file_system.file_system_id)
         .expect("metadata shards");
@@ -7006,12 +7049,87 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         .expect("metadata advertisement present");
     assert_eq!(metadata_advertisement.node_id, local.clone());
     assert!(metadata_advertisement.accepts_metadata);
+    assert_eq!(metadata_advertisement.zone.as_deref(), Some("zone-a"));
     let content_advertisement = store
         .content_service(&local)
         .expect("content advertisement")
         .expect("content advertisement present");
     assert_eq!(content_advertisement.node_id, local);
     assert!(content_advertisement.accepts_content);
+    assert_eq!(content_advertisement.zone.as_deref(), Some("zone-a"));
+    let remote_content_advertisement = store
+        .content_service(&remote)
+        .expect("remote content advertisement")
+        .expect("remote content advertisement present");
+    assert_eq!(remote_content_advertisement.zone.as_deref(), Some("zone-b"));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn non_authority_default_bootstrap_publishes_only_its_local_zone() {
+    let root = temp_root("non-authority-default-bootstrap-zone");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_non_authority_zone")
+            .expect("cluster");
+    let local = NodeId::from_legacy_named("node_dfs_non_authority_zone_local").expect("local node");
+    let remote =
+        NodeId::from_legacy_named("node_dfs_non_authority_zone_remote").expect("remote node");
+    let mut state = sinomo_core::ClusterBootstrapState::pending_join(
+        cluster_id.clone(),
+        "dfs non-authority zone",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].state = sinomo_core::ClusterMemberState::Learner;
+    state
+        .members
+        .push(sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        ));
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+        data_dir,
+        cluster_paths,
+        local.clone(),
+        Box::new(control_plane.clone()),
+    );
+
+    ensure_default_distributed_dfs_with_host(
+        &state,
+        &mut host,
+        DfsDefaultClusterBootstrapOptions {
+            publish_cluster_control: false,
+            materialize_local_metadata: false,
+            local_zone: Some("zone-local".to_string()),
+        },
+    )
+    .expect("local service advertisement");
+
+    let mut reader = control_plane;
+    let store = DfsControlPlaneStore::new(&mut reader);
+    let local_content = store
+        .content_service(&local)
+        .expect("local content advertisement")
+        .expect("local content advertisement present");
+    assert_eq!(local_content.zone.as_deref(), Some("zone-local"));
+    assert!(
+        store
+            .content_service(&remote)
+            .expect("remote content advertisement")
+            .is_none(),
+        "a non-authority node must not synthesize another node's zone"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -18359,6 +18477,94 @@ fn explicit_recovery_hydration_queues_once_and_deduplicates_through_shared_state
 }
 
 #[test]
+fn recovery_hydration_does_not_promote_from_non_authoritative_object_owner() {
+    let root = temp_root("object-owner-no-promotion-authority");
+    let fixture = seed_durable_commit_promotion_fixture(&root, "non-authoritative-owner");
+    let target = NodeId::from_legacy_named("node_recovery_hydrate_target_non_authoritative")
+        .expect("target");
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &fixture.metadata_root)
+            .expect("reopened metadata backend");
+    let mut intent = backend
+        .get_intent(&fixture.object_id, &fixture.intent_id)
+        .expect("read committed intent")
+        .expect("committed intent");
+    intent.coordinator_node_id = fixture.replica.clone();
+    intent.desired_replica_node_ids.push(target.clone());
+    intent.policy = DfsReplicationPolicy::new(2, 3).expect("three-node repair policy");
+    backend
+        .put_intent(&intent)
+        .expect("rebind test coordinator");
+    backend
+        .put_receipt(&DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: intent.file_system_id.clone(),
+                object_id: fixture.object_id.clone(),
+                committed_version: fixture.target_version.clone(),
+                owner_node_id: fixture.replica.clone(),
+                event_id: EventId::generate(),
+            },
+            replica_node_id: target.clone(),
+            content_hash: Some(fixture.content_hash.clone()),
+            received_at: OffsetDateTime::now_utc(),
+        })
+        .expect("target receipt");
+    drop(backend);
+
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: intent.file_system_id.clone(),
+                display_name: "SIFS".to_string(),
+                owner_node_id: fixture.owner.clone(),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem config");
+        store
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: intent.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: fixture.replica.clone(),
+                replica_node_ids: vec![fixture.owner.clone(), target.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("services shard");
+    });
+
+    let detached_send_state = DfsNodeDetachedSendState::new();
+    let transport = recovery_hydration_node_transport(
+        fixture.owner.clone(),
+        fixture.replica,
+        detached_send_state.clone(),
+    );
+    let mut recovery = NetworkedDfsService::new(
+        transport,
+        LocalContentStore::new(fixture.content_root).expect("reopened owner content"),
+    )
+    .with_control_plane(control_plane);
+    recovery.metadata_backend = Some(Box::new(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), fixture.metadata_root)
+            .expect("reopen modified metadata"),
+    ));
+    recovery
+        .hydrate_from_metadata_backend_for_commit_promotion_recovery()
+        .expect("explicit recovery hydration");
+
+    assert_eq!(
+        detached_send_state.queued_send_count(),
+        0,
+        "object ownership alone must not authorize recovered replica promotions"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
     let root = temp_root("hydrate-global-receipt-scan");
     let owner = NodeId::from_legacy_named("node_hydrate_global_receipts").expect("node");
@@ -25139,6 +25345,144 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
             .expect("object")
             .current_locations,
         vec![remote]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reconnect_refreshes_unmanaged_local_manifest_receipt() {
+    let root = temp_root("reconnect-refreshes-unmanaged-receipt");
+    let local = NodeId::from_legacy_named("node_reconnect_unmanaged_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_reconnect_unmanaged_remote").expect("remote");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_reconnect_unmanaged_receipt").expect("object");
+    let version = DfsVersion::from_legacy_named("version_reconnect_unmanaged").expect("version");
+    let bytes = b"ordinary reconnect bytes";
+    let mut dfs = networked_sifs_with_backend(&root, local.clone());
+    let manifest = dfs
+        .content
+        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .expect("seed local manifest and blob");
+    let mut metadata = file_metadata(local.clone());
+    metadata.object_id = object_id.clone();
+    metadata.path = "/services/reconnect-unmanaged.txt".to_string();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    metadata.version = version.clone();
+    metadata.current_locations = vec![remote];
+    metadata.content_hash = Some(manifest.content_hash.clone());
+    metadata.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(metadata).expect("metadata");
+
+    let reconciliation = dfs
+        .reconcile_local_manifests(&object_id)
+        .expect("reconcile unmanaged manifest");
+
+    assert_eq!(reconciliation.refreshed_receipts, 1);
+    assert!(!reconciliation.missing_current);
+    assert!(
+        dfs.metadata_backend()
+            .expect("backend")
+            .receipts_for_version(&object_id, &version)
+            .expect("receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == local),
+        "ordinary reconnect keeps its legacy receipt refresh behavior"
+    );
+    assert!(
+        dfs.metadata()
+            .object(&object_id)
+            .expect("object")
+            .current_locations
+            .contains(&local),
+        "ordinary reconnect keeps its legacy location refresh behavior"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reconnect_does_not_restore_local_replica_removed_by_managed_placement() {
+    let root = temp_root("reconnect-respects-managed-placement");
+    let local = NodeId::from_legacy_named("node_reconnect_placement_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_reconnect_placement_remote").expect("remote");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_reconnect_placement_removed").expect("object");
+    let version = DfsVersion::from_legacy_named("version_reconnect_placement").expect("version");
+    let path = "/services/reconnect-placement.txt";
+    let bytes = b"local bytes remain after replica removal";
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut config = DfsFileSystemConfig::from(&file_system(local.clone()));
+        let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1)
+            .expect("placement policy");
+        policy.forbidden_node_ids = vec![local.clone()];
+        config.subtree_policies.push(
+            normalize_placement_rule(path, DfsPlacementScope::SelfOnly, policy)
+                .expect("placement rule"),
+        );
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_file_system_config(&config)
+            .expect("filesystem config");
+    });
+
+    let mut dfs = networked_sifs_with_backend(&root, local.clone());
+    let manifest = dfs
+        .content
+        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .expect("retain local manifest and blob");
+    let mut metadata = file_metadata(local.clone());
+    metadata.object_id = object_id.clone();
+    metadata.path = path.to_string();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    metadata.version = version.clone();
+    metadata.current_locations = vec![remote.clone()];
+    metadata.content_hash = Some(manifest.content_hash.clone());
+    metadata.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(metadata).expect("metadata");
+    // Once a control plane is attached, a config check cannot authorize a
+    // later receipt write: Apply could create or replace a rule in between.
+    // Reconnect must leave all clustered replica metadata to the permitted job.
+    let mut dfs = dfs.with_control_plane(control_plane);
+    assert!(
+        dfs.resolved_placement_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+            .expect("resolved placement")
+            .policy
+            .forbidden_node_ids
+            .contains(&local),
+        "test setup must explicitly forbid the reconnecting local node"
+    );
+
+    let reconciliation = dfs
+        .reconcile_local_manifests(&object_id)
+        .expect("reconcile local manifests");
+
+    assert_eq!(reconciliation.refreshed_receipts, 0);
+    assert!(
+        !reconciliation.missing_current,
+        "the local bytes still exist"
+    );
+    assert!(
+        dfs.metadata_backend()
+            .expect("backend")
+            .receipts_for_version(&object_id, &version)
+            .expect("receipts")
+            .iter()
+            .all(|receipt| receipt.replica_node_id != local),
+        "reconnect must not recreate the removed local receipt"
+    );
+    assert_eq!(
+        dfs.metadata()
+            .object(&object_id)
+            .expect("object")
+            .current_locations,
+        vec![remote],
+        "reconnect must not recreate the removed local location"
+    );
+    assert!(
+        dfs.content()
+            .has_blob(&manifest.content_hash)
+            .expect("local blob lookup"),
+        "placement removal leaves the bytes available as a local cache"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -40027,10 +40371,14 @@ fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
             .expect("placement rule"),
         );
         let job = DfsPlacementReconciliationJob {
+            schema_version: crate::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
             job_id: "placement-durable-job".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             path: path.to_string(),
             scope: DfsPlacementScope::SelfOnly,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: vec![DfsNodeAdvertisement::content(local.clone())],
+            accepted_config: Some(desired.clone()),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -40051,6 +40399,32 @@ fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
                 .expect("publish placement and job")
         );
         job
+    });
+
+    let non_primary = NodeId::from_legacy_named("node_placement_reconciliation_replica")
+        .expect("non-primary node");
+    let mut replica_service = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(non_primary),
+        LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_control_plane(control_plane.clone());
+    assert!(
+        replica_service
+            .run_placement_reconciliation_bounded(1)
+            .expect("non-primary reconciliation tick")
+            .is_none(),
+        "only the filesystem root metadata primary may advance the durable job"
+    );
+    control_plane.with_client(|kv| {
+        assert_eq!(
+            DfsControlPlaneStore::new(kv)
+                .placement_reconciliation(&file_system.file_system_id, &job.job_id)
+                .expect("unclaimed durable job")
+                .expect("job remains pending")
+                .revision,
+            0,
+            "a non-primary tick must not claim progress or perform side effects"
+        );
     });
 
     let first_page = service

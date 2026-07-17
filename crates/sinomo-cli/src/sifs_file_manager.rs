@@ -11,16 +11,18 @@ use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsFileSystemConfig, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
-    DfsPinAddRequest, DfsPinMode, DfsPlacementPolicy, DfsPlacementPreview,
-    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
-    DfsPosixCreateAttrs, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    fallback_dfs_node_id, metadata_shards_prefix,
+    DfsPinAddRequest, DfsPinMode, DfsPlacementBlockingDiagnostic, DfsPlacementImpact,
+    DfsPlacementNodePreview, DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
+    DfsPlacementPreviewToken, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
+    DfsPlacementScope, DfsPosixCreateAttrs, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat,
+    DfsWriteOptions, LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids,
+    content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    default_dfs_pin_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
+    preview_placement_with_unavailable_nodes,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
@@ -36,6 +38,7 @@ use std::time::{Duration, Instant};
 const SIFS_PEER_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
 const SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET: usize = 1;
 const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
+const SIFS_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
@@ -390,6 +393,113 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot resolve SIFS placement for {}: {error}", stat.path))
     }
 
+    fn preview_materialized_placement_with_paged_impact(
+        &self,
+        base_config: &DfsFileSystemConfig,
+        config: &DfsFileSystemConfig,
+        stat: &DfsStat,
+        candidates: Vec<DfsNodeAdvertisement>,
+        observer_node_id: NodeId,
+        scope: DfsPlacementScope,
+        cluster_paths: &ClusterPaths,
+    ) -> Result<
+        (
+            DfsPlacementPreview,
+            BTreeSet<NodeId>,
+            Vec<DfsNodeAdvertisement>,
+        ),
+        String,
+    > {
+        if candidates.is_empty() {
+            return Err("cannot apply SIFS placement without content candidates".to_string());
+        }
+        let object_fence = sinomo_runtime::dfs::DfsPlacementPreviewObjectFence::from(stat);
+        let connectivity = sifs_placement_connectivity_snapshot(cluster_paths);
+        let unavailable_node_ids = connectivity.explicitly_unavailable_node_ids();
+        let mut preview = preview_placement_with_unavailable_nodes(
+            config,
+            &stat.path,
+            stat.object_id.clone(),
+            stat.version.clone(),
+            stat.policy.clone(),
+            observer_node_id,
+            stat.current_locations.clone(),
+            candidates.clone(),
+            // The caller already materialized additions and removals in this
+            // config. In particular, None here must preserve inherited-policy
+            // previews instead of accidentally re-adding the removed rule.
+            None,
+            scope,
+            &unavailable_node_ids,
+        )
+        .map_err(|error| format!("cannot preview SIFS placement: {error}"))?;
+
+        let mut impact = DfsPlacementImpact::default();
+        let mut cursor = None;
+        loop {
+            // The DFS service is shared by foreground file-manager work. Hold
+            // its mutex for one bounded metadata page, then release it before
+            // resuming from the returned cursor.
+            let page = {
+                let service = self.lock_service()?;
+                service
+                    .placement_impact_page_for_config_with_unavailable_nodes(
+                        config,
+                        &stat.path,
+                        scope,
+                        &candidates,
+                        cursor.as_ref(),
+                        SIFS_PLACEMENT_IMPACT_PAGE_SIZE,
+                        &unavailable_node_ids,
+                    )
+                    .map_err(|error| format!("cannot preview SIFS placement impact: {error}"))?
+            };
+            sinomo_runtime::dfs::merge_placement_impact(&mut impact, &page.impact);
+            merge_sifs_placement_page_diagnostics(&mut preview, page.blocking_diagnostics);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if !preview.blocking_diagnostics.is_empty() {
+            impact.complete = false;
+        }
+        preview.impact = impact;
+        // Impact scans can span multiple pages. Refresh the observational view
+        // once afterward so a desired node that transitioned down cannot slip
+        // through the apply gate on a stale plan.
+        let refreshed_connectivity = sifs_placement_connectivity_snapshot(cluster_paths);
+        enrich_sifs_placement_preview_reachability(&mut preview, &refreshed_connectivity);
+        let compatibility_state = cluster::read_cluster_state_without_kv(cluster_paths)
+            .map_err(|error| format!("cannot verify placement daemon compatibility: {error}"))?;
+        if let Some(diagnostic) =
+            sinomo_runtime::dfs::placement_reconciliation_compatibility_diagnostic(
+                &compatibility_state,
+            )
+            && !preview.blocking_diagnostics.contains(&diagnostic)
+        {
+            preview.blocking_diagnostics.push(diagnostic);
+            preview.impact.complete = false;
+        }
+        // Preserve the exact exclusions used for planning even if a node
+        // recovers during the paged scan, and also include nodes that became
+        // explicitly unavailable before apply.
+        let mut reconciliation_unavailable_node_ids = unavailable_node_ids;
+        reconciliation_unavailable_node_ids.extend(preview.unavailable_node_ids());
+        sinomo_runtime::dfs::bind_placement_preview_token(
+            &mut preview,
+            base_config,
+            config,
+            &stat.path,
+            scope,
+            &object_fence,
+            &candidates,
+            &reconciliation_unavailable_node_ids,
+        )
+        .map_err(|error| format!("cannot seal SIFS placement preview: {error}"))?;
+        Ok((preview, reconciliation_unavailable_node_ids, candidates))
+    }
+
     pub(crate) fn preview_placement(
         &self,
         path: &str,
@@ -403,10 +513,11 @@ impl SifsFileManagerBackend {
         }
         refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
         let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
-        let mut config = DfsControlPlaneStore::new(&mut kv)
+        let base_config = DfsControlPlaneStore::new(&mut kv)
             .get_file_system_config(&sifs_file_system_id())
             .map_err(|error| format!("cannot read SIFS placement policy: {error}"))?
             .ok_or_else(|| "SIFS cluster policy is unavailable".to_string())?;
+        let mut config = base_config.clone();
         match policy {
             Some(policy) => {
                 let rule = sinomo_runtime::dfs::normalize_placement_rule(&path, scope, policy)
@@ -422,28 +533,27 @@ impl SifsFileManagerBackend {
                 .map_err(|error| format!("invalid SIFS placement path: {error}"))?;
             }
         }
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
-        let stat = service
-            .posix_stat_distributed(&path)
-            .map_err(|error| format!("cannot inspect {path}: {error}"))?;
-        let candidates = service
-            .placement_content_candidates()
-            .map_err(|error| format!("cannot read SIFS placement candidates: {error}"))?;
-        let coordinator_node_id = service.node_id().clone();
-        sinomo_runtime::dfs::preview_placement(
+        let (stat, candidates, observer_node_id) = {
+            let mut service = self.lock_service()?;
+            self.refresh_service_peer_targets(&mut service);
+            let stat = service
+                .posix_stat_distributed(&path)
+                .map_err(|error| format!("cannot inspect {path}: {error}"))?;
+            let candidates = service
+                .placement_content_candidates()
+                .map_err(|error| format!("cannot read SIFS placement candidates: {error}"))?;
+            (stat, candidates, service.node_id().clone())
+        };
+        let (preview, _, _) = self.preview_materialized_placement_with_paged_impact(
+            &base_config,
             &config,
-            &stat.path,
-            stat.object_id,
-            stat.version,
-            stat.policy,
-            coordinator_node_id,
-            stat.current_locations,
+            &stat,
             candidates,
-            None,
+            observer_node_id,
             scope,
-        )
-        .map_err(|error| format!("cannot preview SIFS placement: {error}"))
+            &cluster_paths,
+        )?;
+        Ok(preview)
     }
 
     pub(crate) fn update_placement(
@@ -451,6 +561,7 @@ impl SifsFileManagerBackend {
         path: &str,
         policy: Option<DfsPlacementPolicy>,
         scope: DfsPlacementScope,
+        expected_preview_token: DfsPlacementPreviewToken,
     ) -> Result<(DfsPlacementPreview, DfsPlacementReconciliationJob), String> {
         let path = normalize_sifs_path(path)?;
         let cluster_paths = ClusterPaths::new(&self.data_dir);
@@ -458,14 +569,17 @@ impl SifsFileManagerBackend {
             return Err("managed SIFS placement requires a cluster".to_string());
         }
         refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
-        let mut service = self.lock_service()?;
-        self.refresh_service_peer_targets(&mut service);
-        let stat = service
-            .posix_stat_distributed(&path)
-            .map_err(|error| format!("cannot inspect {path}: {error}"))?;
-        let candidates = service
-            .placement_content_candidates()
-            .map_err(|error| format!("cannot read SIFS placement candidates: {error}"))?;
+        let (stat, candidates, observer_node_id) = {
+            let mut service = self.lock_service()?;
+            self.refresh_service_peer_targets(&mut service);
+            let stat = service
+                .posix_stat_distributed(&path)
+                .map_err(|error| format!("cannot inspect {path}: {error}"))?;
+            let candidates = service
+                .placement_content_candidates()
+                .map_err(|error| format!("cannot read SIFS placement candidates: {error}"))?;
+            (stat, candidates, service.node_id().clone())
+        };
         let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
         let mut store = DfsControlPlaneStore::new(&mut kv);
         let expected = store
@@ -488,28 +602,40 @@ impl SifsFileManagerBackend {
                 .map_err(|error| format!("invalid SIFS placement path: {error}"))?;
             }
         }
-        let preview = sinomo_runtime::dfs::preview_placement(
-            &desired,
-            &stat.path,
-            stat.object_id,
-            stat.version,
-            stat.policy,
-            service.node_id().clone(),
-            stat.current_locations,
-            candidates,
-            None,
-            scope,
-        )
-        .map_err(|error| format!("cannot preview SIFS placement: {error}"))?;
+        let (preview, unavailable_node_ids, candidate_snapshot) = self
+            .preview_materialized_placement_with_paged_impact(
+                &expected,
+                &desired,
+                &stat,
+                candidates,
+                observer_node_id,
+                scope,
+                &cluster_paths,
+            )?;
+        if !expected_preview_token.is_well_formed()
+            || expected_preview_token != preview.preview_token
+        {
+            return Err(
+                "SIFS placement preview is stale; refresh the preview and review the updated plan before applying"
+                    .to_string(),
+            );
+        }
+        if !preview.is_satisfiable() {
+            return Err(sifs_placement_blocking_error(&preview.blocking_diagnostics));
+        }
         let now = time::OffsetDateTime::now_utc()
             .unix_timestamp_nanos()
             .try_into()
             .unwrap_or(1_000_000_000);
         let job = DfsPlacementReconciliationJob {
+            schema_version: sinomo_runtime::dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
             job_id: sinomo_runtime::core::Id::generate().to_string(),
             file_system_id: desired.file_system_id.clone(),
             path,
             scope,
+            unavailable_node_ids,
+            candidate_snapshot,
+            accepted_config: Some(desired.clone()),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -533,9 +659,16 @@ impl SifsFileManagerBackend {
                     .to_string(),
             );
         }
-        // Make direct/local clients useful even without waiting for the daemon;
-        // the same durable job remains available to mandatory maintenance.
-        let _ = service.run_placement_reconciliation_bounded(256);
+        let job = store
+            .placement_reconciliation(&desired.file_system_id, &job.job_id)
+            .map_err(|error| format!("cannot read accepted SIFS placement job: {error}"))?
+            .ok_or_else(|| {
+                "accepted SIFS placement job is missing from the control plane".to_string()
+            })?;
+        // Reconciliation belongs to the main daemon, whose exclusive
+        // data-owner lock makes prior-session permit recovery safe. A short-
+        // lived CLI process must never become an indistinguishable placement
+        // authority holder while that daemon remains active.
         Ok((preview, job))
     }
 
@@ -1933,6 +2066,227 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     candidates
 }
 
+#[derive(Clone, Debug, Default)]
+struct SifsPlacementConnectivitySnapshot {
+    local_node_id: Option<NodeId>,
+    graph: Option<network::ClusterConnectivityGraph>,
+    advertised_endpoints: Vec<sinomo_runtime::core::ClusterEndpointRecord>,
+}
+
+impl SifsPlacementConnectivitySnapshot {
+    fn reachability(&self, target_node_id: &NodeId) -> DfsPlacementNodeReachability {
+        let Some(local_node_id) = self.local_node_id.as_ref() else {
+            return DfsPlacementNodeReachability::Unknown;
+        };
+        if target_node_id == local_node_id {
+            return DfsPlacementNodeReachability::Local;
+        }
+        let Some(graph) = self.graph.as_ref() else {
+            return DfsPlacementNodeReachability::Unknown;
+        };
+        sifs_placement_node_reachability(
+            graph,
+            &self.advertised_endpoints,
+            local_node_id,
+            target_node_id,
+        )
+    }
+
+    fn explicitly_unavailable_node_ids(&self) -> BTreeSet<NodeId> {
+        self.advertised_endpoints
+            .iter()
+            .map(|endpoint| endpoint.node_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|node_id| {
+                self.reachability(node_id) == DfsPlacementNodeReachability::Unreachable
+            })
+            .collect()
+    }
+}
+
+fn sifs_placement_connectivity_snapshot(
+    cluster_paths: &ClusterPaths,
+) -> SifsPlacementConnectivitySnapshot {
+    let Ok(state) = cluster::read_cluster_state_without_kv(cluster_paths) else {
+        return SifsPlacementConnectivitySnapshot::default();
+    };
+    let local_node_id = Some(state.local_node_id.clone());
+
+    let mut advertised_endpoints = network::cluster_directory_for(cluster_paths)
+        .endpoints()
+        .unwrap_or_default();
+    if advertised_endpoints.is_empty() {
+        advertised_endpoints.extend(
+            state
+                .members
+                .iter()
+                .flat_map(|member| member.endpoints.iter().cloned()),
+        );
+    }
+    // Connectivity is observational. If the graph cannot be read, retain the
+    // local identity and directory snapshot but leave remote nodes Unknown
+    // instead of treating a missing observation as an outage.
+    let graph = network::ClusterConnectivityGraph::try_read_for_local(cluster_paths, &state).ok();
+    SifsPlacementConnectivitySnapshot {
+        local_node_id,
+        graph,
+        advertised_endpoints,
+    }
+}
+
+fn enrich_sifs_placement_preview_reachability(
+    preview: &mut DfsPlacementPreview,
+    connectivity: &SifsPlacementConnectivitySnapshot,
+) {
+    for node in &mut preview.nodes {
+        node.reachability = connectivity.reachability(&node.node_id);
+    }
+    enrich_sifs_placement_nodes_from_reachability(
+        &mut preview.nodes,
+        &mut preview.blocking_diagnostics,
+    );
+    if !preview.blocking_diagnostics.is_empty() {
+        preview.impact.complete = false;
+    }
+}
+
+fn enrich_sifs_placement_nodes_from_reachability(
+    nodes: &mut [DfsPlacementNodePreview],
+    blocking_diagnostics: &mut Vec<DfsPlacementBlockingDiagnostic>,
+) {
+    const DESIRED_BECAME_UNREACHABLE: &str =
+        "blocked: this desired replica became explicitly unreachable before apply";
+
+    let mut additional_diagnostics = Vec::new();
+    for node in nodes
+        .iter_mut()
+        .filter(|node| node.reachability == DfsPlacementNodeReachability::Unreachable)
+    {
+        if node.required {
+            additional_diagnostics.push(DfsPlacementBlockingDiagnostic::RequiredNodeUnavailable {
+                node_id: node.node_id.clone(),
+            });
+        }
+        if node.desired_replica {
+            additional_diagnostics.push(DfsPlacementBlockingDiagnostic::DesiredNodeUnavailable {
+                node_id: node.node_id.clone(),
+            });
+            if !node.explanation.contains(DESIRED_BECAME_UNREACHABLE) {
+                if !node.explanation.is_empty() {
+                    node.explanation.push_str("; ");
+                }
+                node.explanation.push_str(DESIRED_BECAME_UNREACHABLE);
+            }
+        }
+    }
+    extend_unique_sifs_placement_diagnostics(blocking_diagnostics, additional_diagnostics);
+}
+
+fn sifs_placement_node_reachability(
+    graph: &network::ClusterConnectivityGraph,
+    advertised_endpoints: &[sinomo_runtime::core::ClusterEndpointRecord],
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> DfsPlacementNodeReachability {
+    if target_node_id == local_node_id {
+        return DfsPlacementNodeReachability::Local;
+    }
+    if network::cluster_route_next_hop(graph, local_node_id, target_node_id).is_some() {
+        return DfsPlacementNodeReachability::Reachable;
+    }
+
+    let mut target_endpoints = advertised_endpoints
+        .iter()
+        .filter(|endpoint| &endpoint.node_id == target_node_id)
+        .peekable();
+    if target_endpoints.peek().is_some()
+        && target_endpoints.all(|endpoint| {
+            matches!(
+                graph.state_for_endpoint(endpoint),
+                Some(network::ClusterConnectivityState::Unreachable)
+            )
+        })
+    {
+        DfsPlacementNodeReachability::Unreachable
+    } else {
+        DfsPlacementNodeReachability::Unknown
+    }
+}
+
+#[cfg(test)]
+fn merge_sifs_placement_impact(aggregate: &mut DfsPlacementImpact, subtotal: &DfsPlacementImpact) {
+    sinomo_runtime::dfs::merge_placement_impact(aggregate, subtotal);
+}
+
+fn extend_unique_sifs_placement_diagnostics(
+    target: &mut Vec<DfsPlacementBlockingDiagnostic>,
+    diagnostics: impl IntoIterator<Item = DfsPlacementBlockingDiagnostic>,
+) {
+    for diagnostic in diagnostics {
+        if !target.contains(&diagnostic) {
+            target.push(diagnostic);
+        }
+    }
+}
+
+fn merge_sifs_placement_page_diagnostics(
+    preview: &mut DfsPlacementPreview,
+    diagnostics: impl IntoIterator<Item = DfsPlacementBlockingDiagnostic>,
+) {
+    let anchor_path = preview
+        .resolved
+        .source_path
+        .clone()
+        .unwrap_or_else(|| preview.resolved.path.clone());
+    let anchor_scope = preview
+        .resolved
+        .source_scope
+        .unwrap_or(DfsPlacementScope::SelfOnly);
+    merge_sifs_scoped_placement_diagnostics(
+        &mut preview.blocking_diagnostics,
+        &anchor_path,
+        anchor_scope,
+        diagnostics,
+    );
+}
+
+fn merge_sifs_scoped_placement_diagnostics(
+    target: &mut Vec<DfsPlacementBlockingDiagnostic>,
+    anchor_path: &str,
+    anchor_scope: DfsPlacementScope,
+    diagnostics: impl IntoIterator<Item = DfsPlacementBlockingDiagnostic>,
+) {
+    for diagnostic in diagnostics {
+        let duplicates_unscoped_anchor = matches!(
+            &diagnostic,
+            DfsPlacementBlockingDiagnostic::ScopedPolicy {
+                path,
+                scope,
+                diagnostic,
+            } if path == anchor_path
+                && *scope == anchor_scope
+                && target.contains(diagnostic.as_ref())
+        );
+        if !duplicates_unscoped_anchor && !target.contains(&diagnostic) {
+            target.push(diagnostic);
+        }
+    }
+}
+
+fn sifs_placement_blocking_error(diagnostics: &[DfsPlacementBlockingDiagnostic]) -> String {
+    let detail = diagnostics
+        .iter()
+        .map(DfsPlacementBlockingDiagnostic::message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detail.is_empty() {
+        "cannot apply unsatisfiable SIFS placement policy".to_string()
+    } else {
+        format!("cannot apply unsatisfiable SIFS placement policy: {detail}")
+    }
+}
+
 #[cfg(test)]
 fn choose_sifs_remote_replica_candidate(
     graph: &network::ClusterConnectivityGraph,
@@ -3184,6 +3538,201 @@ mod tests {
     }
 
     #[test]
+    fn placement_reachability_requires_explicit_unreachable_observations() {
+        let local = NodeId::from_legacy_named("node_placement_reachability_local").expect("node");
+        let reachable =
+            NodeId::from_legacy_named("node_placement_reachability_reachable").expect("node");
+        let unreachable_required =
+            NodeId::from_legacy_named("node_placement_reachability_required").expect("node");
+        let unreachable_desired =
+            NodeId::from_legacy_named("node_placement_reachability_desired").expect("node");
+        let unknown =
+            NodeId::from_legacy_named("node_placement_reachability_unknown").expect("node");
+        let reachable_record = healthy_connectivity_record(&local, &reachable, 3);
+        let required_record = connectivity_record(
+            &local,
+            &unreachable_required,
+            network::ClusterConnectivityState::Unreachable,
+            None,
+        );
+        let desired_record = connectivity_record(
+            &local,
+            &unreachable_desired,
+            network::ClusterConnectivityState::Unreachable,
+            None,
+        );
+        let endpoints = vec![
+            connectivity_endpoint(&reachable_record),
+            connectivity_endpoint(&required_record),
+            connectivity_endpoint(&desired_record),
+            connectivity_endpoint(&healthy_connectivity_record(&local, &unknown, 5)),
+        ];
+        let graph = network::ClusterConnectivityGraph::from_records(
+            local.clone(),
+            vec![reachable_record, required_record, desired_record],
+        );
+        let snapshot = SifsPlacementConnectivitySnapshot {
+            local_node_id: Some(local.clone()),
+            graph: Some(graph),
+            advertised_endpoints: endpoints,
+        };
+
+        assert_eq!(
+            snapshot.reachability(&local),
+            DfsPlacementNodeReachability::Local
+        );
+        assert_eq!(
+            snapshot.reachability(&reachable),
+            DfsPlacementNodeReachability::Reachable
+        );
+        assert_eq!(
+            snapshot.reachability(&unreachable_required),
+            DfsPlacementNodeReachability::Unreachable
+        );
+        assert_eq!(
+            snapshot.reachability(&unknown),
+            DfsPlacementNodeReachability::Unknown,
+            "an advertised endpoint without a connectivity observation must remain unknown"
+        );
+        assert_eq!(
+            snapshot.explicitly_unavailable_node_ids(),
+            BTreeSet::from([unreachable_desired.clone(), unreachable_required.clone(),]),
+            "only positively unreachable nodes should be excluded from planning"
+        );
+
+        let mut nodes = vec![
+            {
+                let mut node = placement_node_preview(unreachable_required.clone(), true);
+                node.desired_replica = true;
+                node
+            },
+            {
+                let mut node = placement_node_preview(unreachable_desired.clone(), false);
+                node.desired_replica = true;
+                node.explanation = "selected by dry run".to_string();
+                node
+            },
+            placement_node_preview(unknown.clone(), true),
+        ];
+        for node in &mut nodes {
+            node.reachability = snapshot.reachability(&node.node_id);
+        }
+        let mut diagnostics = Vec::new();
+        enrich_sifs_placement_nodes_from_reachability(&mut nodes, &mut diagnostics);
+        enrich_sifs_placement_nodes_from_reachability(&mut nodes, &mut diagnostics);
+        assert_eq!(
+            nodes[0].reachability,
+            DfsPlacementNodeReachability::Unreachable
+        );
+        assert_eq!(nodes[2].reachability, DfsPlacementNodeReachability::Unknown);
+        assert!(nodes[0].explanation.contains("explicitly unreachable"));
+        assert!(nodes[1].explanation.contains("explicitly unreachable"));
+        assert_eq!(
+            diagnostics,
+            vec![
+                DfsPlacementBlockingDiagnostic::RequiredNodeUnavailable {
+                    node_id: unreachable_required.clone(),
+                },
+                DfsPlacementBlockingDiagnostic::DesiredNodeUnavailable {
+                    node_id: unreachable_required,
+                },
+                DfsPlacementBlockingDiagnostic::DesiredNodeUnavailable {
+                    node_id: unreachable_desired,
+                },
+            ],
+            "required or selected unavailable nodes should block without duplicates"
+        );
+    }
+
+    #[test]
+    fn placement_impact_merge_is_saturating_and_preserves_incomplete_pages() {
+        let mut aggregate = DfsPlacementImpact {
+            affected_object_count: u64::MAX,
+            affected_bytes: 10,
+            unknown_size_object_count: 1,
+            copies_added: 2,
+            copies_removed: 3,
+            metadata_snapshot_digest: String::new(),
+            complete: true,
+        };
+        merge_sifs_placement_impact(
+            &mut aggregate,
+            &DfsPlacementImpact {
+                affected_object_count: 1,
+                affected_bytes: 20,
+                unknown_size_object_count: 4,
+                copies_added: 5,
+                copies_removed: 6,
+                metadata_snapshot_digest: String::new(),
+                complete: false,
+            },
+        );
+
+        assert_eq!(aggregate.affected_object_count, u64::MAX);
+        assert_eq!(aggregate.affected_bytes, 30);
+        assert_eq!(aggregate.unknown_size_object_count, 5);
+        assert_eq!(aggregate.copies_added, 7);
+        assert_eq!(aggregate.copies_removed, 9);
+        assert!(!aggregate.complete);
+    }
+
+    #[test]
+    fn placement_page_diagnostics_do_not_duplicate_the_anchor_failure() {
+        let root_failure = DfsPlacementBlockingDiagnostic::InsufficientCandidates {
+            available: 1,
+            required: 2,
+        };
+        let nested_failure = DfsPlacementBlockingDiagnostic::InsufficientZones {
+            available: 1,
+            required: 2,
+        };
+        let mut diagnostics = vec![root_failure.clone()];
+        merge_sifs_scoped_placement_diagnostics(
+            &mut diagnostics,
+            "/services",
+            DfsPlacementScope::Subtree,
+            [
+                DfsPlacementBlockingDiagnostic::ScopedPolicy {
+                    path: "/services".to_string(),
+                    scope: DfsPlacementScope::Subtree,
+                    diagnostic: Box::new(root_failure),
+                },
+                DfsPlacementBlockingDiagnostic::ScopedPolicy {
+                    path: "/services/nested".to_string(),
+                    scope: DfsPlacementScope::Subtree,
+                    diagnostic: Box::new(nested_failure),
+                },
+            ],
+        );
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(matches!(
+            &diagnostics[1],
+            DfsPlacementBlockingDiagnostic::ScopedPolicy { path, .. }
+                if path == "/services/nested"
+        ));
+    }
+
+    #[test]
+    fn placement_blocking_error_names_each_unsatisfied_constraint() {
+        let required =
+            NodeId::from_legacy_named("node_placement_required_unavailable").expect("node");
+        let error = sifs_placement_blocking_error(&[
+            DfsPlacementBlockingDiagnostic::InsufficientCandidates {
+                available: 1,
+                required: 2,
+            },
+            DfsPlacementBlockingDiagnostic::RequiredNodeUnavailable {
+                node_id: required.clone(),
+            },
+        ]);
+
+        assert!(error.contains("cannot apply unsatisfiable SIFS placement policy"));
+        assert!(error.contains("only 1 eligible content nodes"));
+        assert!(error.contains(&required.to_string()));
+    }
+
+    #[test]
     fn remote_replica_candidate_requires_healthy_peer() {
         let local = NodeId::from_legacy_named("node_replica_select_local").expect("node");
         let degraded = NodeId::from_legacy_named("node_replica_select_degraded").expect("node");
@@ -3462,6 +4011,39 @@ mod tests {
             failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(600),
+        }
+    }
+
+    fn connectivity_endpoint(
+        record: &network::ClusterConnectivityRecord,
+    ) -> sinomo_runtime::core::ClusterEndpointRecord {
+        sinomo_runtime::core::ClusterEndpointRecord {
+            endpoint_id: record.endpoint_id.clone(),
+            node_id: record.target_node_id.clone(),
+            transport: record.transport.clone(),
+            address: record.address.clone(),
+            source: sinomo_runtime::core::ClusterEndpointSource::Static,
+            privacy: sinomo_runtime::core::ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: record
+                .latency_ms
+                .and_then(|latency| latency.try_into().ok()),
+        }
+    }
+
+    fn placement_node_preview(node_id: NodeId, required: bool) -> DfsPlacementNodePreview {
+        DfsPlacementNodePreview {
+            node_id,
+            zone: None,
+            capacity_weight: 1,
+            accepts_content: true,
+            reachability: DfsPlacementNodeReachability::Unknown,
+            current_replica: false,
+            desired_replica: false,
+            preferred_for_commit: false,
+            required,
+            forbidden: false,
+            explanation: String::new(),
         }
     }
 
