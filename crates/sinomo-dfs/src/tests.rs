@@ -1159,6 +1159,64 @@ struct CountingFailingSendTransport {
     send_count: Arc<AtomicUsize>,
 }
 
+struct RecordingFailingSendTransport {
+    local_node_id: NodeId,
+    targets: Arc<Mutex<Vec<NodeId>>>,
+}
+
+impl DfsTransportIdentity for RecordingFailingSendTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsMessageTransport for RecordingFailingSendTransport {
+    fn send_routed_call(
+        &mut self,
+        target_node_id: &NodeId,
+        _call: DfsRoutedCall,
+    ) -> Result<(), NetworkError> {
+        self.targets
+            .lock()
+            .expect("recording targets lock")
+            .push(target_node_id.clone());
+        Err(NetworkError::Io {
+            operation: "test recorded send".to_string(),
+            detail: "unreachable".to_string(),
+        })
+    }
+
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(Vec::new())
+    }
+}
+
+impl AsyncDfsMessageTransport for RecordingFailingSendTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    fn send_routed_call_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        call: DfsRoutedCall,
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
+        Box::pin(async move { self.send_routed_call(target_node_id, call) })
+    }
+
+    fn drain_incoming_messages_async<'a>(
+        &'a mut self,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn pending_incoming_count_async<'a>(
+        &'a mut self,
+    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+        Box::pin(async { Ok(Some(0)) })
+    }
+}
+
 impl DfsTransportIdentity for CountingFailingSendTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
@@ -8656,6 +8714,68 @@ fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
 }
 
 #[test]
+fn metadata_execution_exclusions_park_offline_before_planning_healthy_target() {
+    let root = temp_root("metadata-execution-exclusions");
+    let local = NodeId::from_legacy_named("node_meta_exclusion_local").expect("local");
+    let offline = NodeId::from_legacy_named("node_meta_exclusion_offline").expect("offline");
+    let healthy = NodeId::from_legacy_named("node_meta_exclusion_healthy").expect("healthy");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(local.clone());
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("root"))
+        .expect("metadata backend");
+    backend
+        .put_file_system(&file_system)
+        .expect("filesystem metadata");
+    let mut object = file_metadata(local.clone());
+    object.object_id = DfsObjectId::from_legacy_named("obj_meta_exclusion").expect("object");
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/metadata/exclusion.txt".to_string();
+    backend.put_object(&object).expect("object metadata");
+    drop(backend);
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: local.clone(),
+        replica_node_ids: vec![offline.clone(), healthy.clone()],
+        epoch: 3,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let mut host = RecordingMetadataJournalPublisherHost::new(root.path().to_path_buf());
+
+    let (outcomes, targets) =
+        prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions(
+            file_system.file_system_id,
+            &local,
+            vec![shard],
+            &mut host,
+            &[],
+            &DfsMaintenanceExecutionExclusions::new([offline.clone()]),
+            DfsMetadataJournalReplicationOptions::default(),
+        )
+        .expect("prepare metadata publish with execution exclusion");
+
+    assert!(matches!(
+        outcomes.as_slice(),
+        [DfsMetadataJournalReplicationOutcome::MissingRoute {
+            target_node_id,
+            shard_id: outcome_shard_id,
+            after_sequence: 0,
+        }] if target_node_id == &offline && outcome_shard_id == &shard_id
+    ));
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].target_node_id, healthy);
+    assert_eq!(targets[0].after_sequence, 0);
+    assert!(!targets[0].commands.is_empty());
+    assert_eq!(
+        host.cursor_requests,
+        vec![(offline, shard_id.clone()), (healthy, shard_id)]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn metadata_replication_primary_mismatch_is_topology_mismatch() {
     assert!(metadata_replication_rejection_is_topology_mismatch(
         "metadata journal source node_b is not shard services primary node_a"
@@ -9241,7 +9361,7 @@ fn async_metadata_node_transport_rejects_mismatched_journal_response() {
                     })
                 })
             });
-        let mut transport =
+        let transport =
             AsyncDfsMetadataNodeTransport::new(vec![target.clone()], sender, snapshot_sender);
         let command = DfsMetadataJournalBatchCommand {
             request_id: "async-meta-node_route-mismatch".to_string(),
@@ -15890,6 +16010,139 @@ fn retry_pending_repairs_bounded_limits_scheduled_transfers() {
     assert_eq!(replica_messages, 1);
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn repair_execution_exclusions_park_offline_target_and_run_healthy_target() {
+    let root = temp_root("repair-execution-exclusions");
+    let owner = NodeId::from_legacy_named("node_repair_exclusion_owner").expect("owner");
+    let offline = NodeId::from_legacy_named("node_repair_exclusion_offline").expect("offline");
+    let healthy = NodeId::from_legacy_named("node_repair_exclusion_healthy").expect("healthy");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_exclusion").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_repair_exclusion_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_repair_exclusion_2").expect("version");
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let mut owner_dfs = NetworkedDfsService::new(
+        RecordingFailingSendTransport {
+            local_node_id: owner.clone(),
+            targets: Arc::clone(&targets),
+        },
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    );
+    owner_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("filesystem");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs.add_object_metadata(metadata).expect("object");
+
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(b"repair exclusion body".to_vec()),
+            vec![owner, offline.clone(), healthy.clone()],
+            DfsReplicationPolicy::new(1, 3).expect("policy"),
+            true,
+            false,
+        )
+        .expect("write should commit");
+    let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = write else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 2);
+    targets.lock().expect("recorded targets").clear();
+
+    let scheduled = owner_dfs
+        .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
+            1,
+            &[],
+            &DfsMaintenanceExecutionExclusions::new([offline.clone()]),
+        )
+        .await
+        .expect("repair retry with execution exclusion");
+
+    assert!(
+        scheduled.is_empty(),
+        "the recording transport rejects sends"
+    );
+    assert_eq!(
+        *targets.lock().expect("recorded targets"),
+        vec![healthy],
+        "the excluded target must not execute or consume the one-target budget"
+    );
+    assert!(
+        owner_dfs
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .any(|job| job.missing_replica_node_id == offline)
+    );
+    assert!(
+        owner_dfs
+            .active_repair_attempt_records()
+            .iter()
+            .all(|record| record.missing_replica_node_id != offline),
+        "execution exclusion must not mutate the parked target's attempt state"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn parked_repair_attempt_merge_preserves_active_inputs_byte_for_byte() {
+    let offline = NodeId::from_legacy_named("node_repair_attempt_parked").expect("offline");
+    let healthy = NodeId::from_legacy_named("node_repair_attempt_healthy").expect("healthy");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_attempt_parked").expect("object");
+    let version = DfsVersion::from_legacy_named("version_repair_attempt_parked").expect("version");
+    let content_hash = format!("blake3:{}", "2".repeat(64));
+    let record =
+        |intent_id: &str, target: NodeId, next_retry_unix_nanos: u64| DfsRepairAttemptRecord {
+            intent_id: intent_id.to_string(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: content_hash.clone(),
+            missing_replica_node_id: target,
+            attempts: 7,
+            in_flight: true,
+            last_attempt_unix_nanos: 11,
+            next_retry_unix_nanos,
+            transfer_request_id: Some(format!("request-{intent_id}")),
+            last_error: Some("transient route failure".to_string()),
+        };
+    let parked_future = record("intent-parked-future", offline.clone(), 99);
+    let parked_due = record("intent-parked-due", offline.clone(), 1);
+    let parked_completed = record("intent-parked-completed", offline.clone(), 55);
+    let mut regenerated_excluded = parked_future.clone();
+    regenerated_excluded.attempts = 8;
+    regenerated_excluded.in_flight = false;
+    regenerated_excluded.last_attempt_unix_nanos = 88;
+    regenerated_excluded.next_retry_unix_nanos = 100;
+    regenerated_excluded.transfer_request_id = None;
+    let healthy_active = record("intent-healthy", healthy.clone(), 42);
+    let active_repair_keys = BTreeSet::from([
+        (parked_future.intent_id.clone(), offline.clone()),
+        (parked_due.intent_id.clone(), offline.clone()),
+        (healthy_active.intent_id.clone(), healthy),
+    ]);
+
+    let merged = crate::maintenance::merge_parked_dfs_repair_attempt_records(
+        vec![regenerated_excluded, healthy_active.clone()],
+        vec![parked_future.clone(), parked_due.clone(), parked_completed],
+        &active_repair_keys,
+        &DfsMaintenanceExecutionExclusions::new([offline]),
+    );
+
+    assert_eq!(merged.len(), 3);
+    assert!(merged.contains(&parked_future));
+    assert!(merged.contains(&parked_due));
+    assert!(merged.contains(&healthy_active));
 }
 
 #[test]

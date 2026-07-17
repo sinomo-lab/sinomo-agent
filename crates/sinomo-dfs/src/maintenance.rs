@@ -9,6 +9,7 @@ use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +37,7 @@ use crate::{
     open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
-    publish_dfs_metadata_journal_with_async_host, publish_dfs_metadata_journal_with_host,
+    publish_dfs_metadata_journal_with_host,
     refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
 
@@ -126,6 +127,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
         sync_peer_transport,
         peer_transport,
         None,
+        DfsMaintenanceExecutionExclusions::default(),
         control_plane,
         options,
     )
@@ -150,6 +152,32 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions(
+        runtime,
+        data_dir,
+        cluster_paths,
+        sync_peer_transport,
+        peer_transport,
+        detached_send_state,
+        DfsMaintenanceExecutionExclusions::default(),
+        control_plane,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
         runtime,
         data_dir,
@@ -157,6 +185,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
         sync_peer_transport,
         peer_transport,
         Some(detached_send_state),
+        execution_exclusions,
         control_plane,
         options,
     )
@@ -171,6 +200,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
     sync_peer_transport: Arc<dyn DfsPeerTransport>,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     detached_send_state: Option<DfsNodeDetachedSendState>,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
@@ -225,7 +255,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
         async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
-    run_dfs_maintenance_tick_with_async_host(
+    run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
         &mut service,
         &mut maintenance_host,
         &data_dir,
@@ -234,6 +264,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
         metadata_shards,
         &mut metadata_publisher_host,
         &mut metadata_transport,
+        &execution_exclusions,
         options,
     )
     .await
@@ -959,6 +990,57 @@ pub struct DfsMaintenanceTickOptions {
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
 }
 
+/// Targets that one maintenance execution must leave parked.
+///
+/// This is deliberately separate from durable DFS topology and retry
+/// suppression. A later pass with a different reachability view can execute
+/// the same durable repair or metadata-replication backlog immediately.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsMaintenanceExecutionExclusions {
+    target_node_ids: BTreeSet<NodeId>,
+}
+
+impl DfsMaintenanceExecutionExclusions {
+    pub fn new(target_node_ids: impl IntoIterator<Item = NodeId>) -> Self {
+        Self {
+            target_node_ids: target_node_ids.into_iter().collect(),
+        }
+    }
+
+    pub fn contains(&self, target_node_id: &NodeId) -> bool {
+        self.target_node_ids.contains(target_node_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.target_node_ids.is_empty()
+    }
+}
+
+pub(crate) fn merge_parked_dfs_repair_attempt_records(
+    active_records: Vec<DfsRepairAttemptRecord>,
+    parked_records: Vec<DfsRepairAttemptRecord>,
+    active_repair_keys: &BTreeSet<(String, NodeId)>,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+) -> Vec<DfsRepairAttemptRecord> {
+    let mut records = active_records
+        .into_iter()
+        .filter(|record| !execution_exclusions.contains(&record.missing_replica_node_id))
+        .collect::<Vec<_>>();
+    records.extend(parked_records.into_iter().filter(|record| {
+        active_repair_keys.contains(&(
+            record.intent_id.clone(),
+            record.missing_replica_node_id.clone(),
+        ))
+    }));
+    records.sort_by(|left, right| {
+        left.intent_id.cmp(&right.intent_id).then_with(|| {
+            left.missing_replica_node_id
+                .cmp(&right.missing_replica_node_id)
+        })
+    });
+    records
+}
+
 impl Default for DfsMaintenanceTickOptions {
     fn default() -> Self {
         Self {
@@ -1364,6 +1446,37 @@ pub async fn run_dfs_maintenance_tick_with_async_host<T>(
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
+    run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+        service,
+        maintenance_host,
+        data_dir,
+        file_system_id,
+        local_node_id,
+        metadata_shards,
+        metadata_publisher_host,
+        metadata_transport,
+        &DfsMaintenanceExecutionExclusions::default(),
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_dfs_maintenance_tick_with_async_host_and_execution_exclusions<T>(
+    service: &mut NetworkedDfsService<T>,
+    maintenance_host: &mut dyn DfsMaintenanceHost,
+    data_dir: &SinomoDataDir,
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
+    metadata_shards: Vec<DfsMetadataShardConfig>,
+    metadata_publisher_host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMaintenanceTickOptions,
+) -> Result<DfsMaintenanceTickReport, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
     // Keep the async tick's safety ordering identical to the synchronous tick:
     // handoff activation/rebind must precede every freeze-sensitive mutation.
     service.reconcile_pending_metadata_shard_membership_handoffs(
@@ -1396,26 +1509,45 @@ where
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
+    let (parked_repair_attempts, eligible_repair_attempts): (Vec<_>, Vec<_>) =
+        repair_attempts_before
+            .iter()
+            .cloned()
+            .partition(|record| execution_exclusions.contains(&record.missing_replica_node_id));
     let scheduled_repairs = service
-        .retry_pending_repairs_async_bounded_with_attempts(
+        .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
             options.repair_max_jobs,
-            &repair_attempts_before,
+            &eligible_repair_attempts,
+            execution_exclusions,
         )
         .await?;
     let followup_events = service.process_incoming_async_until_quiescent().await?;
     service.observe_repair_maintenance_events(&followup_events);
-    let repair_attempts_after = service.active_repair_attempt_records();
+    let active_repair_keys = service
+        .coordinator
+        .repair_jobs()
+        .iter()
+        .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let repair_attempts_after = merge_parked_dfs_repair_attempt_records(
+        service.active_repair_attempt_records(),
+        parked_repair_attempts,
+        &active_repair_keys,
+        execution_exclusions,
+    );
     maintenance_host.store_repair_attempt_records(&repair_attempts_after)?;
-    let metadata_replication = publish_dfs_metadata_journal_with_async_host(
-        file_system_id,
-        local_node_id,
-        metadata_shards.clone(),
-        data_dir,
-        metadata_publisher_host,
-        metadata_transport,
-        options.metadata_replication,
-    )
-    .await?;
+    let metadata_replication =
+        crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
+            file_system_id,
+            local_node_id,
+            metadata_shards.clone(),
+            data_dir,
+            metadata_publisher_host,
+            metadata_transport,
+            execution_exclusions,
+            options.metadata_replication,
+        )
+        .await?;
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,

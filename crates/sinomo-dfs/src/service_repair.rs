@@ -85,6 +85,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent: &DistributedWriteIntent,
         pending: &PendingNetworkedWrite,
         durable_nodes: &BTreeSet<NodeId>,
+        execution_exclusions: Option<&DfsMaintenanceExecutionExclusions>,
     ) -> usize {
         let durable_desired = intent
             .desired_replica_nodes
@@ -97,6 +98,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|node_id| {
                 intent.desired_replica_nodes.contains(*node_id)
                     && !durable_nodes.contains(*node_id)
+                    && !execution_exclusions.is_some_and(|excluded| excluded.contains(node_id))
                     && !self.stage_retry_is_due(&intent.intent_id, node_id)
             })
             .cloned();
@@ -106,6 +108,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|node_id| {
                 intent.desired_replica_nodes.contains(*node_id)
                     && !durable_nodes.contains(*node_id)
+                    && !execution_exclusions.is_some_and(|excluded| excluded.contains(node_id))
                     && !self.repair_retry_is_due(&intent.intent_id, node_id)
             })
             .cloned();
@@ -126,12 +129,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent: &DistributedWriteIntent,
         pending: &PendingNetworkedWrite,
         durable_nodes: &BTreeSet<NodeId>,
+        execution_exclusions: Option<&DfsMaintenanceExecutionExclusions>,
     ) -> Vec<NodeId> {
-        let budget = self.pending_stage_send_budget(intent, pending, durable_nodes);
+        let budget =
+            self.pending_stage_send_budget(intent, pending, durable_nodes, execution_exclusions);
         intent
             .desired_replica_nodes
             .iter()
             .filter(|node_id| *node_id != &self.node_id && !durable_nodes.contains(*node_id))
+            .filter(|node_id| {
+                !execution_exclusions.is_some_and(|excluded| excluded.contains(node_id))
+            })
             .filter(|node_id| self.stage_retry_is_due(&intent.intent_id, node_id))
             .filter(|node_id| !self.repair_request_is_active(&intent.intent_id, node_id))
             .take(budget)
@@ -508,10 +516,25 @@ impl<T> NetworkedDfsService<T>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
+    #[cfg(test)]
     pub(crate) async fn retry_pending_repairs_async_bounded_with_attempts(
         &mut self,
         max_scheduled: usize,
         repair_attempts: &[DfsRepairAttemptRecord],
+    ) -> Result<Vec<DistributedRepairJob>, DfsError> {
+        self.retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
+            max_scheduled,
+            repair_attempts,
+            &DfsMaintenanceExecutionExclusions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
+        &mut self,
+        max_scheduled: usize,
+        repair_attempts: &[DfsRepairAttemptRecord],
+        execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_transfer_state();
         self.restore_pending_writes_for_repair_jobs()?;
@@ -522,7 +545,8 @@ where
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
         self.expire_stale_fetch_requests();
         let mut budget = DfsRepairMaintenanceBudget::new(max_scheduled);
-        self.retry_pending_stages_async_bounded(&mut budget).await?;
+        self.retry_pending_stages_async_bounded(&mut budget, execution_exclusions)
+            .await?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
         let mut consumed_repair_targets = BTreeSet::new();
@@ -530,6 +554,9 @@ where
         for job in repair_jobs.iter().cloned() {
             if budget.is_exhausted() {
                 break;
+            }
+            if execution_exclusions.contains(&job.missing_replica_node_id) {
+                continue;
             }
             if consumed_repair_targets
                 .contains(&(job.intent_id.clone(), job.missing_replica_node_id.clone()))
@@ -577,7 +604,7 @@ where
                     continue;
                 }
                 let fetch_outcome = self
-                    .request_repair_blob_from_alternate_async(&job, &pending)
+                    .request_repair_blob_from_alternate_async(&job, &pending, execution_exclusions)
                     .await?;
                 if !fetch_outcome.requested {
                     self.record_repair_retry_scheduled_with_error(
@@ -594,7 +621,7 @@ where
                     break;
                 }
                 let fetch_outcome = self
-                    .request_repair_blob_from_alternate_async(&job, &pending)
+                    .request_repair_blob_from_alternate_async(&job, &pending, execution_exclusions)
                     .await?;
                 if !fetch_outcome.requested {
                     self.record_repair_retry_scheduled_with_error(
@@ -622,6 +649,7 @@ where
                         candidate.intent_id == job.intent_id
                             && candidate.missing_replica_node_id != job.missing_replica_node_id
                             && candidate.missing_replica_node_id != self.node_id
+                            && !execution_exclusions.contains(&candidate.missing_replica_node_id)
                             && !consumed_repair_targets.contains(&(
                                 candidate.intent_id.clone(),
                                 candidate.missing_replica_node_id.clone(),
@@ -711,6 +739,7 @@ where
     async fn retry_pending_stages_async_bounded(
         &mut self,
         budget: &mut DfsRepairMaintenanceBudget,
+        execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<(), DfsError> {
         let pending_intent_ids = self.pending_writes.keys().cloned().collect::<Vec<_>>();
         for intent_id in pending_intent_ids {
@@ -733,8 +762,12 @@ where
                     .into_iter()
                     .map(|receipt| receipt.replica_node_id.clone())
                     .collect::<BTreeSet<_>>();
-                let mut stage_targets =
-                    self.pending_stage_targets(&intent, &pending, &durable_nodes);
+                let mut stage_targets = self.pending_stage_targets(
+                    &intent,
+                    &pending,
+                    &durable_nodes,
+                    Some(execution_exclusions),
+                );
                 if stage_targets.is_empty() {
                     break;
                 }
@@ -775,7 +808,11 @@ where
                 }
                 if self.open_pending_write_blob_stream(&pending).is_err() {
                     let fetch_requested = self
-                        .request_stage_blob_from_alternate_async(&intent, &pending)
+                        .request_stage_blob_from_alternate_async(
+                            &intent,
+                            &pending,
+                            execution_exclusions,
+                        )
                         .await?;
                     if !fetch_requested {
                         for (replica_node_id, _) in full_stage_targets {
@@ -857,11 +894,15 @@ where
         &mut self,
         intent: &DistributedWriteIntent,
         pending: &PendingNetworkedWrite,
+        execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<bool, DfsError> {
         let mut skipped_failed_source = false;
         let authority_object = self.current_read_object_metadata(&pending.object_id).ok();
         let authority_shard = self.command_authority_shard_for_object(authority_object.as_ref())?;
         for source_node_id in self.stage_blob_sources(&intent.intent_id) {
+            if execution_exclusions.contains(&source_node_id) {
+                continue;
+            }
             if pending.fetch_inflight_from.contains(&source_node_id) {
                 continue;
             }
@@ -904,12 +945,16 @@ where
         &mut self,
         job: &DistributedRepairJob,
         pending: &PendingNetworkedWrite,
+        execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<DfsRepairBlobRequestOutcome, DfsError> {
         let mut skipped_failed_source = false;
         let mut last_error = None;
         let authority_object = self.current_read_object_metadata(&pending.object_id).ok();
         let authority_shard = self.command_authority_shard_for_object(authority_object.as_ref())?;
         for source_node_id in self.repair_blob_sources(job, pending)? {
+            if execution_exclusions.contains(&source_node_id) {
+                continue;
+            }
             if pending.fetch_inflight_from.contains(&source_node_id) {
                 continue;
             }
@@ -1344,7 +1389,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .into_iter()
                 .map(|receipt| receipt.replica_node_id.clone())
                 .collect::<BTreeSet<_>>();
-            let mut stage_targets = self.pending_stage_targets(&intent, &pending, &durable_nodes);
+            let mut stage_targets =
+                self.pending_stage_targets(&intent, &pending, &durable_nodes, None);
             if stage_targets.is_empty() {
                 break;
             }

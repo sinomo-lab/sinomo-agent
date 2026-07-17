@@ -24,24 +24,24 @@ use sinomo_dfs::{
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
     DfsMetadataPeerTransportError, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMetadataSnapshotInstallSender, DfsObjectVersionRecord, LocalContentStore,
-    LocalSobjMetadataBackend, default_dfs_metadata_root, distributed_sifs,
-    distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
-    sifs_node_files_path,
+    DfsMetadataSnapshotInstallSender, DfsObjectVersionRecord, LocalSobjMetadataBackend,
+    default_dfs_metadata_root, distributed_sifs, distributed_sifs_bootstrap_objects,
+    file_system_config_key, metadata_shard_key, sifs_node_files_path,
 };
 use sinomo_dfs::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
     DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
-    DfsMaintenanceTickOptions, DfsMessageCommand, DfsMessageExecutionScope,
-    DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
+    DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions, DfsMessageCommand,
+    DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
     DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport,
     DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
     DfsPeerTransportError, DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
-    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
+    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
+    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
+    read_dfs_repair_attempt_snapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -1521,6 +1521,197 @@ fn daemon_dfs_offline_node_ids(
     .collect()
 }
 
+fn daemon_dfs_maintenance_execution_exclusions(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> DfsMaintenanceExecutionExclusions {
+    DfsMaintenanceExecutionExclusions::new(daemon_dfs_offline_node_ids(cluster_paths, state))
+}
+
+fn daemon_dfs_intents_without_recovery_source(
+    data_dir: &SinomoDataDir,
+    metadata: &dyn DfsMetadataBackend,
+    write_intents: &[DfsWriteIntentRecord],
+    receipt_records: &[DfsReplicaReceiptRecord],
+    offline_node_ids: &BTreeSet<NodeId>,
+    local_node_id: &NodeId,
+) -> BTreeSet<String> {
+    if !write_intents
+        .iter()
+        .any(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
+    {
+        return BTreeSet::new();
+    }
+    let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
+    let mut receipts_by_version = BTreeMap::<
+        (
+            &DfsFileSystemId,
+            &sinomo_dfs::DfsObjectId,
+            &sinomo_dfs::DfsVersion,
+        ),
+        Vec<&DfsReplicaReceiptRecord>,
+    >::new();
+    for record in receipt_records {
+        receipts_by_version
+            .entry((
+                &record.receipt.file_system_id,
+                &record.receipt.object_id,
+                &record.receipt.committed_version,
+            ))
+            .or_default()
+            .push(record);
+    }
+    write_intents
+        .iter()
+        .filter(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
+        .filter(|intent| {
+            let Some(content_hash) = intent.content_hash.as_ref() else {
+                return false;
+            };
+            let matching_receipt_node_ids = receipts_by_version
+                .get(&(
+                    &intent.file_system_id,
+                    &intent.object_id,
+                    &intent.target_version,
+                ))
+                .into_iter()
+                .flatten()
+                .filter(|record| {
+                    record.content_hash.as_ref() == Some(content_hash)
+                        && intent
+                            .desired_replica_node_ids
+                            .contains(&record.replica_node_id)
+                })
+                .map(|record| &record.replica_node_id)
+                .collect::<BTreeSet<_>>();
+            if matching_receipt_node_ids.len() >= intent.policy.min_commit_replicas
+                || matching_receipt_node_ids.iter().any(|node_id| {
+                    *node_id != local_node_id && !offline_node_ids.contains(*node_id)
+                })
+            {
+                // Quorum receipts can advance the intent locally even when
+                // their replica nodes are offline. A reachable remote receipt
+                // is also an executable exact-version fetch source.
+                return false;
+            }
+            match metadata.get_object(&intent.object_id) {
+                Ok(Some(object))
+                    if object.file_system_id == intent.file_system_id
+                        && object.version == intent.target_version
+                        && object.content_hash.as_ref() == Some(content_hash) =>
+                {
+                    // The exact target is already visible, so stale-intent
+                    // reconciliation can finish without fetching content.
+                    return false;
+                }
+                Ok(_) => {}
+                // Storage inspection is advisory scheduling state. Fail open
+                // rather than hiding work behind an ambiguous metadata error.
+                Err(_) => return false,
+            }
+            match content.object_version_storage_candidate_exists(
+                intent.object_id.as_str(),
+                intent.target_version.as_str(),
+                content_hash,
+            ) {
+                Ok(true) => false,
+                Ok(false) => true,
+                // Invalid metadata or any local I/O ambiguity must keep the
+                // normal fail-open maintenance cadence.
+                Err(_) => false,
+            }
+        })
+        .map(|intent| intent.intent_id.clone())
+        .collect()
+}
+
+fn daemon_dfs_repairs_without_recovery_source(
+    data_dir: &SinomoDataDir,
+    metadata: &dyn DfsMetadataBackend,
+    repair_views: &[DfsOperatorRepairView],
+    receipt_records: &[DfsReplicaReceiptRecord],
+    offline_node_ids: &BTreeSet<NodeId>,
+    local_node_id: &NodeId,
+) -> BTreeSet<(String, NodeId)> {
+    if repair_views.is_empty() {
+        return BTreeSet::new();
+    }
+    let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
+    let mut receipts_by_version = BTreeMap::<
+        (
+            &DfsFileSystemId,
+            &sinomo_dfs::DfsObjectId,
+            &sinomo_dfs::DfsVersion,
+        ),
+        Vec<&DfsReplicaReceiptRecord>,
+    >::new();
+    for record in receipt_records {
+        receipts_by_version
+            .entry((
+                &record.receipt.file_system_id,
+                &record.receipt.object_id,
+                &record.receipt.committed_version,
+            ))
+            .or_default()
+            .push(record);
+    }
+    repair_views
+        .iter()
+        .filter(|repair| {
+            let Some(content_hash) = repair.content_hash.as_ref() else {
+                return false;
+            };
+            match content.object_version_storage_candidate_exists(
+                repair.object_id.as_str(),
+                repair.version.as_str(),
+                content_hash,
+            ) {
+                Ok(true) => return false,
+                Ok(false) => {}
+                // Advisory source inspection must remain fail-open.
+                Err(_) => return false,
+            }
+            let has_reachable_receipt = receipts_by_version
+                .get(&(&repair.file_system_id, &repair.object_id, &repair.version))
+                .into_iter()
+                .flatten()
+                .any(|record| {
+                    record.content_hash.as_ref() == Some(content_hash)
+                        && &record.replica_node_id != local_node_id
+                        && record.replica_node_id != repair.missing_replica_node_id
+                        && !offline_node_ids.contains(&record.replica_node_id)
+                });
+            if has_reachable_receipt {
+                return false;
+            }
+            match metadata.get_object(&repair.object_id) {
+                Ok(Some(object))
+                    if object.file_system_id == repair.file_system_id
+                        && object.version == repair.version
+                        && object.content_hash.as_ref() == Some(content_hash) =>
+                {
+                    !object.current_locations.iter().any(|node_id| {
+                        node_id != local_node_id
+                            && node_id != &repair.missing_replica_node_id
+                            && !offline_node_ids.contains(node_id)
+                    })
+                }
+                // The repair view may have become stale between the operator
+                // scan and this lookup. Let maintenance reconcile/remove it
+                // instead of classifying the stale record as source-less.
+                Ok(_) => false,
+                Err(_) => false,
+            }
+        })
+        .map(|repair| {
+            (
+                repair.intent_id.clone(),
+                repair.missing_replica_node_id.clone(),
+            )
+        })
+        .collect()
+}
+
 fn daemon_dfs_pending_work_from_records(
     pending_write_count: usize,
     pending_repair_count: usize,
@@ -1530,6 +1721,8 @@ fn daemon_dfs_pending_work_from_records(
     metadata_shard_statuses: &[DfsMetadataShardStatus],
     repair_views: &[DfsOperatorRepairView],
     repair_attempt_records: &[DfsRepairAttemptRecord],
+    intents_without_recovery_source: &BTreeSet<String>,
+    repairs_without_recovery_source: &BTreeSet<(String, NodeId)>,
     offline_node_ids: &BTreeSet<NodeId>,
     local_node_id: &NodeId,
     pending_local_membership_handoff_count: usize,
@@ -1568,6 +1761,12 @@ fn daemon_dfs_pending_work_from_records(
     let eligible_pending_write_count = active_write_intents
         .iter()
         .filter(|intent| {
+            if intents_without_recovery_source.contains(&intent.intent_id) {
+                // A fresh abandoned intent has no executable short-cadence
+                // action when its object, receipts, and readable hash blob are
+                // all absent. Keep it durable for periodic stale reconciliation.
+                return false;
+            }
             let desired_replica_node_ids = intent
                 .desired_replica_node_ids
                 .iter()
@@ -1616,7 +1815,12 @@ fn daemon_dfs_pending_work_from_records(
 
     let mut eligible_repair_keys = BTreeSet::new();
     for repair in repair_views {
-        if !offline_node_ids.contains(&repair.missing_replica_node_id) {
+        if !offline_node_ids.contains(&repair.missing_replica_node_id)
+            && !repairs_without_recovery_source.contains(&(
+                repair.intent_id.clone(),
+                repair.missing_replica_node_id.clone(),
+            ))
+        {
             eligible_repair_keys
                 .insert((repair.intent_id.as_str(), &repair.missing_replica_node_id));
         }
@@ -1705,6 +1909,11 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     } else {
         Vec::new()
     };
+    let repair_views = if summary.pending_repair_count > 0 {
+        DfsOperatorInspector::new(metadata.as_ref()).repairs(None, None)?
+    } else {
+        Vec::new()
+    };
     let mut receipt_records = Vec::new();
     let mut receipt_versions = BTreeSet::new();
     for intent in write_intents.iter().filter(|intent| {
@@ -1718,12 +1927,29 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
                 .extend(metadata.receipts_for_version(&intent.object_id, &intent.target_version)?);
         }
     }
-    let repair_views = if summary.pending_repair_count > 0 {
-        DfsOperatorInspector::new(metadata.as_ref()).repairs(None, None)?
-    } else {
-        Vec::new()
-    };
+    for repair in &repair_views {
+        if receipt_versions.insert((repair.object_id.clone(), repair.version.clone())) {
+            receipt_records
+                .extend(metadata.receipts_for_version(&repair.object_id, &repair.version)?);
+        }
+    }
     let offline_node_ids = daemon_dfs_offline_node_ids(&cluster_paths, &state);
+    let intents_without_recovery_source = daemon_dfs_intents_without_recovery_source(
+        &data_dir,
+        metadata.as_ref(),
+        &write_intents,
+        &receipt_records,
+        &offline_node_ids,
+        &state.local_node_id,
+    );
+    let repairs_without_recovery_source = daemon_dfs_repairs_without_recovery_source(
+        &data_dir,
+        metadata.as_ref(),
+        &repair_views,
+        &receipt_records,
+        &offline_node_ids,
+        &state.local_node_id,
+    );
     Ok(daemon_dfs_pending_work_from_records(
         summary.pending_write_count,
         summary.pending_repair_count,
@@ -1733,6 +1959,8 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &metadata_shard_statuses,
         &repair_views,
         &repair_attempt_records,
+        &intents_without_recovery_source,
+        &repairs_without_recovery_source,
         &offline_node_ids,
         &state.local_node_id,
         pending_local_membership_handoff_count,
@@ -2754,21 +2982,11 @@ async fn handle_daemon_dfs_message_async(
     let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
     if should_publish_metadata {
         notify_daemon_dfs_maintenance_work();
-        let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
-        let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
-        sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime(
-            runtime.clone(),
+        schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
             data_dir,
             cluster_paths,
-            peer_transport,
-            async_peer_transport,
-            &events,
-            daemon_dfs_metadata_publish_schedule_options(),
-            daemon_dfs_metadata_replication_options(),
-            log_dfs_metadata_replication_report,
-            |error| {
-                tracing::warn!("sinomo daemon DFS metadata publish after message mutation failed: {error}");
-            },
+            runtime,
+            traceparent.clone(),
         );
     }
     daemon_dfs_perf_trace_with_traceparent(
@@ -2958,6 +3176,8 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     }
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
+    let execution_exclusions =
+        daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
     // Publish maintenance interest before cluster/local admission. A
     // foreground request that queues anywhere behind this pass can then ask it
     // to yield once its current synchronous poll reaches an await boundary.
@@ -2992,6 +3212,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
                 data_dir,
                 cluster_paths.clone(),
                 cluster_state,
+                execution_exclusions,
                 runtime,
                 &mut deferred_work,
             ));
@@ -3037,6 +3258,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     cluster_state: sinomo_core::ClusterBootstrapState,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
     runtime: &tokio::runtime::Handle,
     deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
 ) -> Result<(), DaemonError> {
@@ -3061,13 +3283,14 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
     let maintenance_result =
-        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state(
+        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions(
             runtime,
             data_dir.clone(),
             cluster_paths.clone(),
             peer_transport,
             async_peer_transport,
             detached_send_runtime.state.clone(),
+            execution_exclusions,
             daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
             daemon_dfs_maintenance_tick_options(),
         )
@@ -3224,37 +3447,81 @@ pub(crate) fn schedule_daemon_dfs_metadata_publish_on_runtime(
 ) -> Result<DfsMetadataPublishScheduleStart, DaemonError> {
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
-    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
-    let report_traceparent = traceparent.clone();
-    let error_traceparent = traceparent;
     Ok(
-        sinomo_dfs::schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime(
-            runtime.clone(),
+        schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
             data_dir,
             cluster_paths,
-            peer_transport,
-            async_peer_transport,
-            daemon_dfs_metadata_publish_schedule_options(),
-            daemon_dfs_metadata_replication_options(),
-            move |report| {
-                daemon_dfs_perf_trace_with_traceparent(
-                    report_traceparent.as_deref(),
-                    format_args!(
-                        "dfs-metadata-publish-complete outcomes={}",
-                        report.outcomes.len()
-                    ),
-                );
-                log_dfs_metadata_replication_report(report);
-            },
-            move |error| {
-                daemon_dfs_perf_trace_with_traceparent(
-                    error_traceparent.as_deref(),
-                    format_args!("dfs-metadata-publish-failed error={error}"),
-                );
-                tracing::warn!("sinomo daemon DFS scheduled metadata publish failed: {error}");
-            },
+            runtime,
+            traceparent,
         ),
+    )
+}
+
+fn schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+) -> DfsMetadataPublishScheduleStart {
+    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
+    let publish_data_dir = data_dir.clone();
+    let publish_cluster_paths = cluster_paths.clone();
+    let report_traceparent = traceparent.clone();
+    let error_traceparent = traceparent;
+    sinomo_dfs::schedule_default_dfs_metadata_publish_async_on_runtime(
+        runtime.clone(),
+        daemon_dfs_metadata_publish_schedule_options(),
+        move || {
+            let data_dir = publish_data_dir.clone();
+            let cluster_paths = publish_cluster_paths.clone();
+            let exclusion_paths = cluster_paths.clone();
+            let peer_transport = Arc::clone(&peer_transport);
+            let async_peer_transport = Arc::clone(&async_peer_transport);
+            async move {
+                // Recompute for every retry/coalesced publish. Read failures
+                // stay fail-open; an older reachability view never becomes
+                // durable DFS state or suppression.
+                let execution_exclusions = tokio::task::spawn_blocking(move || {
+                    sinomo_core::cluster::read_cluster_state_without_kv(&exclusion_paths)
+                        .map(|state| {
+                            daemon_dfs_maintenance_execution_exclusions(&exclusion_paths, &state)
+                        })
+                        .unwrap_or_default()
+                })
+                .await
+                .map_err(|source| {
+                    format!("DFS metadata reachability projection task failed: {source}")
+                })?;
+                sinomo_dfs::publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions(
+                    &data_dir,
+                    &cluster_paths,
+                    peer_transport,
+                    async_peer_transport,
+                    &execution_exclusions,
+                    daemon_dfs_metadata_replication_options(),
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        },
+        move |report| {
+            daemon_dfs_perf_trace_with_traceparent(
+                report_traceparent.as_deref(),
+                format_args!(
+                    "dfs-metadata-publish-complete outcomes={}",
+                    report.outcomes.len()
+                ),
+            );
+            log_dfs_metadata_replication_report(report);
+        },
+        move |error| {
+            daemon_dfs_perf_trace_with_traceparent(
+                error_traceparent.as_deref(),
+                format_args!("dfs-metadata-publish-failed error={error}"),
+            );
+            tracing::warn!("sinomo daemon DFS scheduled metadata publish failed: {error}");
+        },
     )
 }
 
@@ -3984,11 +4251,14 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(DaemonError::from)?;
+        let execution_exclusions =
+            daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
         let mut deferred_work = None;
         let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
             data_dir,
             cluster_paths.clone(),
             cluster_state,
+            execution_exclusions,
             runtime.handle(),
             &mut deferred_work,
         ));
@@ -5112,6 +5382,8 @@ mod tests {
             &[shard_status],
             &[repair],
             &[attempt],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeSet::from([offline_node_id]),
             &local_node_id,
             0,
@@ -5189,6 +5461,8 @@ mod tests {
             &[repair],
             &[],
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &local_node_id,
             0,
             3,
@@ -5198,6 +5472,354 @@ mod tests {
         assert_eq!(pending.unattempted_repair_count, 1);
         assert_eq!(pending.metadata_replica_lag_count, 1);
         assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_missing_orphan_does_not_hide_valid_repair_trigger() {
+        let root = temp_root("pending-missing-orphan-valid-repair");
+        let data_dir = SinomoDataDir::new(root.path());
+        let metadata = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_orphan_local").expect("local node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_pending_orphan_healthy").expect("target node");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let orphan_object_id =
+            DfsObjectId::from_legacy_named("object_pending_orphan").expect("object id");
+        let orphan_version =
+            DfsVersion::from_legacy_named("version_pending_orphan").expect("version");
+        let mut orphan = pending_write_intent_for_test(
+            "intent-pending-orphan",
+            file_system_id.clone(),
+            orphan_object_id,
+            orphan_version,
+            local_node_id.clone(),
+            vec![local_node_id.clone(), target_node_id.clone()],
+            2,
+        );
+        orphan.content_hash = Some(format!("blake3:{}", "0".repeat(64)));
+        let repair = DfsOperatorRepairView {
+            intent_id: "intent-pending-valid-repair".to_string(),
+            file_system_id,
+            object_id: DfsObjectId::from_legacy_named("object_pending_valid_repair")
+                .expect("repair object"),
+            version: DfsVersion::from_legacy_named("version_pending_valid_repair")
+                .expect("repair version"),
+            content_hash: Some("blake3:pending-valid-repair".to_string()),
+            missing_replica_node_id: target_node_id,
+        };
+        let intents_without_recovery_source = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&orphan),
+            &[],
+            &BTreeSet::new(),
+            &local_node_id,
+        );
+        assert_eq!(
+            intents_without_recovery_source,
+            BTreeSet::from([orphan.intent_id.clone()])
+        );
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            1,
+            0,
+            &[orphan],
+            &[],
+            &[],
+            &[repair],
+            &[],
+            &intents_without_recovery_source,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &local_node_id,
+            0,
+            3,
+        );
+
+        assert_eq!(pending.pending_write_count, 0);
+        assert_eq!(pending.unattempted_repair_count, 1);
+        assert!(
+            pending.should_trigger_background_maintenance(),
+            "the executable healthy repair must retain the short cadence"
+        );
+
+        let orphan_only = daemon_dfs_pending_work_from_records(
+            1,
+            0,
+            0,
+            &[pending_write_intent_for_test(
+                "intent-pending-orphan",
+                sinomo_dfs::sifs_file_system_id(),
+                DfsObjectId::from_legacy_named("object_pending_orphan_only").expect("object"),
+                DfsVersion::from_legacy_named("version_pending_orphan_only").expect("version"),
+                local_node_id.clone(),
+                vec![local_node_id.clone()],
+                1,
+            )],
+            &[],
+            &[],
+            &[],
+            &[],
+            &intents_without_recovery_source,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &local_node_id,
+            0,
+            3,
+        );
+        assert!(!orphan_only.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_offline_only_receipt_below_quorum_is_not_executable_work() {
+        let root = temp_root("pending-offline-only-source");
+        let data_dir = SinomoDataDir::new(root.path());
+        let mut metadata = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_source_local").expect("local node");
+        let offline_node_id =
+            NodeId::from_legacy_named("node_pending_source_offline").expect("offline node");
+        let healthy_target_node_id =
+            NodeId::from_legacy_named("node_pending_source_healthy").expect("healthy node");
+        let mut intent = pending_write_intent_for_test(
+            "intent-pending-offline-source",
+            sinomo_dfs::sifs_file_system_id(),
+            DfsObjectId::from_legacy_named("object_pending_offline_source").expect("object"),
+            DfsVersion::from_legacy_named("version_pending_offline_source").expect("version"),
+            local_node_id.clone(),
+            vec![
+                local_node_id.clone(),
+                offline_node_id.clone(),
+                healthy_target_node_id.clone(),
+            ],
+            2,
+        );
+        intent.content_hash = Some(format!("blake3:{}", "1".repeat(64)));
+        let offline_receipt = pending_write_receipt_for_test(
+            &intent,
+            offline_node_id.clone(),
+            "event_pending_offline_source",
+        );
+        let offline_node_ids = BTreeSet::from([offline_node_id.clone()]);
+
+        let source_less = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&offline_receipt),
+            &offline_node_ids,
+            &local_node_id,
+        );
+        assert_eq!(source_less, BTreeSet::from([intent.intent_id.clone()]));
+
+        let reachable_source = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&offline_receipt),
+            &BTreeSet::new(),
+            &local_node_id,
+        );
+        assert!(reachable_source.is_empty());
+
+        let second_offline_receipt = pending_write_receipt_for_test(
+            &intent,
+            healthy_target_node_id.clone(),
+            "event_pending_second_offline_source",
+        );
+        let quorum_offline_sources = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            &[offline_receipt.clone(), second_offline_receipt],
+            &BTreeSet::from([offline_node_id.clone(), healthy_target_node_id.clone()]),
+            &local_node_id,
+        );
+        assert!(
+            quorum_offline_sources.is_empty(),
+            "quorum receipts remain executable local reconciliation work"
+        );
+
+        let repair = DfsOperatorRepairView {
+            intent_id: intent.intent_id.clone(),
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            version: intent.target_version.clone(),
+            content_hash: intent.content_hash.clone(),
+            missing_replica_node_id: healthy_target_node_id,
+        };
+        assert!(
+            daemon_dfs_repairs_without_recovery_source(
+                &data_dir,
+                &metadata,
+                std::slice::from_ref(&repair),
+                std::slice::from_ref(&offline_receipt),
+                &offline_node_ids,
+                &local_node_id,
+            )
+            .is_empty(),
+            "a concurrently removed repair object remains actionable for stale-record cleanup"
+        );
+        metadata
+            .put_file_system(&distributed_sifs(local_node_id.clone()))
+            .expect("filesystem");
+        metadata
+            .put_object(&DfsObjectMetadata {
+                object_id: repair.object_id.clone(),
+                file_system_id: repair.file_system_id.clone(),
+                path: "/pending/offline-source".to_string(),
+                kind: DfsObjectKind::File,
+                owner_node_id: local_node_id.clone(),
+                current_locations: vec![offline_node_id.clone()],
+                content_hash: repair.content_hash.clone(),
+                content_size_bytes: Some(1),
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: repair.version.clone(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            })
+            .expect("repair object");
+        let repairs_without_recovery_source = daemon_dfs_repairs_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&repair),
+            std::slice::from_ref(&offline_receipt),
+            &offline_node_ids,
+            &local_node_id,
+        );
+        assert_eq!(
+            repairs_without_recovery_source,
+            BTreeSet::from([(
+                repair.intent_id.clone(),
+                repair.missing_replica_node_id.clone(),
+            )])
+        );
+        assert!(
+            daemon_dfs_repairs_without_recovery_source(
+                &data_dir,
+                &metadata,
+                std::slice::from_ref(&repair),
+                std::slice::from_ref(&offline_receipt),
+                &BTreeSet::new(),
+                &local_node_id,
+            )
+            .is_empty(),
+            "a reachable exact-version receipt is an executable repair source"
+        );
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            1,
+            0,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&offline_receipt),
+            &[],
+            &[repair],
+            &[],
+            &source_less,
+            &repairs_without_recovery_source,
+            &offline_node_ids,
+            &local_node_id,
+            0,
+            3,
+        );
+        assert_eq!(pending.pending_write_count, 0);
+        assert_eq!(pending.unattempted_repair_count, 0);
+        assert!(!pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_extent_backed_pending_write_is_an_executable_local_source() {
+        let root = temp_root("pending-extent-source");
+        let data_dir = SinomoDataDir::new(root.path());
+        let metadata = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let content =
+            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_extent_local").expect("local node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_pending_extent_target").expect("target node");
+        let object_id = DfsObjectId::from_legacy_named("object_pending_extent").expect("object id");
+        let base_version =
+            DfsVersion::from_legacy_named("version_pending_extent_base").expect("base version");
+        let target_version =
+            DfsVersion::from_legacy_named("version_pending_extent_target").expect("target version");
+        content
+            .put_object_version(object_id.as_str(), base_version.as_str(), b"abcdefgh")
+            .expect("base object version");
+        let patched = content
+            .put_object_version_patch(
+                object_id.as_str(),
+                base_version.as_str(),
+                target_version.as_str(),
+                2,
+                b"ZZ",
+            )
+            .expect("extent-backed target version");
+        assert!(!patched.extents.is_empty());
+        let mut intent = pending_write_intent_for_test(
+            "intent-pending-extent-source",
+            sinomo_dfs::sifs_file_system_id(),
+            object_id,
+            target_version,
+            local_node_id.clone(),
+            vec![local_node_id.clone(), target_node_id.clone()],
+            2,
+        );
+        intent.content_hash = Some(patched.content_hash);
+
+        assert!(
+            daemon_dfs_intents_without_recovery_source(
+                &data_dir,
+                &metadata,
+                std::slice::from_ref(&intent),
+                &[],
+                &BTreeSet::new(),
+                &local_node_id,
+            )
+            .is_empty()
+        );
+        assert!(
+            daemon_dfs_repairs_without_recovery_source(
+                &data_dir,
+                &metadata,
+                &[DfsOperatorRepairView {
+                    intent_id: intent.intent_id,
+                    file_system_id: intent.file_system_id,
+                    object_id: intent.object_id,
+                    version: intent.target_version,
+                    content_hash: intent.content_hash,
+                    missing_replica_node_id: target_node_id,
+                }],
+                &[],
+                &BTreeSet::new(),
+                &local_node_id,
+            )
+            .is_empty(),
+            "the extent-backed local version is also an executable repair source"
+        );
     }
 
     #[test]
@@ -5230,6 +5852,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeSet::from([offline_node_id]),
             &local_node_id,
             0,
@@ -5271,6 +5895,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeSet::from([offline_node_id]),
             &local_node_id,
             0,

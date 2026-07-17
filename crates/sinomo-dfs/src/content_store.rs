@@ -473,8 +473,16 @@ impl LocalContentStore {
         create_dir_all(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))?;
         create_dir_all(root.join("objects"))?;
         create_dir_all(root.join("staging"))?;
-        Ok(Self {
-            root,
+        Ok(Self::open_for_inspection(root))
+    }
+
+    /// Opens a read-only view without initializing the content-store layout.
+    ///
+    /// This constructor is intended for advisory inspection of an existing
+    /// store. Code that may write must use [`Self::new`] first.
+    pub fn open_for_inspection(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
             quota: None,
             // A persisted stats snapshot is derived observability state. It is
             // not trusted for quota admission until this process has rebuilt
@@ -482,7 +490,7 @@ impl LocalContentStore {
             quota_stats_initialized: Arc::new(AtomicBool::new(false)),
             deferred_durable_blobs: Arc::new(Mutex::new(BTreeMap::new())),
             packed_index_cache: Arc::new(Mutex::new(PackedBlobIndexCache::default())),
-        })
+        }
     }
 
     pub fn with_quota(mut self, quota: ContentStoreQuota) -> Self {
@@ -1540,6 +1548,73 @@ impl LocalContentStore {
                 source,
             })?;
         Ok(content_hash(&bytes) == hash)
+    }
+
+    /// Returns whether local storage has an addressable candidate for `hash`.
+    ///
+    /// This is an advisory scheduling probe. It validates the hash syntax and
+    /// the loose-file or packed-index bounds, but deliberately does not read or
+    /// hash the blob bytes. Callers that consume the content remain responsible
+    /// for end-to-end integrity validation.
+    pub fn blob_storage_candidate_exists(&self, hash: &str) -> Result<bool> {
+        let path = self.blob_path(hash)?;
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ContentStoreError::Io { path, source }),
+        }
+        let Some(location) = self.packed_blob_location(hash)? else {
+            return Ok(false);
+        };
+        self.packed_blob_location_readable(&location)
+    }
+
+    /// Read-only form of [`Self::blob_storage_candidate_exists`] that does not
+    /// initialize the content-store directory tree.
+    pub fn blob_storage_candidate_exists_at(root: &Path, hash: &str) -> Result<bool> {
+        Self::open_for_inspection(root).blob_storage_candidate_exists(hash)
+    }
+
+    /// Checks whether the exact object version has addressable local storage
+    /// without reading or hashing its payload bytes.
+    ///
+    /// This mirrors the pending-write stream fallback: an exact manifest may
+    /// reference either one logical blob or multiple extents; if the manifest
+    /// is absent, the expected whole-content blob remains a candidate.
+    pub fn object_version_storage_candidate_exists(
+        &self,
+        object_id: &str,
+        version: &str,
+        expected_hash: &str,
+    ) -> Result<bool> {
+        let manifest = match self.read_manifest(object_id, version) {
+            Ok(manifest) => manifest,
+            Err(error) if content_error_is_not_found(&error) => {
+                return self.blob_storage_candidate_exists(expected_hash);
+            }
+            Err(error) => return Err(error),
+        };
+        if manifest.object_id != object_id
+            || manifest.version != version
+            || manifest.content_hash != expected_hash
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "object version storage candidate does not match requested identity: object={object_id}, version={version}, expected_hash={expected_hash}, manifest_object={}, manifest_version={}, manifest_hash={}",
+                    manifest.object_id, manifest.version, manifest.content_hash
+                ),
+            });
+        }
+        if manifest.extents.is_empty() {
+            return match self.open_blob_stream(expected_hash) {
+                Ok(reader) => Ok(reader.size_bytes() == manifest.size_bytes),
+                Err(error) if content_error_is_not_found(&error) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        let extents = self.logical_extents_for_manifest(&manifest)?;
+        self.extents_readable(&extents)
     }
 
     /// Test-only fault injection: remove a loose content-addressed blob.
@@ -4311,6 +4386,74 @@ fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_storage_candidate_is_presence_only_and_does_not_claim_integrity() {
+        let root = temp_root("blob_storage_candidate_presence_only");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let expected_hash = content_hash(b"expected bytes");
+        let path = store.blob_path(&expected_hash).expect("blob path");
+        fs::create_dir_all(path.parent().expect("blob parent")).expect("create blob parent");
+        fs::write(&path, b"different bytes").expect("write mismatched candidate");
+
+        assert!(
+            store
+                .blob_storage_candidate_exists(&expected_hash)
+                .expect("candidate probe")
+        );
+        assert!(
+            !store.has_blob(&expected_hash).expect("integrity probe"),
+            "the advisory presence probe must not replace integrity validation"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn blob_storage_candidate_probe_does_not_initialize_missing_store() {
+        let root = temp_root("blob_storage_candidate_missing_store");
+        let content_root = root.join("content-not-created");
+        let missing_hash = content_hash(b"missing bytes");
+
+        assert!(
+            !LocalContentStore::blob_storage_candidate_exists_at(&content_root, &missing_hash)
+                .expect("candidate probe")
+        );
+        assert!(!content_root.exists());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn object_version_storage_candidate_accepts_extent_backed_version() {
+        let root = temp_root("object_version_storage_candidate_extents");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version("object-extents", "v1", b"abcdefgh")
+            .expect("base version");
+        let patched = store
+            .put_object_version_patch("object-extents", "v1", "v2", 2, b"ZZ")
+            .expect("patch version");
+
+        assert!(!patched.extents.is_empty());
+        assert!(
+            !store
+                .has_blob(&patched.content_hash)
+                .expect("whole blob probe"),
+            "the patch should remain represented by reusable extents"
+        );
+        assert!(
+            store
+                .object_version_storage_candidate_exists(
+                    "object-extents",
+                    "v2",
+                    &patched.content_hash,
+                )
+                .expect("object-version candidate")
+        );
+
+        cleanup(&root);
+    }
 
     #[test]
     fn put_object_version_writes_blob_and_manifest() {

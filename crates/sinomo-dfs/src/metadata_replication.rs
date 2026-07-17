@@ -27,7 +27,9 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-use crate::maintenance::migrate_legacy_dfs_metadata_replication_cursor;
+use crate::maintenance::{
+    DfsMaintenanceExecutionExclusions, migrate_legacy_dfs_metadata_replication_cursor,
+};
 use crate::{
     AsyncDfsPeerTransport, DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsDistributedWriteResult, DfsError, DfsFileSystem,
@@ -125,9 +127,32 @@ pub async fn publish_cluster_dfs_metadata_journal_async(
     snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    let Some(plan) =
-        prepare_cluster_dfs_metadata_journal_publish_async(data_dir, cluster_paths, options)
-            .await?
+    publish_cluster_dfs_metadata_journal_async_with_execution_exclusions(
+        data_dir,
+        cluster_paths,
+        sender,
+        snapshot_sender,
+        &DfsMaintenanceExecutionExclusions::default(),
+        options,
+    )
+    .await
+}
+
+pub async fn publish_cluster_dfs_metadata_journal_async_with_execution_exclusions(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    sender: AsyncDfsMetadataJournalBatchSender,
+    snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    let Some(plan) = prepare_cluster_dfs_metadata_journal_publish_async(
+        data_dir,
+        cluster_paths,
+        execution_exclusions,
+        options,
+    )
+    .await?
     else {
         return Ok(DfsMetadataJournalReplicationReport {
             outcomes: Vec::new(),
@@ -180,6 +205,25 @@ pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions(
+        data_dir,
+        cluster_paths,
+        sync_peer_transport,
+        peer_transport,
+        &DfsMaintenanceExecutionExclusions::default(),
+        options,
+    )
+    .await
+}
+
+pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
     let refresh_cluster_paths = cluster_paths.clone();
     tokio::task::spawn_blocking(move || {
         refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
@@ -192,11 +236,12 @@ pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async(
         message: format!("DFS metadata publish KV refresh task failed: {source}"),
     })??;
 
-    publish_cluster_dfs_metadata_journal_async(
+    publish_cluster_dfs_metadata_journal_async_with_execution_exclusions(
         data_dir,
         cluster_paths,
         async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        execution_exclusions,
         options,
     )
     .await
@@ -1918,6 +1963,7 @@ pub(crate) struct DfsPreparedMetadataJournalTargetPublish {
 fn prepare_cluster_dfs_metadata_journal_publish(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<Option<DfsPreparedClusterMetadataJournalPublish>, DfsError> {
     if !cluster_paths.state.exists() {
@@ -1935,14 +1981,16 @@ fn prepare_cluster_dfs_metadata_journal_publish(
     .map(|snapshot| snapshot.records)
     .unwrap_or_default();
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
-    let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
-        file_system.file_system_id,
-        &state.local_node_id,
-        shards,
-        &mut host,
-        &metadata_suppressions,
-        options,
-    )?;
+    let (outcomes, targets) =
+        prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions(
+            file_system.file_system_id,
+            &state.local_node_id,
+            shards,
+            &mut host,
+            &metadata_suppressions,
+            execution_exclusions,
+            options,
+        )?;
     Ok(Some(DfsPreparedClusterMetadataJournalPublish {
         data_dir,
         local_node_id: state.local_node_id,
@@ -1955,13 +2003,20 @@ fn prepare_cluster_dfs_metadata_journal_publish(
 async fn prepare_cluster_dfs_metadata_journal_publish_async(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<Option<DfsPreparedClusterMetadataJournalPublish>, DfsError> {
     let trace_started = Instant::now();
     let data_dir = data_dir.clone();
     let cluster_paths = cluster_paths.clone();
+    let execution_exclusions = execution_exclusions.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare_cluster_dfs_metadata_journal_publish(data_dir, cluster_paths, options)
+        prepare_cluster_dfs_metadata_journal_publish(
+            data_dir,
+            cluster_paths,
+            &execution_exclusions,
+            options,
+        )
     })
     .await
     .map_err(|source| DfsError::Metadata {
@@ -1986,9 +2041,35 @@ async fn prepare_cluster_dfs_metadata_journal_publish_async(
 pub(crate) fn prepare_dfs_metadata_journal_publish_with_host(
     file_system_id: DfsFileSystemId,
     local_node_id: &NodeId,
+    shards: Vec<DfsMetadataShardConfig>,
+    host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_suppressions: &[DfsMetadataReplicationSuppressionRecord],
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<
+    (
+        Vec<DfsMetadataJournalReplicationOutcome>,
+        Vec<DfsPreparedMetadataJournalTargetPublish>,
+    ),
+    DfsError,
+> {
+    prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions(
+        file_system_id,
+        local_node_id,
+        shards,
+        host,
+        metadata_suppressions,
+        &DfsMaintenanceExecutionExclusions::default(),
+        options,
+    )
+}
+
+pub(crate) fn prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions(
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
     mut shards: Vec<DfsMetadataShardConfig>,
     host: &mut impl DfsMetadataJournalPublisherHost,
     metadata_suppressions: &[DfsMetadataReplicationSuppressionRecord],
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<
     (
@@ -2047,6 +2128,14 @@ pub(crate) fn prepare_dfs_metadata_journal_publish_with_host(
             }
             let after_sequence =
                 host.metadata_replication_cursor(&mut *backend, &target_node_id, &shard_id)?;
+            if execution_exclusions.contains(&target_node_id) {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                });
+                continue;
+            }
             match prepare_dfs_metadata_journal_target_publish(
                 &mut *backend,
                 local_node_id,
@@ -3904,19 +3993,44 @@ pub async fn publish_dfs_metadata_journal_with_async_host(
     transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
+        file_system_id,
+        local_node_id,
+        shards,
+        data_dir,
+        host,
+        transport,
+        &DfsMaintenanceExecutionExclusions::default(),
+        options,
+    )
+    .await
+}
+
+pub async fn publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
+    shards: Vec<DfsMetadataShardConfig>,
+    data_dir: &SinomoDataDir,
+    host: &mut impl DfsMetadataJournalPublisherHost,
+    transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
     let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
         &default_dfs_metadata_replication_suppression_snapshot_path(data_dir),
     )?
     .map(|snapshot| snapshot.records)
     .unwrap_or_default();
-    let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
-        file_system_id,
-        local_node_id,
-        shards,
-        host,
-        &metadata_suppressions,
-        options,
-    )?;
+    let (outcomes, targets) =
+        prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions(
+            file_system_id,
+            local_node_id,
+            shards,
+            host,
+            &metadata_suppressions,
+            execution_exclusions,
+            options,
+        )?;
     execute_prepared_dfs_metadata_journal_publish_async(
         DfsPreparedClusterMetadataJournalPublish {
             data_dir: data_dir.clone(),
