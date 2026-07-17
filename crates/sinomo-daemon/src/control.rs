@@ -4,8 +4,9 @@ use crate::cluster::{
     prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
-    DaemonDfsMaintenanceTickOutcome, daemon_dfs_maintenance_notify, daemon_dfs_node_transport,
-    daemon_dfs_node_transport_on_runtime, daemon_dfs_pending_maintenance_work,
+    DaemonDfsMaintenanceTickOutcome, DaemonDfsPendingMaintenanceWork,
+    daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
+    daemon_dfs_now_unix_nanos, daemon_dfs_pending_maintenance_work,
     ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
@@ -39,9 +40,10 @@ use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
-pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+const DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // Full DFS passes own the process's sole backend-bearing service lane. Stagger
 // their first acquisition by stable membership rank so a rolling restart does
 // not make every node hold its local lane while asking a peer to enter theirs.
@@ -941,6 +943,83 @@ async fn join_daemon_dfs_maintenance_task(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DaemonDfsMaintenanceProbeDecision {
+    trigger_maintenance: bool,
+    next_probe_at: Instant,
+}
+
+fn daemon_dfs_maintenance_probe_decision(
+    observed_at: Instant,
+    observed_at_unix_nanos: u64,
+    work: Option<DaemonDfsPendingMaintenanceWork>,
+) -> DaemonDfsMaintenanceProbeDecision {
+    let Some(work) = work else {
+        return DaemonDfsMaintenanceProbeDecision {
+            trigger_maintenance: false,
+            next_probe_at: observed_at
+                .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
+                .unwrap_or(observed_at),
+        };
+    };
+    let trigger_maintenance = work.should_trigger_background_maintenance();
+    let next_probe_delay = if trigger_maintenance {
+        // A successful maintenance pass performs its own follow-up probe. Keep
+        // the short safety deadline in case the request is cancelled before a
+        // pass starts or completes.
+        DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL
+    } else {
+        work.next_repair_retry_unix_nanos
+            .map(|retry_at| Duration::from_nanos(retry_at.saturating_sub(observed_at_unix_nanos)))
+            .unwrap_or(DAEMON_DFS_MAINTENANCE_INTERVAL)
+            .min(DAEMON_DFS_MAINTENANCE_INTERVAL)
+    };
+    DaemonDfsMaintenanceProbeDecision {
+        trigger_maintenance,
+        next_probe_at: observed_at
+            .checked_add(next_probe_delay)
+            .unwrap_or(observed_at),
+    }
+}
+
+fn daemon_dfs_failed_maintenance_decision(
+    observed_at: Instant,
+    triggered_maintenance_requested: bool,
+) -> DaemonDfsMaintenanceProbeDecision {
+    DaemonDfsMaintenanceProbeDecision {
+        // A notification can arrive while the maintenance task is running.
+        // Task failure must not consume that already-latched request.
+        trigger_maintenance: triggered_maintenance_requested,
+        next_probe_at: observed_at
+            .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
+            .unwrap_or(observed_at),
+    }
+}
+
+fn apply_daemon_dfs_maintenance_probe_result(
+    work: Option<DaemonDfsPendingMaintenanceWork>,
+    triggered_maintenance_requested: &mut bool,
+    next_probe_at: &mut Instant,
+) {
+    let decision =
+        daemon_dfs_maintenance_probe_decision(Instant::now(), daemon_dfs_now_unix_nanos(), work);
+    *triggered_maintenance_requested = decision.trigger_maintenance;
+    *next_probe_at = decision.next_probe_at;
+}
+
+fn daemon_dfs_maintenance_probe_is_due(now: Instant, next_probe_at: Instant) -> bool {
+    now >= next_probe_at
+}
+
+fn daemon_dfs_periodic_maintenance_is_due(
+    now: Instant,
+    initial_not_before: Instant,
+    last_maintenance: Instant,
+) -> bool {
+    now >= initial_not_before
+        && now.saturating_duration_since(last_maintenance) >= DAEMON_DFS_MAINTENANCE_INTERVAL
+}
+
 async fn run_daemon_background_maintenance_loop(
     paths: DaemonPaths,
     options: crate::DaemonRunOptions,
@@ -984,9 +1063,10 @@ async fn run_daemon_background_maintenance_loop(
     let mut last_dfs_maintenance = maintenance_started
         .checked_sub(initial_dfs_maintenance_elapsed)
         .unwrap_or(maintenance_started);
-    let mut last_dfs_maintenance_probe = maintenance_started
-        .checked_sub(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL)
-        .unwrap_or(maintenance_started);
+    // Probe once immediately after startup. Successful quiet probes choose an
+    // adaptive next deadline; only probe failures retain the short safety
+    // retry cadence.
+    let mut next_dfs_maintenance_probe = maintenance_started;
     let mut last_rollout_telemetry = maintenance_started
         .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
         .unwrap_or(maintenance_started);
@@ -1090,27 +1170,44 @@ async fn run_daemon_background_maintenance_loop(
                 .expect("finished DFS maintenance task exists");
             let completed_outcome =
                 join_daemon_dfs_maintenance_task(completed_task, label.as_str()).await;
-            dfs_triggered_maintenance_requested = matches!(
-                completed_outcome,
-                Some(DaemonDfsMaintenanceTickOutcome::Deferred)
-            );
-            if completed_outcome == Some(DaemonDfsMaintenanceTickOutcome::Completed) {
-                let probe_paths = paths.clone();
-                match tokio::task::spawn_blocking(move || {
-                    daemon_dfs_pending_maintenance_work(&probe_paths)
-                })
-                .await
-                {
-                    Ok(Ok(work)) => {
-                        dfs_triggered_maintenance_requested =
-                            work.should_trigger_background_maintenance();
-                    }
-                    Ok(Err(error)) => tracing::warn!(
-                        "sinomo {label} DFS maintenance follow-up probe failed: {error}"
-                    ),
-                    Err(error) => tracing::warn!(
-                        "sinomo {label} DFS maintenance follow-up probe task failed: {error}"
-                    ),
+            match completed_outcome {
+                Some(DaemonDfsMaintenanceTickOutcome::Deferred) => {
+                    dfs_triggered_maintenance_requested = true;
+                }
+                Some(DaemonDfsMaintenanceTickOutcome::Completed) => {
+                    let probe_paths = paths.clone();
+                    let work = match tokio::task::spawn_blocking(move || {
+                        daemon_dfs_pending_maintenance_work(&probe_paths)
+                    })
+                    .await
+                    {
+                        Ok(Ok(work)) => Some(work),
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                "sinomo {label} DFS maintenance follow-up probe failed: {error}"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "sinomo {label} DFS maintenance follow-up probe task failed: {error}"
+                            );
+                            None
+                        }
+                    };
+                    apply_daemon_dfs_maintenance_probe_result(
+                        work,
+                        &mut dfs_triggered_maintenance_requested,
+                        &mut next_dfs_maintenance_probe,
+                    );
+                }
+                None => {
+                    let decision = daemon_dfs_failed_maintenance_decision(
+                        Instant::now(),
+                        dfs_triggered_maintenance_requested,
+                    );
+                    dfs_triggered_maintenance_requested = decision.trigger_maintenance;
+                    next_dfs_maintenance_probe = decision.next_probe_at;
                 }
             }
             let completed_at = std::time::Instant::now();
@@ -1130,26 +1227,38 @@ async fn run_daemon_background_maintenance_loop(
         if daemon_role_owns_default_dfs(&label)
             && dfs_maintenance_task.is_none()
             && !dfs_triggered_maintenance_requested
-            && last_dfs_maintenance_probe.elapsed() >= DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL
+            && daemon_dfs_maintenance_probe_is_due(Instant::now(), next_dfs_maintenance_probe)
+            // When the safety probe and the full periodic pass are due
+            // together, let the pass run first. Its completion probe observes
+            // the resulting durable state without an immediately redundant
+            // full metadata scan.
+            && !daemon_dfs_periodic_maintenance_is_due(
+                Instant::now(),
+                initial_dfs_maintenance_not_before,
+                last_dfs_maintenance,
+            )
         {
-            last_dfs_maintenance_probe = std::time::Instant::now();
             let probe_paths = paths.clone();
-            match tokio::task::spawn_blocking(move || {
+            let work = match tokio::task::spawn_blocking(move || {
                 daemon_dfs_pending_maintenance_work(&probe_paths)
             })
             .await
             {
-                Ok(Ok(work)) if work.should_trigger_background_maintenance() => {
-                    dfs_triggered_maintenance_requested = true;
-                }
-                Ok(Ok(_)) => {}
+                Ok(Ok(work)) => Some(work),
                 Ok(Err(error)) => {
                     tracing::warn!("sinomo {label} DFS maintenance probe failed: {error}");
+                    None
                 }
                 Err(error) => {
                     tracing::warn!("sinomo {label} DFS maintenance probe task failed: {error}");
+                    None
                 }
-            }
+            };
+            apply_daemon_dfs_maintenance_probe_result(
+                work,
+                &mut dfs_triggered_maintenance_requested,
+                &mut next_dfs_maintenance_probe,
+            );
         }
 
         if daemon_shutdown_requested(&shutdown_rx) {
@@ -1158,11 +1267,13 @@ async fn run_daemon_background_maintenance_loop(
 
         if daemon_role_owns_default_dfs(&label)
             && dfs_maintenance_task.is_none()
-            && Instant::now() >= initial_dfs_maintenance_not_before
-            && (last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
-                || (dfs_triggered_maintenance_requested
-                    && last_dfs_maintenance.elapsed()
-                        >= DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL))
+            && (daemon_dfs_periodic_maintenance_is_due(
+                Instant::now(),
+                initial_dfs_maintenance_not_before,
+                last_dfs_maintenance,
+            ) || (dfs_triggered_maintenance_requested
+                && Instant::now() >= initial_dfs_maintenance_not_before
+                && last_dfs_maintenance.elapsed() >= DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL))
         {
             let dfs_paths = paths.clone();
             let dfs_runtime = runtime.clone();
@@ -1280,11 +1391,7 @@ async fn run_daemon_background_maintenance_loop(
             && dfs_maintenance_task.is_none()
             && !dfs_triggered_maintenance_requested
         {
-            Some(daemon_maintenance_interval_remaining(
-                sleep_started,
-                last_dfs_maintenance_probe,
-                DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL,
-            ))
+            Some(next_dfs_maintenance_probe.saturating_duration_since(sleep_started))
         } else {
             None
         };
@@ -1298,9 +1405,13 @@ async fn run_daemon_background_maintenance_loop(
         });
         #[cfg(not(feature = "sandbox"))]
         let sandbox_lifecycle_maintenance_due = None;
-        // An in-flight DFS pass has its own completion polling. Do not let its
-        // already-due periodic timestamp collapse this loop to a 1ms spin;
-        // cluster-network scheduling remains the wakeup authority meanwhile.
+        // Do not let an already-due periodic timestamp collapse an in-flight
+        // pass to a 1ms spin. Give task completion its own bounded wakeup so a
+        // completed or deferred pass is observed promptly even when all other
+        // maintenance schedules are quiet.
+        let dfs_maintenance_task_completion_due = dfs_maintenance_task
+            .as_ref()
+            .map(|_| DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
         let dfs_schedule_anchor = if dfs_maintenance_task.is_some() {
             sleep_started
         } else {
@@ -1313,6 +1424,7 @@ async fn run_daemon_background_maintenance_loop(
             last_rollout_telemetry,
             dfs_triggered_maintenance_due,
             dfs_maintenance_probe_due,
+            dfs_maintenance_task_completion_due,
             shadow_finalization_due,
             sandbox_lifecycle_maintenance_due,
         );
@@ -1928,6 +2040,7 @@ fn daemon_maintenance_sleep_duration(
     last_rollout_telemetry: Instant,
     dfs_triggered_maintenance_due: Option<Duration>,
     dfs_maintenance_probe_due: Option<Duration>,
+    dfs_maintenance_task_completion_due: Option<Duration>,
     shadow_finalization_due: Option<Duration>,
     sandbox_lifecycle_maintenance_due: Option<Duration>,
 ) -> Duration {
@@ -1948,6 +2061,9 @@ fn daemon_maintenance_sleep_duration(
     }
     if let Some(dfs_maintenance_probe_due) = dfs_maintenance_probe_due {
         next_due = next_due.min(dfs_maintenance_probe_due);
+    }
+    if let Some(dfs_maintenance_task_completion_due) = dfs_maintenance_task_completion_due {
+        next_due = next_due.min(dfs_maintenance_task_completion_due);
     }
     if let Some(shadow_finalization_due) = shadow_finalization_due {
         next_due = next_due.min(shadow_finalization_due);
@@ -6086,6 +6202,156 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_parked_work_uses_periodic_probe_deadline() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork {
+                pending_repair_count: 3,
+                repair_attempt_count: 3,
+                ..DaemonDfsPendingMaintenanceWork::default()
+            }),
+        );
+
+        assert!(!decision.trigger_maintenance);
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_INTERVAL
+        );
+
+        let actionable = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork {
+                pending_write_count: 1,
+                ..DaemonDfsPendingMaintenanceWork::default()
+            }),
+        );
+        assert!(actionable.trigger_maintenance);
+        assert_eq!(
+            actionable.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
+            "an interrupted actionable pass must retain a short safety probe"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_probe_uses_exact_future_repair_retry_deadline() {
+        let observed_at = Instant::now();
+        let observed_at_unix_nanos = 1_000_000_000;
+        let retry_delay = Duration::from_secs(47);
+        let decision = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            observed_at_unix_nanos,
+            Some(DaemonDfsPendingMaintenanceWork {
+                pending_repair_count: 1,
+                repair_attempt_count: 1,
+                next_repair_retry_unix_nanos: Some(
+                    observed_at_unix_nanos
+                        .saturating_add(retry_delay.as_nanos().try_into().expect("retry nanos")),
+                ),
+                ..DaemonDfsPendingMaintenanceWork::default()
+            }),
+        );
+
+        assert!(!decision.trigger_maintenance);
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            retry_delay
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_probe_caps_future_repair_retry_at_periodic_deadline() {
+        let observed_at = Instant::now();
+        let observed_at_unix_nanos = 1_000_000_000;
+        let retry_delay = Duration::from_secs(900);
+        let decision = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            observed_at_unix_nanos,
+            Some(DaemonDfsPendingMaintenanceWork {
+                pending_repair_count: 1,
+                repair_attempt_count: 1,
+                next_repair_retry_unix_nanos: Some(
+                    observed_at_unix_nanos
+                        .saturating_add(retry_delay.as_nanos().try_into().expect("retry nanos")),
+                ),
+                ..DaemonDfsPendingMaintenanceWork::default()
+            }),
+        );
+
+        assert!(!decision.trigger_maintenance);
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_probe_error_uses_short_safety_retry() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_maintenance_probe_decision(observed_at, 1_000_000_000, None);
+
+        assert!(!decision.trigger_maintenance);
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn failed_dfs_maintenance_preserves_latched_request_and_short_probe() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_failed_maintenance_decision(observed_at, true);
+
+        assert!(
+            decision.trigger_maintenance,
+            "a request latched while the failed task was running must survive completion handling"
+        );
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
+            "failed work must retain the bounded recovery probe"
+        );
+    }
+
+    #[test]
+    fn completed_dfs_followup_probe_prevents_same_iteration_probe() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork::default()),
+        );
+
+        assert!(!decision.trigger_maintenance);
+        assert!(!daemon_dfs_maintenance_probe_is_due(
+            observed_at,
+            decision.next_probe_at
+        ));
+        assert!(daemon_dfs_maintenance_probe_is_due(
+            decision.next_probe_at,
+            decision.next_probe_at
+        ));
+    }
+
+    #[test]
+    fn periodic_dfs_maintenance_wins_a_same_deadline_probe() {
+        let now = Instant::now();
+        let last_maintenance = now
+            .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL)
+            .expect("periodic maintenance timestamp");
+
+        assert!(daemon_dfs_maintenance_probe_is_due(now, now));
+        assert!(daemon_dfs_periodic_maintenance_is_due(
+            now,
+            now,
+            last_maintenance
+        ));
+    }
+
+    #[test]
     fn daemon_maintenance_sleep_uses_next_due_work_instead_of_fixed_tick() {
         let now = Instant::now();
         let last_dfs = now
@@ -6102,12 +6368,13 @@ mod tests {
                 last_dfs,
                 last_rollout,
                 None,
-                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
+                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 Some(DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL),
                 None,
             ),
-            DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL,
-            "quiet main daemons should wake periodically to discover durable DFS maintenance work"
+            Duration::from_secs(30),
+            "quiet main daemons may still wake for earlier cluster maintenance"
         );
         assert_eq!(
             daemon_maintenance_sleep_duration(
@@ -6116,7 +6383,8 @@ mod tests {
                 last_dfs,
                 last_rollout,
                 None,
-                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
+                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 Some(Duration::from_secs(5)),
                 None,
             ),
@@ -6130,7 +6398,8 @@ mod tests {
                 last_dfs,
                 last_rollout,
                 Some(Duration::from_secs(3)),
-                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
+                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 None,
                 None,
             ),
@@ -6147,7 +6416,8 @@ mod tests {
                 almost_due_dfs,
                 now,
                 None,
-                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
+                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 None,
                 None,
             ),
@@ -6164,6 +6434,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             Duration::from_millis(1),
             "overdue work should not create a zero-duration spin"
@@ -6174,6 +6445,7 @@ mod tests {
                 Duration::from_secs(600),
                 last_dfs,
                 last_rollout,
+                None,
                 None,
                 None,
                 None,
@@ -6311,13 +6583,23 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_dfs_maintenance_uses_cluster_schedule_instead_of_spinning() {
+    fn in_flight_dfs_maintenance_polls_completion_without_spinning() {
         let now = Instant::now();
-        let cluster_due = Duration::from_secs(4);
+        let converged_cluster_due = Duration::from_secs(60);
         assert_eq!(
-            daemon_maintenance_sleep_duration(now, cluster_due, now, now, None, None, None, None,),
-            cluster_due,
-            "an active DFS task anchors its DFS schedule at now so cluster-network work remains the next wakeup"
+            daemon_maintenance_sleep_duration(
+                now,
+                converged_cluster_due,
+                now,
+                now,
+                None,
+                None,
+                Some(DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL),
+                None,
+                None,
+            ),
+            DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL,
+            "a completed or deferred DFS task must be observed before the converged cluster cadence"
         );
     }
 
