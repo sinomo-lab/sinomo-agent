@@ -2343,16 +2343,20 @@ impl ClusterNetworkMaintenance {
             )
             .await;
             self.idle_stats.incr_disk_reads_network_module_endpoints();
-            let local_state_changed = refresh_local_daemon_membership_async(
+            let refreshed_at = OffsetDateTime::now_utc();
+            let daemon_membership_changed = refresh_local_daemon_membership_async(
                 &runtime,
                 &cluster_paths,
                 &mut state,
                 options,
                 &shadow_options,
-                OffsetDateTime::now_utc(),
+                refreshed_at,
             )
             .await?
             .changed();
+            let network_module_endpoints_changed =
+                refresh_local_network_module_endpoints(&mut state, refreshed_at)?;
+            let local_state_changed = daemon_membership_changed || network_module_endpoints_changed;
             if local_state_changed {
                 self.connectivity_converged = false;
                 sinomo_core::cluster::write_cluster_state_async(&runtime, &cluster_paths, &state)
@@ -7653,6 +7657,69 @@ mod tests {
             priority: 20,
             last_observed_latency_ms: None,
         }
+    }
+
+    #[test]
+    fn maintenance_network_module_endpoint_refresh_updates_publish_state() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_module_endpoint_refresh").expect("cluster");
+        let local_node = NodeId::from_legacy_named("node_module_endpoint_refresh").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "module endpoint refresh",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == local_node)
+            .expect("local member");
+        member.endpoints.push(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_stale_module_refresh",
+            )
+            .expect("stale endpoint"),
+            node_id: local_node.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://stale_module_refresh_key?direct=203.0.113.9:21356".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        });
+        let current = test_network_module_relay_endpoint(&local_node, "module_refresh_key");
+        let refreshed_at = now + time::Duration::seconds(1);
+
+        assert!(
+            apply_network_module_endpoints_to_state(&mut state, [current.clone()], refreshed_at,)
+                .expect("apply active module endpoint")
+        );
+
+        let member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == local_node)
+            .expect("refreshed local member");
+        let module_endpoints = member
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
+            .collect::<Vec<_>>();
+        assert_eq!(module_endpoints.len(), 2);
+        assert!(module_endpoints.contains(&&current));
+        assert_eq!(state.updated_at, refreshed_at);
+
+        let published = sinomo_core::network::build_cluster_network_info_record(
+            &state,
+            &local_node,
+            refreshed_at,
+            CLUSTER_NETWORK_INFO_TTL_SECONDS,
+        );
+        assert!(published.endpoints.contains(&current));
     }
 
     fn append_cluster_raft_command(
