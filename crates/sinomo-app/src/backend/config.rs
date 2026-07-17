@@ -18,7 +18,8 @@ use sinomo_lm::{
     normalize_provider_account_name, provider_health_account_key, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
-    ConfigClient, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType, ConfigWriteTarget,
+    ConfigClient, ConfigClusterMode, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType,
+    ConfigWriteTarget,
 };
 use sinomo_runtime::local::SinomoDataDir;
 
@@ -61,6 +62,8 @@ pub struct ConfigItem {
     pub description: String,
     pub value: String,
     pub source: &'static str,
+    /// Human-readable authority/synchronization scope declared by the catalog.
+    pub scope: &'static str,
     /// `Some` when the value is a boolean (rendered as a toggle).
     pub bool_value: Option<bool>,
     /// How the value is edited in the Advanced editor.
@@ -127,6 +130,7 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
             description: def.description.clone(),
             value: compact(&value),
             source,
+            scope: scope_label(def.cluster_mode),
             bool_value,
             edit_kind,
             edit_value,
@@ -339,6 +343,7 @@ mod tests {
             .find(|item| item.key == sinomo_runtime::module::MODULE_NODE_CONFIG_KEY)
             .expect("module node config");
         let schema = item.schema.as_ref().expect("module config schema");
+        assert!(!item.scope.is_empty(), "catalog scope should reach the UI");
         assert_eq!(schema.name, "ModuleRuntimeConfig");
         assert!(matches!(
             &schema.value,
@@ -1253,6 +1258,16 @@ fn source_label(source: ConfigValueSource) -> &'static str {
         ConfigValueSource::Cluster => "cluster",
         ConfigValueSource::MigratedLocal => "local",
         ConfigValueSource::LegacyCluster => "cluster",
+    }
+}
+
+fn scope_label(mode: ConfigClusterMode) -> &'static str {
+    match mode {
+        ConfigClusterMode::LocalOnly => "this device",
+        ConfigClusterMode::LocalOverrideCluster => "device override",
+        ConfigClusterMode::ClusterOverrideLocal => "cluster override",
+        ConfigClusterMode::Synced => "synced",
+        ConfigClusterMode::ClusterOnly => "cluster",
     }
 }
 
