@@ -1194,6 +1194,24 @@ fn daemon_dfs_maintenance_probe_decision(
     }
 }
 
+fn daemon_dfs_maintenance_completion_decision(
+    outcome: DaemonDfsMaintenanceTickOutcome,
+    observed_at: Instant,
+    observed_at_unix_nanos: u64,
+    work: Option<DaemonDfsPendingMaintenanceWork>,
+) -> DaemonDfsMaintenanceProbeDecision {
+    match outcome {
+        DaemonDfsMaintenanceTickOutcome::Completed | DaemonDfsMaintenanceTickOutcome::Deferred => {
+            // A deferred pass is not evidence that actionable work remains. It
+            // may only mean that a quiet periodic pass yielded to foreground
+            // DFS traffic or lost cluster admission. Reclassify durable state
+            // exactly like a completed pass so repeated preemption cannot turn
+            // an idle node into a short-cadence maintenance loop.
+            daemon_dfs_maintenance_probe_decision(observed_at, observed_at_unix_nanos, work)
+        }
+    }
+}
+
 fn daemon_dfs_failed_maintenance_decision(
     observed_at: Instant,
     triggered_maintenance_requested: bool,
@@ -1401,10 +1419,7 @@ async fn run_daemon_background_maintenance_loop(
             let completed_outcome =
                 join_daemon_dfs_maintenance_task(completed_task, label.as_str()).await;
             match completed_outcome {
-                Some(DaemonDfsMaintenanceTickOutcome::Deferred) => {
-                    dfs_triggered_maintenance_requested = true;
-                }
-                Some(DaemonDfsMaintenanceTickOutcome::Completed) => {
+                Some(outcome) => {
                     let probe_paths = paths.clone();
                     let work = match tokio::task::spawn_blocking(move || {
                         daemon_dfs_pending_maintenance_work(&probe_paths)
@@ -1425,11 +1440,14 @@ async fn run_daemon_background_maintenance_loop(
                             None
                         }
                     };
-                    apply_daemon_dfs_maintenance_probe_result(
+                    let decision = daemon_dfs_maintenance_completion_decision(
+                        outcome,
+                        Instant::now(),
+                        daemon_dfs_now_unix_nanos(),
                         work,
-                        &mut dfs_triggered_maintenance_requested,
-                        &mut next_dfs_maintenance_probe,
                     );
+                    dfs_triggered_maintenance_requested = decision.trigger_maintenance;
+                    next_dfs_maintenance_probe = decision.next_probe_at;
                 }
                 None => {
                     let decision = daemon_dfs_failed_maintenance_decision(
@@ -6664,7 +6682,8 @@ mod tests {
     #[test]
     fn completed_dfs_followup_probe_prevents_same_iteration_probe() {
         let observed_at = Instant::now();
-        let decision = daemon_dfs_maintenance_probe_decision(
+        let decision = daemon_dfs_maintenance_completion_decision(
+            DaemonDfsMaintenanceTickOutcome::Completed,
             observed_at,
             1_000_000_000,
             Some(DaemonDfsPendingMaintenanceWork::default()),
@@ -6679,6 +6698,48 @@ mod tests {
             decision.next_probe_at,
             decision.next_probe_at
         ));
+    }
+
+    #[test]
+    fn deferred_dfs_followup_probe_does_not_latch_quiet_periodic_work() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_maintenance_completion_decision(
+            DaemonDfsMaintenanceTickOutcome::Deferred,
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork::default()),
+        );
+
+        assert!(
+            !decision.trigger_maintenance,
+            "foreground preemption alone must not create triggered DFS work"
+        );
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_INTERVAL,
+            "a quiet deferred pass returns to the periodic cadence"
+        );
+    }
+
+    #[test]
+    fn deferred_dfs_followup_probe_relatches_actionable_work() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_maintenance_completion_decision(
+            DaemonDfsMaintenanceTickOutcome::Deferred,
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork {
+                pending_write_count: 1,
+                ..DaemonDfsPendingMaintenanceWork::default()
+            }),
+        );
+
+        assert!(decision.trigger_maintenance);
+        assert_eq!(
+            decision.next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
+            "deferred actionable work retains the bounded safety probe"
+        );
     }
 
     #[test]
