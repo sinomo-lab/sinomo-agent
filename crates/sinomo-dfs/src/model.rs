@@ -36,7 +36,7 @@ pub struct DfsSubtreePolicy {
     pub policy: DfsObjectPolicy,
     /// Whether the override affects only `path_prefix` or is inherited by all
     /// descendants. Older records default to subtree behavior.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DfsPlacementScope::is_subtree")]
     pub scope: DfsPlacementScope,
     /// Explicit W and N. Absent values retain the legacy policy defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,6 +61,12 @@ pub enum DfsPlacementScope {
     SelfOnly,
     #[default]
     Subtree,
+}
+
+impl DfsPlacementScope {
+    fn is_subtree(value: &Self) -> bool {
+        matches!(value, Self::Subtree)
+    }
 }
 
 impl DfsSubtreePolicy {

@@ -21,6 +21,25 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[test]
+fn subtree_policy_default_encoding_remains_legacy_compatible() {
+    let policy = DfsSubtreePolicy::legacy("/models", DfsObjectPolicy::ReplicatedEventual);
+    let encoded = serde_json::to_value(&policy).expect("serialize subtree policy");
+
+    assert_eq!(
+        encoded,
+        serde_json::json!({
+            "path_prefix": "/models",
+            "policy": "replicated-eventual"
+        }),
+        "default placement fields must not change metadata snapshot semantic checksums"
+    );
+    assert_eq!(
+        serde_json::from_value::<DfsSubtreePolicy>(encoded).expect("deserialize legacy policy"),
+        policy,
+    );
+}
+
 #[derive(Clone, Debug)]
 struct ReceiveOnlyTransport {
     local_node_id: NodeId,
