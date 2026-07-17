@@ -271,6 +271,11 @@ struct ClusterConnectivityProbePlan {
     startup_settle_active: bool,
 }
 
+struct ClusterConnectivityProbeExecution {
+    records: Vec<ClusterConnectivityRecord>,
+    probed_degraded: bool,
+}
+
 pub(crate) struct ClusterConnectivityPendingProbe {
     paths: ClusterPaths,
     source_node_id: NodeId,
@@ -3213,9 +3218,14 @@ impl ClusterNetworkMaintenance {
         } = pending;
         let remaining_due = plan.remaining_due;
         let convergence_active = plan.convergence_active;
-        let probe_records = self
+        let execution = self
             .execute_connectivity_probe_plan_async(&state, plan)
             .await;
+        let convergence_followup_needed = connectivity_probe_result_needs_followup(
+            remaining_due,
+            convergence_active,
+            execution.probed_degraded,
+        );
         match sinomo_core::network::prune_local_cluster_connectivity_records_for_state_async(
             &runtime, &paths, &state,
         )
@@ -3236,10 +3246,8 @@ impl ClusterNetworkMaintenance {
         let records = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
             &paths,
             &source_node_id,
-            probe_records,
+            execution.records,
         );
-        let convergence_followup_needed =
-            connectivity_probe_result_needs_followup(remaining_due, convergence_active, &records);
         let written = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
             &runtime,
             &paths,
@@ -3305,7 +3313,7 @@ impl ClusterNetworkMaintenance {
         &mut self,
         state: &ClusterBootstrapState,
         plan: ClusterConnectivityProbePlan,
-    ) -> Vec<ClusterConnectivityRecord> {
+    ) -> ClusterConnectivityProbeExecution {
         let probed = probe_connectivity_batch_async(
             state.clone(),
             plan.entries.clone(),
@@ -3314,7 +3322,14 @@ impl ClusterNetworkMaintenance {
             plan.startup_settle_active,
         )
         .await;
-        self.apply_connectivity_probe_plan(plan, probed)
+        let probed_degraded = probed
+            .iter()
+            .any(|(_, record)| record.state == ClusterConnectivityState::Degraded);
+        let records = self.apply_connectivity_probe_plan(plan, probed);
+        ClusterConnectivityProbeExecution {
+            records,
+            probed_degraded,
+        }
     }
 
     fn select_connectivity_probe_plan(
@@ -3408,13 +3423,9 @@ fn connectivity_record_target_endpoint_key(record: &ClusterConnectivityRecord) -
 fn connectivity_probe_result_needs_followup(
     remaining_due: usize,
     convergence_active: bool,
-    records: &[ClusterConnectivityRecord],
+    probed_degraded: bool,
 ) -> bool {
-    remaining_due > 0
-        || (convergence_active
-            && records
-                .iter()
-                .any(|record| record.state == ClusterConnectivityState::Degraded))
+    remaining_due > 0 || (convergence_active && probed_degraded)
 }
 
 fn cluster_network_deadline_with_tail_reserve(
@@ -10158,56 +10169,13 @@ mod tests {
 
     #[test]
     fn connectivity_probe_followup_tracks_bounded_work_and_degraded_convergence() {
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_connectivity_followup").expect("cluster");
-        let local_node =
-            NodeId::from_legacy_named("node_connectivity_followup_local").expect("local");
-        let remote_node =
-            NodeId::from_legacy_named("node_connectivity_followup_remote").expect("remote");
-        let state = ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "connectivity followup",
-            local_node,
-            "connectivity followup local",
-            "public-key",
-            now,
-        );
-        let endpoint = sinomo_core::network::daemon_lan_endpoint(
-            &remote_node,
-            "192.0.2.10:21353".to_string(),
-            10,
-        );
-        let degraded = sinomo_core::network::cluster_connectivity_record(
-            &state,
-            &endpoint,
-            ClusterConnectivityState::Degraded,
-            None,
-            1,
-            None,
-            Some("failed".to_string()),
-            now,
-            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
-        );
-        let mut terminal = degraded.clone();
-        terminal.state = ClusterConnectivityState::Unreachable;
-        terminal.consecutive_failures = 3;
-
-        assert!(connectivity_probe_result_needs_followup(1, false, &[]));
-        assert!(connectivity_probe_result_needs_followup(
-            0,
-            true,
-            std::slice::from_ref(&degraded)
-        ));
+        assert!(connectivity_probe_result_needs_followup(1, false, false));
+        assert!(connectivity_probe_result_needs_followup(0, true, true));
         assert!(
-            !connectivity_probe_result_needs_followup(0, false, std::slice::from_ref(&degraded)),
+            !connectivity_probe_result_needs_followup(0, false, true),
             "a new steady-state failure keeps the normal retry cadence"
         );
-        assert!(!connectivity_probe_result_needs_followup(
-            0,
-            true,
-            std::slice::from_ref(&terminal)
-        ));
+        assert!(!connectivity_probe_result_needs_followup(0, true, false));
     }
 
     #[test]
@@ -10652,6 +10620,117 @@ mod tests {
         assert!(
             merged.contains(&offline_record),
             "an unrelated probe must preserve a live unreachable module record until its backoff TTL expires"
+        );
+    }
+
+    #[test]
+    fn unprobed_degraded_module_record_does_not_keep_convergence_accelerated() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-degraded-module-idle");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_connectivity_degraded_module_idle")
+            .expect("cluster");
+        let local = NodeId::from_legacy_named("node_connectivity_degraded_module_idle_local")
+            .expect("local");
+        let remote = NodeId::from_legacy_named("node_connectivity_degraded_module_idle_remote")
+            .expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity degraded module idle",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let module_endpoint =
+            test_network_module_relay_endpoint(&remote, "module_public_key_degraded_idle");
+        let mut remote_member =
+            ClusterMemberRecord::local_non_voting(cluster_id, remote, "remote", "pk-remote", now);
+        remote_member.endpoints = vec![module_endpoint.clone()];
+        state.members.push(remote_member);
+
+        let module_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &module_endpoint,
+            ClusterConnectivityState::Degraded,
+            None,
+            1,
+            None,
+            Some("transient module failure".to_string()),
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            std::slice::from_ref(&module_record),
+        )
+        .expect("seed degraded module connectivity");
+
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            service_registry: None,
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: BTreeMap::new(),
+            connectivity_cursor: 0,
+            connectivity_converged: false,
+            environment_id: None,
+            local_node_role: ClusterNodeRole::Workstation,
+            solo_cluster_idle: false,
+            startup_settle_until: None,
+            tick: 0,
+            publish_failure_streak: 0,
+            kv_snapshot_pull_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
+            last_publish: maintenance_now,
+            last_discovery: maintenance_now,
+            last_probe: maintenance_now,
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+        };
+        let plan = ClusterConnectivityProbePlan {
+            active_keys: Vec::new(),
+            entries: Vec::new(),
+            remaining_due: 0,
+            convergence_active: true,
+            timestamp: "unused".to_string(),
+            now,
+            startup_settle_active: false,
+        };
+
+        let execution =
+            runtime.block_on(maintenance.execute_connectivity_probe_plan_async(&state, plan));
+        assert!(execution.records.is_empty());
+        assert!(
+            !execution.probed_degraded,
+            "a degraded record outside the actual probe batch must not request a convergence follow-up"
+        );
+        let followup_needed =
+            connectivity_probe_result_needs_followup(0, true, execution.probed_degraded);
+        let merged = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
+            &paths,
+            &local,
+            execution.records,
+        );
+        assert!(
+            merged.contains(&module_record),
+            "the module-owned record must still be retained for storage and publication"
+        );
+
+        maintenance.connectivity_converged = !followup_needed;
+        assert!(maintenance.connectivity_converged);
+        assert_eq!(
+            maintenance.next_due_duration(maintenance_now),
+            DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
+            "settled connectivity should return to the normal workstation role cadence"
         );
     }
 

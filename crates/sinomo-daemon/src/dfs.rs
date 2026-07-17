@@ -466,7 +466,7 @@ impl DaemonDfsPendingMaintenanceWork {
     }
 }
 
-fn daemon_dfs_now_unix_nanos() -> u64 {
+pub(crate) fn daemon_dfs_now_unix_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
@@ -1895,7 +1895,14 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     if !cluster_paths.state.exists() {
         return Ok(DaemonDfsPendingMaintenanceWork::default());
     }
-    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
+    // This is a scheduling observation, not a recovery or mutation boundary.
+    // Inspection mode still reads the latest durable tables, but it does not
+    // take write locks, migrate/replay recovery state, or repair cursors on
+    // every background probe.
+    let metadata = sinomo_dfs::open_cluster_aware_dfs_metadata_backend_for_inspection(
+        &data_dir,
+        &cluster_paths,
+    )?;
     let summary = metadata.metadata_summary()?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
