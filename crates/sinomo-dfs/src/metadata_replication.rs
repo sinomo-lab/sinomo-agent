@@ -7,14 +7,16 @@
 //! `metadata_backend`.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::ClusterBootstrapState;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    ClusterPaths, NetworkError, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, NetworkError,
+    ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult, cluster_directory_for,
+    cluster_route_next_hop,
 };
 use sinomo_core::node::NodeId;
+use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -2229,11 +2231,453 @@ fn prepared_dfs_metadata_target_lanes(
     target_lanes.into_values().collect()
 }
 
+/// Treat a node as temporarily ineligible only when every endpoint currently
+/// advertised by the cluster directory has an explicit local `Unreachable`
+/// record and the connectivity graph has no relay path to it. An unobserved
+/// directory-only or module endpoint therefore keeps the target eligible.
+/// Re-reading the graph for each publish also makes a connectivity transition
+/// immediately restore the target without waiting for a replication timer.
+fn dfs_metadata_target_is_explicitly_unreachable(
+    graph: &ClusterConnectivityGraph,
+    advertised_endpoints: &[ClusterEndpointRecord],
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> bool {
+    if cluster_route_next_hop(graph, local_node_id, target_node_id).is_some() {
+        return false;
+    }
+
+    let mut target_endpoints = advertised_endpoints
+        .iter()
+        .filter(|endpoint| &endpoint.node_id == target_node_id)
+        .peekable();
+    target_endpoints.peek().is_some()
+        && target_endpoints.all(|endpoint| {
+            matches!(
+                graph.state_for_endpoint(endpoint),
+                Some(ClusterConnectivityState::Unreachable)
+            )
+        })
+}
+
+fn defer_explicitly_unreachable_dfs_metadata_targets(
+    plan: &mut DfsPreparedClusterMetadataJournalPublish,
+) {
+    if plan.targets.is_empty() {
+        return;
+    }
+    let cluster_paths = ClusterPaths::new(&plan.data_dir);
+    if !cluster_paths.state.exists() {
+        return;
+    }
+    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) else {
+        return;
+    };
+    if state.local_node_id != plan.local_node_id {
+        return;
+    }
+
+    // Fail open when the directory is not installed (for example, an
+    // embedded/pre-cluster caller). State-member endpoints alone are not
+    // sufficient here because the directory may own additional module or
+    // dynamically published endpoints that must remain routable.
+    let Ok(advertised_endpoints) = cluster_directory_for(&cluster_paths).endpoints() else {
+        return;
+    };
+    if advertised_endpoints.is_empty() {
+        return;
+    }
+    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(&cluster_paths, &state) else {
+        return;
+    };
+
+    defer_explicitly_unreachable_dfs_metadata_targets_with_connectivity(
+        plan,
+        &graph,
+        &advertised_endpoints,
+    );
+}
+
+fn defer_explicitly_unreachable_dfs_metadata_targets_with_connectivity(
+    plan: &mut DfsPreparedClusterMetadataJournalPublish,
+    graph: &ClusterConnectivityGraph,
+    advertised_endpoints: &[ClusterEndpointRecord],
+) {
+    let target_node_ids = plan
+        .targets
+        .iter()
+        .map(|target| target.target_node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let deferred_node_ids = target_node_ids
+        .into_iter()
+        .filter(|target_node_id| {
+            dfs_metadata_target_is_explicitly_unreachable(
+                graph,
+                advertised_endpoints,
+                &plan.local_node_id,
+                target_node_id,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if deferred_node_ids.is_empty() {
+        return;
+    }
+
+    let mut deferred_outcomes = Vec::new();
+    plan.targets.retain(|target| {
+        if !deferred_node_ids.contains(&target.target_node_id) {
+            return true;
+        }
+        deferred_outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
+            target_node_id: target.target_node_id.clone(),
+            shard_id: target.shard_id.clone(),
+            after_sequence: target.after_sequence,
+        });
+        false
+    });
+    plan.outcomes.extend(deferred_outcomes);
+}
+
+#[cfg(test)]
+mod explicitly_unreachable_target_tests {
+    use super::*;
+    use sinomo_core::network::ClusterConnectivityRecord;
+    use sinomo_core::node::ClusterId;
+    use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource, ClusterTransportKind, Id};
+
+    fn test_node(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).expect("node id")
+    }
+
+    fn test_endpoint(
+        name: &str,
+        node_id: &NodeId,
+        transport: ClusterTransportKind,
+        address: &str,
+        source: ClusterEndpointSource,
+    ) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: Id::from_legacy_named(name).expect("endpoint id"),
+            node_id: node_id.clone(),
+            transport,
+            address: address.to_string(),
+            source,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn connectivity_record(
+        cluster_id: &ClusterId,
+        source_node_id: &NodeId,
+        endpoint: &ClusterEndpointRecord,
+        state: ClusterConnectivityState,
+    ) -> ClusterConnectivityRecord {
+        let now = OffsetDateTime::now_utc();
+        let is_healthy = state == ClusterConnectivityState::Healthy;
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source_node_id.clone(),
+            target_node_id: endpoint.node_id.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state,
+            latency_ms: is_healthy.then_some(4),
+            consecutive_failures: if is_healthy { 0 } else { 3 },
+            last_success_at: None,
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::hours(1),
+        }
+    }
+
+    fn graph(
+        local_node_id: &NodeId,
+        records: impl IntoIterator<Item = ClusterConnectivityRecord>,
+    ) -> ClusterConnectivityGraph {
+        ClusterConnectivityGraph::from_records(local_node_id.clone(), records)
+    }
+
+    #[test]
+    fn explicitly_unreachable_requires_every_advertised_endpoint_to_be_unreachable() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_metadata_offline_all").expect("cluster id");
+        let local_node_id = test_node("node_dfs_metadata_offline_all_local");
+        let target_node_id = test_node("node_dfs_metadata_offline_all_target");
+        let tcp_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_all_tcp",
+            &target_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.20.2:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let iroh_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_all_iroh",
+            &target_node_id,
+            ClusterTransportKind::Iroh,
+            "iroh-offline-target",
+            ClusterEndpointSource::Rendezvous,
+        );
+        let advertised_endpoints = vec![tcp_endpoint.clone(), iroh_endpoint.clone()];
+        let graph = graph(
+            &local_node_id,
+            [
+                connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &tcp_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                ),
+                connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &iroh_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                ),
+            ],
+        );
+
+        assert!(dfs_metadata_target_is_explicitly_unreachable(
+            &graph,
+            &advertised_endpoints,
+            &local_node_id,
+            &target_node_id,
+        ));
+    }
+
+    #[test]
+    fn explicitly_unreachable_fails_open_for_unobserved_module_endpoint() {
+        let cluster_id = ClusterId::from_legacy_named("cluster_dfs_metadata_offline_unobserved")
+            .expect("cluster id");
+        let local_node_id = test_node("node_dfs_metadata_offline_unobserved_local");
+        let target_node_id = test_node("node_dfs_metadata_offline_unobserved_target");
+        let tcp_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_unobserved_tcp",
+            &target_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.21.2:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let module_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_unobserved_module",
+            &target_node_id,
+            ClusterTransportKind::Iroh,
+            "iroh-module-target",
+            ClusterEndpointSource::Rendezvous,
+        );
+        let graph = graph(
+            &local_node_id,
+            [connectivity_record(
+                &cluster_id,
+                &local_node_id,
+                &tcp_endpoint,
+                ClusterConnectivityState::Unreachable,
+            )],
+        );
+
+        assert!(!dfs_metadata_target_is_explicitly_unreachable(
+            &graph,
+            &[tcp_endpoint, module_endpoint],
+            &local_node_id,
+            &target_node_id,
+        ));
+    }
+
+    #[test]
+    fn explicitly_unreachable_recovers_immediately_on_connectivity_transition() {
+        let cluster_id = ClusterId::from_legacy_named("cluster_dfs_metadata_offline_recovery")
+            .expect("cluster id");
+        let local_node_id = test_node("node_dfs_metadata_offline_recovery_local");
+        let target_node_id = test_node("node_dfs_metadata_offline_recovery_target");
+        let endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_recovery",
+            &target_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.22.2:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let unreachable_graph = graph(
+            &local_node_id,
+            [connectivity_record(
+                &cluster_id,
+                &local_node_id,
+                &endpoint,
+                ClusterConnectivityState::Unreachable,
+            )],
+        );
+        let healthy_graph = graph(
+            &local_node_id,
+            [connectivity_record(
+                &cluster_id,
+                &local_node_id,
+                &endpoint,
+                ClusterConnectivityState::Healthy,
+            )],
+        );
+
+        assert!(dfs_metadata_target_is_explicitly_unreachable(
+            &unreachable_graph,
+            std::slice::from_ref(&endpoint),
+            &local_node_id,
+            &target_node_id,
+        ));
+        assert!(!dfs_metadata_target_is_explicitly_unreachable(
+            &healthy_graph,
+            std::slice::from_ref(&endpoint),
+            &local_node_id,
+            &target_node_id,
+        ));
+    }
+
+    #[test]
+    fn explicitly_unreachable_keeps_target_with_live_relay_path() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_metadata_offline_relay").expect("cluster id");
+        let local_node_id = test_node("node_dfs_metadata_offline_relay_local");
+        let relay_node_id = test_node("node_dfs_metadata_offline_relay_bridge");
+        let target_node_id = test_node("node_dfs_metadata_offline_relay_target");
+        let direct_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_relay_direct",
+            &target_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.23.3:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let relay_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_relay_bridge",
+            &relay_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.23.2:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let relay_target_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_relay_bridge_target",
+            &target_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.23.3:21353",
+            ClusterEndpointSource::Observed,
+        );
+        let graph = graph(
+            &local_node_id,
+            [
+                connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &direct_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                ),
+                connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &relay_endpoint,
+                    ClusterConnectivityState::Healthy,
+                ),
+                connectivity_record(
+                    &cluster_id,
+                    &relay_node_id,
+                    &relay_target_endpoint,
+                    ClusterConnectivityState::Healthy,
+                ),
+            ],
+        );
+
+        assert!(!dfs_metadata_target_is_explicitly_unreachable(
+            &graph,
+            &[direct_endpoint],
+            &local_node_id,
+            &target_node_id,
+        ));
+    }
+
+    #[test]
+    fn explicitly_unreachable_target_is_deferred_without_dropping_healthy_target() {
+        let cluster_id = ClusterId::from_legacy_named("cluster_dfs_metadata_offline_filter")
+            .expect("cluster id");
+        let local_node_id = test_node("node_dfs_metadata_offline_filter_local");
+        let offline_node_id = test_node("node_dfs_metadata_offline_filter_offline");
+        let healthy_node_id = test_node("node_dfs_metadata_offline_filter_healthy");
+        let offline_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_filter_offline",
+            &offline_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.24.2:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let healthy_endpoint = test_endpoint(
+            "endpoint_dfs_metadata_offline_filter_healthy",
+            &healthy_node_id,
+            ClusterTransportKind::LanTcp,
+            "10.90.24.3:21353",
+            ClusterEndpointSource::KvMembership,
+        );
+        let graph = graph(
+            &local_node_id,
+            [
+                connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &offline_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                ),
+                connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &healthy_endpoint,
+                    ClusterConnectivityState::Healthy,
+                ),
+            ],
+        );
+        let file_system_id = DfsFileSystemId::from_legacy_named("fs_dfs_metadata_offline_filter")
+            .expect("file system id");
+        let shard_id = DfsMetadataShardId::new("services");
+        let target = |target_node_id: NodeId| DfsPreparedMetadataJournalTargetPublish {
+            target_node_id,
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            shard_epoch: 4,
+            after_sequence: 19,
+            commands: Vec::new(),
+            backlog_after_sequence: None,
+        };
+        let mut plan = DfsPreparedClusterMetadataJournalPublish {
+            data_dir: SinomoDataDir::new(std::env::temp_dir()),
+            local_node_id: local_node_id.clone(),
+            peer_node_ids: vec![offline_node_id.clone(), healthy_node_id.clone()],
+            outcomes: Vec::new(),
+            targets: vec![
+                target(offline_node_id.clone()),
+                target(healthy_node_id.clone()),
+            ],
+        };
+
+        defer_explicitly_unreachable_dfs_metadata_targets_with_connectivity(
+            &mut plan,
+            &graph,
+            &[offline_endpoint, healthy_endpoint],
+        );
+
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].target_node_id, healthy_node_id);
+        assert!(matches!(
+            plan.outcomes.as_slice(),
+            [DfsMetadataJournalReplicationOutcome::MissingRoute {
+                target_node_id,
+                shard_id: deferred_shard_id,
+                after_sequence: 19,
+            }] if target_node_id == &offline_node_id && deferred_shard_id == &shard_id
+        ));
+    }
+}
+
 fn execute_prepared_dfs_metadata_journal_publish(
-    plan: DfsPreparedClusterMetadataJournalPublish,
+    mut plan: DfsPreparedClusterMetadataJournalPublish,
     transport: &mut dyn DfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    defer_explicitly_unreachable_dfs_metadata_targets(&mut plan);
     let DfsPreparedClusterMetadataJournalPublish {
         data_dir,
         local_node_id,
@@ -2327,10 +2771,11 @@ fn execute_prepared_dfs_metadata_journal_publish(
 }
 
 async fn execute_prepared_dfs_metadata_journal_publish_async(
-    plan: DfsPreparedClusterMetadataJournalPublish,
+    mut plan: DfsPreparedClusterMetadataJournalPublish,
     transport: &dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    defer_explicitly_unreachable_dfs_metadata_targets(&mut plan);
     let DfsPreparedClusterMetadataJournalPublish {
         data_dir,
         local_node_id,
