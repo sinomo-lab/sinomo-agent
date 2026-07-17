@@ -10,10 +10,11 @@ use sinomo_core::network::{
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use time::OffsetDateTime;
 
 use crate::control_plane::topology_preserving_metadata_shard_replicas;
@@ -30,11 +31,13 @@ use crate::{
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, local_dfs_metadata_shard_path, materialize_default_sifs_metadata,
-    materialize_default_sifs_metadata_on_shards, metadata_service_key,
-    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
-    metadata_shard_membership_handoff_proof_key, open_cluster_aware_dfs_metadata_backend,
-    open_local_metadata_shard_backend, open_local_sharded_metadata_backend,
-    run_cluster_dfs_smoke_with_message_sender, sifs_node_files_path,
+    materialize_default_sifs_metadata_on_shards,
+    metadata_replication::materialize_default_sifs_metadata_on_shards_with_report,
+    metadata_service_key, metadata_shard_head_watermark_key, metadata_shard_key,
+    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
+    open_cluster_aware_dfs_metadata_backend, open_local_metadata_shard_backend,
+    open_local_sharded_metadata_backend, run_cluster_dfs_smoke_with_message_sender,
+    sifs_node_files_path,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +57,76 @@ pub struct DfsDefaultClusterBootstrapReport {
     pub file_system: DfsFileSystem,
     pub metadata_shards: Vec<DfsMetadataShardConfig>,
     pub local_has_primary_metadata_shards: bool,
+}
+
+type DfsDefaultMaterializationHandoffEvidence = Vec<(
+    Option<DfsMetadataShardMembershipHandoff>,
+    Option<DfsMetadataShardMembershipHandoffProof>,
+)>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsDefaultMaterializationSignature {
+    file_system: DfsFileSystem,
+    shards: Vec<DfsMetadataShardConfig>,
+    bootstrap_owner_node_ids: Vec<NodeId>,
+    fallback_owner_node_id: NodeId,
+    handoff_evidence: DfsDefaultMaterializationHandoffEvidence,
+}
+
+// Process-local successful-pass cache. The daemon's per-data-dir lifecycle gate
+// serializes calls that share a metadata root, so the signature check and the
+// materialization it guards cannot race there. Other callers may at worst do a
+// redundant idempotent pass. We record only a fully scanned successful pass;
+// process restart/crash clears the cache and forces recovery validation again.
+static DFS_DEFAULT_MATERIALIZATION_SIGNATURES: OnceLock<
+    Mutex<BTreeMap<PathBuf, DfsDefaultMaterializationSignature>>,
+> = OnceLock::new();
+
+fn default_materialization_is_current(
+    data_root: &Path,
+    signature: &DfsDefaultMaterializationSignature,
+) -> bool {
+    DFS_DEFAULT_MATERIALIZATION_SIGNATURES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .is_ok_and(|signatures| signatures.get(data_root) == Some(signature))
+}
+
+fn record_default_materialization(
+    data_root: PathBuf,
+    signature: DfsDefaultMaterializationSignature,
+) {
+    if let Ok(mut signatures) = DFS_DEFAULT_MATERIALIZATION_SIGNATURES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        signatures.insert(data_root, signature);
+    }
+}
+
+#[cfg(test)]
+static DFS_DEFAULT_MATERIALIZATION_RUNS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_default_materialization_run(data_root: &Path) {
+    if let Ok(mut runs) = DFS_DEFAULT_MATERIALIZATION_RUNS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        let count = runs.entry(data_root.to_path_buf()).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+fn default_materialization_run_count(data_root: &Path) -> usize {
+    DFS_DEFAULT_MATERIALIZATION_RUNS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()
+        .and_then(|runs| runs.get(data_root).copied())
+        .unwrap_or_default()
 }
 
 pub trait DfsDefaultClusterBootstrapHost {
@@ -620,7 +693,7 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         &'a mut self,
         file_system: DfsFileSystem,
         shards: Vec<DfsMetadataShardConfig>,
-        bootstrap_owner_node_ids: Vec<NodeId>,
+        mut bootstrap_owner_node_ids: Vec<NodeId>,
         fallback_owner_node_id: NodeId,
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
         Box::pin(async move {
@@ -646,6 +719,21 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     .transpose()?;
                 completion_evidence.push((pending, proof));
             }
+            bootstrap_owner_node_ids.sort();
+            bootstrap_owner_node_ids.dedup();
+            let signature = DfsDefaultMaterializationSignature {
+                file_system: file_system.clone(),
+                shards: shards.clone(),
+                bootstrap_owner_node_ids: bootstrap_owner_node_ids.clone(),
+                fallback_owner_node_id: fallback_owner_node_id.clone(),
+                handoff_evidence: completion_evidence.clone(),
+            };
+            let data_root = self.data_dir.root();
+            if default_materialization_is_current(&data_root, &signature) {
+                return Ok(());
+            }
+            #[cfg(test)]
+            record_default_materialization_run(&data_root);
             let mut backend = open_local_sharded_metadata_backend(
                 default_dfs_metadata_shards_root(&self.data_dir),
                 shards.clone(),
@@ -659,13 +747,17 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     proof.as_ref(),
                 )?;
             }
-            materialize_default_sifs_metadata_on_shards(
+            let migration = materialize_default_sifs_metadata_on_shards_with_report(
                 &mut backend,
                 &file_system,
                 bootstrap_owner_node_ids,
                 fallback_owner_node_id,
                 OffsetDateTime::now_utc(),
-            )
+            )?;
+            if !migration.reached_limit {
+                record_default_materialization(data_root, signature);
+            }
+            Ok(())
         })
     }
 }
@@ -1918,6 +2010,56 @@ mod tests {
             .expect("read async primary-role handoff")
             .expect("async primary-role handoff parked");
         assert_eq!(pending.desired_shard, next_epoch);
+    }
+
+    #[tokio::test]
+    async fn stable_async_cluster_publications_materialize_once() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-stable-publish-materialization");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_stable_publish")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_stable_publish_local").expect("local");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "stable publish",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new(
+            data_dir.clone(),
+            cluster_paths,
+            local,
+            Box::new(sinomo_core::kv::InProcessKvStore::new()),
+        );
+        let options = DfsDefaultClusterBootstrapOptions {
+            publish_cluster_control: true,
+            materialize_local_metadata: true,
+        };
+
+        let first =
+            ensure_default_distributed_dfs_with_async_host(&state, &mut host, options.clone())
+                .await
+                .expect("first default DFS publication");
+        assert!(first.local_has_primary_metadata_shards);
+        assert_eq!(default_materialization_run_count(&data_dir.root()), 1);
+
+        let second = ensure_default_distributed_dfs_with_async_host(&state, &mut host, options)
+            .await
+            .expect("stable default DFS publication");
+        assert_eq!(second.metadata_shards, first.metadata_shards);
+        assert_eq!(
+            default_materialization_run_count(&data_dir.root()),
+            1,
+            "an unchanged publication must not reopen every shard and rescan the object catalog"
+        );
     }
 
     #[test]

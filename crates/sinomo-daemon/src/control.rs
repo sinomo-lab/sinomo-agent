@@ -62,6 +62,14 @@ const DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES: usize = 256 * 1024;
 const DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT: &[u8] = b"sinomo-sandbox-lifecycle-lock-v1\n";
 #[cfg(feature = "sandbox")]
 const DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(feature = "sandbox")]
+const DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR: &str = "sandbox-lifecycle-recovery";
+const DAEMON_SANDBOX_LIFECYCLE_PENDING_DIR: &str = "pending";
+#[cfg(feature = "sandbox")]
+const DAEMON_SANDBOX_LIFECYCLE_SWEEP_STAMP: &str = "last-safety-sweep";
+const DAEMON_SANDBOX_LIFECYCLE_PENDING_MARKER_CONTENT: &[u8] =
+    b"sinomo-sandbox-authoritative-recovery-pending-v1\n";
 
 static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
@@ -177,6 +185,188 @@ async fn start_daemon_network_environment_watch(
         }
     });
     Some(DaemonNetworkEnvironmentWatch { notify, task })
+}
+
+fn daemon_sandbox_lifecycle_recovery_state_dir(paths: &DaemonPaths) -> PathBuf {
+    paths.root.join(DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR)
+}
+
+fn daemon_sandbox_lifecycle_pending_dir(paths: &DaemonPaths) -> PathBuf {
+    daemon_sandbox_lifecycle_recovery_state_dir(paths).join(DAEMON_SANDBOX_LIFECYCLE_PENDING_DIR)
+}
+
+fn daemon_sandbox_lifecycle_pending_marker_path(
+    paths: &DaemonPaths,
+    sandbox_id: &sinomo_sandbox::SandboxId,
+) -> PathBuf {
+    daemon_sandbox_lifecycle_pending_dir(paths).join(sandbox_id.as_str())
+}
+
+#[cfg(feature = "sandbox")]
+fn daemon_sandbox_lifecycle_sweep_stamp_path(paths: &DaemonPaths) -> PathBuf {
+    daemon_sandbox_lifecycle_recovery_state_dir(paths).join(DAEMON_SANDBOX_LIFECYCLE_SWEEP_STAMP)
+}
+
+#[cfg(feature = "sandbox")]
+fn daemon_sandbox_lifecycle_io_error(path: &Path, source: std::io::Error) -> DaemonError {
+    DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    }
+}
+
+fn daemon_sandbox_lifecycle_durable_file_error(
+    source: sinomo_core::storage::durable_file::DurableFileError,
+) -> DaemonError {
+    DaemonError::Io {
+        path: source.path().to_string(),
+        detail: source.detail().to_string(),
+    }
+}
+
+fn ensure_daemon_sandbox_lifecycle_state_dirs(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    let state_dir = daemon_sandbox_lifecycle_recovery_state_dir(paths);
+    let pending_dir = daemon_sandbox_lifecycle_pending_dir(paths);
+    // Create each level separately through the shared durable-file primitive.
+    // It syncs both the new directory and its already-existing parent, using a
+    // backup-semantics directory handle where Windows permits it. The periodic
+    // safety sweep remains the fallback on filesystems that cannot flush
+    // directory metadata explicitly.
+    sinomo_core::storage::durable_file::ensure_private_directory(&state_dir)
+        .map_err(daemon_sandbox_lifecycle_durable_file_error)?;
+    sinomo_core::storage::durable_file::ensure_private_directory(&pending_dir)
+        .map_err(daemon_sandbox_lifecycle_durable_file_error)
+}
+
+fn write_daemon_sandbox_lifecycle_state(path: &Path, bytes: &[u8]) -> Result<(), DaemonError> {
+    sinomo_core::storage::durable_file::write_file_atomic(
+        path,
+        bytes,
+        sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
+            "sandbox-lifecycle-state",
+            "tmp",
+        )
+        .sync_all(),
+    )
+    .map_err(daemon_sandbox_lifecycle_durable_file_error)
+}
+
+fn mark_daemon_sandbox_authoritative_recovery_pending(
+    paths: &DaemonPaths,
+    sandbox_id: &sinomo_sandbox::SandboxId,
+) -> Result<(), DaemonError> {
+    ensure_daemon_sandbox_lifecycle_state_dirs(paths)?;
+    write_daemon_sandbox_lifecycle_state(
+        &daemon_sandbox_lifecycle_pending_marker_path(paths, sandbox_id),
+        DAEMON_SANDBOX_LIFECYCLE_PENDING_MARKER_CONTENT,
+    )
+}
+
+fn clear_daemon_sandbox_authoritative_recovery_pending(
+    paths: &DaemonPaths,
+    sandbox_id: &sinomo_sandbox::SandboxId,
+) -> Result<(), DaemonError> {
+    let path = daemon_sandbox_lifecycle_pending_marker_path(paths, sandbox_id);
+    sinomo_core::storage::durable_file::remove_file_if_exists_and_sync_parent(&path)
+        .map(|_| ())
+        .map_err(daemon_sandbox_lifecycle_durable_file_error)
+}
+
+fn best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+    paths: &DaemonPaths,
+    sandbox_id: &sinomo_sandbox::SandboxId,
+    context: &'static str,
+) {
+    if let Err(error) = clear_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id) {
+        // The authoritative operation has already settled. A stale marker is
+        // safe: the next maintenance tick rechecks DFS and clears it. Returning
+        // an RPC error here would make a committed mutation look retryable.
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            context,
+            error = %error,
+            "failed to clear settled sandbox lifecycle recovery marker"
+        );
+    }
+}
+
+#[cfg(feature = "sandbox")]
+fn daemon_sandbox_authoritative_recovery_pending_ids(
+    paths: &DaemonPaths,
+) -> Result<BTreeSet<sinomo_sandbox::SandboxId>, DaemonError> {
+    let pending_dir = daemon_sandbox_lifecycle_pending_dir(paths);
+    let entries = match std::fs::read_dir(&pending_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(source) => return Err(daemon_sandbox_lifecycle_io_error(&pending_dir, source)),
+    };
+    let mut sandbox_ids = BTreeSet::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| daemon_sandbox_lifecycle_io_error(&pending_dir, source))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|source| daemon_sandbox_lifecycle_io_error(&path, source))?
+            .is_file()
+        {
+            return Err(DaemonError::Io {
+                path: path.display().to_string(),
+                detail: "sandbox lifecycle pending marker is not a regular file".to_string(),
+            });
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: "sandbox lifecycle pending marker name is not UTF-8".to_string(),
+            })?;
+        let sandbox_id =
+            sinomo_sandbox::SandboxId::new(name).map_err(|source| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: format!("invalid sandbox lifecycle pending marker: {source}"),
+            })?;
+        sandbox_ids.insert(sandbox_id);
+    }
+    Ok(sandbox_ids)
+}
+
+#[cfg(feature = "sandbox")]
+fn record_daemon_sandbox_lifecycle_safety_sweep(
+    paths: &DaemonPaths,
+    now_unix_nanos: u64,
+) -> Result<(), DaemonError> {
+    ensure_daemon_sandbox_lifecycle_state_dirs(paths)?;
+    write_daemon_sandbox_lifecycle_state(
+        &daemon_sandbox_lifecycle_sweep_stamp_path(paths),
+        now_unix_nanos.to_string().as_bytes(),
+    )
+}
+
+#[cfg(feature = "sandbox")]
+fn daemon_sandbox_lifecycle_safety_sweep_due_or_initialize(
+    paths: &DaemonPaths,
+    now_unix_nanos: u64,
+) -> Result<bool, DaemonError> {
+    let path = daemon_sandbox_lifecycle_sweep_stamp_path(paths);
+    let stored = match std::fs::read_to_string(&path) {
+        Ok(stored) => stored,
+        // A one-time startup scan preserves recovery for fences written by an
+        // older binary that predates the local marker. The successful scan
+        // records the stamp, so subsequent quiet 30-second ticks stay local.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(daemon_sandbox_lifecycle_io_error(&path, source)),
+    };
+    let Ok(last_sweep_unix_nanos) = stored.trim().parse::<u64>() else {
+        return Ok(true);
+    };
+    if last_sweep_unix_nanos > now_unix_nanos {
+        return Ok(true);
+    }
+    let interval_nanos = u64::try_from(DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos())
+        .unwrap_or(u64::MAX);
+    Ok(now_unix_nanos.saturating_sub(last_sweep_unix_nanos) >= interval_nanos)
 }
 
 type DaemonSandboxLifecycleLease =
@@ -320,7 +510,13 @@ fn acquire_daemon_sandbox_transaction_lease(
     sandbox_id: &sinomo_sandbox::SandboxId,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<DaemonSandboxExecutionLease, DaemonError> {
-    acquire_daemon_sandbox_mutation_lease_with_recovery(paths, sandbox_id, runtime, false)
+    let lease =
+        acquire_daemon_sandbox_mutation_lease_with_recovery(paths, sandbox_id, runtime, false)?;
+    // Publish the marker through the durable-file path before any authoritative
+    // SIFS fence can be written. A crash in any later phase then makes the cheap
+    // 30-second precheck wake recovery without hydrating DFS while idle.
+    mark_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id)?;
+    Ok(lease)
 }
 
 fn acquire_daemon_sandbox_mutation_lease_with_recovery(
@@ -419,10 +615,22 @@ fn recover_daemon_authoritative_sandbox_transaction(
     let manifest = match store.load_allow_pending_reconciliation(sandbox_id) {
         Ok(manifest) => manifest,
         Err(sinomo_sandbox::SandboxStoreError::NotFound { .. })
-        | Err(sinomo_sandbox::SandboxStoreError::LegacyLayout { .. }) => return Ok(()),
+        | Err(sinomo_sandbox::SandboxStoreError::LegacyLayout { .. }) => {
+            best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+                paths,
+                sandbox_id,
+                "recovery target absent",
+            );
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     let Some(pending) = manifest.pending_reconciliation.clone() else {
+        best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+            paths,
+            sandbox_id,
+            "recovery already settled",
+        );
         return Ok(());
     };
     match pending.operation {
@@ -557,6 +765,11 @@ fn recover_daemon_authoritative_sandbox_transaction(
             })?;
         }
     }
+    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+        paths,
+        sandbox_id,
+        "authoritative recovery settled",
+    );
     Ok(())
 }
 
@@ -2413,6 +2626,11 @@ pub(crate) fn handle_daemon_sandbox_create_on_runtime(
         &transaction_id,
         OffsetDateTime::now_utc(),
     )?;
+    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+        paths,
+        &manifest.sandbox_id,
+        "sandbox create committed",
+    );
     Ok(sinomo_sandbox::SandboxCreateInstanceResponse { manifest })
 }
 
@@ -2701,6 +2919,11 @@ pub(crate) fn handle_daemon_sandbox_resume_on_runtime(
         &transaction_id,
         OffsetDateTime::now_utc(),
     )?;
+    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+        paths,
+        &request.sandbox_id,
+        "sandbox resume committed",
+    );
     Ok(sinomo_sandbox::SandboxResumeResponse { manifest })
 }
 
@@ -2784,6 +3007,11 @@ pub(crate) fn handle_daemon_sandbox_reboot_on_runtime(
         &transaction_id,
         OffsetDateTime::now_utc(),
     )?;
+    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+        paths,
+        &request.sandbox_id,
+        "sandbox reboot committed",
+    );
     Ok(sinomo_sandbox::SandboxRebootResponse {
         manifest,
         cleared_tmp,
@@ -2844,6 +3072,11 @@ pub(crate) fn handle_daemon_sandbox_destroy_on_runtime(
             "during destroy finalization",
         )
     })?;
+    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
+        paths,
+        &request.sandbox_id,
+        "sandbox destroy committed",
+    );
     Ok(sinomo_sandbox::SandboxDestroyResponse {
         sandbox_id: request.sandbox_id,
     })
@@ -3624,16 +3857,31 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
 }
 
 #[cfg(feature = "sandbox")]
-fn run_daemon_sandbox_lifecycle_maintenance_tick(
+fn run_daemon_sandbox_lifecycle_maintenance_scan(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
+    marked_sandbox_ids: BTreeSet<sinomo_sandbox::SandboxId>,
 ) -> Result<usize, DaemonError> {
-    let mut recovered = 0_usize;
     let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, Some(runtime))?;
     let mut authoritative_store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
     let pending_manifests = authoritative_store.list_pending_authoritative_manifests()?;
-    for manifest in pending_manifests {
-        let sandbox_id = manifest.sandbox_id.clone();
+    drop(authoritative_store);
+
+    let pending_sandbox_ids = pending_manifests
+        .into_iter()
+        .map(|manifest| manifest.sandbox_id)
+        .collect::<BTreeSet<_>>();
+    let mut candidate_sandbox_ids = marked_sandbox_ids;
+    for sandbox_id in &pending_sandbox_ids {
+        // Safety sweeps can discover fences written by an older binary or a
+        // direct store user. Persist the marker before attempting recovery so
+        // a second crash cannot return the daemon to unindexed work.
+        mark_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id)?;
+        candidate_sandbox_ids.insert(sandbox_id.clone());
+    }
+
+    let mut recovered = 0_usize;
+    for sandbox_id in candidate_sandbox_ids {
         let result = (|| -> Result<(), DaemonError> {
             let raw_lease =
                 acquire_daemon_sandbox_lifecycle_lease(paths, &sandbox_id, Some(runtime))?;
@@ -3647,7 +3895,10 @@ fn run_daemon_sandbox_lifecycle_maintenance_tick(
             )
         })();
         match result {
-            Ok(()) => recovered = recovered.saturating_add(1),
+            Ok(()) if pending_sandbox_ids.contains(&sandbox_id) => {
+                recovered = recovered.saturating_add(1)
+            }
+            Ok(()) => {}
             Err(error) => tracing::warn!(
                 sandbox_id = %sandbox_id,
                 error = %error,
@@ -3656,6 +3907,41 @@ fn run_daemon_sandbox_lifecycle_maintenance_tick(
         }
     }
     Ok(recovered)
+}
+
+#[cfg(feature = "sandbox")]
+fn run_daemon_sandbox_lifecycle_maintenance_tick_with_scan<F>(
+    paths: &DaemonPaths,
+    now_unix_nanos: u64,
+    scan: F,
+) -> Result<usize, DaemonError>
+where
+    F: FnOnce(BTreeSet<sinomo_sandbox::SandboxId>) -> Result<usize, DaemonError>,
+{
+    let marked_sandbox_ids = daemon_sandbox_authoritative_recovery_pending_ids(paths)?;
+    let safety_sweep_due =
+        daemon_sandbox_lifecycle_safety_sweep_due_or_initialize(paths, now_unix_nanos)?;
+    if marked_sandbox_ids.is_empty() && !safety_sweep_due {
+        return Ok(0);
+    }
+
+    let recovered = scan(marked_sandbox_ids)?;
+    record_daemon_sandbox_lifecycle_safety_sweep(paths, now_unix_nanos)?;
+    Ok(recovered)
+}
+
+#[cfg(feature = "sandbox")]
+fn run_daemon_sandbox_lifecycle_maintenance_tick(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<usize, DaemonError> {
+    run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(
+        paths,
+        daemon_dfs_now_unix_nanos(),
+        |marked_sandbox_ids| {
+            run_daemon_sandbox_lifecycle_maintenance_scan(paths, runtime, marked_sandbox_ids)
+        },
+    )
 }
 
 pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
@@ -6513,6 +6799,87 @@ mod tests {
             ),
             Duration::from_secs(2),
             "pending sandbox lifecycle recovery must wake on its own cadence"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn sandbox_lifecycle_quiet_ticks_skip_dfs_scan_after_startup_sweep() {
+        let root = sinomo_testdir::TestDir::new("sandbox-lifecycle-quiet-fast-path");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).expect("daemon root");
+        let started_at = 1_000_000_000_000_u64;
+        let tick_nanos = u64::try_from(DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL.as_nanos())
+            .expect("tick nanos");
+        let mut scan_count = 0_usize;
+
+        run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, started_at, |marked| {
+            scan_count += 1;
+            assert!(marked.is_empty());
+            Ok(0)
+        })
+        .expect("startup sweep");
+        for now in [started_at + tick_nanos, started_at + tick_nanos * 2] {
+            run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now, |_| {
+                scan_count += 1;
+                Ok(0)
+            })
+            .expect("quiet tick");
+        }
+        assert_eq!(scan_count, 1, "two quiet ticks must not hydrate DFS");
+
+        let safety_interval_nanos =
+            u64::try_from(DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos())
+                .expect("safety interval nanos");
+        run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(
+            &paths,
+            started_at + safety_interval_nanos,
+            |marked| {
+                scan_count += 1;
+                assert!(marked.is_empty());
+                Ok(0)
+            },
+        )
+        .expect("bounded safety sweep");
+        assert_eq!(scan_count, 2, "quiet recovery must retain a safety sweep");
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn sandbox_lifecycle_marker_survives_failure_and_wakes_recovery() {
+        let root = sinomo_testdir::TestDir::new("sandbox-lifecycle-pending-marker");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).expect("daemon root");
+        let now = 2_000_000_000_000_u64;
+        record_daemon_sandbox_lifecycle_safety_sweep(&paths, now).expect("sweep stamp");
+        let sandbox_id =
+            sinomo_sandbox::SandboxId::from_legacy_named("sandbox_pending_marker_recovery")
+                .expect("sandbox id");
+        mark_daemon_sandbox_authoritative_recovery_pending(&paths, &sandbox_id)
+            .expect("pending marker");
+
+        run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now, |marked| {
+            assert_eq!(marked, BTreeSet::from([sandbox_id.clone()]));
+            Err(DaemonError::Parse {
+                detail: "injected recovery failure".to_string(),
+            })
+        })
+        .expect_err("failed recovery");
+        assert_eq!(
+            daemon_sandbox_authoritative_recovery_pending_ids(&paths).expect("pending ids"),
+            BTreeSet::from([sandbox_id.clone()])
+        );
+
+        run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now + 1, |marked| {
+            assert_eq!(marked, BTreeSet::from([sandbox_id.clone()]));
+            clear_daemon_sandbox_authoritative_recovery_pending(&paths, &sandbox_id)?;
+            Ok(1)
+        })
+        .expect("successful recovery");
+        assert!(
+            daemon_sandbox_authoritative_recovery_pending_ids(&paths)
+                .expect("settled ids")
+                .is_empty()
         );
     }
 

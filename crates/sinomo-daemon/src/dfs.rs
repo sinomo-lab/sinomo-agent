@@ -13,7 +13,7 @@ use sinomo_core::kv::{
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, ObjectRpcSessionCall, ObjectRpcSessionResult,
-    cluster_route_next_hop,
+    cluster_healthy_route_next_hop,
 };
 use sinomo_core::node::NodeId;
 #[cfg(test)]
@@ -1494,8 +1494,9 @@ fn daemon_dfs_node_is_offline_for_maintenance(
     availability == &ClusterNodeAvailability::Offline
         && local_node_id != target_node_id
         // A failed direct endpoint does not make the node offline when the
-        // canonical network layer still has a relay route to it.
-        && cluster_route_next_hop(connectivity, local_node_id, target_node_id).is_none()
+        // canonical network layer still has a fully healthy relay route to it.
+        // A stale degraded route must not override an Offline health projection.
+        && cluster_healthy_route_next_hop(connectivity, local_node_id, target_node_id).is_none()
 }
 
 fn daemon_dfs_offline_node_ids(
@@ -3794,6 +3795,7 @@ mod tests {
     use sinomo_core::kv::InProcessKvStore;
     use sinomo_core::network::{
         ClusterConnectivityRecord, ClusterConnectivityState, ClusterEndpointId,
+        cluster_route_next_hop,
     };
     use sinomo_core::node::{ClusterId, NodeId};
     use sinomo_core::{
@@ -5547,6 +5549,43 @@ mod tests {
             observed_at: now,
             expires_at: now + time::Duration::minutes(5),
         }
+    }
+
+    #[test]
+    fn daemon_dfs_offline_node_with_only_degraded_route_is_parked() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_pending_degraded").expect("cluster id");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_degraded_local").expect("local node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_pending_degraded_target").expect("target node");
+        let connectivity = ClusterConnectivityGraph::from_records(
+            local_node_id.clone(),
+            [pending_work_connectivity_record(
+                &cluster_id,
+                &local_node_id,
+                &target_node_id,
+                "endpoint_pending_degraded_direct",
+                ClusterConnectivityState::Degraded,
+            )],
+        );
+
+        assert!(
+            cluster_route_next_hop(&connectivity, &local_node_id, &target_node_id).is_some(),
+            "the fixture must retain the stale degraded route"
+        );
+        assert!(daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Offline,
+            &connectivity,
+            &local_node_id,
+            &target_node_id,
+        ));
+        assert!(!daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Online,
+            &connectivity,
+            &local_node_id,
+            &target_node_id,
+        ));
     }
 
     #[test]
