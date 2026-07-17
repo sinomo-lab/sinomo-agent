@@ -985,14 +985,32 @@ fn daemon_dfs_maintenance_probe_decision(
 fn daemon_dfs_failed_maintenance_decision(
     observed_at: Instant,
     triggered_maintenance_requested: bool,
+    next_probe_at: Instant,
 ) -> DaemonDfsMaintenanceProbeDecision {
+    let error_retry_at = observed_at
+        .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
+        .unwrap_or(observed_at);
     DaemonDfsMaintenanceProbeDecision {
-        // A notification can arrive while the maintenance task is running.
-        // Task failure must not consume that already-latched request.
+        // Task failure must not consume an already-classified request.
         trigger_maintenance: triggered_maintenance_requested,
-        next_probe_at: observed_at
-            .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
-            .unwrap_or(observed_at),
+        // A notification is a request to inspect pending work, not proof that
+        // a full pass is required. Preserve an already-due notification probe
+        // across task failure while retaining the bounded error retry.
+        next_probe_at: next_probe_at.min(error_retry_at),
+    }
+}
+
+fn daemon_dfs_maintenance_notification_decision(
+    observed_at: Instant,
+    triggered_maintenance_requested: bool,
+    next_probe_at: Instant,
+) -> DaemonDfsMaintenanceProbeDecision {
+    // Notifications are edge-triggered hints from several sources, including
+    // generic cluster refreshes and replicated metadata. They must wake the
+    // classifier, not bypass it and launch a full metadata pass directly.
+    DaemonDfsMaintenanceProbeDecision {
+        trigger_maintenance: triggered_maintenance_requested,
+        next_probe_at: next_probe_at.min(observed_at),
     }
 }
 
@@ -1205,6 +1223,7 @@ async fn run_daemon_background_maintenance_loop(
                     let decision = daemon_dfs_failed_maintenance_decision(
                         Instant::now(),
                         dfs_triggered_maintenance_requested,
+                        next_dfs_maintenance_probe,
                     );
                     dfs_triggered_maintenance_requested = decision.trigger_maintenance;
                     next_dfs_maintenance_probe = decision.next_probe_at;
@@ -1442,10 +1461,13 @@ async fn run_daemon_background_maintenance_loop(
                 }
             }
             _ = daemon_optional_notify(dfs_notify) => {
-                dfs_triggered_maintenance_requested = true;
-                last_dfs_maintenance = Instant::now()
-                    .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
-                    .unwrap_or(last_dfs_maintenance);
+                let decision = daemon_dfs_maintenance_notification_decision(
+                    Instant::now(),
+                    dfs_triggered_maintenance_requested,
+                    next_dfs_maintenance_probe,
+                );
+                dfs_triggered_maintenance_requested = decision.trigger_maintenance;
+                next_dfs_maintenance_probe = decision.next_probe_at;
             }
             _ = daemon_optional_notify(network_notify) => {
                 tracing::info!("sinomo {label} cluster maintenance refreshed after network environment change");
@@ -6303,7 +6325,10 @@ mod tests {
     #[test]
     fn failed_dfs_maintenance_preserves_latched_request_and_short_probe() {
         let observed_at = Instant::now();
-        let decision = daemon_dfs_failed_maintenance_decision(observed_at, true);
+        let future_probe = observed_at
+            .checked_add(DAEMON_DFS_MAINTENANCE_INTERVAL)
+            .expect("future probe");
+        let decision = daemon_dfs_failed_maintenance_decision(observed_at, true, future_probe);
 
         assert!(
             decision.trigger_maintenance,
@@ -6313,6 +6338,41 @@ mod tests {
             decision.next_probe_at.duration_since(observed_at),
             DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
             "failed work must retain the bounded recovery probe"
+        );
+    }
+
+    #[test]
+    fn dfs_maintenance_notification_requests_a_probe_without_forcing_a_pass() {
+        let observed_at = Instant::now();
+        let mut next_probe_at = observed_at
+            .checked_add(DAEMON_DFS_MAINTENANCE_INTERVAL)
+            .expect("future probe");
+        let triggered_maintenance_requested = false;
+
+        let notification = daemon_dfs_maintenance_notification_decision(
+            observed_at,
+            triggered_maintenance_requested,
+            next_probe_at,
+        );
+        next_probe_at = notification.next_probe_at;
+
+        assert!(daemon_dfs_maintenance_probe_is_due(
+            observed_at,
+            next_probe_at
+        ));
+        assert!(
+            !notification.trigger_maintenance,
+            "an edge hint must not bypass pending-work classification"
+        );
+
+        let decision = daemon_dfs_failed_maintenance_decision(
+            observed_at,
+            triggered_maintenance_requested,
+            next_probe_at,
+        );
+        assert_eq!(
+            decision.next_probe_at, observed_at,
+            "task failure must not discard a notification probe already due"
         );
     }
 
