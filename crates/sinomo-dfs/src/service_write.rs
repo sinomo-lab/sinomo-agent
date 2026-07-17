@@ -88,7 +88,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsReplicaPlacementPlan, DfsError> {
         let candidates = candidate_nodes
             .into_iter()
-            .map(DfsReplicaCandidate::new)
+            .map(|node_id| {
+                let zone = policy.node_zones.get(&node_id).cloned();
+                DfsReplicaCandidate::new(node_id).with_zone(zone)
+            })
             .collect();
         Ok(plan_replicas(&DfsReplicaPlacementRequest {
             file_system_id: request.file_system_id.clone(),
@@ -373,7 +376,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
             let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
@@ -381,7 +384,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 policy.min_commit_replicas.min(desired_replicas)
             };
-            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+            policy.with_counts(min_commit_replicas, desired_replicas)?
         } else {
             policy
         };
@@ -551,7 +554,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
             let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
@@ -559,7 +562,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 policy.min_commit_replicas.min(desired_replicas)
             };
-            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+            policy.with_counts(min_commit_replicas, desired_replicas)?
         } else {
             policy
         };
@@ -703,10 +706,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
-            DfsReplicationPolicy::new(
+            policy.with_counts(
                 policy.min_commit_replicas.min(desired_replicas),
                 desired_replicas,
             )?
@@ -790,10 +793,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
-            DfsReplicationPolicy::new(
+            policy.with_counts(
                 policy.min_commit_replicas.min(desired_replicas),
                 desired_replicas,
             )?
@@ -957,7 +960,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
             let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
@@ -965,7 +968,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 policy.min_commit_replicas.min(desired_replicas)
             };
-            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+            policy.with_counts(min_commit_replicas, desired_replicas)?
         } else {
             policy
         };
@@ -1209,7 +1212,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         if !desired_replica_nodes.contains(&request.requesting_node_id) {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -1225,7 +1228,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 policy.min_commit_replicas.min(desired_replicas)
             };
-            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+            policy.with_counts(min_commit_replicas, desired_replicas)?
         } else {
             policy
         };
@@ -1486,7 +1489,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
             let desired_replicas = desired_replica_nodes.len();
             // Replicated-confirmed requires every desired replica to confirm before
@@ -1499,7 +1502,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 policy.min_commit_replicas.min(desired_replicas)
             };
-            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+            policy.with_counts(min_commit_replicas, desired_replicas)?
         } else {
             policy
         };

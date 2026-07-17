@@ -7,7 +7,7 @@
 
 use crate::DfsFileSystemId;
 use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
-use crate::{DfsFileSystem, DfsSubtreePolicy, sifs_file_system_id};
+use crate::{DfsFileSystem, DfsPlacementReconciliationJob, DfsSubtreePolicy, sifs_file_system_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::{
@@ -30,6 +30,18 @@ pub fn file_system_config_key(file_system_id: &DfsFileSystemId) -> String {
 
 pub fn metadata_shards_prefix(file_system_id: &DfsFileSystemId) -> String {
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/metadata-shards")
+}
+
+pub fn placement_reconciliations_prefix(file_system_id: &DfsFileSystemId) -> String {
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliations/")
+}
+
+pub fn placement_reconciliation_key(file_system_id: &DfsFileSystemId, job_id: &str) -> String {
+    format!(
+        "{}{}",
+        placement_reconciliations_prefix(file_system_id),
+        normalize_segment(job_id)
+    )
 }
 
 pub fn metadata_shard_key(file_system_id: &DfsFileSystemId, shard_id: &str) -> String {
@@ -461,6 +473,95 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
     ) -> Result<Option<DfsFileSystemConfig>, KvError> {
         self.get_serde(&file_system_config_key(file_system_id))
+    }
+
+    /// Atomically publish a placement-rule edit and its durable reconciliation
+    /// job. The compare prevents two Files clients from silently losing one
+    /// another's policy changes.
+    pub fn compare_and_put_placement_update(
+        &mut self,
+        expected: &DfsFileSystemConfig,
+        desired: &DfsFileSystemConfig,
+        job: &DfsPlacementReconciliationJob,
+    ) -> Result<bool, KvError> {
+        let config_key = file_system_config_key(&expected.file_system_id);
+        let Some(current_entry) = self.kv.get(&config_key)? else {
+            return Ok(false);
+        };
+        if current_entry.decode::<DfsFileSystemConfig>()? != *expected {
+            return Ok(false);
+        }
+        let job_key = placement_reconciliation_key(&job.file_system_id, &job.job_id);
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares: vec![
+                    KvCompare::ValueEquals {
+                        key: config_key.clone(),
+                        value: current_entry.value,
+                    },
+                    KvCompare::Missing {
+                        key: job_key.clone(),
+                    },
+                ],
+                success: vec![
+                    KvOp::put_serde(config_key, desired, None)?,
+                    KvOp::put_serde(job_key, job, None)?,
+                ],
+                failure: Vec::new(),
+            })?
+            .succeeded)
+    }
+
+    pub fn placement_reconciliation(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        job_id: &str,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
+        self.get_serde(&placement_reconciliation_key(file_system_id, job_id))
+    }
+
+    pub fn placement_reconciliations(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Vec<DfsPlacementReconciliationJob>, KvError> {
+        let mut jobs = self
+            .kv
+            .range_prefix(&placement_reconciliations_prefix(file_system_id))?
+            .into_iter()
+            .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
+            .collect::<Result<Vec<_>, _>>()?;
+        jobs.sort_by(|left: &DfsPlacementReconciliationJob, right| {
+            left.created_at_unix_nanos
+                .cmp(&right.created_at_unix_nanos)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        Ok(jobs)
+    }
+
+    pub fn compare_and_put_placement_reconciliation(
+        &mut self,
+        expected: &DfsPlacementReconciliationJob,
+        desired: &DfsPlacementReconciliationJob,
+    ) -> Result<bool, KvError> {
+        let key = placement_reconciliation_key(&expected.file_system_id, &expected.job_id);
+        let Some(current_entry) = self.kv.get(&key)? else {
+            return Ok(false);
+        };
+        if current_entry.decode::<DfsPlacementReconciliationJob>()? != *expected {
+            return Ok(false);
+        }
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: current_entry.value,
+                }],
+                success: vec![KvOp::put_serde(key, desired, None)?],
+                failure: Vec::new(),
+            })?
+            .succeeded)
     }
 
     pub fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), KvError> {
@@ -2484,6 +2585,7 @@ fn metadata_hash_range_width(start_inclusive: u64, end_exclusive: u64) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DfsPlacementReconciliationState, DfsPlacementScope};
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -2491,6 +2593,74 @@ mod tests {
 
     fn file_system_id() -> DfsFileSystemId {
         DfsFileSystemId::from_legacy_named("sifs").expect("valid filesystem id")
+    }
+
+    #[test]
+    fn placement_policy_and_reconciliation_job_commit_atomically() {
+        let mut kv = InProcessKvStore::new();
+        let file_system_id = file_system_id();
+        let expected = DfsFileSystemConfig {
+            file_system_id: file_system_id.clone(),
+            display_name: "sifs".to_string(),
+            owner_node_id: node("placement-owner"),
+            subtree_policies: Vec::new(),
+        };
+        let mut desired = expected.clone();
+        desired.subtree_policies.push(DfsSubtreePolicy {
+            path_prefix: "/users/team".to_string(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            scope: DfsPlacementScope::Subtree,
+            min_commit_replicas: Some(1),
+            desired_replicas: Some(3),
+            required_node_ids: vec![node("placement-required")],
+            forbidden_node_ids: Vec::new(),
+            min_distinct_zones: 2,
+        });
+        let job = DfsPlacementReconciliationJob {
+            job_id: "placement-job".to_string(),
+            file_system_id: file_system_id.clone(),
+            path: "/users/team".to_string(),
+            scope: DfsPlacementScope::Subtree,
+            state: DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: 1,
+            updated_at_unix_nanos: 1,
+            last_error: None,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store
+            .put_file_system_config(&expected)
+            .expect("put filesystem");
+        assert!(
+            store
+                .compare_and_put_placement_update(&expected, &desired, &job)
+                .expect("commit placement")
+        );
+        assert_eq!(
+            store
+                .get_file_system_config(&file_system_id)
+                .expect("get filesystem"),
+            Some(desired.clone())
+        );
+        assert_eq!(
+            store
+                .placement_reconciliation(&file_system_id, &job.job_id)
+                .expect("get job"),
+            Some(job.clone())
+        );
+        assert!(
+            !store
+                .compare_and_put_placement_update(&expected, &desired, &job)
+                .expect("reject stale update")
+        );
     }
 
     fn publish_transfer_watermark(
@@ -2669,10 +2839,10 @@ mod tests {
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
             owner_node_id: node_owner.clone(),
-            subtree_policies: vec![DfsSubtreePolicy {
-                path_prefix: ".".to_string(),
-                policy: DfsObjectPolicy::ReplicatedEventual,
-            }],
+            subtree_policies: vec![DfsSubtreePolicy::legacy(
+                ".",
+                DfsObjectPolicy::ReplicatedEventual,
+            )],
         };
         let file_system_config = DfsFileSystemConfig::from(&file_system);
         let shard = DfsMetadataShardConfig {

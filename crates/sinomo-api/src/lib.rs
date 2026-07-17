@@ -64,6 +64,11 @@ pub const DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE: &str = "/daemon/dfs/browser/pin-
 pub const DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE: &str = "/daemon/dfs/browser/unpin-content";
 pub const DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE: &str =
     "/daemon/dfs/browser/transfer-metadata-primary";
+pub const DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE: &str =
+    "/daemon/dfs/browser/placement-preview";
+pub const DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE: &str = "/daemon/dfs/browser/placement-update";
+pub const DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE: &str =
+    "/daemon/dfs/browser/placement-progress";
 pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
@@ -82,6 +87,9 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
 ];
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -325,6 +333,8 @@ pub struct DaemonDfsBrowserStatResponse {
     pub health: Option<DaemonDfsBrowserObjectHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_shard: Option<DaemonDfsBrowserMetadataShard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<sinomo_dfs::DfsResolvedPlacementPolicy>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -560,6 +570,49 @@ pub struct DaemonDfsBrowserTransferMetadataPrimaryResponse {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementPreviewRequest {
+    pub path: String,
+    /// Proposed override. `None` previews removing the exact `(path, scope)`
+    /// rule and inheriting from the next matching ancestor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<sinomo_dfs::DfsPlacementPolicy>,
+    #[serde(default)]
+    pub scope: sinomo_dfs::DfsPlacementScope,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementPreviewResponse {
+    pub preview: sinomo_dfs::DfsPlacementPreview,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementUpdateRequest {
+    pub path: String,
+    /// `None` removes the override for exactly `(path, scope)`, restoring
+    /// inheritance from the nearest matching ancestor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<sinomo_dfs::DfsPlacementPolicy>,
+    #[serde(default)]
+    pub scope: sinomo_dfs::DfsPlacementScope,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementUpdateResponse {
+    pub preview: sinomo_dfs::DfsPlacementPreview,
+    pub reconciliation: sinomo_dfs::DfsPlacementReconciliationJob,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementProgressRequest {
+    pub job_id: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPlacementProgressResponse {
+    pub reconciliation: sinomo_dfs::DfsPlacementReconciliationJob,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonClusterMaintenanceRefreshRequest;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -609,6 +662,27 @@ mod tests {
         assert_eq!(write.as_object().map(|fields| fields.len()), Some(2));
         assert!(write.get("expected_object_id").is_none());
         assert!(write.get("expected_version").is_none());
+    }
+
+    #[test]
+    fn placement_routes_are_typed_and_inheritance_is_explicit() {
+        for route in [
+            DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+        ] {
+            assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&route));
+        }
+        let request = DaemonDfsBrowserPlacementUpdateRequest {
+            path: "/users/team".to_string(),
+            policy: None,
+            scope: sinomo_dfs::DfsPlacementScope::SelfOnly,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode placement update");
+        let decoded: DaemonDfsBrowserPlacementUpdateRequest =
+            serde_json::from_slice(&encoded).expect("decode placement update");
+        assert_eq!(decoded, request);
+        assert!(decoded.policy.is_none());
     }
 
     #[test]

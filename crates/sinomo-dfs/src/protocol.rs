@@ -9,7 +9,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
-use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
+use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 
 fn default_true() -> bool {
     true
@@ -340,6 +340,19 @@ pub enum DfsNamespaceOperation {
     ApplyTransaction {
         transaction: DfsNamespaceTransaction,
     },
+    /// Idempotently applies one durable placement-reconciliation step on the
+    /// object's metadata primary. The operation updates the object's policy,
+    /// records a committed repair intent for missing desired replicas, and
+    /// retires superseded locations only after every desired replica exists.
+    ReconcilePlacement {
+        job_id: String,
+        path: String,
+        object_id: DfsObjectId,
+        expected_version: DfsVersion,
+        object_policy: DfsObjectPolicy,
+        replication_policy: DfsReplicationPolicy,
+        desired_replica_node_ids: Vec<NodeId>,
+    },
     /// Whole-file advisory-lock command routed to the metadata authority for
     /// the stable object. `path` is used only for shard routing and for
     /// detecting a stale path-to-object observation; lock ownership is scoped
@@ -427,6 +440,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. }
@@ -467,6 +481,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. } => vec![path],
             DfsNamespaceOperation::LookupPaths { paths } => {
                 paths.iter().map(String::as_str).collect()

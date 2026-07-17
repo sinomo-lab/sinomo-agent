@@ -57,6 +57,7 @@ mod mounted_sifs;
 mod namespace;
 mod node_transport;
 mod operator;
+mod placement;
 mod posix;
 mod posix_model;
 mod posix_object;
@@ -132,6 +133,7 @@ pub use control_plane::{
     SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
     metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
     metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
+    placement_reconciliation_key, placement_reconciliations_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -166,10 +168,11 @@ pub use discovery::{
     metadata_service_key, metadata_services_prefix,
 };
 pub use distributed::{
-    DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,
+    DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementDecision,
+    DfsReplicaPlacementExplanation, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,
     DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
-    DistributedWriteIntent, plan_replicas, validate_replication_plan,
+    DistributedWriteIntent, explain_replicas, plan_replicas, validate_replication_plan,
 };
 pub use error::DfsError;
 pub(crate) use error::{
@@ -333,8 +336,9 @@ pub(crate) use metadata_replication::{
 pub use metadata_sharded_backend::LocalShardedMetadataBackend;
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
-    DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy, DfsWriteOutcome,
-    ReadRoute, ReadRouteAction, WriteIntent, WriteIntentStatus, WriteRoute, WriteRouteAction,
+    DfsPlacementScope, DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy,
+    DfsWriteOutcome, ReadRoute, ReadRouteAction, WriteIntent, WriteIntentStatus, WriteRoute,
+    WriteRouteAction,
 };
 pub(crate) use model::{normalize_current_locations, path_index_key};
 pub use module_surface::{
@@ -381,6 +385,12 @@ pub use operator::{
     DfsOperatorObjectView, DfsOperatorRepairPage, DfsOperatorRepairView, DfsOperatorStatus,
     DfsOperatorUseConflictVersionReport, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
     DfsPinStoreError, LocalDfsPinStore, resolve_dfs_conflicts, use_dfs_conflict_version,
+};
+pub use placement::{
+    DfsPlacementPolicy, DfsPlacementPreview, DfsPlacementReconciliationJob,
+    DfsPlacementReconciliationState, DfsResolvedPlacementPolicy, normalize_placement_rule,
+    placement_rule_matches, preview_placement, remove_placement_rule, resolve_placement_policy,
+    upsert_placement_rule,
 };
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{
