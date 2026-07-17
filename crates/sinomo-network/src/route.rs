@@ -2073,10 +2073,12 @@ fn cluster_signed_endpoint_session_observation(
     started: Instant,
 ) -> Option<ClusterSignedObjectRpcObservation> {
     match result {
-        Ok(result) => Some(cluster_signed_endpoint_response_observation(
-            &result.response,
-            started,
-        )),
+        // Completing an authenticated session proves that the immediate endpoint is
+        // reachable even when the application response denies the requested operation.
+        // Session/link authentication failures arrive through the `Err` branch below.
+        Ok(_) => Some(ClusterSignedObjectRpcObservation::success(Some(
+            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+        ))),
         Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
     }
 }
@@ -2112,18 +2114,6 @@ fn cluster_paths_data_dir(
         operation: "resolve object RPC session data directory".to_string(),
         detail: error.to_string(),
     })
-}
-
-fn cluster_signed_endpoint_response_observation(
-    response: &ObjectRpcResponse,
-    started: Instant,
-) -> ClusterSignedObjectRpcObservation {
-    match response.error_detail() {
-        Err(NetworkError::AuthDenied) => ClusterSignedObjectRpcObservation::auth_denied(),
-        _ => ClusterSignedObjectRpcObservation::success(Some(
-            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
-        )),
-    }
 }
 
 fn cluster_signed_endpoint_rpc_error_observation(
@@ -3475,6 +3465,34 @@ fn relay_response_routing_error_detail(response: &ObjectRpcResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_endpoint_observation_separates_application_and_session_auth_denials() {
+        let response = ObjectRpcResponse::encode_error(
+            "/test/application-auth-denied",
+            "network authorization was denied",
+        )
+        .expect("application denial response");
+        let result = ObjectRpcSessionResult::value(response);
+        assert!(result.response_origin_verified());
+        assert!(matches!(
+            result.response.error_detail(),
+            Err(NetworkError::AuthDenied)
+        ));
+
+        let application_denial =
+            cluster_signed_endpoint_session_observation(Ok(&result), Instant::now())
+                .expect("completed session observation");
+        assert!(application_denial.is_success());
+        assert!(!application_denial.is_auth_denied());
+
+        let session_error = NetworkError::AuthDenied;
+        let session_denial =
+            cluster_signed_endpoint_session_observation(Err(&session_error), Instant::now())
+                .expect("session authentication observation");
+        assert!(session_denial.is_auth_denied());
+        assert!(!session_denial.is_success());
+    }
 
     fn relay_retry_test_fixture(
         name: &str,

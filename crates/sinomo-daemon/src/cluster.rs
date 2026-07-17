@@ -3311,7 +3311,6 @@ fn merge_probe_records_with_unsuperseded_bootstrap_connectivity(
         .unwrap_or_default();
     for record in existing_records {
         if record.source_node_id != *source_node_id
-            || matches!(record.state, ClusterConnectivityState::Unreachable)
             || !sinomo_core::network::cluster_network_record_live(record.expires_at, now)
         {
             continue;
@@ -10389,6 +10388,78 @@ mod tests {
         assert!(
             merged.contains(&introducer_record),
             "fresh probe replacement must retain a live join introducer edge for bootstrap routing"
+        );
+    }
+
+    #[test]
+    fn pending_connectivity_probe_preserves_live_unprobed_unreachable_module_records() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-unreachable-merge");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_connectivity_unreachable_merge")
+            .expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_connectivity_unreachable_merge_local").expect("local");
+        let offline = NodeId::from_legacy_named("node_connectivity_unreachable_merge_offline")
+            .expect("offline");
+        let probed = NodeId::from_legacy_named("node_connectivity_unreachable_merge_probed")
+            .expect("probed");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "connectivity unreachable merge",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let offline_iroh =
+            test_network_module_relay_endpoint(&offline, "module_public_key_unreachable_merge");
+        let mut offline_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &offline_iroh,
+            ClusterConnectivityState::Unreachable,
+            None,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+            None,
+            Some("network authorization was denied".to_string()),
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+        );
+        offline_record.failure_reason =
+            Some(sinomo_core::network::ClusterConnectivityFailureReason::CommandAuthDenied);
+        let probed_endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&probed, "node1:21353".to_string(), 20);
+        let probed_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &probed_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            std::slice::from_ref(&offline_record),
+        )
+        .expect("seed unreachable module connectivity");
+
+        let merged = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
+            &paths,
+            &local,
+            vec![probed_record.clone()],
+        );
+
+        assert!(merged.contains(&probed_record));
+        assert!(
+            merged.contains(&offline_record),
+            "an unrelated probe must preserve a live unreachable module record until its backoff TTL expires"
         );
     }
 
