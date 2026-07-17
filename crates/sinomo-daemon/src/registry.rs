@@ -649,6 +649,22 @@ mod tests {
     use sinomo_core::{FileSystemAccess, ModuleKind, NetworkAccess, TrustRing};
 
     #[test]
+    fn daemon_sandbox_lifecycle_recovery_state_is_registered() {
+        let layout = sinomo_data_dir_layout().expect("data-dir layout");
+        let report = layout
+            .verify_relative_paths([
+                "daemon/sandbox-lifecycle-recovery/last-safety-sweep",
+                "daemon/sandbox-lifecycle-recovery/pending/sandbox_marker",
+                "shadow-daemon/sandbox-lifecycle-recovery/last-safety-sweep",
+                "shadow-daemon/sandbox-lifecycle-recovery/pending/sandbox_marker",
+            ])
+            .expect("verify lifecycle recovery paths");
+
+        assert!(report.is_complete(), "{:#?}", report.unregistered);
+        assert_eq!(report.covered.len(), 4);
+    }
+
+    #[test]
     fn module_route_local_permissions_propagate_to_network_descriptor() {
         let descriptor = sinomo_module::ModuleObjectRpcRoute::new(
             "/remote/status",

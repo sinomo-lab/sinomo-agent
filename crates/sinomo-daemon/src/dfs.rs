@@ -13,11 +13,27 @@ use sinomo_core::kv::{
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, ObjectRpcSessionCall, ObjectRpcSessionResult,
-    cluster_route_next_hop,
+    cluster_healthy_route_next_hop,
 };
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
+use sinomo_dfs::{
+    ContentStoreError, DfsConflictRecord, DfsConflictStatus, DfsDataPlaneHost,
+    DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
+    DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions, DfsMessageCommand,
+    DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
+    DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata,
+    DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
+    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
+    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    LocalContentStore, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
+    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
+};
 #[cfg(test)]
 use sinomo_dfs::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchCommand,
@@ -27,21 +43,6 @@ use sinomo_dfs::{
     DfsMetadataSnapshotInstallSender, DfsObjectVersionRecord, LocalSobjMetadataBackend,
     default_dfs_metadata_root, distributed_sifs, distributed_sifs_bootstrap_objects,
     file_system_config_key, metadata_shard_key, sifs_node_files_path,
-};
-use sinomo_dfs::{
-    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
-    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
-    DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions, DfsMessageCommand,
-    DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
-    DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
-    DfsPeerTransportError, DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
-    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
-    read_dfs_repair_attempt_snapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -474,6 +475,8 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub unattempted_repair_count: usize,
     pub next_repair_retry_unix_nanos: Option<u64>,
     pub pending_namespace_job_count: usize,
+    pub actionable_conflict_count: usize,
+    pub actionable_placement_reconciliation_count: usize,
     pub metadata_replica_lag_count: usize,
     pub pending_local_membership_handoff_count: usize,
 }
@@ -484,6 +487,8 @@ impl DaemonDfsPendingMaintenanceWork {
         self.pending_write_count > 0
             || self.pending_repair_count > 0
             || self.pending_namespace_job_count > 0
+            || self.actionable_conflict_count > 0
+            || self.actionable_placement_reconciliation_count > 0
             || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
     }
@@ -495,6 +500,8 @@ impl DaemonDfsPendingMaintenanceWork {
         // replicas from hot-looping.
         self.pending_write_count > 0
             || self.pending_namespace_job_count > 0
+            || self.actionable_conflict_count > 0
+            || self.actionable_placement_reconciliation_count > 0
             || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
             || self.due_repair_attempt_count > 0
@@ -1737,8 +1744,9 @@ fn daemon_dfs_node_is_offline_for_maintenance(
     availability == &ClusterNodeAvailability::Offline
         && local_node_id != target_node_id
         // A failed direct endpoint does not make the node offline when the
-        // canonical network layer still has a relay route to it.
-        && cluster_route_next_hop(connectivity, local_node_id, target_node_id).is_none()
+        // canonical network layer still has a fully healthy relay route to it.
+        // A stale degraded route must not override an Offline health projection.
+        && cluster_healthy_route_next_hop(connectivity, local_node_id, target_node_id).is_none()
 }
 
 fn daemon_dfs_offline_node_ids(
@@ -1786,10 +1794,12 @@ fn daemon_dfs_intents_without_recovery_source(
     offline_node_ids: &BTreeSet<NodeId>,
     local_node_id: &NodeId,
 ) -> BTreeSet<String> {
-    if !write_intents
-        .iter()
-        .any(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
-    {
+    if !write_intents.iter().any(|intent| {
+        matches!(
+            intent.status,
+            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+        )
+    }) {
         return BTreeSet::new();
     }
     let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
@@ -1813,11 +1823,58 @@ fn daemon_dfs_intents_without_recovery_source(
     }
     write_intents
         .iter()
-        .filter(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
         .filter(|intent| {
-            let Some(content_hash) = intent.content_hash.as_ref() else {
-                return false;
+            matches!(
+                intent.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+        })
+        .filter(|intent| {
+            let is_invisible_create = match metadata.get_object(&intent.object_id) {
+                Ok(Some(object))
+                    if object.file_system_id == intent.file_system_id
+                        && object.version == intent.target_version =>
+                {
+                    // The target version is already visible. Hydration either
+                    // marks the stale intent committed or reconciles an exact
+                    // hash disagreement; neither path needs a content source.
+                    return false;
+                }
+                Ok(Some(object)) if object.file_system_id == intent.file_system_id => false,
+                Ok(Some(_)) => return false,
+                Ok(None) => true,
+                // Storage inspection is advisory scheduling state. Fail open
+                // rather than hiding work behind an ambiguous metadata error.
+                Err(_) => return false,
             };
+            let Some(content_hash) = intent.content_hash.as_ref() else {
+                // Hydration cannot reconstruct a pending write without either
+                // an already-visible exact target (handled above) or a content
+                // identity. Keep the durable intent for periodic reconciliation
+                // without selecting the short maintenance cadence.
+                return true;
+            };
+            let has_local_storage_candidate = match content.object_version_storage_candidate_exists(
+                intent.object_id.as_str(),
+                intent.target_version.as_str(),
+                content_hash,
+            ) {
+                Ok(available) => available,
+                // Invalid metadata or any local I/O ambiguity must keep the
+                // normal fail-open maintenance cadence.
+                Err(_) => return false,
+            };
+            let has_durable_size_hint =
+                match metadata.get_version(&intent.object_id, &intent.target_version) {
+                    Ok(Some(version))
+                        if version.content_hash.as_ref() == Some(content_hash)
+                            && version.size_bytes.is_some() =>
+                    {
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => return false,
+                };
             let matching_receipt_node_ids = receipts_by_version
                 .get(&(
                     &intent.file_system_id,
@@ -1834,42 +1891,58 @@ fn daemon_dfs_intents_without_recovery_source(
                 })
                 .map(|record| &record.replica_node_id)
                 .collect::<BTreeSet<_>>();
-            if matching_receipt_node_ids.len() >= intent.policy.min_commit_replicas
-                || matching_receipt_node_ids.iter().any(|node_id| {
-                    *node_id != local_node_id && !offline_node_ids.contains(*node_id)
-                })
-            {
-                // Quorum receipts can advance the intent locally even when
-                // their replica nodes are offline. A reachable remote receipt
-                // is also an executable exact-version fetch source.
+            let commit_ready = matching_receipt_node_ids.len() >= intent.policy.min_commit_replicas;
+            if is_invisible_create {
+                let has_valid_object_metadata =
+                    intent.object_metadata.as_ref().is_some_and(|object| {
+                        object.object_id == intent.object_id
+                            && object.file_system_id == intent.file_system_id
+                    });
+                let has_local_manifest_size_hint = match content
+                    .read_manifest(intent.object_id.as_str(), intent.target_version.as_str())
+                {
+                    Ok(manifest)
+                        if manifest.object_id == intent.object_id.as_str()
+                            && manifest.version == intent.target_version.as_str()
+                            && manifest.content_hash == *content_hash =>
+                    {
+                        true
+                    }
+                    Ok(_) => return false,
+                    Err(ContentStoreError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        false
+                    }
+                    Err(_) => return false,
+                };
+                // Hydration deliberately skips an invisible create until it
+                // has all three ingredients needed by commit promotion: the
+                // durable create metadata, receipt quorum, and an exact size
+                // hint backed by a version record or matching manifest. A raw
+                // whole-content blob without a manifest is not a size hint.
+                return !(has_valid_object_metadata
+                    && commit_ready
+                    && (has_durable_size_hint || has_local_manifest_size_hint));
+            }
+            if has_local_storage_candidate || commit_ready {
+                // A visible base object lets hydration reconstruct the pending
+                // update with a zero size fallback. Local content can continue
+                // replica staging below quorum; receipt quorum can commit even
+                // when every receipt holder is currently offline.
                 return false;
             }
-            match metadata.get_object(&intent.object_id) {
-                Ok(Some(object))
-                    if object.file_system_id == intent.file_system_id
-                        && object.version == intent.target_version
-                        && object.content_hash.as_ref() == Some(content_hash) =>
-                {
-                    // The exact target is already visible, so stale-intent
-                    // reconciliation can finish without fetching content.
-                    return false;
-                }
-                Ok(_) => {}
-                // Storage inspection is advisory scheduling state. Fail open
-                // rather than hiding work behind an ambiguous metadata error.
-                Err(_) => return false,
+            if matching_receipt_node_ids
+                .iter()
+                .any(|node_id| *node_id != local_node_id && !offline_node_ids.contains(*node_id))
+            {
+                // A visible base object lets hydration reconstruct the pending
+                // update before repair selects this reachable exact-version
+                // source. Invisible creates returned above because hydration
+                // cannot build that pending write without a local size hint.
+                return false;
             }
-            match content.object_version_storage_candidate_exists(
-                intent.object_id.as_str(),
-                intent.target_version.as_str(),
-                content_hash,
-            ) {
-                Ok(true) => false,
-                Ok(false) => true,
-                // Invalid metadata or any local I/O ambiguity must keep the
-                // normal fail-open maintenance cadence.
-                Err(_) => false,
-            }
+            true
         })
         .map(|intent| intent.intent_id.clone())
         .collect()
@@ -1962,10 +2035,83 @@ fn daemon_dfs_repairs_without_recovery_source(
         .collect()
 }
 
+fn daemon_dfs_actionable_conflict_count(
+    metadata: &dyn DfsMetadataBackend,
+    conflicts: &[DfsConflictRecord],
+) -> Result<usize, DaemonError> {
+    let mut actionable = 0usize;
+    for conflict in conflicts
+        .iter()
+        .filter(|conflict| conflict.status == DfsConflictStatus::Open)
+    {
+        let current = metadata.get_object(&conflict.object_id)?;
+        let requires_maintenance =
+            daemon_dfs_conflict_requires_maintenance(conflict, current.as_ref());
+        actionable = actionable.saturating_add(usize::from(requires_maintenance));
+    }
+    Ok(actionable)
+}
+
+fn daemon_dfs_conflict_requires_maintenance(
+    conflict: &DfsConflictRecord,
+    current: Option<&DfsObjectMetadata>,
+) -> bool {
+    match current {
+        // These are the exact cases that
+        // `reconcile_stale_conflicts_bounded` can advance: a deleted object
+        // supersedes the conflict, either branch becoming visible resolves
+        // it, and any version beyond the recorded base supersedes it. A
+        // conflict whose base remains visible is an intentional
+        // operator-facing conflict and must not select the short background
+        // cadence forever.
+        None => true,
+        Some(object)
+            if object.version == conflict.local_version
+                || object.version == conflict.remote_version =>
+        {
+            true
+        }
+        Some(object)
+            if conflict
+                .base_version
+                .as_ref()
+                .is_some_and(|base_version| object.version == *base_version) =>
+        {
+            false
+        }
+        Some(_) => true,
+    }
+}
+
+fn daemon_dfs_actionable_placement_reconciliation_count(
+    jobs: &[DfsPlacementReconciliationJob],
+    pending_repair_count: usize,
+) -> usize {
+    jobs.iter()
+        .filter(|job| match job.state {
+            DfsPlacementReconciliationState::Pending
+            | DfsPlacementReconciliationState::Scanning => true,
+            // A Repairing job waiting on durable repairs is driven by the
+            // reachability/backoff-aware repair classifier. A freshly
+            // transitioned job (zero pending) and a paged scan must continue
+            // even when unrelated repairs exist; once this job finishes a
+            // pass with pending repairs and no cursor, it can park until the
+            // repair summary drains and one final pass CASes it Completed.
+            DfsPlacementReconciliationState::Repairing => {
+                job.cursor.is_some() || job.pending_repair_count == 0 || pending_repair_count == 0
+            }
+            DfsPlacementReconciliationState::Completed
+            | DfsPlacementReconciliationState::Failed => false,
+        })
+        .count()
+}
+
 fn daemon_dfs_pending_work_from_records(
     pending_write_count: usize,
     pending_repair_count: usize,
     pending_namespace_job_count: usize,
+    actionable_conflict_count: usize,
+    actionable_placement_reconciliation_count: usize,
     write_intents: &[DfsWriteIntentRecord],
     receipt_records: &[DfsReplicaReceiptRecord],
     metadata_shard_statuses: &[DfsMetadataShardStatus],
@@ -2123,6 +2269,8 @@ fn daemon_dfs_pending_work_from_records(
         unattempted_repair_count,
         next_repair_retry_unix_nanos,
         pending_namespace_job_count,
+        actionable_conflict_count,
+        actionable_placement_reconciliation_count,
         metadata_replica_lag_count,
         pending_local_membership_handoff_count,
     }
@@ -2171,6 +2319,26 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     } else {
         Vec::new()
     };
+    let conflicts = if summary.open_conflict_count > 0 {
+        metadata.all_conflicts()?
+    } else {
+        Vec::new()
+    };
+    let actionable_conflict_count =
+        daemon_dfs_actionable_conflict_count(metadata.as_ref(), &conflicts)?;
+    let placement_reconciliation_jobs =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
+            &cluster_paths,
+            &sinomo_dfs::placement_reconciliations_prefix(&sinomo_dfs::sifs_file_system_id()),
+        )?
+        .into_iter()
+        .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let actionable_placement_reconciliation_count =
+        daemon_dfs_actionable_placement_reconciliation_count(
+            &placement_reconciliation_jobs,
+            summary.pending_repair_count,
+        );
     let mut receipt_records = Vec::new();
     let mut receipt_versions = BTreeSet::new();
     for intent in write_intents.iter().filter(|intent| {
@@ -2211,6 +2379,8 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         summary.pending_write_count,
         summary.pending_repair_count,
         summary.pending_namespace_job_count,
+        actionable_conflict_count,
+        actionable_placement_reconciliation_count,
         &write_intents,
         &receipt_records,
         &metadata_shard_statuses,
@@ -3907,6 +4077,7 @@ mod tests {
     use sinomo_core::kv::InProcessKvStore;
     use sinomo_core::network::{
         ClusterConnectivityRecord, ClusterConnectivityState, ClusterEndpointId,
+        cluster_route_next_hop,
     };
     use sinomo_core::node::{ClusterId, NodeId};
     use sinomo_core::{
@@ -5543,6 +5714,188 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_conflict_probe_parks_an_open_base_conflict() {
+        let root = temp_root("pending-conflict-classifier");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let node_id = NodeId::from_legacy_named("node_pending_conflict").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_pending_conflict").expect("cluster"),
+            "pending conflict classifier",
+            node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let object_id =
+            DfsObjectId::from_legacy_named("object_pending_conflict").expect("object id");
+        let base_version =
+            DfsVersion::from_legacy_named("version_pending_conflict_base").expect("base version");
+        let local_version =
+            DfsVersion::from_legacy_named("version_pending_conflict_local").expect("local version");
+        let remote_version = DfsVersion::from_legacy_named("version_pending_conflict_remote")
+            .expect("remote version");
+        let mut object = pending_object_metadata_for_test(
+            object_id.clone(),
+            file_system.file_system_id.clone(),
+            base_version.clone(),
+            node_id.clone(),
+            "/services/pending-conflict.txt",
+        );
+        let conflict = DfsConflictRecord {
+            conflict_id: "conflict_pending_base".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            path: object.path.clone(),
+            base_version: Some(base_version),
+            local_version: local_version.clone(),
+            remote_version,
+            detected_by_node_id: node_id,
+            reason: "base remains visible".to_string(),
+            local_content_hash: Some("blake3:local-pending-conflict".to_string()),
+            remote_content_hash: Some("blake3:remote-pending-conflict".to_string()),
+            created_by_intent_id: None,
+            strategy: Some("branch".to_string()),
+            status: DfsConflictStatus::Open,
+            detected_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut metadata =
+            open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata");
+        metadata.put_file_system(&file_system).expect("filesystem");
+        metadata.put_object(&object).expect("base object");
+        metadata.put_conflict(&conflict).expect("open conflict");
+        drop(metadata);
+
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(pending.actionable_conflict_count, 0);
+        assert!(
+            !pending.should_trigger_background_maintenance(),
+            "an intentional open conflict at its base version must stay parked"
+        );
+
+        object.version = local_version;
+        let mut metadata =
+            open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata");
+        metadata.put_object(&object).expect("resolved object");
+        drop(metadata);
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("resolved pending work");
+        assert_eq!(pending.actionable_conflict_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    fn placement_reconciliation_job_for_test(
+        state: DfsPlacementReconciliationState,
+    ) -> DfsPlacementReconciliationJob {
+        DfsPlacementReconciliationJob {
+            job_id: "placement-probe-job".to_string(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            path: "/services".to_string(),
+            scope: sinomo_dfs::DfsPlacementScope::Subtree,
+            state,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: 1,
+            updated_at_unix_nanos: 1,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn daemon_dfs_placement_probe_triggers_new_work_but_parks_offline_repairs() {
+        let pending =
+            placement_reconciliation_job_for_test(DfsPlacementReconciliationState::Pending);
+        assert_eq!(
+            daemon_dfs_actionable_placement_reconciliation_count(&[pending], 0),
+            1
+        );
+        let scanning =
+            placement_reconciliation_job_for_test(DfsPlacementReconciliationState::Scanning);
+        assert_eq!(
+            daemon_dfs_actionable_placement_reconciliation_count(&[scanning], 0),
+            1
+        );
+        let mut repairing =
+            placement_reconciliation_job_for_test(DfsPlacementReconciliationState::Repairing);
+        assert_eq!(
+            daemon_dfs_actionable_placement_reconciliation_count(
+                std::slice::from_ref(&repairing),
+                3,
+            ),
+            1,
+            "unrelated repair backlog must not stall a fresh Repairing scan"
+        );
+        repairing.pending_repair_count = 1;
+        assert_eq!(
+            daemon_dfs_actionable_placement_reconciliation_count(
+                std::slice::from_ref(&repairing),
+                3,
+            ),
+            0,
+            "a completed Repairing scan with offline work must stay parked"
+        );
+        assert_eq!(
+            daemon_dfs_actionable_placement_reconciliation_count(&[repairing], 0),
+            1,
+            "a repair-free job needs one final pass to CAS Completed"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_pending_probe_reads_placement_jobs_from_cluster_kv() {
+        let root = temp_root("pending-placement-classifier");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let node_id = NodeId::from_legacy_named("node_pending_placement").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_pending_placement").expect("cluster"),
+            "pending placement classifier",
+            node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        let job = placement_reconciliation_job_for_test(DfsPlacementReconciliationState::Pending);
+        append_cluster_raft_command(
+            &cluster_paths,
+            &node_id,
+            sinomo_core::kv::KvCommand::Op(
+                KvOp::put_serde(
+                    sinomo_dfs::placement_reconciliation_key(&job.file_system_id, &job.job_id),
+                    &job,
+                    None,
+                )
+                .expect("placement job op"),
+            ),
+        )
+        .expect("placement job");
+
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(pending.actionable_placement_reconciliation_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
     fn daemon_dfs_pending_repair_backlog_in_backoff_does_not_force_triggered_loop() {
         let pending = DaemonDfsPendingMaintenanceWork {
             pending_write_count: 0,
@@ -5552,6 +5905,8 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: Some(42),
             pending_namespace_job_count: 0,
+            actionable_conflict_count: 0,
+            actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
         };
@@ -5588,6 +5943,43 @@ mod tests {
             observed_at: now,
             expires_at: now + time::Duration::minutes(5),
         }
+    }
+
+    #[test]
+    fn daemon_dfs_offline_node_with_only_degraded_route_is_parked() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_pending_degraded").expect("cluster id");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_degraded_local").expect("local node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_pending_degraded_target").expect("target node");
+        let connectivity = ClusterConnectivityGraph::from_records(
+            local_node_id.clone(),
+            [pending_work_connectivity_record(
+                &cluster_id,
+                &local_node_id,
+                &target_node_id,
+                "endpoint_pending_degraded_direct",
+                ClusterConnectivityState::Degraded,
+            )],
+        );
+
+        assert!(
+            cluster_route_next_hop(&connectivity, &local_node_id, &target_node_id).is_some(),
+            "the fixture must retain the stale degraded route"
+        );
+        assert!(daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Offline,
+            &connectivity,
+            &local_node_id,
+            &target_node_id,
+        ));
+        assert!(!daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Online,
+            &connectivity,
+            &local_node_id,
+            &target_node_id,
+        ));
     }
 
     #[test]
@@ -5713,6 +6105,37 @@ mod tests {
         }
     }
 
+    fn pending_object_metadata_for_test(
+        object_id: DfsObjectId,
+        file_system_id: DfsFileSystemId,
+        version: DfsVersion,
+        owner_node_id: NodeId,
+        path: &str,
+    ) -> DfsObjectMetadata {
+        DfsObjectMetadata {
+            object_id,
+            file_system_id,
+            path: path.to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: owner_node_id.clone(),
+            current_locations: vec![owner_node_id],
+            content_hash: Some("blake3:pending-base".to_string()),
+            content_size_bytes: Some(1),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version,
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        }
+    }
+
     #[test]
     fn daemon_dfs_explicitly_offline_replica_backlog_stays_durable_without_triggering() {
         let local_node_id =
@@ -5777,6 +6200,8 @@ mod tests {
         let pending = daemon_dfs_pending_work_from_records(
             1,
             1,
+            0,
+            0,
             0,
             &[intent],
             &[receipt],
@@ -5856,6 +6281,8 @@ mod tests {
             1,
             1,
             0,
+            0,
+            0,
             &[intent],
             &[receipt],
             &[shard_status],
@@ -5930,6 +6357,8 @@ mod tests {
             1,
             1,
             0,
+            0,
+            0,
             &[orphan],
             &[],
             &[],
@@ -5952,6 +6381,8 @@ mod tests {
 
         let orphan_only = daemon_dfs_pending_work_from_records(
             1,
+            0,
+            0,
             0,
             0,
             &[pending_write_intent_for_test(
@@ -6031,7 +6462,11 @@ mod tests {
             &BTreeSet::new(),
             &local_node_id,
         );
-        assert!(reachable_source.is_empty());
+        assert_eq!(
+            reachable_source,
+            BTreeSet::from([intent.intent_id.clone()]),
+            "a reachable receipt cannot hydrate an invisible create before a pending write exists"
+        );
 
         let second_offline_receipt = pending_write_receipt_for_test(
             &intent,
@@ -6046,9 +6481,10 @@ mod tests {
             &BTreeSet::from([offline_node_id.clone(), healthy_target_node_id.clone()]),
             &local_node_id,
         );
-        assert!(
-            quorum_offline_sources.is_empty(),
-            "quorum receipts remain executable local reconciliation work"
+        assert_eq!(
+            quorum_offline_sources,
+            BTreeSet::from([intent.intent_id.clone()]),
+            "quorum proof does not replace an accessible content or size source"
         );
 
         let repair = DfsOperatorRepairView {
@@ -6130,6 +6566,8 @@ mod tests {
             1,
             1,
             0,
+            0,
+            0,
             std::slice::from_ref(&intent),
             std::slice::from_ref(&offline_receipt),
             &[],
@@ -6148,10 +6586,135 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_stale_local_quorum_receipt_without_content_is_parked() {
+        let root = temp_root("pending-stale-local-quorum");
+        let data_dir = SinomoDataDir::new(root.path());
+        let mut metadata = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_stale_local").expect("local node");
+        let mut intent = pending_write_intent_for_test(
+            "intent-pending-stale-local-quorum",
+            sinomo_dfs::sifs_file_system_id(),
+            DfsObjectId::from_legacy_named("object_pending_stale_local").expect("object"),
+            DfsVersion::from_legacy_named("version_pending_stale_local").expect("version"),
+            local_node_id.clone(),
+            vec![local_node_id.clone()],
+            1,
+        );
+        let base_version = DfsVersion::from_legacy_named("version_pending_stale_local_base")
+            .expect("base version");
+        intent.base_version = Some(base_version.clone());
+        intent.object_metadata = Some(pending_object_metadata_for_test(
+            intent.object_id.clone(),
+            intent.file_system_id.clone(),
+            base_version,
+            local_node_id.clone(),
+            "/services/pending-stale-local.txt",
+        ));
+        intent.content_hash = Some(format!("blake3:{}", "2".repeat(64)));
+        let local_receipt = pending_write_receipt_for_test(
+            &intent,
+            local_node_id.clone(),
+            "event_pending_stale_local",
+        );
+
+        let source_less = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&local_receipt),
+            &BTreeSet::new(),
+            &local_node_id,
+        );
+        assert_eq!(source_less, BTreeSet::from([intent.intent_id.clone()]));
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            0,
+            0,
+            0,
+            0,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&local_receipt),
+            &[],
+            &[],
+            &[],
+            &source_less,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &local_node_id,
+            0,
+            3,
+        );
+        assert_eq!(pending.pending_write_count, 0);
+        assert!(!pending.should_trigger_background_maintenance());
+
+        metadata
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: intent.file_system_id.clone(),
+                object_id: intent.object_id.clone(),
+                version: intent.target_version.clone(),
+                content_hash: intent.content_hash.clone(),
+                size_bytes: Some(1),
+                locations: vec![local_node_id.clone()],
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: false,
+            })
+            .expect("durable target size hint");
+        let create_metadata = intent.object_metadata.take().expect("create metadata");
+        let no_create_metadata = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&local_receipt),
+            &BTreeSet::new(),
+            &local_node_id,
+        );
+        assert_eq!(
+            no_create_metadata,
+            BTreeSet::from([intent.intent_id.clone()]),
+            "receipt quorum and a size hint cannot reconstruct missing create metadata"
+        );
+        intent.object_metadata = Some(create_metadata);
+        assert!(
+            daemon_dfs_intents_without_recovery_source(
+                &data_dir,
+                &metadata,
+                std::slice::from_ref(&intent),
+                std::slice::from_ref(&local_receipt),
+                &BTreeSet::new(),
+                &local_node_id,
+            )
+            .is_empty(),
+            "valid create metadata plus quorum and a durable size hint is promotable"
+        );
+
+        intent.content_hash = None;
+        let no_hash_source_less = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            &[],
+            &BTreeSet::new(),
+            &local_node_id,
+        );
+        assert_eq!(
+            no_hash_source_less,
+            BTreeSet::from([intent.intent_id]),
+            "a non-visible no-hash intent has no hydration recovery path"
+        );
+    }
+
+    #[test]
     fn daemon_dfs_extent_backed_pending_write_is_an_executable_local_source() {
         let root = temp_root("pending-extent-source");
         let data_dir = SinomoDataDir::new(root.path());
-        let metadata = LocalSobjMetadataBackend::new(
+        let mut metadata = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("root"),
             root.path().join("metadata"),
         )
@@ -6167,6 +6730,18 @@ mod tests {
             DfsVersion::from_legacy_named("version_pending_extent_base").expect("base version");
         let target_version =
             DfsVersion::from_legacy_named("version_pending_extent_target").expect("target version");
+        metadata
+            .put_file_system(&distributed_sifs(local_node_id.clone()))
+            .expect("filesystem");
+        metadata
+            .put_object(&pending_object_metadata_for_test(
+                object_id.clone(),
+                sinomo_dfs::sifs_file_system_id(),
+                base_version.clone(),
+                local_node_id.clone(),
+                "/pending/extent-update.txt",
+            ))
+            .expect("base object");
         content
             .put_object_version(object_id.as_str(), base_version.as_str(), b"abcdefgh")
             .expect("base object version");
@@ -6225,35 +6800,73 @@ mod tests {
 
     #[test]
     fn daemon_dfs_quorum_ready_write_still_triggers_when_remaining_replica_is_offline() {
+        let root = temp_root("pending-quorum-ready-update");
+        let data_dir = SinomoDataDir::new(root.path());
+        let mut metadata = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
         let local_node_id =
             NodeId::from_legacy_named("node_pending_quorum_local").expect("local node");
         let offline_node_id =
             NodeId::from_legacy_named("node_pending_quorum_offline").expect("offline node");
-        let intent = pending_write_intent_for_test(
+        let object_id =
+            DfsObjectId::from_legacy_named("object_pending_quorum_ready").expect("object id");
+        let base_version =
+            DfsVersion::from_legacy_named("version_pending_quorum_base").expect("base version");
+        metadata
+            .put_file_system(&distributed_sifs(local_node_id.clone()))
+            .expect("filesystem");
+        metadata
+            .put_object(&pending_object_metadata_for_test(
+                object_id.clone(),
+                sinomo_dfs::sifs_file_system_id(),
+                base_version.clone(),
+                local_node_id.clone(),
+                "/pending/quorum-update.txt",
+            ))
+            .expect("base object");
+        let mut intent = pending_write_intent_for_test(
             "intent-pending-quorum-ready",
             sinomo_dfs::sifs_file_system_id(),
-            DfsObjectId::from_legacy_named("object_pending_quorum_ready").expect("object id"),
+            object_id,
             DfsVersion::from_legacy_named("version_pending_quorum_ready").expect("version"),
             local_node_id.clone(),
             vec![local_node_id.clone(), offline_node_id.clone()],
             1,
         );
+        intent.base_version = Some(base_version);
         let receipt = pending_write_receipt_for_test(
             &intent,
             local_node_id.clone(),
             "event_pending_quorum_ready_receipt",
+        );
+        let source_less = daemon_dfs_intents_without_recovery_source(
+            &data_dir,
+            &metadata,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&receipt),
+            &BTreeSet::from([offline_node_id.clone()]),
+            &local_node_id,
+        );
+        assert!(
+            source_less.is_empty(),
+            "a visible base lets receipt quorum promote an update without a target size hint"
         );
 
         let pending = daemon_dfs_pending_work_from_records(
             1,
             0,
             0,
-            &[intent],
-            &[receipt],
+            0,
+            0,
+            std::slice::from_ref(&intent),
+            std::slice::from_ref(&receipt),
             &[],
             &[],
             &[],
-            &BTreeSet::new(),
+            &source_less,
             &BTreeSet::new(),
             &BTreeSet::from([offline_node_id]),
             &local_node_id,
@@ -6291,6 +6904,8 @@ mod tests {
             1,
             0,
             0,
+            0,
+            0,
             &[intent],
             &[wrong_hash_receipt],
             &[],
@@ -6318,6 +6933,8 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: None,
             pending_namespace_job_count: 0,
+            actionable_conflict_count: 0,
+            actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
         };
@@ -6336,6 +6953,8 @@ mod tests {
             unattempted_repair_count: 4,
             next_repair_retry_unix_nanos: Some(42),
             pending_namespace_job_count: 0,
+            actionable_conflict_count: 0,
+            actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
         };
@@ -6354,6 +6973,8 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: None,
             pending_namespace_job_count: 0,
+            actionable_conflict_count: 0,
+            actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
         };
@@ -6372,6 +6993,8 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: None,
             pending_namespace_job_count: 0,
+            actionable_conflict_count: 0,
+            actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 1,
             pending_local_membership_handoff_count: 0,
         };

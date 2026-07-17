@@ -465,6 +465,7 @@ pub fn select_cluster_connectivity_probe_batch(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
     convergence_active: bool,
+    force_probe: bool,
     now: OffsetDateTime,
 ) -> ClusterConnectivityProbeBatch {
     try_select_cluster_connectivity_probe_batch(
@@ -475,6 +476,7 @@ pub fn select_cluster_connectivity_probe_batch(
         local_node_role,
         startup_settle_active,
         convergence_active,
+        force_probe,
         now,
     )
     .unwrap_or_else(|_| ClusterConnectivityProbeBatch {
@@ -493,6 +495,7 @@ pub fn try_select_cluster_connectivity_probe_batch(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
     convergence_active: bool,
+    force_probe: bool,
     now: OffsetDateTime,
 ) -> Result<ClusterConnectivityProbeBatch, NetworkError> {
     let refresh_deadline =
@@ -542,19 +545,20 @@ pub fn try_select_cluster_connectivity_probe_batch(
                 try_clone_connectivity_record(&probe.record, "clone previous connectivity record")
             })
             .transpose()?;
-        let due = previous.as_ref().is_none_or(|record| {
-            cluster_connectivity_probe_due_with_graph_and_policy(
-                record,
-                endpoint,
-                now,
-                refresh_deadline,
-                local_node_role,
-                &graph,
-                &state.local_node_id,
-                startup_settle_active,
-                convergence_active,
-            )
-        });
+        let due = force_probe
+            || previous.as_ref().is_none_or(|record| {
+                cluster_connectivity_probe_due_with_graph_and_policy(
+                    record,
+                    endpoint,
+                    now,
+                    refresh_deadline,
+                    local_node_role,
+                    &graph,
+                    &state.local_node_id,
+                    startup_settle_active,
+                    convergence_active,
+                )
+            });
         if !due {
             continue;
         }

@@ -266,6 +266,7 @@ struct ClusterConnectivityProbePlan {
     entries: Vec<sinomo_core::network::ClusterConnectivityProbeBatchEntry>,
     remaining_due: usize,
     convergence_active: bool,
+    force_probe: bool,
     timestamp: String,
     now: time::OffsetDateTime,
     startup_settle_active: bool,
@@ -274,6 +275,13 @@ struct ClusterConnectivityProbePlan {
 struct ClusterConnectivityProbeExecution {
     records: Vec<ClusterConnectivityRecord>,
     probed_degraded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterConnectivityProbePlanAction {
+    Probe,
+    PublishRetained,
+    None,
 }
 
 pub(crate) struct ClusterConnectivityPendingProbe {
@@ -2065,6 +2073,9 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
     pub publish_failure_streak: u32,
+    pub connectivity_publish_failure_streak: u32,
+    pub connectivity_publish_retry_at: Option<Instant>,
+    pub connectivity_force_probe: bool,
     pub kv_snapshot_pull_failure_streak: u32,
     pub last_kv_snapshot_pull: Instant,
     pub last_publish: Instant,
@@ -2122,6 +2133,9 @@ impl ClusterNetworkMaintenance {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now
                 .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
@@ -2169,12 +2183,19 @@ impl ClusterNetworkMaintenance {
         // an unconverged degraded endpoint from re-arming another settle window
         // and being softened forever. An explicit environment refresh replaces
         // the marker with a new future deadline.
-        let due = sinomo_core::network::cluster_network_maintenance_due(now, &self.schedule());
+        let connectivity_publish_retry_waiting = self.connectivity_publish_retry_waiting(now);
+        let connectivity_publish_retry_due = self
+            .connectivity_publish_retry_due_duration(now)
+            .is_some_and(|duration| duration.is_zero());
+        let due = sinomo_core::network::cluster_network_maintenance_due(
+            now,
+            &self.schedule_with_connectivity_publish_backoff(now),
+        );
         let kv_snapshot_pull_retry_due = self
             .kv_snapshot_pull_retry_due_duration(now)
             .is_some_and(|duration| duration.is_zero());
         let publish_due = due.publish_due;
-        let probe_due = due.probe_due;
+        let probe_due = due.probe_due && !connectivity_publish_retry_waiting;
         let discovery_due = due.discovery_due;
         if !(publish_due || kv_snapshot_pull_retry_due || probe_due || discovery_due) {
             return Ok(None);
@@ -2197,6 +2218,7 @@ impl ClusterNetworkMaintenance {
         if !state_exists {
             self.solo_cluster_idle = false;
             self.kv_snapshot_pull_failure_streak = 0;
+            self.settle_connectivity_without_publication();
             if publish_due {
                 self.last_publish = now;
             }
@@ -2241,6 +2263,7 @@ impl ClusterNetworkMaintenance {
             }
             if !discovered && sinomo_core::network::cluster_is_settled_solo(&state) {
                 self.kv_snapshot_pull_failure_streak = 0;
+                self.settle_connectivity_without_publication();
                 if publish_due {
                     self.last_publish = now;
                 }
@@ -2273,8 +2296,7 @@ impl ClusterNetworkMaintenance {
             if discovery_due {
                 self.last_discovery = now;
             }
-            self.connectivity_converged = true;
-            self.startup_settle_until = None;
+            self.settle_connectivity_without_publication();
             self.solo_cluster_idle = false;
             return Ok(None);
         }
@@ -2298,7 +2320,7 @@ impl ClusterNetworkMaintenance {
             if discovery_due {
                 self.last_discovery = now;
             }
-            self.connectivity_converged = true;
+            self.settle_connectivity_without_publication();
             self.solo_cluster_idle = sinomo_core::network::cluster_is_settled_solo(&state);
             return Ok(None);
         }
@@ -2427,7 +2449,7 @@ impl ClusterNetworkMaintenance {
                         use_formation_timeouts,
                     });
             }
-            if !cluster_is_solo && !probe_due {
+            if !cluster_is_solo && !probe_due && !self.connectivity_publish_retry_waiting(now) {
                 pending_work.connectivity_publish = Some(ClusterConnectivityPendingPublish {
                     paths: cluster_paths.clone(),
                     source_node_id: state.local_node_id.clone(),
@@ -2505,18 +2527,40 @@ impl ClusterNetworkMaintenance {
             self.last_probe = now;
             if !cluster_is_solo {
                 let plan = self.select_connectivity_probe_plan(&cluster_paths, &state);
-                pending_work.connectivity_probe = Some(ClusterConnectivityPendingProbe {
-                    paths: cluster_paths.clone(),
-                    source_node_id: state.local_node_id.clone(),
-                    state: state.clone(),
-                    plan,
-                    use_formation_timeouts: self
-                        .startup_settle_until
-                        .is_some_and(|settle_until| settle_until > now)
-                        || !self.connectivity_converged,
-                });
+                let use_formation_timeouts = self
+                    .startup_settle_until
+                    .is_some_and(|settle_until| settle_until > now)
+                    || !self.connectivity_converged;
+                match connectivity_probe_plan_action(
+                    &plan,
+                    publish_due || connectivity_publish_retry_due,
+                ) {
+                    ClusterConnectivityProbePlanAction::Probe => {
+                        pending_work.connectivity_probe = Some(ClusterConnectivityPendingProbe {
+                            paths: cluster_paths.clone(),
+                            source_node_id: state.local_node_id.clone(),
+                            state: state.clone(),
+                            plan,
+                            use_formation_timeouts,
+                        });
+                    }
+                    ClusterConnectivityProbePlanAction::PublishRetained => {
+                        // A previous quorum publication failed, but no endpoint
+                        // observation is due. Retry the retained record set without
+                        // running the probe merge/write path again.
+                        pending_work.connectivity_publish =
+                            Some(ClusterConnectivityPendingPublish {
+                                paths: cluster_paths.clone(),
+                                source_node_id: state.local_node_id.clone(),
+                                state: state.clone(),
+                                use_formation_timeouts,
+                            });
+                    }
+                    ClusterConnectivityProbePlanAction::None => {}
+                }
             } else {
                 self.connectivity_converged = true;
+                self.record_connectivity_publish_success();
             }
         }
 
@@ -2536,10 +2580,13 @@ impl ClusterNetworkMaintenance {
         }
 
         if maintenance_changed {
-            self.connectivity_converged = false;
+            self.connectivity_converged = cluster_is_solo;
             sinomo_core::cluster::write_cluster_state_async(&runtime, &cluster_paths, &state)
                 .await
                 .map_err(DaemonError::from)?;
+        }
+        if cluster_is_solo {
+            self.settle_connectivity_without_publication();
         }
         self.solo_cluster_idle = cluster_is_solo && !discovered;
         Ok((!pending_work.is_empty()).then_some(pending_work))
@@ -2557,17 +2604,61 @@ impl ClusterNetworkMaintenance {
         }
     }
 
+    fn schedule_with_connectivity_publish_backoff(
+        &self,
+        now: Instant,
+    ) -> sinomo_core::network::ClusterNetworkMaintenanceSchedule {
+        let mut schedule = self.schedule();
+        if self.connectivity_publish_retry_waiting(now) {
+            // Failed quorum publication has its own deadline. While it is
+            // pending, suppress the 250ms convergence/startup cadence without
+            // delaying unrelated regular publications.
+            schedule.connectivity_converged = true;
+            schedule.startup_settle_until = None;
+        }
+        schedule
+    }
+
     pub fn next_due_duration(&self, now: Instant) -> Duration {
-        let network_due = sinomo_core::network::cluster_network_maintenance_next_due_duration(
-            now,
-            &self.schedule(),
-        );
+        let network_due = if self.connectivity_publish_retry_waiting(now) {
+            // While connectivity publication has an independent retry deadline,
+            // the ordinary probe interval must not wake the daemon early. Keep
+            // unrelated publication and discovery cadences live.
+            let mut due = cluster_network_maintenance_interval_remaining(
+                now,
+                self.last_publish,
+                sinomo_core::network::cluster_network_publish_interval_for_role(
+                    &self.local_node_role,
+                ),
+            );
+            if self.discovery.is_some() {
+                due = due.min(cluster_network_maintenance_interval_remaining(
+                    now,
+                    self.last_discovery,
+                    sinomo_core::network::cluster_network_discovery_interval_for_role(
+                        &self.local_node_role,
+                    ),
+                ));
+            }
+            due.min(
+                self.connectivity_publish_retry_due_duration(now)
+                    .unwrap_or_default(),
+            )
+        } else {
+            sinomo_core::network::cluster_network_maintenance_next_due_duration(
+                now,
+                &self.schedule(),
+            )
+        };
         self.kv_snapshot_pull_retry_due_duration(now)
             .map_or(network_due, |snapshot_due| network_due.min(snapshot_due))
     }
 
     pub(crate) fn request_network_environment_refresh(&mut self, now: Instant) {
         self.connectivity_converged = false;
+        self.connectivity_publish_failure_streak = 0;
+        self.connectivity_publish_retry_at = None;
+        self.connectivity_force_probe = true;
         self.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
         let publish_interval =
             sinomo_core::network::cluster_network_publish_interval_for_role(&self.local_node_role);
@@ -2770,8 +2861,7 @@ impl ClusterNetworkMaintenance {
             .await
             .is_none()
             {
-                self.connectivity_converged = false;
-                self.record_connectivity_publish_failure();
+                self.record_connectivity_probe_failure();
             }
         }
         // A fresh probe reads and publishes the current record set itself, so a
@@ -2980,6 +3070,8 @@ impl ClusterNetworkMaintenance {
             }
         };
         if records.is_empty() {
+            self.connectivity_converged = true;
+            self.record_connectivity_publish_success();
             return;
         }
         let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
@@ -3000,7 +3092,10 @@ impl ClusterNetworkMaintenance {
         )
         .await
         {
-            Ok(_) => self.record_publish_success(),
+            Ok(_) => {
+                self.connectivity_converged = true;
+                self.record_connectivity_publish_success();
+            }
             Err(error) => {
                 self.record_connectivity_publish_failure();
                 tracing::warn!("sinomo daemon cached connectivity quorum publish failed: {error}");
@@ -3120,10 +3215,33 @@ impl ClusterNetworkMaintenance {
     }
 
     fn record_connectivity_publish_failure(&mut self) {
-        let delay = self.record_publish_failure_delay();
+        self.connectivity_converged = false;
+        self.connectivity_publish_failure_streak =
+            self.connectivity_publish_failure_streak.saturating_add(1);
+        let delay = self.connectivity_publish_failure_backoff();
         let now = Instant::now();
-        self.defer_publish_retry(now, delay);
-        self.defer_probe_retry(now, delay);
+        self.connectivity_publish_retry_at = now.checked_add(delay);
+    }
+
+    fn record_connectivity_probe_failure(&mut self) {
+        self.connectivity_force_probe = true;
+        self.record_connectivity_publish_failure();
+    }
+
+    fn clear_connectivity_publish_retry(&mut self) {
+        self.connectivity_publish_failure_streak = 0;
+        self.connectivity_publish_retry_at = None;
+    }
+
+    fn record_connectivity_publish_success(&mut self) {
+        self.clear_connectivity_publish_retry();
+        self.connectivity_force_probe = false;
+    }
+
+    fn settle_connectivity_without_publication(&mut self) {
+        self.connectivity_converged = true;
+        self.startup_settle_until = None;
+        self.record_connectivity_publish_success();
     }
 
     fn record_kv_snapshot_pull_failure(&mut self) {
@@ -3153,6 +3271,16 @@ impl ClusterNetworkMaintenance {
         })
     }
 
+    fn connectivity_publish_retry_waiting(&self, now: Instant) -> bool {
+        self.connectivity_publish_retry_at
+            .is_some_and(|retry_at| retry_at > now)
+    }
+
+    fn connectivity_publish_retry_due_duration(&self, now: Instant) -> Option<Duration> {
+        self.connectivity_publish_retry_at
+            .map(|retry_at| retry_at.saturating_duration_since(now))
+    }
+
     fn record_publish_failure_delay(&mut self) -> Duration {
         self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
         self.publish_failure_backoff()
@@ -3169,22 +3297,21 @@ impl ClusterNetworkMaintenance {
             );
     }
 
-    fn defer_probe_retry(&mut self, now: Instant, delay: Duration) {
-        self.last_probe =
-            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
-                now,
-                sinomo_core::network::cluster_network_probe_interval_for_role(
-                    &self.local_node_role,
-                ),
-                delay,
-            );
-    }
-
     /// Exponential backoff over consecutive publish failures: quick retries
     /// while the cluster is still forming, the full backoff once a failure
     /// looks persistent.
     fn publish_failure_backoff(&self) -> Duration {
         let exponent = self.publish_failure_streak.saturating_sub(1).min(10);
+        DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+            .saturating_mul(1_u32 << exponent)
+            .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+    }
+
+    fn connectivity_publish_failure_backoff(&self) -> Duration {
+        let exponent = self
+            .connectivity_publish_failure_streak
+            .saturating_sub(1)
+            .min(10);
         DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
             .saturating_mul(1_u32 << exponent)
             .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
@@ -3257,6 +3384,7 @@ impl ClusterNetworkMaintenance {
         .await;
         match written {
             Ok(()) => {
+                self.connectivity_force_probe = false;
                 self.idle_stats.incr_connectivity_record_sets_written();
                 let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
                     DaemonClusterRpcMode::new(runtime.clone()),
@@ -3292,18 +3420,16 @@ impl ClusterNetworkMaintenance {
                 match published {
                     Ok(_) => {
                         self.connectivity_converged = !convergence_followup_needed;
-                        self.record_publish_success();
+                        self.record_connectivity_publish_success();
                     }
                     Err(error) => {
-                        self.connectivity_converged = false;
                         self.record_connectivity_publish_failure();
                         tracing::warn!("sinomo daemon connectivity quorum publish failed: {error}");
                     }
                 }
             }
             Err(error) => {
-                self.connectivity_converged = false;
-                self.record_connectivity_publish_failure();
+                self.record_connectivity_probe_failure();
                 tracing::warn!("sinomo daemon local connectivity write failed: {error}");
             }
         }
@@ -3345,6 +3471,7 @@ impl ClusterNetworkMaintenance {
             .startup_settle_until
             .is_some_and(|deadline| Instant::now() < deadline);
         let convergence_active = !self.connectivity_converged;
+        let force_probe = self.connectivity_force_probe;
         let batch = sinomo_core::network::select_cluster_connectivity_probe_batch(
             paths,
             state,
@@ -3353,6 +3480,7 @@ impl ClusterNetworkMaintenance {
             &self.local_node_role,
             startup_settle_active,
             convergence_active,
+            force_probe,
             now,
         );
         self.connectivity_cursor = batch.next_cursor;
@@ -3364,6 +3492,7 @@ impl ClusterNetworkMaintenance {
             entries: batch.entries,
             remaining_due: batch.remaining_due,
             convergence_active,
+            force_probe,
             timestamp,
             now,
             startup_settle_active,
@@ -3426,6 +3555,27 @@ fn connectivity_probe_result_needs_followup(
     probed_degraded: bool,
 ) -> bool {
     remaining_due > 0 || (convergence_active && probed_degraded)
+}
+
+fn cluster_network_maintenance_interval_remaining(
+    now: Instant,
+    last: Instant,
+    interval: Duration,
+) -> Duration {
+    interval.saturating_sub(now.saturating_duration_since(last))
+}
+
+fn connectivity_probe_plan_action(
+    plan: &ClusterConnectivityProbePlan,
+    retained_publish_due: bool,
+) -> ClusterConnectivityProbePlanAction {
+    if plan.force_probe || !plan.entries.is_empty() || plan.remaining_due > 0 {
+        ClusterConnectivityProbePlanAction::Probe
+    } else if plan.convergence_active || retained_publish_due {
+        ClusterConnectivityProbePlanAction::PublishRetained
+    } else {
+        ClusterConnectivityProbePlanAction::None
+    }
 }
 
 fn cluster_network_deadline_with_tail_reserve(
@@ -9298,7 +9448,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_publish_failure_retries_probe_on_publish_backoff() {
+    fn connectivity_publish_failure_uses_independent_backoff() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -9312,40 +9462,122 @@ mod tests {
 
         maintenance.record_connectivity_publish_failure();
 
-        assert_eq!(maintenance.publish_failure_streak, 1);
-        let after_record = Instant::now();
-        let before_backoff = after_record
-            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF / 2)
-            .expect("before backoff instant");
-        let after_backoff = after_record
-            .checked_add(
-                DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF + Duration::from_millis(100),
-            )
-            .expect("after backoff instant");
+        assert_eq!(maintenance.publish_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 1);
+        let first_retry = maintenance
+            .connectivity_publish_retry_at
+            .expect("connectivity retry deadline");
+        assert!(first_retry > Instant::now());
+        assert_eq!(
+            maintenance.last_publish, maintenance.last_probe,
+            "connectivity failure must not defer unrelated publication or probe timestamps"
+        );
 
+        maintenance.record_publish_success();
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 1);
+        assert_eq!(maintenance.connectivity_publish_retry_at, Some(first_retry));
+
+        maintenance.record_connectivity_publish_failure();
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 2);
         assert!(
-            !sinomo_core::network::cluster_network_maintenance_interval_due(
-                before_backoff,
-                maintenance.last_probe,
-                DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
+            maintenance
+                .connectivity_publish_retry_at
+                .expect("second connectivity retry deadline")
+                > first_retry,
+            "repeated connectivity publication failures should extend their own backoff"
+        );
+
+        maintenance.record_connectivity_publish_success();
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_retry_at, None);
+    }
+
+    #[test]
+    fn connectivity_publish_backoff_masks_probe_and_convergence_wakes() {
+        let now = Instant::now();
+        let retry_at = now
+            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+            .expect("retry deadline");
+        let maintenance = ClusterNetworkMaintenance {
+            service_registry: None,
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: BTreeMap::new(),
+            connectivity_cursor: 0,
+            connectivity_converged: false,
+            environment_id: None,
+            local_node_role: ClusterNodeRole::Sensor,
+            solo_cluster_idle: false,
+            startup_settle_until: Some(
+                now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION)
+                    .expect("settle deadline"),
             ),
-            "connectivity publish failures should not immediately reprobe in a tight loop"
+            tick: 0,
+            publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 10,
+            connectivity_publish_retry_at: Some(retry_at),
+            connectivity_force_probe: false,
+            kv_snapshot_pull_failure_streak: 0,
+            last_kv_snapshot_pull: now,
+            last_publish: now,
+            last_discovery: now,
+            last_probe: now
+                .checked_sub(sinomo_core::network::CLUSTER_NETWORK_SENSOR_PROBE_INTERVAL)
+                .expect("overdue probe timestamp"),
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+        };
+
+        let masked = sinomo_core::network::cluster_network_maintenance_due(
+            now,
+            &maintenance.schedule_with_connectivity_publish_backoff(now),
         );
         assert!(
-            sinomo_core::network::cluster_network_maintenance_interval_due(
-                after_backoff,
-                maintenance.last_probe,
-                DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
-            ),
-            "connectivity publish failures should retry the probe/publish path on the publish backoff"
+            masked.probe_due,
+            "the lower-level schedule still sees an overdue ordinary probe"
         );
-        assert!(
-            sinomo_core::network::cluster_network_maintenance_interval_due(
-                after_backoff,
-                maintenance.last_publish,
-                DAEMON_CLUSTER_PUBLISH_INTERVAL,
-            ),
-            "connectivity publish failures should keep member/status publish retries aligned with the same backoff"
+        assert_eq!(
+            maintenance.next_due_duration(now),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+            "the daemon scheduler must ignore both the ordinary probe and 250ms convergence cadence until the independent retry deadline"
+        );
+    }
+
+    #[test]
+    fn connectivity_probe_plan_action_preserves_retained_publish_semantics() {
+        let plan = ClusterConnectivityProbePlan {
+            active_keys: Vec::new(),
+            entries: Vec::new(),
+            remaining_due: 0,
+            convergence_active: false,
+            force_probe: false,
+            timestamp: "unused".to_string(),
+            now: OffsetDateTime::now_utc(),
+            startup_settle_active: false,
+        };
+
+        assert_eq!(
+            connectivity_probe_plan_action(&plan, false),
+            ClusterConnectivityProbePlanAction::None,
+            "an empty probe-only cadence should not rewrite retained observations"
+        );
+        assert_eq!(
+            connectivity_probe_plan_action(&plan, true),
+            ClusterConnectivityProbePlanAction::PublishRetained,
+            "a normal publication cadence must still refresh retained observations"
+        );
+
+        let mut converging = plan;
+        converging.convergence_active = true;
+        assert_eq!(
+            connectivity_probe_plan_action(&converging, false),
+            ClusterConnectivityProbePlanAction::PublishRetained,
+            "an expired publication retry with no due endpoint should republish the retained set"
+        );
+        converging.force_probe = true;
+        assert_eq!(
+            connectivity_probe_plan_action(&converging, false),
+            ClusterConnectivityProbePlanAction::Probe,
+            "a failed local observation write must force fresh observations on retry"
         );
     }
 
@@ -9365,6 +9597,9 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
@@ -9403,6 +9638,9 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
@@ -9445,6 +9683,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -9495,6 +9736,9 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
@@ -9529,6 +9773,9 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
@@ -9561,6 +9808,9 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
@@ -9624,13 +9874,22 @@ mod tests {
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
             connectivity_cursor: 0,
-            connectivity_converged: true,
+            connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
             solo_cluster_idle: false,
 
-            startup_settle_until: None,
+            startup_settle_until: Some(
+                now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION)
+                    .expect("startup settle deadline"),
+            ),
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 3,
+            connectivity_publish_retry_at: Some(
+                now.checked_sub(Duration::from_millis(1))
+                    .expect("expired retry deadline"),
+            ),
+            connectivity_force_probe: true,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: now,
             tick: 7,
@@ -9657,6 +9916,10 @@ mod tests {
             maintenance.connectivity_converged,
             "legacy pending join state must not keep connectivity convergence active"
         );
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_retry_at, None);
+        assert!(!maintenance.connectivity_force_probe);
+        assert_eq!(maintenance.startup_settle_until, None);
         assert!(
             maintenance.next_due_duration(Instant::now())
                 > DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
@@ -9886,6 +10149,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -9932,14 +10198,25 @@ mod tests {
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
             connectivity_cursor: 0,
-            connectivity_converged: true,
+            connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
             solo_cluster_idle: false,
 
-            startup_settle_until: None,
+            startup_settle_until: Some(
+                maintenance_now
+                    .checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION)
+                    .expect("startup settle deadline"),
+            ),
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 3,
+            connectivity_publish_retry_at: Some(
+                maintenance_now
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("expired connectivity retry deadline"),
+            ),
+            connectivity_force_probe: true,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -9981,6 +10258,10 @@ mod tests {
             snapshot.disk_reads_cluster_state, 0,
             "unclustered maintenance should not try to read absent cluster state"
         );
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_retry_at, None);
+        assert!(!maintenance.connectivity_force_probe);
+        assert!(maintenance.connectivity_converged);
         let after_ticks = Instant::now();
         assert!(
             !sinomo_core::network::cluster_network_maintenance_interval_due(
@@ -10067,6 +10348,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -10286,6 +10570,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -10439,6 +10726,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -10449,24 +10739,66 @@ mod tests {
             idle_stats,
         };
 
+        let connectivity_retry_at = Instant::now()
+            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+            .expect("connectivity retry deadline");
+        maintenance.connectivity_converged = false;
+        maintenance.connectivity_publish_failure_streak = 10;
+        maintenance.connectivity_publish_retry_at = Some(connectivity_retry_at);
+        maintenance.last_probe = maintenance_now
+            .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
+            .expect("overdue probe timestamp");
+
+        let unrelated_publish = run_cluster_network_maintenance_tick_for_test(
+            &mut maintenance,
+            &daemon_paths,
+            &DaemonRunOptions::default(),
+            &runtime,
+        )
+        .expect("maintenance tick during connectivity backoff")
+        .expect("ordinary publication should remain scheduled");
+        assert!(
+            !unrelated_publish.member_publishes.is_empty(),
+            "member publication must remain live during connectivity backoff"
+        );
+        assert!(
+            unrelated_publish.connectivity_publish.is_none()
+                && unrelated_publish.connectivity_probe.is_none(),
+            "an unrelated wake must not bypass the connectivity retry deadline"
+        );
+        assert_eq!(
+            maintenance.connectivity_publish_retry_at,
+            Some(connectivity_retry_at),
+            "ordinary publication scheduling must not shorten connectivity backoff"
+        );
+
+        maintenance.connectivity_publish_retry_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("expired connectivity retry deadline"),
+        );
+        maintenance.last_publish = Instant::now();
+
         let pending = run_cluster_network_maintenance_tick_for_test(
             &mut maintenance,
             &daemon_paths,
             &DaemonRunOptions::default(),
             &runtime,
         )
-        .expect("maintenance tick")
-        .expect("publish tick should return pending work");
+        .expect("connectivity retry tick")
+        .expect("expired connectivity retry should return pending work");
         assert!(
             pending.connectivity_publish.is_some(),
-            "publish ticks should repair KV connectivity from the local cache"
+            "an expired retry with no due endpoint should publish the retained local cache"
         );
         assert!(
             pending.connectivity_probe.is_none(),
-            "cached connectivity publish must not depend on a fresh probe being due"
+            "a quorum-only failure must not force an unnecessary fresh probe"
         );
 
         runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_retry_at, None);
 
         let kv_records =
             sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&cluster_paths)
@@ -10689,6 +11021,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -10701,6 +11036,7 @@ mod tests {
             entries: Vec::new(),
             remaining_due: 0,
             convergence_active: true,
+            force_probe: false,
             timestamp: "unused".to_string(),
             now,
             startup_settle_active: false,
@@ -10874,6 +11210,9 @@ mod tests {
             ),
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -10908,15 +11247,15 @@ mod tests {
             "routine node-status publishes must not inherit startup-settle formation timeouts"
         );
         assert!(
-            pending.connectivity_publish.is_none(),
-            "a due fresh probe owns same-tick connectivity publication so stale cached work cannot run first"
+            pending.connectivity_probe.is_none(),
+            "startup settling with no probeable endpoint must not construct an empty probe"
         );
         assert!(
             pending
-                .connectivity_probe
+                .connectivity_publish
                 .as_ref()
                 .is_some_and(|work| work.use_formation_timeouts),
-            "connectivity probe keeps startup-settle behavior"
+            "the retained connectivity publication keeps startup-settle behavior"
         );
     }
 
@@ -10943,6 +11282,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -11066,6 +11408,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -11168,6 +11513,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -11283,6 +11631,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: stale_snapshot_pull,
             last_publish: maintenance_now
@@ -11419,6 +11770,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: stale_snapshot_pull,
             last_publish: maintenance_now
@@ -11481,14 +11835,25 @@ mod tests {
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
             connectivity_cursor: 0,
-            connectivity_converged: true,
+            connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
             solo_cluster_idle: true,
 
-            startup_settle_until: None,
+            startup_settle_until: Some(
+                maintenance_now
+                    .checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION)
+                    .expect("startup settle deadline"),
+            ),
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 3,
+            connectivity_publish_retry_at: Some(
+                maintenance_now
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("expired connectivity retry deadline"),
+            ),
+            connectivity_force_probe: true,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
@@ -11525,6 +11890,10 @@ mod tests {
             !cluster_paths.kv_paths().snapshot.exists(),
             "settled solo maintenance must not create or rewrite the KV snapshot"
         );
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_retry_at, None);
+        assert!(!maintenance.connectivity_force_probe);
+        assert!(maintenance.connectivity_converged);
         let after_tick = Instant::now();
         assert!(
             !sinomo_core::network::cluster_network_maintenance_interval_due(
@@ -12899,6 +13268,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -13079,6 +13451,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: Instant::now(),
             last_publish: Instant::now(),
@@ -13191,6 +13566,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -14002,6 +14380,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
@@ -14129,6 +14510,9 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
             kv_snapshot_pull_failure_streak: 0,
             last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,

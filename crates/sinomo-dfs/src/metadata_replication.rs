@@ -36,12 +36,12 @@ use crate::{
     DfsFileSystemId, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataReplicaIngestPermit,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceResult,
-    DfsObjectRpcSendOptions, DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture,
-    LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
-    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids,
-    decode_dfs_metadata_journal_batch_rpc_response,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardMigrationReport,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsNamespaceResult, DfsObjectRpcSendOptions,
+    DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture, LocalShardedMetadataBackend,
+    LocalSobjMetadataBackend, NetworkedDfsServiceEvent, cluster_dfs_metadata_shards,
+    cluster_dfs_peer_node_ids, decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response,
     default_dfs_metadata_replication_suppression_snapshot_path,
     dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_rpc_request,
@@ -4620,6 +4620,23 @@ pub fn materialize_default_sifs_metadata_on_shards(
     fallback_owner_node_id: NodeId,
     created_at: OffsetDateTime,
 ) -> Result<(), DfsError> {
+    materialize_default_sifs_metadata_on_shards_with_report(
+        backend,
+        file_system,
+        bootstrap_owner_node_ids,
+        fallback_owner_node_id,
+        created_at,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn materialize_default_sifs_metadata_on_shards_with_report(
+    backend: &mut LocalShardedMetadataBackend,
+    file_system: &DfsFileSystem,
+    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
+    fallback_owner_node_id: NodeId,
+    created_at: OffsetDateTime,
+) -> Result<DfsMetadataShardMigrationReport, DfsError> {
     backend.ensure_file_system_on_all_shards(file_system)?;
     materialize_default_sifs_metadata(
         backend,
@@ -4628,11 +4645,10 @@ pub fn materialize_default_sifs_metadata_on_shards(
         fallback_owner_node_id,
         created_at,
     )?;
-    backend.migrate_objects_to_configured_shards(
+    Ok(backend.migrate_objects_to_configured_shards(
         &file_system.file_system_id,
         DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT,
-    )?;
-    Ok(())
+    )?)
 }
 
 pub fn validate_dfs_metadata_journal_batch_source(

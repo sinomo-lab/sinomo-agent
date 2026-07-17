@@ -3393,6 +3393,7 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
         &ClusterNodeRole::Workstation,
         false,
         false,
+        false,
         now,
     );
 
@@ -3441,6 +3442,43 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
     );
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].state, ClusterConnectivityState::Degraded);
+
+    apply_cluster_connectivity_probe_results(
+        &mut connectivity,
+        &batch.active_keys,
+        vec![(batch.entries[0].key.clone(), healthy)],
+    );
+    let retained = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        false,
+        now,
+    );
+    assert!(
+        retained.entries.is_empty(),
+        "a fresh healthy observation should normally be retained without probing"
+    );
+    let forced = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        true,
+        now,
+    );
+    assert_eq!(
+        forced.entries.len(),
+        1,
+        "a failed local observation write must be able to force a fresh probe on retry"
+    );
 }
 
 #[test]
@@ -3522,6 +3560,7 @@ fn cluster_connectivity_probe_batch_prioritizes_soon_expiring_records() {
         &ClusterNodeRole::Workstation,
         false,
         false,
+        false,
         now,
     );
 
@@ -3589,6 +3628,7 @@ fn cluster_connectivity_probe_batch_rotates_bounded_slots() {
         &ClusterNodeRole::Workstation,
         false,
         false,
+        false,
         now,
     );
     let first_ids = first
@@ -3602,6 +3642,7 @@ fn cluster_connectivity_probe_batch_rotates_bounded_slots() {
         &mut connectivity,
         first.next_cursor,
         &ClusterNodeRole::Workstation,
+        false,
         false,
         false,
         now,

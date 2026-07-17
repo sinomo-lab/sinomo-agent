@@ -37,17 +37,17 @@ use sui::{
     DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem,
     FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint,
     ListItem, ListView, MeasureCtx, NumberInput, Observable, PaintCtx, PanelSection,
-    PlacementBadge, PlacementBadgePaint, RadioButton, RebuildOnChange, Rect, RichText, ScrollState,
-    ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SideSheet,
-    SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
-    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
-    TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualCollectionModel,
-    VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
-    VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
-    paint_placement_badge_with, paint_text_cell,
+    PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment, RadioButton, RebuildOnChange,
+    Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
+    SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
+    Separator, SideSheet, SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge,
+    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint,
+    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow,
+    VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable,
+    VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
+    VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, paint_checkbox_indicator,
+    paint_leading_label_cell, paint_placement_badge_with, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -86,7 +86,9 @@ const HEADER_PAD_Y: f32 = 8.0;
 /// keeps its inspector but uses a picker-first row with secondary commands in an overflow sheet.
 const FULL_HEADER_INNER_MIN_W: f32 = 860.0;
 const FILES_STATUS_H: f32 = 34.0;
-const LIST_TASK_STRIP_H: f32 = 88.0;
+const FILES_TASK_BADGE_W: f32 = 210.0;
+const FILES_TASK_POPOVER_W: f32 = 420.0;
+const FILES_TASK_ROW_H: f32 = 44.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
 const PLACES_W: f32 = 208.0;
 const PLACE_ROW_H: f32 = 46.0;
@@ -2968,6 +2970,10 @@ impl FilesState {
         }
         self.record_navigation_origin();
         self.apply_location(source, normalized, waker);
+    }
+
+    pub(crate) fn open_sifs_path(&mut self, path: impl Into<String>, waker: Option<sui::UiHandle>) {
+        self.open_location(FilesSourceKind::Sifs, path.into(), waker);
     }
 
     fn navigate(&mut self, path: String) {
@@ -10518,14 +10524,9 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
 /// Build the file-list body for the current location: an error/empty placeholder, or a virtual
 /// table whose pinned header owns sorting and whose rows support select/open interactions.
 fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (loading, error, is_empty, has_tasks): (bool, Option<String>, bool, bool) = {
+    let (loading, error, is_empty): (bool, Option<String>, bool) = {
         let files = shared.files();
-        (
-            files.loading,
-            files.error.clone(),
-            files.entries.is_empty(),
-            !files.tasks.is_empty(),
-        )
+        (files.loading, files.error.clone(), files.entries.is_empty())
     };
     let source = shared.files().source;
 
@@ -10539,7 +10540,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                 FilesSourceKind::Local => "Reading the local directory...",
             },
         );
-        return placeholder_with_task_strip(shared, reader, body, has_tasks);
+        return WidgetPod::new(body);
     }
     if let Some(error) = error {
         let retry = {
@@ -10614,7 +10615,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         )
         .action(actions)
         .action_height(action_height);
-        return placeholder_with_task_strip(shared, reader, body, has_tasks);
+        return WidgetPod::new(body);
     }
     if is_empty {
         let create_file = {
@@ -10655,44 +10656,10 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         )
         .action(actions)
         .action_height(72.0);
-        return placeholder_with_task_strip(shared, reader, body, has_tasks);
+        return WidgetPod::new(body);
     }
 
-    let scroll = files_list_body_rebuild(shared, reader, scroll_state);
-    if has_tasks {
-        let top_h = LIST_TASK_STRIP_H;
-        let top = Stack::vertical().alignment(Alignment::Stretch).with_child(
-            SizedBox::new()
-                .height(LIST_TASK_STRIP_H)
-                .with_child(files_task_strip(shared, reader)),
-        );
-        WidgetPod::new(Dock::new(scroll).top(top_h, top))
-    } else {
-        WidgetPod::new(scroll)
-    }
-}
-
-fn placeholder_with_task_strip<W>(
-    shared: &Shared,
-    reader: &ThemeReader,
-    body: W,
-    has_tasks: bool,
-) -> WidgetPod
-where
-    W: Widget + 'static,
-{
-    if has_tasks {
-        WidgetPod::new(
-            Dock::new(body).top(
-                LIST_TASK_STRIP_H,
-                SizedBox::new()
-                    .height(LIST_TASK_STRIP_H)
-                    .with_child(files_task_strip(shared, reader)),
-            ),
-        )
-    } else {
-        WidgetPod::new(body)
-    }
+    WidgetPod::new(files_list_body_rebuild(shared, reader, scroll_state))
 }
 
 fn files_list_body_rebuild(
@@ -11301,6 +11268,66 @@ fn files_task_status(files: &FilesState) -> String {
     }
 }
 
+fn files_active_task_progress(files: &FilesState) -> Option<(usize, u8)> {
+    let active = files
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.state,
+                FilesTaskState::Running | FilesTaskState::CancelRequested
+            )
+        })
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return None;
+    }
+    let progress = active
+        .iter()
+        .map(|task| task_progress_fraction(task))
+        .sum::<f32>()
+        / active.len() as f32;
+    Some((
+        active.len(),
+        (progress.clamp(0.0, 1.0) * 100.0).round() as u8,
+    ))
+}
+
+fn files_task_badge_label(files: &FilesState) -> String {
+    let source = files_source_status(files);
+    if let Some((active, progress)) = files_active_task_progress(files) {
+        let task_label = if active == 1 { "task" } else { "tasks" };
+        return format!("{source} - {active} {task_label} {progress}%");
+    }
+    let task_status = files_task_status(files);
+    if task_status == "idle" {
+        source.to_string()
+    } else {
+        format!("{source} - {task_status}")
+    }
+}
+
+fn files_task_badge_tone(files: &FilesState) -> SemanticTone {
+    let source_tone = files_source_tone(files);
+    if source_tone == SemanticTone::Warning
+        || files.picker_error.is_some()
+        || files
+            .tasks
+            .iter()
+            .any(|task| task.state == FilesTaskState::Failed)
+    {
+        return SemanticTone::Warning;
+    }
+    if files.external_file_hovered
+        || files.picker_lane.is_pending()
+        || !files.pending_import_request_ids.is_empty()
+        || files_active_task_progress(files).is_some()
+    {
+        return SemanticTone::Accent;
+    }
+    source_tone
+}
+
 fn files_tasks_have_finished(tasks: &[FilesTask]) -> bool {
     tasks.iter().any(|task| {
         matches!(
@@ -11663,11 +11690,11 @@ fn marked_entries_label(count: usize) -> String {
 fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let badge_label = {
         let s = shared.clone();
-        move || files_source_status(&s.files()).to_string()
+        move || files_task_badge_label(&s.files())
     };
     let badge_tone = {
         let s = shared.clone();
-        move || files_source_tone(&s.files())
+        move || files_task_badge_tone(&s.files())
     };
     let path_summary = {
         let s = shared.clone();
@@ -11682,14 +11709,24 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
             )
         }
     };
-    let task_summary = {
-        let s = shared.clone();
-        move || files_task_status(&s.files())
-    };
     let accessibility_summary = {
         let s = shared.clone();
         move || files_status_summary(&s.files())
     };
+    let task_popover = Popover::new(
+        "File tasks",
+        SizedBox::new().width(FILES_TASK_BADGE_W).with_child(
+            StatusBadge::dynamic("SIFS unknown", badge_label)
+                .tone_when(badge_tone)
+                .icon(IconGlyph::Storage)
+                .theme_when(clone_reader(reader)),
+        ),
+        SizedBox::new()
+            .width(FILES_TASK_POPOVER_W)
+            .with_child(FilesTaskQueue::new(shared.clone(), reader)),
+    )
+    .alignment(PopoverAlignment::Start)
+    .theme(reader());
     let status_theme = clone_reader(reader);
     let body = Background::new(
         Color::TRANSPARENT,
@@ -11701,14 +11738,7 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
                     Flex::horizontal()
                         .gap(8.0)
                         .align_items(Alignment::Center)
-                        .with_child(
-                            SizedBox::new().width(146.0).with_child(
-                                StatusBadge::dynamic("SIFS unknown", badge_label)
-                                    .tone_when(badge_tone)
-                                    .icon(IconGlyph::Storage)
-                                    .theme_when(clone_reader(reader)),
-                            ),
-                        )
+                        .with_child(task_popover)
                         .with_item(
                             StatusBar::new()
                                 .name("Files status")
@@ -11717,10 +11747,6 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
                                 .theme_when(status_theme)
                                 .segment(
                                     StatusBarSegment::dynamic("Path /", path_summary).expand(true),
-                                )
-                                .segment(
-                                    StatusBarSegment::dynamic("idle", task_summary)
-                                        .min_width(144.0),
                                 ),
                             FlexItem::flex(1.0).min_width(0.0),
                         ),
@@ -11862,38 +11888,13 @@ fn files_place_list(
         })
 }
 
-fn task_strip_has_recovery(task: &FilesTask) -> bool {
+fn file_task_has_recovery(task: &FilesTask) -> bool {
     task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
 }
 
-fn task_strip_hidden_task_count(tasks: &[FilesTask]) -> usize {
-    tasks.len().saturating_sub(2)
-}
-
-fn task_strip_overflow_label(hidden: usize) -> String {
-    if hidden == 1 {
-        "1 more in inspector".to_string()
-    } else {
-        format!("{hidden} more in inspector")
-    }
-}
-
-fn task_strip_summary(tasks: &[FilesTask]) -> String {
-    let base = files_task_queue_summary(tasks);
-    let hidden = task_strip_hidden_task_count(tasks);
-    if hidden == 0 {
-        return base;
-    }
-    format!(
-        "{base}; showing 2 of {}; {} in inspector",
-        tasks.len(),
-        plural(hidden, "more task")
-    )
-}
-
-fn task_strip_detail_display(task: &FilesTask) -> String {
+fn file_task_detail_display(task: &FilesTask) -> String {
     let detail = files_task_detail_display(task);
-    if task_strip_has_recovery(task) {
+    if file_task_has_recovery(task) {
         detail
             .strip_suffix(" in Connection")
             .unwrap_or(detail.as_str())
@@ -11903,7 +11904,7 @@ fn task_strip_detail_display(task: &FilesTask) -> String {
     }
 }
 
-fn task_strip_button_padding() -> sui::Insets {
+fn file_task_button_padding() -> sui::Insets {
     sui::Insets {
         left: 8.0,
         right: 8.0,
@@ -11912,14 +11913,14 @@ fn task_strip_button_padding() -> sui::Insets {
     }
 }
 
-fn task_strip_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
+fn file_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
     let s = shared.clone();
     sui::Button::new("Clear finished")
-        .semantic_name("Clear finished tasks")
+        .semantic_name("Clear finished file tasks")
         .description("Dismiss completed, failed, and cancelled file operations")
         .min_width(108.0)
         .min_height(22.0)
-        .padding(task_strip_button_padding())
+        .padding(file_task_button_padding())
         .theme_when(clone_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
@@ -11932,11 +11933,7 @@ fn task_strip_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button
         })
 }
 
-fn task_strip_cancel_button(
-    shared: &Shared,
-    reader: &ThemeReader,
-    task: &FilesTask,
-) -> sui::Button {
+fn file_task_cancel_button(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> sui::Button {
     let s = shared.clone();
     let task_id = task.id;
     sui::Button::new("Cancel")
@@ -11944,7 +11941,7 @@ fn task_strip_cancel_button(
         .description(task.detail.clone())
         .min_width(58.0)
         .min_height(22.0)
-        .padding(task_strip_button_padding())
+        .padding(file_task_button_padding())
         .theme_when(clone_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
@@ -11955,7 +11952,7 @@ fn task_strip_cancel_button(
         })
 }
 
-fn task_strip_recovery_button(
+fn file_task_recovery_button(
     shared: &Shared,
     reader: &ThemeReader,
     task: &FilesTask,
@@ -11968,7 +11965,7 @@ fn task_strip_recovery_button(
         .description(format!("{}: {}", task.title, task.detail))
         .min_width(92.0)
         .min_height(22.0)
-        .padding(task_strip_button_padding())
+        .padding(file_task_button_padding())
         .theme_when(clone_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
@@ -11981,14 +11978,14 @@ fn task_strip_recovery_button(
         })
 }
 
-fn task_strip_action_slot(
+fn file_task_action_slot(
     shared: &Shared,
     reader: &ThemeReader,
     task: &FilesTask,
 ) -> (SwitchView, f32) {
     let action_index = if task.state.can_cancel() {
         1
-    } else if task_strip_has_recovery(task) {
+    } else if file_task_has_recovery(task) {
         2
     } else {
         0
@@ -12001,37 +11998,64 @@ fn task_strip_action_slot(
     let slot = SwitchView::new()
         .selected(action_index)
         .with_child(SizedBox::new())
-        .with_child(task_strip_cancel_button(shared, reader, task))
-        .with_child(task_strip_recovery_button(shared, reader, task));
+        .with_child(file_task_cancel_button(shared, reader, task))
+        .with_child(file_task_recovery_button(shared, reader, task));
     (slot, width)
 }
 
-fn task_strip_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
+fn file_task_progress_indicator(reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
+    const INDICATOR_H: f32 = 32.0;
+    const INDICATOR_W: f32 = 3.0;
+    let fill_h = (INDICATOR_H * task_progress_fraction(task)).clamp(0.0, INDICATOR_H);
+    let tone = task_progress_tone(task);
+    let track_reader = clone_reader(reader);
+    let fill_reader = clone_reader(reader);
+    let track = Background::new(
+        Color::TRANSPARENT,
+        SizedBox::new()
+            .width(INDICATOR_W)
+            .height(INDICATOR_H - fill_h),
+    )
+    .brush_when(move || track_reader().semantic_tone_soft_colors(tone).0);
+    let fill = Background::new(
+        Color::TRANSPARENT,
+        SizedBox::new().width(INDICATOR_W).height(fill_h),
+    )
+    .brush_when(move || fill_reader().semantic_tone_colors(tone).0);
+    SizedBox::new()
+        .width(INDICATOR_W)
+        .height(INDICATOR_H)
+        .with_child(Dock::new(track).bottom(fill_h, fill))
+}
+
+fn file_task_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
     let detail_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
-    let title = format!("{} · {}", task.title, task.state.label());
-    let detail = task_strip_detail_display(task);
     let progress = task_progress_fraction(task);
-    let tone = task_progress_tone(task);
-    let (action, action_w) = task_strip_action_slot(shared, reader, task);
+    let progress_label = if matches!(
+        task.state,
+        FilesTaskState::Running | FilesTaskState::CancelRequested
+    ) {
+        format!(" - {}%", (progress * 100.0).round() as u8)
+    } else {
+        String::new()
+    };
+    let title = format!("{} - {}{progress_label}", task.title, task.state.label());
+    let detail = file_task_detail_display(task);
+    let (action, action_w) = file_task_action_slot(shared, reader, task);
 
-    let body = Flex::vertical()
+    let text = Flex::vertical()
         .main_gap(1.0)
         .align_items(Alignment::Stretch)
         .with_child(Label::new(title).style(title_style))
-        .with_child(Label::new(detail).style(detail_style))
-        .with_child(
-            SizedBox::new().height(3.0).with_child(
-                sui::ProgressBar::new(format!("{} progress", task.title))
-                    .value(progress as f64)
-                    .tone(tone)
-                    .height(3.0)
-                    .min_width(80.0)
-                    .theme_when(clone_reader(reader)),
-            ),
-        );
+        .with_child(Label::new(detail).style(detail_style));
+    let body = Flex::horizontal()
+        .main_gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(file_task_progress_indicator(reader, task))
+        .with_item(text, FlexItem::flex(1.0).min_width(0.0));
 
     TrailingSlotRow::new(body, action)
         .trailing_width(action_w)
@@ -12039,135 +12063,36 @@ fn task_strip_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> im
         .gap(8.0)
 }
 
-fn task_strip_content(
-    shared: &Shared,
-    reader: &ThemeReader,
-    tasks: &[FilesTask],
-) -> impl Widget + use<> {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let overflow_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
-    let hidden = task_strip_hidden_task_count(tasks);
-    let has_finished = files_tasks_have_finished(tasks);
-
-    let mut header_body = Flex::horizontal()
-        .main_gap(8.0)
-        .align_items(Alignment::Center)
-        .with_child(SectionLabel::new("Tasks").theme_when(clone_reader(reader)));
-    if hidden > 0 {
-        header_body = header_body.with_child(
-            Label::new(task_strip_overflow_label(hidden))
-                .style(overflow_style)
-                .semantic_name(task_strip_overflow_label(hidden)),
-        );
-    }
-
-    let clear_slot = SwitchView::new()
-        .selected(if has_finished { 1 } else { 0 })
-        .with_child(SizedBox::new())
-        .with_child(task_strip_clear_button(shared, reader));
-    let header = SizedBox::new().height(24.0).with_child(
-        TrailingSlotRow::new(header_body, clear_slot)
-            .trailing_width(if has_finished { 108.0 } else { 0.0 })
-            .trailing_height(22.0)
-            .gap(8.0),
-    );
-
-    let mut rows = Flex::vertical()
-        .main_gap(4.0)
-        .align_items(Alignment::Stretch)
-        .with_child(header);
-    for task in tasks.iter().take(2) {
-        rows = rows.with_child(
-            SizedBox::new()
-                .height(27.0)
-                .with_child(task_strip_row(shared, reader, task)),
-        );
-    }
-
-    let s = shared.clone();
-    let content = WidgetPadding::symmetric(CONTENT_PAD, 6.0, rows).fill_child_width();
-    let panel =
-        Background::new(Color::TRANSPARENT, content).brush_when(move || palette(&s).sidebar);
-    Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .with_child(
-            SizedBox::new()
-                .height(LIST_TASK_STRIP_H - 1.0)
-                .with_child(panel),
-        )
-        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-}
-
-fn files_task_strip(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let tasks = shared.files().tasks.clone();
-    let summary = task_strip_summary(&tasks);
-    SizedBox::new().height(LIST_TASK_STRIP_H).with_child(
-        SemanticRegion::new(
-            "File task strip",
-            task_strip_content(shared, reader, &tasks),
-        )
-        .role(SemanticsRole::Text)
-        .description(summary),
-    )
-}
-
-struct InspectorTaskQueue {
+struct FilesTaskQueue {
     child: WidgetPod,
 }
 
-impl InspectorTaskQueue {
+impl FilesTaskQueue {
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
         let description_shared = shared.clone();
-        let content = VirtualInspectorTaskContent::new(shared, reader);
+        let content = WidgetPadding::new(
+            Insets {
+                left: 12.0,
+                right: 12.0,
+                top: 10.0,
+                bottom: 12.0,
+            },
+            VirtualFileTaskContent::new(shared, reader),
+        )
+        .fill_child_width();
         Self {
             child: WidgetPod::new(
-                SemanticRegion::new(
-                    "File task queue",
-                    Surface::panel(content)
-                        .padding(sui::Insets {
-                            left: 12.0,
-                            right: 12.0,
-                            top: 10.0,
-                            bottom: 12.0,
-                        })
-                        .fill_width()
-                        .theme_when(clone_reader(reader)),
-                )
-                .role(SemanticsRole::Text)
-                .description_when(move || {
-                    files_task_queue_summary(&description_shared.files().tasks)
-                }),
+                SemanticRegion::new("File task queue", content)
+                    .role(SemanticsRole::Text)
+                    .description_when(move || {
+                        files_task_queue_summary(&description_shared.files().tasks)
+                    }),
             ),
         }
     }
 }
 
-fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
-    let s = shared.clone();
-    sui::Button::new("Clear finished")
-        .semantic_name("Clear finished file tasks")
-        .description("Dismiss completed, failed, and cancelled file operations")
-        .min_width(108.0)
-        .min_height(22.0)
-        .padding(task_strip_button_padding())
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut().clear_finished_tasks();
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-            ctx.request_semantics();
-        })
-}
-
-fn inspector_task_queue_header(
-    shared: &Shared,
-    reader: &ThemeReader,
-    tasks: &[FilesTask],
-) -> WidgetPod {
+fn file_task_queue_header(shared: &Shared, reader: &ThemeReader, tasks: &[FilesTask]) -> WidgetPod {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let summary_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
@@ -12181,7 +12106,7 @@ fn inspector_task_queue_header(
     let clear_slot = SwitchView::new()
         .selected(if has_finished { 1 } else { 0 })
         .with_child(SizedBox::new())
-        .with_child(inspector_task_clear_button(shared, reader));
+        .with_child(file_task_clear_button(shared, reader));
     let header = TrailingSlotRow::new(header_body, clear_slot)
         .trailing_width(if has_finished { 108.0 } else { 0.0 })
         .trailing_height(22.0)
@@ -12189,7 +12114,7 @@ fn inspector_task_queue_header(
     WidgetPod::new(header)
 }
 
-fn inspector_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn file_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     WidgetPod::new(
@@ -12227,7 +12152,7 @@ struct FilesTaskRowsStructure {
     tasks: Vec<FilesTask>,
 }
 
-struct VirtualInspectorTaskContent {
+struct VirtualFileTaskContent {
     source: Arc<dyn Observable<FilesTaskRowsStructure>>,
     model: VirtualCollectionModel<u64, FilesTask>,
     shared: Shared,
@@ -12239,9 +12164,9 @@ struct VirtualInspectorTaskContent {
     is_empty: bool,
 }
 
-impl VirtualInspectorTaskContent {
+impl VirtualFileTaskContent {
     const GAP: f32 = 8.0;
-    const ROW_HEIGHT: f32 = 31.0;
+    const ROW_HEIGHT: f32 = FILES_TASK_ROW_H;
 
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
         let current = shared.signals().files_structure.get();
@@ -12270,7 +12195,7 @@ impl VirtualInspectorTaskContent {
                 WidgetPod::new(
                     SizedBox::new()
                         .height(Self::ROW_HEIGHT)
-                        .with_child(task_strip_row(&shared, &reader, task)),
+                        .with_child(file_task_row(&shared, &reader, task)),
                 )
             })
         })
@@ -12285,8 +12210,8 @@ impl VirtualInspectorTaskContent {
         Self {
             source: Arc::new(source),
             model,
-            header: inspector_task_queue_header(&shared, reader, &tasks),
-            empty: inspector_task_queue_empty(&shared, reader),
+            header: file_task_queue_header(&shared, reader, &tasks),
+            empty: file_task_queue_empty(&shared, reader),
             list: WidgetPod::new(list),
             shared,
             reader: Rc::clone(reader),
@@ -12304,8 +12229,8 @@ impl VirtualInspectorTaskContent {
         );
         if header_key != self.header_key {
             self.header_key = header_key;
-            self.header = inspector_task_queue_header(&self.shared, &self.reader, &structure.tasks);
-            self.empty = inspector_task_queue_empty(&self.shared, &self.reader);
+            self.header = file_task_queue_header(&self.shared, &self.reader, &structure.tasks);
+            self.empty = file_task_queue_empty(&self.shared, &self.reader);
         }
         self.is_empty = structure.tasks.is_empty();
         self.model
@@ -12314,7 +12239,7 @@ impl VirtualInspectorTaskContent {
     }
 }
 
-impl Widget for VirtualInspectorTaskContent {
+impl Widget for VirtualFileTaskContent {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let structure = ctx.observe(self.source.as_ref());
         self.sync(structure);
@@ -12406,7 +12331,7 @@ impl Widget for VirtualInspectorTaskContent {
     }
 }
 
-impl Widget for InspectorTaskQueue {
+impl Widget for FilesTaskQueue {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         self.child.measure(ctx, constraints)
     }
@@ -13694,9 +13619,6 @@ fn inspector(
         ),
     )
     .fill_child_height();
-    let task_queue =
-        WidgetPadding::horizontal(CONTENT_PAD, InspectorTaskQueue::new(shared.clone(), reader))
-            .fill_child_width();
     let body = WidgetPadding::new(
         sui::Insets {
             left: 0.0,
@@ -13708,7 +13630,6 @@ fn inspector(
             .alignment(Alignment::Stretch)
             .spacing(12.0)
             .with_child(header)
-            .with_child(task_queue)
             .with_child(InspectorView::new(shared.clone())),
     )
     .fill_child_width();
@@ -22247,6 +22168,8 @@ mod tests {
             files_status_summary(&state),
             "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task running"
         );
+        assert_eq!(files_task_badge_label(&state), "Local SIFS - 1 task 35%");
+        assert_eq!(files_task_badge_tone(&state), SemanticTone::Accent);
 
         state.tasks[0].state = FilesTaskState::Cancelled;
         assert_eq!(
@@ -22398,7 +22321,7 @@ mod tests {
             files_task_detail_display(&sifs_task),
             "Authorize SIFS in Connection"
         );
-        assert_eq!(task_strip_detail_display(&sifs_task), "Authorize SIFS");
+        assert_eq!(file_task_detail_display(&sifs_task), "Authorize SIFS");
 
         let local_task = FilesTask {
             id: 2,
@@ -24261,7 +24184,7 @@ mod tests {
     }
 
     #[test]
-    fn task_strip_cancel_marks_running_task() -> sui::Result<()> {
+    fn task_popover_cancel_marks_running_task() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24288,7 +24211,7 @@ mod tests {
 
         let runtime = sui::Application::new()
             .window(
-                sui::WindowBuilder::new().title("Files task strip").root(
+                sui::WindowBuilder::new().title("Files task popover").root(
                     SizedBox::new()
                         .width(520.0)
                         .height(720.0)
@@ -24299,6 +24222,11 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Cancel Delete")
@@ -24317,7 +24245,7 @@ mod tests {
     }
 
     #[test]
-    fn task_strip_stays_visible_for_empty_directories() -> sui::Result<()> {
+    fn task_popover_stays_available_for_empty_directories() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24339,7 +24267,7 @@ mod tests {
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Files empty task strip")
+                    .title("Files empty task popover")
                     .root(
                         SizedBox::new()
                             .width(520.0)
@@ -24351,6 +24279,11 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Cancel Copy")
@@ -24400,8 +24333,11 @@ mod tests {
         let window = app.main_window()?;
 
         window
-            .get_by_role(sui::SemanticsRole::Text)
-            .with_name("File task strip")
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
+        window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open Connection settings for Refresh placement")
             .click()?;
@@ -24416,7 +24352,7 @@ mod tests {
     }
 
     #[test]
-    fn task_strip_clear_finished_dismisses_terminal_history() -> sui::Result<()> {
+    fn task_popover_clear_finished_dismisses_terminal_history() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24465,8 +24401,13 @@ mod tests {
         let window = app.main_window()?;
 
         window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
+        window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Clear finished tasks")
+            .with_name("Clear finished file tasks")
             .click()?;
 
         let files = shared.files();
@@ -24478,7 +24419,7 @@ mod tests {
     }
 
     #[test]
-    fn task_strip_announces_overflow_tasks() -> sui::Result<()> {
+    fn task_popover_exposes_all_retained_tasks() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24508,7 +24449,7 @@ mod tests {
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Files task strip overflow")
+                    .title("Files task popover queue")
                     .root(
                         SizedBox::new()
                             .width(520.0)
@@ -24523,24 +24464,28 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Text)
-                .with_name("File task strip")
-                .with_description("4 active; showing 2 of 4; 2 more tasks in inspector")
+                .with_name("File task queue")
                 .count()?,
-            1
+            0
         );
+        window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Button)
                 .with_name("Cancel Copy batch 4")
                 .count()?,
-            0
+            1
         );
 
         Ok(())
     }
 
     #[test]
-    fn inspector_task_queue_is_visible_when_idle() -> sui::Result<()> {
+    fn task_queue_is_only_visible_when_popover_is_open() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24571,6 +24516,18 @@ mod tests {
             window
                 .get_by_role(sui::SemanticsRole::Text)
                 .with_name("File task queue")
+                .count()?,
+            0
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Text)
+                .with_name("File task queue")
                 .with_description("idle")
                 .count()?,
             1
@@ -24580,7 +24537,7 @@ mod tests {
     }
 
     #[test]
-    fn inspector_task_queue_clear_finished_dismisses_terminal_history() -> sui::Result<()> {
+    fn task_popover_clear_button_dismisses_terminal_history() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24626,6 +24583,11 @@ mod tests {
         let window = app.main_window()?;
 
         window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
+        window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Clear finished file tasks")
             .click()?;
@@ -24639,7 +24601,7 @@ mod tests {
     }
 
     #[test]
-    fn inspector_task_queue_keeps_virtual_collection_actions_live() -> sui::Result<()> {
+    fn task_popover_keeps_virtual_collection_actions_live() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24658,29 +24620,26 @@ mod tests {
                 })
                 .collect();
         }
-        let scroll_state = ScrollState::new();
-        let reader: ThemeReader = Rc::new(DefaultTheme::light);
-
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Files full task queue")
+                    .title("Files full task popover")
                     .root(
                         SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(320.0)
-                            .with_child(inspector(&shared, &reader, &scroll_state)),
+                            .width(720.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
                     ),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        let _snapshot = window.snapshot()?;
-        assert!(
-            scroll_state.max_offset().y > 0.0,
-            "expanded task queue should remain scrollable through the inspector ScrollView"
-        );
+        window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
         let cancel_visible = window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Cancel Copy batch 1");
@@ -24695,7 +24654,7 @@ mod tests {
     }
 
     #[test]
-    fn inspector_task_reorder_preserves_virtual_row_widget_ids() -> sui::Result<()> {
+    fn files_task_queue_reorder_preserves_virtual_row_widget_ids() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24728,9 +24687,9 @@ mod tests {
                     .title("Files keyed task rows")
                     .root(
                         SizedBox::new()
-                            .width(INSPECTOR_W)
+                            .width(FILES_TASK_POPOVER_W)
                             .height(240.0)
-                            .with_child(InspectorTaskQueue::new(shared.clone(), &reader)),
+                            .with_child(FilesTaskQueue::new(shared.clone(), &reader)),
                     ),
             )
             .build()?;
@@ -24742,8 +24701,15 @@ mod tests {
                 .accessibility
                 .nodes
                 .iter()
-                .filter(|node| node.role == SemanticsRole::ProgressBar)
-                .filter_map(|node| node.name.clone().map(|name| (name, node.id)))
+                .filter(|node| node.role == SemanticsRole::ListItem)
+                .filter_map(|node| {
+                    node.name
+                        .as_ref()
+                        .filter(|name| {
+                            name.as_str() == "Copy alpha" || name.as_str() == "Copy beta"
+                        })
+                        .map(|name| (name.clone(), node.id))
+                })
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         let before = row_ids(&window.snapshot()?);
@@ -24761,7 +24727,7 @@ mod tests {
     }
 
     #[test]
-    fn task_strip_failed_sifs_task_opens_connection_settings() -> sui::Result<()> {
+    fn task_popover_failed_sifs_task_opens_connection_settings() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24799,6 +24765,11 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        window
+            .get_by_role(sui::SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open Connection settings for Refresh placement")

@@ -11827,6 +11827,8 @@ mod tests {
         assert_eq!(config.max_steps, None);
         assert_eq!(config.max_tool_calls_per_step, None);
         assert_eq!(config.max_model_repair_attempts, None);
+        assert_eq!(config.temperature, None);
+        assert_eq!(config.definition.model_policy.temperature, None);
         assert_eq!(config.max_output_tokens, Some(1600));
         assert_eq!(
             config.instruction_file_max_bytes,
