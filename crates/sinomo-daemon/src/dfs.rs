@@ -219,6 +219,7 @@ struct DaemonDfsDetachedSendRuntime {
 struct DaemonDfsDetachedWorkerSchedule {
     generation: u64,
     latest_worker: Option<DfsNodeDetachedSendWorker>,
+    deferred_target_node_ids: Option<BTreeSet<NodeId>>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2143,9 +2144,33 @@ fn read_daemon_dfs_message_peer_snapshot(
 
 fn schedule_daemon_dfs_message_deferred_work(
     tokio_runtime: &tokio::runtime::Handle,
+    cluster_paths: &ClusterPaths,
     runtime: Arc<DaemonDfsDetachedSendRuntime>,
     worker: DfsNodeDetachedSendWorker,
 ) {
+    let deferred_target_node_ids =
+        sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+            .map(|state| daemon_dfs_offline_node_ids(cluster_paths, &state))
+            // Unknown/unreadable cluster state remains fail-open. Durable
+            // detached work must never be discarded because a local status
+            // projection is temporarily unavailable.
+            .unwrap_or_default();
+    schedule_daemon_dfs_message_deferred_work_with_policy(
+        tokio_runtime,
+        runtime,
+        worker,
+        deferred_target_node_ids,
+    );
+}
+
+fn schedule_daemon_dfs_message_deferred_work_with_policy(
+    tokio_runtime: &tokio::runtime::Handle,
+    runtime: Arc<DaemonDfsDetachedSendRuntime>,
+    mut worker: DfsNodeDetachedSendWorker,
+    deferred_target_node_ids: BTreeSet<NodeId>,
+) {
+    worker.set_deferred_target_node_ids(deferred_target_node_ids.clone());
+    let policy_wakeup = worker.clone();
     let mut schedule = match runtime.message_worker_schedule.lock() {
         Ok(schedule) => schedule,
         Err(_) => {
@@ -2153,14 +2178,25 @@ fn schedule_daemon_dfs_message_deferred_work(
             return;
         }
     };
+    let policy_changed =
+        schedule.deferred_target_node_ids.as_ref() != Some(&deferred_target_node_ids);
+    schedule.deferred_target_node_ids = Some(deferred_target_node_ids);
     schedule.generation = schedule.generation.saturating_add(1);
     schedule.latest_worker = Some(worker);
     drop(schedule);
-    if runtime
+    let start_worker = runtime
         .message_worker_active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+        .is_ok();
+    // A previous worker may be parked because every retained send was
+    // deferred. Publish the refreshed worker before waking it so an
+    // offline-to-online transition cannot miss the policy change. Outbox
+    // enqueues have their own shared notification; do not churn a parked
+    // worker merely because another service lane republished the same policy.
+    if policy_changed && !start_worker {
+        policy_wakeup.notify_scheduler_policy_change();
+    }
+    if !start_worker {
         return;
     }
     let _deferred_work = tokio_runtime.spawn(run_daemon_dfs_message_deferred_worker(runtime));
@@ -2623,7 +2659,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     // this blocking task keeps running, so deferring this wake to the caller
     // could leave restored promotion work idle until unrelated later traffic.
     if let Some((detached_runtime, worker)) = deferred_work {
-        schedule_daemon_dfs_message_deferred_work(runtime, detached_runtime, worker);
+        schedule_daemon_dfs_message_deferred_work(runtime, cluster_paths, detached_runtime, worker);
     }
     Ok(Some(DaemonDfsMessageCommandProcessResult {
         response,
@@ -2954,7 +2990,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         run_daemon_dfs_maintenance_until_foreground_waits(&foreground_preemption, async {
             let mut maintenance = Box::pin(run_daemon_dfs_maintenance_tick_with_admission(
                 data_dir,
-                cluster_paths,
+                cluster_paths.clone(),
                 cluster_state,
                 runtime,
                 &mut deferred_work,
@@ -2978,7 +3014,12 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     drop(foreground_preemption);
     let lease_release_result = lease.release().await;
     if let Some((detached_runtime, worker)) = deferred_work {
-        schedule_daemon_dfs_message_deferred_work(runtime, detached_runtime, worker);
+        schedule_daemon_dfs_message_deferred_work(
+            runtime,
+            &cluster_paths,
+            detached_runtime,
+            worker,
+        );
     }
     lease_release_result?;
     match maintenance_result {
@@ -3946,13 +3987,18 @@ mod tests {
         let mut deferred_work = None;
         let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
             data_dir,
-            cluster_paths,
+            cluster_paths.clone(),
             cluster_state,
             runtime.handle(),
             &mut deferred_work,
         ));
         if let Some((detached_runtime, worker)) = deferred_work {
-            schedule_daemon_dfs_message_deferred_work(runtime.handle(), detached_runtime, worker);
+            schedule_daemon_dfs_message_deferred_work(
+                runtime.handle(),
+                &cluster_paths,
+                detached_runtime,
+                worker,
+            );
         }
         result
     }
@@ -7440,6 +7486,7 @@ mod tests {
         runtime.block_on(async {
             schedule_daemon_dfs_message_deferred_work(
                 runtime.handle(),
+                &cluster_paths,
                 detached_runtime.clone(),
                 worker,
             );
@@ -7449,6 +7496,88 @@ mod tests {
                     .message_worker_active
                     .load(Ordering::Acquire),
                 "the lightweight shared-outbox watcher remains parked for restored work"
+            );
+        });
+    }
+
+    #[test]
+    fn daemon_dfs_deferred_worker_notifies_only_for_target_policy_changes() {
+        let root = temp_root("daemon_dfs_detached_worker_policy_notifications");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_detached_policy_local").expect("local");
+        let offline =
+            NodeId::from_legacy_named("node_dfs_detached_policy_offline").expect("offline");
+        write_test_cluster_state(&data_root, &local);
+        let runtime = daemon_test_runtime("daemon-dfs-detached-worker-policy-notifications");
+        let lane = open_daemon_dfs_message_service_lane(
+            &data_dir,
+            &cluster_paths,
+            &local,
+            Vec::new(),
+            runtime.handle(),
+        )
+        .expect("open message service lane");
+        let detached_runtime = Arc::clone(&lane.detached_send_runtime);
+        let worker = lane
+            .lock()
+            .expect("service lane")
+            .service
+            .detach_message_deferred_work();
+        let inspection_worker = worker.clone();
+
+        runtime.block_on(async {
+            let baseline_generation = inspection_worker
+                .scheduling_snapshot()
+                .expect("baseline detached schedule")
+                .2;
+            let offline_policy = BTreeSet::from([offline]);
+            schedule_daemon_dfs_message_deferred_work_with_policy(
+                runtime.handle(),
+                Arc::clone(&detached_runtime),
+                worker.clone(),
+                offline_policy.clone(),
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(
+                inspection_worker
+                    .scheduling_snapshot()
+                    .expect("initial detached policy schedule")
+                    .2,
+                baseline_generation,
+                "starting the worker does not need a synthetic policy wake"
+            );
+
+            schedule_daemon_dfs_message_deferred_work_with_policy(
+                runtime.handle(),
+                Arc::clone(&detached_runtime),
+                worker.clone(),
+                offline_policy,
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(
+                inspection_worker
+                    .scheduling_snapshot()
+                    .expect("unchanged detached policy schedule")
+                    .2,
+                baseline_generation,
+                "republishing an unchanged target policy must not wake the parked worker"
+            );
+
+            schedule_daemon_dfs_message_deferred_work_with_policy(
+                runtime.handle(),
+                Arc::clone(&detached_runtime),
+                worker,
+                BTreeSet::new(),
+            );
+            assert_eq!(
+                inspection_worker
+                    .scheduling_snapshot()
+                    .expect("recovered detached policy schedule")
+                    .2,
+                baseline_generation.wrapping_add(1),
+                "an offline-to-online target policy change must wake the parked worker"
             );
         });
     }
@@ -7499,11 +7628,13 @@ mod tests {
         runtime.block_on(async {
             schedule_daemon_dfs_message_deferred_work(
                 runtime.handle(),
+                &cluster_paths,
                 Arc::clone(&detached_runtime),
                 first_worker,
             );
             schedule_daemon_dfs_message_deferred_work(
                 runtime.handle(),
+                &cluster_paths,
                 Arc::clone(&detached_runtime),
                 second_worker,
             );

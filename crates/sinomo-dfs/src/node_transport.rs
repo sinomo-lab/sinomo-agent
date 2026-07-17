@@ -717,12 +717,13 @@ pub struct DfsNodeTransport {
 #[derive(Clone, Debug)]
 pub struct DfsNodeDetachedSendWorker {
     transport: DfsNodeTransport,
+    deferred_target_node_ids: BTreeSet<NodeId>,
 }
 
 impl DfsNodeDetachedSendWorker {
     pub fn drain(&mut self) -> Result<(), DfsError> {
         self.transport
-            .flush_detached_peer_sends()
+            .flush_detached_peer_sends_excluding_targets(&self.deferred_target_node_ids)
             .map_err(DfsError::from_network)
     }
 
@@ -734,15 +735,29 @@ impl DfsNodeDetachedSendWorker {
     /// restored for retry.
     pub fn drain_exclusive(&mut self) -> Result<(), DfsError> {
         self.transport
-            .flush_detached_peer_sends_exclusive()
+            .flush_detached_peer_sends_exclusive_excluding_targets(&self.deferred_target_node_ids)
             .map_err(DfsError::from_network)
     }
 
     #[cfg(test)]
     fn drain_at(&mut self, now: Instant) -> Result<(), DfsError> {
         self.transport
-            .flush_detached_peer_sends_with_now(&|| now)
+            .flush_detached_peer_sends_with_now_mode(&|| now, false, &self.deferred_target_node_ids)
             .map_err(DfsError::from_network)
+    }
+
+    /// Replace the targets that this worker must leave parked in the shared
+    /// outbox. The sends and their promotion identities remain pending so a
+    /// later worker can resume them after connectivity recovers.
+    pub fn set_deferred_target_node_ids(&mut self, target_node_ids: BTreeSet<NodeId>) {
+        self.deferred_target_node_ids = target_node_ids;
+    }
+
+    /// Wake a scheduler after publishing a worker with a refreshed target
+    /// policy. The shared generation closes the race with an already-parked
+    /// worker registering its notification.
+    pub fn notify_scheduler_policy_change(&self) {
+        self.transport.detached_send_state.record_change();
     }
 
     pub fn has_pending(&self) -> Result<bool, DfsError> {
@@ -763,7 +778,23 @@ impl DfsNodeDetachedSendWorker {
     /// deadline, and the shared change generation observed with that state.
     pub fn scheduling_snapshot(&self) -> Result<(bool, Option<Instant>, u64), DfsError> {
         self.transport
-            .detached_send_scheduling_snapshot_at(Instant::now())
+            .detached_send_scheduling_snapshot_at_excluding_targets(
+                Instant::now(),
+                &self.deferred_target_node_ids,
+            )
+            .map_err(DfsError::from_network)
+    }
+
+    #[cfg(test)]
+    fn scheduling_snapshot_at(
+        &self,
+        now: Instant,
+    ) -> Result<(bool, Option<Instant>, u64), DfsError> {
+        self.transport
+            .detached_send_scheduling_snapshot_at_excluding_targets(
+                now,
+                &self.deferred_target_node_ids,
+            )
             .map_err(DfsError::from_network)
     }
 
@@ -781,7 +812,10 @@ impl DfsNodeDetachedSendWorker {
 
         let (ready, current_retry_not_before, current_generation) = self
             .transport
-            .detached_send_scheduling_snapshot_at(Instant::now())
+            .detached_send_scheduling_snapshot_at_excluding_targets(
+                Instant::now(),
+                &self.deferred_target_node_ids,
+            )
             .map_err(DfsError::from_network)?;
         if ready || current_retry_not_before.is_none() || current_generation != observed_generation
         {
@@ -811,7 +845,10 @@ impl DfsNodeDetachedSendWorker {
 
         let (_, _, current_generation) = self
             .transport
-            .detached_send_scheduling_snapshot_at(Instant::now())
+            .detached_send_scheduling_snapshot_at_excluding_targets(
+                Instant::now(),
+                &self.deferred_target_node_ids,
+            )
             .map_err(DfsError::from_network)?;
         if current_generation != observed_generation {
             return Ok(());
@@ -855,7 +892,10 @@ impl DfsNodeTransport {
         // Background promotion is independent of the completed caller's
         // deadline. Each queued send still retains its own explicit policy.
         transport.operation_deadline = None;
-        DfsNodeDetachedSendWorker { transport }
+        DfsNodeDetachedSendWorker {
+            transport,
+            deferred_target_node_ids: BTreeSet::new(),
+        }
     }
 
     /// Fork one independent routed call while preserving the operation's
@@ -1499,9 +1539,18 @@ impl DfsNodeTransport {
         )]))
     }
 
+    #[cfg(test)]
     fn detached_send_scheduling_snapshot_at(
         &self,
         now: Instant,
+    ) -> Result<(bool, Option<Instant>, u64), NetworkError> {
+        self.detached_send_scheduling_snapshot_at_excluding_targets(now, &BTreeSet::new())
+    }
+
+    fn detached_send_scheduling_snapshot_at_excluding_targets(
+        &self,
+        now: Instant,
+        deferred_target_node_ids: &BTreeSet<NodeId>,
     ) -> Result<(bool, Option<Instant>, u64), NetworkError> {
         let outbox = self
             .detached_send_state
@@ -1511,8 +1560,16 @@ impl DfsNodeTransport {
                 operation: "inspect detached DFS message schedule".to_string(),
                 detail: "detached send lock is poisoned".to_string(),
             })?;
-        let next_retry_not_before = outbox.cooling_retries.first_key_value().map(|(at, _)| *at);
-        let ready = !outbox.ready_sends.is_empty()
+        let next_retry_not_before = outbox.cooling_retries.iter().find_map(|(at, sends)| {
+            sends
+                .iter()
+                .any(|send| !deferred_target_node_ids.contains(&send.target_node_id))
+                .then_some(*at)
+        });
+        let ready = outbox
+            .ready_sends
+            .iter()
+            .any(|send| !deferred_target_node_ids.contains(&send.target_node_id))
             || next_retry_not_before.is_some_and(|retry_not_before| retry_not_before <= now);
         let generation = self
             .detached_send_state
@@ -1524,6 +1581,7 @@ impl DfsNodeTransport {
     fn take_detached_peer_sends_ready_at(
         &self,
         now: Instant,
+        deferred_target_node_ids: &BTreeSet<NodeId>,
     ) -> Result<VecDeque<DeferredDfsPeerSend>, NetworkError> {
         let mut outbox = self
             .detached_send_state
@@ -1545,7 +1603,12 @@ impl DfsNodeTransport {
             // Healthy work accepted while this retry cooled stays ahead of it.
             outbox.ready_sends.append(&mut due);
         }
-        Ok(std::mem::take(&mut outbox.ready_sends))
+        let ready_sends = std::mem::take(&mut outbox.ready_sends);
+        let (eligible, deferred): (VecDeque<_>, VecDeque<_>) = ready_sends
+            .into_iter()
+            .partition(|send| !deferred_target_node_ids.contains(&send.target_node_id));
+        outbox.ready_sends = deferred;
+        Ok(eligible)
     }
 
     fn send_routed_message_to_peer_detached(
@@ -1634,24 +1697,36 @@ impl DfsNodeTransport {
     }
 
     fn flush_detached_peer_sends(&mut self) -> Result<(), NetworkError> {
-        self.flush_detached_peer_sends_with_now(&Instant::now)
+        self.flush_detached_peer_sends_excluding_targets(&BTreeSet::new())
     }
 
-    fn flush_detached_peer_sends_exclusive(&mut self) -> Result<(), NetworkError> {
-        self.flush_detached_peer_sends_with_now_mode(&Instant::now, true)
+    fn flush_detached_peer_sends_excluding_targets(
+        &mut self,
+        deferred_target_node_ids: &BTreeSet<NodeId>,
+    ) -> Result<(), NetworkError> {
+        self.flush_detached_peer_sends_with_now_mode(&Instant::now, false, deferred_target_node_ids)
     }
 
+    fn flush_detached_peer_sends_exclusive_excluding_targets(
+        &mut self,
+        deferred_target_node_ids: &BTreeSet<NodeId>,
+    ) -> Result<(), NetworkError> {
+        self.flush_detached_peer_sends_with_now_mode(&Instant::now, true, deferred_target_node_ids)
+    }
+
+    #[cfg(test)]
     fn flush_detached_peer_sends_with_now<F>(&mut self, now: &F) -> Result<(), NetworkError>
     where
         F: Fn() -> Instant + ?Sized,
     {
-        self.flush_detached_peer_sends_with_now_mode(now, false)
+        self.flush_detached_peer_sends_with_now_mode(now, false, &BTreeSet::new())
     }
 
     fn flush_detached_peer_sends_with_now_mode<F>(
         &mut self,
         now: &F,
         wait_for_drain_gate: bool,
+        deferred_target_node_ids: &BTreeSet<NodeId>,
     ) -> Result<(), NetworkError>
     where
         F: Fn() -> Instant + ?Sized,
@@ -1676,7 +1751,8 @@ impl DfsNodeTransport {
         };
         let mut first_replay_error = None;
         loop {
-            let mut sends = self.take_detached_peer_sends_ready_at(now())?;
+            let mut sends =
+                self.take_detached_peer_sends_ready_at(now(), deferred_target_node_ids)?;
             if sends.is_empty() {
                 break;
             }
@@ -4234,6 +4310,228 @@ mod tests {
             attempted_at = retry_not_before;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn detached_worker_defers_target_without_blocking_healthy_work_or_spinning() {
+        let local = node_id("node_detached_deferred_local");
+        let deferred = node_id("node_detached_deferred_offline");
+        let healthy = node_id("node_detached_deferred_healthy");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            sender_calls
+                .lock()
+                .expect("detached deferred calls")
+                .push(target.clone());
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [deferred.clone(), healthy.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(
+                &deferred,
+                test_commit_version_message(&local, &deferred, 1),
+            )
+            .expect("queue deferred promotion");
+        transport
+            .send_detached_routed_message(
+                &healthy,
+                test_commit_version_message(&local, &healthy, 2),
+            )
+            .expect("queue healthy promotion");
+
+        let started = Instant::now();
+        let mut worker = transport.fork_detached_send_worker();
+        worker.set_deferred_target_node_ids(BTreeSet::from([deferred.clone()]));
+        worker
+            .drain_at(started)
+            .expect("healthy promotion bypasses deferred target");
+
+        assert_eq!(
+            calls.lock().expect("detached deferred calls").as_slice(),
+            std::slice::from_ref(&healthy)
+        );
+        assert_eq!(transport.detached_send_count(), 1);
+        assert_eq!(transport.pending_commit_promotion_count(), 1);
+        let (ready, retry_not_before, _) = worker
+            .scheduling_snapshot_at(started)
+            .expect("deferred-only schedule");
+        assert!(!ready);
+        assert_eq!(retry_not_before, None);
+
+        for _ in 0..4 {
+            worker
+                .drain_at(started)
+                .expect("deferred-only drain stays idle");
+        }
+        assert_eq!(
+            calls.lock().expect("detached deferred calls").as_slice(),
+            std::slice::from_ref(&healthy),
+            "a deferred ready send must not make the worker spin"
+        );
+
+        worker.set_deferred_target_node_ids(BTreeSet::new());
+        assert!(
+            worker
+                .scheduling_snapshot_at(started)
+                .expect("resumed schedule")
+                .0
+        );
+        worker
+            .drain_at(started)
+            .expect("recovered target resumes exact promotion");
+        assert_eq!(
+            calls.lock().expect("detached deferred calls").as_slice(),
+            &[healthy, deferred]
+        );
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+    }
+
+    #[test]
+    fn detached_worker_ignores_deferred_cooling_deadline_until_target_recovers() {
+        let local = node_id("node_detached_deferred_cooling_local");
+        let deferred = node_id("node_detached_deferred_cooling_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            if sender_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(DfsPeerTransportError::new(
+                    "deferred cooling target offline",
+                ))
+            } else {
+                Ok(test_committed_promotion_rpc_response(command))
+            }
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [deferred.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(
+                &deferred,
+                test_commit_version_message(&local, &deferred, 1),
+            )
+            .expect("queue cooling promotion");
+        let started = Instant::now();
+        transport
+            .flush_detached_peer_sends_with_now(&|| started)
+            .expect_err("first attempt enters cooling");
+        let retry_at = started + DFS_DETACHED_SEND_RETRY_DELAY;
+
+        let mut worker = transport.fork_detached_send_worker();
+        worker.set_deferred_target_node_ids(BTreeSet::from([deferred]));
+        let (ready, retry_not_before, _) = worker
+            .scheduling_snapshot_at(retry_at)
+            .expect("deferred cooling schedule");
+        assert!(!ready);
+        assert_eq!(retry_not_before, None);
+        worker
+            .drain_at(retry_at)
+            .expect("due deferred retry remains parked");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 1);
+
+        worker.set_deferred_target_node_ids(BTreeSet::new());
+        worker
+            .drain_at(retry_at)
+            .expect("recovered cooling target resumes");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.detached_send_count(), 0);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_worker_policy_change_wakes_parked_scheduler() {
+        let local = node_id("node_detached_policy_wake_local");
+        let deferred = node_id("node_detached_policy_wake_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [deferred.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        transport
+            .send_detached_routed_message(
+                &deferred,
+                test_commit_version_message(&local, &deferred, 1),
+            )
+            .expect("queue policy-wake promotion");
+
+        let mut parked_worker = transport.fork_detached_send_worker();
+        parked_worker.set_deferred_target_node_ids(BTreeSet::from([deferred]));
+        let (ready, retry_not_before, generation) = parked_worker
+            .scheduling_snapshot()
+            .expect("parked worker schedule");
+        assert!(!ready);
+        assert_eq!(retry_not_before, None);
+        let waiter = tokio::spawn(async move { parked_worker.wait_for_change(generation).await });
+        tokio::task::yield_now().await;
+
+        let mut recovered_worker = transport.fork_detached_send_worker();
+        recovered_worker.notify_scheduler_policy_change();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("policy change must wake parked scheduler")
+            .expect("parked scheduler task")
+            .expect("parked scheduler wait");
+        recovered_worker
+            .drain_at(Instant::now())
+            .expect("refreshed worker resumes retained promotion");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_worker_new_send_wakes_without_policy_refresh() {
+        let local = node_id("node_detached_enqueue_wake_local");
+        let remote = node_id("node_detached_enqueue_wake_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            [remote.clone()],
+            Duration::from_secs(1),
+            sender,
+        );
+        let waiting_worker = transport.fork_detached_send_worker();
+        let mut drain_worker = waiting_worker.clone();
+        let (_, _, generation) = waiting_worker
+            .scheduling_snapshot()
+            .expect("empty detached schedule");
+        let waiter = tokio::spawn(async move { waiting_worker.wait_for_change(generation).await });
+        tokio::task::yield_now().await;
+
+        transport
+            .send_detached_routed_message(&remote, test_commit_version_message(&local, &remote, 1))
+            .expect("queue promotion without policy refresh");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("new outbox work must wake parked scheduler")
+            .expect("parked scheduler task")
+            .expect("parked scheduler wait");
+        drain_worker
+            .drain_at(Instant::now())
+            .expect("newly queued promotion drains");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.detached_send_count(), 0);
     }
 
     #[test]
