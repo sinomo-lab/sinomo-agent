@@ -30,6 +30,8 @@ pub struct AgentConfigSummary {
     pub editable: bool,
     pub tool_count: usize,
     pub skill_count: usize,
+    pub default_model: String,
+    pub home_server_node_id: Option<String>,
     pub sandbox_node_id: Option<String>,
 }
 
@@ -326,8 +328,22 @@ impl AgentConfigSummary {
             editable: agent_definition_is_editable(definition),
             tool_count: definition.tools.len(),
             skill_count: definition.skills.len(),
+            default_model: agent_default_model_label(definition),
+            home_server_node_id: definition.placement.home_server_node_id.clone(),
             sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
         }
+    }
+}
+
+fn agent_default_model_label(definition: &AgentDefinition) -> String {
+    match (
+        definition.model_policy.provider.as_deref(),
+        definition.model_policy.model.as_deref(),
+    ) {
+        (Some(provider), Some(model)) => format!("{provider} / {model}"),
+        (Some(provider), None) => format!("{provider} default"),
+        (None, Some(model)) => model.to_string(),
+        (None, None) => "Cluster default".to_string(),
     }
 }
 

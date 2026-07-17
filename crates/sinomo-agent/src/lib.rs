@@ -753,7 +753,6 @@ impl AgentDefinition {
     }
 
     pub fn main() -> Self {
-        let temperature = Some(0.2);
         let max_output_tokens = Some(1600);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
@@ -769,7 +768,6 @@ impl AgentDefinition {
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy {
-                temperature,
                 max_output_tokens,
                 ..AgentModelPolicy::default()
             },
@@ -777,13 +775,12 @@ impl AgentDefinition {
             placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature,
+            temperature: None,
             max_output_tokens,
         }
     }
 
     pub fn background() -> Self {
-        let temperature = Some(0.2);
         let max_output_tokens = Some(700);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
@@ -799,7 +796,6 @@ impl AgentDefinition {
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy {
-                temperature,
                 max_output_tokens,
                 ..AgentModelPolicy::default()
             },
@@ -807,13 +803,12 @@ impl AgentDefinition {
             placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature,
+            temperature: None,
             max_output_tokens,
         }
     }
 
     pub fn coding() -> Self {
-        let temperature = Some(0.2);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
             package: AgentPackageDefinition::built_in(),
@@ -827,22 +822,17 @@ impl AgentDefinition {
             skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
-            model_policy: AgentModelPolicy {
-                temperature,
-                max_output_tokens: None,
-                ..AgentModelPolicy::default()
-            },
+            model_policy: AgentModelPolicy::default(),
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
             placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature,
+            temperature: None,
             max_output_tokens: None,
         }
     }
 
     pub fn evolution() -> Self {
-        let temperature = Some(0.2);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
             package: AgentPackageDefinition::built_in(),
@@ -856,16 +846,12 @@ impl AgentDefinition {
             skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
-            model_policy: AgentModelPolicy {
-                temperature,
-                max_output_tokens: None,
-                ..AgentModelPolicy::default()
-            },
+            model_policy: AgentModelPolicy::default(),
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
             placement: AgentPlacementDefinition::default(),
             tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature,
+            temperature: None,
             max_output_tokens: None,
         }
     }
@@ -2836,6 +2822,29 @@ mod tests {
             assert_eq!(
                 definition.compaction.strategy_id,
                 DEFAULT_AGENT_COMPACTION_STRATEGY_ID
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_agents_leave_temperature_to_the_model_default() {
+        for definition in [
+            AgentDefinition::main(),
+            AgentDefinition::background(),
+            AgentDefinition::coding(),
+            AgentDefinition::evolution(),
+        ] {
+            assert_eq!(
+                definition.temperature,
+                None,
+                "{} must not set a legacy temperature override",
+                definition.key()
+            );
+            assert_eq!(
+                definition.model_policy.temperature,
+                None,
+                "{} must not set a model-policy temperature override",
+                definition.key()
             );
         }
     }

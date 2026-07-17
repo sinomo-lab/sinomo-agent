@@ -24,19 +24,23 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
-use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
+use sinomo_agent::{
+    AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole, AgentToolSpec,
+    agent_home_sifs_path_for_id, default_agent_tool_descriptors,
+};
 use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
 };
 use sui::{
     Align, Alignment, ArrangeCtx, Checkbox, Command, Constraints, ContextMenu, ControlSize,
-    DefaultTheme, Event, EventCtx, FieldGroup, Flex, FlexItem, FlexWrap, FontWeight, FormRow,
-    FormSection, IconGlyph, Label, ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx,
-    PasswordInput, ProgressBar, RebuildOnChange, Rect, ScrollState, ScrollView, SectionLabel,
-    Select, SelectionScope, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator,
-    Size, SizedBox, Spinner, Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TabBar,
-    TextArea, TextCommand, TextInput, ThemeTextToken, TrailingSlotRow, VirtualList, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    DefaultTheme, Event, EventCtx, FieldGroup, FixedPaneSplit, Flex, FlexItem, FlexWrap,
+    FontWeight, FormRow, FormSection, IconButton, IconGlyph, Label, ListItem, ListView, MeasureCtx,
+    MenuItem, NumberInput, PaintCtx, PasswordInput, ProgressBar, RebuildOnChange,
+    RebuildOnConstraints, Rect, RichText, ScrollState, ScrollView, SectionLabel, Select,
+    SelectionScope, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, Size,
+    SizedBox, Spinner, Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TabBar,
+    TextArea, TextCommand, TextDocument, TextInput, ThemeTextToken, Tooltip, TooltipPlacement,
+    TrailingSlotRow, VirtualList, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
 };
 
 use sinomo_runtime::config::{
@@ -79,6 +83,9 @@ const SIDEBAR_W: f32 = 276.0;
 const SIDEBAR_ITEM_H: f32 = 52.0;
 const MENU_ROW_H: f32 = 58.0;
 const CONTENT_PAD: f32 = 22.0;
+const AGENT_MENU_W: f32 = 292.0;
+const AGENT_LIST_ROW_H: f32 = 66.0;
+const AGENT_SPLIT_THRESHOLD: f32 = 820.0;
 
 const GENERAL_SETTINGS: &[SettingsSection] =
     &[SettingsSection::Appearance, SettingsSection::Connection];
@@ -236,6 +243,7 @@ pub struct SettingsState {
     pub agent_snapshot: AgentConfigSnapshot,
     pub agent_selected_id: Option<String>,
     pub agent_form: AgentForm,
+    agent_detail_open: bool,
     pub agent_action_error: Option<String>,
     pub agent_action_status: Option<String>,
     pub agent_delete_confirming: Option<String>,
@@ -284,6 +292,7 @@ pub struct SettingsState {
     advanced_controls_revision: u64,
     advanced_detail_expanded: Vec<String>,
     provider_detail_expanded: Vec<String>,
+    provider_usage_expanded: Vec<String>,
     provider_storage_detail_expanded: bool,
     provider_remove_confirming: Option<(String, String)>,
 }
@@ -379,6 +388,7 @@ struct SettingsProviderStructure {
     action_error: Option<String>,
     action_status: Option<ProviderActionStatus>,
     remove_confirming: Option<(String, String)>,
+    usage_expanded: Vec<String>,
     expanded: Vec<String>,
     storage_expanded: bool,
     providers: Vec<(ProviderForm, ProviderHealthState)>,
@@ -393,6 +403,7 @@ struct SettingsAgentsStructure {
     delete_confirming: Option<String>,
     validation_report: Option<AgentValidationReport>,
     editor_previous_id: Option<String>,
+    editor_tools: Vec<AgentToolSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -546,6 +557,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             action_error: settings.provider_action_error.clone(),
             action_status: settings.provider_action_status.clone(),
             remove_confirming: settings.provider_remove_confirming.clone(),
+            usage_expanded: settings.provider_usage_expanded.clone(),
             expanded: settings.provider_detail_expanded.clone(),
             storage_expanded: settings.provider_storage_detail_expanded,
             providers: settings
@@ -569,6 +581,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             delete_confirming: settings.agent_delete_confirming.clone(),
             validation_report: settings.agent_validation_report.clone(),
             editor_previous_id: settings.agent_form.previous_id.clone(),
+            editor_tools: settings.agent_form.definition.tools.clone(),
         };
         let snapshot = &settings.module_snapshot;
         let modules = SettingsModulesStructure {
@@ -1066,7 +1079,9 @@ pub struct AgentForm {
     max_steps: String,
     max_tool_calls_per_step: String,
     max_model_repair_attempts: String,
+    home_server_node_id: String,
     sandbox_node_id: String,
+    tool_add_index: usize,
     output_format_index: usize,
 }
 
@@ -1225,11 +1240,17 @@ impl AgentForm {
                 .max_model_repair_attempts
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+            home_server_node_id: definition
+                .placement
+                .home_server_node_id
+                .clone()
+                .unwrap_or_default(),
             sandbox_node_id: definition
                 .tool_runtime
                 .sandbox_node_id
                 .clone()
                 .unwrap_or_default(),
+            tool_add_index: 0,
             output_format_index,
             definition,
         }
@@ -1260,6 +1281,8 @@ impl AgentForm {
             parse_optional_usize("max tool calls per step", &self.max_tool_calls_per_step)?;
         definition.runtime_limits.max_model_repair_attempts =
             parse_optional_usize("max model repair attempts", &self.max_model_repair_attempts)?;
+        definition.placement.home_server_node_id =
+            optional_trimmed_string(&self.home_server_node_id);
         definition.tool_runtime.sandbox_node_id = optional_trimmed_string(&self.sandbox_node_id);
         definition.output_format = output_format_for_index(self.output_format_index);
         definition.validate().map_err(|error| error.to_string())?;
@@ -1387,6 +1410,7 @@ impl SettingsState {
             agent_snapshot,
             agent_selected_id,
             agent_form,
+            agent_detail_open: false,
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
@@ -1425,6 +1449,7 @@ impl SettingsState {
             advanced_controls_revision: 0,
             advanced_detail_expanded: Vec::new(),
             provider_detail_expanded: Vec::new(),
+            provider_usage_expanded: Vec::new(),
             provider_storage_detail_expanded: false,
             provider_remove_confirming: None,
         }
@@ -1490,6 +1515,7 @@ impl SettingsState {
             agent_snapshot: AgentConfigSnapshot::default(),
             agent_selected_id: None,
             agent_form: AgentForm::new_custom("custom-agent".to_string()),
+            agent_detail_open: false,
             agent_action_error: None,
             agent_action_status: None,
             agent_delete_confirming: None,
@@ -1528,6 +1554,7 @@ impl SettingsState {
             advanced_controls_revision: 0,
             advanced_detail_expanded: Vec::new(),
             provider_detail_expanded: Vec::new(),
+            provider_usage_expanded: Vec::new(),
             provider_storage_detail_expanded: false,
             provider_remove_confirming: None,
         }
@@ -2082,13 +2109,18 @@ impl SettingsState {
                     self.agent_action_error = None;
                     self.agent_action_status = match success.effect {
                         AgentOperationEffect::Refreshed => None,
-                        AgentOperationEffect::Saved(id) => Some(format!("Saved custom agent {id}")),
+                        AgentOperationEffect::Saved(id) => {
+                            self.agent_detail_open = true;
+                            Some(format!("Saved custom agent {id}"))
+                        }
                         AgentOperationEffect::Deleted(id) => {
+                            self.agent_detail_open = false;
                             self.agent_delete_confirming = None;
                             self.agent_validation_report = None;
                             Some(format!("Deleted custom agent {id}"))
                         }
                         AgentOperationEffect::Imported(id) => {
+                            self.agent_detail_open = true;
                             self.agent_import_path.clear();
                             self.agent_validation_report = None;
                             Some(format!("Imported agent package {id}"))
@@ -2298,6 +2330,26 @@ impl SettingsState {
         }
     }
 
+    fn provider_usage_expanded(&self, provider: &str, account: &str) -> bool {
+        let key = provider_account_key(provider, account);
+        self.provider_usage_expanded
+            .iter()
+            .any(|expanded| expanded == &key)
+    }
+
+    fn toggle_provider_usage(&mut self, provider: &str, account: &str) {
+        let key = provider_account_key(provider, account);
+        if let Some(index) = self
+            .provider_usage_expanded
+            .iter()
+            .position(|expanded| expanded == &key)
+        {
+            self.provider_usage_expanded.remove(index);
+        } else {
+            self.provider_usage_expanded.push(key);
+        }
+    }
+
     fn provider_storage_detail_expanded(&self) -> bool {
         self.provider_storage_detail_expanded
     }
@@ -2308,7 +2360,16 @@ impl SettingsState {
 
     fn prepare_agent_selection(&mut self, index: usize) -> Option<String> {
         let id = self.agent_snapshot.agents.get(index)?.id.clone();
+        if self
+            .agent_snapshot
+            .selected_agent
+            .as_ref()
+            .is_some_and(|agent| agent.key() != id)
+        {
+            self.agent_snapshot.selected_agent = None;
+        }
         self.agent_selected_id = Some(id.clone());
+        self.agent_detail_open = true;
         self.agent_action_error = None;
         self.agent_action_status = Some("Loading agent…".to_string());
         self.agent_delete_confirming = None;
@@ -2336,6 +2397,7 @@ impl SettingsState {
         let id = unique_agent_id(&self.agent_snapshot, "custom-agent");
         self.agent_form = AgentForm::new_custom(id.clone());
         self.agent_selected_id = Some(id);
+        self.agent_detail_open = true;
         self.agent_action_error = None;
         self.agent_action_status = None;
         self.agent_delete_confirming = None;
@@ -2366,6 +2428,7 @@ impl SettingsState {
         self.agent_form = AgentForm::duplicate_from(definition, id.clone());
         self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_selected_id = Some(id);
+        self.agent_detail_open = true;
         self.agent_action_error = None;
         self.agent_action_status = Some("Editing duplicated custom agent".to_string());
         self.agent_delete_confirming = None;
@@ -2455,6 +2518,13 @@ impl SettingsState {
         self.agent_action_status = None;
     }
 
+    fn set_agent_home_server_node_id(&mut self, value: String) {
+        self.agent_form.home_server_node_id = value;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
     fn set_agent_sandbox_node_id(&mut self, value: String) {
         self.agent_form.sandbox_node_id = value;
         self.mark_draft_changed(SettingsOperationDomain::Agents);
@@ -2496,6 +2566,45 @@ impl SettingsState {
         self.mark_draft_changed(SettingsOperationDomain::Agents);
         self.agent_action_error = None;
         self.agent_action_status = None;
+    }
+
+    fn set_agent_tool_add_index(&mut self, index: usize) {
+        self.agent_form.tool_add_index = index;
+    }
+
+    fn add_selected_agent_tool(&mut self) {
+        let available = available_agent_tool_specs(&self.agent_form.definition.tools);
+        let Some(spec) = available.get(self.agent_form.tool_add_index).cloned() else {
+            return;
+        };
+        self.agent_form.definition.tools.push(spec);
+        self.agent_form
+            .definition
+            .tools
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.agent_form.tool_add_index = 0;
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn remove_agent_tool(&mut self, name: &str) {
+        let previous_len = self.agent_form.definition.tools.len();
+        self.agent_form
+            .definition
+            .tools
+            .retain(|tool| tool.name != name);
+        if self.agent_form.definition.tools.len() != previous_len {
+            self.agent_form.tool_add_index = 0;
+            self.mark_draft_changed(SettingsOperationDomain::Agents);
+            self.agent_action_error = None;
+            self.agent_action_status = None;
+        }
+    }
+
+    fn back_to_agent_list(&mut self) {
+        self.agent_detail_open = false;
+        self.agent_delete_confirming = None;
     }
 
     fn agent_form_can_save(&self) -> bool {
@@ -4182,10 +4291,7 @@ fn agent_sidebar_preview(snapshot: &AgentConfigSnapshot) -> String {
 }
 
 fn agent_summary_line(agent: &AgentConfigSummary) -> String {
-    let mut parts = vec![
-        agent.role.clone(),
-        format!("{} package {}", agent.source, agent.package_version),
-    ];
+    let mut parts = vec![agent.role.clone(), agent.default_model.clone()];
     if agent.tool_count == 1 {
         parts.push("1 tool".to_string());
     } else if agent.tool_count > 1 {
@@ -4196,11 +4302,17 @@ fn agent_summary_line(agent: &AgentConfigSummary) -> String {
     } else if agent.skill_count > 1 {
         parts.push(format!("{} skills", agent.skill_count));
     }
+    if let Some(node_id) = agent.home_server_node_id.as_ref()
+        && !node_id.trim().is_empty()
+    {
+        parts.push(format!("home {}", short(node_id, 12)));
+    }
     if let Some(node_id) = agent.sandbox_node_id.as_ref()
         && !node_id.trim().is_empty()
     {
         parts.push(format!("sandbox {}", short(node_id, 12)));
     }
+    parts.push(agent.source.clone());
     parts.join(" · ")
 }
 
@@ -4226,6 +4338,21 @@ fn agent_catalog_row(shared: &Shared, agent: &AgentConfigSummary) -> TrailingSlo
         .trailing_width(52.0)
         .trailing_height(20.0)
         .gap(8.0)
+}
+
+fn available_agent_tool_specs(selected: &[AgentToolSpec]) -> Vec<AgentToolSpec> {
+    let selected_names = selected
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut tools = default_agent_tool_descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.spec)
+        .filter(|tool| !selected_names.contains(tool.name.as_str()))
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools.dedup_by(|left, right| left.name == right.name);
+    tools
 }
 
 fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
@@ -4476,15 +4603,25 @@ where
         let s = shared.clone();
         Rc::new(move || status_when(&s.settings()))
     };
-    let error_label = Label::dynamic("Settings error", {
+    let error_selection = SelectionScope::new();
+    let error_style = {
+        let mut style = settings_text_style(shared, shared.theme().text.base);
+        style.color = palette(shared).danger_text;
+        style
+    };
+    let error_text = RichText::dynamic(TextDocument::from_plain_text("", error_style), {
         let error = Rc::clone(&error);
-        move || error().unwrap_or_default()
-    })
-    .style(settings_text_style(shared, shared.theme().text.base))
-    .color_when({
         let s = shared.clone();
-        move || palette(&s).danger_text
-    });
+        move || {
+            let mut style = settings_text_style(&s, s.theme().text.base);
+            style.color = palette(&s).danger_text;
+            TextDocument::from_plain_text(error().unwrap_or_default(), style)
+        }
+    })
+    .semantic_name("Settings error")
+    .selectable(error_selection.clone());
+    let error_text =
+        read_only_text_menu(reader, "settings-error", error_text, error_selection, true);
     let status_label = Label::dynamic("Settings status", {
         let status = Rc::clone(&status);
         move || status().unwrap_or_default()
@@ -4498,7 +4635,7 @@ where
     SwitchView::new()
         .with_child(SizedBox::new().height(0.0))
         .with_child(
-            FormRow::new("Error", error_label)
+            FormRow::new("Error", error_text)
                 .inline()
                 .theme_when(clone_reader(reader)),
         )
@@ -4909,92 +5046,6 @@ where
     FormRow::new(label, input)
         .inline()
         .theme_when(clone_reader(reader))
-}
-
-/// An editable draft plus an explicit commit button. `on_change` is local-only; `on_save` queues
-/// the background write. This is the default for any field whose config client may be daemon RPC.
-fn text_save_row<C, S, P>(
-    reader: &ThemeReader,
-    name: &str,
-    label: &str,
-    value: impl Into<String>,
-    placeholder: &str,
-    on_change: C,
-    on_save: S,
-    pending_when: P,
-) -> FormRow
-where
-    C: FnMut(String) + 'static,
-    S: FnMut() + 'static,
-    P: Fn() -> bool + 'static,
-{
-    let input = TextInput::new(name)
-        .value(value)
-        .placeholder(placeholder)
-        .theme_when(clone_reader(reader))
-        .on_change(on_change);
-    let save = sui::Button::new("Save")
-        .icon(sui::IconGlyph::Check)
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .enabled_when(move || !pending_when())
-        .on_press(on_save);
-    FormRow::new(
-        label,
-        Stack::vertical()
-            .spacing(8.0)
-            .alignment(Alignment::Stretch)
-            .with_child(input)
-            .with_child(
-                Stack::horizontal()
-                    .alignment(Alignment::Start)
-                    .with_child(save),
-            ),
-    )
-    .stacked()
-    .theme_when(clone_reader(reader))
-}
-
-/// A masked secret draft plus explicit commit. Secrets retain normal selection, paste, and IME
-/// behavior while never being painted as plaintext.
-fn password_save_row<C, S, P>(
-    reader: &ThemeReader,
-    name: &str,
-    label: &str,
-    value: impl Into<String>,
-    placeholder: &str,
-    on_change: C,
-    on_save: S,
-    pending_when: P,
-) -> FormRow
-where
-    C: FnMut(String) + 'static,
-    S: FnMut() + 'static,
-    P: Fn() -> bool + 'static,
-{
-    let input = PasswordInput::new(name)
-        .value(value)
-        .placeholder(placeholder)
-        .theme_when(clone_reader(reader))
-        .on_change(on_change);
-    let save = sui::Button::new("Save")
-        .icon(IconGlyph::Check)
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .enabled_when(move || !pending_when())
-        .on_press(on_save);
-    FormRow::new(
-        label,
-        Stack::vertical()
-            .spacing(8.0)
-            .alignment(Alignment::Stretch)
-            .with_child(input)
-            .with_child(Stack::horizontal().with_child(save)),
-    )
-    .stacked()
-    .theme_when(clone_reader(reader))
 }
 
 fn password_row<F>(
@@ -6030,27 +6081,28 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
 }
 
-/// One provider's card: summary rows first, low-level credential and management controls behind a
-/// details disclosure.
+/// One provider account: operational state and chat routing stay visible; quota detail,
+/// credentials, tuning, and destructive actions are disclosed only when requested.
 fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widget + use<> {
     let form = shared.settings().provider_forms[index].clone();
     let health = shared
         .settings()
         .provider_health(&form.provider, &form.account);
-    let expanded = shared
+    let advanced_expanded = shared
         .settings()
         .provider_detail_expanded(&form.provider, &form.account);
+    let usage_expanded = shared
+        .settings()
+        .provider_usage_expanded(&form.provider, &form.account);
 
-    // Keep the operational state and enable control visible without opening details.
     let enable_switch = {
         let s = shared.clone();
         let provider = form.provider.clone();
         let account = form.account.clone();
-        let enabled = !form.enabled;
-        Switch::new("")
+        Switch::new("Enabled")
             .on(form.enabled)
             .theme_when(clone_reader(reader))
-            .on_toggle(move |_| {
+            .on_toggle(move |enabled| {
                 queue_settings_operation(
                     &s,
                     SettingsOperationScope::Providers,
@@ -6073,28 +6125,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         .with_child(health_badge)
         .with_child(enable_switch);
 
-    let mut body = FieldGroup::new().spacing(8.0);
-    body = body.with_child(
-        FormRow::new(
-            "Authentication",
-            Stack::horizontal().with_child(
-                StatusBadge::new(provider_auth_summary(&form))
-                    .icon(if form.signed_in {
-                        IconGlyph::Lock
-                    } else {
-                        IconGlyph::Unlock
-                    })
-                    .tone(if form.signed_in {
-                        SemanticTone::Info
-                    } else {
-                        SemanticTone::Warning
-                    })
-                    .theme_when(clone_reader(reader)),
-            ),
-        )
-        .inline()
-        .theme_when(clone_reader(reader)),
-    );
+    let mut body = FieldGroup::new().spacing(10.0).fill_width();
     let test_button = {
         let s = shared.clone();
         let provider = form.provider.clone();
@@ -6125,22 +6156,56 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .label("Testing connection…")
             .theme_when(clone_reader(reader)),
         );
-    body = body.with_child(value_row(
-        shared,
-        reader,
-        "Verification",
-        provider_last_verified_label(&health),
-    ));
+    let authentication = StatusBadge::new(provider_auth_summary(&form))
+        .icon(if form.signed_in {
+            IconGlyph::Lock
+        } else {
+            IconGlyph::Unlock
+        })
+        .tone(if form.signed_in {
+            SemanticTone::Info
+        } else {
+            SemanticTone::Warning
+        })
+        .theme_when(clone_reader(reader));
+    let connection_summary = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(authentication)
+        .with_child(muted_label(
+            shared,
+            format!(
+                "Last tested {}",
+                provider_last_verified_label(&health).to_lowercase()
+            ),
+        ));
+    let mut connection_detail = Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(connection_summary);
     if let Some(error) = health.error.clone() {
-        body = body.with_child(
-            FormRow::new("Connection error", muted_label(shared, error))
-                .stacked()
-                .theme_when(clone_reader(reader)),
+        connection_detail = connection_detail.with_child(
+            settings_label(shared, error, shared.theme().text.sm).color_when({
+                let s = shared.clone();
+                move || palette(&s).danger_text
+            }),
         );
     }
+    body = body.with_child(
+        FormRow::new(
+            "Connection",
+            TrailingSlotRow::new(connection_detail, test_control)
+                .trailing_width(150.0)
+                .trailing_height(28.0)
+                .gap(12.0),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
     let chat_default_control = if form.is_default {
         Stack::horizontal().alignment(Alignment::Center).with_child(
-            StatusBadge::new("Chat default")
+            StatusBadge::new("Default for chat")
                 .icon(IconGlyph::Chat)
                 .tone(SemanticTone::Accent)
                 .theme_when(clone_reader(reader)),
@@ -6150,8 +6215,8 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         let provider = form.provider.clone();
         let account = form.account.clone();
         let ready_for_chat = form.enabled && form.signed_in;
-        let button = sui::Button::new("Use for chat")
-            .icon(sui::IconGlyph::Check)
+        let button = sui::Button::new("Set as chat default")
+            .icon(sui::IconGlyph::Chat)
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
@@ -6171,28 +6236,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .with_child(button)
     };
     body = body.with_child(
-        FormRow::new("Chat", chat_default_control)
-            .inline()
-            .theme_when(clone_reader(reader)),
-    );
-    let status_label = {
-        let status_shared = shared.clone();
-        let color_shared = shared.clone();
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        Label::dynamic("No changes yet", move || {
-            status_shared
-                .settings()
-                .provider_action_status
-                .as_ref()
-                .filter(|status| status.provider == provider && status.account == account)
-                .map(|status| status.message.clone())
-                .unwrap_or_else(|| "No changes yet".to_string())
-        })
-        .color_when(move || palette(&color_shared).good)
-    };
-    body = body.with_child(
-        FormRow::new("Last change", status_label)
+        FormRow::new("Chat routing", chat_default_control)
             .inline()
             .theme_when(clone_reader(reader)),
     );
@@ -6256,26 +6300,36 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         }
     }
 
-    if let Some(usage) = health.usage.as_ref() {
+    body = body.with_child(provider_usage_summary_row(
+        shared,
+        reader,
+        &form,
+        &health,
+        usage_expanded,
+    ));
+    if usage_expanded && let Some(usage) = health.usage.as_ref() {
         body = body.with_child(provider_usage_row(shared, reader, usage));
-    } else if let Some(error) = health.usage_error.clone() {
-        body = body.with_child(
-            FormRow::new("Usage", muted_label(shared, error))
-                .stacked()
-                .theme_when(clone_reader(reader)),
-        );
+    }
+    if let Some(status) = shared
+        .settings()
+        .provider_action_status
+        .as_ref()
+        .filter(|status| status.provider == form.provider && status.account == form.account)
+        .map(|status| status.message.clone())
+    {
+        body = body.with_child(value_row(shared, reader, "Status", status));
     }
 
     let detail_button = {
         let s = shared.clone();
         let provider = form.provider.clone();
         let account = form.account.clone();
-        sui::Button::new(if expanded {
-            "Hide settings"
+        sui::Button::new(if advanced_expanded {
+            "Hide advanced settings"
         } else {
-            "Settings"
+            "Advanced settings"
         })
-        .icon(if expanded {
+        .icon(if advanced_expanded {
             sui::IconGlyph::ChevronUp
         } else {
             sui::IconGlyph::ChevronDown
@@ -6289,28 +6343,15 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
     };
     body = body.with_child(
         FormRow::new(
-            "Actions",
-            Flex::horizontal()
-                .wrap(FlexWrap::Wrap)
-                .gap(8.0)
-                .align_items(Alignment::Center)
-                .with_child(test_control)
-                .with_child(detail_button),
+            "Configuration",
+            Stack::horizontal().with_child(detail_button),
         )
         .inline()
         .theme_when(clone_reader(reader)),
     );
 
-    if expanded {
-        if has_model_options {
-            body = body.with_child(provider_model_text_row(
-                shared,
-                reader,
-                index,
-                "Custom model",
-            ));
-        }
-        // Authentication: device-login (status + button) or an API-key field.
+    if advanced_expanded {
+        body = body.with_child(provider_subsection_heading(shared, reader, "Credentials"));
         if form.uses_device_login {
             let sign_in_label = if form.signed_in {
                 "Re-authenticate"
@@ -6330,9 +6371,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 .spacing(6.0)
                 .alignment(Alignment::Stretch)
                 .with_child(status_reflector(shared, index, reader))
-                .with_child(button);
+                .with_child(Stack::horizontal().with_child(button));
             body = body.with_child(
-                FormRow::new("Authentication detail", auth)
+                FormRow::new("Sign-in", auth)
                     .stacked()
                     .theme_when(clone_reader(reader)),
             );
@@ -6351,10 +6392,12 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                         .set_provider_field_draft(index, ProviderField::ApiKey, value);
                 }
             };
-            body = body.with_child(password_save_row(
+            body = body.with_child(password_save_inline_row(
+                shared,
                 reader,
                 &format!("provider-{index}-api-key"),
                 "API key",
+                api_key,
                 api_value,
                 placeholder,
                 on_change,
@@ -6373,26 +6416,30 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                         }
                     }
                 },
-                {
-                    let s = shared.clone();
-                    move || {
-                        s.settings()
-                            .domain_pending(SettingsOperationDomain::Providers)
-                    }
-                },
             ));
         }
 
-        // API base URL.
+        body = body.with_child(provider_subsection_heading(shared, reader, "Endpoint"));
+        if has_model_options {
+            body = body.with_child(provider_model_text_row(
+                shared,
+                reader,
+                index,
+                "Model ID override",
+            ));
+        }
+
         let base_url_key =
             provider_field_key(&form.provider, &form.account, ProviderField::BaseUrl);
         let base_url_value = shared
             .settings()
             .field_draft_or(&base_url_key, || form.api_base_url.clone());
-        body = body.with_child(text_save_row(
+        body = body.with_child(text_save_inline_row(
+            shared,
             reader,
             &format!("provider-{index}-base-url"),
             "API base URL",
+            base_url_key,
             base_url_value,
             "Provider default",
             {
@@ -6413,16 +6460,20 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                     }
                 }
             },
-            {
-                let s = shared.clone();
-                move || {
-                    s.settings()
-                        .domain_pending(SettingsOperationDomain::Providers)
-                }
-            },
         ));
 
-        // Reasoning effort (when the provider/model supports it).
+        let has_response_defaults = form.supports_reasoning
+            || provider_supports_reasoning_budget(&form.provider)
+            || provider_supports_text_verbosity(&form.provider)
+            || provider_supports_vendor_options(&form.provider);
+        if has_response_defaults {
+            body = body.with_child(provider_subsection_heading(
+                shared,
+                reader,
+                "Response defaults",
+            ));
+        }
+
         if form.supports_reasoning {
             let selected_when = {
                 let s = shared.clone();
@@ -6470,10 +6521,12 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                     .map(|value| value.to_string())
                     .unwrap_or_default()
             });
-            body = body.with_child(text_save_row(
+            body = body.with_child(text_save_inline_row(
+                shared,
                 reader,
                 &format!("provider-{index}-reasoning-budget"),
                 "Reasoning budget",
+                budget_key,
                 budget_value,
                 "Provider default",
                 {
@@ -6499,13 +6552,6 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                                 operation,
                             );
                         }
-                    }
-                },
-                {
-                    let s = shared.clone();
-                    move || {
-                        s.settings()
-                            .domain_pending(SettingsOperationDomain::Providers)
                     }
                 },
             ));
@@ -6551,10 +6597,12 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             let options_value = shared
                 .settings()
                 .field_draft_or(&options_key, || form.vendor_options.clone());
-            body = body.with_child(text_save_row(
+            body = body.with_child(text_save_inline_row(
+                shared,
                 reader,
                 &format!("provider-{index}-vendor-options"),
                 "Provider options",
+                options_key,
                 options_value,
                 "{}",
                 {
@@ -6582,21 +6630,214 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                         }
                     }
                 },
-                {
-                    let s = shared.clone();
-                    move || {
-                        s.settings()
-                            .domain_pending(SettingsOperationDomain::Providers)
-                    }
-                },
             ));
         }
+        body = body.with_child(provider_subsection_heading(shared, reader, "Account"));
         body = body.with_child(provider_management_row(shared, reader, index, &form));
     }
 
     FormSection::new(form.display_name.clone(), body)
+        .description(provider_card_description(&form))
         .header_action(header_actions)
         .theme_when(clone_reader(reader))
+}
+
+fn provider_card_description(form: &ProviderForm) -> String {
+    let model = if form.default_model.trim().is_empty() {
+        "Provider default model"
+    } else {
+        form.default_model.as_str()
+    };
+    format!("{} account - {model}", form.account_label)
+}
+
+fn provider_usage_summary_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    form: &ProviderForm,
+    health: &ProviderHealthState,
+    expanded: bool,
+) -> FormRow {
+    let summary = provider_usage_summary(health);
+    let Some(usage) = health.usage.as_ref() else {
+        return FormRow::new("Usage", muted_label(shared, summary))
+            .inline()
+            .theme_when(clone_reader(reader));
+    };
+    let button = {
+        let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        sui::Button::new(if expanded {
+            "Hide usage details"
+        } else {
+            "View usage details"
+        })
+        .icon(if expanded {
+            IconGlyph::ChevronUp
+        } else {
+            IconGlyph::ChevronDown
+        })
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .enabled(!usage.limits.is_empty() || usage.credits.is_some())
+        .on_press(move || s.settings_mut().toggle_provider_usage(&provider, &account))
+    };
+    FormRow::new(
+        "Usage",
+        TrailingSlotRow::new(muted_label(shared, summary), button)
+            .trailing_width(156.0)
+            .trailing_height(28.0)
+            .gap(12.0),
+    )
+    .inline()
+    .theme_when(clone_reader(reader))
+}
+
+fn provider_usage_summary(health: &ProviderHealthState) -> String {
+    let Some(usage) = health.usage.as_ref() else {
+        return health
+            .usage_error
+            .clone()
+            .unwrap_or_else(|| "Test the connection to load usage and limits".to_string());
+    };
+    let mut parts = Vec::new();
+    if let Some(plan) = usage.plan.as_deref() {
+        parts.push(plan.to_string());
+    }
+    let highest = usage
+        .limits
+        .iter()
+        .filter_map(provider_usage_used_percent)
+        .fold(None::<f64>, |current, used| {
+            Some(current.map_or(used, |value| value.max(used)))
+        });
+    match (usage.limits.len(), highest) {
+        (0, _) => parts.push("No limits reported".to_string()),
+        (1, Some(used)) => parts.push(format!("{used:.0}% used")),
+        (count, Some(used)) => parts.push(format!("{count} limits - highest {used:.0}% used")),
+        (count, None) => parts.push(format!("{count} limits")),
+    }
+    if let Some(credits) = usage.credits.as_ref()
+        && let Some(balance) = credits.balance.as_deref()
+    {
+        parts.push(format!("Credits {balance}"));
+    }
+    parts.join(" - ")
+}
+
+fn provider_subsection_heading(shared: &Shared, reader: &ThemeReader, title: &str) -> Stack {
+    let mut style = settings_text_style(shared, shared.theme().text.xs);
+    style.weight = FontWeight::SEMIBOLD;
+    Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+        .with_child(
+            Label::new(title.to_ascii_uppercase())
+                .style(style)
+                .color_when({
+                    let s = shared.clone();
+                    move || palette(&s).text_faint
+                }),
+        )
+}
+
+fn provider_save_button<F>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    label: &str,
+    draft_key: String,
+    on_save: F,
+) -> Tooltip
+where
+    F: FnMut() + 'static,
+{
+    let enabled_shared = shared.clone();
+    let enabled_key = draft_key;
+    let button = IconButton::new(IconGlyph::Check, format!("Save {label}"))
+        .description(format!("Save the edited {label}"))
+        .size(28.0)
+        .icon_size(14.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || {
+            let settings = enabled_shared.settings();
+            settings.field_drafts.contains_key(&enabled_key)
+                && !settings.domain_pending(SettingsOperationDomain::Providers)
+        })
+        .on_press(on_save);
+    Tooltip::new(format!("Save {label}"), button)
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
+}
+
+fn text_save_inline_row<C, S>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    draft_key: String,
+    value: impl Into<String>,
+    placeholder: &str,
+    on_change: C,
+    on_save: S,
+) -> FormRow
+where
+    C: FnMut(String) + 'static,
+    S: FnMut() + 'static,
+{
+    let input = TextInput::new(name)
+        .value(value)
+        .placeholder(placeholder)
+        .theme_when(clone_reader(reader))
+        .on_change(on_change);
+    let save = provider_save_button(shared, reader, label, draft_key, on_save);
+    FormRow::new(
+        label,
+        SizedBox::new().height(28.0).with_child(
+            TrailingSlotRow::new(input, save)
+                .trailing_width(28.0)
+                .trailing_height(28.0)
+                .gap(6.0),
+        ),
+    )
+    .inline()
+    .theme_when(clone_reader(reader))
+}
+
+fn password_save_inline_row<C, S>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    draft_key: String,
+    value: impl Into<String>,
+    placeholder: &str,
+    on_change: C,
+    on_save: S,
+) -> FormRow
+where
+    C: FnMut(String) + 'static,
+    S: FnMut() + 'static,
+{
+    let input = PasswordInput::new(name)
+        .value(value)
+        .placeholder(placeholder)
+        .theme_when(clone_reader(reader))
+        .on_change(on_change);
+    let save = provider_save_button(shared, reader, label, draft_key, on_save);
+    FormRow::new(
+        label,
+        SizedBox::new().height(28.0).with_child(
+            TrailingSlotRow::new(input, save)
+                .trailing_width(28.0)
+                .trailing_height(28.0)
+                .gap(6.0),
+        ),
+    )
+    .inline()
+    .theme_when(clone_reader(reader))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6651,10 +6892,12 @@ fn provider_model_text_row(
     let model_value = shared
         .settings()
         .field_draft_or(&model_key, || form.default_model.clone());
-    text_save_row(
+    text_save_inline_row(
+        shared,
         reader,
         &format!("provider-{index}-model"),
         label,
+        model_key,
         model_value,
         "Provider default",
         {
@@ -6673,13 +6916,6 @@ fn provider_model_text_row(
                 {
                     queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
                 }
-            }
-        },
-        {
-            let s = shared.clone();
-            move || {
-                s.settings()
-                    .domain_pending(SettingsOperationDomain::Providers)
             }
         },
     )
@@ -6979,11 +7215,11 @@ fn provider_management_row(
             stack = stack.with_child(
                 settings_label(shared, error, shared.theme().text.sm).color_when({
                     let s = shared.clone();
-                    move || palette(&s).accent
+                    move || palette(&s).danger_text
                 }),
             );
         }
-        FormRow::new("Management", stack)
+        FormRow::new("Remove", stack)
             .stacked()
             .theme_when(clone_reader(reader))
     } else {
@@ -6996,7 +7232,7 @@ fn provider_management_row(
                 .tone(SemanticTone::Danger)
                 .on_press(move || s.settings_mut().confirm_provider_remove(index))
         };
-        FormRow::new("Management", remove)
+        FormRow::new("Remove", Stack::horizontal().with_child(remove))
             .inline()
             .theme_when(clone_reader(reader))
     }
@@ -7032,6 +7268,7 @@ fn provider_section_signature(shared: &Shared) -> String {
         format!("action-status:{:?}", settings.provider_action_status),
         format!("remove:{:?}", settings.provider_remove_confirming),
         format!("expanded:{:?}", settings.provider_detail_expanded),
+        format!("usage-expanded:{:?}", settings.provider_usage_expanded),
         format!(
             "storage-expanded:{}",
             settings.provider_storage_detail_expanded
@@ -7072,7 +7309,7 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             })
     };
     let provider_forms = shared.settings().provider_forms.clone();
-    let body = if provider_forms.is_empty() {
+    let mut body = if provider_forms.is_empty() {
         let storage_expanded = shared.settings().provider_storage_detail_expanded();
         let storage_button = {
             let s = shared.clone();
@@ -7092,6 +7329,7 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             .on_press(move || s.settings_mut().toggle_provider_storage_detail())
         };
         let mut group = FieldGroup::new()
+            .fill_width()
             .spacing(8.0)
             .with_child(value_row(
                 shared,
@@ -7128,6 +7366,7 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         group
     } else {
         FieldGroup::new()
+            .fill_width()
             .spacing(8.0)
             .with_child(value_row(
                 shared,
@@ -7148,6 +7387,19 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 provider_chat_default_summary(&provider_forms),
             ))
     };
+    if let Some(error) = shared.settings().provider_action_error.clone() {
+        body = body.with_child(
+            FormRow::new(
+                "Provider error",
+                settings_label(shared, error, shared.theme().text.sm).color_when({
+                    let s = shared.clone();
+                    move || palette(&s).danger_text
+                }),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    }
     stack = stack.with_child(
         FormSection::new("Providers", body)
             .description(
@@ -7190,6 +7442,7 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
     };
 
     let mut body = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(
             FormRow::new("Provider", provider_select)
@@ -7344,12 +7597,7 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 }
 
 fn section_agents(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    Stack::vertical()
-        .spacing(14.0)
-        .alignment(Alignment::Stretch)
-        .with_child(agent_catalog_section(shared, reader))
-        .with_child(agent_package_management_section(shared, reader))
-        .with_child(agent_details_host(shared, reader))
+    section_agents_body(shared, reader)
 }
 
 fn agent_details_host(
@@ -7364,7 +7612,9 @@ fn agent_details_host(
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |_key| WidgetPod::new(agent_details(&s, &r)))
+    RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(agent_detail_panel(&s, &r))
+    })
 }
 
 #[cfg(test)]
@@ -7378,11 +7628,60 @@ fn agents_section_key(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "selected:{:?};delete:{:?};report:{:?};editor:{:?}\n{agents}",
+        "selected:{:?};detail:{};delete:{:?};report:{:?};editor:{:?};tools:{:?}\n{agents}",
         settings.agent_selected_id,
+        settings.agent_detail_open,
         settings.agent_delete_confirming,
         settings.agent_validation_report,
         settings.agent_form.previous_id,
+        settings.agent_form.definition.tools,
+    )
+}
+
+fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnConstraints::new(
+        false,
+        |constraints| constraints.max.width >= AGENT_SPLIT_THRESHOLD,
+        move |wide| {
+            if *wide {
+                WidgetPod::new(
+                    FixedPaneSplit::horizontal(
+                        agent_catalog_section(&s, &r),
+                        Separator::vertical().theme_when(clone_reader(&r)),
+                        InsetX::new(agent_details_host(&s, &r), 18.0),
+                    )
+                    .fixed_first(AGENT_MENU_W)
+                    .divider_extent(1.0)
+                    .fallback_flexible_extent(560.0),
+                )
+            } else {
+                let back = {
+                    let s = s.clone();
+                    sui::Button::new("Agents")
+                        .icon(IconGlyph::ChevronLeft)
+                        .theme_when(clone_reader(&r))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || s.settings_mut().back_to_agent_list())
+                };
+                let detail = Stack::vertical()
+                    .spacing(10.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(Stack::horizontal().with_child(back))
+                    .with_child(agent_details_host(&s, &r));
+                WidgetPod::new(
+                    SwitchView::new()
+                        .with_child(agent_catalog_section(&s, &r))
+                        .with_child(detail)
+                        .selected_when({
+                            let s = s.clone();
+                            move || usize::from(s.settings().agent_detail_open)
+                        }),
+                )
+            }
+        },
     )
 }
 
@@ -7460,26 +7759,11 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
             .theme_when(clone_reader(reader))
             .on_press(move || s.settings_mut().create_agent())
     };
-    let duplicate = {
-        let s = shared.clone();
-        sui::Button::new("Duplicate")
-            .icon(sui::IconGlyph::Restore)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                move || s.settings().agent_snapshot.selected_agent.is_some()
-            })
-            .on_press(move || s.settings_mut().duplicate_selected_agent())
-    };
     let refresh = {
         let s = shared.clone();
-        sui::Button::new("Refresh")
-            .icon(sui::IconGlyph::Redo)
+        let button = IconButton::new(IconGlyph::Redo, "Refresh")
+            .description("Reload the agent catalog")
             .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
             .on_press(move || {
                 let selected_id = s.settings().agent_selected_id.clone();
                 queue_settings_operation(
@@ -7487,16 +7771,24 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
                     SettingsOperationScope::Agents,
                     SettingsOperation::RefreshAgents { selected_id },
                 );
-            })
+            });
+        Tooltip::new("Refresh agents", button)
+            .placement(TooltipPlacement::Above)
+            .theme(reader())
     };
 
     let summary_body = FieldGroup::new()
         .spacing(8.0)
         .with_child(agent_catalog_summary_host(shared, reader))
         .with_child(
-            FormRow::new("Agents", SizedBox::new().height(230.0).with_child(list))
-                .stacked()
-                .theme_when(clone_reader(reader)),
+            FormRow::new(
+                "Agents",
+                SizedBox::new()
+                    .height(AGENT_LIST_ROW_H * 5.0)
+                    .with_child(list),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
         )
         .with_child(
             FormRow::new(
@@ -7506,18 +7798,11 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
                     .gap(8.0)
                     .align_items(Alignment::Start)
                     .with_child(new_agent)
-                    .with_child(duplicate)
                     .with_child(refresh),
             )
             .inline()
             .theme_when(clone_reader(reader)),
-        )
-        .with_child(feedback_slot(
-            shared,
-            reader,
-            |settings| settings.agent_action_error.clone(),
-            |settings| settings.agent_action_status.clone(),
-        ));
+        );
 
     FormSection::new("Agents", summary_body)
         .description("Create, inspect, validate, and move agent packages without leaving Settings.")
@@ -7570,10 +7855,16 @@ fn agent_catalog_summary_host(
     })
 }
 
-fn agent_details(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+fn agent_detail_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut stack = Stack::vertical()
         .spacing(14.0)
-        .alignment(Alignment::Stretch);
+        .alignment(Alignment::Stretch)
+        .with_child(feedback_slot(
+            shared,
+            reader,
+            |settings| settings.agent_action_error.clone(),
+            |settings| settings.agent_action_status.clone(),
+        ));
 
     let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
     let selected = shared.settings().agent_snapshot.selected_agent.clone();
@@ -7583,7 +7874,20 @@ fn agent_details(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         stack = stack.with_child(agent_editor_section(shared, reader));
     } else if let Some(definition) = selected {
         stack = stack.with_child(agent_readonly_section(shared, reader, definition));
+    } else {
+        stack = stack.with_child(
+            FormSection::new(
+                "Select an agent",
+                muted_label(
+                    shared,
+                    "Choose an agent from the list or create a custom agent.",
+                ),
+            )
+            .description("Agent settings are loaded from the shared agent catalog.")
+            .theme_when(clone_reader(reader)),
+        );
     }
+    stack = stack.with_child(agent_package_management_section(shared, reader));
     if let Some(report) = shared.settings().agent_validation_report.clone() {
         stack = stack.with_child(agent_validation_report_section(shared, reader, report));
     }
@@ -7674,6 +7978,7 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
     let test = agent_lifecycle_action_button(shared, reader, true);
 
     let body = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(
             FormRow::new(
@@ -7781,7 +8086,8 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .on_change(move |index, _label| s.settings_mut().set_agent_output_format_index(index))
     };
 
-    let mut body = FieldGroup::new()
+    let profile = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(agent_text_row(
             shared,
@@ -7822,14 +8128,19 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "System prompt",
             form.system_prompt.clone(),
             "Describe the agent behavior",
-            140.0,
+            220.0,
             |settings, value| settings.set_agent_system_prompt(value),
         ))
+        .with_child(agent_actions_row(shared, reader));
+
+    let model = FieldGroup::new()
+        .fill_width()
+        .spacing(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
             "agent-provider",
-            "Provider",
+            "Default provider",
             form.provider.clone(),
             "Cluster default",
             |settings, value| settings.set_agent_provider(value),
@@ -7838,7 +8149,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             shared,
             reader,
             "agent-model",
-            "Model",
+            "Default model",
             form.model.clone(),
             "Provider default",
             |settings, value| settings.set_agent_model(value),
@@ -7849,7 +8160,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "agent-temperature",
             "Temperature",
             form.temperature.clone(),
-            "0.2",
+            "Model default",
             |settings, value| settings.set_agent_temperature(value),
         ))
         .with_child(agent_text_row(
@@ -7865,7 +8176,112 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             FormRow::new("Output", output_format_select)
                 .inline()
                 .theme_when(clone_reader(reader)),
-        )
+        );
+
+    let mut tools = FieldGroup::new().fill_width().spacing(8.0);
+    if form.definition.tools.is_empty() {
+        tools = tools.with_child(value_row(
+            shared,
+            reader,
+            "Packaged tools",
+            "No packaged tools enabled",
+        ));
+    } else {
+        for tool in form.definition.tools.iter().cloned() {
+            tools = tools.with_child(agent_tool_editor_row(shared, reader, tool));
+        }
+    }
+    let available_tools = available_agent_tool_specs(&form.definition.tools);
+    if !available_tools.is_empty() {
+        let names = available_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let selected_names = names.clone();
+        let tool_select = {
+            let s = shared.clone();
+            Select::new("agent-add-tool-select")
+                .options(names)
+                .selected_when(move || {
+                    Some(
+                        s.settings()
+                            .agent_form
+                            .tool_add_index
+                            .min(selected_names.len().saturating_sub(1)),
+                    )
+                })
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    move |index, _| s.settings_mut().set_agent_tool_add_index(index)
+                })
+        };
+        let add_tool = {
+            let s = shared.clone();
+            sui::Button::new("Add tool")
+                .icon(IconGlyph::Add)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || s.settings_mut().add_selected_agent_tool())
+        };
+        tools = tools.with_child(
+            FormRow::new(
+                "Add packaged tool",
+                TrailingSlotRow::new(tool_select, add_tool)
+                    .trailing_width(108.0)
+                    .trailing_height(28.0)
+                    .gap(8.0),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    tools = tools
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-skills",
+            "Skills",
+            form.skills_text.clone(),
+            "skill-id per line",
+            84.0,
+            |settings, value| settings.set_agent_skills_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-visible-toolsets",
+            "Visible toolsets",
+            form.visible_toolsets_text.clone(),
+            "toolset id per line; empty uses the package default",
+            76.0,
+            |settings, value| settings.set_agent_visible_toolsets_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-allow-tools",
+            "Additional allowed tools",
+            form.allow_tools_text.clone(),
+            "tool id per line",
+            76.0,
+            |settings, value| settings.set_agent_allow_tools_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-deny-tools",
+            "Denied tools",
+            form.deny_tools_text.clone(),
+            "tool id per line",
+            76.0,
+            |settings, value| settings.set_agent_deny_tools_text(value),
+        ));
+
+    let runtime = FieldGroup::new()
+        .fill_width()
+        .spacing(8.0)
         .with_child(agent_text_row(
             shared,
             reader,
@@ -7896,55 +8312,31 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         .with_child(agent_text_row(
             shared,
             reader,
+            "agent-home-server",
+            "Preferred home server",
+            form.home_server_node_id.clone(),
+            "Local session placement",
+            |settings, value| settings.set_agent_home_server_node_id(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
             "agent-sandbox-node",
-            "Sandbox node",
+            "Sandbox execution node",
             form.sandbox_node_id.clone(),
             "Local runtime",
             |settings, value| settings.set_agent_sandbox_node_id(value),
         ))
-        .with_child(agent_area_row(
+        .with_child(agent_home_folder_row(
             shared,
             reader,
-            "agent-skills",
-            "Skills",
-            form.skills_text.clone(),
-            "skill-id per line",
-            74.0,
-            |settings, value| settings.set_agent_skills_text(value),
-        ))
-        .with_child(agent_area_row(
-            shared,
-            reader,
-            "agent-visible-toolsets",
-            "Visible toolsets",
-            form.visible_toolsets_text.clone(),
-            "toolset id per line",
-            70.0,
-            |settings, value| settings.set_agent_visible_toolsets_text(value),
-        ))
-        .with_child(agent_area_row(
-            shared,
-            reader,
-            "agent-allow-tools",
-            "Allowed tools",
-            form.allow_tools_text.clone(),
-            "tool id per line",
-            70.0,
-            |settings, value| settings.set_agent_allow_tools_text(value),
-        ))
-        .with_child(agent_area_row(
-            shared,
-            reader,
-            "agent-deny-tools",
-            "Denied tools",
-            form.deny_tools_text.clone(),
-            "tool id per line",
-            70.0,
-            |settings, value| settings.set_agent_deny_tools_text(value),
+            &form.id,
+            form.previous_id.is_some(),
         ));
 
+    let mut package = FieldGroup::new().fill_width().spacing(8.0);
     if let Some(summary) = selected_agent_config_summary(shared) {
-        body = body
+        package = package
             .with_child(agent_readiness_row(shared, reader, summary.readiness))
             .with_child(value_row(
                 shared,
@@ -7954,15 +8346,130 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             ))
             .with_child(value_row(shared, reader, "Provenance", summary.provenance));
     }
-    body = body.with_child(agent_actions_row(shared, reader));
-    let title = if form.previous_id.is_some() {
-        format!("Edit {}", short_one_line(&form.id, 48))
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            FormSection::new(
+                if form.previous_id.is_some() {
+                    format!("Edit {}", short_one_line(&form.id, 48))
+                } else {
+                    "New custom agent".to_string()
+                },
+                profile,
+            )
+            .description("Identity and system instructions used for every session.")
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Default model", model)
+                .description(
+                    "Leave provider or model blank to inherit the cluster and provider defaults.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Tools and skills", tools)
+                .description(
+                    "Packaged tools define the base capability set; tool-surface rules can further expose or restrict runtime tools.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Runtime", runtime)
+                .description(
+                    "Default turn limits and preferred placement for sessions and sandboxed tools.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Package", package)
+                .description(
+                    "Saved custom definitions live in SIFS and become available to chats and channels.",
+                )
+                .theme_when(clone_reader(reader)),
+        )
+}
+
+fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolSpec) -> FormRow {
+    let description = if tool.async_default {
+        format!("{} Runs asynchronously by default.", tool.description)
     } else {
-        "New custom agent".to_string()
+        tool.description.clone()
     };
-    FormSection::new(title, body)
-        .description("Saved agents are stored under the local Sinomo data directory and become available in chat agent selection.")
-        .theme_when(clone_reader(reader))
+    let remove = {
+        let s = shared.clone();
+        let name = tool.name.clone();
+        let label = format!("Remove {}", tool.name);
+        let button = IconButton::new(IconGlyph::Trash, label.clone())
+            .description(format!("Remove {} from this agent", tool.name))
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().remove_agent_tool(&name));
+        Tooltip::new(label, button)
+            .placement(TooltipPlacement::Above)
+            .theme(reader())
+    };
+    FormRow::new(
+        tool.name,
+        TrailingSlotRow::new(muted_label(shared, description), remove)
+            .trailing_width(28.0)
+            .trailing_height(28.0)
+            .gap(8.0),
+    )
+    .inline()
+    .theme_when(clone_reader(reader))
+}
+
+fn agent_home_folder_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    agent_id: &str,
+    persisted: bool,
+) -> FormRow {
+    let path = agent_home_sifs_path_for_id(agent_id);
+    let open = {
+        let s = shared.clone();
+        let path = path.clone();
+        sui::Button::new("Open home folder")
+            .icon(IconGlyph::Folder)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled(persisted)
+            .on_press(move || open_agent_home_folder(&s, path.clone()))
+    };
+    let detail = if persisted {
+        "Shared SIFS home mounted into this agent's tool runtime."
+    } else {
+        "The home folder becomes available after this agent is saved and first used."
+    };
+    FormRow::new(
+        "Agent home",
+        Stack::vertical()
+            .spacing(6.0)
+            .alignment(Alignment::Stretch)
+            .with_child(
+                TrailingSlotRow::new(
+                    selectable_read_only_input(reader, "agent-home-path", path),
+                    open,
+                )
+                .trailing_width(160.0)
+                .trailing_height(28.0)
+                .gap(8.0),
+            )
+            .with_child(muted_label(shared, detail)),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
+}
+
+fn open_agent_home_folder(shared: &Shared, path: String) {
+    let waker = shared.borrow().waker.clone();
+    {
+        let mut files = shared.files_mut();
+        files.open_sifs_path(path, waker);
+    }
+    open_tab(shared, Tab::Files);
 }
 
 fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
@@ -8089,6 +8596,7 @@ fn agent_readonly_section(
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let mut body = FieldGroup::new()
+        .fill_width()
         .spacing(8.0)
         .with_child(agent_readiness_row(
             shared,
@@ -8157,6 +8665,12 @@ fn agent_readonly_section(
             "System prompt",
             definition.system_prompt.clone(),
         ))
+        .with_child(agent_home_folder_row(
+            shared,
+            reader,
+            definition.key(),
+            true,
+        ))
         .with_child(
             FormRow::new("Actions", duplicate)
                 .inline()
@@ -8164,6 +8678,14 @@ fn agent_readonly_section(
         );
     if let Some(node_id) = definition.tool_runtime.sandbox_node_id.as_ref() {
         body = body.with_child(value_row(shared, reader, "Sandbox node", node_id.clone()));
+    }
+    if let Some(node_id) = definition.placement.home_server_node_id.as_ref() {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Preferred home server",
+            node_id.clone(),
+        ));
     }
     FormSection::new(definition.name.clone(), body)
         .description("This agent is supplied by the runtime. Duplicate it to create an editable custom agent.")
@@ -12577,7 +13099,8 @@ mod tests {
             app.active_tab = Tab::Settings;
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
             settings.open(SettingsSection::Agents);
-            settings.agent_import_path.clear();
+            settings.create_agent();
+            settings.agent_form.name.clear();
             settings.agent_action_status = Some("Previous operation completed".to_string());
         }
 
@@ -12592,7 +13115,7 @@ mod tests {
         let window = app.main_window()?;
         let field = window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("agent-import-path");
+            .with_name("agent-name");
 
         window
             .get_by_text("Previous operation completed")
@@ -12608,7 +13131,79 @@ mod tests {
         field.fill("B")?;
         field.expect().to_be_focused()?;
         field.expect().to_have_value("AB")?;
-        assert_eq!(shared.settings().agent_import_path, "AB");
+        assert_eq!(shared.settings().agent_form.name, "AB");
+
+        Ok(())
+    }
+
+    #[test]
+    fn settings_error_text_can_be_selected_and_copied() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let error_message =
+            "agent definition store I/O failed at /services/sinomo/agents: metadata unavailable";
+        shared.settings_mut().agent_action_error = Some(error_message.to_string());
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Selectable settings error")
+                    .root(feedback_slot(
+                        &shared,
+                        &reader,
+                        |settings| settings.agent_action_error.clone(),
+                        |settings| settings.agent_action_status.clone(),
+                    )),
+            )
+            .build()?;
+        let clipboard = runtime.clipboard();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let error = window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name("Settings error");
+
+        error.expect().to_have_value(error_message)?;
+        error.focus()?;
+        let mut select_all = sui::KeyboardEvent::new("a", sui::KeyState::Pressed);
+        select_all.modifiers.control = true;
+        error.dispatch_event(sui::Event::Keyboard(select_all))?;
+        let mut copy = sui::KeyboardEvent::new("c", sui::KeyState::Pressed);
+        copy.modifiers.control = true;
+        error.dispatch_event(sui::Event::Keyboard(copy))?;
+        assert_eq!(clipboard.text().as_deref(), Some(error_message));
+
+        clipboard.set_text("context menu did not copy");
+        let error_node = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("Settings error")
+            })
+            .expect("settings error semantics");
+        let center = sui::Point::new(
+            error_node.bounds.x() + error_node.bounds.width() * 0.5,
+            error_node.bounds.y() + error_node.bounds.height() * 0.5,
+        );
+        let mut secondary_down = sui::PointerEvent::new(sui::PointerEventKind::Down, center);
+        secondary_down.pointer_id = 1;
+        secondary_down.button = Some(sui::PointerButton::Secondary);
+        secondary_down.buttons = sui::PointerButtons::new(2);
+        window
+            .root()
+            .dispatch_event(sui::Event::Pointer(secondary_down))?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Copy")
+            .click()?;
+        assert_eq!(clipboard.text().as_deref(), Some(error_message));
 
         Ok(())
     }
@@ -13555,7 +14150,9 @@ mod tests {
         state.set_agent_model("gpt-5".to_string());
         state.set_agent_temperature("0.1".to_string());
         state.set_agent_max_steps("4".to_string());
+        state.set_agent_home_server_node_id("home-node".to_string());
         state.set_agent_skills_text("docs.skill\nreview.skill".to_string());
+        state.add_selected_agent_tool();
 
         let operation = state.agent_save_operation().expect("save operation");
         apply_test_operation(
@@ -13576,6 +14173,16 @@ mod tests {
                 .any(|agent| agent.id == "docs-agent" && agent.editable),
             "saved custom agent should appear in the settings catalog"
         );
+        let saved = state
+            .agent_snapshot
+            .selected_agent
+            .as_ref()
+            .expect("saved agent definition");
+        assert_eq!(
+            saved.placement.home_server_node_id.as_deref(),
+            Some("home-node")
+        );
+        assert_eq!(saved.tools.len(), 1);
         let summaries = agent_summaries(backend.data_dir.as_ref());
         assert!(
             summaries.iter().any(|agent| {
@@ -13726,6 +14333,34 @@ mod tests {
             .expect()
             .to_have_value("Rendered custom agent")?;
         window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-temperature")
+            .expect()
+            .to_have_value("")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-home-server")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-home-path")
+            .expect()
+            .to_have_value("/sinomo/agents/render-agent/home")?;
+        let render_summary = shared
+            .settings()
+            .agent_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == "render-agent")
+            .cloned()
+            .expect("render agent summary");
+        assert_eq!(
+            agent_summary_line(&render_summary),
+            "main · Cluster default · custom",
+            "the agent menu detail should expose role, model policy, and source"
+        );
+        window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("New agent")
             .expect()
@@ -13764,6 +14399,126 @@ mod tests {
             .with_name("Test readiness")
             .expect()
             .to_be_visible()?;
+        let snapshot = window.snapshot()?;
+        let agent_list = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::List
+                    && node.name.as_deref() == Some("agent-config-list")
+            })
+            .expect("agent list semantics");
+        let agent_editor = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::TextInput
+                    && node.name.as_deref() == Some("agent-id")
+            })
+            .expect("agent editor semantics");
+        assert!(
+            agent_list.bounds.max_x() < agent_editor.bounds.x(),
+            "wide agent settings should place the second-level agent menu left of the editor"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Add tool")
+            .expect()
+            .to_be_visible()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open home folder")
+            .expect()
+            .to_be_visible()?;
+        open_agent_home_folder(&shared, "/sinomo/agents/render-agent/home".to_string());
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+        assert_eq!(
+            shared.files().source,
+            crate::ui::files::FilesSourceKind::Sifs
+        );
+        assert_eq!(shared.files().path, "/sinomo/agents/render-agent/home");
+
+        Ok(())
+    }
+
+    #[test]
+    fn settings_agents_section_drills_between_list_and_detail_when_compact() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut alpha =
+            AgentDefinition::custom("alpha-agent", AgentRole::Main, "Alpha system prompt.");
+        alpha.name = "Alpha Agent".to_string();
+        backend
+            .save_custom_agent_definition(&alpha, None)
+            .expect("seed alpha agent");
+        let mut zulu =
+            AgentDefinition::custom("zulu-agent", AgentRole::Background, "Zulu system prompt.");
+        zulu.name = "Zulu Agent".to_string();
+        backend
+            .save_custom_agent_definition(&zulu, None)
+            .expect("seed zulu agent");
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Agents);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact settings agents")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(760.0, 720.0))
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::List)
+            .with_name("agent-config-list")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-id")
+            .expect()
+            .to_be_hidden()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("Zulu Agent")
+            .click()?;
+        assert_eq!(
+            shared.settings().agent_selected_id.as_deref(),
+            Some("zulu-agent")
+        );
+        assert!(shared.settings().agent_detail_open);
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Agents")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::List)
+            .with_name("agent-config-list")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-id")
+            .expect()
+            .to_be_hidden()?;
 
         Ok(())
     }
@@ -14676,6 +15431,22 @@ mod tests {
         let window = app.main_window()?;
 
         assert!(window.get_by_text("Verified").count()? >= 1);
+        assert!(window.get_by_text("Pro - 64% used").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::ProgressBar)
+            .with_name("Five-hour limit usage")
+            .expect()
+            .to_be_hidden()?;
+        let collapsed_signature = provider_section_signature(&shared);
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("View usage details")
+            .click()?;
+        assert_ne!(
+            collapsed_signature,
+            provider_section_signature(&shared),
+            "usage disclosure state must invalidate the retained section"
+        );
         assert!(window.get_by_text("Five-hour limit · 64% used").count()? >= 1);
         window
             .get_by_role(sui::SemanticsRole::ProgressBar)
@@ -14683,10 +15454,48 @@ mod tests {
             .expect()
             .to_have_value("64")?;
         window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide usage details")
+            .expect()
+            .to_be_visible()?;
+        window
             .get_by_role(sui::SemanticsRole::ComboBox)
             .with_name("provider-0-model-select")
             .expect()
             .to_be_visible()?;
+        let snapshot = window.snapshot()?;
+        let card = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::GenericContainer
+                    && node.name.as_deref() == Some("OpenAI (work)")
+            })
+            .expect("provider card semantics should exist");
+        let model = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ComboBox
+                    && node.name.as_deref() == Some("provider-0-model-select")
+            })
+            .expect("provider model selector semantics should exist");
+        let model_row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::GenericContainer
+                    && node.name.as_deref() == Some("Model")
+            })
+            .expect("provider model row semantics should exist");
+        assert!(
+            model_row.bounds.width() > card.bounds.width() * 0.9
+                && (model.bounds.max_x() - model_row.bounds.max_x()).abs() < 0.01,
+            "provider settings controls should use the full card content width"
+        );
         window
             .get_by_role(sui::SemanticsRole::TextInput)
             .with_name("provider-0-model")
@@ -14781,12 +15590,12 @@ mod tests {
         let window = app.main_window()?;
 
         assert!(
-            window.get_by_text("Chat default").count()? >= 1,
+            window.get_by_text("Default for chat").count()? >= 1,
             "provider card should identify the current chat default"
         );
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Use for chat")
+            .with_name("Set as chat default")
             .click()?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -14869,7 +15678,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Settings")
+            .with_name("Advanced settings")
             .click()?;
 
         assert_ne!(
@@ -14879,9 +15688,12 @@ mod tests {
         );
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide settings")
+            .with_name("Hide advanced settings")
             .expect()
             .to_be_visible()?;
+        assert!(window.get_by_text("CREDENTIALS").count()? >= 1);
+        assert!(window.get_by_text("ENDPOINT").count()? >= 1);
+        assert!(window.get_by_text("ACCOUNT").count()? >= 1);
         window
             .get_by_role(sui::SemanticsRole::TextInput)
             .with_name("provider-0-base-url")
@@ -14892,6 +15704,84 @@ mod tests {
             .with_name("Remove account")
             .expect()
             .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_card_saves_advanced_text_fields_inline() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            reload_config_state(settings);
+            settings.open(SettingsSection::Providers);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings provider inline save")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Advanced settings")
+            .click()?;
+        let save = window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Save API base URL");
+        save.expect().to_be_visible()?;
+        assert!(
+            save.click().is_err(),
+            "an unchanged inline field must expose a disabled save action"
+        );
+        assert!(
+            shared.settings().provider_action_status.is_none(),
+            "an unchanged inline field must not queue a save"
+        );
+
+        let field = window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-base-url");
+        field.fill("https://example.test/v1")?;
+        field.expect().to_be_focused()?;
+        save.click()?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if shared
+                .settings()
+                .provider_action_status
+                .as_ref()
+                .is_some_and(|status| status.message == "API base URL saved to lm.providers")
+            {
+                break;
+            }
+            if pump_background_operations(&shared) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            shared
+                .settings()
+                .provider_action_status
+                .as_ref()
+                .map(|status| status.message.as_str()),
+            Some("API base URL saved to lm.providers")
+        );
 
         Ok(())
     }
