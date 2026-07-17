@@ -18,6 +18,8 @@ mod service_adapter;
 mod status;
 mod tcp_tunnel;
 
+pub(crate) const DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR: &str = "sandbox-lifecycle-recovery";
+
 pub use sinomo_api::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
     DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
@@ -315,6 +317,14 @@ pub fn register_storage_paths(
     }
     for relative_path in ["daemon/main.stdout.log", "daemon/main.stderr.log"] {
         layout.register_human_text("sinomo-daemon", StorageRing::R1, relative_path)?;
+    }
+    for daemon_root in ["daemon", "shadow-daemon"] {
+        layout.register_escape_path(
+            "sinomo-daemon",
+            StorageRing::R1,
+            format!("{daemon_root}/{DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR}"),
+            "durable sandbox lifecycle recovery markers and sweep state",
+        )?;
     }
     layout.register_escape_path(
         "sinomo-daemon",

@@ -11,9 +11,9 @@ use crate::dfs::{
     run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
-    AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
-    DaemonPaths, daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout,
-    read_daemon_status,
+    AuthenticatedDaemonCommand, DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR, DaemonClusterStatus,
+    DaemonDataOwnerLock, DaemonError, DaemonLock, DaemonPaths, daemon_paths_are_shadow,
+    handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -64,7 +64,6 @@ const DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT: &[u8] = b"sinomo-sandbox-lifecycle-loc
 const DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(feature = "sandbox")]
 const DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR: &str = "sandbox-lifecycle-recovery";
 const DAEMON_SANDBOX_LIFECYCLE_PENDING_DIR: &str = "pending";
 #[cfg(feature = "sandbox")]
 const DAEMON_SANDBOX_LIFECYCLE_SWEEP_STAMP: &str = "last-safety-sweep";
