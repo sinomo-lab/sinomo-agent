@@ -1323,6 +1323,7 @@ async fn receive_server_session_bootstrap<F>(
         SessionWirePayload,
         ObjectRpcSessionDescriptor,
         SessionFrameReader<BoxedSessionReadHalf>,
+        Result<(), NetworkError>,
     ),
     NetworkError,
 >
@@ -1371,7 +1372,7 @@ where
     // cannot consume a valid request nonce. Body bytes are not read before
     // both checks succeed. The request may remain origin-signed across relays
     // while this link's frames are signed by the immediate authorized relay.
-    authenticate(request, &signed.proof.signer_node_id, &expected_public_key)?;
+    let authentication = authenticate(request, &signed.proof.signer_node_id, &expected_public_key);
     let descriptor = descriptor.clone();
     let frame_reader = SessionFrameReader::after_verified_bootstrap(
         reader,
@@ -1383,7 +1384,17 @@ where
         previous_digest,
         header_buffer,
     );
-    Ok((signed.payload, descriptor, frame_reader))
+    Ok((signed.payload, descriptor, frame_reader, authentication))
+}
+
+fn outgoing_body_failure_can_race_response_head(error: &NetworkError) -> bool {
+    match error {
+        NetworkError::Io { operation, .. } | NetworkError::Timeout { operation, .. } => {
+            operation.starts_with("write transfer")
+                || operation == "wait for object RPC transfer acknowledgement"
+        }
+        _ => false,
+    }
 }
 
 /// Starts one client-side canonical RPC session on an already-open transport.
@@ -1476,6 +1487,7 @@ pub(crate) async fn start_object_rpc_client_session(
     };
 
     let mut head_rx = head_rx;
+    let mut outgoing_failure = None;
     enum ClientSessionWait {
         Head(Result<SessionWirePayload, tokio::sync::oneshot::error::RecvError>),
         Outgoing(Result<Result<(), NetworkError>, tokio::task::JoinError>),
@@ -1501,10 +1513,35 @@ pub(crate) async fn start_object_rpc_client_session(
                     detail: "session reader stopped after the request body completed".to_string(),
                 })?,
                 Ok(Err(error)) => {
-                    reader_task.abort();
-                    keepalive_task.abort();
-                    body_tx.fail(error.to_string());
-                    return Err(error);
+                    if !outgoing_body_failure_can_race_response_head(&error) {
+                        reader_task.abort();
+                        keepalive_task.abort();
+                        body_tx.fail(error.to_string());
+                        return Err(error);
+                    }
+                    // A server can reject an authenticated session before it
+                    // consumes the request body. In that case the response
+                    // head is written before the transport closes, while the
+                    // outgoing body task can observe the close first. Keep
+                    // reading for at most one no-progress interval to prefer
+                    // that signed, structured rejection over a secondary
+                    // request-body transport failure. Local body-source
+                    // failures still return immediately above.
+                    outgoing_failure = Some(error);
+                    match tokio::time::timeout(policy.health.no_progress_timeout, &mut head_rx)
+                        .await
+                    {
+                        Ok(Ok(head)) => head,
+                        Ok(Err(_)) | Err(_) => {
+                            let error = outgoing_failure
+                                .take()
+                                .expect("outgoing failure was recorded");
+                            reader_task.abort();
+                            keepalive_task.abort();
+                            body_tx.fail(error.to_string());
+                            return Err(error);
+                        }
+                    }
                 }
                 Err(source) => {
                     reader_task.abort();
@@ -1543,6 +1580,29 @@ pub(crate) async fn start_object_rpc_client_session(
     );
     if !response_origin_verified && !request_uses_relay {
         return Err(NetworkError::AuthDenied);
+    }
+    if body.is_none() && response.error_detail().is_err() {
+        // Bootstrap authorization failures deliberately carry no response
+        // body: the signed metadata is the complete error contract. Do not
+        // wait for an outbound request value or attachment that the rejecting
+        // server is required not to consume.
+        if let Some(task) = outgoing_task.take() {
+            task.abort();
+        }
+        reader_task.abort();
+        keepalive_task.abort();
+        drop(incoming_body);
+        return Ok(ObjectRpcSessionResult::with_origin_verification(
+            response,
+            ObjectRpcIncomingBody::empty(),
+            response_origin_verified,
+        ));
+    }
+    if let Some(error) = outgoing_failure {
+        reader_task.abort();
+        keepalive_task.abort();
+        body_tx.fail(error.to_string());
+        return Err(error);
     }
     if body.is_none() {
         if let Some(task) = outgoing_task.take() {
@@ -1761,11 +1821,38 @@ where
     F: FnOnce(&crate::ObjectRpcRequest, &str, &[u8]) -> Result<(), NetworkError>,
 {
     let (read_half, write_half) = tokio::io::split(stream);
-    let (initial_head, descriptor, reader) =
+    let (initial_head, descriptor, reader, authentication) =
         receive_server_session_bootstrap(read_half, policy, authenticate).await?;
     let SessionWirePayload::RequestHead { .. } = &initial_head else {
         unreachable!("bootstrap validates request head");
     };
+    if let Err(error) = authentication {
+        let SessionWirePayload::RequestHead { request, .. } = &initial_head else {
+            unreachable!("bootstrap validates request head");
+        };
+        let mut response =
+            crate::ObjectRpcResponse::encode_error(request.route.clone(), error.to_string())?;
+        // Error metadata is sufficient for ObjectRpcResponse::error_detail;
+        // keeping this head body-free lets the client stop its request body
+        // without starting a response transfer.
+        response.body.clear();
+        let mut writer = SessionFrameWriter::new(
+            write_half,
+            local_data_dir,
+            descriptor.session_id.clone(),
+            SessionFrameDirection::ResponderToInitiator,
+            policy,
+        )?;
+        ensure_response_head_proof_with_writer(&writer, &descriptor.session_id, &mut response)?;
+        writer
+            .send(SessionWirePayload::ResponseHead {
+                response,
+                body_role: ObjectRpcSessionBodyRole::None,
+                body: None,
+            })
+            .await?;
+        return Err(error);
+    }
     let writer = Arc::new(tokio::sync::Mutex::new(SessionFrameWriter::new(
         write_half,
         local_data_dir,
@@ -4154,6 +4241,68 @@ mod body_tests {
             signed_head_digest,
             "daemon authentication must continue to verify after the canonical session restores the ordinary value"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_auth_denial_returns_a_signed_structured_error_head() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-auth-denial-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-auth-denial-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let route = "/test/session/auth-denial";
+        let request = crate::ObjectRpcRequest::from_encoded_body(
+            route,
+            "test",
+            vec![0x5a_u8; 256 * 1024 + 17],
+        );
+        let prepared = ObjectRpcSessionCall::value(request)
+            .prepare_for_signing()
+            .expect("prepare value request");
+        assert!(
+            prepared.descriptor.request_body.is_some(),
+            "the denial must race an outbound request body"
+        );
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let error = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                |_request, _claimed_node_id, _claimed_public_key| Err(NetworkError::AuthDenied),
+            )
+            .await
+            .expect_err("bootstrap authorization must reject the session");
+            assert!(matches!(error, NetworkError::AuthDenied));
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            start_object_rpc_client_session(
+                Box::new(client_stream),
+                prepared,
+                request_auth,
+                client_data_dir,
+                server_public_key.clone(),
+                server_public_key,
+                NetworkCallPolicy::default(),
+            ),
+        )
+        .await
+        .expect("authorization rejection must not wait for the request body")
+        .expect("authorization rejection must arrive as a response head");
+
+        assert_eq!(result.response.route, route);
+        assert!(result.response.body.is_empty());
+        assert!(result.body.is_empty());
+        assert!(matches!(
+            result.response.error_detail(),
+            Err(NetworkError::AuthDenied)
+        ));
+        server.await.expect("server task");
     }
 
     #[tokio::test]

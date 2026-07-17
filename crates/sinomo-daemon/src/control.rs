@@ -4904,6 +4904,38 @@ mod tests {
         }
     }
 
+    struct PermissionDeniedRegistryService;
+
+    impl sinomo_core::service::Service for PermissionDeniedRegistryService {
+        fn name(&self) -> &'static str {
+            "permission-denied-registry"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/test/permission-denied-session"]
+        }
+
+        fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
+            vec![
+                sinomo_core::service::ServiceRoute::new("/test/permission-denied-session", "test")
+                    .with_auth_scope("authenticated")
+                    .require_local_permission("remote-management"),
+            ]
+        }
+
+        fn handle(
+            &self,
+            _ctx: sinomo_core::service::ServiceContext,
+            _request: sinomo_core::network::ObjectRpcRequest,
+        ) -> sinomo_core::service::ServiceFuture<'_> {
+            Box::pin(async {
+                Err(sinomo_core::service::ServiceError::Service(
+                    "permission-denied handler must not run".to_string(),
+                ))
+            })
+        }
+    }
+
     #[test]
     fn authenticated_registry_failure_returns_session_error() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-registry-rpc-error");
@@ -4981,6 +5013,93 @@ mod tests {
         assert!(
             error.to_string().contains("injected registry failure"),
             "unexpected error detail: {error}"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn node_local_permission_denial_returns_structured_session_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-permission-rpc-error");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            "/test/permission-denied-session",
+            "test",
+            &(),
+        )
+        .expect("request");
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let runtime =
+                crate::build_daemon_async_runtime("daemon-permission-error-test").expect("runtime");
+            let service_runtime = runtime.handle().clone();
+            let error = runtime
+                .block_on(async move {
+                    let listener =
+                        sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("listener");
+                    let stream_address = listener.local_addr_string().expect("listener address");
+                    address_tx
+                        .send(stream_address.clone())
+                        .expect("send listener address");
+                    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+                        paths.clone(),
+                        service_runtime.clone(),
+                        vec![crate::DaemonServiceRegistryHook::new(|builder| {
+                            builder.register(PermissionDeniedRegistryService)
+                        })],
+                    )
+                    .await
+                    .expect("service host");
+                    let stream = listener.accept().await.expect("accept");
+                    handle_daemon_connection_async(
+                        stream,
+                        paths,
+                        service_host,
+                        service_runtime,
+                        stream_address,
+                    )
+                    .await
+                })
+                .expect_err("node-local permission must reject the session");
+            assert!(matches!(error, DaemonError::AuthDenied));
+        });
+
+        let address = address_rx.recv().expect("listener address");
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("client runtime");
+        let client_paths = DaemonPaths::new(&data_dir);
+        let mut host =
+            crate::client::DaemonSignedObjectRpcAsyncHost::new(client_runtime.handle(), false)
+                .with_paths(&client_paths);
+        let error = client_runtime
+            .block_on(
+                sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
+                    .call_loopback(
+                        &data_dir,
+                        &address,
+                        sinomo_core::network::ObjectRpcSessionCall::value(request),
+                        sinomo_core::network::ClusterObjectRpcOptions::new(
+                            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                                Duration::from_secs(2),
+                            ),
+                        ),
+                    ),
+            )
+            .expect_err("permission denial must be returned as an RPC error");
+        assert!(
+            matches!(error, sinomo_core::network::NetworkError::AuthDenied),
+            "unexpected permission error: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("session reader stopped before the response head"),
+            "permission denial regressed to transport EOF: {error}"
         );
         server.join().expect("server thread");
     }
