@@ -36,43 +36,6 @@ RUN if [ "$SINOMO_BENCH_DEPS" = "1" ]; then \
 # and committed so the in-container managed source repo + build.rs commit stamp work.
 WORKDIR /sinomo-src
 COPY . /sinomo-src
-# The desktop app crate has optional/dev path dependencies on the sibling SUI
-# checkout. Cargo still loads those manifests while resolving this workspace,
-# even though this image only builds the `sinomo` daemon binary. Provide minimal
-# package stubs at the same absolute paths so daemon-only container builds and
-# in-container rollout builds do not require shipping the GUI checkout.
-RUN mkdir -p /sui/crates/sui/src /sui/crates/sui-testing/src \
-    && printf '%s\n' \
-        '[package]' \
-        'name = "sui"' \
-        'version = "0.1.0"' \
-        'edition = "2024"' \
-        'license = "MIT OR Apache-2.0"' \
-        '' \
-        '[lib]' \
-        'path = "src/lib.rs"' \
-        > /sui/crates/sui/Cargo.toml \
-    && printf '%s\n' \
-        '#![allow(dead_code)]' \
-        'pub struct Stub;' \
-        > /sui/crates/sui/src/lib.rs \
-    && printf '%s\n' \
-        '[package]' \
-        'name = "sui-testing"' \
-        'version = "0.1.0"' \
-        'edition = "2024"' \
-        'license = "MIT OR Apache-2.0"' \
-        '' \
-        '[dependencies]' \
-        'sui = { path = "../sui" }' \
-        '' \
-        '[lib]' \
-        'path = "src/lib.rs"' \
-        > /sui/crates/sui-testing/Cargo.toml \
-    && printf '%s\n' \
-        '#![allow(dead_code)]' \
-        'pub struct Stub;' \
-        > /sui/crates/sui-testing/src/lib.rs
 # A normal clone ships a real .git directory, which we preserve so build.rs stamps the
 # real commit. A git *worktree* instead ships a .git *file* pointing at an external
 # gitdir absent from the image; git then hard-fails repo discovery on that dangling

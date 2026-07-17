@@ -11,7 +11,7 @@ ring = "r1"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.remote-management"
-interface-version = "sinomo.remote-management.v1"
+interface-version = "sinomo.remote-management.v2"
 cache-key = "module/remote/management"
 source = "rollout:modules/remote/management"
 

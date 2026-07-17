@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use thiserror::Error;
 
-pub const SINOMO_NATIVE_MODULE_ABI_VERSION: u32 = 1;
+pub const SINOMO_NATIVE_MODULE_ABI_VERSION: u32 = 2;
 pub const SINOMO_MODULE_OBJECT_VERSION: u16 = 1;
 
 pub type SinomoModuleStatusCode = i32;
@@ -103,17 +103,23 @@ pub type SinomoModuleHostLogFn = unsafe extern "C" fn(
 
 pub type SinomoModuleHostIsCancelledFn = unsafe extern "C" fn(user_data: *mut c_void) -> u8;
 
+pub type SinomoModuleHostLocalPermissionGrantedFn =
+    unsafe extern "C" fn(user_data: *mut c_void, permission: SinomoModuleByteSlice) -> u8;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct SinomoModuleHostApiV1 {
+pub struct SinomoModuleHostApiV2 {
     pub abi_version: u32,
     pub user_data: *mut c_void,
     pub output_chunk: Option<SinomoModuleHostOutputFn>,
     pub log: Option<SinomoModuleHostLogFn>,
     pub is_cancelled: Option<SinomoModuleHostIsCancelledFn>,
+    /// Fail-closed live check of a node-local permission at the final host
+    /// effect boundary. Unknown names and unavailable state return false.
+    pub local_permission_granted: Option<SinomoModuleHostLocalPermissionGrantedFn>,
 }
 
-impl SinomoModuleHostApiV1 {
+impl SinomoModuleHostApiV2 {
     pub fn empty() -> Self {
         Self {
             abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
@@ -121,6 +127,7 @@ impl SinomoModuleHostApiV1 {
             output_chunk: None,
             log: None,
             is_cancelled: None,
+            local_permission_granted: None,
         }
     }
 }
@@ -129,7 +136,7 @@ pub type SinomoModuleApiVersionFn = unsafe extern "C" fn() -> u32;
 pub type SinomoModuleDescriptorFn =
     unsafe extern "C" fn(out: *mut SinomoModuleByteBuffer) -> SinomoModuleStatusCode;
 pub type SinomoModuleInitFn =
-    unsafe extern "C" fn(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode;
+    unsafe extern "C" fn(host: SinomoModuleHostApiV2) -> SinomoModuleStatusCode;
 pub type SinomoModuleInvokeFn = unsafe extern "C" fn(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
@@ -222,6 +229,8 @@ pub struct NativeModuleObjectRpcRoute {
     pub category: String,
     pub operation: String,
     pub auth: String,
+    pub request_body_mode: NativeModuleBodyMode,
+    pub response_body_mode: NativeModuleBodyMode,
     /// Node-local permissions that must be granted before this route may run.
     ///
     /// The native-module ABI only carries these permission names. The owning
@@ -242,8 +251,20 @@ impl NativeModuleObjectRpcRoute {
             category: category.into(),
             operation: operation.into(),
             auth: auth.into(),
+            request_body_mode: NativeModuleBodyMode::None,
+            response_body_mode: NativeModuleBodyMode::None,
             required_local_permissions: Vec::new(),
         }
+    }
+
+    pub fn with_request_body_mode(mut self, mode: NativeModuleBodyMode) -> Self {
+        self.request_body_mode = mode;
+        self
+    }
+
+    pub fn with_response_body_mode(mut self, mode: NativeModuleBodyMode) -> Self {
+        self.response_body_mode = mode;
+        self
     }
 
     pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
@@ -260,6 +281,14 @@ impl NativeModuleObjectRpcRoute {
             .extend(permissions.into_iter().map(Into::into));
         self
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeModuleBodyMode {
+    None,
+    Optional,
+    Required,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -295,6 +324,17 @@ pub struct NativeModuleProbeCapabilitiesRequest {}
 pub struct NativeModuleInvocationRequest {
     pub operation: String,
     pub payload_sobj: Vec<u8>,
+    /// Host-private request attachment staged for this invocation.
+    ///
+    /// The path is local to the receiving host and must never be returned to a
+    /// remote caller or persisted as module state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<NativeModuleStagedBody>,
+    /// Host-assigned private path at which the module may stage a response
+    /// attachment. The module must return the corresponding verified
+    /// [`NativeModuleStagedBody`] in its invocation response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -314,6 +354,28 @@ pub struct NativeModuleCapabilitiesResponse {
 pub struct NativeModuleInvocationResponse {
     pub operation: String,
     pub payload_sobj: Vec<u8>,
+    /// Description of a response attachment written to the exact
+    /// host-assigned response staging path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<NativeModuleStagedBody>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeModuleStagedBody {
+    pub path: String,
+    pub length: u64,
+    /// BLAKE3 digest formatted as `blake3:<lowercase hex>`.
+    pub blake3: String,
+}
+
+impl NativeModuleStagedBody {
+    pub fn new(path: impl Into<String>, length: u64, blake3: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            length,
+            blake3: blake3.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -376,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn native_module_route_without_local_permissions_remains_compatible() {
+    fn native_module_route_v1_without_body_modes_is_rejected() {
         let legacy = LegacyNativeModuleObjectRpcRoute {
             route: "/legacy/inspect".to_string(),
             category: "legacy".to_string(),
@@ -385,9 +447,29 @@ mod tests {
         };
 
         let encoded = encode_sobj(&legacy).expect("encode legacy route");
-        let decoded: NativeModuleObjectRpcRoute =
-            decode_sobj(&encoded).expect("decode legacy route");
+        let error = decode_sobj::<NativeModuleObjectRpcRoute>(&encoded)
+            .expect_err("ABI v1 route must not decode as ABI v2");
+        assert!(error.to_string().contains("request_body_mode"));
+    }
 
-        assert!(decoded.required_local_permissions.is_empty());
+    #[test]
+    fn native_module_session_staging_roundtrips_through_sobj() {
+        let staged = NativeModuleStagedBody::new(
+            "/private/session/request.body",
+            u64::MAX,
+            "blake3:0123456789abcdef",
+        );
+        let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
+            operation: "files.write".to_string(),
+            payload_sobj: vec![1, 2, 3],
+            request_body: Some(staged.clone()),
+            response_body_path: Some("/private/session/response.body".to_string()),
+        });
+
+        let encoded = encode_sobj(&request).expect("encode request");
+        let decoded: NativeModuleRequest = decode_sobj(&encoded).expect("decode request");
+
+        assert_eq!(decoded, request);
+        assert_eq!(staged.length, u64::MAX);
     }
 }

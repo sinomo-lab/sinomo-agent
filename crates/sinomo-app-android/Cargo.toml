@@ -60,5 +60,5 @@ name = "android.permission.POST_NOTIFICATIONS"
 
 [dependencies]
 sinomo-app = { path = "../sinomo-app", default-features = false, features = ["mobile"] }
-sui = { package = "sinomo-ui", path = "../../../sui/crates/sui", default-features = false, features = ["mobile"] }
+sui = { package = "sinomo-ui", git = "https://github.com/sinomo-lab/sui.git", branch = "main", default-features = false, features = ["mobile"] }
 tracing.workspace = true

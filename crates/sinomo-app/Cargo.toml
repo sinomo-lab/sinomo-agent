@@ -44,10 +44,10 @@ pulldown-cmark = { workspace = true }
 rfd = { workspace = true, optional = true }
 syntect = { workspace = true }
 
-# Graphical toolkit (separate workspace, referenced by path). Keep this behind
-# the app feature so daemon rollout builds can load the workspace without the
-# sibling SUI checkout when `sinomo-app` is not being built.
-sui = { package = "sinomo-ui", path = "../../../sui/crates/sui", optional = true, default-features = false, features = ["wgpu"] }
+# Graphical toolkit tracked from the public SUI main branch. Cargo.lock records
+# the exact reviewed commit used by normal and `--locked` builds, while an
+# intentional `cargo update` advances joint development to a newer main tip.
+sui = { package = "sinomo-ui", git = "https://github.com/sinomo-lab/sui.git", branch = "main", optional = true, default-features = false, features = ["wgpu"] }
 
 # Application/R2 service crates used directly (allowed by trust-ring rules).
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
@@ -62,4 +62,4 @@ sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
 # Headless rendering harness for visual verification of the widget tree.
-sui-testing = { package = "sinomo-ui-testing", path = "../../../sui/crates/sui-testing" }
+sui-testing = { package = "sinomo-ui-testing", git = "https://github.com/sinomo-lab/sui.git", branch = "main" }

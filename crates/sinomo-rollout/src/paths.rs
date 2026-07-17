@@ -46,7 +46,12 @@ impl SelfRolloutPaths {
 
     pub fn plan(&self) -> SelfRolloutPlan {
         let native_dylib_modules = default_native_dylib_module_builds(&self.source_repo);
-        let mut build_args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+        let mut build_args = vec![
+            "build".to_string(),
+            "--locked".to_string(),
+            "-p".to_string(),
+            "sinomo".to_string(),
+        ];
         append_native_dylib_module_build_args(&mut build_args, &native_dylib_modules);
         SelfRolloutPlan {
             build_program: "cargo".to_string(),
@@ -677,8 +682,12 @@ mod tests {
         let paths = SelfRolloutPaths::new(Path::new("/tmp/sinomo-data"));
         let plan = paths.plan();
         let expected_modules = default_native_dylib_module_builds(&paths.source_repo);
-        let mut expected_build_args =
-            vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+        let mut expected_build_args = vec![
+            "build".to_string(),
+            "--locked".to_string(),
+            "-p".to_string(),
+            "sinomo".to_string(),
+        ];
         append_native_dylib_module_build_args(&mut expected_build_args, &expected_modules);
 
         assert_eq!(plan.build_program, "cargo");
@@ -713,7 +722,7 @@ version = "0.1.0"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.remote-management"
-interface-version = "sinomo.remote-management.v1"
+interface-version = "sinomo.remote-management.v2"
 cache-key = "module/remote/management"
 source = "rollout:modules/remote/management"
 "#,
@@ -725,7 +734,7 @@ source = "rollout:modules/remote/management"
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].package, "sinomo-remote-management-module");
         assert_eq!(modules[0].module_id, "module.remote-management");
-        assert_eq!(modules[0].interface_version, "sinomo.remote-management.v1");
+        assert_eq!(modules[0].interface_version, "sinomo.remote-management.v2");
         assert_eq!(modules[0].cache_key, "module/remote/management");
         assert_eq!(modules[0].source, "rollout:modules/remote/management");
         assert_eq!(

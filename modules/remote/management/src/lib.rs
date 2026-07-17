@@ -8,23 +8,25 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Serialize;
 use sinomo_core::node::LocalNodePermission;
 use sinomo_module_api::{
-    NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDeclarativeResource,
-    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationRequest,
-    NativeModuleInvocationResponse, NativeModuleObjectRpcRoute, NativeModuleRequest,
-    NativeModuleResponse, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
-    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
-    SinomoModuleByteSlice, SinomoModuleHostApiV1, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    NativeModuleBackend, NativeModuleBodyMode, NativeModuleCapabilitiesResponse,
+    NativeModuleDeclarativeResource, NativeModuleDescriptor, NativeModuleErrorResponse,
+    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleObjectRpcRoute,
+    NativeModuleRequest, NativeModuleResponse, NativeModuleStagedBody, NativeModuleSurfaces,
+    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 use sinomo_remote_management::*;
 use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
@@ -83,9 +85,11 @@ const MAX_PROCESS_COMMAND_ARGUMENTS: usize = 64;
 const MAX_PROCESS_TEXT_BYTES: usize = 4096;
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHELL_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+const FILE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+static REMOTE_WRITE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
-struct StoredHostApi(SinomoModuleHostApiV1);
+struct StoredHostApi(SinomoModuleHostApiV2);
 
 unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
@@ -105,7 +109,7 @@ pub extern "C" fn sinomo_module_descriptor(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode {
+pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModuleStatusCode {
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
@@ -183,11 +187,13 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
                 remote_management_route(
                     REMOTE_MANAGEMENT_FS_READ_ROUTE,
                     REMOTE_MANAGEMENT_FS_READ_OPERATION,
-                ),
+                )
+                .with_response_body_mode(NativeModuleBodyMode::Optional),
                 remote_management_route(
                     REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
                     REMOTE_MANAGEMENT_FS_WRITE_OPERATION,
-                ),
+                )
+                .with_request_body_mode(NativeModuleBodyMode::Optional),
                 remote_management_route(
                     REMOTE_MANAGEMENT_FS_LIST_ROUTE,
                     REMOTE_MANAGEMENT_FS_LIST_OPERATION,
@@ -245,7 +251,7 @@ fn declarative_resources() -> Vec<NativeModuleDeclarativeResource> {
             FILE_TRANSFER_SKILL_ID,
             "skill",
             FILE_TRANSFER_SKILL_PATH,
-            "Retry-safe bounded remote file transfer guidance.",
+            "Single-session streaming remote file transfer guidance.",
             &["file-transfer", "remote-management"],
             FILE_TRANSFER_CAPABILITIES,
             FILE_TRANSFER_SKILL_MARKDOWN,
@@ -272,7 +278,7 @@ fn declarative_resources() -> Vec<NativeModuleDeclarativeResource> {
             FILE_TRANSFER_PROMPT_ID,
             "prompt",
             FILE_TRANSFER_PROMPT_PATH,
-            "Prompt fragment for retry-safe remote file transfer.",
+            "Prompt fragment for single-session streaming remote file transfer.",
             &["file-transfer", "remote-management"],
             FILE_TRANSFER_CAPABILITIES,
             FILE_TRANSFER_PROMPT_MARKDOWN,
@@ -340,12 +346,8 @@ fn invoke_remote_management_operation(
         REMOTE_MANAGEMENT_SHELL_RUN_OPERATION => {
             invoke_shell_run_operation(request.operation, &request.payload_sobj)
         }
-        REMOTE_MANAGEMENT_FS_READ_OPERATION => {
-            invoke_file_read_operation(request.operation, &request.payload_sobj)
-        }
-        REMOTE_MANAGEMENT_FS_WRITE_OPERATION => {
-            invoke_file_write_operation(request.operation, &request.payload_sobj)
-        }
+        REMOTE_MANAGEMENT_FS_READ_OPERATION => invoke_file_read_operation(request),
+        REMOTE_MANAGEMENT_FS_WRITE_OPERATION => invoke_file_write_operation(request),
         REMOTE_MANAGEMENT_FS_LIST_OPERATION => {
             invoke_file_list_operation(request.operation, &request.payload_sobj)
         }
@@ -379,23 +381,35 @@ fn invoke_shell_run_operation(operation: String, payload_sobj: &[u8]) -> NativeM
     encode_invocation_response(&operation, &response)
 }
 
-fn invoke_file_read_operation(operation: String, payload_sobj: &[u8]) -> NativeModuleResponse {
-    let response = match decode_sobj::<RemoteManagementFileReadRequest>(payload_sobj) {
-        Ok(request) => match read_file(request) {
-            Ok(file) => RemoteManagementFileReadResponse::success(file),
-            Err(error) => RemoteManagementFileReadResponse::failure(error),
+fn invoke_file_read_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    let operation = request.operation;
+    let mut response_body = None;
+    let response = match decode_sobj::<RemoteManagementFileReadRequest>(&request.payload_sobj) {
+        Ok(file_request) => match request.response_body_path {
+            Some(response_body_path) => match read_file(file_request, &response_body_path) {
+                Ok((file, staged_body)) => {
+                    response_body = Some(staged_body);
+                    RemoteManagementFileReadResponse::success(file)
+                }
+                Err(error) => RemoteManagementFileReadResponse::failure(error),
+            },
+            None => RemoteManagementFileReadResponse::failure(RemoteManagementError::new(
+                "missing-response-body-path",
+                "native host did not provide a response attachment staging path",
+            )),
         },
         Err(error) => RemoteManagementFileReadResponse::failure(RemoteManagementError::new(
             "invalid-request",
             format!("decode file read request: {error}"),
         )),
     };
-    encode_invocation_response(&operation, &response)
+    encode_invocation_response_with_body(&operation, &response, response_body)
 }
 
-fn invoke_file_write_operation(operation: String, payload_sobj: &[u8]) -> NativeModuleResponse {
-    let response = match decode_sobj::<RemoteManagementFileWriteRequest>(payload_sobj) {
-        Ok(request) => match write_file(request) {
+fn invoke_file_write_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    let operation = request.operation;
+    let response = match decode_sobj::<RemoteManagementFileWriteRequest>(&request.payload_sobj) {
+        Ok(file_request) => match write_file(file_request, request.request_body.as_ref()) {
             Ok(written) => RemoteManagementFileWriteResponse::success(written),
             Err(error) => RemoteManagementFileWriteResponse::failure(error),
         },
@@ -409,7 +423,10 @@ fn invoke_file_write_operation(operation: String, payload_sobj: &[u8]) -> Native
 
 fn invoke_file_list_operation(operation: String, payload_sobj: &[u8]) -> NativeModuleResponse {
     let response = match decode_sobj::<RemoteManagementFileListRequest>(payload_sobj) {
-        Ok(request) => match list_files(request) {
+        Ok(request) => match with_live_remote_management_permission(
+            "expose the requested file listing",
+            || list_files(request),
+        ) {
             Ok((entries, truncated)) => {
                 RemoteManagementFileListResponse::success(entries, truncated)
             }
@@ -425,7 +442,10 @@ fn invoke_file_list_operation(operation: String, payload_sobj: &[u8]) -> NativeM
 
 fn invoke_file_stat_operation(operation: String, payload_sobj: &[u8]) -> NativeModuleResponse {
     let response = match decode_sobj::<RemoteManagementFileStatRequest>(payload_sobj) {
-        Ok(request) => match stat_file(request) {
+        Ok(request) => match with_live_remote_management_permission(
+            "expose the requested file metadata",
+            || stat_file(request),
+        ) {
             Ok(stat) => RemoteManagementFileStatResponse::success(stat),
             Err(error) => RemoteManagementFileStatResponse::failure(error),
         },
@@ -439,7 +459,14 @@ fn invoke_file_stat_operation(operation: String, payload_sobj: &[u8]) -> NativeM
 
 fn invoke_system_info_operation(operation: String, payload_sobj: &[u8]) -> NativeModuleResponse {
     let response = match decode_sobj::<RemoteManagementSystemInfoRequest>(payload_sobj) {
-        Ok(request) => RemoteManagementSystemInfoResponse::success(system_info(request)),
+        Ok(request) => {
+            match with_live_remote_management_permission("expose system information", || {
+                Ok(system_info(request))
+            }) {
+                Ok(info) => RemoteManagementSystemInfoResponse::success(info),
+                Err(error) => RemoteManagementSystemInfoResponse::failure(error),
+            }
+        }
         Err(error) => RemoteManagementSystemInfoResponse::failure(RemoteManagementError::new(
             "invalid-request",
             format!("decode system info request: {error}"),
@@ -450,7 +477,14 @@ fn invoke_system_info_operation(operation: String, payload_sobj: &[u8]) -> Nativ
 
 fn invoke_system_observe_operation(operation: String, payload_sobj: &[u8]) -> NativeModuleResponse {
     let response = match decode_sobj::<RemoteManagementSystemObserveRequest>(payload_sobj) {
-        Ok(request) => RemoteManagementSystemObserveResponse::success(system_observation(request)),
+        Ok(request) => {
+            match with_live_remote_management_permission("expose system observations", || {
+                Ok(system_observation(request))
+            }) {
+                Ok(observation) => RemoteManagementSystemObserveResponse::success(observation),
+                Err(error) => RemoteManagementSystemObserveResponse::failure(error),
+            }
+        }
         Err(error) => RemoteManagementSystemObserveResponse::failure(RemoteManagementError::new(
             "invalid-request",
             format!("decode system observation request: {error}"),
@@ -460,10 +494,19 @@ fn invoke_system_observe_operation(operation: String, payload_sobj: &[u8]) -> Na
 }
 
 fn encode_invocation_response<T: Serialize>(operation: &str, response: &T) -> NativeModuleResponse {
+    encode_invocation_response_with_body(operation, response, None)
+}
+
+fn encode_invocation_response_with_body<T: Serialize>(
+    operation: &str,
+    response: &T,
+    response_body: Option<NativeModuleStagedBody>,
+) -> NativeModuleResponse {
     match encode_sobj(response) {
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
             operation: operation.to_string(),
             payload_sobj,
+            response_body,
         }),
         Err(error) => NativeModuleResponse::Error(native_error_response(
             "encode-response",
@@ -496,6 +539,7 @@ fn run_shell(
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_shell_process_tree(&mut command);
+    require_live_remote_management_permission("start the shell command")?;
 
     let start = Instant::now();
     let mut child = command.spawn().map_err(|source| {
@@ -574,6 +618,7 @@ fn run_shell(
     let stderr = join_pipe_reader(stderr_reader.take())?;
     process_tree.disarm();
     let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    require_live_remote_management_permission("expose shell command output")?;
 
     Ok(RemoteManagementShellOutcome {
         exit_code: status.and_then(|status| status.code()),
@@ -599,6 +644,68 @@ fn invocation_cancelled() -> bool {
     // The callback and user_data originate from the validated native-module
     // host ABI and remain valid until module shutdown.
     unsafe { is_cancelled(host.user_data) != 0 }
+}
+
+fn require_live_remote_management_permission(effect: &str) -> Result<(), RemoteManagementError> {
+    if invocation_cancelled() {
+        return Err(RemoteManagementError::new(
+            "cancelled",
+            format!("remote-management invocation was cancelled before {effect}"),
+        ));
+    }
+    let host = HOST_API
+        .lock()
+        .ok()
+        .and_then(|api| api.as_ref().copied())
+        .map(|StoredHostApi(host)| host)
+        .ok_or_else(|| {
+            RemoteManagementError::new(
+                "permission-denied",
+                format!(
+                    "cannot {effect}: native host is unavailable for the final remote-management permission check"
+                ),
+            )
+        })?;
+    let check = host.local_permission_granted.ok_or_else(|| {
+        RemoteManagementError::new(
+            "permission-denied",
+            format!(
+                "cannot {effect}: native host does not provide the final remote-management permission check"
+            ),
+        )
+    })?;
+    let permission =
+        SinomoModuleByteSlice::from_slice(REMOTE_MANAGEMENT_LOCAL_PERMISSION.as_bytes());
+    // The callback and user_data originate from the validated native-module
+    // host ABI and remain valid until module shutdown.
+    let granted = unsafe { check(host.user_data, permission) != 0 };
+    if !granted {
+        return Err(RemoteManagementError::new(
+            "permission-denied",
+            format!("cannot {effect}: node-local remote-management permission is not granted"),
+        ));
+    }
+    if invocation_cancelled() {
+        return Err(RemoteManagementError::new(
+            "cancelled",
+            format!("remote-management invocation was cancelled before {effect}"),
+        ));
+    }
+    Ok(())
+}
+
+fn with_live_remote_management_permission<T>(
+    effect: &str,
+    operation: impl FnOnce() -> Result<T, RemoteManagementError>,
+) -> Result<T, RemoteManagementError> {
+    // Check both sides of read-only observation work. The first check avoids
+    // doing host work for an already-revoked request; the second prevents a
+    // revocation racing that work from exposing either data or an informative
+    // host error to the remote caller.
+    require_live_remote_management_permission(effect)?;
+    let result = operation();
+    require_live_remote_management_permission(effect)?;
+    result
 }
 
 fn terminate_shell_process(
@@ -985,55 +1092,76 @@ fn join_pipe_reader(handle: Option<PipeReader>) -> Result<LimitedBytes, RemoteMa
 
 fn read_file(
     request: RemoteManagementFileReadRequest,
-) -> Result<RemoteManagementFileContent, RemoteManagementError> {
+    response_body_path: &str,
+) -> Result<(RemoteManagementFileTransfer, NativeModuleStagedBody), RemoteManagementError> {
     request
         .validate()
         .map_err(|error| protocol_error("invalid-path", error))?;
-    let path = PathBuf::from(&request.path);
-    let metadata = fs::metadata(&path).map_err(|source| {
+    require_live_remote_management_permission("read the requested file")?;
+    let source_path = PathBuf::from(&request.path);
+    let metadata = fs::metadata(&source_path).map_err(|source| {
         RemoteManagementError::new(
             "metadata-failed",
-            format!("stat {}: {source}", path.display()),
+            format!("stat {}: {source}", source_path.display()),
         )
     })?;
     if !metadata.is_file() {
         return Err(RemoteManagementError::new(
             "not-a-file",
-            format!("{} is not a regular file", path.display()),
+            format!("{} is not a regular file", source_path.display()),
         ));
     }
-    let offset = request.offset.unwrap_or(0);
-    let max_bytes = request.effective_max_bytes();
-    let mut file = File::open(&path).map_err(|source| {
-        RemoteManagementError::new("open-failed", format!("open {}: {source}", path.display()))
+    let mut source = File::open(&source_path).map_err(|source| {
+        RemoteManagementError::new(
+            "open-failed",
+            format!("open {}: {source}", source_path.display()),
+        )
     })?;
-    file.seek(SeekFrom::Start(offset)).map_err(|source| {
-        RemoteManagementError::new("seek-failed", format!("seek {}: {source}", path.display()))
-    })?;
-    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
-    file.take(max_bytes as u64)
-        .read_to_end(&mut bytes)
+    let staged_path = PathBuf::from(response_body_path);
+    let mut staged = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&staged_path)
         .map_err(|source| {
-            RemoteManagementError::new("read-failed", format!("read {}: {source}", path.display()))
+            RemoteManagementError::new(
+                "open-response-body-failed",
+                format!(
+                    "open host response staging file {}: {source}",
+                    staged_path.display()
+                ),
+            )
         })?;
-    let len = metadata.len();
-    let truncated = offset.saturating_add(bytes.len() as u64) < len;
-    let text = String::from_utf8(bytes.clone()).ok();
-    Ok(RemoteManagementFileContent {
-        path: path.display().to_string(),
-        bytes,
-        text,
-        len,
-        truncated,
-    })
+    let (length, blake3) = copy_and_hash(&mut source, &mut staged, &source_path)?;
+    staged.sync_all().map_err(|source| {
+        RemoteManagementError::new(
+            "sync-response-body-failed",
+            format!("sync {}: {source}", staged_path.display()),
+        )
+    })?;
+    require_live_remote_management_permission("publish the file response attachment")?;
+    Ok((
+        RemoteManagementFileTransfer {
+            path: source_path.display().to_string(),
+            length,
+            blake3: blake3.clone(),
+        },
+        NativeModuleStagedBody::new(
+            staged_path.display().to_string(),
+            length,
+            format!("blake3:{blake3}"),
+        ),
+    ))
 }
 
 fn write_file(
     request: RemoteManagementFileWriteRequest,
-) -> Result<RemoteManagementFileWriteOutcome, RemoteManagementError> {
+    request_body: Option<&NativeModuleStagedBody>,
+) -> Result<RemoteManagementFileTransfer, RemoteManagementError> {
     request
         .validate()
         .map_err(|error| protocol_error("invalid-write", error))?;
+    ensure_request_head_matches_staged_body(&request, request_body)?;
+    require_live_remote_management_permission("prepare the uploaded file")?;
     let path = PathBuf::from(&request.path);
     if request.create_parent
         && let Some(parent) = path.parent()
@@ -1045,88 +1173,247 @@ fn write_file(
             )
         })?;
     }
-
-    let should_truncate = request.should_truncate();
-    let effective_offset = request.effective_offset();
-    let explicit_chunk = request.offset.is_some() || request.truncate.is_some();
-    let next_offset = request
-        .next_offset()
-        .map_err(|error| protocol_error("invalid-write", error))?;
-    let existing_len = match fs::metadata(&path) {
-        Ok(metadata) => metadata.len(),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(source) => {
-            return Err(RemoteManagementError::new(
-                "metadata-failed",
-                format!("stat {} before write: {source}", path.display()),
-            ));
+    let mut temp = RemoteWriteTemp::new(&path)?;
+    let (length, blake3) = match request_body {
+        Some(body) => {
+            let staged_path = PathBuf::from(&body.path);
+            let metadata = fs::metadata(&staged_path).map_err(|source| {
+                RemoteManagementError::new(
+                    "request-body-metadata-failed",
+                    format!(
+                        "stat staged request body {}: {source}",
+                        staged_path.display()
+                    ),
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(RemoteManagementError::new(
+                    "request-body-not-a-file",
+                    format!(
+                        "staged request body {} is not a file",
+                        staged_path.display()
+                    ),
+                ));
+            }
+            let mut source = File::open(&staged_path).map_err(|source| {
+                RemoteManagementError::new(
+                    "request-body-open-failed",
+                    format!(
+                        "open staged request body {}: {source}",
+                        staged_path.display()
+                    ),
+                )
+            })?;
+            let (length, blake3) = copy_and_hash(&mut source, temp.file_mut(), &staged_path)?;
+            ensure_staged_body_matches(body, length, &blake3)?;
+            ensure_request_head_matches_actual(&request, length, &blake3)?;
+            (length, blake3)
+        }
+        None => {
+            let blake3 = blake3::hash(&[]).to_hex().to_string();
+            ensure_request_head_matches_actual(&request, 0, &blake3)?;
+            (0, blake3)
         }
     };
-    let write_start = if request.append {
-        existing_len
-    } else {
-        effective_offset.unwrap_or(0)
-    };
-    let write_end = write_start
-        .checked_add(request.bytes.len() as u64)
-        .ok_or_else(|| {
-            protocol_error(
-                "invalid-write",
-                RemoteManagementProtocolError::FileWriteOffsetOverflow,
+    temp.sync()?;
+    require_live_remote_management_permission("install the uploaded file")?;
+    temp.commit(&path, request.overwrite)?;
+    Ok(RemoteManagementFileTransfer {
+        path: path.display().to_string(),
+        length,
+        blake3,
+    })
+}
+
+fn copy_and_hash(
+    source: &mut File,
+    destination: &mut File,
+    source_path: &Path,
+) -> Result<(u64, String), RemoteManagementError> {
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; FILE_COPY_BUFFER_BYTES];
+    loop {
+        if invocation_cancelled() {
+            return Err(RemoteManagementError::new(
+                "cancelled",
+                format!(
+                    "file transfer was cancelled while reading {}",
+                    source_path.display()
+                ),
+            ));
+        }
+        let read = source.read(&mut buffer).map_err(|source| {
+            RemoteManagementError::new(
+                "read-failed",
+                format!("read {}: {source}", source_path.display()),
             )
         })?;
-    let projected_len = if should_truncate {
-        write_end
-    } else {
-        existing_len.max(write_end)
-    };
-    if projected_len > MAX_REMOTE_FILE_SIZE_BYTES {
-        return Err(protocol_error(
-            "file-too-large",
-            RemoteManagementProtocolError::FileWriteExceedsMaximum {
-                end: projected_len,
-                maximum: MAX_REMOTE_FILE_SIZE_BYTES,
-            },
-        ));
-    }
-
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
-    if request.append {
-        options.append(true);
-    } else if should_truncate {
-        options.truncate(true);
-    }
-    let mut file = options.open(&path).map_err(|source| {
-        RemoteManagementError::new("open-failed", format!("open {}: {source}", path.display()))
-    })?;
-    if let Some(offset) = effective_offset {
-        file.seek(SeekFrom::Start(offset)).map_err(|source| {
-            RemoteManagementError::new("seek-failed", format!("seek {}: {source}", path.display()))
+        if read == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..read]).map_err(|source| {
+            RemoteManagementError::new(
+                "write-failed",
+                format!("write transfer staging file: {source}"),
+            )
         })?;
+        length = length.checked_add(read as u64).ok_or_else(|| {
+            RemoteManagementError::new("file-length-overflow", "file length exceeded u64")
+        })?;
+        hasher.update(&buffer[..read]);
     }
-    file.write_all(&request.bytes).map_err(|source| {
-        RemoteManagementError::new(
-            "write-failed",
-            format!("write {}: {source}", path.display()),
-        )
-    })?;
-    file.flush().map_err(|source| {
-        RemoteManagementError::new(
-            "flush-failed",
-            format!("flush {}: {source}", path.display()),
-        )
-    })?;
-    let len = file.metadata().ok().map(|metadata| metadata.len());
+    Ok((length, hasher.finalize().to_hex().to_string()))
+}
 
-    Ok(RemoteManagementFileWriteOutcome {
-        path: path.display().to_string(),
-        bytes_written: request.bytes.len() as u64,
-        append: request.append,
-        offset: explicit_chunk.then_some(effective_offset).flatten(),
-        next_offset: explicit_chunk.then_some(next_offset).flatten(),
-        len,
-    })
+fn ensure_staged_body_matches(
+    expected: &NativeModuleStagedBody,
+    actual_length: u64,
+    actual_blake3: &str,
+) -> Result<(), RemoteManagementError> {
+    let expected_blake3 = expected.blake3.strip_prefix("blake3:").unwrap_or("");
+    if expected.length == actual_length && expected_blake3.eq_ignore_ascii_case(actual_blake3) {
+        return Ok(());
+    }
+    Err(RemoteManagementError::new(
+        "request-body-integrity-mismatch",
+        format!(
+            "staged request body expected {} bytes {} but read {actual_length} bytes blake3:{actual_blake3}",
+            expected.length, expected.blake3
+        ),
+    ))
+}
+
+fn ensure_request_head_matches_staged_body(
+    request: &RemoteManagementFileWriteRequest,
+    staged: Option<&NativeModuleStagedBody>,
+) -> Result<(), RemoteManagementError> {
+    match staged {
+        Some(staged)
+            if staged.length == request.expected_len
+                && staged.blake3.strip_prefix("blake3:").is_some_and(|digest| {
+                    digest.eq_ignore_ascii_case(
+                        request
+                            .expected_blake3
+                            .strip_prefix("blake3:")
+                            .unwrap_or(&request.expected_blake3),
+                    )
+                }) =>
+        {
+            Ok(())
+        }
+        None if request.expected_len == 0
+            && request
+                .expected_blake3
+                .strip_prefix("blake3:")
+                .unwrap_or(&request.expected_blake3)
+                .eq_ignore_ascii_case(&blake3::hash(&[]).to_hex().to_string()) =>
+        {
+            Ok(())
+        }
+        _ => Err(RemoteManagementError::new(
+            "request-body-head-mismatch",
+            "signed file write head does not match the host-staged request attachment",
+        )),
+    }
+}
+
+fn ensure_request_head_matches_actual(
+    request: &RemoteManagementFileWriteRequest,
+    actual_length: u64,
+    actual_blake3: &str,
+) -> Result<(), RemoteManagementError> {
+    let expected_blake3 = request
+        .expected_blake3
+        .strip_prefix("blake3:")
+        .unwrap_or(&request.expected_blake3);
+    if request.expected_len == actual_length && expected_blake3.eq_ignore_ascii_case(actual_blake3)
+    {
+        return Ok(());
+    }
+    Err(RemoteManagementError::new(
+        "request-body-head-mismatch",
+        format!(
+            "signed file write head expected {} bytes {} but staged attachment contained {actual_length} bytes blake3:{actual_blake3}",
+            request.expected_len, request.expected_blake3
+        ),
+    ))
+}
+
+struct RemoteWriteTemp {
+    path: PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl RemoteWriteTemp {
+    fn new(destination: &Path) -> Result<Self, RemoteManagementError> {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("remote-file");
+        let sequence = REMOTE_WRITE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{name}.sinomo-put-{}-{sequence}.part",
+            std::process::id()
+        ));
+        let file = sinomo_core::storage::durable_file::create_private_staged_file(&path).map_err(
+            |source| {
+                RemoteManagementError::new(
+                    "create-transfer-temp-failed",
+                    format!("create {}: {source}", path.display()),
+                )
+            },
+        )?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            committed: false,
+        })
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("remote write temp file is open")
+    }
+
+    fn sync(&mut self) -> Result<(), RemoteManagementError> {
+        self.file_mut().sync_all().map_err(|source| {
+            RemoteManagementError::new(
+                "sync-transfer-temp-failed",
+                format!("sync {}: {source}", self.path.display()),
+            )
+        })
+    }
+
+    fn commit(mut self, destination: &Path, overwrite: bool) -> Result<(), RemoteManagementError> {
+        drop(self.file.take());
+        sinomo_core::storage::durable_file::install_staged_file(&self.path, destination, overwrite)
+            .map_err(|source| {
+                let code = if !overwrite && source.kind() == std::io::ErrorKind::AlreadyExists {
+                    "destination-exists"
+                } else {
+                    "install-transfer-failed"
+                };
+                RemoteManagementError::new(
+                    code,
+                    format!(
+                        "install {} (overwrite={overwrite}): {source}",
+                        destination.display()
+                    ),
+                )
+            })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RemoteWriteTemp {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn list_files(
@@ -1239,7 +1526,7 @@ fn hash_file(path: &Path) -> Result<String, RemoteManagementError> {
         RemoteManagementError::new("open-failed", format!("open {}: {source}", path.display()))
     })?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0_u8; FILE_COPY_BUFFER_BYTES];
     loop {
         let read = file.read(&mut buffer).map_err(|source| {
             RemoteManagementError::new("read-failed", format!("hash {}: {source}", path.display()))
@@ -1560,9 +1847,47 @@ fn platform_triple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once};
+
+    static TEST_HOST_INIT: Once = Once::new();
+    static TEST_HOST_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_REMOTE_MANAGEMENT_GRANTED: AtomicBool = AtomicBool::new(true);
+
+    unsafe extern "C" fn test_local_permission_granted(
+        _user_data: *mut std::ffi::c_void,
+        permission: SinomoModuleByteSlice,
+    ) -> u8 {
+        // SAFETY: the module passes a valid borrowed permission slice for this
+        // callback invocation.
+        (unsafe { permission.as_slice() } == REMOTE_MANAGEMENT_LOCAL_PERMISSION.as_bytes()
+            && TEST_REMOTE_MANAGEMENT_GRANTED.load(Ordering::SeqCst)) as u8
+    }
+
+    fn remote_management_permission_for_test(granted: bool) -> MutexGuard<'static, ()> {
+        let guard = TEST_HOST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TEST_HOST_INIT.call_once(|| {
+            let mut host = SinomoModuleHostApiV2::empty();
+            host.local_permission_granted = Some(test_local_permission_granted);
+            assert_eq!(sinomo_module_init(host), SINOMO_MODULE_STATUS_OK);
+        });
+        TEST_REMOTE_MANAGEMENT_GRANTED.store(granted, Ordering::SeqCst);
+        guard
+    }
 
     fn temp_root(name: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(&format!("sinomo-remote-management-module-{name}"))
+    }
+
+    fn decode_invocation_payload<T: serde::de::DeserializeOwned>(
+        response: NativeModuleResponse,
+    ) -> T {
+        let NativeModuleResponse::Invocation(response) = response else {
+            panic!("expected invocation response, got {response:?}");
+        };
+        decode_sobj(&response.payload_sobj).expect("decode invocation response payload")
     }
 
     #[test]
@@ -1598,6 +1923,28 @@ mod tests {
                 .all(|route| route.required_local_permissions
                     == vec![REMOTE_MANAGEMENT_LOCAL_PERMISSION.to_string()])
         );
+        let read_route = descriptor
+            .surfaces
+            .object_rpc_routes
+            .iter()
+            .find(|route| route.route == REMOTE_MANAGEMENT_FS_READ_ROUTE)
+            .expect("file read route");
+        assert_eq!(read_route.request_body_mode, NativeModuleBodyMode::None);
+        assert_eq!(
+            read_route.response_body_mode,
+            NativeModuleBodyMode::Optional
+        );
+        let write_route = descriptor
+            .surfaces
+            .object_rpc_routes
+            .iter()
+            .find(|route| route.route == REMOTE_MANAGEMENT_FS_WRITE_ROUTE)
+            .expect("file write route");
+        assert_eq!(
+            write_route.request_body_mode,
+            NativeModuleBodyMode::Optional
+        );
+        assert_eq!(write_route.response_body_mode, NativeModuleBodyMode::None);
 
         let resource_ids = descriptor
             .surfaces
@@ -1636,6 +1983,7 @@ mod tests {
 
     #[test]
     fn shell_run_captures_stdout() {
+        let _permission = remote_management_permission_for_test(true);
         let outcome = run_shell(
             RemoteManagementShellRunRequest::new("echo sinomo-remote-management")
                 .with_timeout_ms(5_000)
@@ -1651,6 +1999,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_timeout_kills_descendants_that_hold_output_pipes() {
+        let _permission = remote_management_permission_for_test(true);
         let root = temp_root("shell-process-tree-timeout");
         let marker = root.join("descendant-survived");
         let started = Instant::now();
@@ -1679,44 +2028,138 @@ mod tests {
     }
 
     #[test]
-    fn retry_safe_chunk_writes_and_stat_hash_round_trip() {
-        let root = temp_root("chunks");
-        let path = root.join("nested").join("hello.txt");
-        let first = write_file(
-            RemoteManagementFileWriteRequest::chunk(
-                path.display().to_string(),
+    fn revoked_live_permission_blocks_effects_and_observation_exposure() {
+        let _permission = remote_management_permission_for_test(false);
+        let root = temp_root("live-permission-revoked");
+
+        let shell_error = run_shell(RemoteManagementShellRunRequest::new(
+            "this-command-must-not-run",
+        ))
+        .expect_err("revoked permission must prevent shell spawn");
+        assert_eq!(shell_error.code(), "permission-denied");
+
+        let destination = root.join("missing-parent").join("destination.bin");
+        let write_error = write_file(
+            RemoteManagementFileWriteRequest::new(
+                destination.display().to_string(),
                 0,
-                b"hello".to_vec(),
+                blake3::hash(&[]).to_hex().to_string(),
             )
-            .creating_parent(true)
-            .truncating(true),
+            .creating_parent(true),
+            None,
         )
-        .expect("first chunk");
-        assert_eq!(first.offset, Some(0));
-        assert_eq!(first.next_offset, Some(5));
-
-        let second_request = RemoteManagementFileWriteRequest::chunk(
-            path.display().to_string(),
-            5,
-            b" remote".to_vec(),
+        .expect_err("revoked permission must prevent upload preparation");
+        assert_eq!(write_error.code(), "permission-denied");
+        assert!(
+            !destination.parent().expect("destination parent").exists(),
+            "permission denial must occur before create-parent"
         );
-        let second = write_file(second_request.clone()).expect("second chunk");
-        assert_eq!(second.next_offset, Some(12));
-        write_file(second_request).expect("retry second chunk");
 
-        let read = read_file(
-            RemoteManagementFileReadRequest::new(path.display().to_string()).with_max_bytes(64),
+        let staged_response = root.join("response.body");
+        fs::write(&staged_response, []).expect("response staging");
+        let read_error = read_file(
+            RemoteManagementFileReadRequest::new(root.join("missing").display().to_string()),
+            staged_response.to_str().expect("response path"),
         )
-        .expect("read file");
-        assert_eq!(read.text.as_deref(), Some("hello remote"));
+        .expect_err("revoked permission must prevent file reads");
+        assert_eq!(read_error.code(), "permission-denied");
+
+        let list: RemoteManagementFileListResponse =
+            decode_invocation_payload(invoke_file_list_operation(
+                REMOTE_MANAGEMENT_FS_LIST_OPERATION.to_string(),
+                &encode_sobj(&RemoteManagementFileListRequest::new(
+                    root.display().to_string(),
+                ))
+                .expect("encode list request"),
+            ));
+        assert_eq!(
+            list.error.as_ref().map(RemoteManagementError::code),
+            Some("permission-denied")
+        );
+
+        let stat: RemoteManagementFileStatResponse =
+            decode_invocation_payload(invoke_file_stat_operation(
+                REMOTE_MANAGEMENT_FS_STAT_OPERATION.to_string(),
+                &encode_sobj(&RemoteManagementFileStatRequest::new(
+                    root.display().to_string(),
+                ))
+                .expect("encode stat request"),
+            ));
+        assert_eq!(
+            stat.error.as_ref().map(RemoteManagementError::code),
+            Some("permission-denied")
+        );
+
+        let info: RemoteManagementSystemInfoResponse =
+            decode_invocation_payload(invoke_system_info_operation(
+                REMOTE_MANAGEMENT_SYSTEM_INFO_OPERATION.to_string(),
+                &encode_sobj(&RemoteManagementSystemInfoRequest::new())
+                    .expect("encode system info request"),
+            ));
+        assert_eq!(
+            info.error.as_ref().map(RemoteManagementError::code),
+            Some("permission-denied")
+        );
+
+        let observation: RemoteManagementSystemObserveResponse =
+            decode_invocation_payload(invoke_system_observe_operation(
+                REMOTE_MANAGEMENT_SYSTEM_OBSERVE_OPERATION.to_string(),
+                &encode_sobj(&RemoteManagementSystemObserveRequest::new())
+                    .expect("encode system observation request"),
+            ));
+        assert_eq!(
+            observation.error.as_ref().map(RemoteManagementError::code),
+            Some("permission-denied")
+        );
+    }
+
+    #[test]
+    fn single_session_file_transfer_round_trips_more_than_sixteen_mib() {
+        let _permission = remote_management_permission_for_test(true);
+        let root = temp_root("single-session");
+        let path = root.join("nested").join("hello.txt");
+        let staged_request = root.join("request.body");
+        let staged_response = root.join("response.body");
+        let bytes = (0..(17 * 1024 * 1024 + 37))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&staged_request, &bytes).expect("request body");
+        fs::write(&staged_response, []).expect("response body staging");
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let staged = NativeModuleStagedBody::new(
+            staged_request.display().to_string(),
+            bytes.len() as u64,
+            format!("blake3:{hash}"),
+        );
+        let written = write_file(
+            RemoteManagementFileWriteRequest::new(
+                path.display().to_string(),
+                bytes.len() as u64,
+                hash.clone(),
+            )
+            .creating_parent(true),
+            Some(&staged),
+        )
+        .expect("one write session");
+        assert_eq!(written.length, bytes.len() as u64);
+        assert_eq!(written.blake3, hash);
+
+        let (read, response_body) = read_file(
+            RemoteManagementFileReadRequest::new(path.display().to_string()),
+            staged_response.to_str().expect("response path"),
+        )
+        .expect("one read session");
+        assert_eq!(read, written);
+        assert_eq!(response_body.length, bytes.len() as u64);
+        assert_eq!(response_body.blake3, format!("blake3:{hash}"));
+        assert_eq!(fs::read(staged_response).expect("response bytes"), bytes);
 
         let stat = stat_file(
             RemoteManagementFileStatRequest::new(path.display().to_string()).including_blake3(true),
         )
         .expect("stat file");
-        assert_eq!(stat.len, Some(12));
-        let expected_hash = blake3::hash(b"hello remote").to_hex().to_string();
-        assert_eq!(stat.blake3.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(stat.len, Some(bytes.len() as u64));
+        assert_eq!(stat.blake3.as_deref(), Some(hash.as_str()));
 
         let (entries, truncated) = list_files(
             RemoteManagementFileListRequest::new(root.display().to_string()).recursively(true),
@@ -1728,6 +2171,96 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path.ends_with("hello.txt"))
         );
+    }
+
+    #[test]
+    fn zero_byte_transfer_uses_absent_request_body_and_present_empty_response_descriptor() {
+        let _permission = remote_management_permission_for_test(true);
+        let root = temp_root("zero-byte");
+        let path = root.join("empty.bin");
+        let written = write_file(
+            RemoteManagementFileWriteRequest::new(
+                path.display().to_string(),
+                0,
+                blake3::hash(&[]).to_hex().to_string(),
+            ),
+            None,
+        )
+        .expect("write empty file");
+        assert_eq!(written.length, 0);
+        assert_eq!(written.blake3, blake3::hash(&[]).to_hex().to_string());
+
+        let staged_response = root.join("response.body");
+        fs::write(&staged_response, b"stale").expect("response staging");
+        let (read, response_body) = read_file(
+            RemoteManagementFileReadRequest::new(path.display().to_string()),
+            staged_response.to_str().expect("response path"),
+        )
+        .expect("read empty file");
+        assert_eq!(read, written);
+        assert_eq!(response_body.length, 0);
+        assert_eq!(fs::read(staged_response).expect("empty response"), b"");
+    }
+
+    #[test]
+    fn write_hash_mismatch_preserves_destination_and_cleans_atomic_temp() {
+        let _permission = remote_management_permission_for_test(true);
+        let root = temp_root("hash-mismatch");
+        let path = root.join("destination.bin");
+        let staged_request = root.join("request.body");
+        fs::write(&path, b"original").expect("destination");
+        fs::write(&staged_request, b"corrupt").expect("staged body");
+        let staged = NativeModuleStagedBody::new(
+            staged_request.display().to_string(),
+            7,
+            format!("blake3:{}", "00".repeat(32)),
+        );
+        let error = write_file(
+            RemoteManagementFileWriteRequest::new(path.display().to_string(), 7, "00".repeat(32))
+                .overwriting(true),
+            Some(&staged),
+        )
+        .expect_err("hash mismatch");
+        assert_eq!(error.code(), "request-body-integrity-mismatch");
+        assert_eq!(fs::read(&path).expect("original destination"), b"original");
+        let leaked_temp = fs::read_dir(&root)
+            .expect("root entries")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".sinomo-put-"));
+        assert!(!leaked_temp, "failed transfer leaked an atomic temp file");
+    }
+
+    #[test]
+    fn write_requires_explicit_overwrite_for_an_existing_destination() {
+        let _permission = remote_management_permission_for_test(true);
+        let root = temp_root("explicit-overwrite");
+        let path = root.join("destination.bin");
+        let staged_request = root.join("request.body");
+        let replacement = b"replacement";
+        fs::write(&path, b"original").expect("destination");
+        fs::write(&staged_request, replacement).expect("staged body");
+        let hash = blake3::hash(replacement).to_hex().to_string();
+        let staged = NativeModuleStagedBody::new(
+            staged_request.display().to_string(),
+            replacement.len() as u64,
+            format!("blake3:{hash}"),
+        );
+
+        let request = RemoteManagementFileWriteRequest::new(
+            path.display().to_string(),
+            replacement.len() as u64,
+            hash.clone(),
+        );
+        let error =
+            write_file(request.clone(), Some(&staged)).expect_err("overwrite must be explicit");
+        assert_eq!(error.code(), "destination-exists");
+        assert_eq!(fs::read(&path).expect("preserved destination"), b"original");
+
+        let written =
+            write_file(request.overwriting(true), Some(&staged)).expect("explicit overwrite");
+        assert_eq!(written.length, replacement.len() as u64);
+        assert_eq!(written.blake3, hash);
+        assert_eq!(fs::read(&path).expect("replaced destination"), replacement);
     }
 
     #[test]

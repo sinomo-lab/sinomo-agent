@@ -41,7 +41,7 @@ use sinomo_module_api::{
     SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
     SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
     SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
-    SinomoModuleHostApiV1, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -81,7 +81,7 @@ pub extern "C" fn sinomo_module_descriptor(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode {
+pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModuleStatusCode {
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }

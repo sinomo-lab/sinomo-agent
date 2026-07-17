@@ -3,17 +3,18 @@
 //! Native modules share the host process address space. This loader verifies
 //! content hashes and ABI descriptors, but it is not a security sandbox.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use libloading::Library;
 use sinomo_module_api::{
     NativeModuleDescriptor, NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_OK,
     SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleApiVersionFn, SinomoModuleByteBuffer,
     SinomoModuleByteSlice, SinomoModuleDescriptorFn, SinomoModuleFreeBufferFn,
-    SinomoModuleHostApiV1, SinomoModuleInitFn, SinomoModuleInvokeFn, SinomoModuleShutdownFn,
+    SinomoModuleHostApiV2, SinomoModuleInitFn, SinomoModuleInvokeFn, SinomoModuleShutdownFn,
     SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 
@@ -48,6 +49,9 @@ pub trait NativeModuleHostCallbacks: Send + Sync {
     fn output_payload(&self, _payload_sobj: &[u8]) {}
     fn log(&self, _message: &[u8]) {}
     fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn local_permission_granted(&self, _permission: &str) -> bool {
         false
     }
 }
@@ -127,6 +131,80 @@ pub struct NativeModule {
     shutdown: Option<SinomoModuleShutdownFn>,
     free_buffer: SinomoModuleFreeBufferFn,
     callbacks: Box<NativeModuleHostCallbackState>,
+    // Native dylibs store the host API in process-global module state. Hold a
+    // per-library owned permit until shutdown and unload complete so two
+    // handles cannot overwrite each other's callback user_data pointers.
+    _lifecycle_permit: NativeModuleLifecyclePermit,
+}
+
+#[derive(Default)]
+struct NativeModuleLifecycleGate {
+    active: Mutex<bool>,
+    available: Condvar,
+}
+
+struct NativeModuleLifecyclePermit {
+    gate: Arc<NativeModuleLifecycleGate>,
+}
+
+impl NativeModuleLifecycleGate {
+    fn acquire(self: &Arc<Self>) -> Result<NativeModuleLifecyclePermit, NativeModuleHostError> {
+        let mut active = self.active.lock().map_err(|_| {
+            NativeModuleHostError::Unavailable(
+                "native module lifecycle gate lock poisoned".to_string(),
+            )
+        })?;
+        while *active {
+            active = self.available.wait(active).map_err(|_| {
+                NativeModuleHostError::Unavailable(
+                    "native module lifecycle gate wait poisoned".to_string(),
+                )
+            })?;
+        }
+        *active = true;
+        Ok(NativeModuleLifecyclePermit {
+            gate: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for NativeModuleLifecyclePermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .gate
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = false;
+        self.gate.available.notify_one();
+    }
+}
+
+fn native_module_lifecycle_gate(
+    library_path: &Path,
+) -> Result<Arc<NativeModuleLifecycleGate>, NativeModuleHostError> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<NativeModuleLifecycleGate>>>> =
+        OnceLock::new();
+    let library_path =
+        fs::canonicalize(library_path).map_err(|source| NativeModuleHostError::Io {
+            path: library_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| {
+            NativeModuleHostError::Unavailable(
+                "native module lifecycle gate registry lock poisoned".to_string(),
+            )
+        })?;
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&library_path).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    let gate = Arc::new(NativeModuleLifecycleGate::default());
+    gates.insert(library_path, Arc::downgrade(&gate));
+    Ok(gate)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +243,7 @@ impl NativeModule {
         library_path: impl AsRef<Path>,
     ) -> Result<Self, NativeModuleHostError> {
         let library_path = library_path.as_ref();
+        let lifecycle_permit = native_module_lifecycle_gate(library_path)?.acquire()?;
         let library = unsafe { load_native_module_library(library_path) }?;
         let api_version = unsafe { native_module_api_version(&library, library_path) }?;
         if api_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
@@ -198,12 +277,13 @@ impl NativeModule {
         };
 
         let callbacks = Box::new(NativeModuleHostCallbackState::default());
-        let host_api = SinomoModuleHostApiV1 {
+        let host_api = SinomoModuleHostApiV2 {
             abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
             user_data: callbacks.as_ref() as *const NativeModuleHostCallbackState as *mut c_void,
             output_chunk: Some(native_module_output_payload),
             log: Some(native_module_log),
             is_cancelled: Some(native_module_is_cancelled),
+            local_permission_granted: Some(native_module_local_permission_granted),
         };
         let init_status = unsafe { init(host_api) };
         if init_status != SINOMO_MODULE_STATUS_OK {
@@ -220,6 +300,7 @@ impl NativeModule {
             shutdown: Some(shutdown),
             free_buffer,
             callbacks,
+            _lifecycle_permit: lifecycle_permit,
         })
     }
 
@@ -464,6 +545,25 @@ unsafe extern "C" fn native_module_is_cancelled(user_data: *mut c_void) -> u8 {
         .is_some_and(|callbacks| callbacks.is_cancelled()) as u8
 }
 
+unsafe extern "C" fn native_module_local_permission_granted(
+    user_data: *mut c_void,
+    permission: SinomoModuleByteSlice,
+) -> u8 {
+    let Some(state) = (unsafe { (user_data as *const NativeModuleHostCallbackState).as_ref() })
+    else {
+        return 0;
+    };
+    let Ok(permission) = std::str::from_utf8(unsafe { permission.as_slice() }) else {
+        return 0;
+    };
+    let Ok(callbacks) = state.callbacks.lock() else {
+        return 0;
+    };
+    callbacks
+        .as_ref()
+        .is_some_and(|callbacks| callbacks.local_permission_granted(permission)) as u8
+}
+
 unsafe fn load_symbol<T: Copy>(
     library: &Library,
     symbol: &[u8],
@@ -525,6 +625,42 @@ unsafe fn copy_and_free_buffer(
         free_buffer(buffer);
     }
     bytes
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn same_library_lifecycle_gate_serializes_callback_state_ownership() {
+        let root = sinomo_testdir::TestDir::new("sinomo-native-module-lifecycle-gate");
+        let library_path = root.join("module.test");
+        fs::write(&library_path, b"gate identity").expect("write gate identity file");
+        let first_gate = native_module_lifecycle_gate(&library_path).expect("first gate");
+        let second_gate = native_module_lifecycle_gate(&library_path).expect("second gate");
+        assert!(Arc::ptr_eq(&first_gate, &second_gate));
+
+        let first_permit = first_gate.acquire().expect("first permit");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second_permit = second_gate.acquire().expect("second permit");
+            acquired_tx.send(()).expect("signal second permit");
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "second lifecycle entered while the first callback state was active"
+        );
+
+        drop(first_permit);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second lifecycle acquired after release");
+        waiter.join().expect("join lifecycle waiter");
+    }
 }
 
 fn verify_native_module_hash(

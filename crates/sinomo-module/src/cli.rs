@@ -1420,7 +1420,7 @@ mod tests {
             },
             platform_triple: "x86_64-unknown-linux-gnu".to_string(),
             native_abi_version: 1,
-            interface_version: "sinomo.remote-management.v1".to_string(),
+            interface_version: "sinomo.remote-management.v2".to_string(),
             activated_at: module_loader_applied_at_now(),
             source: "test".to_string(),
         }

@@ -2503,6 +2503,8 @@ fn run_dfs_cloud_files_mount_command(options: DfsMountOptions) -> Result<(), Cli
     let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
         operation: SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
         payload_sobj,
+        request_body: None,
+        response_body_path: None,
     });
     match module
         .invoke(&native_request)

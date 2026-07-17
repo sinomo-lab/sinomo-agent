@@ -305,9 +305,9 @@ SCENARIOS: list[MemoryEvalScenario] = [
                 scope="workspace:/home/ix/Workspace/sinomo/sinomo-agent",
                 tier="procedural",
                 summary=(
-                    "If `cargo fmt --all` fails because the sibling sui workspace "
-                    "is missing crates/sui-dev, format the touched Rust file with "
-                    "`rustfmt` and continue focused validation."
+                    "In a shared dirty worktree, `cargo fmt --all` can rewrite "
+                    "unrelated files. Use `cargo fmt -p <crate> -- --check`, then "
+                    "format only the affected package before focused validation."
                 ),
                 source_refs=["workspace:sinomo-agent", "event:evt-rustfmt-gotcha"],
             ),
@@ -315,7 +315,10 @@ SCENARIOS: list[MemoryEvalScenario] = [
                 memory_id="mem.workspace.rollout-build-gate",
                 scope="workspace:/home/ix/Workspace/sinomo/sinomo-agent",
                 tier="procedural",
-                summary="Before rollout-related publication, run `cargo build -p sinomo`.",
+                summary=(
+                    "Before rollout-related publication, run "
+                    "`cargo build --locked -p sinomo`."
+                ),
                 source_refs=["workspace:sinomo-agent", "event:evt-rollout-build-gate"],
             ),
         ],
@@ -323,7 +326,11 @@ SCENARIOS: list[MemoryEvalScenario] = [
             "What local formatting gotcha and rollout-related build gate should "
             "be remembered before validation?"
         ),
-        expected_markers=["rustfmt", "cargo build -p sinomo", "crates/sui-dev"],
+        expected_markers=[
+            "cargo fmt -p",
+            "--check",
+            "cargo build --locked -p sinomo",
+        ],
         forbidden_markers=["ignore formatting"],
         expected_memory_ids=[
             "mem.workspace.format-gotcha",

@@ -149,6 +149,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
+    send_object_rpc_session_to_target_async_with_options as daemon_send_object_rpc_session_to_target_async_with_options,
     send_object_rpc_to_target_with_timeouts as daemon_send_object_rpc_to_target_with_timeouts,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
@@ -1431,36 +1432,47 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
 }
 
 fn remote_management_cli_rpc(
-    target_node_id: Option<&str>,
-    request: network::ObjectRpcRequest,
-) -> Result<network::ObjectRpcResponse, String> {
-    // The shared shell contract permits five-minute commands. Leave a small
-    // transport margin so the terminal response can arrive after process exit.
-    const REMOTE_MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-    const REMOTE_MANAGEMENT_RPC_TIMEOUT: Duration = Duration::from_secs(310);
-    let status = daemon_default_main_daemon_status(REMOTE_MANAGEMENT_CONNECT_TIMEOUT)
-        .map_err(|source| source.to_string())?
-        .ok_or_else(|| "remote management requires the local daemon to be running".to_string())?;
-    observe_cli_rpc_via_daemon(
-        &status,
-        target_node_id,
-        &request,
-        |address, request| {
-            daemon_send_daemon_rpc(address, request, REMOTE_MANAGEMENT_RPC_TIMEOUT)
-                .map_err(|source| source.to_string())
-        },
-        |address, target_node_id, request| {
-            DaemonApiClient::at_address(address.to_string())
-                .object_rpc_to_target_with_deadline(
-                    target_node_id,
-                    request,
-                    REMOTE_MANAGEMENT_CONNECT_TIMEOUT,
-                    Some(REMOTE_MANAGEMENT_RPC_TIMEOUT),
-                    true,
-                )
-                .map_err(|source| source.to_string())
-        },
-    )
+    target_node_id: Option<String>,
+    call: network::ObjectRpcSessionCall,
+) -> sinomo_runtime::remote_management::RemoteManagementCliRpcFuture {
+    Box::pin(async move {
+        // Shell capture may run for five minutes and file sessions may be
+        // arbitrarily large. Connect is short; the idle timeout is a
+        // no-progress policy and is reset by every transferred frame.
+        const REMOTE_MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+        const REMOTE_MANAGEMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(310);
+        let status = daemon_default_main_daemon_status(REMOTE_MANAGEMENT_CONNECT_TIMEOUT)
+            .map_err(|source| source.to_string())?
+            .ok_or_else(|| {
+                "remote management requires the local daemon to be running".to_string()
+            })?;
+        let target_node_id = match target_node_id {
+            Some(target_node_id) => NodeId::new(target_node_id.clone()).map_err(|source| {
+                format!("invalid remote-management target node id `{target_node_id}`: {source}")
+            })?,
+            None => status
+                .cluster
+                .as_ref()
+                .map(|cluster| cluster.node_id.clone())
+                .ok_or_else(|| {
+                    "remote management requires the local daemon to have cluster identity"
+                        .to_string()
+                })?,
+        };
+        let timeouts = network::DaemonRpcTimeouts::connect_only(REMOTE_MANAGEMENT_CONNECT_TIMEOUT)
+            .with_idle_timeout(Some(REMOTE_MANAGEMENT_IDLE_TIMEOUT));
+        let options = network::ClusterObjectRpcOptions::new(timeouts);
+        let runtime = tokio::runtime::Handle::current();
+        daemon_send_object_rpc_session_to_target_async_with_options(
+            &target_node_id,
+            call,
+            options,
+            &runtime,
+            true,
+        )
+        .await
+        .map_err(|source| source.to_string())
+    })
 }
 
 fn cli_command_registry() -> &'static CliCommandRegistry {
@@ -5079,16 +5091,19 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     );
     let remote_transport: Arc<dyn sinomo_agent::AgentRemoteObjectRpcTransport> = Arc::new(
         sinomo_agent::TargetAwareAgentRemoteObjectRpcTransport::new(
-            |target_node_id: Option<&str>,
-             route_key: Option<&str>,
-             request: network::ObjectRpcRequest| {
+            |target_node_id: Option<String>,
+             route_key: Option<String>,
+             call: network::ObjectRpcSessionCall|
+             -> sinomo_agent::AgentRemoteObjectRpcFuture<'static> {
                 if route_key.is_some() {
-                    return Err(
-                        "this runtime does not resolve remote-management route_key values; use target_node_id"
-                            .to_string(),
-                    );
+                    return Box::pin(async {
+                        Err(
+                            "this runtime does not resolve remote-management route_key values; use target_node_id"
+                                .to_string(),
+                        )
+                    });
                 }
-                remote_management_cli_rpc(target_node_id, request)
+                remote_management_cli_rpc(target_node_id, call)
             },
         ),
     );

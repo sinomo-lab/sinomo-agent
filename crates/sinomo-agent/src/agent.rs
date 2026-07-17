@@ -14643,6 +14643,8 @@ mod tests {
                         category: "dynamic.native".to_string(),
                         operation: "dynamic.native.inspect".to_string(),
                         auth: "admin".to_string(),
+                        request_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
+                        response_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
                         required_local_permissions: Vec::new(),
                     },
                     sinomo_runtime::module_api::NativeModuleObjectRpcRoute {
@@ -14650,6 +14652,8 @@ mod tests {
                         category: "dynamic.native".to_string(),
                         operation: "dynamic.native.apply".to_string(),
                         auth: "admin".to_string(),
+                        request_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
+                        response_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
                         required_local_permissions: Vec::new(),
                     },
                 ],

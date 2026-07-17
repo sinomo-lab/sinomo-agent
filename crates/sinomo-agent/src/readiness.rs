@@ -8,14 +8,15 @@ use crate::{
     AgentDefinitionValidationError, AgentItem, AgentLoopInput, AgentLoopResponseMode,
     AgentModelDecisionSource, AgentModelEvent, AgentModuleToolProjection, AgentOp,
     AgentOutputFormat, AgentPackageProvenance, AgentPackageSource, AgentPlacementMetadata,
-    AgentRemoteObjectRpcTool, AgentRemoteObjectRpcTransport, AgentRole, AgentRun, AgentRunContext,
-    AgentRuntimeControlError, AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSession,
-    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionControlResult,
-    AgentSessionControlSnapshot, AgentSessionFollowUpRequest, AgentSessionInspectRequest,
-    AgentSessionInspectResponse, AgentSessionInterruptRequest, AgentSessionProgressRequest,
-    AgentSessionProgressResponse, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
-    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
-    AgentSessionSnapshot, AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
+    AgentRemoteObjectRpcFuture, AgentRemoteObjectRpcTool, AgentRemoteObjectRpcTransport, AgentRole,
+    AgentRun, AgentRunContext, AgentRuntimeControlError, AgentRuntimeControlHost,
+    AgentRuntimeControlRegistry, AgentSession, AgentSessionControlEventCursor,
+    AgentSessionControlResponse, AgentSessionControlResult, AgentSessionControlSnapshot,
+    AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
+    AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
+    AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSnapshot,
+    AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
     AgentSessionStoreRecordKind, AgentSessionTerminalResultsRequest,
     AgentSessionTerminalResultsResponse, AgentSkillPlan, AgentStopReason, AgentTaskLifecycleStatus,
     AgentTaskRef, AgentTaskSnapshot, AgentToolCall, AgentToolCapability, AgentToolEvidence,
@@ -42,7 +43,7 @@ use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{
     ObjectRpcCancelRequest, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcSessionResponse,
+    ObjectRpcSessionCall, ObjectRpcSessionResponse, ObjectRpcSessionResult,
 };
 use sinomo_runtime::node::{LocalNodePermission, NodeId};
 use sinomo_runtime::service::{
@@ -3001,43 +3002,50 @@ struct ReadinessRemoteObjectRpcTransport {
 }
 
 impl AgentRemoteObjectRpcTransport for ReadinessRemoteObjectRpcTransport {
-    fn call(&self, request: ObjectRpcRequest) -> Result<ObjectRpcResponse, String> {
-        match request.route.as_str() {
-            "/agent/readiness/remote-tool/run" => {
-                *self.start_operation_id.lock().expect("start op lock") =
-                    request.operation_id().map(str::to_string);
-                while !self.cancelled.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                ObjectRpcResponse::encode_body(
-                    "/agent/readiness/remote-tool/run",
-                    &serde_json::json!({ "remote": "cancelled" }),
-                )
-                .map_err(|error| error.to_string())
+    fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+        Box::pin(async move {
+            if !call.body.is_empty() {
+                return Err("readiness transport received an unexpected attachment".to_string());
             }
-            "/agent/readiness/remote-tool/cancel" => {
-                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
-                *self.cancel_operation_id.lock().expect("cancel op lock") =
-                    request.cancels_operation_id().map(str::to_string);
-                let body: ObjectRpcCancelRequest =
-                    request.decode_body().map_err(|error| error.to_string())?;
-                if Some(body.operation_id.as_str()) == request.cancels_operation_id() {
-                    self.cancelled.store(true, Ordering::SeqCst);
+            let request = call.request;
+            let response = match request.route.as_str() {
+                "/agent/readiness/remote-tool/run" => {
+                    *self.start_operation_id.lock().expect("start op lock") =
+                        request.operation_id().map(str::to_string);
+                    while !self.cancelled.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                     ObjectRpcResponse::encode_body(
-                        "/agent/readiness/remote-tool/cancel",
-                        &serde_json::json!({ "accepted": true }),
+                        "/agent/readiness/remote-tool/run",
+                        &serde_json::json!({ "remote": "cancelled" }),
                     )
-                    .map_err(|error| error.to_string())
-                } else {
-                    ObjectRpcResponse::encode_error(
-                        "/agent/readiness/remote-tool/cancel",
-                        "operation id mismatch",
-                    )
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?
                 }
-            }
-            other => Err(format!("unexpected route {other}")),
-        }
+                "/agent/readiness/remote-tool/cancel" => {
+                    self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                    *self.cancel_operation_id.lock().expect("cancel op lock") =
+                        request.cancels_operation_id().map(str::to_string);
+                    let body: ObjectRpcCancelRequest =
+                        request.decode_body().map_err(|error| error.to_string())?;
+                    if Some(body.operation_id.as_str()) == request.cancels_operation_id() {
+                        self.cancelled.store(true, Ordering::SeqCst);
+                        ObjectRpcResponse::encode_body(
+                            "/agent/readiness/remote-tool/cancel",
+                            &serde_json::json!({ "accepted": true }),
+                        )
+                        .map_err(|error| error.to_string())?
+                    } else {
+                        ObjectRpcResponse::encode_error(
+                            "/agent/readiness/remote-tool/cancel",
+                            "operation id mismatch",
+                        )
+                        .map_err(|error| error.to_string())?
+                    }
+                }
+                other => return Err(format!("unexpected route {other}")),
+            };
+            Ok(ObjectRpcSessionResult::value(response))
+        })
     }
 }
 

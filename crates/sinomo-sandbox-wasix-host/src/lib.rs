@@ -134,6 +134,8 @@ impl SandboxWasixNativeModule {
         let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_SANDBOX_WASIX_OPERATION.to_string(),
             payload_sobj,
+            request_body: None,
+            response_body_path: None,
         });
         let callbacks = (output_sink.is_some() || cancellation_token.is_some()).then(|| {
             Arc::new(SandboxWasixHostCallbacks {

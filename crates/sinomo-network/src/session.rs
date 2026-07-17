@@ -3596,7 +3596,13 @@ impl SyncBodyProducer {
     ) -> Result<Self, NetworkError> {
         let chunk_bytes = max_chunk_bytes.max(1);
         let (sender, receiver) = tokio::sync::mpsc::channel(BODY_READER_BUFFER_DEPTH);
+        let task_lifetime_guards = Arc::clone(&lifetime_guards);
         let task = tokio::task::spawn_blocking(move || {
+            // A cancelled consumer drops `SyncBodyProducer` without joining
+            // this blocking task. Keep staged-file cleanup guards alive until
+            // the reader itself closes, which is required on Windows where an
+            // open file cannot be unlinked reliably.
+            let _task_lifetime_guards = task_lifetime_guards;
             loop {
                 let mut bytes = match try_zeroed_body_buffer(chunk_bytes) {
                     Ok(bytes) => bytes,
@@ -3747,6 +3753,29 @@ mod body_tests {
     use crate::transfer::TransferReceipt;
     use std::io::Cursor;
     use tokio::io::AsyncWriteExt as _;
+
+    struct BlockingEofReader {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for BlockingEofReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    struct GuardDropSignal(std::sync::mpsc::Sender<()>);
+
+    impl Drop for GuardDropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
 
     #[test]
     fn session_wire_prefix_recognizes_partial_v2_magic_only() {
@@ -4148,6 +4177,43 @@ mod body_tests {
         }
         producer.finish().await.expect("producer join");
         assert_eq!(chunks, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_sync_producer_holds_cleanup_guard_until_reader_closes() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (guard_tx, guard_rx) = std::sync::mpsc::channel();
+        let source = ObjectRpcBodySource::from_reader(
+            BlockingEofReader {
+                entered: Some(entered_tx),
+                release: release_rx,
+            },
+            None,
+        )
+        .with_lifetime_guard(GuardDropSignal(guard_tx))
+        .expect("attach guard");
+        let producer = source
+            .producer(BODY_READER_BUFFER_BYTES)
+            .expect("sync producer");
+        drop(source);
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join entered wait")
+            .expect("reader entered");
+
+        drop(producer);
+        assert!(
+            guard_rx.try_recv().is_err(),
+            "dropping the consumer released cleanup while the reader was open"
+        );
+        release_tx.send(()).expect("release reader");
+        tokio::task::spawn_blocking(move || {
+            guard_rx.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .expect("join guard wait")
+        .expect("reader task released cleanup guard");
     }
 
     #[test]

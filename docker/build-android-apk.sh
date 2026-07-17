@@ -9,6 +9,5 @@ export HOST_UID="${HOST_UID:-$(id -u)}"
 export HOST_GID="${HOST_GID:-$(id -g)}"
 export SINOMO_ANDROID_IMAGE="${image}"
 export SINOMO_REPO_ROOT="${SINOMO_REPO_ROOT:-${repo_root}}"
-export SINOMO_SUI_ROOT="${SINOMO_SUI_ROOT:-$(cd "${repo_root}/../sui" && pwd)}"
 
 docker compose -f "${compose_file}" run --build --rm android-apk "$@"

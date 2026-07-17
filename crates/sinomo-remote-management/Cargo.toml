@@ -12,12 +12,12 @@ ring = "r1"
 [dependencies]
 blake3.workspace = true
 serde.workspace = true
-serde_bytes.workspace = true
 serde_json.workspace = true
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 sinomo-module-api = { path = "../sinomo-module-api" }

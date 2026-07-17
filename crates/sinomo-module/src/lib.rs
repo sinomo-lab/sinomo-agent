@@ -23,7 +23,8 @@ use sinomo_core::{
     RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_module_api::{
-    NativeModuleDeclarativeResource, NativeModuleDescriptor, NativeModuleObjectRpcRoute,
+    NativeModuleBodyMode, NativeModuleDeclarativeResource, NativeModuleDescriptor,
+    NativeModuleObjectRpcRoute,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -1611,6 +1612,10 @@ pub struct ModuleObjectRpcRoute {
     pub category: String,
     pub operation: String,
     pub auth: ModuleRouteAuth,
+    #[serde(default = "default_native_module_body_mode")]
+    pub request_body_mode: NativeModuleBodyMode,
+    #[serde(default = "default_native_module_body_mode")]
+    pub response_body_mode: NativeModuleBodyMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_local_permissions: Vec<String>,
 }
@@ -1623,6 +1628,12 @@ pub struct ModuleObjectRpcRouteDescriptor {
     pub auth_scope: String,
     pub required_capabilities: Vec<CapabilityName>,
     pub required_local_permissions: Vec<String>,
+    pub request_body_mode: NativeModuleBodyMode,
+    pub response_body_mode: NativeModuleBodyMode,
+}
+
+fn default_native_module_body_mode() -> NativeModuleBodyMode {
+    NativeModuleBodyMode::None
 }
 
 impl ModuleObjectRpcRoute {
@@ -1637,8 +1648,20 @@ impl ModuleObjectRpcRoute {
             category: category.into(),
             operation: operation.into(),
             auth,
+            request_body_mode: NativeModuleBodyMode::None,
+            response_body_mode: NativeModuleBodyMode::None,
             required_local_permissions: Vec::new(),
         }
+    }
+
+    pub fn with_request_body_mode(mut self, mode: NativeModuleBodyMode) -> Self {
+        self.request_body_mode = mode;
+        self
+    }
+
+    pub fn with_response_body_mode(mut self, mode: NativeModuleBodyMode) -> Self {
+        self.response_body_mode = mode;
+        self
     }
 
     pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
@@ -1713,6 +1736,8 @@ impl ModuleObjectRpcRoute {
             auth_scope: self.auth_scope().to_string(),
             required_capabilities: vec![operation],
             required_local_permissions: self.required_local_permissions.clone(),
+            request_body_mode: self.request_body_mode,
+            response_body_mode: self.response_body_mode,
         })
     }
 }
@@ -3291,6 +3316,8 @@ fn native_descriptor_route_to_module_route(
         route.operation.clone(),
         native_descriptor_route_auth(&route.auth, &route.route)?,
     )
+    .with_request_body_mode(route.request_body_mode)
+    .with_response_body_mode(route.response_body_mode)
     .require_local_permissions(route.required_local_permissions.clone()))
 }
 
@@ -5657,6 +5684,8 @@ mod tests {
                         "dfs.status.read",
                         ModuleRouteAuth::LocalOrClusterMember,
                     )
+                    .with_request_body_mode(NativeModuleBodyMode::Optional)
+                    .with_response_body_mode(NativeModuleBodyMode::Required)
                     .require_local_permissions(["remote-management", "device:storage"]),
                 )
                 .with_event_kind_name("dfs.metadata.updated")
@@ -5685,6 +5714,14 @@ mod tests {
         assert_eq!(
             decoded.surfaces.object_rpc_routes[0].required_local_permissions,
             vec!["remote-management", "device:storage"]
+        );
+        assert_eq!(
+            decoded.surfaces.object_rpc_routes[0].request_body_mode,
+            NativeModuleBodyMode::Optional
+        );
+        assert_eq!(
+            decoded.surfaces.object_rpc_routes[0].response_body_mode,
+            NativeModuleBodyMode::Required
         );
         assert_eq!(
             decoded.surfaces.object_rpc_routes[0]
@@ -5732,6 +5769,14 @@ mod tests {
         assert_eq!(
             descriptors[0].required_local_permissions,
             vec!["remote-management", "device:storage"]
+        );
+        assert_eq!(
+            descriptors[0].request_body_mode,
+            NativeModuleBodyMode::Optional
+        );
+        assert_eq!(
+            descriptors[0].response_body_mode,
+            NativeModuleBodyMode::Required
         );
         let descriptor = decoded
             .surfaces
@@ -5785,6 +5830,8 @@ mod tests {
                     category: "dynamic.native".to_string(),
                     operation: "dynamic.native.inspect".to_string(),
                     auth: "admin".to_string(),
+                    request_body_mode: sinomo_module_api::NativeModuleBodyMode::Optional,
+                    response_body_mode: sinomo_module_api::NativeModuleBodyMode::Required,
                     required_local_permissions: vec!["remote-management".to_string()],
                 }],
                 declarative_resources: vec![NativeModuleDeclarativeResource {
@@ -5828,6 +5875,14 @@ mod tests {
         assert_eq!(
             registration.surfaces.object_rpc_routes[0].required_local_permissions,
             vec!["remote-management"]
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes[0].request_body_mode,
+            NativeModuleBodyMode::Optional
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes[0].response_body_mode,
+            NativeModuleBodyMode::Required
         );
         assert_eq!(registration.surfaces.declarative_resources.len(), 1);
         assert_eq!(

@@ -12,14 +12,14 @@ use sinomo_agent::{
 };
 use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig};
 use sinomo_runtime::module_api::{
-    NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
-    NativeModuleErrorResponse, NativeModuleInvocationRequest, NativeModuleInvocationResponse,
-    NativeModuleObjectRpcRoute, NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
-    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
-    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
-    SinomoModuleHostApiV1, SinomoModuleHostIsCancelledFn, SinomoModuleStatusCode, decode_sobj,
-    encode_sobj,
+    NativeModuleBackend, NativeModuleBodyMode, NativeModuleCapabilitiesResponse,
+    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationRequest,
+    NativeModuleInvocationResponse, NativeModuleObjectRpcRoute, NativeModuleRequest,
+    NativeModuleResponse, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
+    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
+    SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleHostIsCancelledFn,
+    SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -224,6 +224,8 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
                 category: SINOMO_BENCHMARKS_RPC_CATEGORY.to_string(),
                 operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
                 auth: "local-or-cluster-member".to_string(),
+                request_body_mode: NativeModuleBodyMode::None,
+                response_body_mode: NativeModuleBodyMode::None,
                 required_local_permissions: Vec::new(),
             }],
             capability_exports: vec![
@@ -848,7 +850,7 @@ pub extern "C" fn sinomo_module_descriptor(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode {
+pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModuleStatusCode {
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
@@ -947,6 +949,7 @@ fn invoke_benchmark_operation(request: NativeModuleInvocationRequest) -> NativeM
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
             operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
             payload_sobj,
+            response_body: None,
         }),
         Err(error) => NativeModuleResponse::Error(native_error_response(
             "encode-benchmark-response",
@@ -989,6 +992,7 @@ fn encode_cancel_probe_response(response: BenchmarkCancelProbeResponse) -> Nativ
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
             operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
             payload_sobj,
+            response_body: None,
         }),
         Err(error) => NativeModuleResponse::Error(native_error_response(
             "encode-cancel-probe-response",
@@ -1642,6 +1646,8 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
             payload_sobj,
+            request_body: None,
+            response_body_path: None,
         });
         let request_sobj = encode_sobj(&request).expect("request");
         let mut response_buffer = SinomoModuleByteBuffer::null();
@@ -1680,12 +1686,13 @@ mod tests {
     #[test]
     fn benchmark_module_native_abi_cancel_probe_observes_host_cancellation() {
         let cancelled = AtomicBool::new(false);
-        let status = sinomo_module_init(SinomoModuleHostApiV1 {
+        let status = sinomo_module_init(SinomoModuleHostApiV2 {
             abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
             user_data: &cancelled as *const AtomicBool as *mut c_void,
             output_chunk: None,
             log: None,
             is_cancelled: Some(test_host_is_cancelled),
+            local_permission_granted: None,
         });
         assert_eq!(status, SINOMO_MODULE_STATUS_OK);
 
@@ -1697,6 +1704,8 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
             payload_sobj,
+            request_body: None,
+            response_body_path: None,
         });
         let request_sobj = encode_sobj(&request).expect("request");
 

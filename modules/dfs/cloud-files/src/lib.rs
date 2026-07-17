@@ -18,7 +18,7 @@ use sinomo_module_api::{
     NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
     SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
     SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
-    SinomoModuleByteSlice, SinomoModuleHostApiV1, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 
 #[cfg(windows)]
@@ -26,7 +26,7 @@ mod windows_impl;
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(windows), allow(dead_code))]
-struct StoredHostApi(SinomoModuleHostApiV1);
+struct StoredHostApi(SinomoModuleHostApiV2);
 
 unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
@@ -46,7 +46,7 @@ pub extern "C" fn sinomo_module_descriptor(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode {
+pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModuleStatusCode {
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
@@ -167,6 +167,7 @@ fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> Nativ
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
             operation: SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
             payload_sobj,
+            response_body: None,
         }),
         Err(error) => NativeModuleResponse::Error(native_error_response(
             "encode-cloud-files-response",

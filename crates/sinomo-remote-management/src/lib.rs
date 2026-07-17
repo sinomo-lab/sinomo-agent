@@ -8,8 +8,7 @@ mod cli;
 
 pub use cli::{
     NodePermissionsCliCommandHandler, RemoteManagementCliCommandHandler, RemoteManagementCliRpc,
-    node_permissions_cli_command_handler, remote_cli_command_handler,
-    remote_cli_command_handler_with_rpc,
+    RemoteManagementCliRpcFuture, node_permissions_cli_command_handler, remote_cli_command_handler,
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +24,7 @@ use std::fmt;
 
 pub const REMOTE_MANAGEMENT_MODULE_ID: &str = "module.remote-management";
 pub const REMOTE_MANAGEMENT_MODULE_OWNER: &str = "sinomo-remote-management";
-pub const REMOTE_MANAGEMENT_INTERFACE_VERSION: &str = "sinomo.remote-management.v1";
+pub const REMOTE_MANAGEMENT_INTERFACE_VERSION: &str = "sinomo.remote-management.v2";
 pub const REMOTE_MANAGEMENT_RPC_CATEGORY: &str = "remote.management";
 
 pub const REMOTE_MANAGEMENT_SHELL_RUN_ROUTE: &str = "/remote-management/shell/run";
@@ -75,14 +74,11 @@ pub type RemoteManagementConfigSetResponse = ConfigSetResponse;
 
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_COMMAND_TIMEOUT_MS: u64 = 300_000;
-pub const DEFAULT_OUTPUT_BYTES: usize = 64 * 1024;
-pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-pub const DEFAULT_FILE_READ_BYTES: usize = 64 * 1024;
-pub const MAX_FILE_READ_BYTES: usize = 1024 * 1024;
-pub const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
-/// Maximum file extent accepted by the bounded transfer route. Remote shell
-/// remains the explicitly unbounded escape hatch after local consent.
-pub const MAX_REMOTE_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+/// Default per-stream shell capture budget. Shell execution is host-equivalent
+/// after local consent, but retaining stdout and stderr in an RPC value must
+/// remain an explicit memory policy rather than an accidental wire limit.
+pub const DEFAULT_SHELL_CAPTURE_BYTES: usize = 256 * 1024;
+pub const MAX_SHELL_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_LIST_ENTRIES: usize = 512;
 pub const MAX_LIST_ENTRIES: usize = 4096;
 pub const DEFAULT_OBSERVED_PROCESSES: usize = 64;
@@ -131,18 +127,8 @@ impl std::error::Error for RemoteManagementError {}
 pub enum RemoteManagementProtocolError {
     #[error("{field} must be non-empty")]
     EmptyField { field: &'static str },
-    #[error("file write chunk is {actual} bytes; maximum is {maximum} bytes")]
-    FileWriteChunkTooLarge { actual: usize, maximum: usize },
-    #[error("file write append mode cannot be combined with an explicit offset")]
-    AppendWithOffset,
-    #[error("file write append mode cannot be combined with truncate")]
-    AppendWithTruncate,
-    #[error("file write truncate is valid only at offset zero")]
-    TruncateAtNonzeroOffset,
-    #[error("file write offset plus chunk length exceeds u64")]
-    FileWriteOffsetOverflow,
-    #[error("file write would end at {end} bytes; maximum is {maximum} bytes")]
-    FileWriteExceedsMaximum { end: u64, maximum: u64 },
+    #[error("expected BLAKE3 digest must be 64 hexadecimal characters")]
+    InvalidBlake3,
 }
 
 fn require_non_empty(
@@ -216,8 +202,8 @@ impl RemoteManagementShellRunRequest {
 
     pub fn effective_max_output_bytes(&self) -> usize {
         self.max_output_bytes
-            .unwrap_or(DEFAULT_OUTPUT_BYTES)
-            .min(MAX_OUTPUT_BYTES)
+            .unwrap_or(DEFAULT_SHELL_CAPTURE_BYTES)
+            .min(MAX_SHELL_CAPTURE_BYTES)
     }
 
     pub fn validate(&self) -> Result<(), RemoteManagementProtocolError> {
@@ -279,37 +265,14 @@ impl RemoteManagementShellOutcome {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RemoteManagementFileReadRequest {
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_bytes: Option<usize>,
 }
 
 impl RemoteManagementFileReadRequest {
     pub fn new(path: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            ..Self::default()
-        }
-    }
-
-    pub fn with_offset(mut self, offset: u64) -> Self {
-        self.offset = Some(offset);
-        self
-    }
-
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_bytes = Some(max_bytes);
-        self
-    }
-
-    pub fn effective_max_bytes(&self) -> usize {
-        self.max_bytes
-            .unwrap_or(DEFAULT_FILE_READ_BYTES)
-            .min(MAX_FILE_READ_BYTES)
+        Self { path: path.into() }
     }
 
     pub fn validate(&self) -> Result<(), RemoteManagementProtocolError> {
@@ -320,13 +283,13 @@ impl RemoteManagementFileReadRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RemoteManagementFileReadResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<RemoteManagementFileContent>,
+    pub file: Option<RemoteManagementFileTransfer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RemoteManagementError>,
 }
 
 impl RemoteManagementFileReadResponse {
-    pub fn success(file: RemoteManagementFileContent) -> Self {
+    pub fn success(file: RemoteManagementFileTransfer) -> Self {
         Self {
             file: Some(file),
             error: None,
@@ -340,11 +303,11 @@ impl RemoteManagementFileReadResponse {
         }
     }
 
-    pub fn file(&self) -> Option<&RemoteManagementFileContent> {
+    pub fn file(&self) -> Option<&RemoteManagementFileTransfer> {
         self.file.as_ref()
     }
 
-    pub fn into_result(self) -> Result<RemoteManagementFileContent, RemoteManagementError> {
+    pub fn into_result(self) -> Result<RemoteManagementFileTransfer, RemoteManagementError> {
         match (self.file, self.error) {
             (_, Some(error)) => Err(error),
             (Some(file), None) => Ok(file),
@@ -354,59 +317,36 @@ impl RemoteManagementFileReadResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct RemoteManagementFileContent {
+pub struct RemoteManagementFileTransfer {
     pub path: String,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    pub len: u64,
-    pub truncated: bool,
+    pub length: u64,
+    /// Lowercase hexadecimal BLAKE3 digest of the complete attachment.
+    pub blake3: String,
 }
 
-impl RemoteManagementFileContent {
-    pub fn next_offset(&self, requested_offset: u64) -> u64 {
-        requested_offset.saturating_add(self.bytes.len() as u64)
-    }
-
-    pub fn eof(&self) -> bool {
-        !self.truncated
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RemoteManagementFileWriteRequest {
     pub path: String,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
+    pub expected_len: u64,
+    pub expected_blake3: String,
     #[serde(default)]
     pub create_parent: bool,
     #[serde(default)]
-    pub append: bool,
-    /// Byte offset for idempotent chunk writes. Absent preserves the legacy
-    /// whole-file truncate/append behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    /// Explicit truncation control for chunk writes. Absent preserves legacy
-    /// truncate semantics when `offset` is also absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncate: Option<bool>,
+    pub overwrite: bool,
 }
 
 impl RemoteManagementFileWriteRequest {
-    pub fn new(path: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+    pub fn new(
+        path: impl Into<String>,
+        expected_len: u64,
+        expected_blake3: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
-            bytes: bytes.into(),
-            create_parent: false,
-            append: false,
-            offset: None,
-            truncate: None,
+            expected_len,
+            expected_blake3: expected_blake3.into(),
+            ..Self::default()
         }
-    }
-
-    pub fn chunk(path: impl Into<String>, offset: u64, bytes: impl Into<Vec<u8>>) -> Self {
-        Self::new(path, bytes).with_offset(offset)
     }
 
     pub fn creating_parent(mut self, create_parent: bool) -> Self {
@@ -414,64 +354,19 @@ impl RemoteManagementFileWriteRequest {
         self
     }
 
-    pub fn appending(mut self, append: bool) -> Self {
-        self.append = append;
+    pub fn overwriting(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
         self
-    }
-
-    pub fn with_offset(mut self, offset: u64) -> Self {
-        self.offset = Some(offset);
-        self
-    }
-
-    pub fn truncating(mut self, truncate: bool) -> Self {
-        self.truncate = Some(truncate);
-        self
-    }
-
-    pub fn effective_offset(&self) -> Option<u64> {
-        (!self.append).then_some(self.offset.unwrap_or(0))
-    }
-
-    pub fn should_truncate(&self) -> bool {
-        self.truncate
-            .unwrap_or_else(|| !self.append && self.offset.is_none())
-    }
-
-    pub fn next_offset(&self) -> Result<Option<u64>, RemoteManagementProtocolError> {
-        self.effective_offset()
-            .map(|offset| {
-                offset
-                    .checked_add(self.bytes.len() as u64)
-                    .ok_or(RemoteManagementProtocolError::FileWriteOffsetOverflow)
-            })
-            .transpose()
     }
 
     pub fn validate(&self) -> Result<(), RemoteManagementProtocolError> {
         require_non_empty(&self.path, "file write path")?;
-        if self.bytes.len() > MAX_FILE_WRITE_BYTES {
-            return Err(RemoteManagementProtocolError::FileWriteChunkTooLarge {
-                actual: self.bytes.len(),
-                maximum: MAX_FILE_WRITE_BYTES,
-            });
-        }
-        if self.append && self.offset.is_some() {
-            return Err(RemoteManagementProtocolError::AppendWithOffset);
-        }
-        if self.append && self.truncate == Some(true) {
-            return Err(RemoteManagementProtocolError::AppendWithTruncate);
-        }
-        if self.truncate == Some(true) && self.offset.is_some_and(|offset| offset != 0) {
-            return Err(RemoteManagementProtocolError::TruncateAtNonzeroOffset);
-        }
-        if let Some(end) = self.next_offset()?
-            && end > MAX_REMOTE_FILE_SIZE_BYTES
-        {
-            return Err(RemoteManagementProtocolError::FileWriteExceedsMaximum {
-                end,
-                maximum: MAX_REMOTE_FILE_SIZE_BYTES,
-            });
+        let digest = self
+            .expected_blake3
+            .strip_prefix("blake3:")
+            .unwrap_or(&self.expected_blake3);
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(RemoteManagementProtocolError::InvalidBlake3);
         }
         Ok(())
     }
@@ -480,13 +375,13 @@ impl RemoteManagementFileWriteRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RemoteManagementFileWriteResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub written: Option<RemoteManagementFileWriteOutcome>,
+    pub written: Option<RemoteManagementFileTransfer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RemoteManagementError>,
 }
 
 impl RemoteManagementFileWriteResponse {
-    pub fn success(written: RemoteManagementFileWriteOutcome) -> Self {
+    pub fn success(written: RemoteManagementFileTransfer) -> Self {
         Self {
             written: Some(written),
             error: None,
@@ -500,54 +395,17 @@ impl RemoteManagementFileWriteResponse {
         }
     }
 
-    pub fn written(&self) -> Option<&RemoteManagementFileWriteOutcome> {
+    pub fn written(&self) -> Option<&RemoteManagementFileTransfer> {
         self.written.as_ref()
     }
 
-    pub fn into_result(self) -> Result<RemoteManagementFileWriteOutcome, RemoteManagementError> {
+    pub fn into_result(self) -> Result<RemoteManagementFileTransfer, RemoteManagementError> {
         match (self.written, self.error) {
             (_, Some(error)) => Err(error),
             (Some(written), None) => Ok(written),
             (None, None) => Err(RemoteManagementError::missing_payload(
                 "a file write outcome",
             )),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct RemoteManagementFileWriteOutcome {
-    pub path: String,
-    pub bytes_written: u64,
-    pub append: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub len: Option<u64>,
-}
-
-impl RemoteManagementFileWriteOutcome {
-    pub fn legacy(path: impl Into<String>, bytes_written: u64, append: bool) -> Self {
-        Self {
-            path: path.into(),
-            bytes_written,
-            append,
-            offset: None,
-            next_offset: None,
-            len: None,
-        }
-    }
-
-    pub fn for_chunk(path: impl Into<String>, offset: u64, bytes_written: u64, len: u64) -> Self {
-        Self {
-            path: path.into(),
-            bytes_written,
-            append: false,
-            offset: Some(offset),
-            next_offset: Some(offset.saturating_add(bytes_written)),
-            len: Some(len),
         }
     }
 }
@@ -1026,24 +884,6 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-    struct LegacyFileWriteRequest {
-        path: String,
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-        #[serde(default)]
-        create_parent: bool,
-        #[serde(default)]
-        append: bool,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-    struct LegacyFileWriteOutcome {
-        path: String,
-        bytes_written: u64,
-        append: bool,
-    }
-
     fn sobj_round_trip<T>(value: &T) -> T
     where
         T: Serialize + for<'de> Deserialize<'de>,
@@ -1054,6 +894,10 @@ mod tests {
 
     #[test]
     fn established_routes_and_config_aliases_are_stable() {
+        assert_eq!(
+            REMOTE_MANAGEMENT_INTERFACE_VERSION,
+            "sinomo.remote-management.v2"
+        );
         assert_eq!(
             REMOTE_MANAGEMENT_SHELL_RUN_ROUTE,
             "/remote-management/shell/run"
@@ -1097,10 +941,17 @@ mod tests {
             .with_env("LANG", "C");
         assert_eq!(sobj_round_trip(&shell), shell);
 
-        let read = RemoteManagementFileReadRequest::new("/tmp/data")
-            .with_offset(4)
-            .with_max_bytes(128);
+        let read = RemoteManagementFileReadRequest::new("/tmp/data");
         assert_eq!(sobj_round_trip(&read), read);
+
+        let write = RemoteManagementFileWriteRequest::new(
+            "/tmp/data",
+            0,
+            blake3::hash(&[]).to_hex().to_string(),
+        )
+        .creating_parent(true)
+        .overwriting(true);
+        assert_eq!(sobj_round_trip(&write), write);
 
         let list = RemoteManagementFileListRequest::new("/tmp")
             .recursively(true)
@@ -1112,118 +963,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_write_request_decodes_with_legacy_truncate_semantics() {
-        let legacy = LegacyFileWriteRequest {
-            path: "/tmp/data".to_string(),
-            bytes: b"payload".to_vec(),
-            create_parent: true,
-            append: false,
-        };
-        let bytes = sinomo_module_api::encode_sobj(&legacy).expect("encode legacy write");
-        let current: RemoteManagementFileWriteRequest =
-            sinomo_module_api::decode_sobj(&bytes).expect("decode current write");
-
-        assert_eq!(current.path, legacy.path);
-        assert_eq!(current.bytes, legacy.bytes);
-        assert!(current.create_parent);
-        assert_eq!(current.offset, None);
-        assert_eq!(current.truncate, None);
-        assert!(current.should_truncate());
-        assert_eq!(current.effective_offset(), Some(0));
-        current.validate().expect("valid legacy write");
-    }
-
-    #[test]
-    fn current_legacy_mode_write_decodes_with_legacy_schema() {
-        let current = RemoteManagementFileWriteRequest::new("/tmp/data", b"payload".to_vec())
-            .creating_parent(true);
-        let bytes = sinomo_module_api::encode_sobj(&current).expect("encode current write");
-        let legacy: LegacyFileWriteRequest =
-            sinomo_module_api::decode_sobj(&bytes).expect("decode legacy write");
-
-        assert_eq!(legacy.path, current.path);
-        assert_eq!(legacy.bytes, current.bytes);
-        assert!(legacy.create_parent);
-        assert!(!legacy.append);
-    }
-
-    #[test]
-    fn legacy_file_write_outcome_decodes_with_optional_chunk_metadata() {
-        let legacy = LegacyFileWriteOutcome {
-            path: "/tmp/data".to_string(),
-            bytes_written: 7,
-            append: false,
-        };
-        let bytes = sinomo_module_api::encode_sobj(&legacy).expect("encode legacy outcome");
-        let current: RemoteManagementFileWriteOutcome =
-            sinomo_module_api::decode_sobj(&bytes).expect("decode current outcome");
-        assert_eq!(current.path, legacy.path);
-        assert_eq!(current.bytes_written, 7);
-        assert_eq!(current.offset, None);
-        assert_eq!(current.next_offset, None);
-        assert_eq!(current.len, None);
-    }
-
-    #[test]
-    fn file_write_chunks_are_bounded_and_retry_safe() {
-        let first = RemoteManagementFileWriteRequest::chunk("/tmp/data", 0, b"abc".to_vec())
-            .truncating(true);
-        first.validate().expect("first chunk");
-        assert!(first.should_truncate());
-        assert_eq!(first.next_offset().expect("next offset"), Some(3));
-
-        let repeated = first.clone();
-        assert_eq!(repeated.effective_offset(), Some(0));
-        assert_eq!(sobj_round_trip(&repeated), first);
-
-        let second = RemoteManagementFileWriteRequest::chunk("/tmp/data", 3, b"def".to_vec());
-        second.validate().expect("second chunk");
-        assert!(!second.should_truncate());
-        assert_eq!(second.next_offset().expect("next offset"), Some(6));
-    }
-
-    #[test]
-    fn file_write_validation_rejects_unsafe_chunk_modes() {
-        let oversized =
-            RemoteManagementFileWriteRequest::new("/tmp/data", vec![0; MAX_FILE_WRITE_BYTES + 1]);
-        assert!(matches!(
-            oversized.validate(),
-            Err(RemoteManagementProtocolError::FileWriteChunkTooLarge { .. })
-        ));
-
-        let append_with_offset =
-            RemoteManagementFileWriteRequest::chunk("/tmp/data", 4, b"x".to_vec()).appending(true);
-        assert_eq!(
-            append_with_offset.validate(),
-            Err(RemoteManagementProtocolError::AppendWithOffset)
-        );
-
-        let truncate_nonzero =
-            RemoteManagementFileWriteRequest::chunk("/tmp/data", 4, b"x".to_vec()).truncating(true);
-        assert_eq!(
-            truncate_nonzero.validate(),
-            Err(RemoteManagementProtocolError::TruncateAtNonzeroOffset)
-        );
-
-        let sparse_beyond_limit = RemoteManagementFileWriteRequest::chunk(
+    fn file_transfer_heads_are_path_only_and_unbounded() {
+        let read = RemoteManagementFileReadRequest::new("/tmp/data");
+        let write = RemoteManagementFileWriteRequest::new(
             "/tmp/data",
-            MAX_REMOTE_FILE_SIZE_BYTES,
-            b"x".to_vec(),
-        );
-        assert_eq!(
-            sparse_beyond_limit.validate(),
-            Err(RemoteManagementProtocolError::FileWriteExceedsMaximum {
-                end: MAX_REMOTE_FILE_SIZE_BYTES + 1,
-                maximum: MAX_REMOTE_FILE_SIZE_BYTES,
-            })
-        );
+            0,
+            blake3::hash(&[]).to_hex().to_string(),
+        )
+        .creating_parent(true);
+        read.validate().expect("read head");
+        write.validate().expect("write head");
 
-        let overflowing_offset =
-            RemoteManagementFileWriteRequest::chunk("/tmp/data", u64::MAX, b"x".to_vec());
-        assert_eq!(
-            overflowing_offset.validate(),
-            Err(RemoteManagementProtocolError::FileWriteOffsetOverflow)
-        );
+        let transfer = RemoteManagementFileTransfer {
+            path: "/tmp/data".to_string(),
+            length: u64::MAX,
+            blake3: "00".repeat(32),
+        };
+        assert_eq!(sobj_round_trip(&transfer), transfer);
     }
 
     #[test]

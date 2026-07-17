@@ -3,8 +3,12 @@ use super::{
     AgentToolGatewayTask, AgentToolRegistry, AgentToolRequest, AgentToolResult,
 };
 use crate::{AgentToolKind, AgentToolSpec};
+use serde::Deserialize;
 use sinomo_runtime::module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
-use sinomo_runtime::network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_runtime::network::{
+    ObjectRpcBodySource, ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcSessionCall,
+    ObjectRpcSessionResult,
+};
 use sinomo_runtime::remote_management::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SEARCH_ROUTE,
     CONFIG_SET_ROUTE, ConfigCatalogRequest, ConfigCatalogResponse, ConfigGetRequest,
@@ -16,54 +20,58 @@ use sinomo_runtime::remote_management::{
     RemoteManagementFileListRequest, RemoteManagementFileListResponse,
     RemoteManagementFileReadRequest, RemoteManagementFileReadResponse,
     RemoteManagementFileStatRequest, RemoteManagementFileStatResponse,
-    RemoteManagementFileWriteRequest, RemoteManagementFileWriteResponse,
-    RemoteManagementShellRunRequest, RemoteManagementShellRunResponse,
-    RemoteManagementSystemInfoRequest, RemoteManagementSystemInfoResponse,
-    RemoteManagementSystemObserveRequest, RemoteManagementSystemObserveResponse,
+    RemoteManagementFileTransfer, RemoteManagementFileWriteRequest,
+    RemoteManagementFileWriteResponse, RemoteManagementShellRunRequest,
+    RemoteManagementShellRunResponse, RemoteManagementSystemInfoRequest,
+    RemoteManagementSystemInfoResponse, RemoteManagementSystemObserveRequest,
+    RemoteManagementSystemObserveResponse,
 };
+use std::fs::{self, File};
+use std::future::Future;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::AsyncReadExt as _;
+
+const REMOTE_FILE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+static REMOTE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub type AgentRemoteObjectRpcFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ObjectRpcSessionResult, String>> + Send + 'a>>;
 
 pub trait AgentRemoteObjectRpcTransport: Send + Sync {
-    /// Calls an object-RPC route using the transport's legacy/default target.
-    ///
-    /// This remains the required method so existing closures and transport
-    /// implementations stay source compatible.
-    fn call(&self, request: ObjectRpcRequest) -> Result<ObjectRpcResponse, String>;
+    /// Calls one canonical object-RPC session using the transport's default
+    /// target. Request and response attachments share this same session.
+    fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a>;
 
     /// Calls an object-RPC route using explicit cluster-routing hints.
     ///
-    /// Legacy transports fall back to [`Self::call`] only when no routing hint
-    /// is present; explicit targets fail closed unless a cluster-aware host
-    /// overrides this method. The same hints are supplied for the work request
-    /// and its cancellation.
-    fn call_targeted(
-        &self,
-        target_node_id: Option<&str>,
-        route_key: Option<&str>,
-        request: ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, String> {
+    /// Default-target transports fall back to [`Self::call`] only when no
+    /// routing hint is present; explicit targets fail closed unless a
+    /// cluster-aware host overrides this method. The same hints are supplied
+    /// for the work request and its cancellation.
+    fn call_targeted<'a>(
+        &'a self,
+        target_node_id: Option<String>,
+        route_key: Option<String>,
+        call: ObjectRpcSessionCall,
+    ) -> AgentRemoteObjectRpcFuture<'a> {
         if target_node_id.is_some() || route_key.is_some() {
-            return Err(
-                "remote transport does not support explicit target_node_id or route_key routing"
-                    .to_string(),
-            );
+            return Box::pin(async {
+                Err(
+                    "remote transport does not support explicit target_node_id or route_key routing"
+                        .to_string(),
+                )
+            });
         }
-        self.call(request)
+        self.call(call)
     }
 }
 
-impl<F> AgentRemoteObjectRpcTransport for F
-where
-    F: Fn(ObjectRpcRequest) -> Result<ObjectRpcResponse, String> + Send + Sync,
-{
-    fn call(&self, request: ObjectRpcRequest) -> Result<ObjectRpcResponse, String> {
-        self(request)
-    }
-}
-
-/// Adapts a target-aware closure without conflicting with the legacy
-/// `Fn(ObjectRpcRequest)` transport implementation.
+/// Adapts an owned, asynchronous, target-aware object-RPC session closure.
 pub struct TargetAwareAgentRemoteObjectRpcTransport<F> {
     call: F,
 }
@@ -76,21 +84,25 @@ impl<F> TargetAwareAgentRemoteObjectRpcTransport<F> {
 
 impl<F> AgentRemoteObjectRpcTransport for TargetAwareAgentRemoteObjectRpcTransport<F>
 where
-    F: Fn(Option<&str>, Option<&str>, ObjectRpcRequest) -> Result<ObjectRpcResponse, String>
+    F: Fn(
+            Option<String>,
+            Option<String>,
+            ObjectRpcSessionCall,
+        ) -> AgentRemoteObjectRpcFuture<'static>
         + Send
         + Sync,
 {
-    fn call(&self, request: ObjectRpcRequest) -> Result<ObjectRpcResponse, String> {
-        (self.call)(None, None, request)
+    fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+        (self.call)(None, None, call)
     }
 
-    fn call_targeted(
-        &self,
-        target_node_id: Option<&str>,
-        route_key: Option<&str>,
-        request: ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, String> {
-        (self.call)(target_node_id, route_key, request)
+    fn call_targeted<'a>(
+        &'a self,
+        target_node_id: Option<String>,
+        route_key: Option<String>,
+        call: ObjectRpcSessionCall,
+    ) -> AgentRemoteObjectRpcFuture<'a> {
+        (self.call)(target_node_id, route_key, call)
     }
 }
 
@@ -275,21 +287,25 @@ pub fn remote_management_agent_tool_definitions() -> Vec<AgentRemoteManagementTo
             RemoteManagementFileReadRequest,
             RemoteManagementFileReadResponse,
         >(
-            "remote_file_read",
-            "Read a bounded byte range from a file on a selected remote node.",
+            "remote_file_get",
+            "Stream one complete file from a selected remote node into an atomic local destination.",
             REMOTE_MANAGEMENT_FS_READ_ROUTE,
             REMOTE_MANAGEMENT_RPC_CATEGORY,
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "minLength": 1 },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "max_bytes": { "type": "integer", "minimum": 1 }
+                    "remote_path": { "type": "string", "minLength": 1 },
+                    "local_path": { "type": "string", "minLength": 1 },
+                    "create_parent": { "type": "boolean" },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Must be true to replace an existing local file."
+                    }
                 },
-                "required": ["path"],
+                "required": ["remote_path", "local_path"],
                 "additionalProperties": false
             }),
-            "Remote file bytes, optional UTF-8 text, total length, and truncation state.",
+            "Verified complete-file length and BLAKE3 digest plus the committed local path.",
             [
                 AgentToolCapability::AccessNetwork,
                 AgentToolCapability::CallModule,
@@ -300,27 +316,25 @@ pub fn remote_management_agent_tool_definitions() -> Vec<AgentRemoteManagementTo
             RemoteManagementFileWriteRequest,
             RemoteManagementFileWriteResponse,
         >(
-            "remote_file_write",
-            "Write a bounded, optionally retry-safe byte chunk to a file on a selected remote node.",
+            "remote_file_put",
+            "Stream one complete local file to a selected remote node in one session.",
             REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
             REMOTE_MANAGEMENT_RPC_CATEGORY,
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "minLength": 1 },
-                    "bytes": {
-                        "type": "array",
-                        "items": { "type": "integer", "minimum": 0, "maximum": 255 }
-                    },
+                    "local_path": { "type": "string", "minLength": 1 },
+                    "remote_path": { "type": "string", "minLength": 1 },
                     "create_parent": { "type": "boolean" },
-                    "append": { "type": "boolean" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "truncate": { "type": "boolean" }
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Must be true to replace an existing remote file."
+                    }
                 },
-                "required": ["path", "bytes"],
+                "required": ["local_path", "remote_path"],
                 "additionalProperties": false
             }),
-            "Remote write result including bytes written, effective offset, next offset, and resulting length.",
+            "Verified complete-file length and BLAKE3 digest reported by the receiving node.",
             [
                 AgentToolCapability::AccessNetwork,
                 AgentToolCapability::CallModule,
@@ -574,60 +588,33 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
             remote_routing_hint(&request.call.input, "target_node_id", &request.call.tool)?;
         let route_key = remote_routing_hint(&request.call.input, "route_key", &request.call.tool)?;
         let payload = remote_request_payload(&request.call.input);
-        let rpc = match ObjectRpcRequest::encode_body(&self.route, &self.category, &payload) {
-            Ok(request) => request.with_operation_id(operation_id.clone()),
-            Err(error) => {
-                return Err(AgentToolResult::failed(
-                    format!(
-                        "failed to encode remote tool `{}` request",
-                        request.call.tool
-                    ),
-                    serde_json::json!({
-                        "error": "remote_request_encode_failed",
-                        "tool": request.call.tool,
-                        "detail": error.to_string(),
-                    }),
-                ));
-            }
-        };
         let start_transport = Arc::clone(&self.transport);
         let cancel_transport = Arc::clone(&self.transport);
+        let route = self.route.clone();
+        let category = self.category.clone();
         let cancel_route = self.cancel_route.clone();
         let cancel_category = self.cancel_category.clone();
         let tool = request.call.tool.clone();
         let cancel_tool = tool.clone();
+        let wait_operation_id = operation_id.clone();
         let cancel_target_node_id = target_node_id.clone();
         let cancel_route_key = route_key.clone();
         let cancellation_requested = Arc::new(AtomicBool::new(false));
         let cancellation_for_wait = Arc::clone(&cancellation_requested);
         let cancellation_for_cancel = Arc::clone(&cancellation_requested);
         Ok(AgentToolGatewayTask::new(
-            move || match start_transport.call_targeted(
-                target_node_id.as_deref(),
-                route_key.as_deref(),
-                rpc,
-            ) {
-                Ok(response) => remote_rpc_tool_result(&tool, response, &cancellation_for_wait),
-                Err(detail) if cancellation_for_wait.load(Ordering::SeqCst) => {
-                    AgentToolResult::cancelled(
-                        format!("remote tool `{tool}` cancelled"),
-                        serde_json::json!({
-                            "error": "remote_call_failed_after_cancel",
-                            "tool": tool,
-                            "detail": detail,
-                            "cancelled": true,
-                        }),
-                    )
-                }
-                Err(detail) => AgentToolResult::failed(
-                    format!("remote tool `{tool}` failed"),
-                    serde_json::json!({
-                        "error": "remote_call_failed",
-                        "tool": tool,
-                        "detail": detail,
-                        "cancelled": false,
-                    }),
-                ),
+            move || {
+                execute_remote_tool(
+                    &tool,
+                    &route,
+                    &category,
+                    payload,
+                    target_node_id,
+                    route_key,
+                    wait_operation_id,
+                    start_transport,
+                    &cancellation_for_wait,
+                )
             },
             move || {
                 cancellation_for_cancel.store(true, Ordering::SeqCst);
@@ -647,12 +634,13 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
                         ));
                     }
                 };
-                match cancel_transport.call_targeted(
-                    cancel_target_node_id.as_deref(),
-                    cancel_route_key.as_deref(),
-                    cancel,
-                ) {
-                    Ok(response) => match response.error_detail() {
+                let result = run_agent_remote_session(cancel_transport.call_targeted(
+                    cancel_target_node_id.clone(),
+                    cancel_route_key.clone(),
+                    ObjectRpcSessionCall::value(cancel),
+                ));
+                match result {
+                    Ok(result) => match result.response.error_detail() {
                         Ok(()) => AgentToolGatewayCancellation::accepted(format!(
                             "remote cancellation accepted for `{cancel_tool}`"
                         )),
@@ -672,6 +660,546 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
                 }
             },
         ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRemoteFileGetInput {
+    remote_path: String,
+    local_path: PathBuf,
+    #[serde(default)]
+    create_parent: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRemoteFilePutInput {
+    local_path: PathBuf,
+    remote_path: String,
+    #[serde(default)]
+    create_parent: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_remote_tool(
+    tool: &str,
+    route: &str,
+    category: &str,
+    payload: serde_json::Value,
+    target_node_id: Option<String>,
+    route_key: Option<String>,
+    operation_id: String,
+    transport: Arc<dyn AgentRemoteObjectRpcTransport>,
+    cancellation_requested: &AtomicBool,
+) -> AgentToolResult {
+    if route == REMOTE_MANAGEMENT_FS_READ_ROUTE {
+        return execute_remote_file_get(
+            tool,
+            category,
+            payload,
+            target_node_id,
+            route_key,
+            operation_id,
+            transport,
+            cancellation_requested,
+        );
+    }
+    if route == REMOTE_MANAGEMENT_FS_WRITE_ROUTE {
+        return execute_remote_file_put(
+            tool,
+            category,
+            payload,
+            target_node_id,
+            route_key,
+            operation_id,
+            transport,
+            cancellation_requested,
+        );
+    }
+    let rpc = match ObjectRpcRequest::encode_body(route, category, &payload) {
+        Ok(request) => request.with_operation_id(operation_id),
+        Err(error) => return remote_encode_error(tool, error),
+    };
+    match run_agent_remote_session(transport.call_targeted(
+        target_node_id,
+        route_key,
+        ObjectRpcSessionCall::value(rpc),
+    )) {
+        Ok(response) => remote_rpc_tool_result(tool, response, cancellation_requested),
+        Err(detail) => remote_transport_error(tool, detail, cancellation_requested),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_remote_file_get(
+    tool: &str,
+    category: &str,
+    payload: serde_json::Value,
+    target_node_id: Option<String>,
+    route_key: Option<String>,
+    operation_id: String,
+    transport: Arc<dyn AgentRemoteObjectRpcTransport>,
+    cancellation_requested: &AtomicBool,
+) -> AgentToolResult {
+    let input: AgentRemoteFileGetInput = match serde_json::from_value(payload) {
+        Ok(input) => input,
+        Err(error) => return remote_file_input_error(tool, error),
+    };
+    if input.remote_path.trim().is_empty() || input.local_path.as_os_str().is_empty() {
+        return remote_file_validation_error(tool, "remote_path and local_path must be non-empty");
+    }
+    if input.create_parent
+        && let Some(parent) = input.local_path.parent()
+        && let Err(source) = fs::create_dir_all(parent)
+    {
+        return remote_file_failure(
+            tool,
+            format!("create local parent {}: {source}", parent.display()),
+        );
+    }
+    let temp = match AgentRemoteFileTemp::new(&input.local_path) {
+        Ok(temp) => temp,
+        Err(detail) => return remote_file_failure(tool, detail),
+    };
+    let mut file =
+        match sinomo_runtime::storage::durable_file::create_private_staged_file(temp.path()) {
+            Ok(file) => file,
+            Err(source) => {
+                return remote_file_failure(
+                    tool,
+                    format!("create transfer file {}: {source}", temp.path().display()),
+                );
+            }
+        };
+    let request = RemoteManagementFileReadRequest::new(input.remote_path.clone());
+    let rpc =
+        match ObjectRpcRequest::encode_body(REMOTE_MANAGEMENT_FS_READ_ROUTE, category, &request) {
+            Ok(request) => request.with_operation_id(operation_id),
+            Err(error) => return remote_encode_error(tool, error),
+        };
+    let temp_path = temp.path().to_path_buf();
+    let remote_path = input.remote_path.clone();
+    let transfer = match run_agent_remote_future(async {
+        let result = transport
+            .call_targeted(target_node_id, route_key, ObjectRpcSessionCall::value(rpc))
+            .await?;
+        let (response, mut body) = result.into_parts();
+        validate_agent_response_route(&response, REMOTE_MANAGEMENT_FS_READ_ROUTE)?;
+        let response: RemoteManagementFileReadResponse = response
+            .decode_body()
+            .map_err(|error| format!("decode remote file get response: {error}"))?;
+        let transfer = response.into_result().map_err(|error| error.to_string())?;
+        validate_agent_transfer(&transfer, &remote_path)?;
+        if body
+            .total_bytes()
+            .is_some_and(|length| length != transfer.length)
+        {
+            return Err(format!(
+                "remote file attachment declared {} bytes but its head declared {}",
+                body.total_bytes().unwrap_or_default(),
+                transfer.length
+            ));
+        }
+        let mut hasher = blake3::Hasher::new();
+        let mut length = 0_u64;
+        let mut buffer = vec![0_u8; REMOTE_FILE_COPY_BUFFER_BYTES];
+        loop {
+            if cancellation_requested.load(Ordering::SeqCst) {
+                return Err("remote file get was cancelled".to_string());
+            }
+            let read = body
+                .read(&mut buffer)
+                .await
+                .map_err(|source| format!("read remote file attachment: {source}"))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read]).map_err(|source| {
+                format!("write transfer file {}: {source}", temp_path.display())
+            })?;
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(|| "downloaded file length exceeded u64".to_string())?;
+            hasher.update(&buffer[..read]);
+        }
+        let actual_hash = hasher.finalize().to_hex().to_string();
+        if length != transfer.length {
+            return Err(format!(
+                "downloaded file length mismatch: expected {}, got {length}",
+                transfer.length
+            ));
+        }
+        ensure_agent_hash_matches(&transfer.blake3, &actual_hash)?;
+        Ok(transfer)
+    }) {
+        Ok(transfer) => transfer,
+        Err(detail) => return remote_transport_error(tool, detail, cancellation_requested),
+    };
+    if let Err(source) = file.sync_all() {
+        return remote_file_failure(
+            tool,
+            format!("sync transfer file {}: {source}", temp.path().display()),
+        );
+    }
+    drop(file);
+    if cancellation_requested.load(Ordering::SeqCst) {
+        return AgentToolResult::cancelled(
+            format!("remote tool `{tool}` cancelled"),
+            serde_json::json!({ "cancelled": true, "sessions": 1 }),
+        );
+    }
+    if let Err(detail) = temp.commit(&input.local_path, input.overwrite) {
+        return remote_file_failure(tool, detail);
+    }
+    AgentToolResult::succeeded(
+        format!("remote tool `{tool}` completed"),
+        serde_json::json!({
+            "response": transfer,
+            "local_path": input.local_path,
+            "sessions": 1,
+            "cancelled": false,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_remote_file_put(
+    tool: &str,
+    category: &str,
+    payload: serde_json::Value,
+    target_node_id: Option<String>,
+    route_key: Option<String>,
+    operation_id: String,
+    transport: Arc<dyn AgentRemoteObjectRpcTransport>,
+    cancellation_requested: &AtomicBool,
+) -> AgentToolResult {
+    let input: AgentRemoteFilePutInput = match serde_json::from_value(payload) {
+        Ok(input) => input,
+        Err(error) => return remote_file_input_error(tool, error),
+    };
+    if input.remote_path.trim().is_empty() || input.local_path.as_os_str().is_empty() {
+        return remote_file_validation_error(tool, "local_path and remote_path must be non-empty");
+    }
+    let metadata = match fs::metadata(&input.local_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return remote_file_failure(tool, "local path is not a regular file".to_string()),
+        Err(source) => {
+            return remote_file_failure(
+                tool,
+                format!(
+                    "inspect local file {}: {source}",
+                    input.local_path.display()
+                ),
+            );
+        }
+    };
+    let (local_length, local_hash) =
+        match hash_agent_local_file(&input.local_path, cancellation_requested) {
+            Ok(identity) => identity,
+            Err(detail) => return remote_file_failure(tool, detail),
+        };
+    if local_length != metadata.len() {
+        return remote_file_failure(tool, "local file changed before upload".to_string());
+    }
+    let body = match ObjectRpcBodySource::file(input.local_path.clone()) {
+        Ok(body) => body,
+        Err(error) => return remote_file_failure(tool, error.to_string()),
+    };
+    if body.total_bytes() != Some(local_length) {
+        return remote_file_failure(tool, "local file changed before upload session".to_string());
+    }
+    let request = RemoteManagementFileWriteRequest::new(
+        input.remote_path.clone(),
+        local_length,
+        local_hash.clone(),
+    )
+    .creating_parent(input.create_parent)
+    .overwriting(input.overwrite);
+    let rpc =
+        match ObjectRpcRequest::encode_body(REMOTE_MANAGEMENT_FS_WRITE_ROUTE, category, &request) {
+            Ok(request) => request.with_operation_id(operation_id),
+            Err(error) => return remote_encode_error(tool, error),
+        };
+    let remote_path = input.remote_path.clone();
+    let written = match run_agent_remote_future(async {
+        let result = transport
+            .call_targeted(
+                target_node_id,
+                route_key,
+                ObjectRpcSessionCall::new(rpc, body),
+            )
+            .await?;
+        let (response, body) = result.into_parts();
+        validate_agent_response_route(&response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
+        if !body.is_empty() {
+            return Err("remote file put unexpectedly returned an attachment".to_string());
+        }
+        let response: RemoteManagementFileWriteResponse = response
+            .decode_body()
+            .map_err(|error| format!("decode remote file put response: {error}"))?;
+        let written = response.into_result().map_err(|error| error.to_string())?;
+        validate_agent_transfer(&written, &remote_path)?;
+        Ok(written)
+    }) {
+        Ok(written) => written,
+        Err(detail) => return remote_transport_error(tool, detail, cancellation_requested),
+    };
+    if written.length != local_length
+        || normalize_agent_blake3(&written.blake3) != normalize_agent_blake3(&local_hash)
+    {
+        return remote_file_failure(
+            tool,
+            format!(
+                "uploaded file identity mismatch: local {local_length} bytes blake3:{local_hash}, remote {} bytes {}",
+                written.length, written.blake3
+            ),
+        );
+    }
+    if cancellation_requested.load(Ordering::SeqCst) {
+        return AgentToolResult::cancelled(
+            format!("remote tool `{tool}` cancelled"),
+            serde_json::json!({ "cancelled": true, "sessions": 1 }),
+        );
+    }
+    AgentToolResult::succeeded(
+        format!("remote tool `{tool}` completed"),
+        serde_json::json!({
+            "response": written,
+            "local_path": input.local_path,
+            "sessions": 1,
+            "cancelled": false,
+        }),
+    )
+}
+
+fn run_agent_remote_session(
+    future: AgentRemoteObjectRpcFuture<'_>,
+) -> Result<ObjectRpcSessionResult, String> {
+    run_agent_remote_future(future)
+}
+
+fn run_agent_remote_future<T, F>(future: F) -> Result<T, String>
+where
+    T: Send,
+    F: Future<Output = Result<T, String>> + Send,
+{
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            runtime.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| runtime.block_on(future))
+        } else {
+            Err("remote agent tool cannot block inside a current-thread Tokio runtime".to_string())
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| format!("create remote agent tool runtime: {source}"))?;
+    runtime.block_on(future)
+}
+
+fn validate_agent_response_route(
+    response: &sinomo_runtime::network::ObjectRpcResponse,
+    route: &str,
+) -> Result<(), String> {
+    if response.route != route {
+        return Err(format!(
+            "remote RPC returned route `{}` for request `{route}`",
+            response.route
+        ));
+    }
+    response.error_detail().map_err(|error| error.to_string())
+}
+
+fn validate_agent_transfer(
+    transfer: &RemoteManagementFileTransfer,
+    requested_path: &str,
+) -> Result<(), String> {
+    if transfer.path != requested_path {
+        return Err(format!(
+            "remote transfer returned path `{}` for `{requested_path}`",
+            transfer.path
+        ));
+    }
+    let hash = normalize_agent_blake3(&transfer.blake3);
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid remote BLAKE3 digest `{}`",
+            transfer.blake3
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_agent_hash_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if normalize_agent_blake3(expected) == normalize_agent_blake3(actual) {
+        Ok(())
+    } else {
+        Err(format!(
+            "downloaded file BLAKE3 mismatch: expected {expected}, got {actual}"
+        ))
+    }
+}
+
+fn normalize_agent_blake3(value: &str) -> String {
+    value
+        .strip_prefix("blake3:")
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+}
+
+fn hash_agent_local_file(
+    path: &Path,
+    cancellation_requested: &AtomicBool,
+) -> Result<(u64, String), String> {
+    let mut file = File::open(path)
+        .map_err(|source| format!("open local file {}: {source}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; REMOTE_FILE_COPY_BUFFER_BYTES];
+    loop {
+        if cancellation_requested.load(Ordering::SeqCst) {
+            return Err("remote file put was cancelled while hashing".to_string());
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| format!("read local file {}: {source}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(read as u64)
+            .ok_or_else(|| "local file length exceeded u64".to_string())?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((length, hasher.finalize().to_hex().to_string()))
+}
+
+struct AgentRemoteFileTemp {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl AgentRemoteFileTemp {
+    fn new(destination: &Path) -> Result<Self, String> {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download");
+        let sequence = REMOTE_FILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{name}.sinomo-agent-get-{}-{sequence}.part",
+            std::process::id()
+        ));
+        if path.exists() {
+            return Err(format!("transfer temp already exists: {}", path.display()));
+        }
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(mut self, destination: &Path, overwrite: bool) -> Result<(), String> {
+        sinomo_runtime::storage::durable_file::install_staged_file(
+            &self.path,
+            destination,
+            overwrite,
+        )
+        .map_err(|source| {
+            format!(
+                "install downloaded file {} (overwrite={overwrite}): {source}",
+                destination.display()
+            )
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for AgentRemoteFileTemp {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn remote_encode_error(tool: &str, error: impl std::fmt::Display) -> AgentToolResult {
+    AgentToolResult::failed(
+        format!("failed to encode remote tool `{tool}` request"),
+        serde_json::json!({
+            "error": "remote_request_encode_failed",
+            "tool": tool,
+            "detail": error.to_string(),
+        }),
+    )
+}
+
+fn remote_file_input_error(tool: &str, error: serde_json::Error) -> AgentToolResult {
+    remote_file_validation_error(tool, &format!("invalid file transfer input: {error}"))
+}
+
+fn remote_file_validation_error(tool: &str, detail: &str) -> AgentToolResult {
+    AgentToolResult::failed(
+        format!("remote tool `{tool}` has invalid file transfer input"),
+        serde_json::json!({
+            "error": "invalid_remote_file_transfer_input",
+            "tool": tool,
+            "detail": detail,
+        }),
+    )
+}
+
+fn remote_file_failure(tool: &str, detail: String) -> AgentToolResult {
+    AgentToolResult::failed(
+        format!("remote tool `{tool}` file transfer failed"),
+        serde_json::json!({
+            "error": "remote_file_transfer_failed",
+            "tool": tool,
+            "detail": detail,
+            "cancelled": false,
+        }),
+    )
+}
+
+fn remote_transport_error(
+    tool: &str,
+    detail: String,
+    cancellation_requested: &AtomicBool,
+) -> AgentToolResult {
+    if cancellation_requested.load(Ordering::SeqCst) {
+        AgentToolResult::cancelled(
+            format!("remote tool `{tool}` cancelled"),
+            serde_json::json!({
+                "error": "remote_call_failed_after_cancel",
+                "tool": tool,
+                "detail": detail,
+                "cancelled": true,
+            }),
+        )
+    } else {
+        AgentToolResult::failed(
+            format!("remote tool `{tool}` failed"),
+            serde_json::json!({
+                "error": "remote_call_failed",
+                "tool": tool,
+                "detail": detail,
+                "cancelled": false,
+            }),
+        )
     }
 }
 
@@ -726,10 +1254,22 @@ fn remote_request_payload(input: &serde_json::Value) -> serde_json::Value {
 
 fn remote_rpc_tool_result(
     tool: &str,
-    response: ObjectRpcResponse,
+    result: ObjectRpcSessionResult,
     cancellation_requested: &AtomicBool,
 ) -> AgentToolResult {
+    let (response, body) = result.into_parts();
     let cancelled = cancellation_requested.load(Ordering::SeqCst);
+    if !body.is_empty() {
+        return AgentToolResult::failed(
+            format!("remote tool `{tool}` returned an unexpected attachment"),
+            serde_json::json!({
+                "error": "unexpected_remote_attachment",
+                "tool": tool,
+                "route": response.route,
+                "cancelled": cancelled,
+            }),
+        );
+    }
     if let Err(error) = response.error_detail() {
         let payload = serde_json::json!({
             "error": "remote_rpc_error",
@@ -806,6 +1346,7 @@ mod tests {
         InteractionSurfaceKind,
     };
     use sinomo_runtime::events::SessionId;
+    use sinomo_runtime::network::{ObjectRpcIncomingBody, ObjectRpcResponse};
     use sinomo_runtime::node::NodeId;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -823,59 +1364,61 @@ mod tests {
     }
 
     impl AgentRemoteObjectRpcTransport for FakeRemoteTransport {
-        fn call(&self, request: ObjectRpcRequest) -> Result<ObjectRpcResponse, String> {
-            match request.route.as_str() {
-                "/remote/tool/run" => {
-                    *self.start_operation_id.lock().expect("start op lock") =
-                        request.operation_id().map(str::to_string);
-                    while !self.cancelled.load(Ordering::SeqCst) {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    if self.fail_run_after_cancel {
-                        return Err("remote route ended after cancellation".to_string());
-                    }
-                    ObjectRpcResponse::encode_body(
-                        "/remote/tool/run",
-                        &serde_json::json!({ "remote": "cancelled" }),
-                    )
-                    .map_err(|error| error.to_string())
-                }
-                "/remote/tool/cancel" => {
-                    self.cancel_calls.fetch_add(1, Ordering::SeqCst);
-                    *self.cancel_operation_id.lock().expect("cancel op lock") =
-                        request.cancels_operation_id().map(str::to_string);
-                    let body: ObjectRpcCancelRequest =
-                        request.decode_body().map_err(|error| error.to_string())?;
-                    if Some(body.operation_id.as_str()) == request.cancels_operation_id() {
-                        self.cancelled.store(true, Ordering::SeqCst);
+        fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+            Box::pin(async move {
+                assert!(call.body.is_empty());
+                let request = call.request;
+                let response = match request.route.as_str() {
+                    "/remote/tool/run" => {
+                        *self.start_operation_id.lock().expect("start op lock") =
+                            request.operation_id().map(str::to_string);
+                        while !self.cancelled.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        if self.fail_run_after_cancel {
+                            return Err("remote route ended after cancellation".to_string());
+                        }
                         ObjectRpcResponse::encode_body(
-                            "/remote/tool/cancel",
-                            &serde_json::json!({ "accepted": true }),
+                            "/remote/tool/run",
+                            &serde_json::json!({ "remote": "cancelled" }),
                         )
-                        .map_err(|error| error.to_string())
-                    } else {
-                        ObjectRpcResponse::encode_error(
-                            "/remote/tool/cancel",
-                            "operation id mismatch",
-                        )
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| error.to_string())?
                     }
-                }
-                other => Err(format!("unexpected route {other}")),
-            }
+                    "/remote/tool/cancel" => {
+                        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                        *self.cancel_operation_id.lock().expect("cancel op lock") =
+                            request.cancels_operation_id().map(str::to_string);
+                        let body: ObjectRpcCancelRequest =
+                            request.decode_body().map_err(|error| error.to_string())?;
+                        if Some(body.operation_id.as_str()) == request.cancels_operation_id() {
+                            self.cancelled.store(true, Ordering::SeqCst);
+                            ObjectRpcResponse::encode_body(
+                                "/remote/tool/cancel",
+                                &serde_json::json!({ "accepted": true }),
+                            )
+                            .map_err(|error| error.to_string())?
+                        } else {
+                            ObjectRpcResponse::encode_error(
+                                "/remote/tool/cancel",
+                                "operation id mismatch",
+                            )
+                            .map_err(|error| error.to_string())?
+                        }
+                    }
+                    other => return Err(format!("unexpected route {other}")),
+                };
+                Ok(ObjectRpcSessionResult::value(response))
+            })
         }
 
-        fn call_targeted(
-            &self,
-            target_node_id: Option<&str>,
-            route_key: Option<&str>,
-            request: ObjectRpcRequest,
-        ) -> Result<ObjectRpcResponse, String> {
-            let target = Some((
-                target_node_id.map(str::to_string),
-                route_key.map(str::to_string),
-            ));
-            match request.route.as_str() {
+        fn call_targeted<'a>(
+            &'a self,
+            target_node_id: Option<String>,
+            route_key: Option<String>,
+            call: ObjectRpcSessionCall,
+        ) -> AgentRemoteObjectRpcFuture<'a> {
+            let target = Some((target_node_id, route_key));
+            match call.request.route.as_str() {
                 "/remote/tool/run" => {
                     *self.start_target.lock().expect("start target lock") = target;
                 }
@@ -884,7 +1427,100 @@ mod tests {
                 }
                 _ => {}
             }
-            self.call(request)
+            self.call(call)
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeFileTransferTransport {
+        remote: Mutex<Vec<u8>>,
+        write_calls: AtomicUsize,
+        read_calls: AtomicUsize,
+        write_overwrites: Mutex<Vec<bool>>,
+    }
+
+    impl AgentRemoteObjectRpcTransport for FakeFileTransferTransport {
+        fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+            Box::pin(async move {
+                let request = call.request;
+                match request.route.as_str() {
+                    REMOTE_MANAGEMENT_FS_WRITE_ROUTE => {
+                        let write: RemoteManagementFileWriteRequest =
+                            request.decode_body().map_err(|error| error.to_string())?;
+                        let declared_length = call
+                            .body
+                            .total_bytes()
+                            .ok_or_else(|| "test upload did not declare a length".to_string())?;
+                        let collect_bytes = usize::try_from(declared_length)
+                            .map_err(|_| "test upload does not fit this host".to_string())?;
+                        let uploaded = call
+                            .body
+                            .collect_to_vec(collect_bytes)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let uploaded_hash = blake3::hash(&uploaded).to_hex().to_string();
+                        if write.expected_len != uploaded.len() as u64
+                            || normalize_agent_blake3(&write.expected_blake3) != uploaded_hash
+                        {
+                            return Err(
+                                "agent upload signed head did not match its attachment".to_string()
+                            );
+                        }
+                        self.write_calls.fetch_add(1, Ordering::SeqCst);
+                        self.write_overwrites
+                            .lock()
+                            .expect("overwrite lock")
+                            .push(write.overwrite);
+                        *self.remote.lock().expect("remote bytes lock") = uploaded;
+                        let response = ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
+                            &RemoteManagementFileWriteResponse::success(
+                                RemoteManagementFileTransfer {
+                                    path: write.path,
+                                    length: declared_length,
+                                    blake3: uploaded_hash,
+                                },
+                            ),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(ObjectRpcSessionResult::value(response))
+                    }
+                    REMOTE_MANAGEMENT_FS_READ_ROUTE => {
+                        assert!(call.body.is_empty());
+                        let read: RemoteManagementFileReadRequest =
+                            request.decode_body().map_err(|error| error.to_string())?;
+                        self.read_calls.fetch_add(1, Ordering::SeqCst);
+                        let bytes = self.remote.lock().expect("remote bytes lock").clone();
+                        let response = ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_FS_READ_ROUTE,
+                            &RemoteManagementFileReadResponse::success(
+                                RemoteManagementFileTransfer {
+                                    path: read.path,
+                                    length: bytes.len() as u64,
+                                    blake3: blake3::hash(&bytes).to_hex().to_string(),
+                                },
+                            ),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(ObjectRpcSessionResult::new(
+                            response,
+                            ObjectRpcIncomingBody::bytes(bytes),
+                        ))
+                    }
+                    route => Err(format!("unexpected transfer route {route}")),
+                }
+            })
+        }
+
+        fn call_targeted<'a>(
+            &'a self,
+            target_node_id: Option<String>,
+            route_key: Option<String>,
+            call: ObjectRpcSessionCall,
+        ) -> AgentRemoteObjectRpcFuture<'a> {
+            assert_eq!(target_node_id.as_deref(), Some("node.files"));
+            assert!(route_key.is_none());
+            self.call(call)
         }
     }
 
@@ -1040,88 +1676,41 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fn_transport_fails_closed_for_targeted_tool_input() {
-        let received = Arc::new(Mutex::new(None));
-        let received_for_transport = Arc::clone(&received);
-        let transport: Arc<dyn AgentRemoteObjectRpcTransport> = Arc::new(
-            move |request: ObjectRpcRequest| -> Result<ObjectRpcResponse, String> {
-                let payload: serde_json::Value =
-                    request.decode_body().map_err(|error| error.to_string())?;
-                *received_for_transport.lock().expect("received lock") = Some(payload);
-                ObjectRpcResponse::encode_body(
-                    "/remote/tool/immediate",
-                    &serde_json::json!({ "ok": true }),
-                )
-                .map_err(|error| error.to_string())
-            },
-        );
-        let tool = AgentRemoteObjectRpcTool::json_module_tool(
-            "remote_module_immediate",
-            "fake immediate remote module call",
-            "/remote/tool/immediate",
-            "remote.tool",
-            "/remote/tool/cancel",
-            "remote.tool",
-            transport,
-        );
-        let registry = AgentToolRegistry::new().with_gateway(tool);
-        let call = AgentToolCall {
-            call_id: None,
-            tool: "remote_module_immediate".to_string(),
-            input: serde_json::json!({
-                "target_node_id": "node.legacy-target",
-                "route_key": "legacy-route-key",
-                "query": "status"
-            }),
-            r#async: false,
-            summary: "legacy closure compatibility".to_string(),
-        };
-
-        let outcome = registry.execute(&test_session(), 0, 0, &call);
-
-        assert_eq!(outcome.status, AgentToolStatus::Failed);
-        assert!(
-            outcome
-                .output
-                .get("detail")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|detail| detail.contains("does not support explicit"))
-        );
-        assert_eq!(*received.lock().expect("received lock"), None);
-    }
-
-    #[test]
     fn target_aware_closure_adapter_receives_both_routing_hints() {
         let received = Arc::new(Mutex::new(None));
         let received_for_transport = Arc::clone(&received);
         let transport = TargetAwareAgentRemoteObjectRpcTransport::new(
-            move |target_node_id: Option<&str>,
-                  route_key: Option<&str>,
-                  request: ObjectRpcRequest| {
-                *received_for_transport.lock().expect("received lock") = Some((
-                    target_node_id.map(str::to_string),
-                    route_key.map(str::to_string),
-                    request.route,
-                ));
-                ObjectRpcResponse::encode_body(
-                    "/remote/tool/immediate",
-                    &serde_json::json!({ "ok": true }),
-                )
-                .map_err(|error| error.to_string())
+            move |target_node_id: Option<String>,
+                  route_key: Option<String>,
+                  call: ObjectRpcSessionCall| {
+                let received = Arc::clone(&received_for_transport);
+                Box::pin(async move {
+                    *received.lock().expect("received lock") =
+                        Some((target_node_id, route_key, call.request.route));
+                    let response = ObjectRpcResponse::encode_body(
+                        "/remote/tool/immediate",
+                        &serde_json::json!({ "ok": true }),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(ObjectRpcSessionResult::value(response))
+                }) as AgentRemoteObjectRpcFuture<'static>
             },
         );
-        transport
-            .call_targeted(
-                Some("node.targeted"),
-                Some("route.targeted"),
-                ObjectRpcRequest::encode_body(
-                    "/remote/tool/immediate",
-                    "remote.tool",
-                    &serde_json::json!({}),
-                )
-                .expect("request"),
-            )
-            .expect("targeted call");
+        run_agent_remote_session(
+            transport.call_targeted(
+                Some("node.targeted".to_string()),
+                Some("route.targeted".to_string()),
+                ObjectRpcSessionCall::value(
+                    ObjectRpcRequest::encode_body(
+                        "/remote/tool/immediate",
+                        "remote.tool",
+                        &serde_json::json!({}),
+                    )
+                    .expect("request"),
+                ),
+            ),
+        )
+        .expect("targeted call");
 
         assert_eq!(
             *received.lock().expect("received lock"),
@@ -1130,6 +1719,67 @@ mod tests {
                 Some("route.targeted".to_string()),
                 "/remote/tool/immediate".to_string(),
             ))
+        );
+    }
+
+    #[test]
+    fn agent_file_get_and_put_stream_more_than_sixteen_mib_in_one_session_each() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-remote-file-transfer");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        let bytes = (0..(17 * 1024 * 1024 + 37))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source, &bytes).expect("write source");
+        let transport = Arc::new(FakeFileTransferTransport::default());
+        let registry = AgentToolRegistry::new();
+        register_remote_management_agent_tools(
+            &registry,
+            Arc::clone(&transport) as Arc<dyn AgentRemoteObjectRpcTransport>,
+        );
+
+        let put = AgentToolCall {
+            call_id: None,
+            tool: "remote_file_put".to_string(),
+            input: serde_json::json!({
+                "target_node_id": "node.files",
+                "input": {
+                    "local_path": source,
+                    "remote_path": "/remote/large.bin",
+                    "overwrite": true
+                }
+            }),
+            r#async: false,
+            summary: "upload large file".to_string(),
+        };
+        let put_outcome = registry.execute(&test_session(), 0, 0, &put);
+        assert_eq!(put_outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(transport.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *transport.write_overwrites.lock().expect("overwrite lock"),
+            [true]
+        );
+        assert_eq!(*transport.remote.lock().expect("remote bytes lock"), bytes);
+
+        let get = AgentToolCall {
+            call_id: None,
+            tool: "remote_file_get".to_string(),
+            input: serde_json::json!({
+                "target_node_id": "node.files",
+                "input": {
+                    "remote_path": "/remote/large.bin",
+                    "local_path": destination
+                }
+            }),
+            r#async: false,
+            summary: "download large file".to_string(),
+        };
+        let get_outcome = registry.execute(&test_session(), 0, 0, &get);
+        assert_eq!(get_outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(transport.read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(root.join("destination.bin")).expect("download"),
+            bytes
         );
     }
 
@@ -1178,6 +1828,22 @@ mod tests {
                     .is_some()
             );
         }
+
+        let descriptors = remote_management_agent_tool_descriptors();
+        for tool in ["remote_file_get", "remote_file_put"] {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.spec.name == tool)
+                .expect("file transfer descriptor");
+            let properties = &descriptor.input_schema["properties"]["input"]["properties"];
+            assert!(properties.get("overwrite").is_some());
+            for removed in ["bytes", "offset", "max_bytes", "append", "truncate"] {
+                assert!(
+                    properties.get(removed).is_none(),
+                    "{tool} still exposes removed field {removed}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1188,8 +1854,11 @@ mod tests {
         )
         .expect("error response");
 
-        let outcome =
-            remote_rpc_tool_result("remote_module_immediate", response, &AtomicBool::new(false));
+        let outcome = remote_rpc_tool_result(
+            "remote_module_immediate",
+            ObjectRpcSessionResult::value(response),
+            &AtomicBool::new(false),
+        );
 
         assert_eq!(outcome.status, AgentToolStatus::Failed);
         assert_eq!(
@@ -1221,7 +1890,11 @@ mod tests {
         )
         .expect("typed error response");
 
-        let outcome = remote_rpc_tool_result("remote_shell", response, &AtomicBool::new(false));
+        let outcome = remote_rpc_tool_result(
+            "remote_shell",
+            ObjectRpcSessionResult::value(response),
+            &AtomicBool::new(false),
+        );
 
         assert_eq!(outcome.status, AgentToolStatus::Failed);
         assert_eq!(
@@ -1253,34 +1926,40 @@ mod tests {
         let received_for_transport = Arc::clone(&received);
         let transport: Arc<dyn AgentRemoteObjectRpcTransport> = Arc::new(
             TargetAwareAgentRemoteObjectRpcTransport::new(
-                move |_target_node_id: Option<&str>,
-                      _route_key: Option<&str>,
-                      request: ObjectRpcRequest| {
-                    let request: RemoteManagementSystemObserveRequest =
-                        request.decode_body().map_err(|error| error.to_string())?;
-                    *received_for_transport.lock().expect("received lock") = Some(request);
-                    let mut observation =
-                        sinomo_runtime::remote_management::RemoteManagementSystemObservation::default();
-                    observation.devices.push(
-                        sinomo_runtime::remote_management::RemoteManagementDeviceObservation {
-                            id: "camera.verified".to_string(),
-                            kind: "camera".to_string(),
-                            name: "Verified camera".to_string(),
-                            capabilities: vec!["capture".to_string()],
-                            state: Some("available".to_string()),
-                        },
-                    );
-                    observation.resource_exposure_policies.push(
-                        sinomo_runtime::remote_management::RemoteManagementResourceExposurePolicy {
-                            resource_id: "camera.policy-only".to_string(),
-                            allowed_operations: vec!["observe".to_string()],
-                        },
-                    );
-                    ObjectRpcResponse::encode_body(
-                        REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE,
-                        &RemoteManagementSystemObserveResponse::success(observation),
-                    )
-                    .map_err(|error| error.to_string())
+                move |_target_node_id: Option<String>,
+                      _route_key: Option<String>,
+                      call: ObjectRpcSessionCall| {
+                    let received = Arc::clone(&received_for_transport);
+                    Box::pin(async move {
+                        assert!(call.body.is_empty());
+                        let request: RemoteManagementSystemObserveRequest = call
+                            .request
+                            .decode_body()
+                            .map_err(|error| error.to_string())?;
+                        *received.lock().expect("received lock") = Some(request);
+                        let mut observation = sinomo_runtime::remote_management::RemoteManagementSystemObservation::default();
+                        observation.devices.push(
+                            sinomo_runtime::remote_management::RemoteManagementDeviceObservation {
+                                id: "camera.verified".to_string(),
+                                kind: "camera".to_string(),
+                                name: "Verified camera".to_string(),
+                                capabilities: vec!["capture".to_string()],
+                                state: Some("available".to_string()),
+                            },
+                        );
+                        observation.resource_exposure_policies.push(
+                            sinomo_runtime::remote_management::RemoteManagementResourceExposurePolicy {
+                                resource_id: "camera.policy-only".to_string(),
+                                allowed_operations: vec!["observe".to_string()],
+                            },
+                        );
+                        let response = ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE,
+                            &RemoteManagementSystemObserveResponse::success(observation),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(ObjectRpcSessionResult::value(response))
+                    }) as AgentRemoteObjectRpcFuture<'static>
                 },
             ),
         );

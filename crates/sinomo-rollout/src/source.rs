@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER: &str = "crates/sinomo-app";
-const MANAGED_SIBLING_SOURCE_REPOS: &[&str] = &["sui"];
 const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
 const ROLLOUT_NATIVE_DYLIB_TARGET_DIR: &str = "rollout-native-dylib";
 
@@ -318,18 +316,28 @@ pub fn rollout_build_dev_native_dylib_module(
 }
 
 fn rollout_binary_build_args() -> Vec<String> {
-    vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()]
+    vec![
+        "build".to_string(),
+        "--locked".to_string(),
+        "-p".to_string(),
+        "sinomo".to_string(),
+    ]
 }
 
 #[cfg(test)]
 fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+    let mut args = vec![
+        "build".to_string(),
+        "--locked".to_string(),
+        "-p".to_string(),
+        "sinomo".to_string(),
+    ];
     append_native_dylib_module_build_args(&mut args, modules);
     args
 }
 
 fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec!["build".to_string()];
+    let mut args = vec!["build".to_string(), "--locked".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
     args
 }
@@ -337,6 +345,7 @@ fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> V
 fn rollout_single_module_build_args(module: &SelfRolloutNativeDylibModuleBuild) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
+        "--locked".to_string(),
         "-p".to_string(),
         module.package.clone(),
     ];
@@ -455,65 +464,18 @@ fn rollout_build_process_error(command: String, build: &std::process::Output) ->
     }
 }
 
-/// Restores temporary rollout workspace/lockfile preparation when dropped.
+/// Restores the rollout lockfile snapshot when dropped.
 ///
 /// Cluster build hosts use this guard around the compiler executor while
 /// keeping artifact construction and caching outside the rollout path.
 pub struct RolloutBuildSourceGuards {
-    _workspace_manifest: RolloutBuildWorkspaceManifest,
     _lockfile: RolloutBuildLockfileGuard,
 }
 
 pub fn prepare_rollout_build_source(repo: &Path) -> Result<RolloutBuildSourceGuards, RolloutError> {
     let lockfile = RolloutBuildLockfileGuard::capture(repo)?;
-    let workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
     Ok(RolloutBuildSourceGuards {
-        _workspace_manifest: workspace_manifest,
         _lockfile: lockfile,
-    })
-}
-
-struct RolloutBuildWorkspaceManifest {
-    path: PathBuf,
-    original: Option<String>,
-}
-
-impl Drop for RolloutBuildWorkspaceManifest {
-    fn drop(&mut self) {
-        if let Some(original) = self.original.take() {
-            let _ = fs::write(&self.path, original);
-        }
-    }
-}
-
-fn prepare_rollout_build_workspace_manifest(
-    repo: &Path,
-) -> Result<RolloutBuildWorkspaceManifest, RolloutError> {
-    let path = repo.join("Cargo.toml");
-    let original = fs::read_to_string(&path).map_err(|source| RolloutError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if rollout_build_sibling_gui_dependencies_available(repo) {
-        return Ok(RolloutBuildWorkspaceManifest {
-            path,
-            original: None,
-        });
-    }
-    let patched = rollout_build_workspace_manifest(&original);
-    if patched == original {
-        return Ok(RolloutBuildWorkspaceManifest {
-            path,
-            original: None,
-        });
-    }
-    fs::write(&path, patched).map_err(|source| RolloutError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(RolloutBuildWorkspaceManifest {
-        path,
-        original: Some(original),
     })
 }
 
@@ -552,105 +514,6 @@ impl Drop for RolloutBuildLockfileGuard {
             },
         }
     }
-}
-
-fn rollout_build_sibling_gui_dependencies_available(repo: &Path) -> bool {
-    let Some(parent) = repo.parent() else {
-        return false;
-    };
-    let sibling = parent.join("sui");
-    sibling
-        .join("crates")
-        .join("sui")
-        .join("Cargo.toml")
-        .exists()
-        && sibling
-            .join("crates")
-            .join("sui-testing")
-            .join("Cargo.toml")
-            .exists()
-}
-
-fn rollout_build_workspace_manifest(original: &str) -> String {
-    let without_default_member =
-        remove_rollout_build_default_member(original, ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER);
-    if workspace_manifest_excludes_member(
-        &without_default_member,
-        ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER,
-    ) {
-        return without_default_member;
-    }
-
-    let mut patched = String::with_capacity(
-        without_default_member.len() + ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER.len() + 32,
-    );
-    let mut inserted = false;
-    for line in without_default_member.split_inclusive('\n') {
-        patched.push_str(line);
-        if !inserted && line.trim() == "[workspace]" {
-            patched.push_str("exclude = [\n    \"");
-            patched.push_str(ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER);
-            patched.push_str("\",\n]\n");
-            inserted = true;
-        }
-    }
-    if inserted {
-        patched
-    } else {
-        without_default_member
-    }
-}
-
-fn remove_rollout_build_default_member(original: &str, member: &str) -> String {
-    let mut patched = String::with_capacity(original.len());
-    let mut in_default_members = false;
-    let member_line = format!("\"{member}\",");
-    for line in original.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.starts_with("default-members") && trimmed.ends_with('[') {
-            in_default_members = true;
-            patched.push_str(line);
-            continue;
-        }
-        if in_default_members && trimmed == member_line {
-            continue;
-        }
-        if in_default_members && trimmed == "]" {
-            in_default_members = false;
-        }
-        patched.push_str(line);
-    }
-    patched
-}
-
-fn workspace_manifest_excludes_member(manifest: &str, member: &str) -> bool {
-    let member_line = format!("\"{member}\",");
-    let mut in_workspace = false;
-    let mut in_exclude = false;
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[workspace]" {
-            in_workspace = true;
-            continue;
-        }
-        if in_workspace && trimmed.starts_with('[') {
-            return false;
-        }
-        if !in_workspace {
-            continue;
-        }
-        if trimmed.starts_with("exclude") && trimmed.ends_with('[') {
-            in_exclude = true;
-            continue;
-        }
-        if in_exclude && trimmed == member_line {
-            return true;
-        }
-        if in_exclude && trimmed == "]" {
-            in_exclude = false;
-        }
-    }
-    false
 }
 
 pub fn prepare_rollout_dev_binary(
@@ -804,11 +667,11 @@ pub fn deploy_managed_source_repo_with_options(
     options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
     if same_path_if_exists(source_repo, &paths.source_repo) {
-        return sync_managed_sibling_source_repos(paths, source_repo, options);
+        return Ok(());
     }
     if paths.source_repo.join(".git").exists() {
         merge_external_repo_into_managed(paths, source_repo, options)?;
-        return sync_managed_sibling_source_repos(paths, source_repo, options);
+        return Ok(());
     }
     let Some(parent) = paths.source_repo.parent() else {
         return Err(RolloutError::Io {
@@ -856,8 +719,7 @@ pub fn deploy_managed_source_repo_with_options(
         detail: source.to_string(),
     })?;
     remove_all_git_remotes(&paths.source_repo)?;
-    remove_dir_if_exists(&previous)?;
-    sync_managed_sibling_source_repos(paths, source_repo, options)
+    remove_dir_if_exists(&previous)
 }
 
 pub fn sync_external_repo_from_managed(
@@ -1077,100 +939,6 @@ pub struct RolloutStatusView {
     pub main_binary_exists: bool,
     pub shadow_binary_exists: bool,
     pub source_status: ManagedSourceStatus,
-}
-
-fn sync_managed_sibling_source_repos(
-    paths: &SelfRolloutPaths,
-    source_repo: &Path,
-    options: ManagedSourceDeployOptions,
-) -> Result<(), RolloutError> {
-    let Some(source_parent) = source_repo.parent() else {
-        return Ok(());
-    };
-    let Some(managed_parent) = paths.source_repo.parent() else {
-        return Err(RolloutError::Io {
-            path: paths.source_repo.display().to_string(),
-            detail: "managed source path has no parent".to_string(),
-        });
-    };
-
-    for sibling_name in MANAGED_SIBLING_SOURCE_REPOS {
-        let source_sibling = source_parent.join(sibling_name);
-        if !source_sibling.join(".git").exists() {
-            continue;
-        }
-        let managed_sibling = managed_parent.join(sibling_name);
-        deploy_managed_sibling_source_repo(&managed_sibling, &source_sibling, options)?;
-    }
-    Ok(())
-}
-
-fn deploy_managed_sibling_source_repo(
-    managed_repo: &Path,
-    source_repo: &Path,
-    options: ManagedSourceDeployOptions,
-) -> Result<(), RolloutError> {
-    if same_path_if_exists(source_repo, managed_repo) {
-        return Ok(());
-    }
-    if managed_repo.join(".git").exists() {
-        require_git_repo(managed_repo, "managed sibling source repo")?;
-        require_git_repo(source_repo, "sibling source repo")?;
-        merge_repo_head(
-            managed_repo,
-            source_repo,
-            "sinomo-external-sibling",
-            options,
-        )?;
-        return remove_all_git_remotes(managed_repo);
-    }
-    let Some(parent) = managed_repo.parent() else {
-        return Err(RolloutError::Io {
-            path: managed_repo.display().to_string(),
-            detail: "managed sibling source path has no parent".to_string(),
-        });
-    };
-    fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
-        path: parent.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let next = managed_repo.with_extension("next");
-    let previous = managed_repo.with_extension("previous");
-    remove_dir_if_exists(&next)?;
-    let output = rollout_child_command("git")
-        .arg("clone")
-        .arg("--no-hardlinks")
-        .arg(source_repo)
-        .arg(&next)
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: "git clone sibling source".to_string(),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(RolloutError::Process {
-            command: format!(
-                "git clone --no-hardlinks {} {}",
-                source_repo.display(),
-                next.display()
-            ),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    remove_dir_if_exists(&previous)?;
-    if managed_repo.exists() {
-        fs::rename(managed_repo, &previous).map_err(|source| RolloutError::Io {
-            path: format!("{} -> {}", managed_repo.display(), previous.display()),
-            detail: source.to_string(),
-        })?;
-    }
-    fs::rename(&next, managed_repo).map_err(|source| RolloutError::Io {
-        path: format!("{} -> {}", next.display(), managed_repo.display()),
-        detail: source.to_string(),
-    })?;
-    remove_all_git_remotes(managed_repo)?;
-    remove_dir_if_exists(&previous)
 }
 
 fn merge_external_repo_into_managed(
@@ -1420,11 +1188,15 @@ mod tests {
             source: "test".to_string(),
         };
 
-        assert_eq!(rollout_binary_build_args(), vec!["build", "-p", "sinomo"]);
+        assert_eq!(
+            rollout_binary_build_args(),
+            vec!["build", "--locked", "-p", "sinomo"]
+        );
         assert_eq!(
             rollout_build_args(std::slice::from_ref(&module)),
             vec![
                 "build",
+                "--locked",
                 "-p",
                 "sinomo",
                 "-p",
@@ -1437,6 +1209,7 @@ mod tests {
             rollout_module_build_args(std::slice::from_ref(&module)),
             vec![
                 "build",
+                "--locked",
                 "-p",
                 "sinomo-test-module",
                 "--features",
@@ -1447,6 +1220,7 @@ mod tests {
             rollout_single_module_build_args(&module),
             vec![
                 "build",
+                "--locked",
                 "-p",
                 "sinomo-test-module",
                 "--features",
@@ -1495,7 +1269,12 @@ mod tests {
         run_git_for_test(&root, &["add", "README.md"]);
         run_git_for_test(&root, &["commit", "-m", "init"]);
 
-        let args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+        let args = vec![
+            "build".to_string(),
+            "--locked".to_string(),
+            "-p".to_string(),
+            "sinomo".to_string(),
+        ];
         let target_dir = root.join("target").join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR);
         let command =
             rollout_cargo_build_command(&root, &args, Some(&target_dir)).expect("command");
@@ -1517,7 +1296,7 @@ mod tests {
         assert_eq!(
             rollout_cargo_build_log_command(&args, Some(&target_dir)),
             format!(
-                "CARGO_TARGET_DIR={} cargo build -p sinomo",
+                "CARGO_TARGET_DIR={} cargo build --locked -p sinomo",
                 target_dir.display()
             )
         );
@@ -1590,47 +1369,19 @@ mod tests {
     }
 
     #[test]
-    fn rollout_build_workspace_manifest_excludes_app_crate() {
-        let original = r#"[workspace]
-resolver = "3"
-
-members = [
-    "crates/*",
-    "modules/*/*",
-]
-
-default-members = [
-    "crates/sinomo",
-    "crates/sinomo-app",
-    "crates/sinomo-cli",
-]
-"#;
-
-        let patched = rollout_build_workspace_manifest(original);
-
-        assert!(patched.contains("exclude = [\n    \"crates/sinomo-app\",\n]\n"));
-        assert!(patched.contains("    \"crates/*\",\n"));
-        assert!(patched.contains("    \"crates/sinomo\",\n"));
-        assert!(patched.contains("    \"crates/sinomo-cli\",\n"));
-        assert_eq!(patched.matches("\"crates/sinomo-app\",").count(), 1);
-    }
-
-    #[test]
-    fn rollout_build_workspace_manifest_guard_restores_original_manifest() {
-        let root = unique_temp("sinomo-rollout-build-manifest");
+    fn rollout_build_source_guard_leaves_workspace_manifest_untouched() {
+        let root = unique_temp("sinomo-rollout-build-source");
         let manifest = root.join("Cargo.toml");
         let original =
             "[workspace]\nresolver = \"3\"\ndefault-members = [\n    \"crates/sinomo-app\",\n]\n";
         fs::write(&manifest, original).expect("manifest");
 
         {
-            let _guard = prepare_rollout_build_workspace_manifest(&root).expect("guard");
-            let patched = fs::read_to_string(&manifest).expect("patched");
-            assert_ne!(patched, original);
-            assert!(patched.contains("exclude = [\n    \"crates/sinomo-app\",\n]\n"));
+            let _guard = prepare_rollout_build_source(&root).expect("guard");
+            assert_eq!(fs::read_to_string(&manifest).expect("manifest"), original);
         }
 
-        assert_eq!(fs::read_to_string(&manifest).expect("restored"), original);
+        assert_eq!(fs::read_to_string(&manifest).expect("manifest"), original);
     }
 
     #[test]
@@ -1646,46 +1397,6 @@ default-members = [
         }
 
         assert_eq!(fs::read(&lockfile).expect("restored"), original);
-    }
-
-    #[test]
-    fn rollout_build_manifest_guard_keeps_app_when_sui_sibling_exists() {
-        let root = unique_temp("sinomo-rollout-build-manifest-sui");
-        let repo = root.join("sinomo");
-        let manifest = repo.join("Cargo.toml");
-        let original =
-            "[workspace]\nresolver = \"3\"\ndefault-members = [\n    \"crates/sinomo-app\",\n]\n";
-        fs::create_dir_all(&repo).expect("repo");
-        fs::write(&manifest, original).expect("manifest");
-        fs::create_dir_all(root.join("sui").join("crates").join("sui")).expect("sui crate");
-        fs::create_dir_all(root.join("sui").join("crates").join("sui-testing"))
-            .expect("sui-testing crate");
-        fs::write(
-            root.join("sui")
-                .join("crates")
-                .join("sui")
-                .join("Cargo.toml"),
-            "[package]\nname = \"sui\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .expect("sui manifest");
-        fs::write(
-            root.join("sui")
-                .join("crates")
-                .join("sui-testing")
-                .join("Cargo.toml"),
-            "[package]\nname = \"sui-testing\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .expect("sui-testing manifest");
-
-        {
-            let _guard = prepare_rollout_build_workspace_manifest(&repo).expect("guard");
-            assert_eq!(
-                fs::read_to_string(&manifest).expect("unchanged manifest"),
-                original
-            );
-        }
-
-        assert_eq!(fs::read_to_string(&manifest).expect("restored"), original);
     }
 
     #[test]
@@ -1953,7 +1664,7 @@ default-members = [
     }
 
     #[test]
-    fn deploy_managed_source_repo_syncs_known_sui_sibling() {
+    fn deploy_managed_source_repo_ignores_sibling_repositories() {
         let root = unique_temp("sinomo-rollout-source-sibling");
         let external_root = root.join("external");
         let external = external_root.join("sinomo");
@@ -1987,9 +1698,6 @@ default-members = [
         run_git_for_test(&external_sui, &["config", "user.name", "Sinomo Test"]);
         run_git_for_test(&external_sui, &["add", "-A"]);
         run_git_for_test(&external_sui, &["commit", "-m", "initial"]);
-        let expected_sui_head =
-            git_one_line(&external_sui, &["rev-parse", "HEAD"]).expect("sui head");
-
         let paths = SelfRolloutPaths::new(&data);
         deploy_managed_source_repo(&paths, &external).expect("deploy");
         let managed_sui = paths
@@ -1997,19 +1705,8 @@ default-members = [
             .parent()
             .expect("managed source parent")
             .join("sui");
-        let managed_sui_head =
-            git_one_line(&managed_sui, &["rev-parse", "HEAD"]).expect("managed sui head");
-        let managed_sui_remotes = git_lines(&managed_sui, &["remote"]).expect("managed remotes");
 
-        assert_eq!(managed_sui_head, expected_sui_head);
-        assert!(
-            managed_sui
-                .join("crates")
-                .join("sui")
-                .join("Cargo.toml")
-                .exists()
-        );
-        assert!(managed_sui_remotes.is_empty());
+        assert!(!managed_sui.exists());
     }
 
     fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {

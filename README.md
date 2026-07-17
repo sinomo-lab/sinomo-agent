@@ -35,15 +35,10 @@ operator guides, subsystem designs, specifications, plans, and research notes.
 - Docker with Compose, only for the containerized cluster and Android
   workflows.
 
-The desktop app uses the separate [SUI](https://git.sinomo.net/sinomo/sui)
-workspace through a relative path dependency. Check out `sinomo` and `sui` as
-siblings before building `sinomo-app` or the full workspace:
-
-```text
-parent/
-├── sinomo/
-└── sui/
-```
+The desktop app tracks the public
+[SUI](https://github.com/sinomo-lab/sui) `main` branch. Cargo fetches it as a
+Git dependency, while `Cargo.lock` records the reviewed commit used by
+reproducible builds; no sibling checkout is required.
 
 Platform development libraries used by SUI/wgpu and the native audio and video
 backends must also be available when building the desktop app.
@@ -85,8 +80,6 @@ families cover clusters, daemons, DFS, rollouts, models and providers, agents,
 skills, voice, usage, and runtime tests.
 
 ### Run the desktop app
-
-With the sibling SUI checkout in place:
 
 ```bash
 cargo run -p sinomo-app

@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-memory = { path = "../sinomo-memory" }
 sinomo-runtime = { path = "../sinomo-runtime" }

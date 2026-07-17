@@ -20,7 +20,7 @@ use sinomo_sandbox_wasix_api::{
     SandboxWasixNativeResponse, SandboxWasixRequestKind, SandboxWasixRunModuleRequest,
     SandboxWasixRunReplayFixtureRequest, SandboxWasixRunToolchainCommandRequest,
     SandboxWasixValidateComponentRequest, SinomoWasixByteBuffer, SinomoWasixByteSlice,
-    SinomoWasixHostApiV1, SinomoWasixStatusCode, decode_sobj, encode_sobj,
+    SinomoWasixHostApiV2, SinomoWasixStatusCode, decode_sobj, encode_sobj,
 };
 
 #[cfg(feature = "wasix-runtime")]
@@ -37,7 +37,7 @@ use crate::{
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(feature = "wasix-runtime"), allow(dead_code))]
-struct StoredHostApi(SinomoWasixHostApiV1);
+struct StoredHostApi(SinomoWasixHostApiV2);
 
 unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
@@ -57,7 +57,7 @@ pub extern "C" fn sinomo_module_descriptor(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_init(host: SinomoWasixHostApiV1) -> SinomoWasixStatusCode {
+pub extern "C" fn sinomo_module_init(host: SinomoWasixHostApiV2) -> SinomoWasixStatusCode {
     if host.abi_version != SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION {
         return SINOMO_WASIX_STATUS_UNSUPPORTED_ABI;
     }
@@ -180,6 +180,7 @@ fn invoke_wasix_operation_response(
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
             operation: SINOMO_SANDBOX_WASIX_OPERATION.to_string(),
             payload_sobj,
+            response_body: None,
         }),
         Err(error) => NativeModuleResponse::Error(native_error_response(
             "encode-wasix-response",
@@ -631,12 +632,13 @@ mod tests {
 
     fn install_test_host_api(cancelled: &AtomicBool) -> HostApiRestore {
         let mut api = HOST_API.lock().expect("host api lock");
-        let previous = api.replace(StoredHostApi(SinomoWasixHostApiV1 {
+        let previous = api.replace(StoredHostApi(SinomoWasixHostApiV2 {
             abi_version: SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION,
             user_data: cancelled as *const AtomicBool as *mut std::ffi::c_void,
             output_chunk: None,
             log: None,
             is_cancelled: Some(test_is_cancelled),
+            local_permission_granted: None,
         }));
         HostApiRestore(previous)
     }

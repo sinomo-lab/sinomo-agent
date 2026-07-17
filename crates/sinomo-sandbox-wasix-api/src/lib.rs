@@ -23,7 +23,7 @@ pub use sinomo_module_api::{
     SinomoModuleByteBuffer as SinomoWasixByteBuffer, SinomoModuleByteSlice as SinomoWasixByteSlice,
     SinomoModuleDescriptorFn as SinomoWasixDescriptorFn,
     SinomoModuleFreeBufferFn as SinomoWasixFreeBufferFn,
-    SinomoModuleHostApiV1 as SinomoWasixHostApiV1,
+    SinomoModuleHostApiV2 as SinomoWasixHostApiV2,
     SinomoModuleHostIsCancelledFn as SinomoWasixHostIsCancelledFn,
     SinomoModuleHostLogFn as SinomoWasixHostLogFn,
     SinomoModuleHostOutputFn as SinomoWasixHostOutputChunkFn,

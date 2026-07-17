@@ -7,27 +7,34 @@ use sinomo_cli_registry::{
     CliCommandMetadata, CliCommandPolicy, CliParseError,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{
+    ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResult,
+};
 use sinomo_core::node::{LocalNodePermissionStore, LocalNodePermissions};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::fs::{self, File};
+use std::future::Future;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncReadExt as _;
 
 const REMOTE_CLI_POLICY: CliCommandPolicy = CliCommandPolicy::local_capable();
 const NODE_PERMISSIONS_CLI_POLICY: CliCommandPolicy = CliCommandPolicy::local_capable();
-const TRANSFER_WRITE_ATTEMPTS: usize = 3;
+const FILE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Target-aware object-RPC function injected by the CLI composition root.
 ///
 /// `None` selects the receiving/local node. A concrete node ID asks the
 /// composition root to route the request to that node.
+pub type RemoteManagementCliRpcFuture =
+    Pin<Box<dyn Future<Output = Result<ObjectRpcSessionResult, String>> + Send + 'static>>;
 pub type RemoteManagementCliRpc =
-    Arc<dyn Fn(Option<&str>, ObjectRpcRequest) -> Result<ObjectRpcResponse, String> + Send + Sync>;
+    Arc<dyn Fn(Option<String>, ObjectRpcSessionCall) -> RemoteManagementCliRpcFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct RemoteManagementCliCommandHandler {
@@ -44,23 +51,14 @@ impl fmt::Debug for RemoteManagementCliCommandHandler {
 
 /// Constructs the registered `remote` command around a target-aware RPC
 /// function. The handler contains no direct host-management fallback.
-pub fn remote_cli_command_handler(
-    rpc: impl Fn(Option<&str>, ObjectRpcRequest) -> Result<ObjectRpcResponse, String>
-    + Send
-    + Sync
-    + 'static,
-) -> RemoteManagementCliCommandHandler {
-    RemoteManagementCliCommandHandler { rpc: Arc::new(rpc) }
-}
-
-/// Compatibility spelling for [`remote_cli_command_handler`].
-pub fn remote_cli_command_handler_with_rpc(
-    rpc: impl Fn(Option<&str>, ObjectRpcRequest) -> Result<ObjectRpcResponse, String>
-    + Send
-    + Sync
-    + 'static,
-) -> RemoteManagementCliCommandHandler {
-    remote_cli_command_handler(rpc)
+pub fn remote_cli_command_handler<F, Fut>(rpc: F) -> RemoteManagementCliCommandHandler
+where
+    F: Fn(Option<String>, ObjectRpcSessionCall) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ObjectRpcSessionResult, String>> + Send + 'static,
+{
+    RemoteManagementCliCommandHandler {
+        rpc: Arc::new(move |target, call| Box::pin(rpc(target, call))),
+    }
 }
 
 impl CliCommandHandler for RemoteManagementCliCommandHandler {
@@ -244,6 +242,7 @@ struct RemoteGetOptions {
     remote_path: String,
     local_path: PathBuf,
     create_parent: bool,
+    overwrite: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -252,6 +251,7 @@ struct RemotePutOptions {
     local_path: PathBuf,
     remote_path: String,
     create_parent: bool,
+    overwrite: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,8 +319,8 @@ fn remote_cli_help() -> CliCommandHelp {
             "  sinomo remote shell [--cwd <path>] [--shell <path>] [--timeout-ms <ms>] [--max-output-bytes <n>] [--env <key=value>] [--target <node>] [--json] -- <quoted-command-string>",
             "  sinomo remote ls <remote-path> [--recursive] [--max-entries <n>] [--target <node>] [--json]",
             "  sinomo remote stat <remote-path> [--blake3] [--target <node>] [--json]",
-            "  sinomo remote get <remote-path> <local-path> [--create-parent] [--target <node>] [--json]",
-            "  sinomo remote put <local-path> <remote-path> [--create-parent] [--target <node>] [--json]",
+            "  sinomo remote get <remote-path> <local-path> [--create-parent] [--overwrite] [--target <node>] [--json]",
+            "  sinomo remote put <local-path> <remote-path> [--create-parent] [--overwrite] [--target <node>] [--json]",
             "  sinomo remote config catalog [--owner <owner>] [--target <node>] [--json]",
             "  sinomo remote config search <query> [--target <node>] [--json]",
             "  sinomo remote config get <key> [--target <node>] [--json]",
@@ -412,11 +412,13 @@ fn remote_cli_autocomplete() -> CliAutocompleteSpec {
             common[0].clone(),
             common[1].clone(),
             CliAutocompleteOption::flag("--create-parent", "create local parent directories"),
+            CliAutocompleteOption::flag("--overwrite", "replace an existing local file"),
         ]),
         CliAutocompleteSpec::new("put", "upload and verify a local file").with_options([
             common[0].clone(),
             common[1].clone(),
             CliAutocompleteOption::flag("--create-parent", "create remote parent directories"),
+            CliAutocompleteOption::flag("--overwrite", "replace an existing remote file"),
         ]),
         CliAutocompleteSpec::new("config", "read or write node configuration").with_children([
             CliAutocompleteSpec::new("catalog", "list configuration definitions").with_options([
@@ -704,6 +706,7 @@ fn parse_remote_get(args: &[String]) -> Result<RemoteGetOptions, CliParseError> 
         }
         match args[index].as_str() {
             "--create-parent" => options.create_parent = true,
+            "--overwrite" => options.overwrite = true,
             value if !value.starts_with('-') => paths.push(value.to_string()),
             _ => return Err(CliParseError::Usage),
         }
@@ -728,6 +731,7 @@ fn parse_remote_put(args: &[String]) -> Result<RemotePutOptions, CliParseError> 
         }
         match args[index].as_str() {
             "--create-parent" => options.create_parent = true,
+            "--overwrite" => options.overwrite = true,
             value if !value.starts_with('-') => paths.push(value.to_string()),
             _ => return Err(CliParseError::Usage),
         }
@@ -1140,7 +1144,7 @@ fn run_remote_shell(
         request = request.with_timeout_ms(timeout_ms.clamp(1, MAX_COMMAND_TIMEOUT_MS));
     }
     if let Some(max_output_bytes) = options.max_output_bytes {
-        request = request.with_max_output_bytes(max_output_bytes.min(MAX_OUTPUT_BYTES));
+        request = request.with_max_output_bytes(max_output_bytes.min(MAX_SHELL_CAPTURE_BYTES));
     }
     for (key, value) in options.env {
         request = request.with_env(key, value);
@@ -1351,7 +1355,7 @@ struct RemoteTransferReport {
     destination: String,
     bytes: u64,
     blake3: String,
-    chunks: usize,
+    sessions: usize,
 }
 
 fn run_remote_get(
@@ -1359,10 +1363,6 @@ fn run_remote_get(
     rpc: &RemoteManagementCliRpc,
     options: RemoteGetOptions,
 ) -> Result<(), CliCommandError> {
-    let target = options.common.target.as_deref();
-    let initial_stat = fetch_remote_stat(rpc, target, &options.remote_path, true)?;
-    let (expected_len, expected_hash) = verified_file_identity(&initial_stat)?;
-
     if options.create_parent
         && let Some(parent) = options.local_path.parent()
     {
@@ -1374,77 +1374,80 @@ fn run_remote_get(
         })?;
     }
     let temp_path = TransferTempPath::new(&options.local_path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp_path.path())
+    let mut file = sinomo_core::storage::durable_file::create_private_staged_file(temp_path.path())
         .map_err(|source| {
             CliCommandError::new(format!(
                 "failed to create transfer file {}: {source}",
                 temp_path.path().display()
             ))
         })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut offset = 0_u64;
-    let mut chunks = 0_usize;
-    while offset < expected_len {
-        let request = RemoteManagementFileReadRequest::new(options.remote_path.clone())
-            .with_offset(offset)
-            .with_max_bytes(MAX_FILE_READ_BYTES);
-        let response: RemoteManagementFileReadResponse = remote_rpc(
-            rpc,
-            target,
-            REMOTE_MANAGEMENT_FS_READ_ROUTE,
-            REMOTE_MANAGEMENT_RPC_CATEGORY,
-            &request,
-        )?;
-        let content = response.into_result().map_err(command_error)?;
-        if content.path != options.remote_path {
-            return Err(CliCommandError::new(format!(
-                "remote read returned path `{}` while reading `{}`",
-                content.path, options.remote_path
-            )));
-        }
-        if content.len != expected_len {
-            return Err(CliCommandError::new(format!(
-                "remote file length changed during download: expected {expected_len}, got {}",
-                content.len
-            )));
-        }
-        if content.bytes.is_empty() {
-            return Err(CliCommandError::new(format!(
-                "remote read made no progress at offset {offset}"
-            )));
-        }
-        if content.bytes.len() > MAX_FILE_READ_BYTES {
-            return Err(CliCommandError::new(format!(
-                "remote read returned {} bytes; maximum is {MAX_FILE_READ_BYTES}",
-                content.bytes.len()
-            )));
-        }
-        let next_offset = offset
-            .checked_add(content.bytes.len() as u64)
-            .ok_or_else(|| CliCommandError::new("remote read offset overflow"))?;
-        if next_offset > expected_len {
-            return Err(CliCommandError::new(format!(
-                "remote read exceeded expected file length {expected_len}"
-            )));
-        }
-        if next_offset < expected_len && !content.truncated {
-            return Err(CliCommandError::new(
-                "remote read reported end-of-file before the advertised length",
+    let request = RemoteManagementFileReadRequest::new(options.remote_path.clone());
+    request.validate().map_err(command_error)?;
+    let head = ObjectRpcRequest::encode_body(
+        REMOTE_MANAGEMENT_FS_READ_ROUTE,
+        REMOTE_MANAGEMENT_RPC_CATEGORY,
+        &request,
+    )
+    .map_err(command_error)?;
+    let target = options.common.target.clone();
+    let remote_path = options.remote_path.clone();
+    let transfer_path = temp_path.path().to_path_buf();
+    let (expected_len, expected_hash, actual_hash) = run_remote_session(async {
+        let result = rpc(target, ObjectRpcSessionCall::value(head))
+            .await
+            .map_err(|error| {
+                format!("remote RPC {REMOTE_MANAGEMENT_FS_READ_ROUTE} failed: {error}")
+            })?;
+        let (response, mut body) = result.into_parts();
+        validate_response_route(&response, REMOTE_MANAGEMENT_FS_READ_ROUTE)?;
+        let response: RemoteManagementFileReadResponse =
+            response.decode_body().map_err(|error| {
+                format!("failed to decode {REMOTE_MANAGEMENT_FS_READ_ROUTE} response: {error}")
+            })?;
+        let transfer = response.into_result().map_err(|error| error.to_string())?;
+        validate_transfer_head(&transfer, &remote_path)?;
+        if body
+            .total_bytes()
+            .is_some_and(|length| length != transfer.length)
+        {
+            return Err(format!(
+                "remote response attachment declared {} bytes but the typed head declared {}",
+                body.total_bytes().unwrap_or_default(),
+                transfer.length
             ));
         }
-        file.write_all(&content.bytes).map_err(|source| {
-            CliCommandError::new(format!(
-                "failed to write local transfer file {}: {source}",
-                temp_path.path().display()
-            ))
-        })?;
-        hasher.update(&content.bytes);
-        offset = next_offset;
-        chunks += 1;
-    }
+        let mut hasher = blake3::Hasher::new();
+        let mut length = 0_u64;
+        let mut buffer = vec![0_u8; FILE_COPY_BUFFER_BYTES];
+        loop {
+            let read = body
+                .read(&mut buffer)
+                .await
+                .map_err(|source| format!("read remote response attachment: {source}"))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read]).map_err(|source| {
+                format!(
+                    "write local transfer file {}: {source}",
+                    transfer_path.display()
+                )
+            })?;
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(|| "downloaded file length exceeded u64".to_string())?;
+            hasher.update(&buffer[..read]);
+        }
+        let actual_hash = hasher.finalize().to_hex().to_string();
+        if length != transfer.length {
+            return Err(format!(
+                "downloaded file length mismatch: expected {}, got {length}",
+                transfer.length
+            ));
+        }
+        ensure_hash_matches_string("downloaded file", &transfer.blake3, &actual_hash)?;
+        Ok((transfer.length, transfer.blake3, actual_hash))
+    })?;
     file.sync_all().map_err(|source| {
         CliCommandError::new(format!(
             "failed to sync local transfer file {}: {source}",
@@ -1452,19 +1455,8 @@ fn run_remote_get(
         ))
     })?;
     drop(file);
-
-    let actual_hash = hasher.finalize().to_hex().to_string();
     ensure_hash_matches("downloaded file", &expected_hash, &actual_hash)?;
-    let final_stat = fetch_remote_stat(rpc, target, &options.remote_path, true)?;
-    let (final_len, final_hash) = verified_file_identity(&final_stat)?;
-    if final_len != expected_len
-        || normalize_blake3(&final_hash) != normalize_blake3(&expected_hash)
-    {
-        return Err(CliCommandError::new(
-            "remote file changed while it was being downloaded",
-        ));
-    }
-    temp_path.commit(&options.local_path)?;
+    temp_path.commit(&options.local_path, options.overwrite)?;
 
     let report = RemoteTransferReport {
         direction: "get",
@@ -1472,7 +1464,7 @@ fn run_remote_get(
         destination: options.local_path.display().to_string(),
         bytes: expected_len,
         blake3: actual_hash,
-        chunks,
+        sessions: 1,
     };
     print_transfer_report(context, report, options.common.json)
 }
@@ -1482,17 +1474,9 @@ fn run_remote_put(
     rpc: &RemoteManagementCliRpc,
     options: RemotePutOptions,
 ) -> Result<(), CliCommandError> {
-    // Open first so a path replacement cannot redirect later reads to a
-    // different inode/handle after validation.
-    let mut file = File::open(&options.local_path).map_err(|source| {
+    let metadata = fs::metadata(&options.local_path).map_err(|source| {
         CliCommandError::new(format!(
-            "failed to open local file {}: {source}",
-            options.local_path.display()
-        ))
-    })?;
-    let metadata = file.metadata().map_err(|source| {
-        CliCommandError::new(format!(
-            "failed to inspect opened local file {}: {source}",
+            "failed to inspect local file {}: {source}",
             options.local_path.display()
         ))
     })?;
@@ -1503,96 +1487,61 @@ fn run_remote_put(
         )));
     }
     let expected_len = metadata.len();
-    let (snapshot_len, snapshot_hash) = hash_open_local_file(&mut file, &options.local_path)?;
+    let (snapshot_len, local_hash) = hash_local_file(&options.local_path)?;
     if snapshot_len != expected_len {
         return Err(CliCommandError::new(format!(
             "local file changed before upload: metadata reported {expected_len} bytes, read {snapshot_len}"
         )));
     }
-    let mut buffer = vec![0_u8; MAX_FILE_WRITE_BYTES];
-    let mut hasher = blake3::Hasher::new();
-    let mut offset = 0_u64;
-    let mut chunks = 0_usize;
-    loop {
-        let read = file.read(&mut buffer).map_err(|source| {
-            CliCommandError::new(format!(
-                "failed to read local file {}: {source}",
-                options.local_path.display()
-            ))
-        })?;
-        if read == 0 && (offset != 0 || chunks != 0) {
-            break;
-        }
-        let bytes = buffer[..read].to_vec();
-        hasher.update(&bytes);
-        let request =
-            RemoteManagementFileWriteRequest::chunk(options.remote_path.clone(), offset, bytes)
-                .creating_parent(options.create_parent)
-                .truncating(offset == 0);
-        request.validate().map_err(command_error)?;
-        let response: RemoteManagementFileWriteResponse = remote_rpc_with_attempts(
-            rpc,
-            options.common.target.as_deref(),
-            REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
-            REMOTE_MANAGEMENT_RPC_CATEGORY,
-            &request,
-            TRANSFER_WRITE_ATTEMPTS,
-        )?;
-        let written = response.into_result().map_err(command_error)?;
-        let next_offset = offset
-            .checked_add(read as u64)
-            .ok_or_else(|| CliCommandError::new("remote write offset overflow"))?;
-        if written.path != options.remote_path
-            || written.bytes_written != read as u64
-            || written.offset != Some(offset)
-            || written.next_offset != Some(next_offset)
-            || written.len != Some(next_offset)
-        {
-            return Err(CliCommandError::new(format!(
-                "remote write did not acknowledge retry-safe chunk offset {offset} length {read}"
-            )));
-        }
-        offset = next_offset;
-        chunks += 1;
-        if read == 0 {
-            break;
-        }
-    }
-    if offset != expected_len {
+    let request = RemoteManagementFileWriteRequest::new(
+        options.remote_path.clone(),
+        expected_len,
+        local_hash.clone(),
+    )
+    .creating_parent(options.create_parent)
+    .overwriting(options.overwrite);
+    request.validate().map_err(command_error)?;
+    let head = ObjectRpcRequest::encode_body(
+        REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
+        REMOTE_MANAGEMENT_RPC_CATEGORY,
+        &request,
+    )
+    .map_err(command_error)?;
+    let body = ObjectRpcBodySource::file(options.local_path.clone()).map_err(command_error)?;
+    if body.total_bytes() != Some(expected_len) {
         return Err(CliCommandError::new(format!(
-            "local file changed while uploading: expected {expected_len} bytes, read {offset}"
+            "local file changed before upload session: expected {expected_len} bytes, found {}",
+            body.total_bytes().unwrap_or_default()
         )));
     }
-    let local_hash = hasher.finalize().to_hex().to_string();
-    let final_metadata = file.metadata().map_err(|source| {
-        CliCommandError::new(format!(
-            "failed to reinspect opened local file {}: {source}",
-            options.local_path.display()
-        ))
+    let target = options.common.target.clone();
+    let remote_path = options.remote_path.clone();
+    let written = run_remote_session(async {
+        let result = rpc(target, ObjectRpcSessionCall::new(head, body))
+            .await
+            .map_err(|error| {
+                format!("remote RPC {REMOTE_MANAGEMENT_FS_WRITE_ROUTE} failed: {error}")
+            })?;
+        let (response, response_body) = result.into_parts();
+        validate_response_route(&response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
+        if !response_body.is_empty() {
+            return Err("remote file write unexpectedly returned an attachment".to_string());
+        }
+        let response: RemoteManagementFileWriteResponse =
+            response.decode_body().map_err(|error| {
+                format!("failed to decode {REMOTE_MANAGEMENT_FS_WRITE_ROUTE} response: {error}")
+            })?;
+        let written = response.into_result().map_err(|error| error.to_string())?;
+        validate_transfer_head(&written, &remote_path)?;
+        Ok(written)
     })?;
-    let (final_len, final_hash) = hash_open_local_file(&mut file, &options.local_path)?;
-    if final_metadata.len() != expected_len
-        || final_len != expected_len
-        || normalize_blake3(&snapshot_hash) != normalize_blake3(&local_hash)
-        || normalize_blake3(&final_hash) != normalize_blake3(&local_hash)
-    {
-        return Err(CliCommandError::new(
-            "local file changed while it was being uploaded",
-        ));
-    }
-    let stat = fetch_remote_stat(
-        rpc,
-        options.common.target.as_deref(),
-        &options.remote_path,
-        true,
-    )?;
-    let (remote_len, remote_hash) = verified_file_identity(&stat)?;
-    if remote_len != expected_len {
+    if written.length != expected_len {
         return Err(CliCommandError::new(format!(
-            "uploaded file length mismatch: local {expected_len}, remote {remote_len}"
+            "uploaded file length mismatch: local {expected_len}, remote {}",
+            written.length
         )));
     }
-    ensure_hash_matches("uploaded file", &remote_hash, &local_hash)?;
+    ensure_hash_matches("uploaded file", &written.blake3, &local_hash)?;
 
     let report = RemoteTransferReport {
         direction: "put",
@@ -1600,20 +1549,20 @@ fn run_remote_put(
         destination: options.remote_path,
         bytes: expected_len,
         blake3: local_hash,
-        chunks,
+        sessions: 1,
     };
     print_transfer_report(context, report, options.common.json)
 }
 
-fn hash_open_local_file(file: &mut File, path: &Path) -> Result<(u64, String), CliCommandError> {
-    file.seek(std::io::SeekFrom::Start(0)).map_err(|source| {
+fn hash_local_file(path: &Path) -> Result<(u64, String), CliCommandError> {
+    let mut file = File::open(path).map_err(|source| {
         CliCommandError::new(format!(
-            "failed to rewind local file {}: {source}",
+            "failed to open local file {}: {source}",
             path.display()
         ))
     })?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; MAX_FILE_WRITE_BYTES];
+    let mut buffer = vec![0_u8; FILE_COPY_BUFFER_BYTES];
     let mut len = 0_u64;
     loop {
         let read = file.read(&mut buffer).map_err(|source| {
@@ -1630,12 +1579,6 @@ fn hash_open_local_file(file: &mut File, path: &Path) -> Result<(u64, String), C
             .ok_or_else(|| CliCommandError::new("local file length overflow"))?;
         hasher.update(&buffer[..read]);
     }
-    file.seek(std::io::SeekFrom::Start(0)).map_err(|source| {
-        CliCommandError::new(format!(
-            "failed to rewind local file {} after hashing: {source}",
-            path.display()
-        ))
-    })?;
     Ok((len, hasher.finalize().to_hex().to_string()))
 }
 
@@ -1657,36 +1600,11 @@ fn fetch_remote_stat(
     response.into_result().map_err(command_error)
 }
 
-fn verified_file_identity(
-    stat: &RemoteManagementFileStat,
-) -> Result<(u64, String), CliCommandError> {
-    if stat.file_type != RemoteManagementFileType::File {
-        return Err(CliCommandError::new(format!(
-            "remote path {} is not a regular file",
-            stat.path
-        )));
-    }
-    let len = stat.len.ok_or_else(|| {
-        CliCommandError::new(format!("remote path {} did not report a length", stat.path))
-    })?;
-    let hash = stat.blake3.clone().ok_or_else(|| {
-        CliCommandError::new(format!(
-            "remote path {} did not report the requested BLAKE3 digest",
-            stat.path
-        ))
-    })?;
-    validate_blake3(&hash)?;
-    Ok((len, hash))
-}
-
-fn validate_blake3(value: &str) -> Result<(), CliCommandError> {
+fn validate_blake3_string(value: &str) -> Result<(), String> {
     let normalized = normalize_blake3(value);
-    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(CliCommandError::new(format!(
-            "invalid remote BLAKE3 digest `{value}`"
-        )));
-    }
-    Ok(())
+    (normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(())
+        .ok_or_else(|| format!("invalid remote BLAKE3 digest `{value}`"))
 }
 
 fn normalize_blake3(value: &str) -> String {
@@ -1697,13 +1615,30 @@ fn normalize_blake3(value: &str) -> String {
 }
 
 fn ensure_hash_matches(label: &str, expected: &str, actual: &str) -> Result<(), CliCommandError> {
-    if normalize_blake3(expected) == normalize_blake3(actual) {
-        Ok(())
-    } else {
-        Err(CliCommandError::new(format!(
+    ensure_hash_matches_string(label, expected, actual).map_err(CliCommandError::new)
+}
+
+fn ensure_hash_matches_string(label: &str, expected: &str, actual: &str) -> Result<(), String> {
+    validate_blake3_string(expected)?;
+    if normalize_blake3(expected) != normalize_blake3(actual) {
+        return Err(format!(
             "{label} BLAKE3 mismatch: expected {expected}, got {actual}"
-        )))
+        ));
     }
+    Ok(())
+}
+
+fn validate_transfer_head(
+    transfer: &RemoteManagementFileTransfer,
+    requested_path: &str,
+) -> Result<(), String> {
+    if transfer.path != requested_path {
+        return Err(format!(
+            "remote transfer returned path `{}` for requested path `{requested_path}`",
+            transfer.path
+        ));
+    }
+    validate_blake3_string(&transfer.blake3)
 }
 
 fn print_transfer_report(
@@ -1720,7 +1655,7 @@ fn print_transfer_report(
     ))?;
     context.stdout_line(format_args!("bytes: {}", report.bytes))?;
     context.stdout_line(format_args!("blake3: {}", report.blake3))?;
-    context.stdout_line(format_args!("chunks: {}", report.chunks))
+    context.stdout_line(format_args!("sessions: {}", report.sessions))
 }
 
 struct TransferTempPath {
@@ -1756,15 +1691,14 @@ impl TransferTempPath {
         &self.path
     }
 
-    fn commit(mut self, destination: &Path) -> Result<(), CliCommandError> {
-        sinomo_core::storage::durable_file::replace_file(&self.path, destination).map_err(
-            |source| {
+    fn commit(mut self, destination: &Path, overwrite: bool) -> Result<(), CliCommandError> {
+        sinomo_core::storage::durable_file::install_staged_file(&self.path, destination, overwrite)
+            .map_err(|source| {
                 CliCommandError::new(format!(
-                    "failed to install downloaded file {}: {source}",
+                    "failed to install downloaded file {} (overwrite={overwrite}): {source}",
                     destination.display()
                 ))
-            },
-        )?;
+            })?;
         self.committed = true;
         Ok(())
     }
@@ -1787,51 +1721,33 @@ fn remote_rpc<Req, Resp>(
 ) -> Result<Resp, CliCommandError>
 where
     Req: Serialize + ?Sized,
-    Resp: DeserializeOwned,
+    Resp: DeserializeOwned + Send,
 {
-    remote_rpc_attempt(rpc, target, route, category, request).map_err(CliCommandError::new)
-}
-
-fn remote_rpc_with_attempts<Req, Resp>(
-    rpc: &RemoteManagementCliRpc,
-    target: Option<&str>,
-    route: &str,
-    category: &str,
-    request: &Req,
-    attempts: usize,
-) -> Result<Resp, CliCommandError>
-where
-    Req: Serialize + ?Sized,
-    Resp: DeserializeOwned,
-{
-    let attempts = attempts.max(1);
-    let mut last_error = None;
-    for _ in 0..attempts {
-        match remote_rpc_attempt(rpc, target, route, category, request) {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
+    let head = ObjectRpcRequest::encode_body(route, category, request).map_err(|error| {
+        CliCommandError::new(format!("failed to encode {route} request: {error}"))
+    })?;
+    let target = target.map(str::to_string);
+    run_remote_session(async {
+        let result = rpc(target, ObjectRpcSessionCall::value(head))
+            .await
+            .map_err(|error| format!("remote RPC {route} failed: {error}"))?;
+        let (response, body) = result.into_parts();
+        validate_response_route(&response, route)?;
+        if !body.is_empty() {
+            return Err(format!(
+                "remote RPC {route} unexpectedly returned an attachment"
+            ));
         }
-    }
-    Err(CliCommandError::new(last_error.unwrap_or_else(|| {
-        "remote RPC failed without an error".to_string()
-    })))
+        response
+            .decode_body()
+            .map_err(|error| format!("failed to decode {route} response: {error}"))
+    })
 }
 
-fn remote_rpc_attempt<Req, Resp>(
-    rpc: &RemoteManagementCliRpc,
-    target: Option<&str>,
+fn validate_response_route(
+    response: &sinomo_core::network::ObjectRpcResponse,
     route: &str,
-    category: &str,
-    request: &Req,
-) -> Result<Resp, String>
-where
-    Req: Serialize + ?Sized,
-    Resp: DeserializeOwned,
-{
-    let request = ObjectRpcRequest::encode_body(route, category, request)
-        .map_err(|error| format!("failed to encode {route} request: {error}"))?;
-    let response =
-        rpc(target, request).map_err(|error| format!("remote RPC {route} failed: {error}"))?;
+) -> Result<(), String> {
     if response.route != route {
         return Err(format!(
             "remote RPC returned route `{}` for request `{route}`",
@@ -1839,8 +1755,36 @@ where
         ));
     }
     response
-        .decode_body()
-        .map_err(|error| format!("failed to decode {route} response: {error}"))
+        .error_detail()
+        .map_err(|error| format!("remote RPC {route} was rejected: {error}"))
+}
+
+fn run_remote_session<T, F>(future: F) -> Result<T, CliCommandError>
+where
+    T: Send,
+    F: Future<Output = Result<T, String>> + Send,
+{
+    let result = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            runtime.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| runtime.block_on(future))
+        } else {
+            return Err(CliCommandError::new(
+                "remote management cannot synchronously run inside a current-thread Tokio runtime",
+            ));
+        }
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| {
+                CliCommandError::new(format!("create remote-management runtime: {source}"))
+            })?;
+        runtime.block_on(future)
+    };
+    result.map_err(CliCommandError::new)
 }
 
 fn run_node_permissions_command(
@@ -1971,6 +1915,7 @@ fn command_error(error: impl fmt::Display) -> CliCommandError {
 mod tests {
     use super::*;
     use sinomo_config::{ConfigKey, ConfigValueSource};
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcResponse};
     use std::sync::Mutex;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -2013,39 +1958,46 @@ mod tests {
     fn remote_handler_forwards_target_and_bounds_one_shot_shell() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_for_rpc = Arc::clone(&seen);
-        let handler = remote_cli_command_handler(move |target, request| {
-            seen_for_rpc.lock().expect("seen").push((
-                target.map(str::to_string),
-                request.route.clone(),
-                request.category.clone(),
-            ));
-            match request.route.as_str() {
-                REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE => ObjectRpcResponse::encode_body(
-                    REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE,
-                    &RemoteManagementSystemInfoResponse::success(system_info()),
-                )
-                .map_err(|error| error.to_string()),
-                REMOTE_MANAGEMENT_SHELL_RUN_ROUTE => {
-                    let request: RemoteManagementShellRunRequest =
-                        request.decode_body().map_err(|error| error.to_string())?;
-                    assert_eq!(request.command, "echo ok");
-                    assert_eq!(request.timeout_ms, Some(MAX_COMMAND_TIMEOUT_MS));
-                    assert_eq!(request.max_output_bytes, Some(MAX_OUTPUT_BYTES));
-                    ObjectRpcResponse::encode_body(
-                        REMOTE_MANAGEMENT_SHELL_RUN_ROUTE,
-                        &RemoteManagementShellRunResponse::success(RemoteManagementShellOutcome {
-                            exit_code: Some(0),
-                            stdout: "ok\n".to_string(),
-                            stderr: String::new(),
-                            duration_ms: 1,
-                            timed_out: false,
-                            stdout_truncated: false,
-                            stderr_truncated: false,
-                        }),
+        let handler = remote_cli_command_handler(move |target, call| {
+            let seen = Arc::clone(&seen_for_rpc);
+            async move {
+                let request = call.request;
+                seen.lock().expect("seen").push((
+                    target,
+                    request.route.clone(),
+                    request.category.clone(),
+                ));
+                let response = match request.route.as_str() {
+                    REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE => ObjectRpcResponse::encode_body(
+                        REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE,
+                        &RemoteManagementSystemInfoResponse::success(system_info()),
                     )
-                    .map_err(|error| error.to_string())
-                }
-                route => Err(format!("unexpected route {route}")),
+                    .map_err(|error| error.to_string())?,
+                    REMOTE_MANAGEMENT_SHELL_RUN_ROUTE => {
+                        let request: RemoteManagementShellRunRequest =
+                            request.decode_body().map_err(|error| error.to_string())?;
+                        assert_eq!(request.command, "echo ok");
+                        assert_eq!(request.timeout_ms, Some(MAX_COMMAND_TIMEOUT_MS));
+                        assert_eq!(request.max_output_bytes, Some(MAX_SHELL_CAPTURE_BYTES));
+                        ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_SHELL_RUN_ROUTE,
+                            &RemoteManagementShellRunResponse::success(
+                                RemoteManagementShellOutcome {
+                                    exit_code: Some(0),
+                                    stdout: "ok\n".to_string(),
+                                    stderr: String::new(),
+                                    duration_ms: 1,
+                                    timed_out: false,
+                                    stdout_truncated: false,
+                                    stderr_truncated: false,
+                                },
+                            ),
+                        )
+                        .map_err(|error| error.to_string())?
+                    }
+                    route => return Err(format!("unexpected route {route}")),
+                };
+                Ok(ObjectRpcSessionResult::value(response))
             }
         });
 
@@ -2095,14 +2047,16 @@ mod tests {
 
     #[test]
     fn remote_observe_separates_verified_devices_from_resource_exposure_policies() {
-        let handler = remote_cli_command_handler(|target, request| {
-            assert_eq!(target, Some("node-observe"));
-            assert_eq!(request.route, REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE);
-            let request: RemoteManagementSystemObserveRequest =
-                request.decode_body().map_err(|error| error.to_string())?;
+        let handler = remote_cli_command_handler(|target, call| async move {
+            assert_eq!(target.as_deref(), Some("node-observe"));
+            assert_eq!(call.request.route, REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE);
+            let request: RemoteManagementSystemObserveRequest = call
+                .request
+                .decode_body()
+                .map_err(|error| error.to_string())?;
             assert!(request.include_devices);
             assert!(request.include_resource_exposures);
-            ObjectRpcResponse::encode_body(
+            let response = ObjectRpcResponse::encode_body(
                 REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE,
                 &RemoteManagementSystemObserveResponse::success(
                     RemoteManagementSystemObservation {
@@ -2122,7 +2076,8 @@ mod tests {
                     },
                 ),
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            Ok(ObjectRpcSessionResult::value(response))
         });
 
         let (stdout, _) = run_handler(
@@ -2149,23 +2104,28 @@ mod tests {
     fn config_set_uses_authoritative_route_contract_and_write_target() {
         let seen = Arc::new(Mutex::new(None));
         let seen_for_rpc = Arc::clone(&seen);
-        let handler = remote_cli_command_handler(move |target, request| {
-            assert_eq!(request.route, CONFIG_SET_ROUTE);
-            assert_eq!(request.category, CONFIG_RPC_CATEGORY);
-            let body: ConfigSetRequest =
-                request.decode_body().map_err(|error| error.to_string())?;
-            *seen_for_rpc.lock().expect("seen") = Some((target.map(str::to_string), body.clone()));
-            ObjectRpcResponse::encode_body(
-                CONFIG_SET_ROUTE,
-                &ConfigSetResponse {
-                    result: ConfigWriteResult {
-                        key: ConfigKey::new(body.key).map_err(|error| error.to_string())?,
-                        value: body.value,
-                        source: ConfigValueSource::Local,
+        let handler = remote_cli_command_handler(move |target, call| {
+            let seen = Arc::clone(&seen_for_rpc);
+            async move {
+                let request = call.request;
+                assert_eq!(request.route, CONFIG_SET_ROUTE);
+                assert_eq!(request.category, CONFIG_RPC_CATEGORY);
+                let body: ConfigSetRequest =
+                    request.decode_body().map_err(|error| error.to_string())?;
+                *seen.lock().expect("seen") = Some((target, body.clone()));
+                let response = ObjectRpcResponse::encode_body(
+                    CONFIG_SET_ROUTE,
+                    &ConfigSetResponse {
+                        result: ConfigWriteResult {
+                            key: ConfigKey::new(body.key).map_err(|error| error.to_string())?,
+                            value: body.value,
+                            source: ConfigValueSource::Local,
+                        },
                     },
-                },
-            )
-            .map_err(|error| error.to_string())
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(ObjectRpcSessionResult::value(response))
+            }
         });
 
         run_handler(
@@ -2194,111 +2154,102 @@ mod tests {
     #[derive(Default)]
     struct FakeTransferState {
         remote: Vec<u8>,
-        write_offsets: Vec<u64>,
-        read_offsets: Vec<u64>,
-        fail_first_zero_write: bool,
+        write_calls: usize,
+        read_calls: usize,
+        corrupt_read_hash: bool,
+        write_overwrites: Vec<bool>,
     }
 
     fn transfer_rpc(
         state: Arc<Mutex<FakeTransferState>>,
-    ) -> impl Fn(Option<&str>, ObjectRpcRequest) -> Result<ObjectRpcResponse, String> + Send + Sync
+    ) -> impl Fn(Option<String>, ObjectRpcSessionCall) -> RemoteManagementCliRpcFuture + Send + Sync
     {
-        move |_target, request| match request.route.as_str() {
-            REMOTE_MANAGEMENT_FS_WRITE_ROUTE => {
-                let write: RemoteManagementFileWriteRequest =
-                    request.decode_body().map_err(|error| error.to_string())?;
-                let offset = write
-                    .effective_offset()
-                    .ok_or_else(|| "append is not supported by transfer fake".to_string())?;
-                let mut state = state.lock().expect("transfer state");
-                state.write_offsets.push(offset);
-                if offset == 0 && state.fail_first_zero_write {
-                    state.fail_first_zero_write = false;
-                    return Err("transient write failure".to_string());
+        move |_target, call| {
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                let request = call.request;
+                match request.route.as_str() {
+                    REMOTE_MANAGEMENT_FS_WRITE_ROUTE => {
+                        let write: RemoteManagementFileWriteRequest =
+                            request.decode_body().map_err(|error| error.to_string())?;
+                        let declared_length = call.body.total_bytes().ok_or_else(|| {
+                            "test upload body did not declare a length".to_string()
+                        })?;
+                        let collect_bytes = usize::try_from(declared_length)
+                            .map_err(|_| "test upload body does not fit this host".to_string())?;
+                        let uploaded = call
+                            .body
+                            .collect_to_vec(collect_bytes)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let uploaded_hash = blake3::hash(&uploaded).to_hex().to_string();
+                        if write.expected_len != uploaded.len() as u64
+                            || normalize_blake3(&write.expected_blake3) != uploaded_hash
+                        {
+                            return Err("signed upload head did not match attachment".to_string());
+                        }
+                        let mut state = state.lock().expect("transfer state");
+                        state.write_calls += 1;
+                        state.write_overwrites.push(write.overwrite);
+                        state.remote = uploaded;
+                        let response = ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
+                            &RemoteManagementFileWriteResponse::success(
+                                RemoteManagementFileTransfer {
+                                    path: write.path,
+                                    length: state.remote.len() as u64,
+                                    blake3: uploaded_hash,
+                                },
+                            ),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(ObjectRpcSessionResult::value(response))
+                    }
+                    REMOTE_MANAGEMENT_FS_READ_ROUTE => {
+                        let read: RemoteManagementFileReadRequest =
+                            request.decode_body().map_err(|error| error.to_string())?;
+                        assert!(call.body.is_empty());
+                        let mut state = state.lock().expect("transfer state");
+                        state.read_calls += 1;
+                        let bytes = state.remote.clone();
+                        let hash = if state.corrupt_read_hash {
+                            "00".repeat(32)
+                        } else {
+                            blake3::hash(&bytes).to_hex().to_string()
+                        };
+                        let response = ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_FS_READ_ROUTE,
+                            &RemoteManagementFileReadResponse::success(
+                                RemoteManagementFileTransfer {
+                                    path: read.path,
+                                    length: bytes.len() as u64,
+                                    blake3: hash,
+                                },
+                            ),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(ObjectRpcSessionResult::new(
+                            response,
+                            ObjectRpcIncomingBody::bytes(bytes),
+                        ))
+                    }
+                    route => Err(format!("unexpected transfer route {route}")),
                 }
-                if write.should_truncate() {
-                    state.remote.clear();
-                }
-                let start = usize::try_from(offset).map_err(|error| error.to_string())?;
-                let end = start
-                    .checked_add(write.bytes.len())
-                    .ok_or_else(|| "write range overflow".to_string())?;
-                if state.remote.len() < end {
-                    state.remote.resize(end, 0);
-                }
-                state.remote[start..end].copy_from_slice(&write.bytes);
-                ObjectRpcResponse::encode_body(
-                    REMOTE_MANAGEMENT_FS_WRITE_ROUTE,
-                    &RemoteManagementFileWriteResponse::success(
-                        RemoteManagementFileWriteOutcome::for_chunk(
-                            write.path,
-                            offset,
-                            write.bytes.len() as u64,
-                            state.remote.len() as u64,
-                        ),
-                    ),
-                )
-                .map_err(|error| error.to_string())
-            }
-            REMOTE_MANAGEMENT_FS_READ_ROUTE => {
-                let read: RemoteManagementFileReadRequest =
-                    request.decode_body().map_err(|error| error.to_string())?;
-                let offset = read.offset.unwrap_or(0);
-                let mut state = state.lock().expect("transfer state");
-                state.read_offsets.push(offset);
-                let start = usize::try_from(offset).map_err(|error| error.to_string())?;
-                let end = start
-                    .saturating_add(read.effective_max_bytes())
-                    .min(state.remote.len());
-                let bytes = state.remote[start..end].to_vec();
-                let len = state.remote.len() as u64;
-                ObjectRpcResponse::encode_body(
-                    REMOTE_MANAGEMENT_FS_READ_ROUTE,
-                    &RemoteManagementFileReadResponse::success(RemoteManagementFileContent {
-                        path: read.path,
-                        bytes,
-                        text: None,
-                        len,
-                        truncated: end < state.remote.len(),
-                    }),
-                )
-                .map_err(|error| error.to_string())
-            }
-            REMOTE_MANAGEMENT_FS_STAT_ROUTE => {
-                let stat: RemoteManagementFileStatRequest =
-                    request.decode_body().map_err(|error| error.to_string())?;
-                let state = state.lock().expect("transfer state");
-                ObjectRpcResponse::encode_body(
-                    REMOTE_MANAGEMENT_FS_STAT_ROUTE,
-                    &RemoteManagementFileStatResponse::success(RemoteManagementFileStat {
-                        path: stat.path,
-                        file_type: RemoteManagementFileType::File,
-                        len: Some(state.remote.len() as u64),
-                        readonly: false,
-                        modified_unix_ms: None,
-                        blake3: stat
-                            .include_blake3
-                            .then(|| blake3::hash(&state.remote).to_hex().to_string()),
-                    }),
-                )
-                .map_err(|error| error.to_string())
-            }
-            route => Err(format!("unexpected transfer route {route}")),
+            })
         }
     }
 
     #[test]
-    fn get_and_put_use_bounded_chunks_retry_offsets_and_verify_blake3() {
+    fn get_and_put_each_use_one_session_for_more_than_sixteen_mib() {
         let root = sinomo_testdir::TestDir::new("remote-management-cli-transfer");
         let local_source = root.join("source.bin");
         let local_destination = root.join("downloaded.bin");
-        let bytes: Vec<u8> = (0..(MAX_FILE_WRITE_BYTES * 2 + 37))
+        let bytes: Vec<u8> = (0..(17 * 1024 * 1024 + 37))
             .map(|index| (index % 251) as u8)
             .collect();
         fs::write(&local_source, &bytes).expect("source");
 
         let state = Arc::new(Mutex::new(FakeTransferState {
-            fail_first_zero_write: true,
             ..Default::default()
         }));
         let handler = remote_cli_command_handler(transfer_rpc(Arc::clone(&state)));
@@ -2311,6 +2262,7 @@ mod tests {
                 "/remote/data.bin",
                 "--target",
                 "node-files",
+                "--overwrite",
                 "--json",
             ],
         )
@@ -2318,15 +2270,8 @@ mod tests {
         {
             let state = state.lock().expect("state");
             assert_eq!(state.remote, bytes);
-            assert_eq!(
-                state.write_offsets,
-                vec![
-                    0,
-                    0,
-                    MAX_FILE_WRITE_BYTES as u64,
-                    (MAX_FILE_WRITE_BYTES * 2) as u64
-                ]
-            );
+            assert_eq!(state.write_calls, 1);
+            assert_eq!(state.write_overwrites, [true]);
         }
 
         let destination = local_destination.display().to_string();
@@ -2344,14 +2289,103 @@ mod tests {
         .expect("get");
         assert_eq!(fs::read(local_destination).expect("download"), bytes);
         let state = state.lock().expect("state");
+        assert_eq!(state.read_calls, 1);
+    }
+
+    #[test]
+    fn zero_byte_get_and_put_each_use_one_optional_body_session() {
+        let root = sinomo_testdir::TestDir::new("remote-management-cli-zero-transfer");
+        let local_source = root.join("empty-source.bin");
+        let local_destination = root.join("empty-download.bin");
+        fs::write(&local_source, []).expect("empty source");
+        let state = Arc::new(Mutex::new(FakeTransferState::default()));
+        let handler = remote_cli_command_handler(transfer_rpc(Arc::clone(&state)));
+
+        run_handler(
+            &handler,
+            &[
+                "put",
+                local_source.to_str().expect("source path"),
+                "/remote/empty.bin",
+            ],
+        )
+        .expect("zero-byte put");
+        run_handler(
+            &handler,
+            &[
+                "get",
+                "/remote/empty.bin",
+                local_destination.to_str().expect("destination path"),
+            ],
+        )
+        .expect("zero-byte get");
+        assert_eq!(fs::read(local_destination).expect("empty download"), b"");
+        let state = state.lock().expect("state");
+        assert_eq!((state.write_calls, state.read_calls), (1, 1));
+        assert_eq!(state.write_overwrites, [false]);
+    }
+
+    #[test]
+    fn get_hash_mismatch_preserves_destination_and_cleans_temp_file() {
+        let root = sinomo_testdir::TestDir::new("remote-management-cli-hash-mismatch");
+        let destination = root.join("destination.bin");
+        fs::write(&destination, b"original").expect("destination");
+        let state = Arc::new(Mutex::new(FakeTransferState {
+            remote: b"replacement".to_vec(),
+            corrupt_read_hash: true,
+            ..Default::default()
+        }));
+        let handler = remote_cli_command_handler(transfer_rpc(Arc::clone(&state)));
+        let error = run_handler(
+            &handler,
+            &[
+                "get",
+                "/remote/replacement.bin",
+                destination.to_str().expect("destination path"),
+            ],
+        )
+        .expect_err("hash mismatch");
+        assert!(error.contains("BLAKE3 mismatch"));
+        assert_eq!(fs::read(&destination).expect("destination"), b"original");
+        let leaked_temp = fs::read_dir(&root)
+            .expect("root entries")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".sinomo-get-"));
+        assert!(!leaked_temp, "failed get leaked an atomic temp file");
+        assert_eq!(state.lock().expect("state").read_calls, 1);
+    }
+
+    #[test]
+    fn get_requires_explicit_overwrite_for_an_existing_local_file() {
+        let root = sinomo_testdir::TestDir::new("remote-management-cli-explicit-overwrite");
+        let destination = root.join("destination.bin");
+        fs::write(&destination, b"original").expect("destination");
+        let state = Arc::new(Mutex::new(FakeTransferState {
+            remote: b"replacement".to_vec(),
+            ..Default::default()
+        }));
+        let handler = remote_cli_command_handler(transfer_rpc(Arc::clone(&state)));
+        let args = [
+            "get",
+            "/remote/replacement.bin",
+            destination.to_str().expect("destination path"),
+        ];
+
+        let error = run_handler(&handler, &args).expect_err("overwrite must be explicit");
+        assert!(error.contains("overwrite=false"));
         assert_eq!(
-            state.read_offsets,
-            vec![
-                0,
-                MAX_FILE_READ_BYTES as u64,
-                (MAX_FILE_READ_BYTES * 2) as u64
-            ]
+            fs::read(&destination).expect("preserved destination"),
+            b"original"
         );
+
+        let mut overwrite_args = args.to_vec();
+        overwrite_args.push("--overwrite");
+        run_handler(&handler, &overwrite_args).expect("explicit overwrite");
+        assert_eq!(
+            fs::read(&destination).expect("replaced destination"),
+            b"replacement"
+        );
+        assert_eq!(state.lock().expect("state").read_calls, 2);
     }
 
     #[test]
@@ -2417,8 +2451,8 @@ mod tests {
 
     #[test]
     fn handlers_expose_help_autocomplete_and_authority_policies() {
-        let remote = remote_cli_command_handler(|_, request| {
-            Err(format!("unexpected RPC {}", request.route))
+        let remote = remote_cli_command_handler(|_, call| async move {
+            Err(format!("unexpected RPC {}", call.request.route))
         });
         assert_eq!(remote.metadata().name, "remote");
         assert_eq!(remote.metadata().policy, CliCommandPolicy::local_capable());

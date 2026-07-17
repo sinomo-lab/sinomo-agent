@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::registry::network_module_surfaces;
 use sinomo_config::{
@@ -4066,6 +4066,8 @@ struct DaemonInternalModuleSnapshot {
 struct DaemonNativeDylibRouteTarget {
     module_id: sinomo_module::ModuleId,
     operation: String,
+    request_body_mode: ServiceBodyMode,
+    response_body_mode: ServiceBodyMode,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4089,11 +4091,20 @@ impl DaemonOperationCancellationToken {
 
 struct NativeDylibModuleInvocationCallbacks {
     cancellation_token: DaemonOperationCancellationToken,
+    data_dir_root: PathBuf,
 }
 
 impl sinomo_module::NativeModuleHostCallbacks for NativeDylibModuleInvocationCallbacks {
     fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
+    }
+
+    fn local_permission_granted(&self, permission: &str) -> bool {
+        let Ok(permission) = sinomo_core::node::LocalNodePermission::try_from(permission) else {
+            return false;
+        };
+        sinomo_core::node::LocalNodePermissionStore::new(&self.data_dir_root)
+            .permission_granted(permission)
     }
 }
 
@@ -4203,7 +4214,19 @@ fn module_object_rpc_route_descriptor_to_daemon_route(
     for permission in &descriptor.required_local_permissions {
         route = route.require_local_permission(permission);
     }
+    route.request_body_mode = native_module_body_mode_to_service(descriptor.request_body_mode);
+    route.response_body_mode = native_module_body_mode_to_service(descriptor.response_body_mode);
     route
+}
+
+fn native_module_body_mode_to_service(
+    mode: sinomo_module_api::NativeModuleBodyMode,
+) -> ServiceBodyMode {
+    match mode {
+        sinomo_module_api::NativeModuleBodyMode::None => ServiceBodyMode::None,
+        sinomo_module_api::NativeModuleBodyMode::Optional => ServiceBodyMode::Optional,
+        sinomo_module_api::NativeModuleBodyMode::Required => ServiceBodyMode::Required,
+    }
 }
 
 fn daemon_module_snapshot_route_descriptors(
@@ -4225,6 +4248,10 @@ fn daemon_module_snapshot_route_descriptors(
             .map_err(module_error_to_network_error)?
         {
             let operation = descriptor.operation.as_str().to_string();
+            let request_body_mode =
+                native_module_body_mode_to_service(descriptor.request_body_mode);
+            let response_body_mode =
+                native_module_body_mode_to_service(descriptor.response_body_mode);
             let descriptor = module_object_rpc_route_descriptor_to_daemon_route(&descriptor);
             if !seen_routes.insert(descriptor.route.clone()) {
                 return Err(NetworkError::Serialization {
@@ -4240,6 +4267,8 @@ fn daemon_module_snapshot_route_descriptors(
                     DaemonNativeDylibRouteTarget {
                         module_id: registration.manifest.module_id.clone(),
                         operation: operation.clone(),
+                        request_body_mode,
+                        response_body_mode,
                     },
                 );
             }
@@ -4407,6 +4436,47 @@ fn unregister_native_dylib_operation_cancellation(
     }
 }
 
+struct NativeDylibOperationCancellationRegistration {
+    active_operations: Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
+    operation_id: Option<String>,
+    token: DaemonOperationCancellationToken,
+}
+
+impl NativeDylibOperationCancellationRegistration {
+    fn register(
+        active_operations: Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
+        operation_id: Option<String>,
+    ) -> Result<Self, NetworkError> {
+        let token = register_native_dylib_operation_cancellation(
+            &active_operations,
+            operation_id.as_deref(),
+        )?;
+        Ok(Self {
+            active_operations,
+            operation_id,
+            token,
+        })
+    }
+
+    fn token(&self) -> DaemonOperationCancellationToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for NativeDylibOperationCancellationRegistration {
+    fn drop(&mut self) {
+        // Dropping the async dispatch future (disconnect, timeout, or caller
+        // cancellation) detaches any active blocking invocation. Signal its
+        // per-invocation callbacks before removing the registry entry so a
+        // large synchronous copy stops promptly and releases staged files.
+        self.token.cancel();
+        unregister_native_dylib_operation_cancellation(
+            &self.active_operations,
+            self.operation_id.as_deref(),
+        );
+    }
+}
+
 fn dispatch_native_dylib_module_cancel_request(
     active_operations: &Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
     request: ObjectRpcRequest,
@@ -4502,18 +4572,366 @@ fn inject_native_dylib_host_authority(
     Ok(())
 }
 
+#[derive(Debug)]
+struct NativeDylibSessionStaging {
+    root: PathBuf,
+    request_body_path: Option<PathBuf>,
+    response_body_path: Option<PathBuf>,
+}
+
+impl NativeDylibSessionStaging {
+    fn create(
+        data_dir_root: &std::path::Path,
+        request_body_mode: ServiceBodyMode,
+        response_body_mode: ServiceBodyMode,
+    ) -> Result<Self, NetworkError> {
+        let runtime_root = data_dir_root.join("module").join("runtime");
+        std::fs::create_dir_all(&runtime_root).map_err(|source| NetworkError::Io {
+            operation: format!(
+                "create native dylib module runtime root {}",
+                runtime_root.display()
+            ),
+            detail: source.to_string(),
+        })?;
+        let parent = runtime_root.join("native-dylib-sessions");
+        sinomo_core::storage::durable_file::ensure_private_directory(&parent).map_err(
+            |source| NetworkError::Io {
+                operation: format!(
+                    "create private native dylib session staging root {}",
+                    parent.display()
+                ),
+                detail: source.to_string(),
+            },
+        )?;
+
+        let root = (0..8)
+            .find_map(|_| {
+                let candidate = parent.join(sinomo_core::Id::generate().as_str());
+                match sinomo_core::storage::durable_file::create_private_directory(&candidate) {
+                    Ok(()) => Some(Ok(candidate)),
+                    Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(source) => Some(Err(NetworkError::Io {
+                        operation: format!(
+                            "create native dylib session staging {}",
+                            candidate.display()
+                        ),
+                        detail: source.to_string(),
+                    })),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| NetworkError::Io {
+                operation: "create native dylib session staging".to_string(),
+                detail: "could not allocate a unique private staging directory".to_string(),
+            })?;
+
+        let request_body_path =
+            (request_body_mode != ServiceBodyMode::None).then(|| root.join("request.body"));
+        let response_body_path =
+            (response_body_mode != ServiceBodyMode::None).then(|| root.join("response.body"));
+        // Construct the cleanup guard before creating either staged body. If a
+        // later file creation fails, `Drop` removes the partially initialized
+        // private session instead of leaving it behind indefinitely.
+        let staging = Self {
+            root,
+            request_body_path,
+            response_body_path,
+        };
+        for path in staging
+            .request_body_path
+            .iter()
+            .chain(staging.response_body_path.iter())
+        {
+            sinomo_core::storage::durable_file::create_private_staged_file(path).map_err(
+                |source| NetworkError::Io {
+                    operation: format!("create private native dylib body file {}", path.display()),
+                    detail: source.to_string(),
+                },
+            )?;
+        }
+        Ok(staging)
+    }
+}
+
+impl Drop for NativeDylibSessionStaging {
+    fn drop(&mut self) {
+        if let Err(source) = std::fs::remove_dir_all(&self.root)
+            && source.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.root.display(),
+                error = %source,
+                "failed to clean native dylib session staging"
+            );
+        }
+    }
+}
+
+fn native_dylib_staged_body_path(path: &std::path::Path) -> Result<String, NetworkError> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| NetworkError::Serialization {
+            detail: format!(
+                "native dylib session staging path is not valid UTF-8: {}",
+                path.display()
+            ),
+        })
+}
+
+async fn stage_native_dylib_request_body(
+    mut body: sinomo_core::network::ObjectRpcIncomingBody,
+    path: &std::path::Path,
+    cancellation_token: &DaemonOperationCancellationToken,
+) -> Result<sinomo_module_api::NativeModuleStagedBody, NetworkError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: format!("open native dylib request body staging {}", path.display()),
+            detail: source.to_string(),
+        })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        if cancellation_token.is_cancelled() {
+            return Err(NetworkError::Io {
+                operation: format!("stage native dylib request body for {}", path.display()),
+                detail: "native dylib operation was cancelled while receiving its request body"
+                    .to_string(),
+            });
+        }
+        let read = body
+            .read(&mut buffer)
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: format!("stream native dylib request body to {}", path.display()),
+                detail: source.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: format!("write native dylib request body staging {}", path.display()),
+                detail: source.to_string(),
+            })?;
+        hasher.update(&buffer[..read]);
+        length = length
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| NetworkError::Serialization {
+                detail: "native dylib request body length exceeds u64".to_string(),
+            })?;
+    }
+    file.flush().await.map_err(|source| NetworkError::Io {
+        operation: format!("flush native dylib request body staging {}", path.display()),
+        detail: source.to_string(),
+    })?;
+    drop(file);
+    Ok(sinomo_module_api::NativeModuleStagedBody::new(
+        native_dylib_staged_body_path(path)?,
+        length,
+        format!("blake3:{}", hasher.finalize().to_hex()),
+    ))
+}
+
+fn inspect_native_dylib_staged_body(
+    path: &std::path::Path,
+) -> Result<sinomo_module_api::NativeModuleStagedBody, NetworkError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| NetworkError::Io {
+        operation: format!("inspect native dylib response body {}", path.display()),
+        detail: source.to_string(),
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "native dylib response body is not a regular file: {}",
+                path.display()
+            ),
+        });
+    }
+    let mut file = std::fs::File::open(path).map_err(|source| NetworkError::Io {
+        operation: format!("open native dylib response body {}", path.display()),
+        detail: source.to_string(),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        let read =
+            std::io::Read::read(&mut file, &mut buffer).map_err(|source| NetworkError::Io {
+                operation: format!("hash native dylib response body {}", path.display()),
+                detail: source.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        length = length
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| NetworkError::Serialization {
+                detail: "native dylib response body length exceeds u64".to_string(),
+            })?;
+    }
+    Ok(sinomo_module_api::NativeModuleStagedBody::new(
+        native_dylib_staged_body_path(path)?,
+        length,
+        format!("blake3:{}", hasher.finalize().to_hex()),
+    ))
+}
+
+fn validate_native_dylib_response_body(
+    mode: ServiceBodyMode,
+    expected_path: Option<&std::path::Path>,
+    reported: Option<sinomo_module_api::NativeModuleStagedBody>,
+) -> Result<Option<PathBuf>, NetworkError> {
+    let Some(reported) = reported else {
+        return if mode == ServiceBodyMode::Required {
+            Err(NetworkError::Serialization {
+                detail: "native dylib route requires a non-empty response body".to_string(),
+            })
+        } else {
+            Ok(None)
+        };
+    };
+    if mode == ServiceBodyMode::None {
+        return Err(NetworkError::Serialization {
+            detail: "native dylib route does not declare a response body".to_string(),
+        });
+    }
+    let expected_path = expected_path.ok_or_else(|| NetworkError::Serialization {
+        detail: "native dylib response body has no host-assigned staging path".to_string(),
+    })?;
+    if std::path::Path::new(&reported.path) != expected_path {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "native dylib response body path `{}` does not match host-assigned path `{}`",
+                reported.path,
+                expected_path.display()
+            ),
+        });
+    }
+    let actual = inspect_native_dylib_staged_body(expected_path)?;
+    if reported.length != actual.length {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "native dylib response body length mismatch: module reported {}, host measured {}",
+                reported.length, actual.length
+            ),
+        });
+    }
+    if reported.blake3 != actual.blake3 {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "native dylib response body BLAKE3 mismatch: module reported {}, host measured {}",
+                reported.blake3, actual.blake3
+            ),
+        });
+    }
+    if mode == ServiceBodyMode::Required && actual.length == 0 {
+        return Err(NetworkError::Serialization {
+            detail: "native dylib route requires a non-empty response body".to_string(),
+        });
+    }
+    Ok(Some(expected_path.to_path_buf()))
+}
+
+fn validate_native_dylib_request_body_mode(
+    route: &str,
+    mode: ServiceBodyMode,
+    has_body: bool,
+) -> Result<(), NetworkError> {
+    match mode {
+        ServiceBodyMode::None if has_body => Err(NetworkError::Serialization {
+            detail: format!("native dylib route {route} does not accept a request body"),
+        }),
+        ServiceBodyMode::Required if !has_body => Err(NetworkError::Serialization {
+            detail: format!("native dylib route {route} requires a non-empty request body"),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn validate_native_dylib_staged_request_body(
+    route: &str,
+    mode: ServiceBodyMode,
+    body: Option<&sinomo_module_api::NativeModuleStagedBody>,
+) -> Result<(), NetworkError> {
+    match (mode, body) {
+        (ServiceBodyMode::None, Some(_)) => Err(NetworkError::Serialization {
+            detail: format!("native dylib route {route} does not accept a request body"),
+        }),
+        (ServiceBodyMode::Required, None)
+        | (
+            ServiceBodyMode::Required,
+            Some(sinomo_module_api::NativeModuleStagedBody { length: 0, .. }),
+        ) => Err(NetworkError::Serialization {
+            detail: format!("native dylib route {route} requires a non-empty request body"),
+        }),
+        _ => Ok(()),
+    }
+}
+
 async fn dispatch_native_dylib_module_request(
     paths: DaemonPaths,
     target: DaemonNativeDylibRouteTarget,
     active_operations: Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
-    request: ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let route_for_error = request.route.clone();
-    let operation_id = request.operation_id().map(str::to_string);
-    tokio::task::spawn_blocking(move || {
-        let data_dir_root = daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?;
-        let mut request = request;
-        inject_native_dylib_host_authority(&data_dir_root, &target, &mut request)?;
+    request: ObjectRpcSessionRequest,
+) -> Result<ObjectRpcSessionResponse, NetworkError> {
+    let route_for_error = request.request.route.clone();
+    let operation_id = request.request.operation_id().map(str::to_string);
+    let has_request_body = !request.body.is_empty();
+    validate_native_dylib_request_body_mode(
+        &route_for_error,
+        target.request_body_mode,
+        has_request_body,
+    )?;
+    let cancellation_registration = NativeDylibOperationCancellationRegistration::register(
+        Arc::clone(&active_operations),
+        operation_id.clone(),
+    )?;
+    let cancellation_token = cancellation_registration.token();
+    let data_dir_root = daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?;
+    let staging = (target.request_body_mode != ServiceBodyMode::None
+        || target.response_body_mode != ServiceBodyMode::None)
+        .then(|| {
+            NativeDylibSessionStaging::create(
+                &data_dir_root,
+                target.request_body_mode,
+                target.response_body_mode,
+            )
+        })
+        .transpose()?;
+    let staged_request_body = if has_request_body {
+        let request_path = staging
+            .as_ref()
+            .and_then(|staging| staging.request_body_path.as_deref())
+            .ok_or_else(|| NetworkError::Serialization {
+                detail: format!("native dylib route {route_for_error} has no request staging path"),
+            })?;
+        Some(
+            stage_native_dylib_request_body(request.body, request_path, &cancellation_token)
+                .await?,
+        )
+    } else {
+        None
+    };
+    validate_native_dylib_staged_request_body(
+        &route_for_error,
+        target.request_body_mode,
+        staged_request_body.as_ref(),
+    )?;
+    let response_body_path = staging
+        .as_ref()
+        .and_then(|staging| staging.response_body_path.as_deref())
+        .map(native_dylib_staged_body_path)
+        .transpose()?;
+    let mut request = request.request;
+    inject_native_dylib_host_authority(&data_dir_root, &target, &mut request)?;
+    let (response, response_body_path, staging) = tokio::task::spawn_blocking(move || {
         let state =
             sinomo_module::read_native_dylib_module_loader_state(&data_dir_root, &target.module_id)
                 .map_err(module_error_to_network_error)?
@@ -4560,13 +4978,10 @@ async fn dispatch_native_dylib_module_request(
                 ),
             });
         }
-        let cancellation_token = register_native_dylib_operation_cancellation(
-            &active_operations,
-            operation_id.as_deref(),
-        )?;
         let callbacks: Arc<dyn sinomo_module::NativeModuleHostCallbacks> =
             Arc::new(NativeDylibModuleInvocationCallbacks {
                 cancellation_token: cancellation_token.clone(),
+                data_dir_root: data_dir_root.clone(),
             });
         let native_response = module
             .invoke_with_callbacks(
@@ -4574,12 +4989,13 @@ async fn dispatch_native_dylib_module_request(
                     sinomo_module_api::NativeModuleInvocationRequest {
                         operation: target.operation.clone(),
                         payload_sobj: request.body,
+                        request_body: staged_request_body,
+                        response_body_path,
                     },
                 ),
                 Some(callbacks),
             )
             .map_err(module_error_to_network_error);
-        unregister_native_dylib_operation_cancellation(&active_operations, operation_id.as_deref());
         let native_response = native_response?;
         match native_response {
             sinomo_module_api::NativeModuleResponse::Invocation(response) => {
@@ -4591,9 +5007,17 @@ async fn dispatch_native_dylib_module_request(
                         ),
                     });
                 }
-                Ok(ObjectRpcResponse::from_encoded_body(
-                    request.route,
-                    response.payload_sobj,
+                let response_body_path = validate_native_dylib_response_body(
+                    target.response_body_mode,
+                    staging
+                        .as_ref()
+                        .and_then(|staging| staging.response_body_path.as_deref()),
+                    response.response_body,
+                )?;
+                Ok((
+                    ObjectRpcResponse::from_encoded_body(request.route, response.payload_sobj),
+                    response_body_path,
+                    staging,
                 ))
             }
             sinomo_module_api::NativeModuleResponse::Error(error) => {
@@ -4618,7 +5042,17 @@ async fn dispatch_native_dylib_module_request(
     .map_err(|source| NetworkError::Io {
         operation: format!("dispatch native dylib module route {route_for_error}"),
         detail: format!("native dylib module route task failed: {source}"),
-    })?
+    })??;
+    let body = if let Some(path) = response_body_path {
+        let staging = staging.ok_or_else(|| NetworkError::Serialization {
+            detail: "native dylib response body lost its staging lifetime".to_string(),
+        })?;
+        ObjectRpcBodySource::file(path)?.with_lifetime_guard(staging)?
+    } else {
+        drop(staging);
+        ObjectRpcBodySource::empty()
+    };
+    Ok(ObjectRpcSessionResponse::new(response, body))
 }
 
 fn insert_daemon_route_descriptor(
@@ -4795,20 +5229,13 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                     .map(ObjectRpcSessionResponse::value);
                 }
                 if let Some(native_target) = native_target {
-                    if !request.body.is_empty() {
-                        return Err(NetworkError::Serialization {
-                            detail: "native module invocation does not accept a request body"
-                                .to_string(),
-                        });
-                    }
                     return dispatch_native_dylib_module_request(
                         paths,
                         native_target,
                         active_native_dylib_operations,
-                        request.request,
+                        request,
                     )
-                    .await
-                    .map(ObjectRpcSessionResponse::value);
+                    .await;
                 }
                 let route = request.request.route.clone();
                 let category = request.request.category.clone();
@@ -5205,6 +5632,8 @@ mod tests {
             "remote.management.status.read",
             sinomo_module::ModuleRouteAuth::Admin,
         )
+        .with_request_body_mode(sinomo_module_api::NativeModuleBodyMode::Optional)
+        .with_response_body_mode(sinomo_module_api::NativeModuleBodyMode::Required)
         .require_local_permissions(["remote-management", "device:display"])
         .descriptor()
         .expect("module route descriptor");
@@ -5215,6 +5644,283 @@ mod tests {
             daemon.required_local_permissions,
             vec!["remote-management", "device:display"]
         );
+        assert_eq!(daemon.request_body_mode, ServiceBodyMode::Optional);
+        assert_eq!(daemon.response_body_mode, ServiceBodyMode::Required);
+    }
+
+    #[test]
+    fn native_dylib_request_body_streams_to_private_staging_without_aggregate_cap() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-request-staging");
+        let staging = NativeDylibSessionStaging::create(
+            &root,
+            ServiceBodyMode::Optional,
+            ServiceBodyMode::None,
+        )
+        .expect("create staging");
+        let staging_root = staging.root.clone();
+        let request_path = staging.request_body_path.as_deref().expect("request path");
+        let payload = (0..(2 * 1024 * 1024 + 19))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected_digest = format!("blake3:{}", blake3::hash(&payload).to_hex());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let descriptor = runtime
+            .block_on(stage_native_dylib_request_body(
+                sinomo_core::network::ObjectRpcIncomingBody::bytes(payload.clone()),
+                request_path,
+                &DaemonOperationCancellationToken::new(),
+            ))
+            .expect("stage request body");
+
+        assert_eq!(descriptor.length, payload.len() as u64);
+        assert_eq!(descriptor.blake3, expected_digest);
+        assert_eq!(
+            std::fs::read(request_path).expect("read staged body"),
+            payload
+        );
+        drop(staging);
+        assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn native_dylib_request_body_modes_reject_none_and_empty_required_bodies() {
+        assert!(
+            validate_native_dylib_request_body_mode("/native/value", ServiceBodyMode::None, false,)
+                .is_ok()
+        );
+        assert!(
+            validate_native_dylib_request_body_mode(
+                "/native/optional",
+                ServiceBodyMode::Optional,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_native_dylib_request_body_mode(
+                "/native/required",
+                ServiceBodyMode::Required,
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_native_dylib_request_body_mode("/native/value", ServiceBodyMode::None, true,)
+                .expect_err("none mode must reject an attachment")
+                .to_string()
+                .contains("does not accept")
+        );
+        assert!(
+            validate_native_dylib_request_body_mode(
+                "/native/required",
+                ServiceBodyMode::Required,
+                false,
+            )
+            .expect_err("required mode must reject an absent or zero-byte attachment")
+            .to_string()
+            .contains("non-empty")
+        );
+
+        // A streaming reader may advertise an unknown length and then reach
+        // EOF without yielding bytes. The post-drain staged descriptor is the
+        // authoritative check for Required mode.
+        let empty_staged = sinomo_module_api::NativeModuleStagedBody::new(
+            "/private/request.body",
+            0,
+            format!("blake3:{}", blake3::hash(&[]).to_hex()),
+        );
+        assert!(
+            validate_native_dylib_staged_request_body(
+                "/native/required",
+                ServiceBodyMode::Required,
+                Some(&empty_staged),
+            )
+            .expect_err("required mode must reject a drained zero-byte reader")
+            .to_string()
+            .contains("non-empty")
+        );
+        assert!(
+            validate_native_dylib_staged_request_body(
+                "/native/optional",
+                ServiceBodyMode::Optional,
+                Some(&empty_staged),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn native_dylib_request_staging_observes_operation_cancellation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-request-cancel");
+        let staging = NativeDylibSessionStaging::create(
+            &root,
+            ServiceBodyMode::Optional,
+            ServiceBodyMode::None,
+        )
+        .expect("create staging");
+        let request_path = staging.request_body_path.as_deref().expect("request path");
+        let cancellation = DaemonOperationCancellationToken::new();
+        cancellation.cancel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let error = runtime
+            .block_on(stage_native_dylib_request_body(
+                sinomo_core::network::ObjectRpcIncomingBody::bytes(vec![0x5a; 1024]),
+                request_path,
+                &cancellation,
+            ))
+            .expect_err("cancelled staging must fail");
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn dropping_native_dylib_dispatch_registration_cancels_and_unregisters() {
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
+        let registration = NativeDylibOperationCancellationRegistration::register(
+            Arc::clone(&active),
+            Some("operation.drop".to_string()),
+        )
+        .expect("register operation");
+        let token = registration.token();
+        assert!(!token.is_cancelled());
+        assert!(
+            active
+                .lock()
+                .expect("active operations")
+                .contains_key("operation.drop")
+        );
+
+        drop(registration);
+
+        assert!(token.is_cancelled());
+        assert!(active.lock().expect("active operations").is_empty());
+    }
+
+    #[test]
+    fn native_dylib_final_permission_callback_observes_live_local_revocation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-permission-callback");
+        let store = sinomo_core::node::LocalNodePermissionStore::new(&root);
+        let callbacks = NativeDylibModuleInvocationCallbacks {
+            cancellation_token: DaemonOperationCancellationToken::new(),
+            data_dir_root: root.to_path_buf(),
+        };
+        let granted = |permission| {
+            sinomo_module::NativeModuleHostCallbacks::local_permission_granted(
+                &callbacks, permission,
+            )
+        };
+
+        assert!(!granted("remote-management"));
+        assert!(!granted("unknown-permission"));
+        let mut permissions = sinomo_core::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        store.save(&permissions).expect("grant local permission");
+        assert!(granted("remote-management"));
+
+        permissions.set_remote_management_enabled(false);
+        store.save(&permissions).expect("revoke local permission");
+        assert!(!granted("remote-management"));
+    }
+
+    #[test]
+    fn native_dylib_response_body_requires_exact_host_path_length_and_hash() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-response-staging");
+        let staging = NativeDylibSessionStaging::create(
+            &root,
+            ServiceBodyMode::None,
+            ServiceBodyMode::Optional,
+        )
+        .expect("create staging");
+        let response_path = staging
+            .response_body_path
+            .as_deref()
+            .expect("response path");
+        std::fs::write(response_path, vec![0x5a; 512 * 1024 + 7]).expect("write response body");
+        let descriptor = inspect_native_dylib_staged_body(response_path).expect("descriptor");
+
+        let validated = validate_native_dylib_response_body(
+            ServiceBodyMode::Optional,
+            Some(response_path),
+            Some(descriptor.clone()),
+        )
+        .expect("validate response")
+        .expect("response path");
+        assert_eq!(validated, response_path);
+
+        let mut wrong_path = descriptor.clone();
+        wrong_path.path.push_str(".other");
+        assert!(
+            validate_native_dylib_response_body(
+                ServiceBodyMode::Optional,
+                Some(response_path),
+                Some(wrong_path),
+            )
+            .expect_err("foreign path must fail")
+            .to_string()
+            .contains("host-assigned path")
+        );
+        let mut wrong_length = descriptor;
+        wrong_length.length += 1;
+        assert!(
+            validate_native_dylib_response_body(
+                ServiceBodyMode::Optional,
+                Some(response_path),
+                Some(wrong_length),
+            )
+            .expect_err("wrong length must fail")
+            .to_string()
+            .contains("length mismatch")
+        );
+
+        std::fs::write(response_path, []).expect("truncate response body");
+        let empty = inspect_native_dylib_staged_body(response_path).expect("empty descriptor");
+        assert!(
+            validate_native_dylib_response_body(
+                ServiceBodyMode::Required,
+                Some(response_path),
+                Some(empty),
+            )
+            .expect_err("required response body must be non-empty")
+            .to_string()
+            .contains("non-empty")
+        );
+    }
+
+    #[test]
+    fn native_dylib_response_staging_cleanup_lives_with_body_source() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-response-lifetime");
+        let staging = NativeDylibSessionStaging::create(
+            &root,
+            ServiceBodyMode::None,
+            ServiceBodyMode::Required,
+        )
+        .expect("create staging");
+        let staging_root = staging.root.clone();
+        let response_path = staging.response_body_path.clone().expect("response path");
+        std::fs::write(&response_path, b"response attachment").expect("write response body");
+        let descriptor = inspect_native_dylib_staged_body(&response_path).expect("descriptor");
+        let validated = validate_native_dylib_response_body(
+            ServiceBodyMode::Required,
+            Some(&response_path),
+            Some(descriptor),
+        )
+        .expect("validate response")
+        .expect("response path");
+        let source = ObjectRpcBodySource::file(validated)
+            .expect("file body")
+            .with_lifetime_guard(staging)
+            .expect("attach cleanup guard");
+
+        assert!(staging_root.exists());
+        drop(source);
+        assert!(!staging_root.exists());
     }
 
     #[test]
@@ -6322,6 +7028,8 @@ mod tests {
                 .expect("module id"),
             operation: sinomo_remote_management::REMOTE_MANAGEMENT_SYSTEM_OBSERVE_OPERATION
                 .to_string(),
+            request_body_mode: ServiceBodyMode::None,
+            response_body_mode: ServiceBodyMode::None,
         };
 
         inject_native_dylib_host_authority(&authoritative, &target, &mut request)
