@@ -12,22 +12,23 @@ use super::{
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
     DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
     DfsExposeCliCommand, DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions,
-    DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelOptionValueUpdate,
-    ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand,
-    ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
-    ProviderName, RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
-    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
-    RolloutProgressTiming, RolloutTarget, RolloutTelemetryGateSetOptions,
-    RuntimeMainAgentInteractionHandler, SelfRolloutPaths, SkillActivateOptions, SkillCliCommand,
-    SkillExportOptions, SkillImportOptions, SkillListOptions, SkillShowOptions, TestCliCommand,
-    UninstallOptions, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
-    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
-    cluster_invite_has_remote_usable_introducer, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave,
-    cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    DfsPinCliCommand, DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
+    DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
+    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
+    ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand,
+    ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutAdvanceOptions,
+    RolloutCliCommand, RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    RolloutProgressExpectation, RolloutProgressTiming, RolloutTarget,
+    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
+    SkillActivateOptions, SkillCliCommand, SkillExportOptions, SkillImportOptions,
+    SkillListOptions, SkillShowOptions, TestCliCommand, UninstallOptions,
+    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    cli_command_is_help, cli_command_requires_cluster_state,
+    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_has_remote_usable_introducer,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
+    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
@@ -7887,6 +7888,107 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
 }
 
 #[test]
+fn dfs_parser_requires_explicit_placement_authority_recovery_evidence() {
+    let file_system_id = sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
+        .expect("filesystem");
+    assert_eq!(
+        parse_dfs_command(&[
+            "placement-authority".to_string(),
+            "inspect".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("inspect placement authority"),
+        DfsCliCommand::PlacementAuthority(DfsPlacementAuthorityCliCommand::Inspect(
+            DfsPlacementAuthorityInspectOptions {
+                file_system_id: default_dfs_file_system_id(),
+                json: true,
+            }
+        ))
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "placement-authority".to_string(),
+            "clear".to_string(),
+            "--filesystem".to_string(),
+            file_system_id.to_string(),
+            "--expected-token".to_string(),
+            "v1:7:permit-hash".to_string(),
+            "--acknowledge-owner-stopped".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("normal placement authority recovery"),
+        DfsCliCommand::PlacementAuthority(DfsPlacementAuthorityCliCommand::Clear(
+            DfsPlacementAuthorityClearOptions {
+                file_system_id: file_system_id.clone(),
+                expected_recovery_token: "v1:7:permit-hash".to_string(),
+                recovery: DfsPlacementAuthorityRecovery::RemovedNode,
+                json: true,
+            }
+        ))
+    );
+    let acknowledgement = sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT;
+    assert_eq!(
+        parse_dfs_command(&[
+            "placement-authority".to_string(),
+            "clear".to_string(),
+            "--expected-token".to_string(),
+            "v1:8:legacy-permit".to_string(),
+            "--break-glass-acknowledgement".to_string(),
+            acknowledgement.to_string(),
+        ])
+        .expect("break-glass placement authority recovery"),
+        DfsCliCommand::PlacementAuthority(DfsPlacementAuthorityCliCommand::Clear(
+            DfsPlacementAuthorityClearOptions {
+                file_system_id: default_dfs_file_system_id(),
+                expected_recovery_token: "v1:8:legacy-permit".to_string(),
+                recovery: DfsPlacementAuthorityRecovery::BreakGlass {
+                    acknowledgement: acknowledgement.to_string(),
+                },
+                json: false,
+            }
+        ))
+    );
+
+    for args in [
+        vec![
+            "placement-authority",
+            "clear",
+            "--expected-token",
+            "v1:7:permit-hash",
+        ],
+        vec![
+            "placement-authority",
+            "clear",
+            "--expected-token",
+            "v1:7:permit-hash",
+            "--acknowledge-owner-stopped",
+            "--break-glass-acknowledgement",
+            acknowledgement,
+        ],
+        vec![
+            "placement-authority",
+            "clear",
+            "--expected-token",
+            "v1:7:permit-hash",
+            "--break-glass-acknowledgement",
+            "almost-the-right-phrase",
+        ],
+        vec![
+            "placement-authority",
+            "clear",
+            "--expected-token",
+            "v1:7:permit-hash",
+            "--force",
+        ],
+    ] {
+        assert!(matches!(
+            parse_dfs_command(&args.into_iter().map(str::to_string).collect::<Vec<_>>()),
+            Err(CliError::Usage)
+        ));
+    }
+}
+
+#[test]
 fn dfs_operator_inspection_uses_configured_metadata_shards() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-sharded-inspection");
     let data_dir = SinomoDataDir::new(&root);
@@ -13917,6 +14019,22 @@ fn agent_help_documents_selection_resume_and_json_run_output() {
     assert!(stdout.contains("--json"));
     assert!(stdout.contains("durable session"));
     assert!(stdout.contains("context projection"));
+    assert!(captured.output.stderr.is_empty());
+}
+
+#[test]
+fn dfs_help_documents_guarded_placement_authority_recovery() {
+    let captured = super::execute_cli_command_captured(&["dfs".to_string(), "help".to_string()]);
+
+    assert_eq!(captured.status, super::CliCommandStatus::Completed);
+    let stdout = String::from_utf8_lossy(&captured.output.stdout);
+    assert!(stdout.contains("placement-authority inspect"));
+    assert!(stdout.contains("--acknowledge-owner-stopped"));
+    assert!(stdout.contains("--break-glass-acknowledgement"));
+    assert!(
+        stdout.contains(sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT)
+    );
+    assert!(!stdout.contains("placement-authority clear --force"));
     assert!(captured.output.stderr.is_empty());
 }
 

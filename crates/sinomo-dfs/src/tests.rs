@@ -25350,6 +25350,144 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
 }
 
 #[test]
+fn reconnect_refreshes_unmanaged_local_manifest_receipt() {
+    let root = temp_root("reconnect-refreshes-unmanaged-receipt");
+    let local = NodeId::from_legacy_named("node_reconnect_unmanaged_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_reconnect_unmanaged_remote").expect("remote");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_reconnect_unmanaged_receipt").expect("object");
+    let version = DfsVersion::from_legacy_named("version_reconnect_unmanaged").expect("version");
+    let bytes = b"ordinary reconnect bytes";
+    let mut dfs = networked_sifs_with_backend(&root, local.clone());
+    let manifest = dfs
+        .content
+        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .expect("seed local manifest and blob");
+    let mut metadata = file_metadata(local.clone());
+    metadata.object_id = object_id.clone();
+    metadata.path = "/services/reconnect-unmanaged.txt".to_string();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    metadata.version = version.clone();
+    metadata.current_locations = vec![remote];
+    metadata.content_hash = Some(manifest.content_hash.clone());
+    metadata.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(metadata).expect("metadata");
+
+    let reconciliation = dfs
+        .reconcile_local_manifests(&object_id)
+        .expect("reconcile unmanaged manifest");
+
+    assert_eq!(reconciliation.refreshed_receipts, 1);
+    assert!(!reconciliation.missing_current);
+    assert!(
+        dfs.metadata_backend()
+            .expect("backend")
+            .receipts_for_version(&object_id, &version)
+            .expect("receipts")
+            .iter()
+            .any(|receipt| receipt.replica_node_id == local),
+        "ordinary reconnect keeps its legacy receipt refresh behavior"
+    );
+    assert!(
+        dfs.metadata()
+            .object(&object_id)
+            .expect("object")
+            .current_locations
+            .contains(&local),
+        "ordinary reconnect keeps its legacy location refresh behavior"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reconnect_does_not_restore_local_replica_removed_by_managed_placement() {
+    let root = temp_root("reconnect-respects-managed-placement");
+    let local = NodeId::from_legacy_named("node_reconnect_placement_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_reconnect_placement_remote").expect("remote");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_reconnect_placement_removed").expect("object");
+    let version = DfsVersion::from_legacy_named("version_reconnect_placement").expect("version");
+    let path = "/services/reconnect-placement.txt";
+    let bytes = b"local bytes remain after replica removal";
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut config = DfsFileSystemConfig::from(&file_system(local.clone()));
+        let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1)
+            .expect("placement policy");
+        policy.forbidden_node_ids = vec![local.clone()];
+        config.subtree_policies.push(
+            normalize_placement_rule(path, DfsPlacementScope::SelfOnly, policy)
+                .expect("placement rule"),
+        );
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_file_system_config(&config)
+            .expect("filesystem config");
+    });
+
+    let mut dfs = networked_sifs_with_backend(&root, local.clone());
+    let manifest = dfs
+        .content
+        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .expect("retain local manifest and blob");
+    let mut metadata = file_metadata(local.clone());
+    metadata.object_id = object_id.clone();
+    metadata.path = path.to_string();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    metadata.version = version.clone();
+    metadata.current_locations = vec![remote.clone()];
+    metadata.content_hash = Some(manifest.content_hash.clone());
+    metadata.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(metadata).expect("metadata");
+    // Once a control plane is attached, a config check cannot authorize a
+    // later receipt write: Apply could create or replace a rule in between.
+    // Reconnect must leave all clustered replica metadata to the permitted job.
+    let mut dfs = dfs.with_control_plane(control_plane);
+    assert!(
+        dfs.resolved_placement_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+            .expect("resolved placement")
+            .policy
+            .forbidden_node_ids
+            .contains(&local),
+        "test setup must explicitly forbid the reconnecting local node"
+    );
+
+    let reconciliation = dfs
+        .reconcile_local_manifests(&object_id)
+        .expect("reconcile local manifests");
+
+    assert_eq!(reconciliation.refreshed_receipts, 0);
+    assert!(
+        !reconciliation.missing_current,
+        "the local bytes still exist"
+    );
+    assert!(
+        dfs.metadata_backend()
+            .expect("backend")
+            .receipts_for_version(&object_id, &version)
+            .expect("receipts")
+            .iter()
+            .all(|receipt| receipt.replica_node_id != local),
+        "reconnect must not recreate the removed local receipt"
+    );
+    assert_eq!(
+        dfs.metadata()
+            .object(&object_id)
+            .expect("object")
+            .current_locations,
+        vec![remote],
+        "reconnect must not recreate the removed local location"
+    );
+    assert!(
+        dfs.content()
+            .has_blob(&manifest.content_hash)
+            .expect("local blob lookup"),
+        "placement removal leaves the bytes available as a local cache"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn commit_version_rejects_manifest_without_content_bytes() {
     let root = temp_root("commit-rejects-manifest-without-blob");
     let owner = NodeId::from_legacy_named("node_commit_missing_blob_owner").expect("node");
@@ -40233,10 +40371,14 @@ fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
             .expect("placement rule"),
         );
         let job = DfsPlacementReconciliationJob {
+            schema_version: crate::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
             job_id: "placement-durable-job".to_string(),
             file_system_id: file_system.file_system_id.clone(),
             path: path.to_string(),
             scope: DfsPlacementScope::SelfOnly,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: vec![DfsNodeAdvertisement::content(local.clone())],
+            accepted_config: Some(desired.clone()),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,

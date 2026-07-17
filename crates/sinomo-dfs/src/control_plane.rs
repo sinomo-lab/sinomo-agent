@@ -7,22 +7,227 @@
 
 use crate::DfsFileSystemId;
 use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
+use crate::placement::{
+    DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION, placement_config_remains_authoritative_for_job,
+    scoped_placement_config_for_job,
+};
 use crate::{DfsFileSystem, DfsPlacementReconciliationJob, DfsSubtreePolicy, sifs_file_system_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
-use sinomo_core::node::NodeId;
+use sinomo_core::node::{NodeId, cluster_member_key};
+use sinomo_core::{ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const DFS_KV_PREFIX: &str = "/dfs";
 const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
 const METADATA_OPERATION_FLOOR_PUBLISH_RETRIES: usize = 4;
 const METADATA_MEMBERSHIP_HANDOFF_RETRIES: usize = 4;
+const PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION: u32 = 1;
+const PLACEMENT_RECONCILIATION_QUEUE_CAS_RETRIES: usize = 8;
+const MAX_ACTIVE_PLACEMENT_RECONCILIATIONS: usize = 1_024;
+const FILE_SYSTEM_CONFIG_CAS_RETRIES: usize = 8;
+const PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES: usize = 4;
+
+/// Exact phrase required by the deliberately exceptional placement-authority
+/// break-glass path. Callers must treat the matching value as an operator
+/// acknowledgement, not as a generic force flag.
+pub const DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT: &str =
+    "all-prior-placement-writers-are-stopped-or-fenced";
+
+/// One exclusion latch coupling a v1 reconciliation authority check to one
+/// bounded metadata mutation.
+///
+/// This record deliberately has no wall-clock deadline or expiring KV lease.
+/// Metadata writes do not yet carry a fencing token, so allowing a stalled
+/// holder to expire would let a newer Apply commit while the old holder can
+/// still mutate metadata. Apply and other filesystem-config writers therefore
+/// compare the latch missing in the same Raft transaction that changes policy.
+///
+/// Every new holder is bound to both its node and process session. This lets a
+/// fresh `NetworkedDfsService` in the same daemon reclaim a release whose KV
+/// response was lost, while a restarted daemon may recover only its own prior
+/// process after acquiring the exclusive local data-owner lock. There is
+/// intentionally no time-based or cross-node automatic recovery path.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsPlacementAuthorityPermitRecord {
+    job_id: String,
+    holder_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    holder_cluster_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    holder_node_id: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    holder_session_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DfsPlacementAuthorityPermit {
+    file_system_id: DfsFileSystemId,
+    record: DfsPlacementAuthorityPermitRecord,
+    released: bool,
+}
+
+/// Opaque daemon-incarnation identity embedded in every new placement permit.
+/// Cluster and process identity are supplied by the control-plane host; the
+/// DFS service supplies the local node id at acquisition time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsPlacementAuthorityProcessIdentity {
+    pub cluster_id: String,
+    pub process_session_id: String,
+}
+
+/// Sanitized classification of the identity carried by a placement permit.
+/// Process-session and random holder ids remain private to the authority
+/// implementation; operators receive only the fields needed to establish the
+/// recovery class plus an opaque exact-generation token.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsPlacementAuthorityPermitHolderKind {
+    Identified,
+    Partial,
+    Legacy,
+}
+
+/// Read-only operator view of a non-expiring placement mutation permit.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPlacementAuthorityPermitStatus {
+    pub file_system_id: DfsFileSystemId,
+    pub job_id: String,
+    pub holder_kind: DfsPlacementAuthorityPermitHolderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_cluster_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_node_id: Option<NodeId>,
+    /// Opaque token bound to both the exact encoded permit and its KV
+    /// generation. Recovery must echo this value unchanged.
+    pub recovery_token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsPlacementAuthorityRecoveryRefusal {
+    OwnerStoppedAcknowledgementRequired,
+    CurrentLocalNode,
+    IncompleteHolderIdentity,
+    ForeignCluster,
+    HolderMembershipPresent { state: ClusterMemberState },
+    InvalidRemovedMembershipEvidence,
+    BreakGlassAcknowledgementRequired,
+    NormalRecoveryRequired,
+}
+
+/// Outcome of an operator-authorized placement permit recovery attempt.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum DfsPlacementAuthorityRecoveryOutcome {
+    Missing,
+    Cleared,
+    Changed,
+    Refused {
+        reason: DfsPlacementAuthorityRecoveryRefusal,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsPlacementAuthorityPendingRelease {
+    file_system_id: DfsFileSystemId,
+    record: DfsPlacementAuthorityPermitRecord,
+}
+
+static PENDING_PLACEMENT_AUTHORITY_RELEASES: OnceLock<
+    Mutex<Vec<DfsPlacementAuthorityPendingRelease>>,
+> = OnceLock::new();
+static IN_PROCESS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
+
+fn pending_placement_authority_releases() -> &'static Mutex<Vec<DfsPlacementAuthorityPendingRelease>>
+{
+    PENDING_PLACEMENT_AUTHORITY_RELEASES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn with_pending_placement_authority_releases<R>(
+    action: impl FnOnce(&mut Vec<DfsPlacementAuthorityPendingRelease>) -> R,
+) -> R {
+    let mut pending = pending_placement_authority_releases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    action(&mut pending)
+}
+
+fn queue_placement_authority_release(permit: &DfsPlacementAuthorityPermit) {
+    queue_placement_authority_record_release(&permit.file_system_id, &permit.record);
+}
+
+fn queue_placement_authority_record_release(
+    file_system_id: &DfsFileSystemId,
+    record: &DfsPlacementAuthorityPermitRecord,
+) {
+    let pending = DfsPlacementAuthorityPendingRelease {
+        file_system_id: file_system_id.clone(),
+        record: record.clone(),
+    };
+    with_pending_placement_authority_releases(|releases| {
+        if !releases.contains(&pending) {
+            releases.push(pending);
+        }
+    });
+}
+
+fn placement_authority_release_is_pending(
+    file_system_id: &DfsFileSystemId,
+    record: &DfsPlacementAuthorityPermitRecord,
+) -> bool {
+    with_pending_placement_authority_releases(|releases| {
+        releases
+            .iter()
+            .any(|pending| pending.file_system_id == *file_system_id && pending.record == *record)
+    })
+}
+
+fn clear_pending_placement_authority_release(
+    file_system_id: &DfsFileSystemId,
+    record: &DfsPlacementAuthorityPermitRecord,
+) {
+    with_pending_placement_authority_releases(|releases| {
+        releases.retain(|pending| {
+            pending.file_system_id != *file_system_id || pending.record != *record
+        });
+    });
+}
+
+impl Drop for DfsPlacementAuthorityPermit {
+    fn drop(&mut self) {
+        if !self.released {
+            // A panic or early unwind after acquisition is positive evidence
+            // that this bounded mutation's stack has exited. Preserve the
+            // exact handle process-wide so a fresh service can finish release.
+            queue_placement_authority_release(self);
+        }
+    }
+}
+
+/// Compact scheduling state for placement jobs whose full, immutable planning
+/// snapshots remain in their per-job KV records. Keeping only active ids here
+/// lets maintenance ticks avoid loading an ever-growing terminal history while
+/// preserving those records for delayed-intent authority checks and audit.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsPlacementReconciliationQueue {
+    schema_version: u32,
+    job_ids: Vec<String>,
+}
+
+impl Default for DfsPlacementReconciliationQueue {
+    fn default() -> Self {
+        Self {
+            schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+            job_ids: Vec::new(),
+        }
+    }
+}
 
 pub fn file_system_config_key(file_system_id: &DfsFileSystemId) -> String {
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/config")
@@ -33,7 +238,7 @@ pub fn metadata_shards_prefix(file_system_id: &DfsFileSystemId) -> String {
 }
 
 pub fn placement_reconciliations_prefix(file_system_id: &DfsFileSystemId) -> String {
-    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliations/")
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliations-v1/")
 }
 
 pub fn placement_reconciliation_key(file_system_id: &DfsFileSystemId, job_id: &str) -> String {
@@ -42,6 +247,217 @@ pub fn placement_reconciliation_key(file_system_id: &DfsFileSystemId, job_id: &s
         placement_reconciliations_prefix(file_system_id),
         normalize_segment(job_id)
     )
+}
+
+fn placement_reconciliation_queue_key(file_system_id: &DfsFileSystemId) -> String {
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-queue-v1")
+}
+
+fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> String {
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-authority-permit-v1")
+}
+
+fn placement_authority_permit_holder_kind(
+    record: &DfsPlacementAuthorityPermitRecord,
+) -> DfsPlacementAuthorityPermitHolderKind {
+    match (
+        &record.holder_cluster_id,
+        &record.holder_node_id,
+        &record.holder_session_id,
+    ) {
+        (Some(_), Some(_), Some(_)) => DfsPlacementAuthorityPermitHolderKind::Identified,
+        (None, None, None) => DfsPlacementAuthorityPermitHolderKind::Legacy,
+        _ => DfsPlacementAuthorityPermitHolderKind::Partial,
+    }
+}
+
+fn placement_authority_permit_recovery_token(entry: &KvEntry) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo-dfs-placement-authority-permit-v1\0");
+    hasher.update(&entry.modify_revision.0.to_be_bytes());
+    hasher.update(&entry.value);
+    format!(
+        "v1:{}:{}",
+        entry.modify_revision.0,
+        hasher.finalize().to_hex()
+    )
+}
+
+fn placement_authority_permit_status_from_entry(
+    file_system_id: &DfsFileSystemId,
+    entry: &KvEntry,
+) -> Result<DfsPlacementAuthorityPermitStatus, KvError> {
+    let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+    let holder_kind = placement_authority_permit_holder_kind(&record);
+    Ok(DfsPlacementAuthorityPermitStatus {
+        file_system_id: file_system_id.clone(),
+        job_id: record.job_id,
+        holder_kind,
+        holder_cluster_id: record.holder_cluster_id,
+        holder_node_id: record.holder_node_id,
+        recovery_token: placement_authority_permit_recovery_token(entry),
+    })
+}
+
+fn placement_authority_busy_path(
+    file_system_id: &DfsFileSystemId,
+    record: &DfsPlacementAuthorityPermitRecord,
+) -> String {
+    let holder = match (
+        &record.holder_cluster_id,
+        &record.holder_node_id,
+        &record.holder_session_id,
+    ) {
+        (Some(cluster_id), Some(node_id), Some(session_id)) => {
+            format!("held by node {node_id} in cluster {cluster_id}, daemon session {session_id}")
+        }
+        _ => "held by an unknown legacy session".to_string(),
+    };
+    format!(
+        "{}; active placement metadata mutation permit {holder} cannot be auto-expired; restart the owning daemon for guarded local-session recovery; a permanently removed node requires operator intervention after member revocation",
+        placement_authority_permit_key(file_system_id),
+    )
+}
+
+/// Merge a generic filesystem publication without granting it policy-edit
+/// authority. Once a config exists, its complete managed-rule set remains
+/// authoritative; generic callers may update base fields but cannot create,
+/// replace, or resurrect placement rules. Adding known generated defaults is
+/// reserved for [`merge_file_system_config_defaults`], while explicit user
+/// edits belong exclusively to the placement Apply transaction.
+fn merge_file_system_config_publication(
+    current: Option<&DfsFileSystemConfig>,
+    proposed: &DfsFileSystemConfig,
+) -> DfsFileSystemConfig {
+    let Some(current) = current else {
+        return proposed.clone();
+    };
+    let mut merged = proposed.clone();
+    merged.subtree_policies = current.subtree_policies.clone();
+    merged
+}
+
+fn merge_file_system_config_defaults(
+    current: Option<&DfsFileSystemConfig>,
+    defaults: &DfsFileSystemConfig,
+) -> DfsFileSystemConfig {
+    let Some(current) = current else {
+        return defaults.clone();
+    };
+    let mut merged = current.clone();
+    for rule in &defaults.subtree_policies {
+        if !merged.subtree_policies.iter().any(|existing| {
+            existing.path_prefix == rule.path_prefix && existing.scope == rule.scope
+        }) {
+            merged.subtree_policies.push(rule.clone());
+        }
+    }
+    merged
+}
+
+fn legacy_placement_reconciliations_prefix(file_system_id: &DfsFileSystemId) -> String {
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliations/")
+}
+
+fn legacy_placement_reconciliation_key(file_system_id: &DfsFileSystemId, job_id: &str) -> String {
+    format!(
+        "{}{}",
+        legacy_placement_reconciliations_prefix(file_system_id),
+        normalize_segment(job_id)
+    )
+}
+
+fn validate_v1_placement_reconciliation_job(
+    job: &DfsPlacementReconciliationJob,
+) -> Result<(), KvError> {
+    if job.schema_version != DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation job {} uses schema version {}, expected {}",
+                job.job_id, job.schema_version, DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION
+            ),
+        });
+    }
+    let Some(accepted_config) = job.accepted_config.as_ref() else {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation job {} is missing its accepted config snapshot",
+                job.job_id
+            ),
+        });
+    };
+    if accepted_config.file_system_id != job.file_system_id {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation job {} snapshot belongs to filesystem {} instead of {}",
+                job.job_id, accepted_config.file_system_id, job.file_system_id
+            ),
+        });
+    }
+    if job.candidate_snapshot.is_empty() {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation job {} is missing its accepted candidate snapshot",
+                job.job_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placement_reconciliation_queue(
+    file_system_id: &DfsFileSystemId,
+    queue: &DfsPlacementReconciliationQueue,
+) -> Result<(), KvError> {
+    if queue.schema_version != PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation queue for {file_system_id} uses schema version {}, expected {}",
+                queue.schema_version, PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION
+            ),
+        });
+    }
+    if queue.job_ids.len() > MAX_ACTIVE_PLACEMENT_RECONCILIATIONS {
+        return Err(KvError::RangeLimit {
+            prefix: placement_reconciliation_queue_key(file_system_id),
+            max_entries: MAX_ACTIVE_PLACEMENT_RECONCILIATIONS,
+        });
+    }
+    let unique_job_ids = queue.job_ids.iter().collect::<BTreeSet<_>>();
+    if unique_job_ids.len() != queue.job_ids.len()
+        || queue.job_ids.iter().any(|job_id| job_id.is_empty())
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation queue for {file_system_id} contains empty or duplicate job ids"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placement_reconciliation_snapshot_identity(
+    expected: &DfsPlacementReconciliationJob,
+    desired: &DfsPlacementReconciliationJob,
+) -> Result<(), KvError> {
+    if expected.schema_version != desired.schema_version
+        || expected.job_id != desired.job_id
+        || expected.file_system_id != desired.file_system_id
+        || expected.path != desired.path
+        || expected.scope != desired.scope
+        || expected.unavailable_node_ids != desired.unavailable_node_ids
+        || expected.candidate_snapshot != desired.candidate_snapshot
+        || expected.accepted_config != desired.accepted_config
+        || expected.created_at_unix_nanos != desired.created_at_unix_nanos
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "placement reconciliation job {} cannot change its accepted policy or topology snapshots",
+                expected.job_id
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub fn metadata_shard_key(file_system_id: &DfsFileSystemId, shard_id: &str) -> String {
@@ -258,6 +674,28 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
         Ok(())
     }
 
+    /// Identify a host process which is authorized to execute placement
+    /// reconciliation. Generic clients return `None`; the daemon supplies a
+    /// cluster-bound process session and the in-process test store supplies an
+    /// isolated embedded session.
+    fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
+        None
+    }
+
+    /// Confirm that this client is backed by the host's current exclusive
+    /// ownership proof before recovering a permit from an earlier process.
+    ///
+    /// The identity fields alone are deliberately insufficient: they are wire
+    /// data and can be constructed by any caller. Production hosts override
+    /// this method only while they retain their OS-backed ownership lock.
+    fn authorizes_prior_process_placement_authority_recovery(
+        &self,
+        _local_node_id: &NodeId,
+        _current_process: &DfsPlacementAuthorityProcessIdentity,
+    ) -> bool {
+        false
+    }
+
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
@@ -375,6 +813,26 @@ where
             .refresh_latest()
     }
 
+    fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|client| client.placement_authority_process_identity())
+    }
+
+    fn authorizes_prior_process_placement_authority_recovery(
+        &self,
+        local_node_id: &NodeId,
+        current_process: &DfsPlacementAuthorityProcessIdentity,
+    ) -> bool {
+        self.inner.lock().is_ok_and(|client| {
+            client.authorizes_prior_process_placement_authority_recovery(
+                local_node_id,
+                current_process,
+            )
+        })
+    }
+
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         self.inner
             .lock()
@@ -413,6 +871,25 @@ where
 }
 
 impl DfsControlPlaneKvClient for InProcessKvStore {
+    fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
+        Some(DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "in-process".to_string(),
+            process_session_id: IN_PROCESS_PLACEMENT_AUTHORITY_SESSION_ID
+                .get_or_init(|| sinomo_core::Id::generate().to_string())
+                .clone(),
+        })
+    }
+
+    fn authorizes_prior_process_placement_authority_recovery(
+        &self,
+        _local_node_id: &NodeId,
+        _current_process: &DfsPlacementAuthorityProcessIdentity,
+    ) -> bool {
+        // An in-process store has no external daemon lifetime. It is used by
+        // embedded callers and tests which own the complete store directly.
+        true
+    }
+
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         Ok(self.get(key).cloned())
     }
@@ -465,7 +942,49 @@ impl<'a> DfsControlPlaneStore<'a> {
     }
 
     pub fn put_file_system_config(&mut self, config: &DfsFileSystemConfig) -> Result<(), KvError> {
-        self.put_serde(&file_system_config_key(&config.file_system_id), config)
+        for _ in 0..FILE_SYSTEM_CONFIG_CAS_RETRIES {
+            let current = self.get_file_system_config(&config.file_system_id)?;
+            let merged = merge_file_system_config_publication(current.as_ref(), config);
+            if current.as_ref() == Some(&merged) {
+                return Ok(());
+            }
+            if self.compare_and_put_file_system_config(current.as_ref(), &merged)? {
+                return Ok(());
+            }
+        }
+        Err(KvError::Busy {
+            path: format!(
+                "{} changed concurrently during generic filesystem publication; retry",
+                file_system_config_key(&config.file_system_id)
+            ),
+        })
+    }
+
+    /// Idempotently seed filesystem defaults without changing any existing
+    /// owner/display metadata or managed placement rule. This is the recurring
+    /// bootstrap publication path; missing generated rules are appended with
+    /// an exact config CAS so it cannot regress a concurrent owner or policy
+    /// update.
+    pub fn ensure_file_system_config_defaults(
+        &mut self,
+        defaults: &DfsFileSystemConfig,
+    ) -> Result<(), KvError> {
+        for _ in 0..FILE_SYSTEM_CONFIG_CAS_RETRIES {
+            let current = self.get_file_system_config(&defaults.file_system_id)?;
+            let merged = merge_file_system_config_defaults(current.as_ref(), defaults);
+            if current.as_ref() == Some(&merged) {
+                return Ok(());
+            }
+            if self.compare_and_put_file_system_config(current.as_ref(), &merged)? {
+                return Ok(());
+            }
+        }
+        Err(KvError::Busy {
+            path: format!(
+                "{} changed concurrently while ensuring filesystem defaults; retry",
+                file_system_config_key(&defaults.file_system_id)
+            ),
+        })
     }
 
     pub fn get_file_system_config(
@@ -473,6 +992,537 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
     ) -> Result<Option<DfsFileSystemConfig>, KvError> {
         self.get_serde(&file_system_config_key(file_system_id))
+    }
+
+    /// Compare-and-set a filesystem config while participating in the same
+    /// placement-authority latch as Apply. Callers which merge a freshly read
+    /// config (such as recurring default-cluster publication) must use this
+    /// form so a concurrent user Apply cannot be overwritten by their stale
+    /// snapshot.
+    pub fn compare_and_put_file_system_config(
+        &mut self,
+        expected: Option<&DfsFileSystemConfig>,
+        desired: &DfsFileSystemConfig,
+    ) -> Result<bool, KvError> {
+        if expected.is_some_and(|config| config.file_system_id != desired.file_system_id) {
+            return Err(KvError::Serialization {
+                detail: "filesystem config compare-and-put cannot change the filesystem id"
+                    .to_string(),
+            });
+        }
+        let key = file_system_config_key(&desired.file_system_id);
+        let current_entry = self.kv.get(&key)?;
+        let config_compare = match (expected, current_entry) {
+            (None, None) => KvCompare::Missing { key: key.clone() },
+            (Some(expected), Some(entry)) => {
+                if entry.decode::<DfsFileSystemConfig>()? != *expected {
+                    return Ok(false);
+                }
+                KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value,
+                }
+            }
+            _ => return Ok(false),
+        };
+        let permit_compare =
+            self.placement_authority_permit_missing_compare(&desired.file_system_id)?;
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares: vec![config_compare, permit_compare],
+                success: vec![KvOp::put_serde(key, desired, None)?],
+                failure: Vec::new(),
+            })?
+            .succeeded)
+    }
+
+    fn placement_authority_permit_missing_compare(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<KvCompare, KvError> {
+        let key = placement_authority_permit_key(file_system_id);
+        for _ in 0..PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES {
+            let Some(entry) = self.kv.get(&key)? else {
+                return Ok(KvCompare::Missing { key });
+            };
+            let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+            if !placement_authority_release_is_pending(file_system_id, &record) {
+                return Err(KvError::Busy {
+                    path: placement_authority_busy_path(file_system_id, &record),
+                });
+            }
+            let response = self.kv.txn(KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value,
+                }],
+                success: vec![KvOp::Delete { key: key.clone() }],
+                failure: Vec::new(),
+            })?;
+            if response.succeeded {
+                clear_pending_placement_authority_release(file_system_id, &record);
+                return Ok(KvCompare::Missing { key });
+            }
+        }
+        Err(KvError::Busy {
+            path: format!(
+                "{} changed repeatedly during exact pending-release recovery; retry",
+                placement_authority_permit_key(file_system_id)
+            ),
+        })
+    }
+
+    /// Inspect the current placement mutation permit without exposing its
+    /// random holder id or process-session id. The returned recovery token is
+    /// bound to the exact encoded value and KV generation.
+    pub fn placement_authority_permit_status(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsPlacementAuthorityPermitStatus>, KvError> {
+        let Some(entry) = self
+            .kv
+            .get(&placement_authority_permit_key(file_system_id))?
+        else {
+            return Ok(None);
+        };
+        placement_authority_permit_status_from_entry(file_system_id, &entry).map(Some)
+    }
+
+    /// Clear a permit owned by a fully identified, removed node in this exact
+    /// cluster. Absence from membership is checked in the same quorum
+    /// transaction as the exact permit delete; an explicitly `Removed` record
+    /// is accepted only under an exact-value membership compare. Offline,
+    /// suspect, pending, active, local, foreign, and partial holders fail
+    /// closed.
+    ///
+    /// Membership removal does not fence an already-running metadata writer,
+    /// so the operator must additionally acknowledge that the old owner has
+    /// been stopped or externally fenced.
+    pub fn recover_removed_node_placement_authority_permit(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        current_cluster_id: &str,
+        local_node_id: &NodeId,
+        expected_recovery_token: &str,
+        acknowledge_owner_stopped: bool,
+    ) -> Result<DfsPlacementAuthorityRecoveryOutcome, KvError> {
+        if !acknowledge_owner_stopped {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::OwnerStoppedAcknowledgementRequired,
+            });
+        }
+        let permit_key = placement_authority_permit_key(file_system_id);
+        let Some(permit_entry) = self.kv.get(&permit_key)? else {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Missing);
+        };
+        if placement_authority_permit_recovery_token(&permit_entry) != expected_recovery_token {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Changed);
+        }
+        let record = permit_entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+        let (Some(holder_cluster_id), Some(holder_node_id), Some(_holder_session_id)) = (
+            record.holder_cluster_id.as_deref(),
+            record.holder_node_id.as_ref(),
+            record.holder_session_id.as_deref(),
+        ) else {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity,
+            });
+        };
+        if holder_cluster_id != current_cluster_id {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::ForeignCluster,
+            });
+        }
+        if holder_node_id == local_node_id {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::CurrentLocalNode,
+            });
+        }
+
+        let member_key = cluster_member_key(holder_node_id);
+        let member_compare = match self.kv.get(&member_key)? {
+            None => KvCompare::Missing {
+                key: member_key.clone(),
+            },
+            Some(member_entry) => {
+                let member = member_entry.decode::<ClusterMemberRecord>()?;
+                if member.node_id != *holder_node_id
+                    || member.cluster_id.to_string() != current_cluster_id
+                {
+                    return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                        reason:
+                            DfsPlacementAuthorityRecoveryRefusal::InvalidRemovedMembershipEvidence,
+                    });
+                }
+                if member.state != ClusterMemberState::Removed {
+                    return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                        reason: DfsPlacementAuthorityRecoveryRefusal::HolderMembershipPresent {
+                            state: member.state,
+                        },
+                    });
+                }
+                KvCompare::ValueEquals {
+                    key: member_key.clone(),
+                    value: member_entry.value,
+                }
+            }
+        };
+
+        let response = self.kv.txn(KvTxn {
+            compares: vec![
+                KvCompare::ValueEquals {
+                    key: permit_key.clone(),
+                    value: permit_entry.value,
+                },
+                KvCompare::ModifyRevisionEquals {
+                    key: permit_key.clone(),
+                    revision: permit_entry.modify_revision,
+                },
+                member_compare,
+            ],
+            success: vec![KvOp::Delete { key: permit_key }],
+            failure: Vec::new(),
+        })?;
+        if !response.succeeded {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Changed);
+        }
+        clear_pending_placement_authority_release(file_system_id, &record);
+        Ok(DfsPlacementAuthorityRecoveryOutcome::Cleared)
+    }
+
+    /// Deliberately exceptional recovery for a foreign-cluster or incomplete
+    /// legacy permit whose owner cannot be proven through current membership.
+    /// The exact acknowledgement phrase and exact-generation token are both
+    /// required. Fully identified same-cluster holders must use the normal
+    /// removed-node recovery path and can never cross this escape hatch.
+    pub fn break_glass_recover_placement_authority_permit(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        current_cluster_id: &str,
+        expected_recovery_token: &str,
+        acknowledgement: &str,
+    ) -> Result<DfsPlacementAuthorityRecoveryOutcome, KvError> {
+        if acknowledgement != DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::BreakGlassAcknowledgementRequired,
+            });
+        }
+        let permit_key = placement_authority_permit_key(file_system_id);
+        let Some(permit_entry) = self.kv.get(&permit_key)? else {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Missing);
+        };
+        if placement_authority_permit_recovery_token(&permit_entry) != expected_recovery_token {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Changed);
+        }
+        let record = permit_entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+        let fully_identified_same_cluster = matches!(
+            (
+                record.holder_cluster_id.as_deref(),
+                record.holder_node_id.as_ref(),
+                record.holder_session_id.as_deref(),
+            ),
+            (Some(cluster_id), Some(_), Some(_)) if cluster_id == current_cluster_id
+        );
+        if fully_identified_same_cluster {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::NormalRecoveryRequired,
+            });
+        }
+
+        let response = self.kv.txn(KvTxn {
+            compares: vec![
+                KvCompare::ValueEquals {
+                    key: permit_key.clone(),
+                    value: permit_entry.value,
+                },
+                KvCompare::ModifyRevisionEquals {
+                    key: permit_key.clone(),
+                    revision: permit_entry.modify_revision,
+                },
+            ],
+            success: vec![KvOp::Delete { key: permit_key }],
+            failure: Vec::new(),
+        })?;
+        if !response.succeeded {
+            return Ok(DfsPlacementAuthorityRecoveryOutcome::Changed);
+        }
+        clear_pending_placement_authority_release(file_system_id, &record);
+        Ok(DfsPlacementAuthorityRecoveryOutcome::Cleared)
+    }
+
+    /// Recover a permit belonging to an earlier process on this exact node.
+    ///
+    /// The caller must hold the node's exclusive daemon and data-owner locks,
+    /// and must refresh its control-plane view before invoking this method.
+    /// Those locks prove the prior local process is gone. Unknown legacy
+    /// records, current-process holders, and records owned by another node are
+    /// deliberately left intact. The delete itself compares the exact encoded
+    /// record, so it cannot remove a concurrently replaced holder.
+    pub fn recover_prior_process_placement_authority_permit_for_local_node(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        local_node_id: &NodeId,
+        current_process: &DfsPlacementAuthorityProcessIdentity,
+    ) -> Result<bool, KvError> {
+        if !self
+            .kv
+            .authorizes_prior_process_placement_authority_recovery(local_node_id, current_process)
+        {
+            return Err(KvError::Busy {
+                path: format!(
+                    "{} recovery requires the host's live exclusive data-owner capability",
+                    placement_authority_permit_key(file_system_id)
+                ),
+            });
+        }
+        let key = placement_authority_permit_key(file_system_id);
+        let Some(entry) = self.kv.get(&key)? else {
+            return Ok(false);
+        };
+        let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+        if record.holder_cluster_id.as_deref() != Some(current_process.cluster_id.as_str())
+            || record.holder_node_id.as_ref() != Some(local_node_id)
+            || !record
+                .holder_session_id
+                .as_deref()
+                .is_some_and(|session_id| session_id != current_process.process_session_id)
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value,
+                }],
+                success: vec![KvOp::Delete { key }],
+                failure: Vec::new(),
+            })?
+            .succeeded)
+    }
+
+    /// Acquire the exact v1 job/config generation through the quorum-backed
+    /// transaction path and keep Apply excluded until the caller releases the
+    /// returned permit. The preliminary reads preserve encoding compatibility;
+    /// the transaction compares the exact stored bytes, not only decoded
+    /// values, and writes a fresh non-expiring holder record so it cannot take
+    /// the semantic no-effect shortcut.
+    pub(crate) fn try_acquire_placement_authority_permit(
+        &mut self,
+        expected_job: &DfsPlacementReconciliationJob,
+        expected_config: &DfsFileSystemConfig,
+        holder_node_id: &NodeId,
+        holder_process: &DfsPlacementAuthorityProcessIdentity,
+    ) -> Result<Option<DfsPlacementAuthorityPermit>, KvError> {
+        validate_v1_placement_reconciliation_job(expected_job)?;
+        let job_key =
+            placement_reconciliation_key(&expected_job.file_system_id, &expected_job.job_id);
+        let config_key = file_system_config_key(&expected_job.file_system_id);
+        let Some(job_entry) = self.kv.get(&job_key)? else {
+            return Ok(None);
+        };
+        if job_entry.decode::<DfsPlacementReconciliationJob>()? != *expected_job {
+            return Ok(None);
+        }
+        let Some(config_entry) = self.kv.get(&config_key)? else {
+            return Ok(None);
+        };
+        if config_entry.decode::<DfsFileSystemConfig>()? != *expected_config {
+            return Ok(None);
+        }
+
+        let holder_id = sinomo_core::Id::generate().to_string();
+        let record = DfsPlacementAuthorityPermitRecord {
+            job_id: expected_job.job_id.clone(),
+            holder_id,
+            holder_cluster_id: Some(holder_process.cluster_id.clone()),
+            holder_node_id: Some(holder_node_id.clone()),
+            holder_session_id: Some(holder_process.process_session_id.clone()),
+        };
+        let permit_key = placement_authority_permit_key(&expected_job.file_system_id);
+        let permit_compare =
+            match self.placement_authority_permit_missing_compare(&expected_job.file_system_id) {
+                Ok(value) => value,
+                Err(KvError::Busy { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        let permit_put = KvOp::put_serde(permit_key, &record, None)?;
+        // Arm the non-cloneable RAII permit before entering the transaction.
+        // If the client panics or returns an error after quorum committed the
+        // Put, Drop queues this exact record before the unwind can strand it.
+        let mut permit = DfsPlacementAuthorityPermit {
+            file_system_id: expected_job.file_system_id.clone(),
+            record,
+            released: false,
+        };
+        let response = self.kv.txn(KvTxn {
+            compares: vec![
+                KvCompare::ValueEquals {
+                    key: job_key,
+                    value: job_entry.value,
+                },
+                KvCompare::ValueEquals {
+                    key: config_key,
+                    value: config_entry.value,
+                },
+                permit_compare,
+            ],
+            success: vec![permit_put],
+            failure: Vec::new(),
+        })?;
+        if !response.succeeded {
+            // The authoritative compare rejected the Put, so Drop must not
+            // queue a record that was never installed.
+            permit.released = true;
+            return Ok(None);
+        }
+        Ok(Some(permit))
+    }
+
+    pub(crate) fn release_placement_authority_permit(
+        &mut self,
+        permit: &mut DfsPlacementAuthorityPermit,
+    ) -> Result<(), KvError> {
+        // Queue the exact handle before contacting KV. This positive evidence
+        // that the bounded mutation stack has exited survives ephemeral
+        // service destruction and lets a later service finish an ambiguous or
+        // failed release without inferring liveness from a timeout.
+        if !permit.released {
+            queue_placement_authority_release(permit);
+        }
+        let key = placement_authority_permit_key(&permit.file_system_id);
+        let value = sinomo_core::kv::encode_kv_value(&permit.record)?;
+        // A false compare means the exact holder is already gone. Never delete
+        // a different holder's permit from a delayed finally/retry path.
+        self.kv.txn(KvTxn {
+            compares: vec![KvCompare::ValueEquals {
+                key: key.clone(),
+                value,
+            }],
+            success: vec![KvOp::Delete { key }],
+            failure: Vec::new(),
+        })?;
+        clear_pending_placement_authority_release(&permit.file_system_id, &permit.record);
+        permit.released = true;
+        Ok(())
+    }
+
+    fn v1_placement_reconciliation(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        job_id: &str,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
+        self.get_serde(&placement_reconciliation_key(file_system_id, job_id))
+    }
+
+    fn initial_placement_reconciliation_queue(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        current_config: &DfsFileSystemConfig,
+    ) -> Result<DfsPlacementReconciliationQueue, KvError> {
+        let mut jobs = self
+            .kv
+            .range_prefix(&placement_reconciliations_prefix(file_system_id))?
+            .into_iter()
+            .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
+            .collect::<Result<Vec<_>, _>>()?;
+        for job in &jobs {
+            validate_v1_placement_reconciliation_job(job)?;
+        }
+        jobs.retain(|job| !job.state.is_terminal());
+        jobs.sort_by(|left, right| {
+            left.created_at_unix_nanos
+                .cmp(&right.created_at_unix_nanos)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        if jobs.len() > MAX_ACTIVE_PLACEMENT_RECONCILIATIONS {
+            return Err(KvError::RangeLimit {
+                prefix: placement_reconciliations_prefix(file_system_id),
+                max_entries: MAX_ACTIVE_PLACEMENT_RECONCILIATIONS,
+            });
+        }
+
+        // Run jobs that are still authoritative before stale work. Repeated
+        // same-path Apply operations therefore put the newest useful job at
+        // the head without starving older jobs for unrelated scopes.
+        let (authoritative, superseded): (Vec<_>, Vec<_>) = jobs.into_iter().partition(|job| {
+            job.accepted_config.as_ref().is_some_and(|accepted| {
+                placement_config_remains_authoritative_for_job(accepted, current_config, job)
+            })
+        });
+        let job_ids = authoritative
+            .into_iter()
+            .chain(superseded)
+            .map(|job| job.job_id)
+            .collect();
+        Ok(DfsPlacementReconciliationQueue {
+            schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+            job_ids,
+        })
+    }
+
+    fn placement_reconciliation_queue_snapshot(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        current_config: &DfsFileSystemConfig,
+    ) -> Result<(Option<KvEntry>, DfsPlacementReconciliationQueue), KvError> {
+        let key = placement_reconciliation_queue_key(file_system_id);
+        let Some(entry) = self.kv.get(&key)? else {
+            return self
+                .initial_placement_reconciliation_queue(file_system_id, current_config)
+                .map(|queue| (None, queue));
+        };
+        let queue = entry.decode::<DfsPlacementReconciliationQueue>()?;
+        validate_placement_reconciliation_queue(file_system_id, &queue)?;
+        Ok((Some(entry), queue))
+    }
+
+    fn compact_and_prioritize_placement_reconciliation_queue(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        queue: DfsPlacementReconciliationQueue,
+        desired_config: &DfsFileSystemConfig,
+        new_job_id: Option<&str>,
+    ) -> Result<DfsPlacementReconciliationQueue, KvError> {
+        let mut authoritative = Vec::new();
+        let mut superseded = Vec::new();
+        for job_id in queue.job_ids {
+            let Some(job) = self.v1_placement_reconciliation(file_system_id, &job_id)? else {
+                continue;
+            };
+            validate_v1_placement_reconciliation_job(&job)?;
+            if job.state.is_terminal() {
+                continue;
+            }
+            let target = if job.accepted_config.as_ref().is_some_and(|accepted| {
+                placement_config_remains_authoritative_for_job(accepted, desired_config, &job)
+            }) {
+                &mut authoritative
+            } else {
+                &mut superseded
+            };
+            target.push(job_id);
+        }
+        if let Some(job_id) = new_job_id {
+            if authoritative.len().saturating_add(superseded.len())
+                >= MAX_ACTIVE_PLACEMENT_RECONCILIATIONS
+            {
+                return Err(KvError::RangeLimit {
+                    prefix: placement_reconciliation_queue_key(file_system_id),
+                    max_entries: MAX_ACTIVE_PLACEMENT_RECONCILIATIONS,
+                });
+            }
+            authoritative.push(job_id.to_string());
+        }
+        authoritative.extend(superseded);
+        let queue = DfsPlacementReconciliationQueue {
+            schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+            job_ids: authoritative,
+        };
+        validate_placement_reconciliation_queue(file_system_id, &queue)?;
+        Ok(queue)
     }
 
     /// Atomically publish a placement-rule edit and its durable reconciliation
@@ -491,7 +1541,39 @@ impl<'a> DfsControlPlaneStore<'a> {
         if current_entry.decode::<DfsFileSystemConfig>()? != *expected {
             return Ok(false);
         }
+        let mut durable_job = job.clone();
+        // Bind the reconciliation to exactly the config committed by this KV
+        // transaction even if a future caller forgets to populate the public
+        // snapshot field before calling the store.
+        durable_job.accepted_config = Some(scoped_placement_config_for_job(desired, job));
+        validate_v1_placement_reconciliation_job(&durable_job)?;
         let job_key = placement_reconciliation_key(&job.file_system_id, &job.job_id);
+        let legacy_job_key = legacy_placement_reconciliation_key(&job.file_system_id, &job.job_id);
+        let queue_key = placement_reconciliation_queue_key(&job.file_system_id);
+        let (queue_entry, queue) =
+            self.placement_reconciliation_queue_snapshot(&job.file_system_id, desired)?;
+        let queue = self.compact_and_prioritize_placement_reconciliation_queue(
+            &job.file_system_id,
+            queue,
+            desired,
+            Some(&job.job_id),
+        )?;
+        let queue_compare = match queue_entry {
+            Some(entry) => KvCompare::ValueEquals {
+                key: queue_key.clone(),
+                value: entry.value,
+            },
+            None => KvCompare::Missing {
+                key: queue_key.clone(),
+            },
+        };
+        let permit_compare =
+            self.placement_authority_permit_missing_compare(&job.file_system_id)?;
+        let success = vec![
+            KvOp::put_serde(config_key.clone(), desired, None)?,
+            KvOp::put_serde(job_key.clone(), &durable_job, None)?,
+            KvOp::put_serde(queue_key.clone(), &queue, None)?,
+        ];
         Ok(self
             .kv
             .txn(KvTxn {
@@ -503,11 +1585,13 @@ impl<'a> DfsControlPlaneStore<'a> {
                     KvCompare::Missing {
                         key: job_key.clone(),
                     },
+                    KvCompare::Missing {
+                        key: legacy_job_key,
+                    },
+                    queue_compare,
+                    permit_compare,
                 ],
-                success: vec![
-                    KvOp::put_serde(config_key, desired, None)?,
-                    KvOp::put_serde(job_key, job, None)?,
-                ],
+                success,
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -518,7 +1602,27 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
         job_id: &str,
     ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
-        self.get_serde(&placement_reconciliation_key(file_system_id, job_id))
+        if let Some(job) = self.v1_placement_reconciliation(file_system_id, job_id)? {
+            return Ok(Some(job));
+        }
+        self.get_serde(&legacy_placement_reconciliation_key(file_system_id, job_id))
+    }
+
+    pub(crate) fn has_v1_placement_reconciliation_state(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<bool, KvError> {
+        if self
+            .kv
+            .get(&placement_reconciliation_queue_key(file_system_id))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(!self
+            .kv
+            .range_prefix(&placement_reconciliations_prefix(file_system_id))?
+            .is_empty())
     }
 
     pub fn placement_reconciliations(
@@ -531,6 +1635,19 @@ impl<'a> DfsControlPlaneStore<'a> {
             .into_iter()
             .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
             .collect::<Result<Vec<_>, _>>()?;
+        let v1_job_ids = jobs
+            .iter()
+            .map(|job| job.job_id.clone())
+            .collect::<BTreeSet<_>>();
+        jobs.extend(
+            self.kv
+                .range_prefix(&legacy_placement_reconciliations_prefix(file_system_id))?
+                .into_iter()
+                .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|job| !v1_job_ids.contains(&job.job_id)),
+        );
         jobs.sort_by(|left: &DfsPlacementReconciliationJob, right| {
             left.created_at_unix_nanos
                 .cmp(&right.created_at_unix_nanos)
@@ -539,11 +1656,69 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(jobs)
     }
 
+    /// Return the next executable v1 placement job without loading terminal
+    /// history. A missing queue is initialized once from the v1 namespace;
+    /// afterward ticks use one compact queue read and one point lookup.
+    pub fn next_placement_reconciliation(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        current_config: &DfsFileSystemConfig,
+    ) -> Result<Option<DfsPlacementReconciliationJob>, KvError> {
+        let queue_key = placement_reconciliation_queue_key(file_system_id);
+        for _ in 0..PLACEMENT_RECONCILIATION_QUEUE_CAS_RETRIES {
+            let (queue_entry, queue) =
+                self.placement_reconciliation_queue_snapshot(file_system_id, current_config)?;
+            let Some(queue_entry) = queue_entry else {
+                let response = self.kv.txn(KvTxn {
+                    compares: vec![KvCompare::Missing {
+                        key: queue_key.clone(),
+                    }],
+                    success: vec![KvOp::put_serde(queue_key.clone(), &queue, None)?],
+                    failure: Vec::new(),
+                })?;
+                if response.succeeded && queue.job_ids.is_empty() {
+                    return Ok(None);
+                }
+                continue;
+            };
+            let Some(job_id) = queue.job_ids.first() else {
+                return Ok(None);
+            };
+            if let Some(job) = self.v1_placement_reconciliation(file_system_id, job_id)? {
+                validate_v1_placement_reconciliation_job(&job)?;
+                if !job.state.is_terminal() {
+                    return Ok(Some(job));
+                }
+            }
+
+            // Missing/terminal ids can only result from interrupted migration
+            // or an older writer. Repair them with a queue-value compare so a
+            // concurrent Apply cannot be overwritten.
+            let mut repaired = queue;
+            repaired.job_ids.remove(0);
+            let response = self.kv.txn(KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key: queue_key.clone(),
+                    value: queue_entry.value,
+                }],
+                success: vec![KvOp::put_serde(queue_key.clone(), &repaired, None)?],
+                failure: Vec::new(),
+            })?;
+            if response.succeeded && repaired.job_ids.is_empty() {
+                return Ok(None);
+            }
+        }
+        Err(KvError::Busy { path: queue_key })
+    }
+
     pub fn compare_and_put_placement_reconciliation(
         &mut self,
         expected: &DfsPlacementReconciliationJob,
         desired: &DfsPlacementReconciliationJob,
     ) -> Result<bool, KvError> {
+        validate_v1_placement_reconciliation_job(expected)?;
+        validate_v1_placement_reconciliation_job(desired)?;
+        validate_placement_reconciliation_snapshot_identity(expected, desired)?;
         let key = placement_reconciliation_key(&expected.file_system_id, &expected.job_id);
         let Some(current_entry) = self.kv.get(&key)? else {
             return Ok(false);
@@ -551,14 +1726,39 @@ impl<'a> DfsControlPlaneStore<'a> {
         if current_entry.decode::<DfsPlacementReconciliationJob>()? != *expected {
             return Ok(false);
         }
+        let mut compares = vec![KvCompare::ValueEquals {
+            key: key.clone(),
+            value: current_entry.value,
+        }];
+        let mut success = vec![KvOp::put_serde(key, desired, None)?];
+        if desired.state == crate::DfsPlacementReconciliationState::Failed {
+            // `Failed` revokes authority for delayed operations and receipts;
+            // order that transition after any currently permitted one-object
+            // mutation just like a replacement Apply.
+            compares
+                .push(self.placement_authority_permit_missing_compare(&desired.file_system_id)?);
+        }
+        if desired.state.is_terminal() {
+            let queue_key = placement_reconciliation_queue_key(&desired.file_system_id);
+            if let Some(queue_entry) = self.kv.get(&queue_key)? {
+                let mut queue = queue_entry.decode::<DfsPlacementReconciliationQueue>()?;
+                validate_placement_reconciliation_queue(&desired.file_system_id, &queue)?;
+                let previous_len = queue.job_ids.len();
+                queue.job_ids.retain(|job_id| job_id != &desired.job_id);
+                if queue.job_ids.len() != previous_len {
+                    compares.push(KvCompare::ValueEquals {
+                        key: queue_key.clone(),
+                        value: queue_entry.value,
+                    });
+                    success.push(KvOp::put_serde(queue_key, &queue, None)?);
+                }
+            }
+        }
         Ok(self
             .kv
             .txn(KvTxn {
-                compares: vec![KvCompare::ValueEquals {
-                    key: key.clone(),
-                    value: current_entry.value,
-                }],
-                success: vec![KvOp::put_serde(key, desired, None)?],
+                compares,
+                success,
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -1270,16 +2470,142 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         &mut self,
         config: &DfsFileSystemConfig,
     ) -> Result<(), KvError> {
-        self.put_serde(&file_system_config_key(&config.file_system_id), config)
-            .await
+        for _ in 0..FILE_SYSTEM_CONFIG_CAS_RETRIES {
+            let current = self.get_file_system_config(&config.file_system_id).await?;
+            let merged = merge_file_system_config_publication(current.as_ref(), config);
+            if current.as_ref() == Some(&merged) {
+                return Ok(());
+            }
+            if self
+                .compare_and_put_file_system_config(current.as_ref(), &merged)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(KvError::Busy {
+            path: format!(
+                "{} changed concurrently during generic filesystem publication; retry",
+                file_system_config_key(&config.file_system_id)
+            ),
+        })
+    }
+
+    pub async fn ensure_file_system_config_defaults(
+        &mut self,
+        defaults: &DfsFileSystemConfig,
+    ) -> Result<(), KvError> {
+        for _ in 0..FILE_SYSTEM_CONFIG_CAS_RETRIES {
+            let current = self
+                .get_file_system_config(&defaults.file_system_id)
+                .await?;
+            let merged = merge_file_system_config_defaults(current.as_ref(), defaults);
+            if current.as_ref() == Some(&merged) {
+                return Ok(());
+            }
+            if self
+                .compare_and_put_file_system_config(current.as_ref(), &merged)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(KvError::Busy {
+            path: format!(
+                "{} changed concurrently while ensuring filesystem defaults; retry",
+                file_system_config_key(&defaults.file_system_id)
+            ),
+        })
     }
 
     pub async fn get_file_system_config(
-        &self,
+        &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Option<DfsFileSystemConfig>, KvError> {
-        self.get_serde(&file_system_config_key(file_system_id))
-            .await
+        let key = file_system_config_key(file_system_id);
+        let Some(entry) = self.kv.get_async(&key).await? else {
+            return Ok(None);
+        };
+        entry.decode().map(Some)
+    }
+
+    pub async fn compare_and_put_file_system_config(
+        &mut self,
+        expected: Option<&DfsFileSystemConfig>,
+        desired: &DfsFileSystemConfig,
+    ) -> Result<bool, KvError> {
+        if expected.is_some_and(|config| config.file_system_id != desired.file_system_id) {
+            return Err(KvError::Serialization {
+                detail: "filesystem config compare-and-put cannot change the filesystem id"
+                    .to_string(),
+            });
+        }
+        let key = file_system_config_key(&desired.file_system_id);
+        let current_entry = self.kv.get_async(&key).await?;
+        let config_compare = match (expected, current_entry) {
+            (None, None) => KvCompare::Missing { key: key.clone() },
+            (Some(expected), Some(entry)) => {
+                if entry.decode::<DfsFileSystemConfig>()? != *expected {
+                    return Ok(false);
+                }
+                KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value,
+                }
+            }
+            _ => return Ok(false),
+        };
+        let permit_compare = self
+            .placement_authority_permit_missing_compare(&desired.file_system_id)
+            .await?;
+        Ok(self
+            .kv
+            .txn_async(KvTxn {
+                compares: vec![config_compare, permit_compare],
+                success: vec![KvOp::put_serde(key, desired, None)?],
+                failure: Vec::new(),
+            })
+            .await?
+            .succeeded)
+    }
+
+    async fn placement_authority_permit_missing_compare(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<KvCompare, KvError> {
+        let key = placement_authority_permit_key(file_system_id);
+        for _ in 0..PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES {
+            let Some(entry) = self.kv.get_async(&key).await? else {
+                return Ok(KvCompare::Missing { key });
+            };
+            let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
+            if !placement_authority_release_is_pending(file_system_id, &record) {
+                return Err(KvError::Busy {
+                    path: placement_authority_busy_path(file_system_id, &record),
+                });
+            }
+            let response = self
+                .kv
+                .txn_async(KvTxn {
+                    compares: vec![KvCompare::ValueEquals {
+                        key: key.clone(),
+                        value: entry.value,
+                    }],
+                    success: vec![KvOp::Delete { key: key.clone() }],
+                    failure: Vec::new(),
+                })
+                .await?;
+            if response.succeeded {
+                clear_pending_placement_authority_release(file_system_id, &record);
+                return Ok(KvCompare::Missing { key });
+            }
+        }
+        Err(KvError::Busy {
+            path: format!(
+                "{} changed repeatedly during exact pending-release recovery; retry",
+                placement_authority_permit_key(file_system_id)
+            ),
+        })
     }
 
     pub async fn put_metadata_shard(
@@ -2585,7 +3911,120 @@ fn metadata_hash_range_width(start_inclusive: u64, end_exclusive: u64) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DfsPlacementReconciliationState, DfsPlacementScope};
+    use crate::{DfsNodeAdvertisement, DfsPlacementReconciliationState, DfsPlacementScope};
+
+    #[derive(Debug)]
+    struct RejectPlacementHistoryRangeKv {
+        inner: InProcessKvStore,
+    }
+
+    impl DfsControlPlaneKvClient for RejectPlacementHistoryRangeKv {
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            if prefix == placement_reconciliations_prefix(&file_system_id()) {
+                return Err(KvError::Serialization {
+                    detail: "placement history range must not be loaded after queue initialization"
+                        .to_string(),
+                });
+            }
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.inner.txn(txn)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaleObservedAuthoritativeTxnKv {
+        observed: InProcessKvStore,
+        authoritative: InProcessKvStore,
+    }
+
+    impl DfsControlPlaneKvClient for StaleObservedAuthoritativeTxnKv {
+        fn authorizes_prior_process_placement_authority_recovery(
+            &self,
+            _local_node_id: &NodeId,
+            _current_process: &DfsPlacementAuthorityProcessIdentity,
+        ) -> bool {
+            true
+        }
+
+        fn refresh_latest(&mut self) -> Result<(), KvError> {
+            self.observed = InProcessKvStore::restore(self.authoritative.try_snapshot()?)?;
+            Ok(())
+        }
+
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(self.observed.get(key).cloned())
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.observed.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.authoritative.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.authoritative.txn(txn)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailPlacementPermitDeleteKv {
+        inner: InProcessKvStore,
+        remaining_delete_failures: usize,
+        apply_acquisition_then_fail: bool,
+    }
+
+    impl DfsControlPlaneKvClient for FailPlacementPermitDeleteKv {
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            let puts_placement_permit = txn.success.iter().any(|operation| {
+                matches!(operation, KvOp::Put { key, .. } if key.ends_with("/placement-authority-permit-v1"))
+            });
+            if puts_placement_permit && self.apply_acquisition_then_fail {
+                self.apply_acquisition_then_fail = false;
+                let response = self.inner.txn(txn)?;
+                assert!(response.succeeded, "injected acquisition must commit");
+                return Err(KvError::Io {
+                    path: "test-placement-authority-permit".to_string(),
+                    detail: "injected ambiguous permit acquisition".to_string(),
+                });
+            }
+            let deletes_placement_permit = txn.success.iter().any(|operation| {
+                matches!(operation, KvOp::Delete { key } if key.ends_with("/placement-authority-permit-v1"))
+            });
+            if deletes_placement_permit && self.remaining_delete_failures > 0 {
+                self.remaining_delete_failures -= 1;
+                return Err(KvError::Io {
+                    path: "test-placement-authority-permit".to_string(),
+                    detail: "injected permit release failure".to_string(),
+                });
+            }
+            self.inner.txn(txn)
+        }
+    }
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -2593,6 +4032,108 @@ mod tests {
 
     fn file_system_id() -> DfsFileSystemId {
         DfsFileSystemId::from_legacy_named("sifs").expect("valid filesystem id")
+    }
+
+    fn placement_authority_test_config(
+        owner: &NodeId,
+        desired_replicas: usize,
+    ) -> DfsFileSystemConfig {
+        DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: vec![DfsSubtreePolicy {
+                path_prefix: "/users/team".to_string(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                scope: DfsPlacementScope::Subtree,
+                min_commit_replicas: Some(1),
+                desired_replicas: Some(desired_replicas),
+                required_node_ids: Vec::new(),
+                forbidden_node_ids: Vec::new(),
+                min_distinct_zones: 0,
+            }],
+        }
+    }
+
+    fn placement_authority_test_job(
+        job_id: &str,
+        file_system_id: &DfsFileSystemId,
+        owner: &NodeId,
+        created_at_unix_nanos: u64,
+    ) -> DfsPlacementReconciliationJob {
+        DfsPlacementReconciliationJob {
+            schema_version: DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
+            job_id: job_id.to_string(),
+            file_system_id: file_system_id.clone(),
+            path: "/users/team".to_string(),
+            scope: DfsPlacementScope::Subtree,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: vec![DfsNodeAdvertisement::content(owner.clone())],
+            accepted_config: None,
+            state: DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos,
+            updated_at_unix_nanos: created_at_unix_nanos,
+            last_error: None,
+        }
+    }
+
+    fn placement_authority_test_process_identity() -> DfsPlacementAuthorityProcessIdentity {
+        DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "placement-test-cluster".to_string(),
+            process_session_id: "placement-test-process-session".to_string(),
+        }
+    }
+
+    fn placement_authority_operator_test_cluster_id() -> sinomo_core::Id {
+        sinomo_core::Id::from_legacy_named("placement-operator-cluster").expect("valid cluster id")
+    }
+
+    fn placement_authority_operator_test_record(
+        cluster_id: Option<&sinomo_core::Id>,
+        holder_node_id: Option<NodeId>,
+        holder_session_id: Option<&str>,
+    ) -> DfsPlacementAuthorityPermitRecord {
+        DfsPlacementAuthorityPermitRecord {
+            job_id: "placement-operator-recovery-job".to_string(),
+            holder_id: sinomo_core::Id::generate().to_string(),
+            holder_cluster_id: cluster_id.map(ToString::to_string),
+            holder_node_id,
+            holder_session_id: holder_session_id.map(ToString::to_string),
+        }
+    }
+
+    fn put_placement_authority_operator_test_record(
+        kv: &mut InProcessKvStore,
+        file_system_id: &DfsFileSystemId,
+        record: &DfsPlacementAuthorityPermitRecord,
+    ) {
+        kv.put_serde(placement_authority_permit_key(file_system_id), record, None)
+            .expect("put placement authority permit");
+    }
+
+    fn placement_authority_operator_test_member(
+        cluster_id: &sinomo_core::Id,
+        node_id: &NodeId,
+        state: ClusterMemberState,
+    ) -> ClusterMemberRecord {
+        let mut member = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            node_id.clone(),
+            "placement recovery holder",
+            "placement-recovery-holder-public-key",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        member.state = state;
+        member
     }
 
     #[test]
@@ -2616,11 +4157,25 @@ mod tests {
             forbidden_node_ids: Vec::new(),
             min_distinct_zones: 2,
         });
+        desired.subtree_policies.push(DfsSubtreePolicy {
+            path_prefix: "/elsewhere".to_string(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            scope: DfsPlacementScope::Subtree,
+            min_commit_replicas: Some(1),
+            desired_replicas: Some(1),
+            required_node_ids: Vec::new(),
+            forbidden_node_ids: Vec::new(),
+            min_distinct_zones: 0,
+        });
         let job = DfsPlacementReconciliationJob {
+            schema_version: DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
             job_id: "placement-job".to_string(),
             file_system_id: file_system_id.clone(),
             path: "/users/team".to_string(),
             scope: DfsPlacementScope::Subtree,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: vec![DfsNodeAdvertisement::content(node("placement-owner"))],
+            accepted_config: None,
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
             total_object_count: 0,
@@ -2650,17 +4205,1234 @@ mod tests {
                 .expect("get filesystem"),
             Some(desired.clone())
         );
+        let mut durable_job = job.clone();
+        durable_job.accepted_config = Some(scoped_placement_config_for_job(&desired, &job));
+        assert_eq!(
+            durable_job
+                .accepted_config
+                .as_ref()
+                .expect("accepted config")
+                .subtree_policies
+                .iter()
+                .map(|rule| rule.path_prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/users/team"]
+        );
         assert_eq!(
             store
                 .placement_reconciliation(&file_system_id, &job.job_id)
                 .expect("get job"),
-            Some(job.clone())
+            Some(durable_job.clone())
+        );
+        assert!(
+            placement_reconciliation_key(&file_system_id, &job.job_id)
+                .starts_with(&placement_reconciliations_prefix(&file_system_id))
+        );
+        assert!(
+            store
+                .kv
+                .range_prefix(&legacy_placement_reconciliations_prefix(&file_system_id))
+                .expect("legacy placement prefix")
+                .is_empty(),
+            "a legacy worker must not be able to list a v1 reconciliation job"
+        );
+
+        let mut stripped = durable_job.clone();
+        stripped.candidate_snapshot.clear();
+        assert!(matches!(
+            store.compare_and_put_placement_reconciliation(&durable_job, &stripped),
+            Err(KvError::Serialization { detail })
+                if detail.contains("candidate snapshot")
+        ));
+        assert_eq!(
+            store
+                .placement_reconciliation(&file_system_id, &job.job_id)
+                .expect("job after rejected snapshot strip"),
+            Some(durable_job.clone())
         );
         assert!(
             !store
                 .compare_and_put_placement_update(&expected, &desired, &job)
                 .expect("reject stale update")
         );
+
+        let mut completed = durable_job.clone();
+        completed.state = DfsPlacementReconciliationState::Completed;
+        completed.revision = 1;
+        completed.updated_at_unix_nanos = 2;
+        assert!(
+            store
+                .compare_and_put_placement_reconciliation(&durable_job, &completed)
+                .expect("complete placement job")
+        );
+        let queue_key = placement_reconciliation_queue_key(&file_system_id);
+        let queue = store
+            .get_serde::<DfsPlacementReconciliationQueue>(&queue_key)
+            .expect("read active queue")
+            .expect("active queue");
+        assert!(queue.job_ids.is_empty());
+        assert_eq!(
+            store
+                .placement_reconciliation(&file_system_id, &job.job_id)
+                .expect("retained terminal job"),
+            Some(completed.clone())
+        );
+
+        // Simulate an interrupted/older writer leaving stale queue ids. The
+        // scheduler repairs both without falling back to a history scan.
+        store
+            .put_serde(
+                &queue_key,
+                &DfsPlacementReconciliationQueue {
+                    schema_version: PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION,
+                    job_ids: vec!["missing-job".to_string(), completed.job_id.clone()],
+                },
+            )
+            .expect("inject stale queue ids");
+        drop(store);
+        let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        assert_eq!(
+            store
+                .next_placement_reconciliation(&file_system_id, &desired)
+                .expect("repair stale queue"),
+            None
+        );
+        assert!(
+            store
+                .get_serde::<DfsPlacementReconciliationQueue>(&queue_key)
+                .expect("read repaired queue")
+                .expect("repaired queue")
+                .job_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generic_publication_preserves_policy_and_defaults_preserve_base_fields() {
+        let mut kv = InProcessKvStore::new();
+        let original_owner = node("placement-publication-original-owner");
+        let updated_owner = node("placement-publication-updated-owner");
+        let mut custom = placement_authority_test_config(&original_owner, 2);
+        custom.display_name = "custom sifs".to_string();
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store
+            .put_file_system_config(&custom)
+            .expect("initial custom config");
+
+        store
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: custom.file_system_id.clone(),
+                display_name: "renamed sifs".to_string(),
+                owner_node_id: updated_owner.clone(),
+                subtree_policies: Vec::new(),
+            })
+            .expect("generic owner/display update");
+        let published = store
+            .get_file_system_config(&custom.file_system_id)
+            .expect("published config")
+            .expect("published config exists");
+        assert_eq!(published.owner_node_id, updated_owner);
+        assert_eq!(published.display_name, "renamed sifs");
+        assert_eq!(published.subtree_policies, custom.subtree_policies);
+
+        let defaults = DfsFileSystemConfig {
+            file_system_id: custom.file_system_id.clone(),
+            display_name: "bootstrap default".to_string(),
+            owner_node_id: original_owner,
+            subtree_policies: vec![DfsSubtreePolicy {
+                path_prefix: "/services".to_string(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                scope: DfsPlacementScope::Subtree,
+                min_commit_replicas: Some(1),
+                desired_replicas: Some(1),
+                required_node_ids: Vec::new(),
+                forbidden_node_ids: Vec::new(),
+                min_distinct_zones: 0,
+            }],
+        };
+        store
+            .ensure_file_system_config_defaults(&defaults)
+            .expect("first defaults publication");
+        store
+            .ensure_file_system_config_defaults(&defaults)
+            .expect("recurring defaults publication");
+        let merged = store
+            .get_file_system_config(&custom.file_system_id)
+            .expect("merged config")
+            .expect("merged config exists");
+        assert_eq!(merged.owner_node_id, updated_owner);
+        assert_eq!(merged.display_name, "renamed sifs");
+        assert_eq!(merged.subtree_policies[0], custom.subtree_policies[0]);
+        assert!(merged.subtree_policies.iter().any(|rule| {
+            rule.path_prefix == "/services" && rule.scope == DfsPlacementScope::Subtree
+        }));
+    }
+
+    #[test]
+    fn generic_publication_does_not_resurrect_deleted_policy() {
+        let mut kv = InProcessKvStore::new();
+        let owner = node("placement-publication-deleted-policy-owner");
+        let deleted = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs after placement deletion".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store
+            .put_file_system_config(&deleted)
+            .expect("seed authoritative post-Apply config");
+
+        let mut stale_publication = placement_authority_test_config(&owner, 2);
+        stale_publication.display_name = "generic publisher base-field update".to_string();
+        assert!(
+            !stale_publication.subtree_policies.is_empty(),
+            "test setup must carry the placement rule deleted by Apply"
+        );
+        store
+            .put_file_system_config(&stale_publication)
+            .expect("generic publication");
+
+        let published = store
+            .get_file_system_config(&deleted.file_system_id)
+            .expect("published config")
+            .expect("published config exists");
+        assert_eq!(
+            published.display_name, stale_publication.display_name,
+            "generic publication may still update non-policy fields"
+        );
+        assert!(
+            published.subtree_policies.is_empty(),
+            "generic publication must not resurrect a policy deleted by Apply"
+        );
+    }
+
+    #[test]
+    fn placement_apply_cannot_cross_a_held_metadata_mutation_permit() {
+        let mut kv = InProcessKvStore::new();
+        let owner = node("placement-permit-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let first_config = placement_authority_test_config(&owner, 2);
+        let first_job =
+            placement_authority_test_job("placement-permit-first", &base.file_system_id, &owner, 1);
+        let second_config = placement_authority_test_config(&owner, 1);
+        let second_job = placement_authority_test_job(
+            "placement-permit-second",
+            &base.file_system_id,
+            &owner,
+            2,
+        );
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &first_config, &first_job)
+                .expect("first Apply")
+        );
+        let durable_first = store
+            .placement_reconciliation(&base.file_system_id, &first_job.job_id)
+            .expect("first job read")
+            .expect("first job");
+        let mut permit = store
+            .try_acquire_placement_authority_permit(
+                &durable_first,
+                &first_config,
+                &owner,
+                &placement_authority_test_process_identity(),
+            )
+            .expect("acquire first permit")
+            .expect("first permit");
+
+        let mut bootstrap_defaults = first_config.clone();
+        bootstrap_defaults.subtree_policies.push(DfsSubtreePolicy {
+            path_prefix: "/services".to_string(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            scope: DfsPlacementScope::Subtree,
+            min_commit_replicas: Some(1),
+            desired_replicas: Some(1),
+            required_node_ids: Vec::new(),
+            forbidden_node_ids: Vec::new(),
+            min_distinct_zones: 0,
+        });
+        assert!(matches!(
+            store.ensure_file_system_config_defaults(&bootstrap_defaults),
+            Err(KvError::Busy { path })
+                if path.contains(&placement_authority_permit_key(&base.file_system_id))
+        ));
+
+        assert!(matches!(
+            store.compare_and_put_placement_update(
+                &first_config,
+                &second_config,
+                &second_job,
+            ),
+            Err(KvError::Busy { path })
+                if path.contains(&placement_authority_permit_key(&base.file_system_id))
+        ));
+        assert_eq!(
+            store
+                .get_file_system_config(&base.file_system_id)
+                .expect("config while permit held"),
+            Some(first_config.clone())
+        );
+
+        store
+            .release_placement_authority_permit(&mut permit)
+            .expect("release first permit");
+        assert!(
+            store
+                .compare_and_put_placement_update(&first_config, &second_config, &second_job,)
+                .expect("second Apply after release")
+        );
+        assert!(
+            store
+                .try_acquire_placement_authority_permit(
+                    &durable_first,
+                    &first_config,
+                    &owner,
+                    &placement_authority_test_process_identity(),
+                )
+                .expect("stale generation acquire")
+                .is_none(),
+            "an old job/config generation must not acquire after replacement Apply"
+        );
+    }
+
+    #[test]
+    fn stale_observed_generation_cannot_pass_the_authoritative_permit_transaction() {
+        let owner = node("placement-stale-observed-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let first_config = placement_authority_test_config(&owner, 2);
+        let first_job = placement_authority_test_job(
+            "placement-stale-observed-first",
+            &base.file_system_id,
+            &owner,
+            1,
+        );
+        let second_config = placement_authority_test_config(&owner, 1);
+        let second_job = placement_authority_test_job(
+            "placement-stale-observed-second",
+            &base.file_system_id,
+            &owner,
+            2,
+        );
+        let mut authoritative = InProcessKvStore::new();
+        let durable_first = {
+            let mut store = DfsControlPlaneStore::new(&mut authoritative);
+            store.put_file_system_config(&base).expect("base config");
+            assert!(
+                store
+                    .compare_and_put_placement_update(&base, &first_config, &first_job)
+                    .expect("first Apply")
+            );
+            store
+                .placement_reconciliation(&base.file_system_id, &first_job.job_id)
+                .expect("first job read")
+                .expect("first job")
+        };
+        let observed = InProcessKvStore::restore(
+            authoritative
+                .try_snapshot()
+                .expect("stale observed snapshot"),
+        )
+        .expect("restore stale observed snapshot");
+        {
+            let mut store = DfsControlPlaneStore::new(&mut authoritative);
+            assert!(
+                store
+                    .compare_and_put_placement_update(&first_config, &second_config, &second_job,)
+                    .expect("replacement Apply")
+            );
+        }
+
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        assert!(
+            store
+                .try_acquire_placement_authority_permit(
+                    &durable_first,
+                    &first_config,
+                    &owner,
+                    &placement_authority_test_process_identity(),
+                )
+                .expect("stale observed permit attempt")
+                .is_none(),
+            "the exact job/config compare must execute against authoritative Raft state"
+        );
+        store.kv.refresh_latest().expect("refresh observed state");
+        assert_eq!(
+            store
+                .get_file_system_config(&base.file_system_id)
+                .expect("refreshed config"),
+            Some(second_config)
+        );
+    }
+
+    #[test]
+    fn active_placement_permit_never_auto_expires_and_stale_release_is_harmless() {
+        let mut kv = InProcessKvStore::new();
+        let owner = node("placement-permanent-permit-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let first_config = placement_authority_test_config(&owner, 2);
+        let first_job = placement_authority_test_job(
+            "placement-permanent-first",
+            &base.file_system_id,
+            &owner,
+            1,
+        );
+        let second_config = placement_authority_test_config(&owner, 1);
+        let second_job = placement_authority_test_job(
+            "placement-permanent-second",
+            &base.file_system_id,
+            &owner,
+            2,
+        );
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &first_config, &first_job)
+                .expect("first Apply")
+        );
+        let durable_first = store
+            .placement_reconciliation(&base.file_system_id, &first_job.job_id)
+            .expect("first job read")
+            .expect("first job");
+        let mut first_permit = store
+            .try_acquire_placement_authority_permit(
+                &durable_first,
+                &first_config,
+                &owner,
+                &placement_authority_test_process_identity(),
+            )
+            .expect("acquire permanent permit")
+            .expect("permanent permit");
+        let permit_key = placement_authority_permit_key(&base.file_system_id);
+        let permit_entry = store
+            .kv
+            .get(&permit_key)
+            .expect("permit read")
+            .expect("permit");
+        assert_eq!(
+            permit_entry.lease_id, None,
+            "the latch must not auto-expire"
+        );
+        assert!(matches!(
+            store.compare_and_put_placement_update(&first_config, &second_config, &second_job),
+            Err(KvError::Busy { path })
+                if path.contains(&placement_authority_permit_key(&base.file_system_id))
+                    && path.contains("cannot be auto-expired")
+        ));
+
+        store
+            .release_placement_authority_permit(&mut first_permit)
+            .expect("release first permit");
+        assert!(
+            store
+                .compare_and_put_placement_update(&first_config, &second_config, &second_job)
+                .expect("Apply after exact release")
+        );
+        let durable_second = store
+            .placement_reconciliation(&base.file_system_id, &second_job.job_id)
+            .expect("second job read")
+            .expect("second job");
+        let mut new_permit = store
+            .try_acquire_placement_authority_permit(
+                &durable_second,
+                &second_config,
+                &owner,
+                &placement_authority_test_process_identity(),
+            )
+            .expect("acquire new permit")
+            .expect("new permit");
+        let new_entry = store
+            .kv
+            .get(&permit_key)
+            .expect("new permit read")
+            .expect("new permit entry")
+            .clone();
+
+        // A delayed retry from the prior holder compares its exact value and
+        // therefore cannot delete the replacement holder.
+        store
+            .release_placement_authority_permit(&mut first_permit)
+            .expect("stale release is harmless");
+        assert_eq!(
+            store
+                .kv
+                .get(&permit_key)
+                .expect("permit after stale release"),
+            Some(new_entry)
+        );
+        store
+            .release_placement_authority_permit(&mut new_permit)
+            .expect("release new permit");
+    }
+
+    #[test]
+    fn placement_failed_release_survives_ephemeral_store_and_fresh_store_finishes_exact_delete() {
+        let owner = node("placement-release-recovery-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let accepted = placement_authority_test_config(&owner, 2);
+        let job = placement_authority_test_job(
+            "placement-release-recovery",
+            &base.file_system_id,
+            &owner,
+            1,
+        );
+        let mut client = FailPlacementPermitDeleteKv {
+            inner: InProcessKvStore::new(),
+            remaining_delete_failures: 0,
+            apply_acquisition_then_fail: false,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &accepted, &job)
+                .expect("Apply")
+        );
+        let durable_job = store
+            .placement_reconciliation(&base.file_system_id, &job.job_id)
+            .expect("job read")
+            .expect("durable job");
+        let mut permit = store
+            .try_acquire_placement_authority_permit(
+                &durable_job,
+                &accepted,
+                &owner,
+                &placement_authority_test_process_identity(),
+            )
+            .expect("permit acquisition")
+            .expect("permit");
+        let permit_record = permit.record.clone();
+
+        drop(store);
+        client.remaining_delete_failures = 1;
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        assert!(matches!(
+            store.release_placement_authority_permit(&mut permit),
+            Err(KvError::Io { detail, .. }) if detail.contains("injected")
+        ));
+        assert!(placement_authority_release_is_pending(
+            &base.file_system_id,
+            &permit_record
+        ));
+
+        // Model the maintenance tick's ephemeral store and service being
+        // destroyed after release exhaustion. The process-wide exact handle
+        // remains recoverable by a new store instance.
+        drop(store);
+        drop(permit);
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        let mut republished = accepted.clone();
+        republished.display_name = "sifs after release recovery".to_string();
+        store
+            .put_file_system_config(&republished)
+            .expect("fresh store recovers exact pending release");
+        assert!(
+            store
+                .kv
+                .get(&placement_authority_permit_key(&base.file_system_id))
+                .expect("permit read")
+                .is_none()
+        );
+        assert!(!placement_authority_release_is_pending(
+            &base.file_system_id,
+            &permit_record
+        ));
+    }
+
+    #[test]
+    fn placement_ambiguous_acquisition_is_queued_before_any_metadata_mutation() {
+        let owner = node("placement-ambiguous-acquisition-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let accepted = placement_authority_test_config(&owner, 2);
+        let job = placement_authority_test_job(
+            "placement-ambiguous-acquisition",
+            &base.file_system_id,
+            &owner,
+            1,
+        );
+        let mut client = FailPlacementPermitDeleteKv {
+            inner: InProcessKvStore::new(),
+            remaining_delete_failures: 0,
+            apply_acquisition_then_fail: false,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &accepted, &job)
+                .expect("Apply")
+        );
+        let durable_job = store
+            .placement_reconciliation(&base.file_system_id, &job.job_id)
+            .expect("job read")
+            .expect("durable job");
+        drop(store);
+
+        client.apply_acquisition_then_fail = true;
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        assert!(matches!(
+            store.try_acquire_placement_authority_permit(
+                &durable_job,
+                &accepted,
+                &owner,
+                &placement_authority_test_process_identity(),
+            ),
+            Err(KvError::Io { detail, .. }) if detail.contains("ambiguous permit acquisition")
+        ));
+        drop(store);
+        let permit_record = client
+            .inner
+            .get(&placement_authority_permit_key(&base.file_system_id))
+            .expect("committed ambiguous permit")
+            .decode::<DfsPlacementAuthorityPermitRecord>()
+            .expect("permit decoding");
+        assert!(placement_authority_release_is_pending(
+            &base.file_system_id,
+            &permit_record
+        ));
+
+        // No metadata action was entered, so a fresh store may clear only the
+        // exact ambiguously committed record and proceed with config work.
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        let mut republished = accepted.clone();
+        republished.display_name = "sifs after ambiguous acquisition".to_string();
+        store
+            .put_file_system_config(&republished)
+            .expect("fresh store clears ambiguous acquisition");
+        assert!(
+            store
+                .kv
+                .get(&placement_authority_permit_key(&base.file_system_id))
+                .expect("permit read")
+                .is_none()
+        );
+        assert!(!placement_authority_release_is_pending(
+            &base.file_system_id,
+            &permit_record
+        ));
+    }
+
+    #[test]
+    fn placement_prior_process_recovery_requires_host_ownership_capability() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-recovery-unauthorized-owner");
+        let current_process = DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "placement-recovery-unauthorized-cluster".to_string(),
+            process_session_id: "placement-recovery-unauthorized-current-session".to_string(),
+        };
+        let record = DfsPlacementAuthorityPermitRecord {
+            job_id: "placement-recovery-unauthorized-job".to_string(),
+            holder_id: "placement-recovery-unauthorized-holder".to_string(),
+            holder_cluster_id: Some(current_process.cluster_id.clone()),
+            holder_node_id: Some(owner.clone()),
+            holder_session_id: Some("placement-recovery-unauthorized-prior-session".to_string()),
+        };
+        let key = placement_authority_permit_key(&file_system_id);
+        let mut client = RejectPlacementHistoryRangeKv {
+            inner: InProcessKvStore::new(),
+        };
+        client
+            .inner
+            .put(
+                key.clone(),
+                sinomo_core::kv::encode_kv_value(&record).expect("permit encoding"),
+                None,
+            )
+            .expect("permit write");
+
+        let error = DfsControlPlaneStore::new(&mut client)
+            .recover_prior_process_placement_authority_permit_for_local_node(
+                &file_system_id,
+                &owner,
+                &current_process,
+            )
+            .expect_err("generic clients cannot forge daemon ownership");
+        assert!(
+            matches!(error, KvError::Busy { path } if path.contains("live exclusive data-owner capability"))
+        );
+        assert!(client.inner.get(&key).is_some());
+    }
+
+    #[test]
+    fn placement_prior_process_recovery_requires_exact_cluster_node_and_new_session() {
+        let mut kv = InProcessKvStore::new();
+        let owner = node("placement-prior-process-owner");
+        let base = DfsFileSystemConfig {
+            file_system_id: file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let accepted = placement_authority_test_config(&owner, 2);
+        let job = placement_authority_test_job(
+            "placement-prior-process",
+            &base.file_system_id,
+            &owner,
+            1,
+        );
+        let prior_process = DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "placement-recovery-cluster".to_string(),
+            process_session_id: "placement-prior-process-session".to_string(),
+        };
+        let current_process = DfsPlacementAuthorityProcessIdentity {
+            cluster_id: prior_process.cluster_id.clone(),
+            process_session_id: "placement-current-process-session".to_string(),
+        };
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store.put_file_system_config(&base).expect("base config");
+        assert!(
+            store
+                .compare_and_put_placement_update(&base, &accepted, &job)
+                .expect("Apply")
+        );
+        let durable_job = store
+            .placement_reconciliation(&base.file_system_id, &job.job_id)
+            .expect("job read")
+            .expect("durable job");
+        let permit = store
+            .try_acquire_placement_authority_permit(&durable_job, &accepted, &owner, &prior_process)
+            .expect("permit acquisition")
+            .expect("permit");
+        // Simulate the old process disappearing without running Drop. The
+        // daemon-side exclusive lock is the external proof used by recovery.
+        std::mem::forget(permit);
+
+        assert!(
+            !store
+                .recover_prior_process_placement_authority_permit_for_local_node(
+                    &base.file_system_id,
+                    &owner,
+                    &prior_process,
+                )
+                .expect("current-session recovery is rejected")
+        );
+        assert!(
+            !store
+                .recover_prior_process_placement_authority_permit_for_local_node(
+                    &base.file_system_id,
+                    &node("placement-foreign-node"),
+                    &current_process,
+                )
+                .expect("foreign-node recovery is rejected")
+        );
+        let foreign_cluster = DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "placement-foreign-cluster".to_string(),
+            process_session_id: current_process.process_session_id.clone(),
+        };
+        assert!(
+            !store
+                .recover_prior_process_placement_authority_permit_for_local_node(
+                    &base.file_system_id,
+                    &owner,
+                    &foreign_cluster,
+                )
+                .expect("foreign-cluster recovery is rejected")
+        );
+        assert!(
+            store
+                .recover_prior_process_placement_authority_permit_for_local_node(
+                    &base.file_system_id,
+                    &owner,
+                    &current_process,
+                )
+                .expect("guarded prior-process recovery")
+        );
+        assert!(
+            store
+                .kv
+                .get(&placement_authority_permit_key(&base.file_system_id))
+                .expect("permit read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn placement_prior_process_recovery_exact_cas_preserves_replacement_and_legacy_records() {
+        let file_system_id = file_system_id();
+        let owner = node("placement-recovery-cas-owner");
+        let current_process = DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "placement-recovery-cas-cluster".to_string(),
+            process_session_id: "placement-recovery-cas-current-session".to_string(),
+        };
+        let old = DfsPlacementAuthorityPermitRecord {
+            job_id: "placement-recovery-cas-old-job".to_string(),
+            holder_id: "placement-recovery-cas-old-holder".to_string(),
+            holder_cluster_id: Some(current_process.cluster_id.clone()),
+            holder_node_id: Some(owner.clone()),
+            holder_session_id: Some("placement-recovery-cas-prior-session".to_string()),
+        };
+        let replacement = DfsPlacementAuthorityPermitRecord {
+            job_id: "placement-recovery-cas-new-job".to_string(),
+            holder_id: "placement-recovery-cas-new-holder".to_string(),
+            holder_cluster_id: Some(current_process.cluster_id.clone()),
+            holder_node_id: Some(owner.clone()),
+            holder_session_id: Some(current_process.process_session_id.clone()),
+        };
+        let key = placement_authority_permit_key(&file_system_id);
+        let mut observed = InProcessKvStore::new();
+        observed
+            .put(
+                key.clone(),
+                sinomo_core::kv::encode_kv_value(&old).expect("old record encoding"),
+                None,
+            )
+            .expect("observed old record");
+        let mut authoritative = InProcessKvStore::new();
+        authoritative
+            .put(
+                key.clone(),
+                sinomo_core::kv::encode_kv_value(&replacement)
+                    .expect("replacement record encoding"),
+                None,
+            )
+            .expect("authoritative replacement");
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        assert!(
+            !store
+                .recover_prior_process_placement_authority_permit_for_local_node(
+                    &file_system_id,
+                    &owner,
+                    &current_process,
+                )
+                .expect("stale recovery compare")
+        );
+        drop(store);
+        assert_eq!(
+            client
+                .authoritative
+                .get(&key)
+                .expect("replacement remains")
+                .decode::<DfsPlacementAuthorityPermitRecord>()
+                .expect("replacement decoding"),
+            replacement
+        );
+
+        let legacy = DfsPlacementAuthorityPermitRecord {
+            job_id: "placement-recovery-legacy-job".to_string(),
+            holder_id: "placement-recovery-legacy-holder".to_string(),
+            holder_cluster_id: None,
+            holder_node_id: None,
+            holder_session_id: None,
+        };
+        let mut kv = InProcessKvStore::new();
+        kv.put(
+            key.clone(),
+            sinomo_core::kv::encode_kv_value(&legacy).expect("legacy record encoding"),
+            None,
+        )
+        .expect("legacy record");
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        assert!(
+            !store
+                .recover_prior_process_placement_authority_permit_for_local_node(
+                    &file_system_id,
+                    &owner,
+                    &current_process,
+                )
+                .expect("legacy recovery is rejected")
+        );
+        assert!(store.kv.get(&key).expect("legacy record read").is_some());
+    }
+
+    #[test]
+    fn placement_operator_inspection_is_sanitized_and_missing_member_clear_is_guarded() {
+        let file_system_id = file_system_id();
+        let cluster_id = placement_authority_operator_test_cluster_id();
+        let holder_node_id = node("placement-operator-missing-holder");
+        let local_node_id = node("placement-operator-local-node");
+        let record = placement_authority_operator_test_record(
+            Some(&cluster_id),
+            Some(holder_node_id.clone()),
+            Some("private-holder-session"),
+        );
+        let mut kv = InProcessKvStore::new();
+        put_placement_authority_operator_test_record(&mut kv, &file_system_id, &record);
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        let status = store
+            .placement_authority_permit_status(&file_system_id)
+            .expect("inspect permit")
+            .expect("permit status");
+        assert_eq!(
+            status.holder_kind,
+            DfsPlacementAuthorityPermitHolderKind::Identified
+        );
+        assert_eq!(status.holder_cluster_id, Some(cluster_id.to_string()));
+        assert_eq!(status.holder_node_id, Some(holder_node_id));
+        assert!(status.recovery_token.starts_with("v1:"));
+        let encoded = serde_json::to_string(&status).expect("status json");
+        assert!(!encoded.contains("private-holder-session"));
+        assert!(!encoded.contains(&record.holder_id));
+
+        assert_eq!(
+            store
+                .recover_removed_node_placement_authority_permit(
+                    &file_system_id,
+                    &cluster_id.to_string(),
+                    &local_node_id,
+                    &status.recovery_token,
+                    false,
+                )
+                .expect("reject missing acknowledgement"),
+            DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::OwnerStoppedAcknowledgementRequired,
+            }
+        );
+        assert_eq!(
+            store
+                .recover_removed_node_placement_authority_permit(
+                    &file_system_id,
+                    &cluster_id.to_string(),
+                    &local_node_id,
+                    &status.recovery_token,
+                    true,
+                )
+                .expect("clear removed holder"),
+            DfsPlacementAuthorityRecoveryOutcome::Cleared
+        );
+        assert_eq!(
+            store
+                .placement_authority_permit_status(&file_system_id)
+                .expect("inspect cleared permit"),
+            None
+        );
+    }
+
+    #[test]
+    fn placement_operator_clear_accepts_only_exact_removed_membership_evidence() {
+        let file_system_id = file_system_id();
+        let cluster_id = placement_authority_operator_test_cluster_id();
+        let local_node_id = node("placement-operator-membership-local");
+        let holder_node_id = node("placement-operator-membership-holder");
+
+        for state in [
+            ClusterMemberState::Active,
+            ClusterMemberState::Offline,
+            ClusterMemberState::Pending,
+            ClusterMemberState::Suspect,
+        ] {
+            let record = placement_authority_operator_test_record(
+                Some(&cluster_id),
+                Some(holder_node_id.clone()),
+                Some("placement-membership-session"),
+            );
+            let mut kv = InProcessKvStore::new();
+            put_placement_authority_operator_test_record(&mut kv, &file_system_id, &record);
+            kv.put_serde(
+                cluster_member_key(&holder_node_id),
+                &placement_authority_operator_test_member(
+                    &cluster_id,
+                    &holder_node_id,
+                    state.clone(),
+                ),
+                None,
+            )
+            .expect("put member");
+            let mut store = DfsControlPlaneStore::new(&mut kv);
+            let status = store
+                .placement_authority_permit_status(&file_system_id)
+                .expect("inspect permit")
+                .expect("permit");
+            assert_eq!(
+                store
+                    .recover_removed_node_placement_authority_permit(
+                        &file_system_id,
+                        &cluster_id.to_string(),
+                        &local_node_id,
+                        &status.recovery_token,
+                        true,
+                    )
+                    .expect("refuse present member"),
+                DfsPlacementAuthorityRecoveryOutcome::Refused {
+                    reason: DfsPlacementAuthorityRecoveryRefusal::HolderMembershipPresent { state },
+                }
+            );
+            assert!(
+                store
+                    .placement_authority_permit_status(&file_system_id)
+                    .expect("permit remains")
+                    .is_some()
+            );
+        }
+
+        let record = placement_authority_operator_test_record(
+            Some(&cluster_id),
+            Some(holder_node_id.clone()),
+            Some("placement-removed-session"),
+        );
+        let mut kv = InProcessKvStore::new();
+        put_placement_authority_operator_test_record(&mut kv, &file_system_id, &record);
+        kv.put_serde(
+            cluster_member_key(&holder_node_id),
+            &placement_authority_operator_test_member(
+                &cluster_id,
+                &holder_node_id,
+                ClusterMemberState::Removed,
+            ),
+            None,
+        )
+        .expect("put removed member");
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        let token = store
+            .placement_authority_permit_status(&file_system_id)
+            .expect("inspect removed permit")
+            .expect("removed permit")
+            .recovery_token;
+        assert_eq!(
+            store
+                .recover_removed_node_placement_authority_permit(
+                    &file_system_id,
+                    &cluster_id.to_string(),
+                    &local_node_id,
+                    &token,
+                    true,
+                )
+                .expect("clear explicitly removed member"),
+            DfsPlacementAuthorityRecoveryOutcome::Cleared
+        );
+    }
+
+    #[test]
+    fn placement_operator_break_glass_is_explicit_and_limited_to_foreign_or_incomplete_holders() {
+        let file_system_id = file_system_id();
+        let current_cluster_id = placement_authority_operator_test_cluster_id();
+        let foreign_cluster_id =
+            sinomo_core::Id::from_legacy_named("placement-operator-foreign-cluster")
+                .expect("valid foreign cluster id");
+        let holder_node_id = node("placement-operator-break-glass-holder");
+        let local_node_id = node("placement-operator-break-glass-local");
+
+        let cases = [
+            placement_authority_operator_test_record(
+                Some(&foreign_cluster_id),
+                Some(holder_node_id.clone()),
+                Some("foreign-session"),
+            ),
+            placement_authority_operator_test_record(
+                Some(&current_cluster_id),
+                Some(holder_node_id.clone()),
+                None,
+            ),
+            placement_authority_operator_test_record(None, None, None),
+        ];
+        for record in cases {
+            let mut kv = InProcessKvStore::new();
+            put_placement_authority_operator_test_record(&mut kv, &file_system_id, &record);
+            let mut store = DfsControlPlaneStore::new(&mut kv);
+            let status = store
+                .placement_authority_permit_status(&file_system_id)
+                .expect("inspect break-glass permit")
+                .expect("break-glass permit");
+            let normal_reason = if record.holder_cluster_id.as_deref()
+                == Some(current_cluster_id.to_string().as_str())
+            {
+                DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity
+            } else if record.holder_cluster_id.is_some() {
+                DfsPlacementAuthorityRecoveryRefusal::ForeignCluster
+            } else {
+                DfsPlacementAuthorityRecoveryRefusal::IncompleteHolderIdentity
+            };
+            assert_eq!(
+                store
+                    .recover_removed_node_placement_authority_permit(
+                        &file_system_id,
+                        &current_cluster_id.to_string(),
+                        &local_node_id,
+                        &status.recovery_token,
+                        true,
+                    )
+                    .expect("normal recovery refusal"),
+                DfsPlacementAuthorityRecoveryOutcome::Refused {
+                    reason: normal_reason,
+                }
+            );
+            assert_eq!(
+                store
+                    .break_glass_recover_placement_authority_permit(
+                        &file_system_id,
+                        &current_cluster_id.to_string(),
+                        &status.recovery_token,
+                        "yes",
+                    )
+                    .expect("reject weak acknowledgement"),
+                DfsPlacementAuthorityRecoveryOutcome::Refused {
+                    reason: DfsPlacementAuthorityRecoveryRefusal::BreakGlassAcknowledgementRequired,
+                }
+            );
+            assert_eq!(
+                store
+                    .break_glass_recover_placement_authority_permit(
+                        &file_system_id,
+                        &current_cluster_id.to_string(),
+                        &status.recovery_token,
+                        DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
+                    )
+                    .expect("break-glass clear"),
+                DfsPlacementAuthorityRecoveryOutcome::Cleared
+            );
+        }
+
+        let same_cluster = placement_authority_operator_test_record(
+            Some(&current_cluster_id),
+            Some(holder_node_id),
+            Some("same-cluster-session"),
+        );
+        let mut kv = InProcessKvStore::new();
+        put_placement_authority_operator_test_record(&mut kv, &file_system_id, &same_cluster);
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        let token = store
+            .placement_authority_permit_status(&file_system_id)
+            .expect("inspect same-cluster permit")
+            .expect("same-cluster permit")
+            .recovery_token;
+        assert_eq!(
+            store
+                .break_glass_recover_placement_authority_permit(
+                    &file_system_id,
+                    &current_cluster_id.to_string(),
+                    &token,
+                    DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
+                )
+                .expect("same-cluster break-glass refusal"),
+            DfsPlacementAuthorityRecoveryOutcome::Refused {
+                reason: DfsPlacementAuthorityRecoveryRefusal::NormalRecoveryRequired,
+            }
+        );
+    }
+
+    #[test]
+    fn placement_operator_recovery_exact_cas_preserves_replacement_and_readded_member() {
+        let file_system_id = file_system_id();
+        let cluster_id = placement_authority_operator_test_cluster_id();
+        let holder_node_id = node("placement-operator-cas-holder");
+        let local_node_id = node("placement-operator-cas-local");
+        let old = placement_authority_operator_test_record(
+            Some(&cluster_id),
+            Some(holder_node_id.clone()),
+            Some("old-session"),
+        );
+        let replacement = placement_authority_operator_test_record(
+            Some(&cluster_id),
+            Some(holder_node_id.clone()),
+            Some("replacement-session"),
+        );
+        let key = placement_authority_permit_key(&file_system_id);
+        let mut observed = InProcessKvStore::new();
+        put_placement_authority_operator_test_record(&mut observed, &file_system_id, &old);
+        let mut authoritative = InProcessKvStore::new();
+        put_placement_authority_operator_test_record(
+            &mut authoritative,
+            &file_system_id,
+            &replacement,
+        );
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        let token = store
+            .placement_authority_permit_status(&file_system_id)
+            .expect("inspect stale permit")
+            .expect("stale permit")
+            .recovery_token;
+        assert_eq!(
+            store
+                .recover_removed_node_placement_authority_permit(
+                    &file_system_id,
+                    &cluster_id.to_string(),
+                    &local_node_id,
+                    &token,
+                    true,
+                )
+                .expect("replacement compare"),
+            DfsPlacementAuthorityRecoveryOutcome::Changed
+        );
+        drop(store);
+        assert_eq!(
+            client
+                .authoritative
+                .get(&key)
+                .expect("replacement remains")
+                .decode::<DfsPlacementAuthorityPermitRecord>()
+                .expect("decode replacement"),
+            replacement
+        );
+
+        let mut observed = InProcessKvStore::new();
+        put_placement_authority_operator_test_record(&mut observed, &file_system_id, &old);
+        let mut authoritative =
+            InProcessKvStore::restore(observed.try_snapshot().expect("snapshot observed permit"))
+                .expect("restore authoritative permit");
+        authoritative
+            .put_serde(
+                cluster_member_key(&holder_node_id),
+                &placement_authority_operator_test_member(
+                    &cluster_id,
+                    &holder_node_id,
+                    ClusterMemberState::Active,
+                ),
+                None,
+            )
+            .expect("re-add holder membership");
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        let mut store = DfsControlPlaneStore::new(&mut client);
+        let token = store
+            .placement_authority_permit_status(&file_system_id)
+            .expect("inspect before membership race")
+            .expect("permit before membership race")
+            .recovery_token;
+        assert_eq!(
+            store
+                .recover_removed_node_placement_authority_permit(
+                    &file_system_id,
+                    &cluster_id.to_string(),
+                    &local_node_id,
+                    &token,
+                    true,
+                )
+                .expect("membership race compare"),
+            DfsPlacementAuthorityRecoveryOutcome::Changed
+        );
+        assert!(client.authoritative.get(&key).is_some());
     }
 
     fn publish_transfer_watermark(

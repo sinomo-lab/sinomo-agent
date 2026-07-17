@@ -421,7 +421,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// still in flight. When that exact sibling later becomes durable, publish
     /// its location and promote the staged replica without re-running the
     /// already-completed visible commit.
-    pub(crate) fn finalize_late_committed_stage_receipt(
+    /// Called only from the stage-response closure while its placement
+    /// authority permit is still held.
+    pub(crate) fn finalize_late_committed_stage_receipt_under_authority(
         &mut self,
         intent_id: &str,
         replica_node_id: &NodeId,
@@ -663,6 +665,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn restore_pending_writes_for_repair_jobs(&mut self) -> Result<(), DfsError> {
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         for job in repair_jobs {
+            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
+                continue;
+            }
             let object = self.current_read_object_metadata(&job.object_id)?;
             if self.is_local_metadata_primary_for_object(&object)? {
                 self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;

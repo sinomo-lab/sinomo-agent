@@ -447,7 +447,9 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
     }
 
     fn put_file_system_config(&mut self, config: &DfsFileSystemConfig) -> Result<(), DfsError> {
-        self.put_serde_if_changed(file_system_config_key(&config.file_system_id), config)
+        DfsControlPlaneStore::new(self.control_plane.as_mut())
+            .ensure_file_system_config_defaults(config)
+            .map_err(DfsError::from)
     }
 
     fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), DfsError> {
@@ -619,8 +621,10 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         config: DfsFileSystemConfig,
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
         Box::pin(async move {
-            self.put_serde_if_changed(file_system_config_key(&config.file_system_id), &config)
+            DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
+                .ensure_file_system_config_defaults(&config)
                 .await
+                .map_err(DfsError::from)
         })
     }
 

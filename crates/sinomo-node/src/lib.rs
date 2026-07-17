@@ -244,6 +244,13 @@ mod tests {
                 .any(|capability| capability.as_str() == "cluster.kv.vote")
         );
         assert!(
+            main_daemon_capabilities(&sinomo_base::ClusterMemberRole::Voter)
+                .iter()
+                .any(|capability| {
+                    capability.as_str() == DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY
+                })
+        );
+        assert!(
             shadow_daemon_capabilities()
                 .iter()
                 .any(|capability| capability.as_str() == "daemon.shadow.supervise")

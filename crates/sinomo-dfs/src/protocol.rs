@@ -344,6 +344,9 @@ pub enum DfsNamespaceOperation {
     /// object's metadata primary. The operation updates the object's policy,
     /// records a committed repair intent for missing desired replicas, and
     /// retires superseded locations only after every desired replica exists.
+    /// The v1 wire name is deliberately unknown to legacy metadata primaries,
+    /// so a stale capability view cannot make an old daemon execute it.
+    #[serde(rename = "reconcile-placement-v1", alias = "reconcile-placement")]
     ReconcilePlacement {
         job_id: String,
         path: String,

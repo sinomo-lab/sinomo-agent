@@ -392,34 +392,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         reason: error.to_string(),
                     });
                 }
-                self.put_metadata_receipt(
-                    &response.file_system_id,
-                    &response.object_id,
-                    &response.version,
-                    &response.replica_node_id,
-                    content_hash,
-                )?;
-                self.coordinator.record_durable_receipt(
-                    &response.intent_id,
-                    response.replica_node_id.clone(),
-                )?;
-                self.mark_repaired_location(
-                    &response.object_id,
-                    &response.version,
-                    &response.replica_node_id,
-                    content_hash,
-                )?;
-                self.record_repair_metadata_settle(&response.intent_id, &response.replica_node_id);
-                self.cleanup_committed_pending_write_if_repaired(&response.intent_id);
-                Ok(NetworkedDfsServiceEvent::ReplicaRepaired {
-                    intent_id: response.intent_id,
-                    object_id: response.object_id,
-                    version: response.version,
-                    replica_node_id: response.replica_node_id,
-                    content_hash: content_hash.clone(),
-                })
+                let event =
+                    self.with_placement_intent_authority(&response.intent_id, |service| {
+                        service.put_metadata_receipt(
+                            &response.file_system_id,
+                            &response.object_id,
+                            &response.version,
+                            &response.replica_node_id,
+                            content_hash,
+                        )?;
+                        service.coordinator.record_durable_receipt(
+                            &response.intent_id,
+                            response.replica_node_id.clone(),
+                        )?;
+                        service.mark_repaired_location(
+                            &response.object_id,
+                            &response.version,
+                            &response.replica_node_id,
+                            content_hash,
+                        )?;
+                        service.record_repair_metadata_settle(
+                            &response.intent_id,
+                            &response.replica_node_id,
+                        );
+                        service.cleanup_committed_pending_write_if_repaired(&response.intent_id);
+                        Ok(NetworkedDfsServiceEvent::ReplicaRepaired {
+                            intent_id: response.intent_id.clone(),
+                            object_id: response.object_id.clone(),
+                            version: response.version.clone(),
+                            replica_node_id: response.replica_node_id.clone(),
+                            content_hash: content_hash.clone(),
+                        })
+                    })?;
+                Ok(
+                    event.unwrap_or_else(|| NetworkedDfsServiceEvent::RepairRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: "write intent is closed or its placement policy was superseded"
+                            .to_string(),
+                    }),
+                )
             }
             DfsBlobTransferResult::Rejected { ref reason } => {
+                if !self.placement_intent_remains_authoritative(&response.intent_id)? {
+                    return Ok(NetworkedDfsServiceEvent::RepairRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: "write intent is closed or its placement policy was superseded"
+                            .to_string(),
+                    });
+                }
                 match self.ensure_repair_response_request_matches_pending(&response) {
                     Ok(()) => {
                         if repair_rejection_indicates_lost_authority(reason) {
@@ -556,6 +580,9 @@ where
                 break;
             }
             if execution_exclusions.contains(&job.missing_replica_node_id) {
+                continue;
+            }
+            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
                 continue;
             }
             if consumed_repair_targets
@@ -1097,6 +1124,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for job in repair_jobs.iter().cloned() {
             if budget.is_exhausted() {
                 break;
+            }
+            if !self.placement_intent_remains_authoritative(&job.intent_id)? {
+                continue;
             }
             if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&job.intent_id)) {
                 continue;

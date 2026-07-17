@@ -8,6 +8,8 @@ use crate::dfs::{
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
     daemon_dfs_now_unix_nanos, daemon_dfs_pending_maintenance_work,
     ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
+    evict_daemon_dfs_message_service_cache_on_shutdown,
+    recover_prior_process_default_dfs_placement_authority, register_daemon_dfs_data_owner_lock,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
@@ -590,7 +592,9 @@ pub fn run_daemon_control_loop_with_services(
     crate::cluster::ensure_cluster_directory_installed();
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     let _data_owner_lock = if label == "daemon" {
-        Some(DaemonDataOwnerLock::acquire(&paths)?)
+        let lock = Arc::new(DaemonDataOwnerLock::acquire(&paths)?);
+        register_daemon_dfs_data_owner_lock(&paths, &lock)?;
+        Some(lock)
     } else {
         None
     };
@@ -614,6 +618,20 @@ pub fn run_daemon_control_loop_with_services(
     }
     let daemon_runtime = crate::build_daemon_async_runtime(label)?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
+    if daemon_role_owns_default_dfs(label) {
+        // Both process-lifetime locks are held and no listener or background
+        // service exists yet, so a prior local daemon session cannot still be
+        // mutating DFS metadata. Failure leaves the latch intact and placement
+        // blocked; the mandatory lifecycle retries once quorum is available.
+        if let Err(error) =
+            recover_prior_process_default_dfs_placement_authority(&paths, &daemon_runtime_handle)
+        {
+            tracing::warn!(
+                target: "sinomo.dfs.placement",
+                "prior-process SIFS placement authority recovery deferred: {error}"
+            );
+        }
+    }
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = daemon_runtime.block_on(
         sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
@@ -801,6 +819,14 @@ pub fn run_daemon_control_loop_with_services(
         );
     }
     drain_daemon_runtime_after_task_shutdown(&daemon_runtime);
+    if daemon_role_owns_default_dfs(label)
+        && let Err(error) = evict_daemon_dfs_message_service_cache_on_shutdown(&paths)
+    {
+        tracing::warn!(
+            target: "sinomo.dfs.placement",
+            "failed to evict daemon DFS message cache during shutdown: {error}"
+        );
+    }
     crate::append_operational_event_best_effort(
         &paths,
         crate::OperationalSeverity::Info,
@@ -4098,7 +4124,8 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
         daemon_dfs_node_transport(state.local_node_id.clone(), peer_node_ids)
     };
     let dfs = sinomo_dfs::NetworkedDfsService::new(transport, content);
-    let dfs = crate::dfs::with_daemon_dfs_control_plane_on_runtime(dfs, &cluster_paths, runtime);
+    let dfs =
+        crate::dfs::with_daemon_owned_dfs_control_plane_on_runtime(dfs, &cluster_paths, runtime);
     let metadata = crate::dfs::open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let mut dfs = dfs
         .with_boxed_metadata_backend(metadata)

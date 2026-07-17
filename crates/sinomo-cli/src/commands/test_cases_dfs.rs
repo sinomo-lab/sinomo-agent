@@ -1697,7 +1697,12 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 
     let subtree_update = browser
-        .update_placement(&base, Some(eventual.clone()), DfsPlacementScope::Subtree)
+        .update_placement(
+            &base,
+            Some(eventual.clone()),
+            DfsPlacementScope::Subtree,
+            preview.preview_token.clone(),
+        )
         .map_err(|error| placement_test_error("apply subtree placement", error))?;
     ctx.record("subtree_job_id", &subtree_update.reconciliation.job_id);
     // Reopen the Files-facing daemon client before observing the job. The job
@@ -1760,6 +1765,7 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             &override_path,
             Some(confirmed.clone()),
             DfsPlacementScope::SelfOnly,
+            confirmed_preview.preview_token.clone(),
         )
         .map_err(|error| placement_test_error("apply self placement", error))?;
     let (confirmed_job, confirmed_states) = wait_for_placement_job(
@@ -1807,7 +1813,12 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ));
     }
     let removal_update = browser
-        .update_placement(&override_path, None, DfsPlacementScope::SelfOnly)
+        .update_placement(
+            &override_path,
+            None,
+            DfsPlacementScope::SelfOnly,
+            removal_preview.preview_token.clone(),
+        )
         .map_err(|error| placement_test_error("remove self placement", error))?;
     let (removal_job, removal_states) = wait_for_placement_job(
         &progress_browser,
@@ -1831,8 +1842,16 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ));
     }
 
+    let subtree_removal_preview = browser
+        .preview_placement(&base, None, DfsPlacementScope::Subtree)
+        .map_err(|error| placement_test_error("preview subtree placement removal", error))?;
     let subtree_removal = browser
-        .update_placement(&base, None, DfsPlacementScope::Subtree)
+        .update_placement(
+            &base,
+            None,
+            DfsPlacementScope::Subtree,
+            subtree_removal_preview.preview_token,
+        )
         .map_err(|error| placement_test_error("remove subtree placement", error))?;
     let (_, cleanup_states) = wait_for_placement_job(
         &progress_browser,

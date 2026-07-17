@@ -394,6 +394,23 @@ pub(super) fn print_dfs_help() {
     println!(
         "      Transfer a metadata shard primary to an existing replica through fenced cluster KV."
     );
+    println!("  sinomo dfs placement-authority inspect [--filesystem <file_system_id>] [--json]");
+    println!(
+        "      Inspect the main daemon's non-expiring placement mutation permit and recovery token."
+    );
+    println!(
+        "  sinomo dfs placement-authority clear --expected-token <token> --acknowledge-owner-stopped [--filesystem <file_system_id>] [--json]"
+    );
+    println!(
+        "      Clear a permit only after cluster membership proves its identified holder was removed."
+    );
+    println!(
+        "  sinomo dfs placement-authority clear --expected-token <token> --break-glass-acknowledgement {} [--filesystem <file_system_id>] [--json]",
+        sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT
+    );
+    println!(
+        "      Exceptional local-only recovery for a legacy, partial, or foreign-cluster permit after all prior writers are stopped or fenced."
+    );
     println!(
         "  sinomo dfs mount <mount-point> [--root <sifs-path>] [--read-only] [--allow-other] [--data-dir <path>]"
     );

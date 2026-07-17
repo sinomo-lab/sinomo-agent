@@ -660,7 +660,6 @@ impl DaemonLock {
 #[derive(Debug)]
 pub struct DaemonDataOwnerLock {
     file: File,
-    path: PathBuf,
 }
 
 impl DaemonDataOwnerLock {
@@ -704,14 +703,18 @@ impl DaemonDataOwnerLock {
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-        Ok(Self { file, path })
+        Ok(Self { file })
     }
 }
 
 impl Drop for DaemonDataOwnerLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
-        let _ = fs::remove_file(&self.path);
+        // Keep the lock inode stable. Unlinking after unlock races a new owner
+        // which can acquire the old inode before removal, allowing a third
+        // process to create and lock a different inode at the same path.
+        // Rollout readiness already probes the advisory lock rather than file
+        // absence, so a persistent empty lock file is the safe convention.
     }
 }
 

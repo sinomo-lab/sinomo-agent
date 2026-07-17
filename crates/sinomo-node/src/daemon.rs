@@ -6,6 +6,9 @@ use sinomo_base::{
 
 pub use sinomo_base::DAEMON_MAIN_RUN_CAPABILITY;
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
+/// Advertised only by main daemons that understand snapshot-bound placement
+/// reconciliation jobs and their v1 control-plane namespace.
+pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reconciliation.v1";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -18,6 +21,7 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new("cluster.message.receive").expect("static capability"),
         CapabilityName::new("cluster.message.send").expect("static capability"),
         CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("static capability"),
+        CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {
         capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));

@@ -331,6 +331,9 @@ pub fn authorize_authenticated_daemon_command(
         route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
+        route if route == crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE => {
+            authenticated.signer.can_run_admin_command()
+        }
         route if crate::DAEMON_DFS_BROWSER_ROUTES.contains(&route) => {
             authenticated.signer.can_run_local_command()
         }
@@ -2117,6 +2120,28 @@ mod tests {
         ] {
             let authenticated =
                 authenticated_command(sinomo_dfs::DFS_SMOKE_ROUTE.to_string(), signer);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn dfs_placement_authority_admin_authorizes_only_local_or_voter() {
+        for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+            authorize_authenticated_daemon_command(&authenticated_command(
+                crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE.to_string(),
+                signer,
+            ))
+            .expect("local operators and state authorities may inspect placement authority");
+        }
+        for signer in [
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+            DaemonSignerAuthority::StatusProbe,
+        ] {
+            let authenticated = authenticated_command(
+                crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE.to_string(),
+                signer,
+            );
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
