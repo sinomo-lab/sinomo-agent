@@ -6175,7 +6175,8 @@ mod tests {
         local_leader: bool,
         forwarded: Option<ClusterKvTxnCommitResult>,
         committed_txns: usize,
-        elected: bool,
+        election_calls: usize,
+        current_term: u64,
         reachable_voters: usize,
     }
 
@@ -6205,7 +6206,10 @@ mod tests {
             &mut self,
             _state: &ClusterBootstrapState,
         ) -> Result<bool, Self::Error> {
-            self.elected = true;
+            self.election_calls = self.election_calls.saturating_add(1);
+            self.current_term = self
+                .current_term
+                .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
             self.local_leader = true;
             Ok(true)
         }
@@ -6235,6 +6239,77 @@ mod tests {
             Ok(ClusterKvRaftQuorumCommitResult {
                 snapshot: store.snapshot().expect("snapshot"),
                 txn_response: Some(txn_response),
+            })
+        }
+
+        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(detail)
+        }
+    }
+
+    impl ClusterKvTxnQuorumAsyncHost for TxnQuorumDriverTestHost {
+        type Error = QuorumCommitTestError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
+
+        fn local_is_raft_leader_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
+            Box::pin(async move { Ok(self.local_leader) })
+        }
+
+        fn forward_cluster_kv_txn_to_voter_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            _txn: &'a KvTxn,
+        ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
+            Box::pin(async move { Ok(self.forwarded.clone()) })
+        }
+
+        fn elect_cluster_raft_leader_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
+            Box::pin(async move {
+                self.election_calls = self.election_calls.saturating_add(1);
+                self.current_term = self
+                    .current_term
+                    .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
+                self.local_leader = true;
+                Ok(true)
+            })
+        }
+
+        fn reachable_voter_count_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, usize, Self::Error> {
+            Box::pin(async move { Ok(self.reachable_voters) })
+        }
+
+        fn semantic_txn_no_effect_response_async<'a>(
+            &'a mut self,
+            _txn: &'a KvTxn,
+        ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn commit_cluster_raft_txn_with_quorum_async<'a>(
+            &'a mut self,
+            _state: &'a mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftQuorumCommitResult, Self::Error> {
+            Box::pin(async move {
+                self.committed_txns = self.committed_txns.saturating_add(1);
+                let mut store = InProcessKvStore::new();
+                let txn_response = store.txn(txn)?;
+                Ok(ClusterKvRaftQuorumCommitResult {
+                    snapshot: store.snapshot().expect("snapshot"),
+                    txn_response: Some(txn_response),
+                })
             })
         }
 
@@ -6446,7 +6521,7 @@ mod tests {
         .expect("commit local leader txn");
 
         assert_eq!(host.committed_txns, 1);
-        assert!(!host.elected);
+        assert_eq!(host.election_calls, 0);
         assert_eq!(
             result
                 .snapshot
@@ -6510,26 +6585,27 @@ mod tests {
 
         assert_eq!(result, forwarded);
         assert_eq!(host.committed_txns, 0);
-        assert!(!host.elected);
+        assert_eq!(host.election_calls, 0);
     }
 
     #[test]
-    fn kv_txn_quorum_driver_forwarded_voter_can_elect_locally() {
+    fn kv_txn_quorum_driver_forwarded_voter_never_starts_election() {
         let local = NodeId::from_legacy_named("node_txn_driver_forwarded_local").expect("local");
         let remote = NodeId::from_legacy_named("node_txn_driver_forwarded_remote").expect("remote");
         let mut state = quorum_commit_test_state(&local, &remote);
         let mut host = TxnQuorumDriverTestHost {
+            current_term: 41,
             reachable_voters: 2,
             ..TxnQuorumDriverTestHost::default()
         };
 
-        let result = commit_cluster_kv_txn_with_quorum_with_host(
+        let error = commit_cluster_kv_txn_with_quorum_with_host(
             &mut state,
             KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
-                    key: "/kv/txn-driver/forwarded-local-election".to_string(),
-                    value: b"committed".to_vec(),
+                    key: "/kv/txn-driver/forwarded-rejected".to_string(),
+                    value: b"rejected".to_vec(),
                     lease_id: None,
                 }],
                 failure: Vec::new(),
@@ -6539,14 +6615,153 @@ mod tests {
             },
             &mut host,
         )
-        .expect("forwarded voter should be able to recover local leadership");
+        .expect_err("forwarded voter must not recover leadership by campaigning");
 
-        assert!(host.elected);
+        assert!(matches!(
+            error,
+            QuorumCommitTestError::ReadOnly(ref detail)
+                if detail == "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+        ));
+        assert_eq!(host.election_calls, 0);
+        assert_eq!(host.current_term, 41);
+        assert_eq!(host.committed_txns, 0);
+        assert!(!host.local_leader);
+    }
+
+    #[test]
+    fn kv_txn_quorum_driver_originating_voter_retains_election_behavior() {
+        let local = NodeId::from_legacy_named("node_txn_driver_origin_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_origin_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            current_term: 41,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+
+        let result = commit_cluster_kv_txn_with_quorum_with_host(
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/kv/txn-driver/origin-local-election".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+            ClusterKvTxnQuorumDriverOptions {
+                allow_forwarding: true,
+            },
+            &mut host,
+        );
+
+        let result = result.expect("originating voter should retain local election behavior");
+        assert_eq!(host.election_calls, 1);
+        assert_eq!(
+            host.current_term,
+            41 + CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
+        );
         assert_eq!(host.committed_txns, 1);
         assert_eq!(
             result
                 .snapshot
-                .get("/kv/txn-driver/forwarded-local-election")
+                .get("/kv/txn-driver/origin-local-election")
+                .expect("committed key")
+                .value,
+            b"committed".to_vec()
+        );
+    }
+
+    #[test]
+    fn kv_txn_quorum_async_driver_forwarded_voter_never_starts_election() {
+        let local = NodeId::from_legacy_named("node_txn_async_forwarded_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_async_forwarded_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            current_term: 73,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let error = runtime
+            .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
+                &mut state,
+                KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key: "/kv/txn-driver/async-forwarded-rejected".to_string(),
+                        value: b"rejected".to_vec(),
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                },
+                ClusterKvTxnQuorumDriverOptions {
+                    allow_forwarding: false,
+                },
+                &mut host,
+            ))
+            .expect_err("forwarded voter must not recover leadership by campaigning");
+
+        assert!(matches!(
+            error,
+            QuorumCommitTestError::ReadOnly(ref detail)
+                if detail == "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+        ));
+        assert_eq!(host.election_calls, 0);
+        assert_eq!(host.current_term, 73);
+        assert_eq!(host.committed_txns, 0);
+        assert!(!host.local_leader);
+    }
+
+    #[test]
+    fn kv_txn_quorum_async_driver_originating_voter_retains_election_behavior() {
+        let local = NodeId::from_legacy_named("node_txn_async_origin_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_async_origin_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            current_term: 73,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
+                &mut state,
+                KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key: "/kv/txn-driver/async-origin-local-election".to_string(),
+                        value: b"committed".to_vec(),
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                },
+                ClusterKvTxnQuorumDriverOptions {
+                    allow_forwarding: true,
+                },
+                &mut host,
+            ))
+            .expect("originating voter should retain local election behavior");
+
+        assert_eq!(host.election_calls, 1);
+        assert_eq!(
+            host.current_term,
+            73 + CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
+        );
+        assert_eq!(host.committed_txns, 1);
+        assert_eq!(
+            result
+                .snapshot
+                .get("/kv/txn-driver/async-origin-local-election")
                 .expect("committed key")
                 .value,
             b"committed".to_vec()
@@ -6555,6 +6770,7 @@ mod tests {
 
     struct AppendReplicationTestHost {
         last_index: u64,
+        snapshot_only_at_catch_up_anchor: bool,
         requested_next_indices: Vec<u64>,
         responses: VecDeque<ClusterRaftAppendResponse>,
         sent_count: usize,
@@ -6591,10 +6807,12 @@ mod tests {
                     entries: Vec::new(),
                     leader_commit: next_index.saturating_sub(1),
                 },
-                snapshot: Some(RaftSnapshot {
-                    last_included_index: next_index.saturating_sub(1),
-                    last_included_term: 1,
-                    kv: test_kv_snapshot_with_events(Vec::new()),
+                snapshot: (!self.snapshot_only_at_catch_up_anchor || next_index == 1).then(|| {
+                    RaftSnapshot {
+                        last_included_index: next_index.saturating_sub(1),
+                        last_included_term: 1,
+                        kv: test_kv_snapshot_with_events(Vec::new()),
+                    }
                 }),
             })
         }
@@ -6625,6 +6843,77 @@ mod tests {
         }
     }
 
+    struct DurableAppendReplicationTestHost {
+        leader_store: ClusterKvRaftStore,
+        follower: DurableRaftKvNode,
+        requested_next_indices: Vec<u64>,
+        sent_snapshot_flags: Vec<bool>,
+    }
+
+    impl ClusterKvRaftAppendReplicationHost for DurableAppendReplicationTestHost {
+        type Error = QuorumCommitTestError;
+        type Target = NodeId;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
+
+        fn last_local_raft_log_index(
+            &mut self,
+            state: &ClusterBootstrapState,
+        ) -> Result<u64, Self::Error> {
+            self.leader_store
+                .last_log_index(&state.local_node_id)
+                .map_err(QuorumCommitTestError::from)
+        }
+
+        fn build_raft_append_request(
+            &mut self,
+            state: &ClusterBootstrapState,
+            next_index: u64,
+        ) -> Result<ClusterRaftAppendRequest, Self::Error> {
+            self.requested_next_indices.push(next_index);
+            self.leader_store
+                .build_cluster_raft_append_request_from_next_index(state, next_index)
+                .map_err(QuorumCommitTestError::from)
+        }
+
+        fn append_attempt_timeout(
+            &mut self,
+            _target: &Self::Target,
+            remaining: Duration,
+            _request: &ClusterRaftAppendRequest,
+        ) -> Duration {
+            remaining.min(Duration::from_secs(1))
+        }
+
+        fn send_raft_append(
+            &mut self,
+            _target: &Self::Target,
+            request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, Self::Error> {
+            self.sent_snapshot_flags.push(request.snapshot.is_some());
+            let outcome = self
+                .follower
+                .apply_append_entries_with_optional_snapshot(
+                    request.snapshot.clone(),
+                    request.append.clone(),
+                )
+                .map_err(QuorumCommitTestError::from)?;
+            Ok(ClusterRaftAppendResponse {
+                accepted: outcome.response.success,
+                detail: if outcome.response.success {
+                    "test raft append applied".to_string()
+                } else {
+                    "test raft append rejected".to_string()
+                },
+                state: request.state.clone(),
+                append: outcome.response,
+            })
+        }
+    }
+
     fn test_cluster_raft_append_response(
         state: &ClusterBootstrapState,
         accepted: bool,
@@ -6651,6 +6940,7 @@ mod tests {
         let watch_event = test_kv_put_event(1, "/kv/append/watch", b"ok");
         let mut host = AppendReplicationTestHost {
             last_index: 5,
+            snapshot_only_at_catch_up_anchor: false,
             requested_next_indices: Vec::new(),
             responses: VecDeque::from([
                 test_cluster_raft_append_response(&state, false, 2),
@@ -6675,6 +6965,168 @@ mod tests {
         assert!(outcome.watch_event_fanout_needed);
         assert_eq!(host.requested_next_indices, vec![6, 3]);
         assert_eq!(host.sent_count, 2);
+    }
+
+    #[test]
+    fn cluster_kv_raft_append_replication_forces_catch_up_anchor_for_committed_conflict() {
+        let local = NodeId::from_legacy_named("node_kv_append_conflict_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_kv_append_conflict_remote").expect("remote");
+        let state = quorum_commit_test_state(&local, &remote);
+        let mut host = AppendReplicationTestHost {
+            last_index: 5,
+            snapshot_only_at_catch_up_anchor: true,
+            requested_next_indices: Vec::new(),
+            responses: VecDeque::from([
+                test_cluster_raft_append_response(&state, false, 4),
+                test_cluster_raft_append_response(&state, false, 4),
+                test_cluster_raft_append_response(&state, true, 5),
+            ]),
+            sent_count: 0,
+        };
+
+        let outcome = replicate_cluster_kv_raft_to_target_with_host(
+            &state,
+            &remote,
+            &[],
+            ClusterKvRaftAppendReplicationOptions {
+                max_attempts: 3,
+                timeout: Duration::from_secs(5),
+            },
+            &mut host,
+        )
+        .expect("append replication through committed conflict");
+
+        assert!(outcome.response.accepted);
+        assert_eq!(host.requested_next_indices, vec![6, 5, 1]);
+        assert_eq!(host.sent_count, 3);
+    }
+
+    #[test]
+    fn cluster_kv_raft_append_replication_repairs_same_index_divergence_via_snapshot() {
+        let leader_root = temp_raft_root("sinomo-kv-replication-divergence-leader");
+        let follower_root = temp_raft_root("sinomo-kv-replication-divergence-follower");
+        let leader_id =
+            NodeId::from_legacy_named("node_replication_divergence_leader").expect("leader node");
+        let follower_id = NodeId::from_legacy_named("node_replication_divergence_follower")
+            .expect("follower node");
+        let state = quorum_commit_test_state(&leader_id, &follower_id);
+        let leader_paths = ClusterKvPaths::new(leader_root.to_path_buf());
+        let leader_store = ClusterKvRaftStore::new(
+            leader_paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let leader_snapshot = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), leader_paths.raft_wal_paths(&leader_id))
+                    .expect("leader open");
+            let committed = leader
+                .append_local_command(
+                    2,
+                    KvCommand::Op(KvOp::Delete {
+                        key: "/config/replication-divergence".to_string(),
+                    }),
+                )
+                .expect("append authoritative committed entry");
+            leader
+                .commit_to(committed.index)
+                .expect("commit authoritative entry");
+            let snapshot = leader.save_snapshot().expect("save authoritative snapshot");
+            leader.become_leader(3).expect("advance leader term");
+            leader
+                .append_local_command(
+                    3,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/after-divergence".to_string(),
+                        value: b"uncommitted-tail".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append leader tail");
+            snapshot
+        };
+
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let mut follower = DurableRaftKvNode::open(follower_id.clone(), follower_paths.clone())
+            .expect("follower open");
+        let divergent = follower
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/config/replication-divergence".to_string(),
+                    value: b"stale-local-value".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append divergent committed entry");
+        follower
+            .commit_to(divergent.index)
+            .expect("commit divergent entry");
+        assert!(leader_snapshot.kv.revision < follower.store().revision());
+        let authority_heartbeat = follower
+            .append_entries(RaftAppendEntriesRequest {
+                term: 3,
+                leader_id: leader_id.clone(),
+                prev_log_index: follower.applied_index(),
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: follower.hard_state().commit_index,
+            })
+            .expect("establish current leader");
+        assert!(authority_heartbeat.success);
+
+        let mut host = DurableAppendReplicationTestHost {
+            leader_store,
+            follower,
+            requested_next_indices: Vec::new(),
+            sent_snapshot_flags: Vec::new(),
+        };
+        let outcome = replicate_cluster_kv_raft_to_target_with_host(
+            &state,
+            &follower_id,
+            &[],
+            ClusterKvRaftAppendReplicationOptions {
+                max_attempts: 4,
+                timeout: Duration::from_secs(5),
+            },
+            &mut host,
+        )
+        .expect("replicate through same-index divergence");
+
+        assert!(outcome.response.accepted);
+        assert_eq!(host.requested_next_indices, vec![3, 2, 1]);
+        assert_eq!(host.sent_snapshot_flags, vec![false, false, true]);
+        assert_eq!(host.follower.applied_index(), 1);
+        assert_eq!(host.follower.hard_state().commit_index, 1);
+        assert_eq!(host.follower.term_at(1), Some(2));
+        assert_eq!(host.follower.last_log_index(), 2);
+        assert_eq!(
+            host.follower.store().revision(),
+            leader_snapshot.kv.revision
+        );
+        assert!(
+            host.follower
+                .store()
+                .get("/config/replication-divergence")
+                .is_none()
+        );
+        drop(host);
+
+        let reopened =
+            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen repaired follower");
+        assert_eq!(reopened.applied_index(), 1);
+        assert_eq!(reopened.hard_state().commit_index, 1);
+        assert_eq!(reopened.term_at(1), Some(2));
+        assert_eq!(reopened.last_log_index(), 2);
+        assert_eq!(reopened.store().revision(), leader_snapshot.kv.revision);
+        assert!(
+            reopened
+                .store()
+                .get("/config/replication-divergence")
+                .is_none()
+        );
     }
 
     #[test]
@@ -9061,6 +9513,114 @@ mod tests {
                 .value,
             b"from-snapshot"
         );
+    }
+
+    #[test]
+    fn optional_snapshot_append_repairs_same_index_committed_divergence() {
+        let leader_root = temp_raft_root("sinomo-kv-same-index-repair-leader");
+        let follower_root = temp_raft_root("sinomo-kv-same-index-repair-follower");
+        let leader_id =
+            NodeId::from_legacy_named("node_same_index_repair_leader").expect("leader node");
+        let follower_id =
+            NodeId::from_legacy_named("node_same_index_repair_follower").expect("follower node");
+        let follower_paths = KvWalPaths::new(&follower_root);
+
+        let leader_snapshot = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), KvWalPaths::new(&leader_root))
+                    .expect("leader open");
+            let entry = leader
+                .append_local_command(
+                    2,
+                    KvCommand::Op(KvOp::Delete {
+                        key: "/config/divergent".to_string(),
+                    }),
+                )
+                .expect("append leader no-effect command");
+            leader
+                .commit_to(entry.index)
+                .expect("commit leader command");
+            leader.save_snapshot().expect("save leader snapshot")
+        };
+
+        {
+            let mut follower = DurableRaftKvNode::open(follower_id.clone(), follower_paths.clone())
+                .expect("follower open");
+            let divergent_entry = follower
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/config/divergent".to_string(),
+                        value: b"stale-local-value".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append divergent follower command");
+            follower
+                .commit_to(divergent_entry.index)
+                .expect("commit divergent follower command");
+
+            assert_eq!(
+                leader_snapshot.last_included_index,
+                follower.applied_index()
+            );
+            assert_eq!(leader_snapshot.last_included_term, 2);
+            assert_eq!(follower.term_at(follower.applied_index()), Some(1));
+            assert!(
+                leader_snapshot.kv.revision < follower.store().revision(),
+                "the authoritative snapshot must repair a follower whose divergent command produced a higher revision"
+            );
+
+            let authority_heartbeat = follower
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 3,
+                    leader_id: leader_id.clone(),
+                    prev_log_index: follower.applied_index(),
+                    prev_log_term: 1,
+                    entries: Vec::new(),
+                    leader_commit: follower.hard_state().commit_index,
+                })
+                .expect("establish current leader");
+            assert!(authority_heartbeat.success);
+            assert_eq!(follower.hard_state().current_term, 3);
+            assert_eq!(follower.hard_state().leader_id.as_ref(), Some(&leader_id));
+
+            let outcome = follower
+                .apply_append_entries_with_optional_snapshot(
+                    Some(leader_snapshot.clone()),
+                    RaftAppendEntriesRequest {
+                        term: 3,
+                        leader_id: leader_id.clone(),
+                        prev_log_index: leader_snapshot.last_included_index,
+                        prev_log_term: leader_snapshot.last_included_term,
+                        entries: Vec::new(),
+                        leader_commit: leader_snapshot.last_included_index,
+                    },
+                )
+                .expect("repair same-index divergence");
+
+            assert!(outcome.response.success);
+            assert!(outcome.snapshot_restored);
+            assert_eq!(follower.term_at(follower.applied_index()), Some(2));
+            assert_eq!(follower.store().revision(), leader_snapshot.kv.revision);
+            assert!(follower.store().get("/config/divergent").is_none());
+        }
+
+        let reopened =
+            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen repaired follower");
+        assert_eq!(
+            reopened.applied_index(),
+            leader_snapshot.last_included_index
+        );
+        assert_eq!(
+            reopened.hard_state().commit_index,
+            leader_snapshot.last_included_index
+        );
+        assert_eq!(reopened.hard_state().current_term, 3);
+        assert_eq!(reopened.hard_state().leader_id.as_ref(), Some(&leader_id));
+        assert_eq!(reopened.term_at(reopened.applied_index()), Some(2));
+        assert_eq!(reopened.store().revision(), leader_snapshot.kv.revision);
+        assert!(reopened.store().get("/config/divergent").is_none());
     }
 
     #[test]

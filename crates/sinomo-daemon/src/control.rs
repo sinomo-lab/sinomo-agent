@@ -4,9 +4,10 @@ use crate::cluster::{
     prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
-    daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
-    daemon_dfs_pending_maintenance_work, ensure_default_distributed_dfs_async_on_runtime,
-    ensure_default_local_dfs_expose, run_daemon_dfs_maintenance_tick_in_blocking_task,
+    DaemonDfsMaintenanceTickOutcome, daemon_dfs_maintenance_notify, daemon_dfs_node_transport,
+    daemon_dfs_node_transport_on_runtime, daemon_dfs_pending_maintenance_work,
+    ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
+    run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
@@ -40,6 +41,7 @@ use tokio::io::AsyncWriteExt as _;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 // Full DFS passes own the process's sole backend-bearing service lane. Stagger
 // their first acquisition by stable membership rank so a rolling restart does
 // not make every node hold its local lane while asking a peer to enter theirs.
@@ -916,25 +918,25 @@ fn daemon_dfs_initial_maintenance_phase(paths: &DaemonPaths) -> Result<Duration,
 fn spawn_daemon_dfs_maintenance_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
-) -> tokio::task::JoinHandle<Result<(), DaemonError>> {
+) -> tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>> {
     tokio::spawn(run_daemon_dfs_maintenance_tick_in_blocking_task(
         paths, runtime,
     ))
 }
 
 async fn join_daemon_dfs_maintenance_task(
-    task: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    task: tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
     label: &str,
-) -> bool {
+) -> Option<DaemonDfsMaintenanceTickOutcome> {
     match task.await {
-        Ok(Ok(())) => true,
+        Ok(Ok(outcome)) => Some(outcome),
         Ok(Err(error)) => {
             tracing::warn!("sinomo {label} DFS maintenance tick failed: {error}");
-            false
+            None
         }
         Err(error) => {
             tracing::warn!("sinomo {label} DFS maintenance task failed: {error}");
-            false
+            None
         }
     }
 }
@@ -1000,7 +1002,9 @@ async fn run_daemon_background_maintenance_loop(
         None
     };
     let mut dfs_triggered_maintenance_requested = false;
-    let mut dfs_maintenance_task: Option<tokio::task::JoinHandle<Result<(), DaemonError>>> = None;
+    let mut dfs_maintenance_task: Option<
+        tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
+    > = None;
 
     loop {
         if daemon_shutdown_requested(&shutdown_rx) {
@@ -1084,10 +1088,13 @@ async fn run_daemon_background_maintenance_loop(
             let completed_task = dfs_maintenance_task
                 .take()
                 .expect("finished DFS maintenance task exists");
-            let completed_ok =
+            let completed_outcome =
                 join_daemon_dfs_maintenance_task(completed_task, label.as_str()).await;
-            dfs_triggered_maintenance_requested = false;
-            if completed_ok {
+            dfs_triggered_maintenance_requested = matches!(
+                completed_outcome,
+                Some(DaemonDfsMaintenanceTickOutcome::Deferred)
+            );
+            if completed_outcome == Some(DaemonDfsMaintenanceTickOutcome::Completed) {
                 let probe_paths = paths.clone();
                 match tokio::task::spawn_blocking(move || {
                     daemon_dfs_pending_maintenance_work(&probe_paths)
@@ -1106,7 +1113,18 @@ async fn run_daemon_background_maintenance_loop(
                     ),
                 }
             }
-            last_dfs_maintenance = std::time::Instant::now();
+            let completed_at = std::time::Instant::now();
+            last_dfs_maintenance =
+                if completed_outcome == Some(DaemonDfsMaintenanceTickOutcome::Deferred) {
+                    completed_at
+                        .checked_sub(
+                            DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
+                                .saturating_sub(DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY),
+                        )
+                        .unwrap_or(completed_at)
+                } else {
+                    completed_at
+                };
         }
 
         if daemon_role_owns_default_dfs(&label)
@@ -4886,6 +4904,38 @@ mod tests {
         }
     }
 
+    struct PermissionDeniedRegistryService;
+
+    impl sinomo_core::service::Service for PermissionDeniedRegistryService {
+        fn name(&self) -> &'static str {
+            "permission-denied-registry"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/test/permission-denied-session"]
+        }
+
+        fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
+            vec![
+                sinomo_core::service::ServiceRoute::new("/test/permission-denied-session", "test")
+                    .with_auth_scope("authenticated")
+                    .require_local_permission("remote-management"),
+            ]
+        }
+
+        fn handle(
+            &self,
+            _ctx: sinomo_core::service::ServiceContext,
+            _request: sinomo_core::network::ObjectRpcRequest,
+        ) -> sinomo_core::service::ServiceFuture<'_> {
+            Box::pin(async {
+                Err(sinomo_core::service::ServiceError::Service(
+                    "permission-denied handler must not run".to_string(),
+                ))
+            })
+        }
+    }
+
     #[test]
     fn authenticated_registry_failure_returns_session_error() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-registry-rpc-error");
@@ -4963,6 +5013,93 @@ mod tests {
         assert!(
             error.to_string().contains("injected registry failure"),
             "unexpected error detail: {error}"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn node_local_permission_denial_returns_structured_session_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-permission-rpc-error");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            "/test/permission-denied-session",
+            "test",
+            &(),
+        )
+        .expect("request");
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let runtime =
+                crate::build_daemon_async_runtime("daemon-permission-error-test").expect("runtime");
+            let service_runtime = runtime.handle().clone();
+            let error = runtime
+                .block_on(async move {
+                    let listener =
+                        sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("listener");
+                    let stream_address = listener.local_addr_string().expect("listener address");
+                    address_tx
+                        .send(stream_address.clone())
+                        .expect("send listener address");
+                    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+                        paths.clone(),
+                        service_runtime.clone(),
+                        vec![crate::DaemonServiceRegistryHook::new(|builder| {
+                            builder.register(PermissionDeniedRegistryService)
+                        })],
+                    )
+                    .await
+                    .expect("service host");
+                    let stream = listener.accept().await.expect("accept");
+                    handle_daemon_connection_async(
+                        stream,
+                        paths,
+                        service_host,
+                        service_runtime,
+                        stream_address,
+                    )
+                    .await
+                })
+                .expect_err("node-local permission must reject the session");
+            assert!(matches!(error, DaemonError::AuthDenied));
+        });
+
+        let address = address_rx.recv().expect("listener address");
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("client runtime");
+        let client_paths = DaemonPaths::new(&data_dir);
+        let mut host =
+            crate::client::DaemonSignedObjectRpcAsyncHost::new(client_runtime.handle(), false)
+                .with_paths(&client_paths);
+        let error = client_runtime
+            .block_on(
+                sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
+                    .call_loopback(
+                        &data_dir,
+                        &address,
+                        sinomo_core::network::ObjectRpcSessionCall::value(request),
+                        sinomo_core::network::ClusterObjectRpcOptions::new(
+                            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                                Duration::from_secs(2),
+                            ),
+                        ),
+                    ),
+            )
+            .expect_err("permission denial must be returned as an RPC error");
+        assert!(
+            matches!(error, sinomo_core::network::NetworkError::AuthDenied),
+            "unexpected permission error: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("session reader stopped before the response head"),
+            "permission denial regressed to transport EOF: {error}"
         );
         server.join().expect("server thread");
     }
@@ -6150,12 +6287,15 @@ mod tests {
             let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
             let task = tokio::spawn(async move {
                 release_rx.await.expect("release maintenance task");
-                Ok(())
+                Ok(DaemonDfsMaintenanceTickOutcome::Completed)
             });
             let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let joined_after_wait = Arc::clone(&joined);
             let waiter = tokio::spawn(async move {
-                assert!(join_daemon_dfs_maintenance_task(task, "daemon-test").await);
+                assert_eq!(
+                    join_daemon_dfs_maintenance_task(task, "daemon-test").await,
+                    Some(DaemonDfsMaintenanceTickOutcome::Completed)
+                );
                 joined_after_wait.store(true, std::sync::atomic::Ordering::Release);
             });
 

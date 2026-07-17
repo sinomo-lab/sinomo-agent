@@ -10,7 +10,7 @@ use crate::file_manager::{
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
@@ -19,7 +19,7 @@ use sinomo_runtime::dfs::{
     default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
     fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal_with_peer_transport,
+    publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{KvError, KvOp, KvTxn, KvTxnResponse};
@@ -27,6 +27,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2074,18 +2075,41 @@ fn publish_sifs_metadata_journal_from_data_dir(
     operation_deadline: Option<Instant>,
 ) -> Result<DfsMetadataJournalReplicationReport, sinomo_runtime::dfs::DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
+    let peer_transport = Arc::new(
         SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
             .with_operation_deadline(operation_deadline),
     );
+    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let options = sifs_foreground_metadata_publish_options_with_deadline(operation_deadline)
         .map_err(|message| sinomo_runtime::dfs::DfsError::Network { message })?;
-    publish_cluster_dfs_metadata_journal_with_peer_transport(
+    let publish = publish_cluster_dfs_metadata_journal_with_peer_transports_async(
         data_dir,
         &cluster_paths,
-        peer_transport,
+        sync_peer_transport,
+        async_peer_transport,
         options,
-    )
+    );
+    block_on_sifs_rpc_runtime(rpc_runtime, publish)
+}
+
+fn block_on_sifs_rpc_runtime<F, T>(rpc_runtime: &SifsRpcRuntime, future: F) -> Result<T, DfsError>
+where
+    F: Future<Output = Result<T, DfsError>>,
+{
+    if let Ok(current) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            current.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| rpc_runtime.runtime.block_on(future));
+        }
+        return Err(DfsError::Network {
+            message: "SIFS metadata publication cannot block a current-thread Tokio runtime; use the async transport"
+                .to_string(),
+        });
+    }
+    rpc_runtime.runtime.block_on(future)
 }
 
 fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOptions {
@@ -3041,6 +3065,61 @@ mod tests {
         assert_eq!(options.max_batches_per_target, 1);
         assert_eq!(options.attempt_timeout, network::DEFAULT_NETWORK_TIMEOUT);
         assert_eq!(options.target_timeout, network::DEFAULT_NETWORK_TIMEOUT);
+    }
+
+    #[test]
+    fn sifs_rpc_runtime_blocks_foreground_publish_from_plain_thread() {
+        let rpc_runtime = SifsRpcRuntime::new().expect("SIFS RPC runtime");
+
+        let value = block_on_sifs_rpc_runtime(&rpc_runtime, async {
+            tokio::task::yield_now().await;
+            Ok::<_, DfsError>(41)
+        })
+        .expect("foreground publish future");
+
+        assert_eq!(value, 41);
+    }
+
+    #[test]
+    fn sifs_rpc_runtime_blocks_foreground_publish_from_multithread_runtime() {
+        let rpc_runtime = SifsRpcRuntime::new().expect("SIFS RPC runtime");
+        let caller_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("caller runtime");
+
+        let value = caller_runtime
+            .block_on(async {
+                block_on_sifs_rpc_runtime(&rpc_runtime, async {
+                    tokio::task::yield_now().await;
+                    Ok::<_, DfsError>(42)
+                })
+            })
+            .expect("foreground publish future");
+
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn sifs_rpc_runtime_rejects_blocking_current_thread_runtime() {
+        let rpc_runtime = SifsRpcRuntime::new().expect("SIFS RPC runtime");
+        let caller_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("caller runtime");
+
+        let error = caller_runtime
+            .block_on(async {
+                block_on_sifs_rpc_runtime(&rpc_runtime, async { Ok::<_, DfsError>(()) })
+            })
+            .expect_err("current-thread runtime must not be blocked");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot block a current-thread Tokio runtime")
+        );
     }
 
     #[test]

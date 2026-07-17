@@ -43,6 +43,38 @@ pub(crate) struct DfsRepairBlobRequestOutcome {
     pub(crate) last_error: Option<String>,
 }
 
+/// Shared work budget for one repair-maintenance pass.
+///
+/// Stage retries and committed repairs use the same target budget. A failed or
+/// unroutable send still consumes one slot: the bound limits attempted work and
+/// wall-clock exposure, not only successful schedules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DfsRepairMaintenanceBudget {
+    remaining_targets: usize,
+}
+
+impl DfsRepairMaintenanceBudget {
+    const fn new(max_targets: usize) -> Self {
+        Self {
+            remaining_targets: max_targets,
+        }
+    }
+
+    const fn is_exhausted(self) -> bool {
+        self.remaining_targets == 0
+    }
+
+    fn reserve(&mut self, requested: usize) -> usize {
+        let reserved = requested.min(self.remaining_targets);
+        self.remaining_targets -= reserved;
+        reserved
+    }
+
+    fn reserve_one(&mut self) -> bool {
+        self.reserve(1) == 1
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Number of new stage sends that may be reserved for this intent now.
     /// Background writes reserve only the exact W deficit; foreground writes
@@ -489,12 +521,16 @@ where
         }
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
         self.expire_stale_fetch_requests();
-        self.retry_pending_stages_async().await?;
+        let mut budget = DfsRepairMaintenanceBudget::new(max_scheduled);
+        self.retry_pending_stages_async_bounded(&mut budget).await?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
         let mut consumed_repair_targets = BTreeSet::new();
 
         for job in repair_jobs.iter().cloned() {
+            if budget.is_exhausted() {
+                break;
+            }
             if consumed_repair_targets
                 .contains(&(job.intent_id.clone(), job.missing_replica_node_id.clone()))
             {
@@ -521,6 +557,9 @@ where
             }
 
             if job.missing_replica_node_id == self.node_id {
+                if !budget.reserve_one() {
+                    break;
+                }
                 if self
                     .local_object_version_manifest_size_if_matches(
                         &pending.object_id,
@@ -551,6 +590,9 @@ where
             }
 
             if self.open_pending_write_blob_stream(&pending).is_err() {
+                if !budget.reserve_one() {
+                    break;
+                }
                 let fetch_outcome = self
                     .request_repair_blob_from_alternate_async(&job, &pending)
                     .await?;
@@ -568,7 +610,7 @@ where
                 .get(&job.missing_replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
-            let remaining = max_scheduled.saturating_sub(scheduled.len());
+            let remaining = budget.remaining_targets;
             if remaining == 0 {
                 break;
             }
@@ -620,6 +662,8 @@ where
                     }
                 }
             }
+            let reserved = budget.reserve(fanout_jobs.len());
+            debug_assert_eq!(reserved, fanout_jobs.len());
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
             let fanout_targets = fanout_jobs
                 .iter()
@@ -656,7 +700,7 @@ where
                     );
                 }
             }
-            if scheduled.len() >= max_scheduled {
+            if budget.is_exhausted() {
                 break;
             }
         }
@@ -664,9 +708,15 @@ where
         Ok(scheduled)
     }
 
-    async fn retry_pending_stages_async(&mut self) -> Result<(), DfsError> {
+    async fn retry_pending_stages_async_bounded(
+        &mut self,
+        budget: &mut DfsRepairMaintenanceBudget,
+    ) -> Result<(), DfsError> {
         let pending_intent_ids = self.pending_writes.keys().cloned().collect::<Vec<_>>();
         for intent_id in pending_intent_ids {
+            if budget.is_exhausted() {
+                break;
+            }
             let Some(intent) = self.coordinator.intent(&intent_id).cloned() else {
                 continue;
             };
@@ -683,9 +733,15 @@ where
                     .into_iter()
                     .map(|receipt| receipt.replica_node_id.clone())
                     .collect::<BTreeSet<_>>();
-                let stage_targets = self.pending_stage_targets(&intent, &pending, &durable_nodes);
+                let mut stage_targets =
+                    self.pending_stage_targets(&intent, &pending, &durable_nodes);
                 if stage_targets.is_empty() {
                     break;
+                }
+                let reserved = budget.reserve(stage_targets.len());
+                stage_targets.truncate(reserved);
+                if stage_targets.is_empty() {
+                    return Ok(());
                 }
                 let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
                 let mut full_stage_targets = Vec::new();
@@ -749,6 +805,9 @@ where
                     } else {
                         self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
                     }
+                }
+                if budget.is_exhausted() {
+                    return Ok(());
                 }
             }
         }
@@ -984,12 +1043,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
         self.expire_stale_fetch_requests();
-        self.retry_pending_stages_scoped(intent_filter)?;
+        let mut budget = DfsRepairMaintenanceBudget::new(max_scheduled);
+        self.retry_pending_stages_scoped_bounded(intent_filter, &mut budget)?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
         let mut consumed_repair_targets = BTreeSet::new();
 
         for job in repair_jobs.iter().cloned() {
+            if budget.is_exhausted() {
+                break;
+            }
             if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&job.intent_id)) {
                 continue;
             }
@@ -1019,6 +1082,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
 
             if job.missing_replica_node_id == self.node_id {
+                if !budget.reserve_one() {
+                    break;
+                }
                 if self
                     .local_object_version_manifest_size_if_matches(
                         &pending.object_id,
@@ -1047,6 +1113,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
 
             if self.open_pending_write_blob_stream(&pending).is_err() {
+                if !budget.reserve_one() {
+                    break;
+                }
                 let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
                 if !fetch_outcome.requested {
                     self.record_repair_retry_scheduled_with_error(
@@ -1062,7 +1131,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get(&job.missing_replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
-            let remaining = max_scheduled.saturating_sub(scheduled.len());
+            let remaining = budget.remaining_targets;
             if remaining == 0 {
                 break;
             }
@@ -1114,6 +1183,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
             }
+            let reserved = budget.reserve(fanout_jobs.len());
+            debug_assert_eq!(reserved, fanout_jobs.len());
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
             let fanout_targets = fanout_jobs
                 .iter()
@@ -1148,7 +1219,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     );
                 }
             }
-            if scheduled.len() >= max_scheduled {
+            if budget.is_exhausted() {
                 break;
             }
         }
@@ -1187,12 +1258,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.remove_pending_write_state(intent_id);
     }
 
-    fn retry_pending_stages_scoped(
+    fn retry_pending_stages_scoped_bounded(
         &mut self,
         intent_filter: Option<&BTreeSet<String>>,
+        budget: &mut DfsRepairMaintenanceBudget,
     ) -> Result<(), DfsError> {
         let pending_intent_ids = self.pending_writes.keys().cloned().collect::<Vec<_>>();
         for intent_id in pending_intent_ids {
+            if budget.is_exhausted() {
+                break;
+            }
             if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&intent_id)) {
                 continue;
             }
@@ -1210,7 +1285,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             };
             let object_metadata = self.current_object_for_write(&object_id)?;
-            self.stage_missing_desired_replicas_for_intent(&intent_id, object_metadata)?;
+            self.stage_missing_desired_replicas_for_intent_bounded(
+                &intent_id,
+                object_metadata,
+                budget,
+            )?;
         }
         Ok(())
     }
@@ -1229,6 +1308,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         object_metadata: DfsObjectMetadata,
     ) -> Result<(), DfsError> {
+        let mut budget = DfsRepairMaintenanceBudget::new(usize::MAX);
+        self.stage_missing_desired_replicas_for_intent_bounded(
+            intent_id,
+            object_metadata,
+            &mut budget,
+        )
+    }
+
+    fn stage_missing_desired_replicas_for_intent_bounded(
+        &mut self,
+        intent_id: &str,
+        object_metadata: DfsObjectMetadata,
+        budget: &mut DfsRepairMaintenanceBudget,
+    ) -> Result<(), DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(());
         };
@@ -1239,6 +1332,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         loop {
+            if budget.is_exhausted() {
+                break;
+            }
             let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
                 break;
             };
@@ -1248,7 +1344,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .into_iter()
                 .map(|receipt| receipt.replica_node_id.clone())
                 .collect::<BTreeSet<_>>();
-            let stage_targets = self.pending_stage_targets(&intent, &pending, &durable_nodes);
+            let mut stage_targets = self.pending_stage_targets(&intent, &pending, &durable_nodes);
+            if stage_targets.is_empty() {
+                break;
+            }
+            let reserved = budget.reserve(stage_targets.len());
+            stage_targets.truncate(reserved);
             if stage_targets.is_empty() {
                 break;
             }

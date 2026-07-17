@@ -845,6 +845,31 @@ pub trait ClusterKvRaftAppendReplicationAsyncHost {
     ) -> ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error>;
 }
 
+fn cluster_kv_raft_next_index_after_rejection(
+    next_index: u64,
+    request: &ClusterRaftAppendRequest,
+    match_index: u64,
+) -> u64 {
+    let rejected_next_index = match_index.saturating_add(1);
+    if rejected_next_index < next_index {
+        rejected_next_index
+    } else if rejected_next_index == next_index
+        && request.snapshot.is_none()
+        && match_index == request.append.prev_log_index
+        && request.append.prev_log_index == request.append.leader_commit
+    {
+        // The follower reports that its log ends at our prev_log_index but
+        // rejected the committed anchor's term. Backtracking by one would resend
+        // that conflicting committed entry. Restart from the catch-up anchor so
+        // a compacted leader builds an authoritative snapshot instead.
+        1
+    } else if match_index >= next_index {
+        next_index.saturating_div(2).max(1)
+    } else {
+        next_index.saturating_sub(1).max(1)
+    }
+}
+
 pub fn replicate_cluster_kv_raft_to_target_with_host<H>(
     state: &ClusterBootstrapState,
     target: &H::Target,
@@ -877,14 +902,11 @@ where
                 watch_event_fanout_needed,
             });
         }
-        let rejected_next_index = response.append.match_index.saturating_add(1);
-        next_index = if rejected_next_index < next_index {
-            rejected_next_index
-        } else if response.append.match_index >= next_index {
-            next_index.saturating_div(2).max(1)
-        } else {
-            next_index.saturating_sub(1).max(1)
-        };
+        next_index = cluster_kv_raft_next_index_after_rejection(
+            next_index,
+            &request,
+            response.append.match_index,
+        );
         last_response = Some(response);
     }
     Ok(ClusterKvRaftAppendReplicationOutcome {
@@ -944,14 +966,11 @@ where
                 watch_event_fanout_needed,
             });
         }
-        let rejected_next_index = response.append.match_index.saturating_add(1);
-        next_index = if rejected_next_index < next_index {
-            rejected_next_index
-        } else if response.append.match_index >= next_index {
-            next_index.saturating_div(2).max(1)
-        } else {
-            next_index.saturating_sub(1).max(1)
-        };
+        next_index = cluster_kv_raft_next_index_after_rejection(
+            next_index,
+            &request,
+            response.append.match_index,
+        );
         last_response = Some(response);
     }
     Ok(ClusterKvRaftAppendReplicationOutcome {
@@ -1575,14 +1594,16 @@ where
     let mut previous_commit_failure: Option<H::Error> = None;
     for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
         if !host.local_is_raft_leader(state)? {
-            let forwarding_failure = if options.allow_forwarding {
-                match host.forward_cluster_kv_txn_to_voter(state, &txn) {
-                    Ok(Some(response)) => return Ok(response),
-                    Ok(None) => None,
-                    Err(error) => Some(error),
-                }
-            } else {
-                None
+            if !options.allow_forwarding {
+                return Err(host.cluster_read_only_error(
+                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+                        .to_string(),
+                ));
+            }
+            let forwarding_failure = match host.forward_cluster_kv_txn_to_voter(state, &txn) {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => None,
+                Err(error) => Some(error),
             };
             if !host.elect_cluster_raft_leader(state)? {
                 let mut detail = if let Some(forwarding_failure) = forwarding_failure {
@@ -1590,10 +1611,8 @@ where
                         "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
                         forwarding_failure.to_string()
                     )
-                } else if options.allow_forwarding {
-                    "local node is not the Raft leader and could not win quorum".to_string()
                 } else {
-                    "forwarded cluster KV transaction reached a non-leader voter and it could not win quorum".to_string()
+                    "local node is not the Raft leader and could not win quorum".to_string()
                 };
                 if let Some(error) = previous_commit_failure.as_ref() {
                     detail.push_str("; previous local commit failed: ");
@@ -1671,14 +1690,19 @@ where
     let mut previous_commit_failure: Option<H::Error> = None;
     for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
         if !host.local_is_raft_leader_async(state).await? {
-            let forwarding_failure = if options.allow_forwarding {
-                match host.forward_cluster_kv_txn_to_voter_async(state, &txn).await {
-                    Ok(Some(response)) => return Ok(response),
-                    Ok(None) => None,
-                    Err(error) => Some(error),
-                }
-            } else {
-                None
+            if !options.allow_forwarding {
+                return Err(host.cluster_read_only_error(
+                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
+                        .to_string(),
+                ));
+            }
+            let forwarding_failure = match host
+                .forward_cluster_kv_txn_to_voter_async(state, &txn)
+                .await
+            {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => None,
+                Err(error) => Some(error),
             };
             if !host.elect_cluster_raft_leader_async(state).await? {
                 let mut detail = if let Some(forwarding_failure) = forwarding_failure {
@@ -1686,10 +1710,8 @@ where
                         "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
                         forwarding_failure.to_string()
                     )
-                } else if options.allow_forwarding {
-                    "local node is not the Raft leader and could not win quorum".to_string()
                 } else {
-                    "forwarded cluster KV transaction reached a non-leader voter and it could not win quorum".to_string()
+                    "local node is not the Raft leader and could not win quorum".to_string()
                 };
                 if let Some(error) = previous_commit_failure.as_ref() {
                     detail.push_str("; previous local commit failed: ");
@@ -3056,17 +3078,34 @@ impl DurableRaftKvNode {
         let before_revision = self.store().revision();
         let mut snapshot_restored = false;
         if let Some(snapshot) = snapshot {
+            let applied_index = self.applied_index();
+            let current_term = self.hard_state().current_term;
             let snapshot_matches_append = append.prev_log_index >= snapshot.last_included_index
                 && (append.prev_log_index != snapshot.last_included_index
                     || append.prev_log_term == snapshot.last_included_term);
-            let snapshot_is_newer = snapshot.last_included_index > self.applied_index();
-            let snapshot_repairs_divergent_compaction = snapshot.last_included_term
-                > self.last_log_term()
-                && snapshot.kv.revision >= self.store().revision();
-            let append_term_is_current = append.term >= self.hard_state().current_term;
+            let snapshot_is_newer = snapshot.last_included_index > applied_index;
+            // Cluster RPC admission authenticates `append.leader_id` before this
+            // method is reached. A same-index install is nevertheless much more
+            // destructive than normal forward catch-up, so only allow it from the
+            // leader this follower has already recorded for the exact current term.
+            // This repairs a compacted committed-log fork even when the divergent
+            // local command happened to produce a higher KV revision.
+            let snapshot_repairs_same_index_divergence = snapshot.last_included_index > 0
+                && snapshot.last_included_index == applied_index
+                && snapshot.last_included_index == self.hard_state().commit_index
+                && self.term_at(snapshot.last_included_index).is_some_and(|local_term| {
+                    snapshot.last_included_term > local_term
+                })
+                && snapshot.last_included_term <= append.term
+                && append.prev_log_index == snapshot.last_included_index
+                && append.prev_log_term == snapshot.last_included_term
+                && append.leader_commit == snapshot.last_included_index
+                && append.term == current_term
+                && self.hard_state().leader_id.as_ref() == Some(&append.leader_id);
+            let append_term_is_current = append.term >= current_term;
             if append_term_is_current
                 && snapshot_matches_append
-                && (snapshot_is_newer || snapshot_repairs_divergent_compaction)
+                && (snapshot_is_newer || snapshot_repairs_same_index_divergence)
             {
                 self.restore_snapshot(snapshot)?;
                 snapshot_restored = true;

@@ -67,9 +67,11 @@ const CROSS_SHARD_MOVE_VERSION_HISTORY_LIMIT: usize = 32;
 /// response replay has not yet surfaced the mutation locally.
 const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 /// Whole-file POSIX writes are blind overwrites, not user-supplied CAS writes.
-/// If another local service instance advanced the metadata between lookup and
-/// commit, refresh from the backend and retry against the current version.
-const POSIX_WRITE_STALE_BASE_RETRY_ROUNDS: usize = 4;
+/// If another service instance is already committing, wait for that intent to
+/// settle, refresh from the backend, and retry against the new current version.
+/// The caller's transport deadline remains authoritative; callers without one
+/// use the same bounded wait as foreground commit settlement.
+const POSIX_WRITE_SERIALIZATION_RETRY_IDLE_SLEEP: Duration = Duration::from_millis(10);
 /// Budget for an authoritative path lookup or the best-effort freshness pull
 /// used after that lookup cannot answer. These requests share the serialized
 /// namespace lane with durable mutations, so the budget must tolerate bounded
@@ -93,12 +95,22 @@ struct PosixBulkParentTouch {
     metadata_primary: Option<NodeId>,
 }
 
-fn posix_error_is_stale_write_base(error: &DfsPosixError) -> bool {
-    matches!(
-        error,
-        DfsPosixError::Dfs(DfsError::Distributed { message })
-            if message.contains("stale DFS write base")
-    )
+fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
+    let DfsPosixError::Dfs(DfsError::Distributed { message }) = error else {
+        return false;
+    };
+    // Local authority errors and routed rejection envelopes currently meet at
+    // this string-typed DFS boundary. Keep this list aligned with
+    // `distributed_error_is_stale_or_concurrent_write`: all four messages mean
+    // that this blind overwrite was not accepted and may be retried safely.
+    [
+        "stale DFS write base",
+        "base version conflict",
+        "duplicate DFS write intent for",
+        "pending DFS write intent",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
@@ -1105,8 +1117,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusive_create: bool,
         follow_final_for_exclusive_create: bool,
     ) -> Result<DfsStat> {
-        let mut last_stale_base = None;
-        for attempt in 0..=POSIX_WRITE_STALE_BASE_RETRY_ROUNDS {
+        let started_at = Instant::now();
+        let retry_deadline = self
+            .transport
+            .operation_deadline()
+            .map(|deadline| deadline.min(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT))
+            .unwrap_or(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT);
+        loop {
             match self.posix_write_file_bytes_checked_parent_once(
                 path,
                 bytes,
@@ -1120,22 +1137,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 None,
             ) {
                 Ok(stat) => return Ok(stat),
-                Err(error)
-                    if attempt < POSIX_WRITE_STALE_BASE_RETRY_ROUNDS
-                        && posix_error_is_stale_write_base(&error) =>
-                {
-                    last_stale_base = Some(error);
+                Err(error) if posix_error_is_retryable_write_serialization(&error) => {
+                    self.check_cancelled("POSIX blind-write serialization retry")?;
+                    let now = Instant::now();
+                    if now >= retry_deadline {
+                        return Err(error);
+                    }
+                    std::thread::sleep(
+                        POSIX_WRITE_SERIALIZATION_RETRY_IDLE_SLEEP
+                            .min(retry_deadline.saturating_duration_since(now)),
+                    );
                     self.hydrate_from_metadata_backend()?;
-                    continue;
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(last_stale_base.unwrap_or_else(|| {
-            DfsPosixError::Dfs(DfsError::Distributed {
-                message: "stale DFS write base retry exhausted".to_string(),
-            })
-        }))
     }
 
     fn posix_write_file_bytes_checked_parent_once(
@@ -2198,6 +2214,45 @@ fn _assert_filesystem_send_sync<T: Send + Sync>(_: &DfsFileSystem) {}
 #[cfg(test)]
 mod replica_candidate_tests {
     use super::*;
+
+    fn distributed_posix_error(message: &str) -> DfsPosixError {
+        DfsPosixError::Dfs(DfsError::Distributed {
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn blind_write_serialization_retry_classifies_every_unaccepted_write_race() {
+        for message in [
+            "stale DFS write base for object",
+            "base version conflict for object",
+            "duplicate DFS write intent for object conflicts with requested target",
+            "pending DFS write intent intent-a for object conflicts with requested target",
+            "distributed DFS error: pending DFS write intent intent-a for object conflicts",
+        ] {
+            assert!(
+                posix_error_is_retryable_write_serialization(&distributed_posix_error(message)),
+                "expected retryable blind-write serialization error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_pending_write_is_not_restarted_as_a_blind_overwrite() {
+        assert!(!posix_error_is_retryable_write_serialization(
+            &DfsPosixError::PendingWrite {
+                intent_id: "accepted-intent".to_string(),
+                durable_receipts: 1,
+                required_receipts: 2,
+            }
+        ));
+        assert!(!posix_error_is_retryable_write_serialization(
+            &distributed_posix_error("invalid DFS replication policy")
+        ));
+        assert!(!posix_error_is_retryable_write_serialization(
+            &distributed_posix_error("duplicate DFS write intent id intent-a")
+        ));
+    }
 
     #[test]
     fn posix_write_selects_local_plus_policy_sized_remote_set() {

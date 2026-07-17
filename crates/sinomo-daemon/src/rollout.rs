@@ -1,4 +1,4 @@
-use crate::cluster::{CLUSTER_HEALTH_PROBE_TIMEOUT, start_shadow_daemon_status_publisher};
+use crate::cluster::CLUSTER_HEALTH_PROBE_TIMEOUT;
 #[cfg(windows)]
 use crate::prepare_noninteractive_command;
 #[cfg(not(unix))]
@@ -62,7 +62,6 @@ const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60)
 const SUPERVISED_MAIN_RESTART_REQUEST_FILE: &str = "supervised-main-restart.request";
 const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SHADOW_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-const SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHADOW_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
@@ -801,7 +800,6 @@ fn join_shadow_runtime_task(
 fn shadow_runtime_task_join_timeout(label: &str) -> Duration {
     match label {
         "network module context" => SHADOW_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT,
-        "status publisher" => SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT,
         _ => SHADOW_RUNTIME_TASK_JOIN_TIMEOUT,
     }
 }
@@ -885,26 +883,9 @@ pub fn run_shadow_daemon_supervision_loop(
     ) {
         shadow_runtime_tasks.push(("network module context", task));
     }
-    match start_shadow_daemon_status_publisher(
-        &shadow_paths,
-        daemon_runtime_handle.clone(),
-        control_shutdown_rx.clone(),
-    ) {
-        Ok(task) => shadow_runtime_tasks.push(("status publisher", task)),
-        Err(error) => {
-            tracing::warn!("sinomo shadow daemon status publisher disabled: {error}");
-            crate::append_operational_log_best_effort(
-                &shadow_paths,
-                crate::OperationalSeverity::Warn,
-                "shadow-daemon",
-                "sinomo shadow daemon status publisher disabled",
-                None,
-                serde_json::json!({
-                    "error": error.to_string(),
-                }),
-            );
-        }
-    }
+    // The shadow is an alternate supervision endpoint, not a cluster member.
+    // The main daemon probes it and publishes its status; starting a publisher
+    // here would let the shadow originate quorum writes and leader campaigns.
     if let Err(error) = complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths) {
         tracing::warn!("sinomo shadow daemon rollout finalization publish failed: {error}");
         crate::append_operational_log_best_effort(
@@ -4330,10 +4311,6 @@ mod tests {
         assert_eq!(
             shadow_runtime_task_join_timeout("network module context"),
             SHADOW_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT
-        );
-        assert_eq!(
-            shadow_runtime_task_join_timeout("status publisher"),
-            SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT
         );
         assert!(
             shadow_runtime_task_join_timeout("network module context")

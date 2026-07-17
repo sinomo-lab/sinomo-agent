@@ -18,7 +18,9 @@ On permission denial, stop and request manual local enablement.
 
 ## Upload
 
-1. Split the payload into chunks no larger than the protocol write limit.
+1. Split the payload into chunks no larger than the remote-management route's
+   per-write application limit. This is a retry/resource policy for the file
+   operation, not a network message-size limit.
 2. Send the first `/remote-management/fs/write` request with `offset: 0` and
    `truncate: true`. Set `create_parent` only when creating missing directories
    is intended.

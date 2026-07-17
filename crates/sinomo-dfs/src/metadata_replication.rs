@@ -15,12 +15,13 @@ use sinomo_core::network::{
     ClusterPaths, NetworkError, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
 };
 use sinomo_core::node::NodeId;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -50,6 +51,7 @@ use crate::{metadata_cursor, metadata_lock};
 
 type ClusterMetadataBackendCache =
     BTreeMap<(PathBuf, DfsMetadataShardId), Arc<Mutex<LocalSobjMetadataBackend>>>;
+static DFS_METADATA_REPLICATION_SUPPRESSION_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// A topology change may leave legacy objects on their former metadata shard.
 /// Limit cross-shard rewrites per mandatory pass while still scanning the full
@@ -81,6 +83,7 @@ fn cached_cluster_metadata_backend(
 }
 
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
+const DEFAULT_DFS_METADATA_REPLICATION_MAX_CONCURRENT_TARGET_NODES: usize = 8;
 
 pub fn publish_cluster_dfs_metadata_journal(
     data_dir: &SinomoDataDir,
@@ -1327,7 +1330,14 @@ pub enum DfsMetadataJournalReplicationTransportError {
     Failed { reason: String },
 }
 
-pub trait DfsMetadataJournalReplicationTransport {
+pub trait DfsMetadataJournalReplicationTransport: Send {
+    /// Returns an independent transport handle for one target-node lane.
+    /// Implementations without a cheap, thread-safe fork retain serial
+    /// execution through the default `None` result.
+    fn fork_target_lane(&self) -> Option<Box<dyn DfsMetadataJournalReplicationTransport>> {
+        None
+    }
+
     fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool;
 
     fn send_metadata_journal_batch(
@@ -1348,11 +1358,11 @@ pub trait DfsMetadataJournalReplicationTransport {
 pub type DfsMetadataJournalReplicationTransportFuture<'a, T> =
     Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-pub trait AsyncDfsMetadataJournalReplicationTransport: Send {
+pub trait AsyncDfsMetadataJournalReplicationTransport: Send + Sync {
     fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool;
 
     fn send_metadata_journal_batch_async<'a>(
-        &'a mut self,
+        &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataJournalBatchCommand,
         timeout: Duration,
@@ -1362,7 +1372,7 @@ pub trait AsyncDfsMetadataJournalReplicationTransport: Send {
     >;
 
     fn send_metadata_snapshot_install_async<'a>(
-        &'a mut self,
+        &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataSnapshotInstallCommand,
         timeout: Duration,
@@ -1509,6 +1519,10 @@ fn validate_dfs_metadata_snapshot_install_replication_response(
 }
 
 impl DfsMetadataJournalReplicationTransport for DfsMetadataNodeTransport {
+    fn fork_target_lane(&self) -> Option<Box<dyn DfsMetadataJournalReplicationTransport>> {
+        Some(Box::new(self.clone()))
+    }
+
     fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool {
         self.has_peer_node(target_node_id)
     }
@@ -1601,7 +1615,7 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataNodeTranspo
     }
 
     fn send_metadata_journal_batch_async<'a>(
-        &'a mut self,
+        &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataJournalBatchCommand,
         timeout: Duration,
@@ -1633,7 +1647,7 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataNodeTranspo
     }
 
     fn send_metadata_snapshot_install_async<'a>(
-        &'a mut self,
+        &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataSnapshotInstallCommand,
         timeout: Duration,
@@ -1666,6 +1680,10 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataNodeTranspo
 }
 
 pub trait DfsMetadataJournalPublisherHost: Send {
+    fn local_data_dir(&self) -> Option<&SinomoDataDir> {
+        None
+    }
+
     fn open_primary_shard_backend(
         &mut self,
         shard_id: &DfsMetadataShardId,
@@ -1693,6 +1711,10 @@ impl LocalDfsMetadataJournalPublisherHost {
 }
 
 impl DfsMetadataJournalPublisherHost for LocalDfsMetadataJournalPublisherHost {
+    fn local_data_dir(&self) -> Option<&SinomoDataDir> {
+        Some(&self.data_dir)
+    }
+
     fn open_primary_shard_backend(
         &mut self,
         shard_id: &DfsMetadataShardId,
@@ -1983,17 +2005,32 @@ fn dfs_metadata_replication_suppression_for<'a>(
     })
 }
 
-async fn put_local_dfs_metadata_replication_suppression_async(
-    data_dir: SinomoDataDir,
-    record: DfsMetadataReplicationSuppressionRecord,
+fn record_dfs_metadata_replication_topology_mismatch(
+    data_dir: &SinomoDataDir,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    shard_epoch: u64,
+    reason: &str,
 ) -> Result<(), DfsError> {
-    tokio::task::spawn_blocking(move || {
-        put_local_dfs_metadata_replication_suppression(&data_dir, record)
-    })
-    .await
-    .map_err(|source| DfsError::Metadata {
-        message: format!("DFS metadata replication suppression write task failed: {source}"),
-    })?
+    if !metadata_replication_rejection_is_topology_mismatch(reason) {
+        return Ok(());
+    }
+    let _write_guard = DFS_METADATA_REPLICATION_SUPPRESSION_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| DfsError::Metadata {
+            message: "DFS metadata replication suppression write lock is poisoned".to_string(),
+        })?;
+    put_local_dfs_metadata_replication_suppression(
+        data_dir,
+        DfsMetadataReplicationSuppressionRecord {
+            target_node_id: target_node_id.clone(),
+            shard_id: shard_id.clone(),
+            shard_epoch,
+            reason: reason.to_owned(),
+            updated_at_unix_nanos: dfs_now_unix_nanos(),
+        },
+    )
 }
 
 async fn record_dfs_metadata_replication_topology_mismatch_async(
@@ -2006,44 +2043,854 @@ async fn record_dfs_metadata_replication_topology_mismatch_async(
     if !metadata_replication_rejection_is_topology_mismatch(reason) {
         return Ok(());
     }
-    put_local_dfs_metadata_replication_suppression_async(
-        data_dir.clone(),
-        DfsMetadataReplicationSuppressionRecord {
-            target_node_id: target_node_id.clone(),
-            shard_id: shard_id.clone(),
+    let data_dir = data_dir.clone();
+    let target_node_id = target_node_id.clone();
+    let shard_id = shard_id.clone();
+    let reason = reason.to_owned();
+    tokio::task::spawn_blocking(move || {
+        record_dfs_metadata_replication_topology_mismatch(
+            &data_dir,
+            &target_node_id,
+            &shard_id,
             shard_epoch,
-            reason: reason.to_owned(),
-            updated_at_unix_nanos: dfs_now_unix_nanos(),
-        },
-    )
+            &reason,
+        )
+    })
     .await
+    .map_err(|source| DfsError::Metadata {
+        message: format!("DFS metadata replication suppression write task failed: {source}"),
+    })?
+}
+
+fn prepared_dfs_metadata_target_lanes(
+    targets: Vec<DfsPreparedMetadataJournalTargetPublish>,
+) -> VecDeque<Vec<(usize, DfsPreparedMetadataJournalTargetPublish)>> {
+    let mut target_lanes =
+        BTreeMap::<NodeId, Vec<(usize, DfsPreparedMetadataJournalTargetPublish)>>::new();
+    for (target_index, target) in targets.into_iter().enumerate() {
+        target_lanes
+            .entry(target.target_node_id.clone())
+            .or_default()
+            .push((target_index, target));
+    }
+    target_lanes.into_values().collect()
+}
+
+fn execute_prepared_dfs_metadata_journal_publish(
+    plan: DfsPreparedClusterMetadataJournalPublish,
+    transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    let DfsPreparedClusterMetadataJournalPublish {
+        data_dir,
+        local_node_id,
+        peer_node_ids: _,
+        mut outcomes,
+        targets,
+    } = plan;
+    let Some(first_lane_transport) = transport.fork_target_lane() else {
+        for target in targets {
+            execute_prepared_dfs_metadata_journal_target_publish(
+                &data_dir,
+                &local_node_id,
+                target,
+                transport,
+                options,
+                &mut outcomes,
+            )?;
+        }
+        return Ok(DfsMetadataJournalReplicationReport { outcomes });
+    };
+
+    let target_count = targets.len();
+    let mut first_lane_transport = Some(first_lane_transport);
+    let mut pending_lanes = prepared_dfs_metadata_target_lanes(targets)
+        .into_iter()
+        .map(|target_lane| {
+            let lane_transport = first_lane_transport.take().unwrap_or_else(|| {
+                transport
+                    .fork_target_lane()
+                    .expect("metadata transport stopped supporting target lane forks")
+            });
+            (target_lane, lane_transport)
+        })
+        .collect::<VecDeque<_>>();
+    let mut ordered_target_results = std::iter::repeat_with(|| None)
+        .take(target_count)
+        .collect::<Vec<_>>();
+    while !pending_lanes.is_empty() {
+        let lane_count = pending_lanes
+            .len()
+            .min(DEFAULT_DFS_METADATA_REPLICATION_MAX_CONCURRENT_TARGET_NODES);
+        let lanes = pending_lanes.drain(..lane_count).collect::<Vec<_>>();
+        let completed_lanes = std::thread::scope(|scope| {
+            lanes
+                .into_iter()
+                .map(|(target_lane, mut lane_transport)| {
+                    let data_dir = &data_dir;
+                    let local_node_id = &local_node_id;
+                    scope.spawn(move || {
+                        let mut lane_results = Vec::with_capacity(target_lane.len());
+                        for (target_index, target) in target_lane {
+                            let mut target_outcomes = Vec::new();
+                            let result = execute_prepared_dfs_metadata_journal_target_publish(
+                                &data_dir,
+                                &local_node_id,
+                                target,
+                                lane_transport.as_mut(),
+                                options,
+                                &mut target_outcomes,
+                            )
+                            .map(|()| target_outcomes);
+                            let failed = result.is_err();
+                            lane_results.push((target_index, result));
+                            if failed {
+                                break;
+                            }
+                        }
+                        lane_results
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("metadata target lane panicked"))
+                .collect::<Vec<_>>()
+        });
+        for completed in completed_lanes {
+            for (target_index, result) in completed {
+                ordered_target_results[target_index] = Some(result);
+            }
+        }
+    }
+
+    for result in ordered_target_results {
+        let result = result.expect("metadata target result missing without an earlier error");
+        match result {
+            Ok(mut target_outcomes) => outcomes.append(&mut target_outcomes),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(DfsMetadataJournalReplicationReport { outcomes })
 }
 
 async fn execute_prepared_dfs_metadata_journal_publish_async(
     plan: DfsPreparedClusterMetadataJournalPublish,
-    transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    transport: &dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    let mut outcomes = plan.outcomes;
-    for target in plan.targets {
-        execute_prepared_dfs_metadata_journal_target_publish_async(
-            &plan.data_dir,
-            &plan.local_node_id,
-            target,
-            transport,
-            options,
-            &mut outcomes,
-        )
-        .await?;
+    let DfsPreparedClusterMetadataJournalPublish {
+        data_dir,
+        local_node_id,
+        peer_node_ids: _,
+        mut outcomes,
+        targets,
+    } = plan;
+    let target_count = targets.len();
+    // One lane owns all shard plans for a target node, preserving the
+    // established per-target batch/shard ordering. Independent node lanes run
+    // concurrently so an offline replica cannot head-of-line block healthy
+    // replicas. Results are reassembled by their original plan index below,
+    // keeping report/error ordering deterministic rather than completion-timed.
+    let mut pending_lanes = prepared_dfs_metadata_target_lanes(targets);
+    let mut in_flight = Vec::<DfsMetadataTargetLaneFuture<'_>>::new();
+    let mut ordered_target_results = std::iter::repeat_with(|| None)
+        .take(target_count)
+        .collect::<Vec<_>>();
+    while !pending_lanes.is_empty() || !in_flight.is_empty() {
+        while in_flight.len() < DEFAULT_DFS_METADATA_REPLICATION_MAX_CONCURRENT_TARGET_NODES {
+            let Some(target_lane) = pending_lanes.pop_front() else {
+                break;
+            };
+            let data_dir = &data_dir;
+            let local_node_id = &local_node_id;
+            in_flight.push(Box::pin(async move {
+                let mut lane_results = Vec::with_capacity(target_lane.len());
+                for (target_index, target) in target_lane {
+                    let mut target_outcomes = Vec::new();
+                    let result = execute_prepared_dfs_metadata_journal_target_publish_async(
+                        &data_dir,
+                        &local_node_id,
+                        target,
+                        transport,
+                        options,
+                        &mut target_outcomes,
+                    )
+                    .await
+                    .map(|()| target_outcomes);
+                    let failed = result.is_err();
+                    lane_results.push((target_index, result));
+                    if failed {
+                        break;
+                    }
+                }
+                lane_results
+            }));
+        }
+
+        let completed = next_completed_dfs_metadata_target_lane(&mut in_flight).await;
+        for (target_index, result) in completed {
+            ordered_target_results[target_index] = Some(result);
+        }
+    }
+
+    for result in ordered_target_results {
+        let result = result.expect("metadata target result missing without an earlier error");
+        match result {
+            Ok(mut target_outcomes) => outcomes.append(&mut target_outcomes),
+            Err(error) => return Err(error),
+        }
     }
     Ok(DfsMetadataJournalReplicationReport { outcomes })
+}
+
+type DfsMetadataTargetPublishResult = Result<Vec<DfsMetadataJournalReplicationOutcome>, DfsError>;
+type DfsMetadataTargetLaneResult = Vec<(usize, DfsMetadataTargetPublishResult)>;
+type DfsMetadataTargetLaneFuture<'a> =
+    Pin<Box<dyn Future<Output = DfsMetadataTargetLaneResult> + Send + 'a>>;
+
+async fn next_completed_dfs_metadata_target_lane(
+    in_flight: &mut Vec<DfsMetadataTargetLaneFuture<'_>>,
+) -> DfsMetadataTargetLaneResult {
+    let (completed_index, result) = std::future::poll_fn(|context| {
+        for (index, future) in in_flight.iter_mut().enumerate() {
+            if let Poll::Ready(result) = future.as_mut().poll(context) {
+                return Poll::Ready((index, result));
+            }
+        }
+        Poll::Pending
+    })
+    .await;
+    drop(in_flight.swap_remove(completed_index));
+    result
+}
+
+fn execute_prepared_dfs_metadata_journal_target_publish(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    target: DfsPreparedMetadataJournalTargetPublish,
+    transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsMetadataJournalReplicationOptions,
+    outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
+) -> Result<(), DfsError> {
+    let DfsPreparedMetadataJournalTargetPublish {
+        target_node_id,
+        file_system_id,
+        shard_id,
+        shard_epoch,
+        mut after_sequence,
+        commands,
+        backlog_after_sequence,
+    } = target;
+    if !transport.has_metadata_replication_route(&target_node_id) {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
+            target_node_id,
+            shard_id,
+            after_sequence,
+        });
+        return Ok(());
+    }
+
+    let target_started_at = Instant::now();
+    let mut completed_plan = true;
+    for command in commands {
+        let Some(attempt_timeout) =
+            dfs_metadata_replication_attempt_timeout(options, target_started_at)
+        else {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                after_sequence,
+                max_batches: options.max_batches_per_target,
+            });
+            completed_plan = false;
+            break;
+        };
+        let response =
+            match transport.send_metadata_journal_batch(&target_node_id, &command, attempt_timeout)
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    push_dfs_metadata_transport_error_outcome(
+                        outcomes,
+                        &target_node_id,
+                        &shard_id,
+                        after_sequence,
+                        error,
+                    );
+                    completed_plan = false;
+                    break;
+                }
+            };
+        if let Err(reason) =
+            validate_dfs_metadata_journal_replication_response(&command, &shard_id, &response)
+        {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                reason,
+            });
+            completed_plan = false;
+            break;
+        }
+        match response.result {
+            DfsMetadataJournalBatchResult::Applied => {
+                let next_after_sequence = command.batch.next_after_sequence;
+                put_local_dfs_metadata_replication_cursor(
+                    data_dir,
+                    &target_node_id,
+                    &shard_id,
+                    next_after_sequence,
+                )?;
+                after_sequence = next_after_sequence;
+                outcomes.push(DfsMetadataJournalReplicationOutcome::Applied {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    entries: command.batch.entries.len(),
+                    next_after_sequence,
+                });
+            }
+            DfsMetadataJournalBatchResult::Rejected { reason } => {
+                if metadata_journal_rejection_allows_snapshot_repair(&reason) {
+                    execute_prepared_dfs_metadata_snapshot_repair(
+                        data_dir,
+                        local_node_id,
+                        &target_node_id,
+                        &shard_id,
+                        shard_epoch,
+                        &file_system_id,
+                        after_sequence,
+                        reason,
+                        transport,
+                        options,
+                        target_started_at,
+                        outcomes,
+                    )?;
+                } else {
+                    record_dfs_metadata_replication_topology_mismatch(
+                        data_dir,
+                        &target_node_id,
+                        &shard_id,
+                        shard_epoch,
+                        &reason,
+                    )?;
+                    outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        reason,
+                    });
+                }
+                completed_plan = false;
+                break;
+            }
+        }
+    }
+
+    if completed_plan {
+        if let Some(after_sequence) = backlog_after_sequence {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id,
+                shard_id,
+                after_sequence,
+                max_batches: options.max_batches_per_target,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_prepared_dfs_metadata_snapshot_repair(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    shard_epoch: u64,
+    file_system_id: &DfsFileSystemId,
+    after_sequence: u64,
+    reason: String,
+    transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsMetadataJournalReplicationOptions,
+    target_started_at: Instant,
+    outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
+) -> Result<(), DfsError> {
+    let command = build_local_dfs_metadata_snapshot_install_command(
+        data_dir,
+        local_node_id,
+        target_node_id,
+        file_system_id,
+        shard_epoch,
+        shard_id,
+        reason.clone(),
+    )?;
+    let Some(attempt_timeout) =
+        dfs_metadata_replication_attempt_timeout(options, target_started_at)
+    else {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+            target_node_id: target_node_id.clone(),
+            shard_id: shard_id.clone(),
+            after_sequence,
+            max_batches: options.max_batches_per_target,
+        });
+        return Ok(());
+    };
+    let response =
+        match transport.send_metadata_snapshot_install(target_node_id, &command, attempt_timeout) {
+            Ok(response) => response,
+            Err(error) => {
+                push_dfs_metadata_snapshot_transport_error_outcome(
+                    outcomes,
+                    target_node_id,
+                    shard_id,
+                    after_sequence,
+                    reason,
+                    error,
+                );
+                return Ok(());
+            }
+        };
+    if let Err(reason) =
+        validate_dfs_metadata_snapshot_install_replication_response(&command, &response)
+    {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+            target_node_id: target_node_id.clone(),
+            shard_id: shard_id.clone(),
+            reason,
+        });
+        return Ok(());
+    }
+    match response.result {
+        DfsMetadataSnapshotInstallResult::Installed { archived_existing } => {
+            put_local_dfs_metadata_replication_cursor(
+                data_dir,
+                target_node_id,
+                shard_id,
+                command.next_after_sequence,
+            )?;
+            outcomes.push(DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                next_after_sequence: command.next_after_sequence,
+                archived_existing,
+            });
+        }
+        DfsMetadataSnapshotInstallResult::Rejected {
+            reason: snapshot_reason,
+        } => {
+            let reason = format!("{reason}; snapshot repair rejected: {snapshot_reason}");
+            record_dfs_metadata_replication_topology_mismatch(
+                data_dir,
+                target_node_id,
+                shard_id,
+                shard_epoch,
+                &reason,
+            )?;
+            outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod concurrent_target_publish_tests {
+    use super::*;
+
+    fn prepared_target(
+        local_node_id: &NodeId,
+        target_node_id: NodeId,
+        file_system_id: DfsFileSystemId,
+        shard_id: &str,
+    ) -> DfsPreparedMetadataJournalTargetPublish {
+        let shard_id = DfsMetadataShardId::new(shard_id);
+        DfsPreparedMetadataJournalTargetPublish {
+            target_node_id: target_node_id.clone(),
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            shard_epoch: 1,
+            after_sequence: 0,
+            commands: vec![DfsMetadataJournalBatchCommand {
+                request_id: format!("publish-{target_node_id}-{}", shard_id.0),
+                source_node_id: Some(local_node_id.clone()),
+                file_system_id: Some(file_system_id),
+                authority_epoch: Some(1),
+                verify_prefix_only: false,
+                prefix_probe: None,
+                authority_probe: None,
+                batch: DfsMetadataJournalBatch {
+                    shard_id,
+                    entries: Vec::new(),
+                    next_after_sequence: 1,
+                },
+            }],
+            backlog_after_sequence: None,
+        }
+    }
+
+    fn snapshot_sender() -> AsyncDfsMetadataSnapshotInstallSender {
+        Arc::new(move |_target_node_id, command, _timeout| {
+            Box::pin(async move {
+                Ok(DfsMetadataSnapshotInstallResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: command.shard_id.clone(),
+                    next_after_sequence: command.next_after_sequence,
+                    result: DfsMetadataSnapshotInstallResult::Installed {
+                        archived_existing: false,
+                    },
+                })
+            })
+        })
+    }
+
+    fn sync_snapshot_sender() -> DfsMetadataSnapshotInstallSender {
+        Arc::new(move |_target_node_id, command, _timeout| {
+            Ok(DfsMetadataSnapshotInstallResponse {
+                request_id: command.request_id.clone(),
+                shard_id: command.shard_id.clone(),
+                next_after_sequence: command.next_after_sequence,
+                result: DfsMetadataSnapshotInstallResult::Installed {
+                    archived_existing: false,
+                },
+            })
+        })
+    }
+
+    #[test]
+    fn sync_healthy_target_publish_does_not_wait_behind_offline_target() {
+        let test_dir = sinomo_testdir::TestDir::new("dfs-metadata-sync-concurrent-targets");
+        let data_dir = SinomoDataDir::new(test_dir.path());
+        data_dir.ensure_root_layout().expect("root layout");
+        let local_node_id =
+            NodeId::from_legacy_named("node_metadata_sync_concurrent_local").expect("local node");
+        let offline_node_id =
+            NodeId::from_legacy_named("node_metadata_sync_concurrent_offline").expect("offline");
+        let healthy_node_id =
+            NodeId::from_legacy_named("node_metadata_sync_concurrent_healthy").expect("healthy");
+        let file_system_id = distributed_sifs(local_node_id.clone()).file_system_id;
+        let (offline_started_sender, offline_started_receiver) = std::sync::mpsc::channel();
+        let (release_offline_sender, release_offline_receiver) = std::sync::mpsc::channel();
+        let release_offline_receiver = Arc::new(Mutex::new(release_offline_receiver));
+        let (healthy_completed_sender, healthy_completed_receiver) = std::sync::mpsc::channel();
+        let sender: DfsMetadataJournalBatchSender = {
+            let offline_node_id = offline_node_id.clone();
+            let release_offline_receiver = Arc::clone(&release_offline_receiver);
+            Arc::new(move |target_node_id, command, _timeout| {
+                if *target_node_id == offline_node_id {
+                    offline_started_sender.send(()).expect("offline started");
+                    release_offline_receiver
+                        .lock()
+                        .expect("offline release lock")
+                        .recv()
+                        .expect("offline release");
+                    return Err(DfsMetadataPeerTransportError::new("offline"));
+                }
+                healthy_completed_sender
+                    .send(())
+                    .expect("healthy completed");
+                Ok(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id.clone(),
+                    shard_id: command.batch.shard_id.clone(),
+                    next_after_sequence: command.batch.next_after_sequence,
+                    applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
+                    result: DfsMetadataJournalBatchResult::Applied,
+                })
+            })
+        };
+        let mut transport = DfsMetadataNodeTransport::new(
+            vec![offline_node_id.clone(), healthy_node_id.clone()],
+            sender,
+            sync_snapshot_sender(),
+        );
+        let plan = DfsPreparedClusterMetadataJournalPublish {
+            data_dir,
+            local_node_id: local_node_id.clone(),
+            peer_node_ids: vec![offline_node_id.clone(), healthy_node_id.clone()],
+            outcomes: Vec::new(),
+            targets: vec![
+                prepared_target(
+                    &local_node_id,
+                    offline_node_id.clone(),
+                    file_system_id.clone(),
+                    "root",
+                ),
+                prepared_target(
+                    &local_node_id,
+                    healthy_node_id.clone(),
+                    file_system_id,
+                    "root",
+                ),
+            ],
+        };
+
+        let publish = std::thread::spawn(move || {
+            execute_prepared_dfs_metadata_journal_publish(
+                plan,
+                &mut transport,
+                DfsMetadataJournalReplicationOptions {
+                    attempt_timeout: Duration::from_secs(5),
+                    target_timeout: Duration::from_secs(5),
+                    ..DfsMetadataJournalReplicationOptions::default()
+                },
+            )
+        });
+        offline_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("offline publish started");
+        healthy_completed_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("healthy publish must complete while offline target is blocked");
+        assert!(!publish.is_finished());
+
+        release_offline_sender.send(()).expect("release offline");
+        let report = publish
+            .join()
+            .expect("publish thread")
+            .expect("publish report");
+        assert!(matches!(
+            &report.outcomes[0],
+            DfsMetadataJournalReplicationOutcome::Failed { target_node_id, .. }
+                if target_node_id == &offline_node_id
+        ));
+        assert!(matches!(
+            &report.outcomes[1],
+            DfsMetadataJournalReplicationOutcome::Applied { target_node_id, .. }
+                if target_node_id == &healthy_node_id
+        ));
+    }
+
+    #[test]
+    fn healthy_target_publish_does_not_wait_behind_offline_target() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let test_dir = sinomo_testdir::TestDir::new("dfs-metadata-concurrent-targets");
+            let data_dir = SinomoDataDir::new(test_dir.path());
+            data_dir.ensure_root_layout().expect("root layout");
+            let local_node_id =
+                NodeId::from_legacy_named("node_metadata_concurrent_local").expect("local node");
+            let offline_node_id =
+                NodeId::from_legacy_named("node_metadata_concurrent_offline").expect("offline");
+            let healthy_node_id =
+                NodeId::from_legacy_named("node_metadata_concurrent_healthy").expect("healthy");
+            let file_system_id = distributed_sifs(local_node_id.clone()).file_system_id;
+            let offline_started = Arc::new(tokio::sync::Notify::new());
+            let release_offline = Arc::new(tokio::sync::Notify::new());
+            let healthy_completed = Arc::new(tokio::sync::Notify::new());
+            let sender: AsyncDfsMetadataJournalBatchSender = {
+                let offline_node_id = offline_node_id.clone();
+                let offline_started = Arc::clone(&offline_started);
+                let release_offline = Arc::clone(&release_offline);
+                let healthy_completed = Arc::clone(&healthy_completed);
+                Arc::new(move |target_node_id, command, _timeout| {
+                    let is_offline = *target_node_id == offline_node_id;
+                    let offline_started = Arc::clone(&offline_started);
+                    let release_offline = Arc::clone(&release_offline);
+                    let healthy_completed = Arc::clone(&healthy_completed);
+                    Box::pin(async move {
+                        if is_offline {
+                            offline_started.notify_one();
+                            release_offline.notified().await;
+                            return Err(DfsMetadataPeerTransportError::new("offline"));
+                        }
+                        healthy_completed.notify_one();
+                        Ok(DfsMetadataJournalBatchResponse {
+                            request_id: command.request_id.clone(),
+                            shard_id: command.batch.shard_id.clone(),
+                            next_after_sequence: command.batch.next_after_sequence,
+                            applied_entries: command.batch.entries.len(),
+                            verified_prefix_only: command.verify_prefix_only,
+                            verified_authority_probe_id: None,
+                            result: DfsMetadataJournalBatchResult::Applied,
+                        })
+                    })
+                })
+            };
+            let mut transport = AsyncDfsMetadataNodeTransport::new(
+                vec![offline_node_id.clone(), healthy_node_id.clone()],
+                sender,
+                snapshot_sender(),
+            );
+            let plan = DfsPreparedClusterMetadataJournalPublish {
+                data_dir,
+                local_node_id: local_node_id.clone(),
+                peer_node_ids: vec![offline_node_id.clone(), healthy_node_id.clone()],
+                outcomes: Vec::new(),
+                targets: vec![
+                    prepared_target(
+                        &local_node_id,
+                        offline_node_id.clone(),
+                        file_system_id.clone(),
+                        "root",
+                    ),
+                    prepared_target(
+                        &local_node_id,
+                        healthy_node_id.clone(),
+                        file_system_id,
+                        "root",
+                    ),
+                ],
+            };
+
+            let publish = tokio::spawn(async move {
+                execute_prepared_dfs_metadata_journal_publish_async(
+                    plan,
+                    &mut transport,
+                    DfsMetadataJournalReplicationOptions {
+                        attempt_timeout: Duration::from_secs(5),
+                        target_timeout: Duration::from_secs(5),
+                        ..DfsMetadataJournalReplicationOptions::default()
+                    },
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), offline_started.notified())
+                .await
+                .expect("offline publish started");
+            tokio::time::timeout(Duration::from_millis(250), healthy_completed.notified())
+                .await
+                .expect("healthy publish must complete while offline target is blocked");
+            assert!(!publish.is_finished());
+
+            release_offline.notify_one();
+            let report = tokio::time::timeout(Duration::from_secs(1), publish)
+                .await
+                .expect("publish completed after offline release")
+                .expect("publish task")
+                .expect("publish report");
+            assert!(matches!(
+                &report.outcomes[0],
+                DfsMetadataJournalReplicationOutcome::Failed { target_node_id, .. }
+                    if target_node_id == &offline_node_id
+            ));
+            assert!(matches!(
+                &report.outcomes[1],
+                DfsMetadataJournalReplicationOutcome::Applied { target_node_id, .. }
+                    if target_node_id == &healthy_node_id
+            ));
+        });
+    }
+
+    #[test]
+    fn one_target_node_lane_preserves_shard_plan_order() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let test_dir = sinomo_testdir::TestDir::new("dfs-metadata-target-order");
+            let data_dir = SinomoDataDir::new(test_dir.path());
+            data_dir.ensure_root_layout().expect("root layout");
+            let local_node_id =
+                NodeId::from_legacy_named("node_metadata_order_local").expect("local node");
+            let target_node_id =
+                NodeId::from_legacy_named("node_metadata_order_target").expect("target node");
+            let file_system_id = distributed_sifs(local_node_id.clone()).file_system_id;
+            let first_started = Arc::new(tokio::sync::Notify::new());
+            let release_first = Arc::new(tokio::sync::Notify::new());
+            let second_started = Arc::new(tokio::sync::Notify::new());
+            let sender: AsyncDfsMetadataJournalBatchSender = {
+                let first_started = Arc::clone(&first_started);
+                let release_first = Arc::clone(&release_first);
+                let second_started = Arc::clone(&second_started);
+                Arc::new(move |_target_node_id, command, _timeout| {
+                    let is_first = command.batch.shard_id.0 == "root";
+                    let first_started = Arc::clone(&first_started);
+                    let release_first = Arc::clone(&release_first);
+                    let second_started = Arc::clone(&second_started);
+                    Box::pin(async move {
+                        if is_first {
+                            first_started.notify_one();
+                            release_first.notified().await;
+                        } else {
+                            second_started.notify_one();
+                        }
+                        Ok(DfsMetadataJournalBatchResponse {
+                            request_id: command.request_id.clone(),
+                            shard_id: command.batch.shard_id.clone(),
+                            next_after_sequence: command.batch.next_after_sequence,
+                            applied_entries: command.batch.entries.len(),
+                            verified_prefix_only: command.verify_prefix_only,
+                            verified_authority_probe_id: None,
+                            result: DfsMetadataJournalBatchResult::Applied,
+                        })
+                    })
+                })
+            };
+            let mut transport = AsyncDfsMetadataNodeTransport::new(
+                vec![target_node_id.clone()],
+                sender,
+                snapshot_sender(),
+            );
+            let plan = DfsPreparedClusterMetadataJournalPublish {
+                data_dir,
+                local_node_id: local_node_id.clone(),
+                peer_node_ids: vec![target_node_id.clone()],
+                outcomes: Vec::new(),
+                targets: vec![
+                    prepared_target(
+                        &local_node_id,
+                        target_node_id.clone(),
+                        file_system_id.clone(),
+                        "root",
+                    ),
+                    prepared_target(&local_node_id, target_node_id, file_system_id, "services"),
+                ],
+            };
+
+            let publish = tokio::spawn(async move {
+                execute_prepared_dfs_metadata_journal_publish_async(
+                    plan,
+                    &mut transport,
+                    DfsMetadataJournalReplicationOptions::default(),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+                .await
+                .expect("first shard publish started");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), second_started.notified())
+                    .await
+                    .is_err(),
+                "the second shard must stay queued behind the first for the same node"
+            );
+            release_first.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), second_started.notified())
+                .await
+                .expect("second shard started after first completed");
+            let report = tokio::time::timeout(Duration::from_secs(1), publish)
+                .await
+                .expect("ordered publish completed")
+                .expect("publish task")
+                .expect("publish report");
+            assert_eq!(report.outcomes.len(), 2);
+            assert!(matches!(
+                &report.outcomes[0],
+                DfsMetadataJournalReplicationOutcome::Applied { shard_id, .. }
+                    if shard_id.0 == "root"
+            ));
+            assert!(matches!(
+                &report.outcomes[1],
+                DfsMetadataJournalReplicationOutcome::Applied { shard_id, .. }
+                    if shard_id.0 == "services"
+            ));
+        });
+    }
 }
 
 async fn execute_prepared_dfs_metadata_journal_target_publish_async(
     data_dir: &SinomoDataDir,
     local_node_id: &NodeId,
     target: DfsPreparedMetadataJournalTargetPublish,
-    transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    transport: &dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
     outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
 ) -> Result<(), DfsError> {
@@ -2186,7 +3033,7 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
     file_system_id: &DfsFileSystemId,
     after_sequence: u64,
     reason: String,
-    transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    transport: &dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
     target_started_at: Instant,
     outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
@@ -2287,9 +3134,8 @@ async fn build_local_dfs_metadata_snapshot_install_command_async(
     reason: String,
 ) -> Result<DfsMetadataSnapshotInstallCommand, DfsError> {
     tokio::task::spawn_blocking(move || {
-        let mut backend = open_local_metadata_shard_backend(&data_dir, shard_id.clone())?;
-        dfs_metadata_snapshot_install_command(
-            &mut backend,
+        build_local_dfs_metadata_snapshot_install_command(
+            &data_dir,
             &local_node_id,
             &target_node_id,
             &file_system_id,
@@ -2304,6 +3150,49 @@ async fn build_local_dfs_metadata_snapshot_install_command_async(
     })?
 }
 
+fn build_local_dfs_metadata_snapshot_install_command(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    authority_epoch: u64,
+    shard_id: &DfsMetadataShardId,
+    reason: String,
+) -> Result<DfsMetadataSnapshotInstallCommand, DfsError> {
+    let mut backend = open_local_metadata_shard_backend(data_dir, shard_id.clone())?;
+    dfs_metadata_snapshot_install_command(
+        &mut backend,
+        local_node_id,
+        target_node_id,
+        file_system_id,
+        authority_epoch,
+        shard_id,
+        reason,
+    )
+}
+
+fn put_local_dfs_metadata_replication_cursor(
+    data_dir: &SinomoDataDir,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    next_after_sequence: u64,
+) -> Result<(), DfsError> {
+    // Cursor acknowledgement is independent of materialized metadata tables.
+    // Keep the same shard write lock and durable monotonic cursor update
+    // without loading unrelated table state.
+    let root = local_dfs_metadata_shard_path(data_dir, shard_id);
+    let _lock = metadata_lock::metadata_write_lock(
+        root.clone(),
+        metadata_cursor::journal_write_lock_path(&root),
+    )?;
+    Ok(metadata_cursor::put_metadata_replication_cursor(
+        &root,
+        target_node_id,
+        shard_id,
+        next_after_sequence,
+    )?)
+}
+
 async fn put_local_dfs_metadata_replication_cursor_async(
     data_dir: SinomoDataDir,
     target_node_id: NodeId,
@@ -2311,22 +3200,12 @@ async fn put_local_dfs_metadata_replication_cursor_async(
     next_after_sequence: u64,
 ) -> Result<(), DfsError> {
     tokio::task::spawn_blocking(move || {
-        // Cursor acknowledgement is independent of materialized metadata
-        // tables. Opening a complete shard backend here replays and decodes
-        // those tables once per replicated batch, which can dominate publish
-        // latency on large shards. Keep the same shard write lock and durable
-        // monotonic cursor update without loading unrelated table state.
-        let root = local_dfs_metadata_shard_path(&data_dir, &shard_id);
-        let _lock = metadata_lock::metadata_write_lock(
-            root.clone(),
-            metadata_cursor::journal_write_lock_path(&root),
-        )?;
-        Ok(metadata_cursor::put_metadata_replication_cursor(
-            &root,
+        put_local_dfs_metadata_replication_cursor(
+            &data_dir,
             &target_node_id,
             &shard_id,
             next_after_sequence,
-        )?)
+        )
     })
     .await
     .map_err(|source| DfsError::Metadata {
@@ -2342,6 +3221,33 @@ pub fn publish_dfs_metadata_journal_with_host(
     transport: &mut dyn DfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    if let Some(data_dir) = host.local_data_dir().cloned() {
+        let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
+            &default_dfs_metadata_replication_suppression_snapshot_path(&data_dir),
+        )?
+        .map(|snapshot| snapshot.records)
+        .unwrap_or_default();
+        let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
+            file_system_id,
+            local_node_id,
+            shards,
+            host,
+            &metadata_suppressions,
+            options,
+        )?;
+        return execute_prepared_dfs_metadata_journal_publish(
+            DfsPreparedClusterMetadataJournalPublish {
+                data_dir,
+                local_node_id: local_node_id.clone(),
+                peer_node_ids: Vec::new(),
+                outcomes,
+                targets,
+            },
+            transport,
+            options,
+        );
+    }
+
     shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
     if shards.is_empty() {
         return Ok(DfsMetadataJournalReplicationReport {

@@ -4,7 +4,6 @@ use crate::kv_local_store::kv_err;
 use crate::kv_local_store::locked_apply_cluster_raft_vote;
 use crate::prelude::*;
 #[allow(unused_imports)]
-#[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::{ClusterKvRaftLocalVoteMetadata, ClusterRaftVoteRequest, ClusterRaftVoteResponse};
 use sinomo_kv::{KvSnapshot, RaftRequestVoteRequest, RaftRequestVoteResponse};
@@ -403,12 +402,107 @@ pub(crate) fn locked_cluster_raft_local_vote_metadata(
         .map_err(kv_err)
 }
 
+fn lock_cluster_raft_campaign(paths: &ClusterPaths) -> Result<(std::fs::File, bool), NetworkError> {
+    let kv_paths = paths.kv_paths();
+    match sinomo_kv::lock_cluster_kv_commit_sequence(&kv_paths, Duration::ZERO) {
+        Ok(lock) => Ok((lock, false)),
+        Err(KvError::Busy { .. }) => sinomo_kv::lock_cluster_kv_commit_sequence(
+            &kv_paths,
+            sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
+        )
+        .map(|lock| (lock, true))
+        .map_err(kv_err),
+        Err(error) => Err(kv_err(error)),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterRaftLeaderObservation {
+    leader_id: Option<NodeId>,
+    current_term: u64,
+}
+
+fn locked_cluster_raft_leader_observation(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<ClusterRaftLeaderObservation, NetworkError> {
+    let store = paths.kv_paths().raft_store();
+    let _raft_guard = store.lock_operation().map_err(kv_err)?;
+    let leader_id = store.known_voter_leader_id(state).map_err(kv_err)?;
+    let current_term = store
+        .local_vote_metadata(&state.local_node_id)
+        .map_err(kv_err)?
+        .current_term;
+    Ok(ClusterRaftLeaderObservation {
+        leader_id,
+        current_term,
+    })
+}
+
+fn cluster_raft_leader_outcome_after_campaign_wait(
+    local_node_id: &NodeId,
+    waited_for_campaign_lock: bool,
+    observation_before_wait: &ClusterRaftLeaderObservation,
+    observation_after_wait: &ClusterRaftLeaderObservation,
+    remote_leader_blocks_campaign: bool,
+) -> Option<bool> {
+    if observation_after_wait.leader_id.as_ref() == Some(local_node_id) {
+        Some(true)
+    } else if waited_for_campaign_lock
+        || observation_after_wait != observation_before_wait
+        || remote_leader_blocks_campaign
+    {
+        // A caller that actually queued must accept the completed campaign's
+        // outcome, including a failed election. Immediately starting another
+        // campaign here recreates a term storm when quorum is temporarily
+        // unavailable. A durable remote leader also remains authoritative until
+        // local liveness evidence explicitly marks it offline or unreachable;
+        // one application forwarding failure is not an election timeout.
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn observed_remote_leader_blocks_campaign(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    observation: &ClusterRaftLeaderObservation,
+) -> bool {
+    observation.leader_id.as_ref().is_some_and(|leader_id| {
+        leader_id != &state.local_node_id
+            && !sinomo_network::cluster_node_blocks_leader_preference(paths, state, leader_id)
+    })
+}
+
 pub fn elect_cluster_raft_leader_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     options: ClusterRaftLeaderElectionOptions,
     host: &mut impl ClusterRaftVoteTransportHost,
 ) -> Result<bool, NetworkError> {
+    // A transaction that observed no usable leader may wait here behind
+    // another transaction that is already campaigning or committing. Recheck
+    // the durable leader while holding the same outer sequence lock used by
+    // append -> replicate -> commit so a queued campaign cannot immediately
+    // invalidate a leader that appeared while it waited. An unchanged remote
+    // leader remains authoritative unless local status/connectivity evidence
+    // explicitly marks it offline or unreachable. A forwarding failure alone
+    // is not enough evidence to preempt an otherwise live leader.
+    let observation_before_wait = locked_cluster_raft_leader_observation(paths, state)?;
+    let (_campaign_lock, waited_for_campaign_lock) = lock_cluster_raft_campaign(paths)?;
+    let observation_after_wait = locked_cluster_raft_leader_observation(paths, state)?;
+    let remote_leader_blocks_campaign =
+        observed_remote_leader_blocks_campaign(paths, state, &observation_after_wait);
+    if let Some(existing_outcome) = cluster_raft_leader_outcome_after_campaign_wait(
+        &state.local_node_id,
+        waited_for_campaign_lock,
+        &observation_before_wait,
+        &observation_after_wait,
+        remote_leader_blocks_campaign,
+    ) {
+        return Ok(existing_outcome);
+    }
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
     if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
@@ -451,6 +545,38 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
     options: ClusterRaftLeaderElectionOptions,
     host: &mut (impl ClusterRaftVoteTransportAsyncHost + Send),
 ) -> Result<bool, NetworkError> {
+    let paths_for_lock = paths.clone();
+    let state_for_lock = state.clone();
+    let (_campaign_lock, existing_outcome) = runtime
+        .spawn_blocking(move || {
+            let observation_before_wait =
+                locked_cluster_raft_leader_observation(&paths_for_lock, &state_for_lock)?;
+            let (campaign_lock, waited_for_campaign_lock) =
+                lock_cluster_raft_campaign(&paths_for_lock)?;
+            let observation_after_wait =
+                locked_cluster_raft_leader_observation(&paths_for_lock, &state_for_lock)?;
+            let remote_leader_blocks_campaign = observed_remote_leader_blocks_campaign(
+                &paths_for_lock,
+                &state_for_lock,
+                &observation_after_wait,
+            );
+            let existing_outcome = cluster_raft_leader_outcome_after_campaign_wait(
+                &state_for_lock.local_node_id,
+                waited_for_campaign_lock,
+                &observation_before_wait,
+                &observation_after_wait,
+                remote_leader_blocks_campaign,
+            );
+            Ok::<_, NetworkError>((campaign_lock, existing_outcome))
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft leader election".to_string(),
+            detail: format!("campaign lock task failed: {source}"),
+        })??;
+    if let Some(existing_outcome) = existing_outcome {
+        return Ok(existing_outcome);
+    }
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
     if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
@@ -489,4 +615,107 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
         &mut election_host,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(leader_id: Option<NodeId>, current_term: u64) -> ClusterRaftLeaderObservation {
+        ClusterRaftLeaderObservation {
+            leader_id,
+            current_term,
+        }
+    }
+
+    #[test]
+    fn queued_campaign_accepts_failed_predecessor_outcome() {
+        let local_node_id = NodeId::from_legacy_named("queued_campaign_local").expect("node");
+        let remote_node_id = NodeId::from_legacy_named("queued_campaign_remote").expect("node");
+        let before = observation(Some(remote_node_id.clone()), 7);
+
+        assert_eq!(
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                true,
+                &before,
+                &before,
+                false,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                false,
+                &before,
+                &before,
+                false,
+            ),
+            None,
+            "an explicitly blocked stale leader must remain replaceable"
+        );
+        assert_eq!(
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                false,
+                &before,
+                &before,
+                true,
+            ),
+            Some(false),
+            "a remote leader without explicit offline evidence must suppress the campaign"
+        );
+        assert_eq!(
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                false,
+                &before,
+                &observation(Some(remote_node_id), 8),
+                false,
+            ),
+            Some(false),
+            "a new term observed while acquiring the lock suppresses a stale campaign"
+        );
+        assert_eq!(
+            cluster_raft_leader_outcome_after_campaign_wait(
+                &local_node_id,
+                true,
+                &before,
+                &observation(Some(local_node_id.clone()), 8),
+                false,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn campaign_lock_reports_observed_contention() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-campaign-lock-contention");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let (first_lock, first_waited) = lock_cluster_raft_campaign(&paths).expect("first lock");
+        assert!(!first_waited);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let queued_paths = paths.clone();
+        let queued = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            let (_lock, waited) =
+                lock_cluster_raft_campaign(&queued_paths).expect("queued campaign lock");
+            result_tx.send(waited).expect("waited result");
+        });
+        started_rx.recv().expect("queued thread started");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(result_rx.try_recv().is_err(), "queued lock must still wait");
+        drop(first_lock);
+
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queued lock result")
+        );
+        queued.join().expect("queued thread");
+    }
 }
