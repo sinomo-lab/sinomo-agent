@@ -4,13 +4,17 @@ use crate::client::{
 };
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{DaemonError, DaemonPaths, DaemonRunOptions};
+use sinomo_core::ClusterNodeAvailability;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{
     KvCompare, KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ClusterPaths, ObjectRpcSessionCall, ObjectRpcSessionResult};
+use sinomo_core::network::{
+    ClusterConnectivityGraph, ClusterPaths, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    cluster_route_next_hop,
+};
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
@@ -34,11 +38,12 @@ use sinomo_dfs::{
     DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
     DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, NetworkedDfsService,
-    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
-    read_dfs_repair_attempt_snapshot,
+    DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
+    DfsPeerTransportError, DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
+    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{
@@ -1460,6 +1465,214 @@ fn daemon_dfs_local_membership_handoff_keys(
         .collect()
 }
 
+struct DaemonDfsConnectivityStatusProbe;
+
+impl sinomo_core::cluster::ClusterStatusProbe for DaemonDfsConnectivityStatusProbe {
+    fn probe_member_status(
+        &self,
+        _state: &sinomo_core::ClusterBootstrapState,
+        _member: &sinomo_core::ClusterMemberRecord,
+    ) -> Option<sinomo_core::ClusterNodeStatusRecord> {
+        None
+    }
+}
+
+fn daemon_dfs_node_is_offline_for_maintenance(
+    availability: &ClusterNodeAvailability,
+    connectivity: &ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> bool {
+    availability == &ClusterNodeAvailability::Offline
+        && local_node_id != target_node_id
+        // A failed direct endpoint does not make the node offline when the
+        // canonical network layer still has a relay route to it.
+        && cluster_route_next_hop(connectivity, local_node_id, target_node_id).is_none()
+}
+
+fn daemon_dfs_offline_node_ids(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> BTreeSet<NodeId> {
+    // The stored self-status of a crashed node remains Online. Reuse the
+    // cluster-health availability projection so proven-unreachable connectivity
+    // also marks the node Offline. The no-op probe keeps this scheduling read
+    // local and bounded; Unknown nodes remain eligible (fail open).
+    let connectivity = ClusterConnectivityGraph::read_for_local(cluster_paths, state);
+    sinomo_core::cluster::cluster_health_rows_with_probe(
+        cluster_paths,
+        state,
+        &DaemonDfsConnectivityStatusProbe,
+        false,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|row| {
+        daemon_dfs_node_is_offline_for_maintenance(
+            &row.availability,
+            &connectivity,
+            &state.local_node_id,
+            &row.member.node_id,
+        )
+        .then_some(row.member.node_id)
+    })
+    .collect()
+}
+
+fn daemon_dfs_pending_work_from_records(
+    pending_write_count: usize,
+    pending_repair_count: usize,
+    pending_namespace_job_count: usize,
+    write_intents: &[DfsWriteIntentRecord],
+    receipt_records: &[DfsReplicaReceiptRecord],
+    metadata_shard_statuses: &[DfsMetadataShardStatus],
+    repair_views: &[DfsOperatorRepairView],
+    repair_attempt_records: &[DfsRepairAttemptRecord],
+    offline_node_ids: &BTreeSet<NodeId>,
+    local_node_id: &NodeId,
+    pending_local_membership_handoff_count: usize,
+    now_unix_nanos: u64,
+) -> DaemonDfsPendingMaintenanceWork {
+    // Keep offline repair state durable, but do not let it select the short
+    // triggered-maintenance cadence. A periodic pass still re-evaluates the
+    // backlog after node status changes.
+    let mut receipts_by_version = BTreeMap::<
+        (
+            &DfsFileSystemId,
+            &sinomo_dfs::DfsObjectId,
+            &sinomo_dfs::DfsVersion,
+        ),
+        Vec<&DfsReplicaReceiptRecord>,
+    >::new();
+    for record in receipt_records {
+        receipts_by_version
+            .entry((
+                &record.receipt.file_system_id,
+                &record.receipt.object_id,
+                &record.receipt.committed_version,
+            ))
+            .or_default()
+            .push(record);
+    }
+    let active_write_intents = write_intents
+        .iter()
+        .filter(|intent| {
+            matches!(
+                &intent.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+        })
+        .collect::<Vec<_>>();
+    let eligible_pending_write_count = active_write_intents
+        .iter()
+        .filter(|intent| {
+            let desired_replica_node_ids = intent
+                .desired_replica_node_ids
+                .iter()
+                .collect::<BTreeSet<_>>();
+            if desired_replica_node_ids.is_empty() {
+                return true;
+            }
+            let receipt_nodes = receipts_by_version
+                .get(&(
+                    &intent.file_system_id,
+                    &intent.object_id,
+                    &intent.target_version,
+                ))
+                .into_iter()
+                .flatten()
+                .filter(|record| {
+                    intent
+                        .content_hash
+                        .as_ref()
+                        .is_none_or(|hash| record.content_hash.as_ref() == Some(hash))
+                })
+                .map(|record| &record.replica_node_id)
+                .collect::<BTreeSet<_>>();
+            let received_replica_count = desired_replica_node_ids
+                .iter()
+                .filter(|node_id| receipt_nodes.contains(*node_id))
+                .count();
+            if received_replica_count >= intent.policy.min_commit_replicas {
+                // The intent can make progress locally even if every remaining
+                // desired replica is offline.
+                return true;
+            }
+            let missing_replica_node_ids = desired_replica_node_ids
+                .iter()
+                .filter(|node_id| !receipt_nodes.contains(*node_id))
+                .collect::<Vec<_>>();
+            missing_replica_node_ids.is_empty()
+                || missing_replica_node_ids
+                    .iter()
+                    .any(|node_id| !offline_node_ids.contains(**node_id))
+        })
+        .count()
+        // If the summary and full scan ever disagree, retain the old fail-open
+        // behavior rather than hiding work whose target cannot be classified.
+        .saturating_add(pending_write_count.saturating_sub(active_write_intents.len()));
+
+    let mut eligible_repair_keys = BTreeSet::new();
+    for repair in repair_views {
+        if !offline_node_ids.contains(&repair.missing_replica_node_id) {
+            eligible_repair_keys
+                .insert((repair.intent_id.as_str(), &repair.missing_replica_node_id));
+        }
+    }
+
+    let eligible_repair_attempt_records = repair_attempt_records
+        .iter()
+        .filter(|record| {
+            eligible_repair_keys
+                .contains(&(record.intent_id.as_str(), &record.missing_replica_node_id))
+        })
+        .collect::<Vec<_>>();
+    let attempted_eligible_repair_keys = eligible_repair_attempt_records
+        .iter()
+        .map(|record| (record.intent_id.as_str(), &record.missing_replica_node_id))
+        .collect::<BTreeSet<_>>();
+    let due_repair_attempt_count = eligible_repair_attempt_records
+        .iter()
+        .filter(|record| {
+            !record.in_flight
+                && record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= now_unix_nanos
+        })
+        .count();
+    let next_repair_retry_unix_nanos = eligible_repair_attempt_records
+        .iter()
+        .filter(|record| !record.in_flight && record.next_retry_unix_nanos != u64::MAX)
+        .filter_map(|record| {
+            (record.next_retry_unix_nanos > now_unix_nanos).then_some(record.next_retry_unix_nanos)
+        })
+        .min();
+    let unattempted_repair_count = eligible_repair_keys
+        .difference(&attempted_eligible_repair_keys)
+        .count()
+        // Preserve fail-open triggering if operator inspection returns fewer
+        // repair records than the metadata summary counted.
+        .saturating_add(pending_repair_count.saturating_sub(repair_views.len()));
+    let metadata_replica_lag_count = metadata_shard_statuses
+        .iter()
+        .filter(|status| status.primary_node_id.as_ref() == Some(local_node_id))
+        .flat_map(|status| status.replica_lag.iter())
+        .filter(|lag| lag.lag_entries > 0 && !offline_node_ids.contains(&lag.target_node_id))
+        .count();
+
+    DaemonDfsPendingMaintenanceWork {
+        pending_write_count: eligible_pending_write_count,
+        pending_repair_count,
+        repair_attempt_count: repair_attempt_records.len(),
+        due_repair_attempt_count,
+        unattempted_repair_count,
+        next_repair_retry_unix_nanos,
+        pending_namespace_job_count,
+        metadata_replica_lag_count,
+        pending_local_membership_handoff_count,
+    }
+}
+
 pub(crate) fn daemon_dfs_pending_maintenance_work(
     paths: &DaemonPaths,
 ) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
@@ -1474,12 +1687,6 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
     let metadata_shard_statuses = metadata.metadata_shard_statuses()?;
-    let metadata_replica_lag_count = metadata_shard_statuses
-        .iter()
-        .filter(|status| status.primary_node_id.as_ref() == Some(&state.local_node_id))
-        .flat_map(|status| status.replica_lag.iter())
-        .filter(|lag| lag.lag_entries > 0)
-        .count();
     let pending_local_membership_handoff_count =
         daemon_dfs_local_membership_handoff_keys(&metadata_shard_statuses, &state.local_node_id)
             .into_iter()
@@ -1492,36 +1699,44 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
-    let now = daemon_dfs_now_unix_nanos();
-    let due_repair_attempt_count = repair_attempt_records
-        .iter()
-        .filter(|record| {
-            !record.in_flight
-                && record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos <= now
-        })
-        .count();
-    let next_repair_retry_unix_nanos = repair_attempt_records
-        .iter()
-        .filter(|record| !record.in_flight && record.next_retry_unix_nanos != u64::MAX)
-        .filter_map(|record| {
-            (record.next_retry_unix_nanos > now).then_some(record.next_retry_unix_nanos)
-        })
-        .min();
-    let unattempted_repair_count = summary
-        .pending_repair_count
-        .saturating_sub(repair_attempt_records.len());
-    Ok(DaemonDfsPendingMaintenanceWork {
-        pending_write_count: summary.pending_write_count,
-        pending_repair_count: summary.pending_repair_count,
-        repair_attempt_count: repair_attempt_records.len(),
-        due_repair_attempt_count,
-        unattempted_repair_count,
-        next_repair_retry_unix_nanos,
-        pending_namespace_job_count: summary.pending_namespace_job_count,
-        metadata_replica_lag_count,
+    let write_intents = if summary.pending_write_count > 0 {
+        metadata.all_intents()?
+    } else {
+        Vec::new()
+    };
+    let mut receipt_records = Vec::new();
+    let mut receipt_versions = BTreeSet::new();
+    for intent in write_intents.iter().filter(|intent| {
+        matches!(
+            &intent.status,
+            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+        )
+    }) {
+        if receipt_versions.insert((intent.object_id.clone(), intent.target_version.clone())) {
+            receipt_records
+                .extend(metadata.receipts_for_version(&intent.object_id, &intent.target_version)?);
+        }
+    }
+    let repair_views = if summary.pending_repair_count > 0 {
+        DfsOperatorInspector::new(metadata.as_ref()).repairs(None, None)?
+    } else {
+        Vec::new()
+    };
+    let offline_node_ids = daemon_dfs_offline_node_ids(&cluster_paths, &state);
+    Ok(daemon_dfs_pending_work_from_records(
+        summary.pending_write_count,
+        summary.pending_repair_count,
+        summary.pending_namespace_job_count,
+        &write_intents,
+        &receipt_records,
+        &metadata_shard_statuses,
+        &repair_views,
+        &repair_attempt_records,
+        &offline_node_ids,
+        &state.local_node_id,
         pending_local_membership_handoff_count,
-    })
+        daemon_dfs_now_unix_nanos(),
+    ))
 }
 
 fn daemon_dfs_message_service_cache()
@@ -3090,17 +3305,22 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::DfsWriteReceipt;
+    use sinomo_core::events::EventId;
     use sinomo_core::kv::InProcessKvStore;
-    use sinomo_core::node::NodeId;
+    use sinomo_core::network::{
+        ClusterConnectivityRecord, ClusterConnectivityState, ClusterEndpointId,
+    };
+    use sinomo_core::node::{ClusterId, NodeId};
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
         DfsObjectPolicy, DfsWriteRequest,
     };
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsDistributedWriteCommand, DfsMetadataJournalReplicationOutcome,
-        DfsNamespaceCommand, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage,
-        DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy, DfsRoutedMessage,
-        DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
+        DfsMetadataReplicaLagStatus, DfsNamespaceCommand, DfsNamespaceJobStatus,
+        DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+        DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -4621,6 +4841,398 @@ mod tests {
 
         assert!(pending.has_work());
         assert!(!pending.should_trigger_background_maintenance());
+    }
+
+    fn pending_work_connectivity_record(
+        cluster_id: &ClusterId,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        endpoint_id: &str,
+        state: ClusterConnectivityState,
+    ) -> ClusterConnectivityRecord {
+        let now = OffsetDateTime::now_utc();
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            endpoint_id: ClusterEndpointId::from_legacy_named(endpoint_id).expect("endpoint id"),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("{}.example.test:21353", target_node_id.as_str()),
+            latency_ms: (state == ClusterConnectivityState::Healthy).then_some(1),
+            consecutive_failures: if state == ClusterConnectivityState::Unreachable {
+                1
+            } else {
+                0
+            },
+            last_success_at: None,
+            last_failure_at: None,
+            failure_reason: None,
+            state,
+            observed_at: now,
+            expires_at: now + time::Duration::minutes(5),
+        }
+    }
+
+    #[test]
+    fn daemon_dfs_relay_routable_node_is_not_treated_as_offline() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_pending_routed").expect("cluster id");
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_routed_local").expect("local node");
+        let bridge_node_id =
+            NodeId::from_legacy_named("node_pending_routed_bridge").expect("bridge node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_pending_routed_target").expect("target node");
+        let connectivity = ClusterConnectivityGraph::from_records(
+            local_node_id.clone(),
+            [
+                pending_work_connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &target_node_id,
+                    "endpoint_pending_routed_direct",
+                    ClusterConnectivityState::Unreachable,
+                ),
+                pending_work_connectivity_record(
+                    &cluster_id,
+                    &local_node_id,
+                    &bridge_node_id,
+                    "endpoint_pending_routed_bridge",
+                    ClusterConnectivityState::Healthy,
+                ),
+                pending_work_connectivity_record(
+                    &cluster_id,
+                    &bridge_node_id,
+                    &target_node_id,
+                    "endpoint_pending_routed_target",
+                    ClusterConnectivityState::Healthy,
+                ),
+            ],
+        );
+
+        assert!(!daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Offline,
+            &connectivity,
+            &local_node_id,
+            &target_node_id,
+        ));
+
+        let unroutable = ClusterConnectivityGraph::from_records(
+            local_node_id.clone(),
+            [pending_work_connectivity_record(
+                &cluster_id,
+                &local_node_id,
+                &target_node_id,
+                "endpoint_pending_unroutable_direct",
+                ClusterConnectivityState::Unreachable,
+            )],
+        );
+        assert!(daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Offline,
+            &unroutable,
+            &local_node_id,
+            &target_node_id,
+        ));
+        assert!(!daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Offline,
+            &unroutable,
+            &local_node_id,
+            &local_node_id,
+        ));
+        assert!(!daemon_dfs_node_is_offline_for_maintenance(
+            &ClusterNodeAvailability::Unknown,
+            &unroutable,
+            &local_node_id,
+            &target_node_id,
+        ));
+    }
+
+    fn pending_write_intent_for_test(
+        intent_id: &str,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        target_version: DfsVersion,
+        coordinator_node_id: NodeId,
+        desired_replica_node_ids: Vec<NodeId>,
+        min_commit_replicas: usize,
+    ) -> DfsWriteIntentRecord {
+        DfsWriteIntentRecord {
+            intent_id: intent_id.to_string(),
+            file_system_id,
+            object_id,
+            base_version: None,
+            target_version,
+            coordinator_node_id,
+            owner_epoch: 1,
+            policy: DfsReplicationPolicy::new(min_commit_replicas, desired_replica_node_ids.len())
+                .expect("replication policy"),
+            desired_replica_node_ids,
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some("blake3:pending-write".to_string()),
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        }
+    }
+
+    fn pending_write_receipt_for_test(
+        intent: &DfsWriteIntentRecord,
+        replica_node_id: NodeId,
+        event_id: &str,
+    ) -> DfsReplicaReceiptRecord {
+        DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: intent.file_system_id.clone(),
+                object_id: intent.object_id.clone(),
+                committed_version: intent.target_version.clone(),
+                owner_node_id: intent.coordinator_node_id.clone(),
+                event_id: EventId::from_legacy_named(event_id).expect("event id"),
+            },
+            replica_node_id,
+            content_hash: intent.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn daemon_dfs_explicitly_offline_replica_backlog_stays_durable_without_triggering() {
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_offline_local").expect("local node");
+        let offline_node_id =
+            NodeId::from_legacy_named("node_pending_offline_target").expect("offline node");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let object_id =
+            DfsObjectId::from_legacy_named("object_pending_offline").expect("object id");
+        let version = DfsVersion::from_legacy_named("version_pending_offline").expect("version");
+        let intent = pending_write_intent_for_test(
+            "intent-active-pending-offline",
+            file_system_id.clone(),
+            object_id.clone(),
+            version.clone(),
+            local_node_id.clone(),
+            vec![local_node_id.clone(), offline_node_id.clone()],
+            2,
+        );
+        let receipt = pending_write_receipt_for_test(
+            &intent,
+            local_node_id.clone(),
+            "event_pending_offline_local_receipt",
+        );
+        let repair = DfsOperatorRepairView {
+            intent_id: "intent-pending-offline".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some("blake3:pending-offline".to_string()),
+            missing_replica_node_id: offline_node_id.clone(),
+        };
+        let attempt = DfsRepairAttemptRecord {
+            intent_id: repair.intent_id.clone(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: "blake3:pending-offline".to_string(),
+            missing_replica_node_id: offline_node_id.clone(),
+            attempts: 3,
+            in_flight: false,
+            last_attempt_unix_nanos: 1,
+            next_retry_unix_nanos: 2,
+            transfer_request_id: None,
+            last_error: Some("offline".to_string()),
+        };
+        let shard_status = DfsMetadataShardStatus {
+            shard_id: DfsMetadataShardId::new("root"),
+            file_system_id: Some(file_system_id),
+            primary_node_id: Some(local_node_id.clone()),
+            replica_node_ids: vec![offline_node_id.clone()],
+            epoch: Some(1),
+            journal_next_sequence: 10,
+            journal_last_sequence: 9,
+            replica_lag: vec![DfsMetadataReplicaLagStatus {
+                target_node_id: offline_node_id.clone(),
+                replicated_through_sequence: 1,
+                lag_entries: 8,
+            }],
+            replay_cursors: Vec::new(),
+        };
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            1,
+            0,
+            &[intent],
+            &[receipt],
+            &[shard_status],
+            &[repair],
+            &[attempt],
+            &BTreeSet::from([offline_node_id]),
+            &local_node_id,
+            0,
+            3,
+        );
+
+        assert_eq!(pending.pending_write_count, 0);
+        assert_eq!(pending.pending_repair_count, 1);
+        assert_eq!(pending.repair_attempt_count, 1);
+        assert_eq!(pending.due_repair_attempt_count, 0);
+        assert_eq!(pending.unattempted_repair_count, 0);
+        assert_eq!(pending.next_repair_retry_unix_nanos, None);
+        assert_eq!(pending.metadata_replica_lag_count, 0);
+        assert!(
+            pending.has_work(),
+            "the durable repair backlog remains visible"
+        );
+        assert!(!pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_non_offline_replica_backlog_still_triggers() {
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_online_local").expect("local node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_pending_online_target").expect("target node");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let object_id = DfsObjectId::from_legacy_named("object_pending_online").expect("object id");
+        let version = DfsVersion::from_legacy_named("version_pending_online").expect("version");
+        let intent = pending_write_intent_for_test(
+            "intent-active-pending-online",
+            file_system_id.clone(),
+            object_id.clone(),
+            version.clone(),
+            local_node_id.clone(),
+            vec![local_node_id.clone(), target_node_id.clone()],
+            2,
+        );
+        let receipt = pending_write_receipt_for_test(
+            &intent,
+            local_node_id.clone(),
+            "event_pending_online_local_receipt",
+        );
+        let repair = DfsOperatorRepairView {
+            intent_id: "intent-pending-online".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id,
+            version,
+            content_hash: Some("blake3:pending-online".to_string()),
+            missing_replica_node_id: target_node_id.clone(),
+        };
+        let shard_status = DfsMetadataShardStatus {
+            shard_id: DfsMetadataShardId::new("root"),
+            file_system_id: Some(file_system_id),
+            primary_node_id: Some(local_node_id.clone()),
+            replica_node_ids: vec![target_node_id.clone()],
+            epoch: Some(1),
+            journal_next_sequence: 10,
+            journal_last_sequence: 9,
+            replica_lag: vec![DfsMetadataReplicaLagStatus {
+                target_node_id,
+                replicated_through_sequence: 1,
+                lag_entries: 8,
+            }],
+            replay_cursors: Vec::new(),
+        };
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            1,
+            0,
+            &[intent],
+            &[receipt],
+            &[shard_status],
+            &[repair],
+            &[],
+            &BTreeSet::new(),
+            &local_node_id,
+            0,
+            3,
+        );
+
+        assert_eq!(pending.pending_write_count, 1);
+        assert_eq!(pending.unattempted_repair_count, 1);
+        assert_eq!(pending.metadata_replica_lag_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_quorum_ready_write_still_triggers_when_remaining_replica_is_offline() {
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_quorum_local").expect("local node");
+        let offline_node_id =
+            NodeId::from_legacy_named("node_pending_quorum_offline").expect("offline node");
+        let intent = pending_write_intent_for_test(
+            "intent-pending-quorum-ready",
+            sinomo_dfs::sifs_file_system_id(),
+            DfsObjectId::from_legacy_named("object_pending_quorum_ready").expect("object id"),
+            DfsVersion::from_legacy_named("version_pending_quorum_ready").expect("version"),
+            local_node_id.clone(),
+            vec![local_node_id.clone(), offline_node_id.clone()],
+            1,
+        );
+        let receipt = pending_write_receipt_for_test(
+            &intent,
+            local_node_id.clone(),
+            "event_pending_quorum_ready_receipt",
+        );
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            0,
+            0,
+            &[intent],
+            &[receipt],
+            &[],
+            &[],
+            &[],
+            &BTreeSet::from([offline_node_id]),
+            &local_node_id,
+            0,
+            3,
+        );
+
+        assert_eq!(pending.pending_write_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_wrong_hash_receipt_does_not_hide_actionable_pending_write() {
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_hash_local").expect("local node");
+        let offline_node_id =
+            NodeId::from_legacy_named("node_pending_hash_offline").expect("offline node");
+        let intent = pending_write_intent_for_test(
+            "intent-pending-wrong-hash",
+            sinomo_dfs::sifs_file_system_id(),
+            DfsObjectId::from_legacy_named("object_pending_wrong_hash").expect("object id"),
+            DfsVersion::from_legacy_named("version_pending_wrong_hash").expect("version"),
+            local_node_id.clone(),
+            vec![local_node_id.clone(), offline_node_id.clone()],
+            2,
+        );
+        let mut wrong_hash_receipt = pending_write_receipt_for_test(
+            &intent,
+            local_node_id.clone(),
+            "event_pending_wrong_hash_receipt",
+        );
+        wrong_hash_receipt.content_hash = Some("blake3:different-content".to_string());
+
+        let pending = daemon_dfs_pending_work_from_records(
+            1,
+            0,
+            0,
+            &[intent],
+            &[wrong_hash_receipt],
+            &[],
+            &[],
+            &[],
+            &BTreeSet::from([offline_node_id]),
+            &local_node_id,
+            0,
+            3,
+        );
+
+        assert_eq!(pending.pending_write_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
     }
 
     #[test]
