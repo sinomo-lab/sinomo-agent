@@ -52,7 +52,9 @@ use sui::{
 use sinomo_cli::app_api::{
     SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary,
     SifsListOptions, SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails,
-    SifsObjectDetails, SifsObjectHealth, SifsReplaceFileIfVersionOutcome,
+    SifsObjectDetails, SifsObjectHealth, SifsPlacementPolicy, SifsPlacementPreview,
+    SifsPlacementReconciliationJob, SifsPlacementScope, SifsPlacementUpdateOutcome,
+    SifsReplaceFileIfVersionOutcome,
 };
 use sinomo_runtime::{
     api::{
@@ -150,6 +152,7 @@ enum FileActionPromptKind {
     Rename,
     Delete,
     DeleteSelected,
+    Placement,
 }
 
 #[allow(dead_code)]
@@ -233,6 +236,7 @@ impl FileActionPromptKind {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
+            Self::Placement => "Edit placement",
         }
     }
 
@@ -251,6 +255,7 @@ impl FileActionPromptKind {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
+            Self::Placement => "Apply placement",
         }
     }
 }
@@ -621,6 +626,11 @@ pub struct FilesState {
     pending_attachment_request_id: Option<u64>,
     pending_attachment_source_path: Option<(FilesSourceKind, String)>,
     pending_import_request_ids: BTreeSet<u64>,
+    placement_preview: Option<SifsPlacementPreview>,
+    placement_reconciliation: Option<SifsPlacementReconciliationJob>,
+    placement_loading: bool,
+    placement_error: Option<String>,
+    pending_placement_request_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -703,6 +713,10 @@ enum FilesDialogStructure {
         target_path: Option<String>,
         targets: Vec<FileActionTarget>,
         error: Option<String>,
+        placement_preview: Option<SifsPlacementPreview>,
+        placement_reconciliation: Option<SifsPlacementReconciliationJob>,
+        placement_loading: bool,
+        placement_error: Option<String>,
     },
     Compact {
         theme: (AppThemeMode, AppTextScale),
@@ -868,6 +882,10 @@ impl FilesStructureKey {
                 target_path: prompt.target_path.clone(),
                 targets: prompt.targets.clone(),
                 error: prompt.error.clone(),
+                placement_preview: state.placement_preview.clone(),
+                placement_reconciliation: state.placement_reconciliation.clone(),
+                placement_loading: state.placement_loading,
+                placement_error: state.placement_error.clone(),
             }
         } else if let Some(overlay) = state.compact_overlay {
             FilesDialogStructure::Compact {
@@ -972,6 +990,11 @@ impl FilesState {
             pending_attachment_request_id: None,
             pending_attachment_source_path: None,
             pending_import_request_ids: BTreeSet::new(),
+            placement_preview: None,
+            placement_reconciliation: None,
+            placement_loading: false,
+            placement_error: None,
+            pending_placement_request_id: None,
         }
     }
 
@@ -1291,6 +1314,11 @@ impl FilesState {
         self.pending_attachment_request_id = None;
         self.pending_attachment_source_path = None;
         self.pending_import_request_ids.clear();
+        self.placement_preview = None;
+        self.placement_reconciliation = None;
+        self.placement_loading = false;
+        self.placement_error = None;
+        self.pending_placement_request_id = None;
         self.attachment_loading = false;
         if let Some(document) = self.document.as_mut()
             && document.saving
@@ -1426,6 +1454,14 @@ impl FilesState {
                         self.attachment_loading = false;
                         self.attachment_error = Some(
                             "The Files background worker stopped while reading the attachment."
+                                .to_string(),
+                        );
+                        changed = true;
+                    }
+                    if self.pending_placement_request_id.take().is_some() {
+                        self.placement_loading = false;
+                        self.placement_error = Some(
+                            "The Files background worker stopped while managing placement."
                                 .to_string(),
                         );
                         changed = true;
@@ -1798,6 +1834,85 @@ impl FilesState {
             } => self.update_task_progress(request_id, detail, progress),
             FilesWorkerResult::Operation { request_id, result } => {
                 self.apply_operation_result(request_id, result)
+            }
+            FilesWorkerResult::PlacementPreview {
+                request_id,
+                path,
+                result,
+            } => {
+                if self.pending_placement_request_id != Some(request_id) {
+                    return false;
+                }
+                self.pending_placement_request_id = None;
+                self.placement_loading = false;
+                if self
+                    .action_prompt
+                    .as_ref()
+                    .and_then(|prompt| prompt.target_path.as_deref())
+                    != Some(path.as_str())
+                {
+                    return false;
+                }
+                match result {
+                    Ok(preview) => {
+                        self.placement_preview = Some(preview);
+                        self.placement_error = None;
+                    }
+                    Err(error) => {
+                        self.placement_preview = None;
+                        self.placement_error = Some(error);
+                    }
+                }
+                true
+            }
+            FilesWorkerResult::PlacementUpdate {
+                request_id,
+                path,
+                result,
+            } => {
+                if self.pending_placement_request_id != Some(request_id) {
+                    return false;
+                }
+                self.pending_placement_request_id = None;
+                self.placement_loading = false;
+                match result {
+                    Ok(outcome) => {
+                        let terminal = outcome.reconciliation.state.is_terminal();
+                        let job_id = outcome.reconciliation.job_id.clone();
+                        self.placement_preview = Some(outcome.preview);
+                        self.placement_reconciliation = Some(outcome.reconciliation);
+                        self.placement_error = None;
+                        self.pending_select_path = Some(path);
+                        if terminal {
+                            self.refresh(None);
+                        } else {
+                            self.schedule_placement_progress_poll(job_id);
+                        }
+                    }
+                    Err(error) => self.placement_error = Some(error),
+                }
+                true
+            }
+            FilesWorkerResult::PlacementProgress { request_id, result } => {
+                if self.pending_placement_request_id != Some(request_id) {
+                    return false;
+                }
+                self.pending_placement_request_id = None;
+                match result {
+                    Ok(job) => {
+                        let terminal = job.state.is_terminal();
+                        let job_id = job.job_id.clone();
+                        self.placement_reconciliation = Some(job);
+                        self.placement_error = None;
+                        if terminal {
+                            self.refresh(None);
+                        } else {
+                            self.schedule_placement_progress_poll(job_id);
+                        }
+                    }
+                    Err(error) => self.placement_error = Some(error),
+                }
+                true
             }
         }
     }
@@ -2689,6 +2804,13 @@ impl FilesState {
             FileActionPromptKind::Move => target_name.clone(),
             FileActionPromptKind::Rename => target_name.clone(),
             FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => String::new(),
+            FileActionPromptKind::Placement => self
+                .selected_details
+                .as_ref()
+                .map(placement_editor_spec)
+                .unwrap_or_else(|| {
+                    "eventual W=1 N=2 zones=0 scope=self required= forbidden=".to_string()
+                }),
         };
         let error = match kind {
             FileActionPromptKind::Copy
@@ -2709,8 +2831,24 @@ impl FilesState {
             {
                 Some("select one or more entries first".to_string())
             }
+            FileActionPromptKind::Placement
+                if self.source != FilesSourceKind::Sifs || target_path.is_none() =>
+            {
+                Some("select a SIFS file or folder first".to_string())
+            }
             _ => None,
         };
+        if kind == FileActionPromptKind::Placement {
+            self.placement_preview = None;
+            self.placement_error = None;
+            if self
+                .placement_reconciliation
+                .as_ref()
+                .is_some_and(|job| Some(job.path.as_str()) != target_path.as_deref())
+            {
+                self.placement_reconciliation = None;
+            }
+        }
         self.action_prompt = Some(FileActionPrompt {
             kind,
             input,
@@ -2724,6 +2862,9 @@ impl FilesState {
 
     fn close_action_prompt(&mut self) {
         self.action_prompt = None;
+        self.placement_preview = None;
+        self.placement_error = None;
+        self.placement_loading = false;
     }
 
     fn open_compact_overlay(&mut self, overlay: CompactFilesOverlay) {
@@ -2739,6 +2880,10 @@ impl FilesState {
         if let Some(prompt) = &mut self.action_prompt {
             prompt.input = input;
             prompt.error = None;
+            if prompt.kind == FileActionPromptKind::Placement {
+                self.placement_preview = None;
+                self.placement_error = None;
+            }
         }
     }
 
@@ -2774,6 +2919,10 @@ impl FilesState {
                     }
                 }
             }
+            return;
+        }
+        if prompt.kind == FileActionPromptKind::Placement {
+            self.start_placement_update(&prompt, waker);
             return;
         }
         if prompt.kind == FileActionPromptKind::DeleteSelected {
@@ -2828,12 +2977,124 @@ impl FilesState {
         }
     }
 
+    fn start_placement_preview(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(prompt) = self.action_prompt.clone() else {
+            return;
+        };
+        if prompt.kind != FileActionPromptKind::Placement {
+            return;
+        }
+        let Some(path) = prompt.target_path.clone() else {
+            if let Some(current) = self.action_prompt.as_mut() {
+                current.error = Some("select a SIFS file or folder first".to_string());
+            }
+            return;
+        };
+        let (policy, scope) = match parse_placement_editor_spec(&prompt.input) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                if let Some(current) = self.action_prompt.as_mut() {
+                    current.error = Some(error);
+                }
+                return;
+            }
+        };
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_placement_request_id = Some(request_id);
+        self.placement_loading = true;
+        self.placement_error = None;
+        if tx
+            .send(FilesWorkerCommand::PlacementPreview {
+                request_id,
+                path,
+                policy,
+                scope,
+            })
+            .is_err()
+        {
+            self.pending_placement_request_id = None;
+            self.placement_loading = false;
+            self.placement_error = Some("SIFS browser worker stopped".to_string());
+        }
+    }
+
+    fn start_placement_update(&mut self, prompt: &FileActionPrompt, waker: Option<sui::UiHandle>) {
+        let Some(path) = prompt.target_path.clone() else {
+            if let Some(current) = self.action_prompt.as_mut() {
+                current.error = Some("select a SIFS file or folder first".to_string());
+            }
+            return;
+        };
+        let (policy, scope) = match parse_placement_editor_spec(&prompt.input) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                if let Some(current) = self.action_prompt.as_mut() {
+                    current.error = Some(error);
+                }
+                return;
+            }
+        };
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_placement_request_id = Some(request_id);
+        self.placement_loading = true;
+        self.placement_error = None;
+        if tx
+            .send(FilesWorkerCommand::PlacementUpdate {
+                request_id,
+                path,
+                policy,
+                scope,
+            })
+            .is_err()
+        {
+            self.pending_placement_request_id = None;
+            self.placement_loading = false;
+            self.placement_error = Some("SIFS browser worker stopped".to_string());
+        }
+    }
+
+    fn schedule_placement_progress_poll(&mut self, job_id: String) {
+        let Some(tx) = self.worker_tx.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_placement_request_id = Some(request_id);
+        let waker = self.worker_waker.clone();
+        let _ = thread::Builder::new()
+            .name("sinomo-app-files-placement-progress".to_string())
+            .spawn(move || {
+                thread::sleep(Duration::from_millis(500));
+                let _ = tx.send(FilesWorkerCommand::PlacementProgress { request_id, job_id });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+    }
+
     fn operation_from_prompt(
         &self,
         prompt: &FileActionPrompt,
     ) -> Result<(FilesOperation, String, String), String> {
         match prompt.kind {
             FileActionPromptKind::GoTo => unreachable!("Go to path is handled before operations"),
+            FileActionPromptKind::Placement => {
+                unreachable!("placement is handled through the typed placement API")
+            }
             FileActionPromptKind::DeleteSelected => {
                 unreachable!("Delete selected queues individual delete operations")
             }
@@ -3644,6 +3905,20 @@ enum FilesWorkerResult {
         request_id: u64,
         result: FilesOperationResult,
     },
+    PlacementPreview {
+        request_id: u64,
+        path: String,
+        result: Result<SifsPlacementPreview, String>,
+    },
+    PlacementUpdate {
+        request_id: u64,
+        path: String,
+        result: Result<SifsPlacementUpdateOutcome, String>,
+    },
+    PlacementProgress {
+        request_id: u64,
+        result: Result<SifsPlacementReconciliationJob, String>,
+    },
 }
 
 enum FilesLiveUpdate {
@@ -3704,6 +3979,22 @@ enum FilesWorkerCommand {
         request_id: u64,
         source: FilesSourceKind,
         operation: FilesOperation,
+    },
+    PlacementPreview {
+        request_id: u64,
+        path: String,
+        policy: Option<SifsPlacementPolicy>,
+        scope: SifsPlacementScope,
+    },
+    PlacementUpdate {
+        request_id: u64,
+        path: String,
+        policy: Option<SifsPlacementPolicy>,
+        scope: SifsPlacementScope,
+    },
+    PlacementProgress {
+        request_id: u64,
+        job_id: String,
     },
 }
 
@@ -4255,6 +4546,66 @@ fn files_worker_loop(
                     result,
                 });
             }
+            FilesWorkerCommand::PlacementPreview {
+                request_id,
+                path,
+                policy,
+                scope,
+            } => {
+                ensure_files_worker_browser(
+                    &mut browser,
+                    &mut open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&browser, &open_error) {
+                    (Some(browser), _) => browser.preview_placement(&path, policy, scope),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("SIFS browser did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::PlacementPreview {
+                    request_id,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::PlacementUpdate {
+                request_id,
+                path,
+                policy,
+                scope,
+            } => {
+                ensure_files_worker_browser(
+                    &mut browser,
+                    &mut open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&browser, &open_error) {
+                    (Some(browser), _) => browser.update_placement(&path, policy, scope),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("SIFS browser did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::PlacementUpdate {
+                    request_id,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::PlacementProgress { request_id, job_id } => {
+                ensure_files_worker_browser(
+                    &mut browser,
+                    &mut open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&browser, &open_error) {
+                    (Some(browser), _) => browser.placement_progress(&job_id),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("SIFS browser did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::PlacementProgress { request_id, result });
+            }
             FilesWorkerCommand::Operation {
                 request_id,
                 source,
@@ -4353,6 +4704,24 @@ fn files_worker_loop(
     }
 }
 
+fn ensure_files_worker_browser(
+    browser: &mut Option<SifsBrowser>,
+    open_error: &mut Option<String>,
+    daemon_address: Option<&str>,
+    app_runtime: &tokio::runtime::Handle,
+) {
+    if browser.is_some() || open_error.is_some() {
+        return;
+    }
+    match daemon_address {
+        Some(address) => match SifsBrowser::open_daemon_on_runtime(address, app_runtime) {
+            Ok(opened) => *browser = Some(opened),
+            Err(error) => *open_error = Some(error),
+        },
+        None => *open_error = Some("SIFS browsing requires a daemon connection".to_string()),
+    }
+}
+
 fn send_task_progress(
     result_tx: &Sender<FilesWorkerResult>,
     waker: &sui::UiHandle,
@@ -4409,6 +4778,141 @@ fn normalize_path(path: &str) -> String {
     } else {
         format!("/{}", parts.join("/"))
     }
+}
+
+fn placement_editor_spec(details: &SifsObjectDetails) -> String {
+    let Some(resolved) = details.placement.as_ref() else {
+        return "eventual W=1 N=2 zones=0 scope=self required= forbidden=".to_string();
+    };
+    let consistency = match &resolved.policy.consistency {
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => "confirmed",
+        _ => "eventual",
+    };
+    let scope = if resolved.source_path.as_deref() == Some(details.path.as_str()) {
+        match resolved.source_scope {
+            Some(SifsPlacementScope::Subtree) => "subtree",
+            _ => "self",
+        }
+    } else {
+        "self"
+    };
+    let required = resolved
+        .policy
+        .required_node_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let forbidden = resolved
+        .policy
+        .forbidden_node_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{consistency} W={} N={} zones={} scope={scope} required={required} forbidden={forbidden}",
+        resolved.policy.min_commit_replicas,
+        resolved.policy.desired_replicas,
+        resolved.policy.min_distinct_zones,
+    )
+}
+
+fn parse_placement_editor_spec(
+    input: &str,
+) -> Result<(Option<SifsPlacementPolicy>, SifsPlacementScope), String> {
+    let mut tokens = input.split_whitespace();
+    let mode = tokens
+        .next()
+        .ok_or_else(|| "enter eventual, confirmed, or inherit".to_string())?
+        .to_ascii_lowercase();
+    let mut scope = SifsPlacementScope::SelfOnly;
+    if mode == "inherit" {
+        for token in tokens {
+            let (key, value) = token
+                .split_once('=')
+                .ok_or_else(|| format!("expected key=value, found {token}"))?;
+            if key.eq_ignore_ascii_case("scope") {
+                scope = parse_placement_scope(value)?;
+            } else {
+                return Err(format!("inherit accepts only scope=, found {key}"));
+            }
+        }
+        return Ok((None, scope));
+    }
+    let consistency = match mode.as_str() {
+        "eventual" | "replicated-eventual" => {
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual
+        }
+        "confirmed" | "replicated-confirmed" => {
+            sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed
+        }
+        _ => return Err("placement must start with eventual, confirmed, or inherit".to_string()),
+    };
+    let mut min_commit_replicas = 1usize;
+    let mut desired_replicas = 2usize;
+    let mut w_explicit = false;
+    let mut min_distinct_zones = 0usize;
+    let mut required_node_ids = Vec::new();
+    let mut forbidden_node_ids = Vec::new();
+    for token in tokens {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("expected key=value, found {token}"))?;
+        match key.to_ascii_lowercase().as_str() {
+            "w" => {
+                min_commit_replicas = parse_placement_count("W", value)?;
+                w_explicit = true;
+            }
+            "n" => desired_replicas = parse_placement_count("N", value)?,
+            "zones" => {
+                min_distinct_zones = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid zone count: {value}"))?;
+            }
+            "scope" => scope = parse_placement_scope(value)?,
+            "required" => required_node_ids = parse_placement_nodes(value)?,
+            "forbidden" => forbidden_node_ids = parse_placement_nodes(value)?,
+            _ => return Err(format!("unknown placement field: {key}")),
+        }
+    }
+    if consistency == sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed && !w_explicit {
+        min_commit_replicas = desired_replicas;
+    }
+    let mut policy = SifsPlacementPolicy::new(consistency, min_commit_replicas, desired_replicas)
+        .map_err(|error| error.to_string())?;
+    policy.required_node_ids = required_node_ids;
+    policy.forbidden_node_ids = forbidden_node_ids;
+    policy.min_distinct_zones = min_distinct_zones;
+    policy.validate().map_err(|error| error.to_string())?;
+    Ok((Some(policy), scope))
+}
+
+fn parse_placement_count(label: &str, value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{label} must be a positive integer"))
+}
+
+fn parse_placement_scope(value: &str) -> Result<SifsPlacementScope, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "self" | "self-only" => Ok(SifsPlacementScope::SelfOnly),
+        "subtree" => Ok(SifsPlacementScope::Subtree),
+        _ => Err(format!("scope must be self or subtree, found {value}")),
+    }
+}
+
+fn parse_placement_nodes(value: &str) -> Result<Vec<sinomo_runtime::node::NodeId>, String> {
+    value
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            sinomo_runtime::node::NodeId::from_legacy_named(value.trim())
+                .map_err(|error| format!("invalid node id {value}: {error}"))
+        })
+        .collect()
 }
 
 fn default_local_path(fallback: impl AsRef<Path>) -> String {
@@ -7368,6 +7872,9 @@ fn sifs_repair_backlog_count(health: &SifsObjectHealth) -> usize {
 
 fn sifs_replica_desired_count(details: &SifsObjectDetails) -> usize {
     let current = details.current_locations.len();
+    if let Some(placement) = details.placement.as_ref() {
+        return placement.policy.desired_replicas.max(current);
+    }
     details
         .health
         .as_ref()
@@ -10655,6 +11162,7 @@ enum InspectorAction {
     Move,
     Rename,
     Delete,
+    EditPlacement,
     RefreshPlacement,
     RepairReplicas,
     MakeMetadataPrimary,
@@ -10678,6 +11186,7 @@ impl InspectorAction {
             Self::Move => "Move",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
+            Self::EditPlacement => "Edit placement",
             Self::RefreshPlacement => "Refresh placement",
             Self::RepairReplicas => "Repair replicas",
             Self::MakeMetadataPrimary => "Make metadata primary",
@@ -10700,6 +11209,7 @@ impl InspectorAction {
             Self::Move => IconGlyph::ChevronRight,
             Self::Rename => IconGlyph::MoreHorizontal,
             Self::Delete => IconGlyph::Trash,
+            Self::EditPlacement => IconGlyph::Storage,
             Self::RefreshPlacement => IconGlyph::Storage,
             Self::RepairReplicas => IconGlyph::Redo,
             Self::MakeMetadataPrimary => IconGlyph::ChevronUp,
@@ -10719,6 +11229,7 @@ impl InspectorAction {
             Self::Move => Some(FileActionPromptKind::Move),
             Self::Rename => Some(FileActionPromptKind::Rename),
             Self::Delete => Some(FileActionPromptKind::Delete),
+            Self::EditPlacement => Some(FileActionPromptKind::Placement),
             Self::OpenFolder
             | Self::ViewFile
             | Self::AttachToChat
@@ -10740,6 +11251,7 @@ impl InspectorAction {
             Self::ViewFile => format!("View or edit {}", entry.name),
             Self::AttachToChat => format!("Attach {} to current chat", entry.name),
             Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
+            Self::EditPlacement => format!("Edit placement {}", entry.name),
             Self::RepairReplicas => format!("Repair replicas {}", entry.name),
             Self::MakeMetadataPrimary => format!("Make metadata primary {}", entry.name),
             Self::PinMetadata => format!("Pin metadata {}", entry.name),
@@ -10781,6 +11293,7 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
         if metadata_needs_connection {
             actions.push(InspectorAction::ConnectionSettings);
         }
+        actions.push(InspectorAction::EditPlacement);
         actions.push(InspectorAction::RefreshPlacement);
         if !metadata_needs_connection && !files.details_loading {
             if let Some(details) = files.selected_details.as_ref() {
@@ -11128,6 +11641,10 @@ fn inspector_action_description(action: InspectorAction, entry: &SifsEntry) -> S
         InspectorAction::RefreshPlacement => {
             format!("Refresh SIFS placement metadata for {}", entry.path)
         }
+        InspectorAction::EditPlacement => format!(
+            "Preview and edit inherited W/N, node, and zone placement for {}",
+            entry.path
+        ),
         InspectorAction::RepairReplicas => {
             format!("Request SIFS replica repair for {}", entry.path)
         }
@@ -11184,6 +11701,7 @@ fn inspector_buttons(
             InspectorAction::AttachToChat => (ButtonAppearance::Tonal, SemanticTone::Accent),
             InspectorAction::Delete => (ButtonAppearance::Tonal, SemanticTone::Danger),
             InspectorAction::RefreshPlacement
+            | InspectorAction::EditPlacement
             | InspectorAction::RepairReplicas
             | InspectorAction::MakeMetadataPrimary
             | InspectorAction::PinMetadata
@@ -11274,6 +11792,7 @@ fn activate_inspector_action(
             }
         }
         InspectorAction::Copy
+        | InspectorAction::EditPlacement
         | InspectorAction::CopyToSifs
         | InspectorAction::CopyToLocal
         | InspectorAction::Move
@@ -11672,6 +12191,42 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                     ),
                     ("Local pins", sifs_pin_detail_summary(details)),
                 ];
+                if let Some(placement) = details.placement.as_ref() {
+                    placement_detail_rows.push((
+                        "Managed placement",
+                        format!(
+                            "W={} · N={} · zones≥{}",
+                            placement.policy.min_commit_replicas,
+                            placement.policy.desired_replicas,
+                            placement.policy.min_distinct_zones
+                        ),
+                    ));
+                    placement_detail_rows.push(("Inheritance", placement.explanation.clone()));
+                    if !placement.policy.required_node_ids.is_empty() {
+                        placement_detail_rows.push((
+                            "Required nodes",
+                            placement
+                                .policy
+                                .required_node_ids
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
+                    if !placement.policy.forbidden_node_ids.is_empty() {
+                        placement_detail_rows.push((
+                            "Forbidden nodes",
+                            placement
+                                .policy
+                                .forbidden_node_ids
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
+                }
                 if let Some(shard) = details.metadata_shard.as_ref() {
                     placement_detail_rows
                         .push(("Metadata shard", sifs_metadata_shard_detail_summary(shard)));
@@ -12384,11 +12939,18 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
     let files = shared.files();
     match &files.action_prompt {
         Some(prompt) => format!(
-            "{:?}|{}|{}|{}",
+            "{:?}|{}|{}|{}|{}|{}|{}|{}",
             prompt.kind,
             prompt.target_path.as_deref().unwrap_or(""),
             prompt.targets.len(),
-            prompt.error.as_deref().unwrap_or("")
+            prompt.error.as_deref().unwrap_or(""),
+            files.placement_loading,
+            files
+                .placement_reconciliation
+                .as_ref()
+                .map_or(0, |job| job.revision),
+            files.placement_preview.is_some(),
+            files.placement_error.as_deref().unwrap_or(""),
         ),
         None => "closed".to_string(),
     }
@@ -12410,6 +12972,83 @@ fn go_to_path_placeholder(source: FilesSourceKind) -> &'static str {
         FilesSourceKind::Sifs => "/services",
         FilesSourceKind::Local => "C:\\Users or \\\\server\\share",
     }
+}
+
+fn placement_preview_rows(preview: &SifsPlacementPreview) -> Vec<(&'static str, String)> {
+    let policy = &preview.resolved.policy;
+    let consistency = match &policy.consistency {
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => "replicated-confirmed",
+        _ => "replicated-eventual",
+    };
+    let desired = preview
+        .placement
+        .plan
+        .desired_replica_nodes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changes = format!(
+        "+{} / -{}",
+        preview.added_replica_node_ids.len(),
+        preview.removed_replica_node_ids.len()
+    );
+    let decisions = preview
+        .placement
+        .decisions
+        .iter()
+        .map(|decision| format!("{}: {}", decision.node_id, decision.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut rows = vec![
+        (
+            "Resolved",
+            format!(
+                "{consistency} · W={} · N={} · zones≥{}",
+                policy.min_commit_replicas, policy.desired_replicas, policy.min_distinct_zones
+            ),
+        ),
+        ("Inheritance", preview.resolved.explanation.clone()),
+        ("Desired nodes", desired),
+        ("Changes", changes),
+        ("Explanation", decisions),
+    ];
+    if !preview.warnings.is_empty() {
+        rows.push(("Warning", preview.warnings.join("; ")));
+    }
+    rows
+}
+
+fn placement_reconciliation_rows(
+    job: &SifsPlacementReconciliationJob,
+) -> Vec<(&'static str, String)> {
+    let (completed, total) = job.progress_fraction();
+    let percent = if total == 0 {
+        0
+    } else {
+        completed.saturating_mul(100) / total
+    };
+    let mut rows = vec![
+        ("Reconciliation", format!("{:?} · {percent}%", job.state)),
+        (
+            "Objects",
+            format!(
+                "{} scanned · {} matched · {} updated",
+                job.scanned_object_count, job.matched_object_count, job.updated_object_count
+            ),
+        ),
+        (
+            "Repairs",
+            format!(
+                "{} completed · {} pending",
+                job.completed_repair_count, job.pending_repair_count
+            ),
+        ),
+    ];
+    if let Some(error) = job.last_error.as_ref() {
+        rows.push(("Retrying", error.clone()));
+    }
+    rows
 }
 
 fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -12475,6 +13114,15 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             let label = marked_entries_label(prompt.targets.len());
             format!("Delete {label} from {}", shared.files().path)
         }
+        FileActionPromptKind::Placement => prompt
+            .target_path
+            .as_deref()
+            .map(|path| {
+                format!(
+                    "Configure {path}. Use eventual or confirmed, W/N, zones, scope=self|subtree, and comma-separated required/forbidden node IDs. Use inherit scope=... to remove this override."
+                )
+            })
+            .unwrap_or_else(|| "Select a SIFS file or folder first".to_string()),
     };
     let input_label = match prompt.kind {
         FileActionPromptKind::GoTo => "Path",
@@ -12486,6 +13134,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         | FileActionPromptKind::MoveSelected
         | FileActionPromptKind::Move => "Destination",
         FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => "Type DELETE",
+        FileActionPromptKind::Placement => "Placement policy",
         _ => "Name",
     };
     let input = {
@@ -12503,6 +13152,9 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 FilesSourceKind::Sifs => "C:\\Users\\you\\Downloads",
                 FilesSourceKind::Local => "/services/imports",
             },
+            FileActionPromptKind::Placement => {
+                "eventual W=1 N=3 zones=2 scope=subtree required=node-a forbidden=node-b"
+            }
             _ => input_label,
         };
         sui::TextInput::new(format!("files-action-input-{title}"))
@@ -12538,12 +13190,25 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 request_files_overlay_rebuild(ctx);
             })
     };
-    let actions = Flex::horizontal()
+    let mut actions = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(8.0)
-        .align_items(Alignment::End)
-        .with_child(submit)
-        .with_child(cancel);
+        .align_items(Alignment::End);
+    if prompt.kind == FileActionPromptKind::Placement {
+        let preview_shared = shared.clone();
+        actions = actions.with_child(
+            sui::Button::new("Preview")
+                .appearance(ButtonAppearance::Outline)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    let waker = { preview_shared.borrow().waker.clone() };
+                    preview_shared.files_mut().start_placement_preview(waker);
+                    request_files_overlay_rebuild(ctx);
+                }),
+        );
+    }
+    actions = actions.with_child(submit).with_child(cancel);
 
     let dialog_theme = shared.theme();
     let mut body = Stack::vertical()
@@ -12553,6 +13218,32 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         .with_child(input);
     if let Some(error) = prompt.error {
         body = body.with_child(sui::Label::new(error).theme(dialog_theme.clone()));
+    }
+    if prompt.kind == FileActionPromptKind::Placement {
+        let files = shared.files();
+        if files.placement_loading {
+            body = body.with_child(
+                StatusBadge::new("Checking placement")
+                    .tone(SemanticTone::Info)
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+        if let Some(preview) = files.placement_preview.as_ref() {
+            body = body.with_child(detail_rows_widget(placement_preview_rows(preview), reader));
+        }
+        if let Some(job) = files.placement_reconciliation.as_ref() {
+            body = body.with_child(detail_rows_widget(
+                placement_reconciliation_rows(job),
+                reader,
+            ));
+        }
+        if let Some(error) = files.placement_error.as_ref() {
+            body = body.with_child(
+                StatusBadge::new(error.clone())
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+            );
+        }
     }
     body = body.with_child(actions);
 
@@ -13180,8 +13871,29 @@ mod tests {
             current_locations: vec!["node-a".to_string()],
             local_pins,
             metadata_shard: None,
+            placement: None,
             health: None,
         }
+    }
+
+    #[test]
+    fn placement_editor_parses_constraints_and_inheritance_scope() {
+        let (policy, scope) = parse_placement_editor_spec(
+            "confirmed N=3 zones=2 scope=subtree required=node-a forbidden=node-b",
+        )
+        .expect("placement");
+        let policy = policy.expect("managed policy");
+        assert_eq!(scope, SifsPlacementScope::Subtree);
+        assert_eq!(policy.min_commit_replicas, 3);
+        assert_eq!(policy.desired_replicas, 3);
+        assert_eq!(policy.min_distinct_zones, 2);
+        assert_eq!(policy.required_node_ids.len(), 1);
+        assert_eq!(policy.forbidden_node_ids.len(), 1);
+
+        assert_eq!(
+            parse_placement_editor_spec("inherit scope=self").expect("inherit"),
+            (None, SifsPlacementScope::SelfOnly)
+        );
     }
 
     #[test]
@@ -14967,6 +15679,7 @@ mod tests {
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
             metadata_shard: None,
+            placement: None,
             health: None,
         };
         assert_eq!(
@@ -15003,6 +15716,7 @@ mod tests {
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
             metadata_shard: None,
+            placement: None,
             health: None,
         };
         assert_eq!(
@@ -15239,6 +15953,7 @@ mod tests {
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
             metadata_shard: None,
+            placement: None,
             health: Some(SifsObjectHealth {
                 agent_state: "pending-repair".to_string(),
                 version_count: 2,
@@ -15311,6 +16026,7 @@ mod tests {
             current_locations: vec!["node-a".to_string(), "node-b".to_string()],
             local_pins: Vec::new(),
             metadata_shard: None,
+            placement: None,
             health: Some(SifsObjectHealth {
                 agent_state: "current".to_string(),
                 version_count: 1,
@@ -15364,6 +16080,7 @@ mod tests {
             current_locations: Vec::new(),
             local_pins: Vec::new(),
             metadata_shard: None,
+            placement: None,
             health: None,
         };
 
@@ -15480,6 +16197,7 @@ mod tests {
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
             metadata_shard: None,
+            placement: None,
             health: None,
         };
         let first = sifs_details_signature(Some(&details));
@@ -15981,6 +16699,7 @@ mod tests {
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
                 local_pins: Vec::new(),
                 metadata_shard: None,
+                placement: None,
                 health: None,
             })),
         });
@@ -18763,6 +19482,7 @@ mod tests {
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
                 local_pins: Vec::new(),
                 metadata_shard: None,
+                placement: None,
                 health: None,
             });
         }

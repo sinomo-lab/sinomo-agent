@@ -356,7 +356,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// A node routing on a stale shard view can address a former primary;
     /// the authority rejection names the current primary, and the operation
     /// is retried against it (bounded) instead of failing.
-    pub(super) fn route_namespace_operation(
+    pub(crate) fn route_namespace_operation(
         &mut self,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
@@ -701,6 +701,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.apply_namespace_transaction(transaction.clone())
                     .map_err(DfsPosixError::from)
             }
+            DfsNamespaceOperation::ReconcilePlacement {
+                job_id,
+                path,
+                object_id,
+                expected_version,
+                object_policy,
+                replication_policy,
+                desired_replica_node_ids,
+            } => self
+                .reconcile_object_placement_local(
+                    job_id,
+                    path,
+                    object_id,
+                    expected_version,
+                    object_policy.clone(),
+                    replication_policy.clone(),
+                    desired_replica_node_ids,
+                )
+                .map_err(DfsPosixError::from),
             DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }

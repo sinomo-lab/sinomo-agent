@@ -10,6 +10,24 @@ use thiserror::Error;
 pub struct DfsReplicationPolicy {
     pub min_commit_replicas: usize,
     pub desired_replicas: usize,
+    /// Nodes that must be part of every deterministic placement plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_node_ids: Vec<NodeId>,
+    /// Nodes that may not receive durable content for this intent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_node_ids: Vec<NodeId>,
+    /// Minimum number of distinct advertised zones represented by the plan.
+    /// Zero disables the constraint so legacy intents remain valid.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub min_distinct_zones: usize,
+    /// Authoritative placement-input snapshot used to make zone selection
+    /// deterministic and explainable for this intent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_zones: BTreeMap<NodeId, String>,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 impl DfsReplicationPolicy {
@@ -20,6 +38,10 @@ impl DfsReplicationPolicy {
         let policy = Self {
             min_commit_replicas,
             desired_replicas,
+            required_node_ids: Vec::new(),
+            forbidden_node_ids: Vec::new(),
+            min_distinct_zones: 0,
+            node_zones: BTreeMap::new(),
         };
         policy.validate()?;
         Ok(policy)
@@ -33,7 +55,39 @@ impl DfsReplicationPolicy {
         self.min_commit_replicas == self.desired_replicas
     }
 
-    fn validate(&self) -> Result<(), DfsDistributedError> {
+    pub fn with_placement_constraints(
+        mut self,
+        mut required_node_ids: Vec<NodeId>,
+        mut forbidden_node_ids: Vec<NodeId>,
+        min_distinct_zones: usize,
+        node_zones: BTreeMap<NodeId, String>,
+    ) -> Result<Self, DfsDistributedError> {
+        required_node_ids.sort();
+        required_node_ids.dedup();
+        forbidden_node_ids.sort();
+        forbidden_node_ids.dedup();
+        self.required_node_ids = required_node_ids;
+        self.forbidden_node_ids = forbidden_node_ids;
+        self.min_distinct_zones = min_distinct_zones;
+        self.node_zones = node_zones;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Change W/N while retaining node and zone constraints.
+    pub fn with_counts(
+        &self,
+        min_commit_replicas: usize,
+        desired_replicas: usize,
+    ) -> Result<Self, DfsDistributedError> {
+        let mut policy = self.clone();
+        policy.min_commit_replicas = min_commit_replicas;
+        policy.desired_replicas = desired_replicas;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), DfsDistributedError> {
         if self.min_commit_replicas == 0 {
             return Err(DfsDistributedError::InvalidPolicy {
                 reason: "min_commit_replicas must be greater than zero".to_string(),
@@ -52,6 +106,35 @@ impl DfsReplicationPolicy {
             });
         }
 
+        if self.required_node_ids.len() > self.desired_replicas {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: format!(
+                    "required node count {} cannot exceed desired_replicas {}",
+                    self.required_node_ids.len(),
+                    self.desired_replicas
+                ),
+            });
+        }
+
+        if let Some(node_id) = self
+            .required_node_ids
+            .iter()
+            .find(|node_id| self.forbidden_node_ids.contains(*node_id))
+        {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: format!("node {node_id} cannot be both required and forbidden"),
+            });
+        }
+
+        if self.min_distinct_zones > self.desired_replicas {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: format!(
+                    "min_distinct_zones {} cannot exceed desired_replicas {}",
+                    self.min_distinct_zones, self.desired_replicas
+                ),
+            });
+        }
+
         Ok(())
     }
 }
@@ -60,11 +143,17 @@ impl DfsReplicationPolicy {
 pub struct DfsReplicaCandidate {
     pub node_id: NodeId,
     pub weight: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
 }
 
 impl DfsReplicaCandidate {
     pub fn new(node_id: NodeId) -> Self {
-        Self { node_id, weight: 1 }
+        Self {
+            node_id,
+            weight: 1,
+            zone: None,
+        }
     }
 
     pub fn weighted(node_id: NodeId, weight: u32) -> Result<Self, DfsDistributedError> {
@@ -73,7 +162,16 @@ impl DfsReplicaCandidate {
                 reason: "replica candidate weight must be greater than zero".to_string(),
             });
         }
-        Ok(Self { node_id, weight })
+        Ok(Self {
+            node_id,
+            weight,
+            zone: None,
+        })
+    }
+
+    pub fn with_zone(mut self, zone: Option<String>) -> Self {
+        self.zone = zone;
+        self
     }
 }
 
@@ -93,13 +191,51 @@ pub struct DfsReplicaPlacementPlan {
     pub preferred_commit_nodes: Vec<NodeId>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaPlacementDecision {
+    pub node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    pub selected: bool,
+    pub preferred_for_commit: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaPlacementExplanation {
+    pub plan: DfsReplicaPlacementPlan,
+    pub represented_zone_count: usize,
+    pub decisions: Vec<DfsReplicaPlacementDecision>,
+}
+
 pub fn plan_replicas(
     request: &DfsReplicaPlacementRequest,
 ) -> Result<DfsReplicaPlacementPlan, DfsDistributedError> {
+    Ok(explain_replicas(request)?.plan)
+}
+
+pub fn explain_replicas(
+    request: &DfsReplicaPlacementRequest,
+) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
     request.policy.validate()?;
     validate_candidate_set(&request.candidates, &request.policy)?;
 
-    let mut ranked = request.candidates.clone();
+    let mut ranked = request
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            !request
+                .policy
+                .forbidden_node_ids
+                .contains(&candidate.node_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for candidate in &mut ranked {
+        if candidate.zone.is_none() {
+            candidate.zone = request.policy.node_zones.get(&candidate.node_id).cloned();
+        }
+    }
     ranked.sort_by(|left, right| {
         let left_is_coordinator = left.node_id == request.coordinator_node_id;
         let right_is_coordinator = right.node_id == request.coordinator_node_id;
@@ -112,20 +248,112 @@ pub fn plan_replicas(
             })
     });
 
-    let desired_replica_nodes: Vec<NodeId> = ranked
+    let mut selected = Vec::<DfsReplicaCandidate>::new();
+    for candidate in &ranked {
+        if request
+            .policy
+            .required_node_ids
+            .contains(&candidate.node_id)
+        {
+            selected.push(candidate.clone());
+        }
+    }
+
+    while selected.len() < request.policy.desired_replicas {
+        let selected_zones = selected
+            .iter()
+            .filter_map(|candidate| candidate.zone.as_deref())
+            .collect::<BTreeSet<_>>();
+        let need_new_zone = selected_zones.len() < request.policy.min_distinct_zones;
+        let candidate = ranked.iter().find(|candidate| {
+            !selected
+                .iter()
+                .any(|selected| selected.node_id == candidate.node_id)
+                && (!need_new_zone
+                    || candidate
+                        .zone
+                        .as_deref()
+                        .is_some_and(|zone| !selected_zones.contains(zone)))
+        });
+        let candidate = candidate.or_else(|| {
+            ranked.iter().find(|candidate| {
+                !selected
+                    .iter()
+                    .any(|selected| selected.node_id == candidate.node_id)
+            })
+        });
+        let Some(candidate) = candidate else {
+            break;
+        };
+        selected.push(candidate.clone());
+    }
+
+    let desired_replica_nodes = selected
         .iter()
-        .take(request.policy.desired_replicas)
         .map(|candidate| candidate.node_id.clone())
-        .collect();
+        .collect::<Vec<_>>();
     let preferred_commit_nodes = desired_replica_nodes
         .iter()
         .take(request.policy.min_commit_replicas)
         .cloned()
         .collect();
 
-    Ok(DfsReplicaPlacementPlan {
+    let plan = DfsReplicaPlacementPlan {
         desired_replica_nodes,
         preferred_commit_nodes,
+    };
+    validate_replication_plan(&plan.desired_replica_nodes, &request.policy)?;
+
+    let represented_zone_count = selected
+        .iter()
+        .filter_map(|candidate| candidate.zone.as_deref())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let decisions = request
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let selected = plan.desired_replica_nodes.contains(&candidate.node_id);
+            let preferred_for_commit = plan.preferred_commit_nodes.contains(&candidate.node_id);
+            let required = request
+                .policy
+                .required_node_ids
+                .contains(&candidate.node_id);
+            let forbidden = request
+                .policy
+                .forbidden_node_ids
+                .contains(&candidate.node_id);
+            let zone = candidate
+                .zone
+                .clone()
+                .or_else(|| request.policy.node_zones.get(&candidate.node_id).cloned());
+            let reason = if forbidden {
+                "rejected: forbidden by policy".to_string()
+            } else if required {
+                "selected: required by policy".to_string()
+            } else if preferred_for_commit {
+                "selected: preferred commit replica".to_string()
+            } else if selected {
+                match zone.as_deref() {
+                    Some(zone) => format!("selected: deterministic rank and zone spread ({zone})"),
+                    None => "selected: deterministic rank".to_string(),
+                }
+            } else {
+                "eligible but outside the desired replica count".to_string()
+            };
+            DfsReplicaPlacementDecision {
+                node_id: candidate.node_id.clone(),
+                zone,
+                selected,
+                preferred_for_commit,
+                reason,
+            }
+        })
+        .collect();
+    Ok(DfsReplicaPlacementExplanation {
+        plan,
+        represented_zone_count,
+        decisions,
     })
 }
 
@@ -134,7 +362,37 @@ pub fn validate_replication_plan(
     policy: &DfsReplicationPolicy,
 ) -> Result<(), DfsDistributedError> {
     policy.validate()?;
-    validate_replica_set(desired_replica_nodes, policy)
+    validate_replica_set(desired_replica_nodes, policy)?;
+    for required in &policy.required_node_ids {
+        if !desired_replica_nodes.contains(required) {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: format!("required node {required} is missing from the replica plan"),
+            });
+        }
+    }
+    for forbidden in &policy.forbidden_node_ids {
+        if desired_replica_nodes.contains(forbidden) {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: format!("forbidden node {forbidden} is present in the replica plan"),
+            });
+        }
+    }
+    if policy.min_distinct_zones > 0 {
+        let represented = desired_replica_nodes
+            .iter()
+            .filter_map(|node_id| policy.node_zones.get(node_id))
+            .collect::<BTreeSet<_>>()
+            .len();
+        if represented < policy.min_distinct_zones {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: format!(
+                    "replica plan represents {represented} zones but policy requires {}",
+                    policy.min_distinct_zones
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1009,10 +1267,48 @@ fn validate_candidate_set(
             reason: "replica candidate weight must be greater than zero".to_string(),
         });
     }
-    if candidates.len() < policy.desired_replicas {
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| !policy.forbidden_node_ids.contains(&candidate.node_id))
+        .collect::<Vec<_>>();
+    if eligible.len() < policy.desired_replicas {
         return Err(DfsDistributedError::InvalidReplicaSet {
-            reason: "not enough replica candidates for desired_replicas".to_string(),
+            reason: format!(
+                "not enough eligible replica candidates for desired_replicas: have {}, need {}",
+                eligible.len(),
+                policy.desired_replicas
+            ),
         });
+    }
+    for required in &policy.required_node_ids {
+        if !eligible
+            .iter()
+            .any(|candidate| &candidate.node_id == required)
+        {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: format!("required node {required} is not an eligible candidate"),
+            });
+        }
+    }
+    if policy.min_distinct_zones > 0 {
+        let available_zone_count = eligible
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .zone
+                    .as_ref()
+                    .or_else(|| policy.node_zones.get(&candidate.node_id))
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        if available_zone_count < policy.min_distinct_zones {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: format!(
+                    "only {available_zone_count} eligible zones are advertised but policy requires {}",
+                    policy.min_distinct_zones
+                ),
+            });
+        }
     }
     Ok(())
 }

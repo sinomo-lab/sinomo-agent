@@ -138,6 +138,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match operation {
             DfsNamespaceOperation::LookupPath { path }
             | DfsNamespaceOperation::SyncPath { path }
+            | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. } => {

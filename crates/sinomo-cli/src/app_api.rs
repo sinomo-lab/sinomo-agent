@@ -5689,6 +5689,18 @@ pub struct SifsObjectDetails {
     pub local_pins: Vec<SifsPinDetails>,
     pub health: Option<SifsObjectHealth>,
     pub metadata_shard: Option<SifsMetadataShardDetails>,
+    pub placement: Option<sinomo_runtime::dfs::DfsResolvedPlacementPolicy>,
+}
+
+pub type SifsPlacementPolicy = sinomo_runtime::dfs::DfsPlacementPolicy;
+pub type SifsPlacementScope = sinomo_runtime::dfs::DfsPlacementScope;
+pub type SifsPlacementPreview = sinomo_runtime::dfs::DfsPlacementPreview;
+pub type SifsPlacementReconciliationJob = sinomo_runtime::dfs::DfsPlacementReconciliationJob;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsPlacementUpdateOutcome {
+    pub preview: SifsPlacementPreview,
+    pub reconciliation: SifsPlacementReconciliationJob,
 }
 
 /// Metadata shard placement for the selected SIFS path.
@@ -5927,7 +5939,8 @@ impl SifsBrowser {
                     .ok()
                     .flatten()
                     .map(|shard| sifs_metadata_shard_from_config(shard, local_node_id.clone()));
-                sifs_details_from_stat(stat, local_pins, metadata_shard)
+                let placement = backend.resolved_placement(&stat).ok();
+                sifs_details_from_stat(stat, local_pins, metadata_shard, placement)
             }),
             SifsBrowserBackend::Remote(remote) => remote.stat(path),
         }
@@ -6095,6 +6108,46 @@ impl SifsBrowser {
                 .transfer_metadata_primary_to_local(path, None)
                 .map(sifs_metadata_primary_transfer_from_backend),
             SifsBrowserBackend::Remote(remote) => remote.make_metadata_primary(path),
+        }
+    }
+
+    pub fn preview_placement(
+        &self,
+        path: &str,
+        policy: Option<SifsPlacementPolicy>,
+        scope: SifsPlacementScope,
+    ) -> Result<SifsPlacementPreview, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.preview_placement(path, policy, scope),
+            SifsBrowserBackend::Remote(remote) => remote.preview_placement(path, policy, scope),
+        }
+    }
+
+    pub fn update_placement(
+        &self,
+        path: &str,
+        policy: Option<SifsPlacementPolicy>,
+        scope: SifsPlacementScope,
+    ) -> Result<SifsPlacementUpdateOutcome, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                let (preview, reconciliation) = backend.update_placement(path, policy, scope)?;
+                Ok(SifsPlacementUpdateOutcome {
+                    preview,
+                    reconciliation,
+                })
+            }
+            SifsBrowserBackend::Remote(remote) => remote.update_placement(path, policy, scope),
+        }
+    }
+
+    pub fn placement_progress(
+        &self,
+        job_id: &str,
+    ) -> Result<SifsPlacementReconciliationJob, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.placement_progress(job_id),
+            SifsBrowserBackend::Remote(remote) => remote.placement_progress(job_id),
         }
     }
 
@@ -6495,6 +6548,53 @@ impl RemoteSifsBrowser {
         )?;
         Ok(sifs_metadata_primary_transfer_from_rpc(response))
     }
+
+    fn preview_placement(
+        &self,
+        path: &str,
+        policy: Option<SifsPlacementPolicy>,
+        scope: SifsPlacementScope,
+    ) -> Result<SifsPlacementPreview, String> {
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementPreviewResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserPlacementPreviewRequest {
+                path: path.to_string(),
+                policy,
+                scope,
+            },
+        )?;
+        Ok(response.preview)
+    }
+
+    fn update_placement(
+        &self,
+        path: &str,
+        policy: Option<SifsPlacementPolicy>,
+        scope: SifsPlacementScope,
+    ) -> Result<SifsPlacementUpdateOutcome, String> {
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateRequest {
+                path: path.to_string(),
+                policy,
+                scope,
+            },
+        )?;
+        Ok(SifsPlacementUpdateOutcome {
+            preview: response.preview,
+            reconciliation: response.reconciliation,
+        })
+    }
+
+    fn placement_progress(&self, job_id: &str) -> Result<SifsPlacementReconciliationJob, String> {
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementProgressResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserPlacementProgressRequest {
+                job_id: job_id.to_string(),
+            },
+        )?;
+        Ok(response.reconciliation)
+    }
 }
 
 fn reconcile_conditional_replace_bytes(
@@ -6556,6 +6656,7 @@ fn sifs_details_from_stat(
     stat: sinomo_runtime::dfs::DfsStat,
     local_pins: Vec<sinomo_runtime::dfs::DfsPinRecord>,
     metadata_shard: Option<SifsMetadataShardDetails>,
+    placement: Option<sinomo_runtime::dfs::DfsResolvedPlacementPolicy>,
 ) -> SifsObjectDetails {
     SifsObjectDetails {
         file_system_id: stat.file_system_id.to_string(),
@@ -6582,6 +6683,7 @@ fn sifs_details_from_stat(
         local_pins: local_pins.into_iter().map(sifs_pin_from_record).collect(),
         health: None,
         metadata_shard,
+        placement,
     }
 }
 
@@ -6613,6 +6715,7 @@ fn sifs_details_from_rpc(
             .collect(),
         health: response.health.map(sifs_object_health_from_rpc),
         metadata_shard: response.metadata_shard.map(sifs_metadata_shard_from_rpc),
+        placement: response.placement,
     }
 }
 

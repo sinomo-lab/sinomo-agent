@@ -536,9 +536,12 @@ fn capture_settings_responsive() {
         app.run_until_idle().expect("settle narrow layout");
         capture("settings-narrow-menu", &window);
 
-        // Drill into the "Connection" row → detail page with a back affordance. (Row geometry: the
-        // composed menu ListView is inset from the top bar; the Connection row sits near y=170.)
-        click_at(&root, 120.0, 170.0);
+        // Drill into Connectivity through semantics so grouped-menu spacing can evolve safely.
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("Connectivity")
+            .click()
+            .expect("open Connectivity settings");
         app.run_until_idle().expect("settle drill-in");
         capture("settings-narrow-detail", &window);
     }
@@ -720,20 +723,23 @@ fn capture_settings_composed() {
 #[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn settings_wide_sidebar_navigates() {
     use sinomo_app::ui::settings::SettingsSection;
+    use sui::SemanticsRole;
 
     let shared = boot(Tab::Settings);
     let runtime = build_runtime(shared.clone()).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
-    let root = window.root();
     app.run_until_idle().expect("settle wide layout");
     assert!(
         shared.settings().selected.is_none(),
         "wide layout starts with no explicit selection (defaults to Appearance)"
     );
 
-    // The sidebar ListView rows sit ~y=128 (Appearance), stepping by ~40px. Click "Providers" (5th).
-    click_at(&root, 120.0, 288.0);
+    window
+        .get_by_role(SemanticsRole::ListItem)
+        .with_name("Providers")
+        .click()
+        .expect("open Providers settings");
     app.run_until_idle().expect("settle nav");
     assert_eq!(
         shared.settings().selected,
@@ -747,7 +753,7 @@ fn settings_wide_sidebar_navigates() {
 #[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn settings_narrow_click_navigates() {
     use sinomo_app::ui::settings::SettingsSection;
-    use sui::{Event, Size, WindowEvent};
+    use sui::{Event, SemanticsRole, Size, WindowEvent};
 
     let shared = boot(Tab::Settings);
     let runtime = build_runtime(shared.clone()).expect("build runtime");
@@ -760,8 +766,11 @@ fn settings_narrow_click_navigates() {
     app.run_until_idle().expect("settle narrow");
     assert!(shared.settings().selected.is_none(), "starts at the menu");
 
-    // Drill into Connection.
-    click_at(&root, 120.0, 170.0);
+    window
+        .get_by_role(SemanticsRole::ListItem)
+        .with_name("Connectivity")
+        .click()
+        .expect("open Connectivity settings");
     app.run_until_idle().expect("settle drill-in");
     assert_eq!(
         shared.settings().selected,
@@ -769,8 +778,11 @@ fn settings_narrow_click_navigates() {
         "clicking the Connection menu row drills in"
     );
 
-    // The back button (top-left of the detail) returns to the menu.
-    click_at(&root, 50.0, 67.0);
+    window
+        .get_by_role(SemanticsRole::Button)
+        .with_name("Settings")
+        .click()
+        .expect("return to settings menu");
     app.run_until_idle().expect("settle back");
     assert!(
         shared.settings().selected.is_none(),
@@ -1035,6 +1047,7 @@ fn capture_files_composed() {
                 created_at_unix_nanos: Some(1_766_000_040_000_000_000),
             }],
             metadata_shard: None,
+            placement: None,
             health: Some(SifsObjectHealth {
                 agent_state: "healthy".to_string(),
                 version_count: 1,

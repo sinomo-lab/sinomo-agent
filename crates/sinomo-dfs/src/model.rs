@@ -34,6 +34,48 @@ pub struct DfsFileSystem {
 pub struct DfsSubtreePolicy {
     pub path_prefix: String,
     pub policy: DfsObjectPolicy,
+    /// Whether the override affects only `path_prefix` or is inherited by all
+    /// descendants. Older records default to subtree behavior.
+    #[serde(default)]
+    pub scope: DfsPlacementScope,
+    /// Explicit W and N. Absent values retain the legacy policy defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_commit_replicas: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_replicas: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub min_distinct_zones: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsPlacementScope {
+    SelfOnly,
+    #[default]
+    Subtree,
+}
+
+impl DfsSubtreePolicy {
+    pub fn legacy(path_prefix: impl Into<String>, policy: DfsObjectPolicy) -> Self {
+        Self {
+            path_prefix: path_prefix.into(),
+            policy,
+            scope: DfsPlacementScope::Subtree,
+            min_commit_replicas: None,
+            desired_replicas: None,
+            required_node_ids: Vec::new(),
+            forbidden_node_ids: Vec::new(),
+            min_distinct_zones: 0,
+        }
+    }
 }
 
 impl DfsFileSystem {

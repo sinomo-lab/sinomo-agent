@@ -125,10 +125,12 @@ use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
     DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
-    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
-    DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+    DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+    DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
+    DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
+    DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
@@ -2009,6 +2011,13 @@ impl DaemonDfsBrowserBackend {
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;
+        let placement = service
+            .resolved_placement_policy_for_path(
+                &stat.path,
+                stat.policy.clone(),
+                stat.current_locations.len().max(1),
+            )
+            .ok();
         let health = daemon_dfs_browser_object_health(&service, &stat.object_id);
         let local_pins =
             daemon_dfs_browser_local_pins(&self.data_dir, &stat.file_system_id, &stat.path);
@@ -2024,6 +2033,7 @@ impl DaemonDfsBrowserBackend {
             local_pins,
             health,
             metadata_shard,
+            placement,
         ))
     }
 
@@ -2151,7 +2161,7 @@ impl DaemonDfsBrowserBackend {
         let replica_candidates =
             sinomo_dfs::discover_mounted_sifs_content_replica_candidates(&self.data_dir)
                 .map_err(dfs_browser_service_error)?;
-        let options = sifs_browser_write_options(&replica_candidates);
+        let options = sifs_browser_write_options(&mut service, &path, &replica_candidates)?;
         service
             .posix_write_file(&path, &request.bytes, options)
             .map_err(dfs_browser_service_error)?;
@@ -2199,7 +2209,16 @@ impl DaemonDfsBrowserBackend {
         let replica_candidates =
             sinomo_dfs::discover_mounted_sifs_content_replica_candidates(&self.data_dir)
                 .map_err(dfs_browser_service_error)?;
-        let options = sifs_browser_write_options(&replica_candidates);
+        let options = match sifs_browser_write_options(&mut service, &path, &replica_candidates) {
+            Ok(options) => options,
+            Err(error) => {
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: Outcome::Rejected {
+                        detail: error.to_string(),
+                    },
+                });
+            }
+        };
         let stat = match service.posix_replace_file_if_version(
             &path,
             &object_id,
@@ -2439,6 +2458,177 @@ impl DaemonDfsBrowserBackend {
             changed: true,
             metadata_shard: daemon_dfs_browser_metadata_shard(updated, &local_node_id),
         })
+    }
+
+    fn placement_preview(
+        &self,
+        request: crate::DaemonDfsBrowserPlacementPreviewRequest,
+    ) -> Result<crate::DaemonDfsBrowserPlacementPreviewResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err(ServiceError::Service(
+                "managed DFS placement requires a cluster".to_string(),
+            ));
+        }
+        let mut kv = DaemonDfsBrowserControlPlaneKvClient::read_only(&cluster_paths);
+        let mut config = sinomo_dfs::DfsControlPlaneStore::new(&mut kv)
+            .get_file_system_config(&sinomo_dfs::sifs_file_system_id())
+            .map_err(dfs_browser_service_error)?
+            .ok_or_else(|| {
+                ServiceError::Service("SIFS cluster policy is unavailable".to_string())
+            })?;
+        match request.policy.clone() {
+            Some(policy) => {
+                let rule = sinomo_dfs::normalize_placement_rule(&path, request.scope, policy)
+                    .map_err(dfs_browser_service_error)?;
+                sinomo_dfs::upsert_placement_rule(&mut config.subtree_policies, rule);
+            }
+            None => {
+                sinomo_dfs::remove_placement_rule(
+                    &mut config.subtree_policies,
+                    &path,
+                    request.scope,
+                )
+                .map_err(dfs_browser_service_error)?;
+            }
+        }
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        let stat = service
+            .posix_stat_distributed(&path)
+            .map_err(dfs_browser_service_error)?;
+        let candidates = service
+            .placement_content_candidates()
+            .map_err(dfs_browser_service_error)?;
+        let preview = sinomo_dfs::preview_placement(
+            &config,
+            &stat.path,
+            stat.object_id,
+            stat.version,
+            stat.policy,
+            service.node_id().clone(),
+            stat.current_locations,
+            candidates,
+            None,
+            request.scope,
+        )
+        .map_err(dfs_browser_service_error)?;
+        Ok(crate::DaemonDfsBrowserPlacementPreviewResponse { preview })
+    }
+
+    fn placement_update(
+        &self,
+        request: crate::DaemonDfsBrowserPlacementUpdateRequest,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<crate::DaemonDfsBrowserPlacementUpdateResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err(ServiceError::Service(
+                "managed DFS placement requires a cluster".to_string(),
+            ));
+        }
+        let mut service = self.lock_service()?;
+        self.refresh_peer_targets(&mut service);
+        let stat = service
+            .posix_stat_distributed(&path)
+            .map_err(dfs_browser_service_error)?;
+        let candidates = service
+            .placement_content_candidates()
+            .map_err(dfs_browser_service_error)?;
+        let mut kv = DaemonDfsBrowserControlPlaneKvClient::new(&cluster_paths, runtime.clone());
+        let mut store = sinomo_dfs::DfsControlPlaneStore::new(&mut kv);
+        let expected = store
+            .get_file_system_config(&sinomo_dfs::sifs_file_system_id())
+            .map_err(dfs_browser_service_error)?
+            .ok_or_else(|| {
+                ServiceError::Service("SIFS cluster policy is unavailable".to_string())
+            })?;
+        let mut desired = expected.clone();
+        match request.policy.clone() {
+            Some(policy) => {
+                let rule = sinomo_dfs::normalize_placement_rule(&path, request.scope, policy)
+                    .map_err(dfs_browser_service_error)?;
+                sinomo_dfs::upsert_placement_rule(&mut desired.subtree_policies, rule);
+            }
+            None => {
+                sinomo_dfs::remove_placement_rule(
+                    &mut desired.subtree_policies,
+                    &path,
+                    request.scope,
+                )
+                .map_err(dfs_browser_service_error)?;
+            }
+        }
+        let preview = sinomo_dfs::preview_placement(
+            &desired,
+            &stat.path,
+            stat.object_id,
+            stat.version,
+            stat.policy,
+            service.node_id().clone(),
+            stat.current_locations,
+            candidates,
+            None,
+            request.scope,
+        )
+        .map_err(dfs_browser_service_error)?;
+        let now = time::OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .try_into()
+            .unwrap_or(1_000_000_000);
+        let reconciliation = sinomo_dfs::DfsPlacementReconciliationJob {
+            job_id: sinomo_core::Id::generate().to_string(),
+            file_system_id: desired.file_system_id.clone(),
+            path,
+            scope: request.scope,
+            state: sinomo_dfs::DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: now,
+            updated_at_unix_nanos: now,
+            last_error: None,
+        };
+        if !store
+            .compare_and_put_placement_update(&expected, &desired, &reconciliation)
+            .map_err(dfs_browser_service_error)?
+        {
+            return Err(ServiceError::Service(
+                "SIFS placement policy changed concurrently; refresh the preview and retry"
+                    .to_string(),
+            ));
+        }
+        crate::dfs::notify_daemon_dfs_maintenance_work();
+        Ok(crate::DaemonDfsBrowserPlacementUpdateResponse {
+            preview,
+            reconciliation,
+        })
+    }
+
+    fn placement_progress(
+        &self,
+        request: crate::DaemonDfsBrowserPlacementProgressRequest,
+    ) -> Result<crate::DaemonDfsBrowserPlacementProgressResponse, ServiceError> {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let mut kv = DaemonDfsBrowserControlPlaneKvClient::read_only(&cluster_paths);
+        let reconciliation = sinomo_dfs::DfsControlPlaneStore::new(&mut kv)
+            .placement_reconciliation(&sinomo_dfs::sifs_file_system_id(), &request.job_id)
+            .map_err(dfs_browser_service_error)?
+            .ok_or_else(|| {
+                ServiceError::Service(format!(
+                    "unknown DFS placement reconciliation job: {}",
+                    request.job_id
+                ))
+            })?;
+        Ok(crate::DaemonDfsBrowserPlacementProgressResponse { reconciliation })
     }
 
     fn flush_after_mutation(
@@ -2892,6 +3082,63 @@ impl Service for DaemonDfsBrowserService {
                         &result.0,
                     )?
                 }
+                DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser placement preview",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
+                                .placement_preview(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+                        &result,
+                    )?
+                }
+                DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE => {
+                    let payload: crate::DaemonDfsBrowserPlacementUpdateRequest =
+                        request.decode_body()?;
+                    let changed_path = payload.path.clone();
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser placement update",
+                        move || {
+                            let backend =
+                                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?;
+                            let result = backend.placement_update(payload, &runtime)?;
+                            Ok((result, backend.event_origin_node_id()?))
+                        },
+                    )
+                    .await?;
+                    event_hub.publish_dfs_placement_change(
+                        result.1.clone(),
+                        "update-policy",
+                        vec![changed_path],
+                    );
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+                        &result.0,
+                    )?
+                }
+                DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser placement progress",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?
+                                .placement_progress(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+                        &result,
+                    )?
+                }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
@@ -2905,6 +3152,7 @@ fn daemon_dfs_browser_stat_response(
     local_pins: Vec<crate::DaemonDfsBrowserPinRecord>,
     health: Option<crate::DaemonDfsBrowserObjectHealth>,
     metadata_shard: Option<crate::DaemonDfsBrowserMetadataShard>,
+    placement: Option<sinomo_dfs::DfsResolvedPlacementPolicy>,
 ) -> crate::DaemonDfsBrowserStatResponse {
     crate::DaemonDfsBrowserStatResponse {
         file_system_id: stat.file_system_id.to_string(),
@@ -2931,6 +3179,7 @@ fn daemon_dfs_browser_stat_response(
         local_pins,
         health,
         metadata_shard,
+        placement,
     }
 }
 
@@ -3109,11 +3358,39 @@ fn schedule_daemon_sifs_metadata_publish(
 }
 
 fn sifs_browser_write_options(
+    service: &mut sinomo_dfs::MountedSifsService,
+    path: &str,
     replica_candidates: &[sinomo_core::node::NodeId],
-) -> sinomo_dfs::DfsWriteOptions {
-    let mut options = sinomo_dfs::DfsWriteOptions::replicated_eventual(replica_candidates.to_vec());
+) -> Result<sinomo_dfs::DfsWriteOptions, ServiceError> {
+    let object_policy = service
+        .posix_stat(path)
+        .map(|stat| stat.policy)
+        .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual);
+    let (_, _, policy) = service
+        .managed_replication_policy_for_path(path, object_policy, replica_candidates.len())
+        .map_err(dfs_browser_service_error)?;
+    let candidates = sifs_browser_write_candidates(replica_candidates, &policy);
+    let mut options = sinomo_dfs::DfsWriteOptions {
+        policy,
+        replica_candidates: candidates,
+        wait_for_commit: true,
+        foreground_replica_repair: false,
+    };
     options.foreground_replica_repair = false;
-    options
+    Ok(options)
+}
+
+fn sifs_browser_write_candidates(
+    replica_candidates: &[sinomo_core::node::NodeId],
+    policy: &sinomo_dfs::DfsReplicationPolicy,
+) -> Vec<sinomo_core::node::NodeId> {
+    let mut candidates = replica_candidates.to_vec();
+    for required in &policy.required_node_ids {
+        if !candidates.contains(required) {
+            candidates.push(required.clone());
+        }
+    }
+    candidates
 }
 
 fn dfs_browser_service_error(error: impl std::fmt::Display) -> ServiceError {
@@ -5991,10 +6268,10 @@ mod tests {
         )
         .expect("second content server");
 
-        let options = sifs_browser_write_options(&[first.clone(), second.clone()]);
+        let policy = sinomo_dfs::DfsReplicationPolicy::new(1, 2).expect("policy");
+        let candidates = sifs_browser_write_candidates(&[first.clone(), second.clone()], &policy);
 
-        assert_eq!(options.replica_candidates, vec![first, second]);
-        assert!(!options.foreground_replica_repair);
+        assert_eq!(candidates, vec![first, second]);
     }
 
     #[test]

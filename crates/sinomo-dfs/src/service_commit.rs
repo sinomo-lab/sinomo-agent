@@ -469,12 +469,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         object: &DfsObjectMetadata,
         desired_replica_nodes: Vec<NodeId>,
+        policy: &DfsReplicationPolicy,
     ) -> Vec<NodeId> {
         let mut normalized = desired_replica_nodes;
         if matches!(
             object.policy,
             DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) && !normalized.contains(&object.owner_node_id)
+        ) && !policy.forbidden_node_ids.contains(&object.owner_node_id)
+            && !normalized.contains(&object.owner_node_id)
         {
             normalized.insert(0, object.owner_node_id.clone());
         }

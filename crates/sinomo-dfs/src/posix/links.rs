@@ -54,7 +54,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::InvalidPath { path: link_path });
         }
         self.ensure_parent_directory(&link_path)?;
-        let object = match self.lookup_sifs_path(&link_path)? {
+        let mut object = match self.lookup_sifs_path(&link_path)? {
             Some(object) if object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path: link_path });
             }
@@ -78,6 +78,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
+        self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let outcome = self.write_distributed_eventual_with_candidates_and_parent_touch(
