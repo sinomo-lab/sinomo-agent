@@ -32,17 +32,19 @@ use std::time::Duration;
 use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
-    CheckboxIndicatorState, Color, Constraints, ControlSize, DefaultTheme, DetailRow, Dock,
-    EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight,
-    IconButton, IconGlyph, Insets, KeyState, KeyedChildren, Label, LeadingLabelCellPaint, ListItem,
-    ListView, MeasureCtx, Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint,
-    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl,
-    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator,
-    SideSheet, SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar,
-    StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface,
-    TextWrap, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    CheckboxIndicatorState, CollectionWindow, Color, Constraints, ControlSize, DefaultTheme,
+    DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem,
+    FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint,
+    ListItem, ListView, MeasureCtx, Observable, PaintCtx, PanelSection, PlacementBadge,
+    PlacementBadgePaint, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
+    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsCtx,
+    SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size, SizedBox, Stack,
+    StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface, SurfaceBorder,
+    SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, Tooltip, TooltipPlacement,
+    TrailingSlotRow, VirtualCollectionModel, VirtualList, VirtualListChrome,
+    VirtualListSelectionMode, VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind,
+    VirtualTableRowContext, VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
     paint_checkbox_indicator, paint_leading_label_cell, paint_placement_badge_with,
     paint_text_cell,
 };
@@ -8487,13 +8489,17 @@ fn files_list_body_rebuild(
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    RebuildOnChange::new_observable(source, move |_key| files_list_body_table(&s, &r, &ss))
+    let table_state = VirtualTableState::new();
+    RebuildOnChange::new_observable(source, move |_key| {
+        files_list_body_table(&s, &r, &ss, &table_state)
+    })
 }
 
 fn files_list_body_table(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
+    table_state: &VirtualTableState,
 ) -> WidgetPod {
     let _ = scroll_state;
     let (entries, source, sort_mode, total_count) = {
@@ -8525,17 +8531,30 @@ fn files_list_body_table(
         let page_s = shared.clone();
         let description_s = shared.clone();
         VirtualTable::new("files-listing")
+            .state(table_state.clone())
             .columns([
-                VirtualTableColumn::new("").width(36.0),
+                VirtualTableColumn::new("").key(1).width(36.0),
                 VirtualTableColumn::new("Name")
+                    .key(2)
                     .min_width(180.0)
                     .sort_direction(sort_mode.name_sort_direction()),
-                VirtualTableColumn::new("Placement").width(156.0),
+                VirtualTableColumn::new("Placement").key(3).width(156.0),
                 VirtualTableColumn::new("Kind / size")
+                    .key(4)
                     .width(128.0)
                     .sort_direction(sort_mode.meta_sort_direction()),
             ])
+            .collection_window(CollectionWindow::loaded(
+                0..entries.len(),
+                Some(total_count),
+                false,
+                entries.len() < total_count,
+            ))
             .row_count(entries.len())
+            .row_key({
+                let entries = entries.clone();
+                move |index| entries.get(index).map(file_entry_key).unwrap_or_default()
+            })
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -8605,6 +8624,15 @@ fn files_list_body_table(
     };
 
     WidgetPod::new(table)
+}
+
+fn file_entry_key(entry: &SifsEntry) -> u64 {
+    let mut key = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in entry.path.bytes() {
+        key ^= u64::from(byte);
+        key = key.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    key.max(1)
 }
 
 fn paint_file_table_row(
@@ -9777,7 +9805,7 @@ struct InspectorTaskQueue {
 impl InspectorTaskQueue {
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
         let description_shared = shared.clone();
-        let content = KeyedInspectorTaskContent::new(shared, reader);
+        let content = VirtualInspectorTaskContent::new(shared, reader);
         Self {
             child: WidgetPod::new(
                 SemanticRegion::new(
@@ -9885,24 +9913,26 @@ struct FilesTaskRowsStructure {
     tasks: Vec<FilesTask>,
 }
 
-struct KeyedInspectorTaskContent {
+struct VirtualInspectorTaskContent {
     source: Arc<dyn Observable<FilesTaskRowsStructure>>,
+    model: VirtualCollectionModel<u64, FilesTask>,
     shared: Shared,
     reader: ThemeReader,
     header_key: (AppThemeMode, AppTextScale, String, bool),
     header: WidgetPod,
     empty: WidgetPod,
-    children: KeyedChildren<u64, FilesTask>,
+    list: WidgetPod,
     is_empty: bool,
 }
 
-impl KeyedInspectorTaskContent {
+impl VirtualInspectorTaskContent {
     const GAP: f32 = 8.0;
     const ROW_HEIGHT: f32 = 31.0;
 
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
         let current = shared.signals().files_structure.get();
         let tasks = current.tasks;
+        let model = VirtualCollectionModel::named("File task collection");
         let header_key = (
             current.theme.0,
             current.theme.1,
@@ -9913,18 +9943,40 @@ impl KeyedInspectorTaskContent {
             shared
                 .signals()
                 .files_structure
-                .select_named("files keyed task rows", |key| FilesTaskRowsStructure {
+                .select_named("files virtual task rows", |key| FilesTaskRowsStructure {
                     theme: key.theme,
                     tasks: key.tasks.clone(),
                 });
+        let row_shared = shared.clone();
+        let row_reader = Rc::clone(reader);
+        let list = VirtualList::new("File task queue", model.clone(), move |_id, task| {
+            let shared = row_shared.clone();
+            let reader = Rc::clone(&row_reader);
+            RebuildOnChange::new_observable(task, move |task| {
+                WidgetPod::new(
+                    SizedBox::new()
+                        .height(Self::ROW_HEIGHT)
+                        .with_child(task_strip_row(&shared, &reader, task)),
+                )
+            })
+        })
+        .estimated_row_height(Self::ROW_HEIGHT)
+        .spacing(Self::GAP)
+        .selection_mode(VirtualListSelectionMode::None)
+        .chrome(VirtualListChrome::Transparent)
+        .overlay_scroll_bars(false)
+        .theme_when(clone_reader(reader))
+        .row_name(|_id, task| task.title.clone())
+        .row_description(|_id, task| format!("{}; {}", task.state.label(), task.detail));
         Self {
             source: Arc::new(source),
+            model,
             header: inspector_task_queue_header(&shared, reader, &tasks),
             empty: inspector_task_queue_empty(&shared, reader),
+            list: WidgetPod::new(list),
             shared,
             reader: Rc::clone(reader),
             header_key,
-            children: KeyedChildren::new(),
             is_empty: tasks.is_empty(),
         }
     }
@@ -9942,27 +9994,13 @@ impl KeyedInspectorTaskContent {
             self.empty = inspector_task_queue_empty(&self.shared, &self.reader);
         }
         self.is_empty = structure.tasks.is_empty();
-        let shared = self.shared.clone();
-        let reader = Rc::clone(&self.reader);
-        self.children.reconcile(
-            structure.tasks,
-            |task| task.id,
-            move |_id, task| {
-                let row_shared = shared.clone();
-                let row_reader = Rc::clone(&reader);
-                RebuildOnChange::new_observable(task, move |task| {
-                    WidgetPod::new(
-                        SizedBox::new()
-                            .height(Self::ROW_HEIGHT)
-                            .with_child(task_strip_row(&row_shared, &row_reader, task)),
-                    )
-                })
-            },
-        );
+        self.model
+            .replace(structure.tasks.into_iter().map(|task| (task.id, task)))
+            .expect("file task ids must be unique");
     }
 }
 
-impl Widget for KeyedInspectorTaskContent {
+impl Widget for VirtualInspectorTaskContent {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let structure = ctx.observe(self.source.as_ref());
         self.sync(structure);
@@ -9976,12 +10014,12 @@ impl Widget for KeyedInspectorTaskContent {
         let body_height = if self.is_empty {
             self.empty.measure(ctx, child_constraints).height
         } else {
-            for (_, _, child) in self.children.iter_mut() {
-                child.measure(ctx, Constraints::tight(Size::new(width, Self::ROW_HEIGHT)));
-            }
-            self.children.len() as f32 * Self::ROW_HEIGHT
-                + self.children.len().saturating_sub(1) as f32 * Self::GAP
+            self.empty.measure(ctx, Constraints::tight(Size::ZERO));
+            self.list.measure(ctx, child_constraints).height
         };
+        if self.is_empty {
+            self.list.measure(ctx, Constraints::tight(Size::ZERO));
+        }
         constraints.clamp(Size::new(width, header.height + Self::GAP + body_height))
     }
 
@@ -9991,8 +10029,9 @@ impl Widget for KeyedInspectorTaskContent {
             ctx,
             Rect::new(bounds.x(), bounds.y(), bounds.width(), header_height),
         );
-        let mut y = bounds.y() + header_height + Self::GAP;
+        let y = bounds.y() + header_height + Self::GAP;
         if self.is_empty {
+            self.list.arrange(ctx, Rect::ZERO);
             self.empty.arrange(
                 ctx,
                 Rect::new(
@@ -10004,13 +10043,16 @@ impl Widget for KeyedInspectorTaskContent {
             );
             return;
         }
-        for (_, _, child) in self.children.iter_mut() {
-            child.arrange(
-                ctx,
-                Rect::new(bounds.x(), y, bounds.width(), Self::ROW_HEIGHT),
-            );
-            y += Self::ROW_HEIGHT + Self::GAP;
-        }
+        self.empty.arrange(ctx, Rect::ZERO);
+        self.list.arrange(
+            ctx,
+            Rect::new(
+                bounds.x(),
+                y,
+                bounds.width(),
+                self.list.measured_size().height,
+            ),
+        );
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -10018,9 +10060,7 @@ impl Widget for KeyedInspectorTaskContent {
         if self.is_empty {
             self.empty.paint(ctx);
         } else {
-            for (_, _, child) in self.children.iter() {
-                child.paint(ctx);
-            }
+            self.list.paint(ctx);
         }
     }
 
@@ -10029,9 +10069,7 @@ impl Widget for KeyedInspectorTaskContent {
         if self.is_empty {
             self.empty.semantics(ctx);
         } else {
-            for (_, _, child) in self.children.iter() {
-                child.semantics(ctx);
-            }
+            self.list.semantics(ctx);
         }
     }
 
@@ -10040,7 +10078,7 @@ impl Widget for KeyedInspectorTaskContent {
         if self.is_empty {
             visitor.visit(&self.empty);
         } else {
-            self.children.visit_children(visitor);
+            visitor.visit(&self.list);
         }
     }
 
@@ -10049,7 +10087,7 @@ impl Widget for KeyedInspectorTaskContent {
         if self.is_empty {
             visitor.visit(&mut self.empty);
         } else {
-            self.children.visit_children_mut(visitor);
+            visitor.visit(&mut self.list);
         }
     }
 }
@@ -17337,7 +17375,7 @@ mod tests {
     }
 
     #[test]
-    fn inspector_task_queue_exposes_all_retained_tasks() -> sui::Result<()> {
+    fn inspector_task_queue_keeps_virtual_collection_actions_live() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -17379,21 +17417,21 @@ mod tests {
             scroll_state.max_offset().y > 0.0,
             "expanded task queue should remain scrollable through the inspector ScrollView"
         );
-
-        window
+        let cancel_visible = window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel Copy batch 6")
-            .click()?;
+            .with_name("Cancel Copy batch 1");
+        cancel_visible.expect().to_be_visible()?;
+        cancel_visible.click()?;
 
         let files = shared.files();
-        assert_eq!(files.tasks[5].state, FilesTaskState::CancelRequested);
-        assert!(operation_cancelled(&files.worker_cancellations, 105));
+        assert_eq!(files.tasks[0].state, FilesTaskState::CancelRequested);
+        assert!(operation_cancelled(&files.worker_cancellations, 100));
 
         Ok(())
     }
 
     #[test]
-    fn inspector_task_reorder_preserves_keyed_row_widget_ids() -> sui::Result<()> {
+    fn inspector_task_reorder_preserves_virtual_row_widget_ids() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
