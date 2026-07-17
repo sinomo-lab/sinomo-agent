@@ -14,7 +14,7 @@ ring = "r0"
 [dependencies]
 base64.workspace = true
 fs2.workspace = true
-ring = "0.17"
+ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-base = { path = "../sinomo-base" }

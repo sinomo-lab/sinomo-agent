@@ -23,7 +23,7 @@ blake3.workspace = true
 fs2.workspace = true
 metrics.workspace = true
 netwatcher.workspace = true
-ring = "0.17"
+ring = "0.17.14"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
 serde_bytes.workspace = true
@@ -43,8 +43,8 @@ sinomo-sandbox = { path = "../sinomo-sandbox" }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
-tower-layer = "0.3"
-tower-service = "0.3"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
 tracing.workspace = true
 
 [dev-dependencies]

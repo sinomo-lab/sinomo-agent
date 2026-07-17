@@ -22,4 +22,4 @@ time.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }
-wat = "1.248.0"
+wat = "1.253.0"

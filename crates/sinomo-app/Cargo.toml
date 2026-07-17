@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Sinomo agent client — graphical desktop app (chat, SIFS files, settings)"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 include = ["**/*.rs", "build.rs", "Cargo.toml", "assets/**/*"]
 

@@ -5795,10 +5795,14 @@ mod tests {
         state: DfsPlacementReconciliationState,
     ) -> DfsPlacementReconciliationJob {
         DfsPlacementReconciliationJob {
+            schema_version: sinomo_dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
             job_id: "placement-probe-job".to_string(),
             file_system_id: sinomo_dfs::sifs_file_system_id(),
             path: "/services".to_string(),
             scope: sinomo_dfs::DfsPlacementScope::Subtree,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot: Vec::new(),
+            accepted_config: None,
             state,
             cursor: None,
             total_object_count: 0,

@@ -203,6 +203,7 @@ pub use client::{
     send_daemon_rpc_to_endpoint_with_timeouts, send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request, send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async,
+    send_object_rpc_session_to_target_async_with_cluster_paths_and_options,
     send_object_rpc_session_to_target_async_with_options,
     send_object_rpc_session_to_target_with_options, send_object_rpc_to_target,
     send_object_rpc_to_target_async, send_object_rpc_to_target_async_with_options,

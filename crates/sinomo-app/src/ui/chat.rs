@@ -18426,10 +18426,13 @@ mod tests {
                     .root(view(shared.clone())),
             )
             .build()?;
-        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        // This maximum-size transcript deliberately exercises a first frame
+        // that can exceed the harness's five-second idle failure timeout in a
+        // debug build. One deterministic frame is sufficient for the semantic
+        // snapshot under test and avoids conflating frame cost with liveness.
+        let app = sui_testing::TestApp::from_runtime_with_frame_budget(runtime, 1)?;
         let window = app.main_window()?;
 
-        app.run_until_idle()?;
         let snapshot = window.snapshot()?;
         let expected_summary_prefix = format!("Messages {loaded_start}-{loaded_end} of 50000");
         assert!(

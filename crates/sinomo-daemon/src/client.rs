@@ -518,11 +518,32 @@ pub async fn send_object_rpc_session_to_target_async_with_options(
         address: target_node_id.to_string(),
         detail: "cluster target RPC requires a local Sinomo data directory".to_string(),
     })?;
-    let state = sinomo_core::cluster::read_cluster_state(&paths).map_err(DaemonError::from)?;
+    send_object_rpc_session_to_target_async_with_cluster_paths_and_options(
+        &paths,
+        target_node_id,
+        call,
+        options,
+        runtime,
+        observe_connectivity,
+    )
+    .await
+}
+
+/// Routes one object-RPC session to a cluster node using an explicit local
+/// cluster-state root for route discovery and request signing.
+pub async fn send_object_rpc_session_to_target_async_with_cluster_paths_and_options(
+    paths: &sinomo_core::network::ClusterPaths,
+    target_node_id: &NodeId,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<ObjectRpcSessionResult, DaemonError> {
+    let state = sinomo_core::cluster::read_cluster_state(paths).map_err(DaemonError::from)?;
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity)
-        .with_cluster_paths(&paths);
+        .with_cluster_paths(paths);
     let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, paths);
     client
         .call_target(&state, target_node_id, call, options)
         .await
