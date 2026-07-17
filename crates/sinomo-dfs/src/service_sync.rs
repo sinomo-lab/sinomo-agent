@@ -965,11 +965,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(certificate);
             }
 
-            // Probe replicas already known at the frozen head before spending
-            // this barrier's deadline catching up a lagging member. A reachable
-            // exact quorum can therefore complete around one offline replica;
-            // if it cannot, the catch-up wave below still runs before unrelated
-            // incoming traffic is drained again.
+            // A membership handoff has already frozen authoritative writes, so
+            // probe replicas known at that exact head before spending the
+            // barrier's deadline catching up a lagging member. A reachable
+            // joint quorum can therefore complete around one offline replica.
+            // Ordinary durability barriers retain catch-up-first ordering:
+            // unrelated incoming work may otherwise advance their live head
+            // before the requested historical prefix is delivered.
+            if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability) {
+                self.send_metadata_sync_catchup_batches(&target, &probe_barrier_id)?;
+            }
             let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
                 &target,
                 &probe_barrier_id,
