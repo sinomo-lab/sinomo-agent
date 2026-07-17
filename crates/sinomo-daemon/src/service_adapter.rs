@@ -526,6 +526,7 @@ impl Service for DaemonControlService {
         for route in &mut routes {
             if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+                || route.route == DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
                 || route.route == DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
             {
                 route.auth_scope = Some("local-command".to_string());
@@ -5595,12 +5596,27 @@ mod tests {
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder()
             .register(DaemonControlService {
-                paths,
+                paths: paths.clone(),
                 runtime: Some(runtime.handle().clone()),
             })
             .build();
         let host = test_service_host(&root, registry);
         let mut router = host.route_policy_layer().layer(host.active_router());
+        let mut request = ObjectRpcRequest::encode_body(
+            DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &crate::DaemonClusterMaintenanceRefreshRequest,
+        )
+        .expect("request");
+        request.auth = Some(
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                .expect("sign maintenance refresh request"),
+        );
+        let authenticated =
+            authenticate_daemon_control_request_via_registry(&paths, &request, &host)
+                .expect("authenticate local maintenance refresh request");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+        annotate_daemon_service_request(&mut request, &authenticated);
 
         runtime.block_on(async {
             let dfs_notify = crate::dfs::daemon_dfs_maintenance_notify();
@@ -5610,18 +5626,9 @@ mod tests {
             {}
             let notified = dfs_notify.notified();
             tokio::pin!(notified);
-            let response = call_value_object_rpc_service_async(&mut router, {
-                let mut request = ObjectRpcRequest::encode_body(
-                    DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-                    DAEMON_RPC_CATEGORY,
-                    &crate::DaemonClusterMaintenanceRefreshRequest,
-                )
-                .expect("request");
-                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
-                request
-            })
-            .await
-            .expect("maintenance refresh response");
+            let response = call_value_object_rpc_service_async(&mut router, request)
+                .await
+                .expect("maintenance refresh response");
             response.error_detail().expect("maintenance refresh ok");
             tokio::time::timeout(Duration::from_secs(1), &mut notified)
                 .await
@@ -6797,6 +6804,14 @@ mod tests {
             .expect("local connectivity reload route");
         assert_eq!(
             connectivity_reload.auth_scope.as_deref(),
+            Some("local-command")
+        );
+        let maintenance_refresh = catalog
+            .routes
+            .get(DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE)
+            .expect("cluster maintenance refresh route");
+        assert_eq!(
+            maintenance_refresh.auth_scope.as_deref(),
             Some("local-command")
         );
     }
