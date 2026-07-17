@@ -626,7 +626,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_objects: usize,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
-        let (expected, config) = {
+        let (expected, config, coordinator_node_id) = {
             let Some(control_plane) = self.control_plane.as_mut() else {
                 return Ok(None);
             };
@@ -643,8 +643,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsError::UnknownFileSystem {
                     file_system_id: file_system_id.clone(),
                 })?;
-            (job, config)
+            let coordinator_node_id = store
+                .select_metadata_shard_for_path_strict_default_sifs_split(&file_system_id, "/")?
+                .map(|shard| shard.primary_node_id);
+            (job, config, coordinator_node_id)
         };
+        // Advancing a job performs durable object-side effects before the
+        // progress CAS. Without one deterministic runner, every daemon can
+        // race the same revision and create the same repair intent under a
+        // different coordinator. The filesystem root primary is a
+        // failover-capable, cluster-wide job coordinator; using one global
+        // primary also means a placement update can wake the same node that
+        // owns the Files API in the default cluster. Individual objects are
+        // still routed to their own metadata primaries below.
+        if coordinator_node_id
+            .as_ref()
+            .is_some_and(|node_id| node_id != &self.node_id)
+        {
+            return Ok(None);
+        }
         let mut desired = expected.clone();
         let result =
             self.advance_placement_reconciliation_page(&config, &mut desired, max_objects.max(1));

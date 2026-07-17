@@ -81,6 +81,14 @@ const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
+
+fn daemon_dfs_local_zone() -> Option<String> {
+    std::env::var(SINOMO_DFS_ZONE_ENV)
+        .ok()
+        .map(|zone| zone.trim().to_string())
+        .filter(|zone| !zone.is_empty())
+}
 
 /// Bootstrap reconciliation and full maintenance both open and recover the
 /// local metadata tables. Keep those mandatory lifecycle paths single-flight
@@ -3124,6 +3132,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control,
             materialize_local_metadata: true,
+            local_zone: daemon_dfs_local_zone(),
         },
     )
     .await?;
@@ -3579,6 +3588,7 @@ async fn run_daemon_dfs_smoke_async(
                 bootstrap: DfsDefaultClusterBootstrapOptions {
                     publish_cluster_control: false,
                     materialize_local_metadata: false,
+                    local_zone: None,
                 },
                 smoke: daemon_dfs_smoke_options(),
             },
