@@ -8317,6 +8317,7 @@ dependencies = [
 name = "sinomo-agent"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "serde",
  "serde_json",
@@ -8462,6 +8463,7 @@ dependencies = [
  "time",
  "tokenizers 0.23.1",
  "tokio",
+ "tracing",
  "wat",
 ]
 
@@ -9364,6 +9366,7 @@ dependencies = [
 name = "sinomo-vfs"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "sinomo-core",
@@ -9376,6 +9379,7 @@ name = "sinomo-vfs-sifs"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sinomo-api",
  "sinomo-core",
  "sinomo-dfs",

@@ -246,7 +246,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsNamespaceOperation::LookupPath { path }
             | DfsNamespaceOperation::Mkdir { path }
-            | DfsNamespaceOperation::MkdirWithAttrs { path, .. } => {
+            | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
+            | DfsNamespaceOperation::MkdirAtNoLinks { path, .. } => {
                 posix_path::normalized_posix_path_key(path)
                     .into_iter()
                     .collect()

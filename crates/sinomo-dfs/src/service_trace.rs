@@ -100,6 +100,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
     match operation {
         DfsNamespaceOperation::Mkdir { .. } => "mkdir",
         DfsNamespaceOperation::MkdirWithAttrs { .. } => "mkdir-with-attrs",
+        DfsNamespaceOperation::MkdirAtNoLinks { .. } => "mkdir-at-no-links",
         DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
         DfsNamespaceOperation::Rmdir { .. } => "rmdir",
         DfsNamespaceOperation::Unlink { .. } => "unlink",

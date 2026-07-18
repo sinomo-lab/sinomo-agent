@@ -53,6 +53,76 @@ impl AgentToolRegistry {
         Self::default()
     }
 
+    /// Capture an independent executor/resource snapshot for transactional host
+    /// reconfiguration. Unlike `Clone`, mutations to either registry do not
+    /// affect the other one.
+    pub fn detached_snapshot(&self) -> Self {
+        let tools = self
+            .tools
+            .read()
+            .expect("agent tool registry lock poisoned")
+            .clone();
+        let resources = self
+            .resources
+            .read()
+            .expect("agent tool registry resource lock poisoned")
+            .clone();
+        let local_permission_checker = self
+            .local_permission_checker
+            .read()
+            .expect("agent tool registry local permission checker lock poisoned")
+            .clone();
+        Self {
+            tools: Arc::new(RwLock::new(tools)),
+            resources: Arc::new(RwLock::new(resources)),
+            local_permission_checker: Arc::new(RwLock::new(local_permission_checker)),
+            generation: Arc::new(AtomicU64::new(self.generation())),
+        }
+    }
+
+    /// Replace the complete live registry from an independent snapshot.
+    ///
+    /// Hosts use this only while their externally reachable runtime route is
+    /// detached. The common tool/resource lock order still ensures an executor
+    /// can never be observed without the resources that keep it alive.
+    pub fn replace_all_registered_from(&self, replacement: &Self) {
+        if Arc::ptr_eq(&self.tools, &replacement.tools) {
+            return;
+        }
+        let replacement_tools = replacement
+            .tools
+            .read()
+            .expect("replacement agent tool registry lock poisoned")
+            .clone();
+        let replacement_resources = replacement
+            .resources
+            .read()
+            .expect("replacement agent tool registry resource lock poisoned")
+            .clone();
+        let replacement_local_permission_checker = replacement
+            .local_permission_checker
+            .read()
+            .expect("replacement agent tool registry local permission checker lock poisoned")
+            .clone();
+
+        let mut tools = self
+            .tools
+            .write()
+            .expect("agent tool registry lock poisoned");
+        let mut resources = self
+            .resources
+            .write()
+            .expect("agent tool registry resource lock poisoned");
+        let mut local_permission_checker = self
+            .local_permission_checker
+            .write()
+            .expect("agent tool registry local permission checker lock poisoned");
+        *tools = replacement_tools;
+        *resources = replacement_resources;
+        *local_permission_checker = replacement_local_permission_checker;
+        self.bump_generation();
+    }
+
     pub fn descriptor_only(descriptors: impl IntoIterator<Item = AgentToolDescriptor>) -> Self {
         let registry = Self::new();
         for descriptor in descriptors {
@@ -154,6 +224,53 @@ impl AgentToolRegistry {
         None
     }
 
+    /// Atomically replace or add the executors registered in `replacement`.
+    ///
+    /// The destination tool lock remains held while replacement resources are
+    /// retained, so a concurrent invocation cannot observe a new executor
+    /// without the resources that keep it alive. Existing invocations already
+    /// hold their own tool/resource snapshots and may finish normally.
+    pub fn replace_registered_tools_from(&self, replacement: &Self) {
+        if Arc::ptr_eq(&self.tools, &replacement.tools) {
+            return;
+        }
+        let replacement_tools = replacement
+            .tools
+            .read()
+            .expect("replacement agent tool registry lock poisoned")
+            .clone();
+        let replacement_resources = replacement
+            .resources
+            .read()
+            .expect("replacement agent tool registry resource lock poisoned")
+            .clone();
+        if replacement_tools.is_empty() && replacement_resources.is_empty() {
+            return;
+        }
+
+        let mut tools = self
+            .tools
+            .write()
+            .expect("agent tool registry lock poisoned");
+        let mut resources = self
+            .resources
+            .write()
+            .expect("agent tool registry resource lock poisoned");
+        for replacement_tool in replacement_tools {
+            let name = replacement_tool.descriptor().spec.name;
+            if let Some(index) = tools
+                .iter()
+                .position(|existing| existing.descriptor().spec.name == name)
+            {
+                tools[index] = replacement_tool;
+            } else {
+                tools.push(replacement_tool);
+            }
+        }
+        resources.extend(replacement_resources);
+        self.bump_generation();
+    }
+
     /// Keep a shared runtime resource alive for as long as this registry (or
     /// any of its clones) remains configured.
     pub fn retain_resource<T>(&self, resource: Arc<T>)
@@ -177,6 +294,32 @@ impl AgentToolRegistry {
         let descriptor = tools.remove(index).descriptor();
         self.bump_generation();
         Some(descriptor)
+    }
+
+    /// Remove a related executor bundle under one registry write lock.
+    ///
+    /// Authority transitions use this to fail closed between principals: a
+    /// concurrent lookup can observe the complete old bundle, no bundle, or
+    /// the complete replacement bundle, but never a partially removed set.
+    pub fn remove_registered_tools(&self, tool_names: &[&str]) -> Vec<AgentToolDescriptor> {
+        let mut tools = self
+            .tools
+            .write()
+            .expect("agent tool registry lock poisoned");
+        let mut removed = Vec::new();
+        tools.retain(|tool| {
+            let descriptor = tool.descriptor();
+            if tool_names.contains(&descriptor.spec.name.as_str()) {
+                removed.push(descriptor);
+                false
+            } else {
+                true
+            }
+        });
+        if !removed.is_empty() {
+            self.bump_generation();
+        }
+        removed
     }
 
     pub fn clear(&self) {

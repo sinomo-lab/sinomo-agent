@@ -705,6 +705,10 @@ pub trait AgentTraceStore: Send + Sync {
 pub struct AgentStoragePaths {
     pub root: PathBuf,
     pub sessions_dir: PathBuf,
+    /// Latest typed background-activity projections, partitioned by a hash of
+    /// the owning agent definition key. This is deliberately outside raw
+    /// model-session directories so bounded history search never scans them.
+    pub task_activity_dir: PathBuf,
     pub channels_dir: PathBuf,
     pub traces_dir: PathBuf,
     pub evidence_dir: PathBuf,
@@ -715,6 +719,7 @@ impl AgentStoragePaths {
         let root = root.into();
         Self {
             sessions_dir: root.join("sessions"),
+            task_activity_dir: root.join("task-activity"),
             channels_dir: root.join("channels"),
             traces_dir: root.join("traces"),
             evidence_dir: root.join("evidence"),
@@ -752,6 +757,23 @@ impl AgentStoragePaths {
     pub fn session_projections_path_for_session(&self, session_id: &SessionId) -> PathBuf {
         self.session_dir_for_session(session_id)
             .join("projections.jsonl")
+    }
+
+    pub fn task_activity_dir_for_agent(&self, agent_definition_key: &str) -> PathBuf {
+        self.task_activity_dir.join(
+            blake3::hash(agent_definition_key.as_bytes())
+                .to_hex()
+                .as_str(),
+        )
+    }
+
+    pub fn task_activity_path_for_agent(
+        &self,
+        agent_definition_key: &str,
+        task_id: &TaskId,
+    ) -> PathBuf {
+        self.task_activity_dir_for_agent(agent_definition_key)
+            .join(format!("{}.json", task_id.as_str()))
     }
 
     pub fn session_audio_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
@@ -5211,6 +5233,12 @@ pub enum AgentTaskLifecycleStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentTaskSnapshot {
     pub task: AgentTaskRef,
+    /// Host-projected agent identity that owns this activity. This metadata is
+    /// part of the control plane rather than model-visible session state so
+    /// consumers can authorize persisted task history without loading a raw
+    /// agent-session snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition_key: Option<String>,
     pub status: AgentTaskLifecycleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_summary: Option<String>,
@@ -5228,6 +5256,7 @@ impl AgentTaskSnapshot {
     pub fn new(task: AgentTaskRef, status: AgentTaskLifecycleStatus) -> Self {
         Self {
             task,
+            agent_definition_key: None,
             status,
             progress_summary: None,
             active_op_id: None,
@@ -5235,6 +5264,11 @@ impl AgentTaskSnapshot {
             event_ids: Vec::new(),
             updated_at: time::OffsetDateTime::now_utc(),
         }
+    }
+
+    pub fn with_agent_definition_key(mut self, key: impl Into<String>) -> Self {
+        self.agent_definition_key = Some(key.into());
+        self
     }
 }
 
@@ -5886,8 +5920,18 @@ impl AgentSessionControlPlane {
         result_ref: Option<String>,
         event_ids: Vec<EventId>,
     ) -> AgentEvent {
+        // Ownership is immutable once a task exists. In particular, do not
+        // claim a legacy unowned task during a later status update and do not
+        // move an in-flight task when the live session switches agents.
+        let agent_definition_key = self
+            .tasks
+            .iter()
+            .find(|existing| existing.task.task_id == task.task_id)
+            .map(|existing| existing.agent_definition_key.clone())
+            .unwrap_or_else(|| self.session.agent_definition_key.clone());
         let snapshot = AgentTaskSnapshot {
             task,
+            agent_definition_key,
             status,
             progress_summary,
             active_op_id,
@@ -5993,6 +6037,7 @@ where
 pub struct AgentRuntimeStorage {
     memory_retriever: Option<Arc<dyn MemoryRetriever>>,
     durable_paths: Option<AgentStoragePaths>,
+    durable_data_dir: Option<SinomoDataDir>,
 }
 
 impl AgentRuntimeStorage {
@@ -6004,6 +6049,7 @@ impl AgentRuntimeStorage {
         Self {
             memory_retriever: Some(Arc::new(IndexedFileMemoryStore::from_data_dir(data_dir))),
             durable_paths: Some(AgentStoragePaths::from_data_dir(data_dir)),
+            durable_data_dir: Some(data_dir.clone()),
         }
     }
 
@@ -6031,7 +6077,12 @@ impl AgentRuntimeStorage {
         let Some(paths) = &self.durable_paths else {
             return Ok(None);
         };
-        FileAgentSessionStore::new(paths.clone()).load_session(session_id)
+        let store = self
+            .durable_data_dir
+            .as_ref()
+            .map(FileAgentSessionStore::for_data_dir)
+            .unwrap_or_else(|| FileAgentSessionStore::new(paths.clone()));
+        store.load_session(session_id)
     }
 
     fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
@@ -6045,7 +6096,12 @@ impl AgentRuntimeStorage {
         }
         if let Some(paths) = &self.durable_paths {
             if !agent.session_store_configured {
-                agent = agent.with_session_store(FileAgentSessionStore::new(paths.clone()));
+                let store = self
+                    .durable_data_dir
+                    .as_ref()
+                    .map(FileAgentSessionStore::for_data_dir)
+                    .unwrap_or_else(|| FileAgentSessionStore::new(paths.clone()));
+                agent = agent.with_session_store(store);
             }
             if !agent.trace_store_configured {
                 agent =
@@ -6068,7 +6124,7 @@ struct AgentSessionRuntimeState {
     /// removes the `JoinHandle`, so handle presence alone cannot fence a new
     /// turn while the previous worker is still exiting.
     turn_worker_running: bool,
-    worker: Option<thread::JoinHandle<()>>,
+    worker: Option<thread::JoinHandle<Result<(), AgentError>>>,
 }
 
 impl<M> AgentSessionRuntime<M>
@@ -6131,8 +6187,20 @@ where
                 ),
             });
         }
+        let previous_control = state.control.clone();
+        let previous_runtime_event_count = state.runtime_events.len();
         let result = state.control.submit_op(self.agent.as_ref(), op)?;
         state.append_control_runtime_events(&result.events);
+        if let Err(error) = self.agent.persist_control_result(&result) {
+            // Do not publish an in-memory control transition whose durable
+            // record failed. Some actions (notably cancellation) may already
+            // have signalled an in-flight worker, but restoring the control
+            // view still prevents callers from mistaking an unrecorded update
+            // for a committed one.
+            state.control = previous_control;
+            state.runtime_events.truncate(previous_runtime_event_count);
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -6222,6 +6290,9 @@ where
     fn submit_turn_op(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError> {
         self.reap_finished_worker()?;
         let mut state = self.lock_state()?;
+        let previous_control = state.control.clone();
+        let previous_in_flight_input_ids = state.in_flight_input_ids.clone();
+        let previous_runtime_event_count = state.runtime_events.len();
         let sequence = state.control.next_sequence;
         state.control.next_sequence = state.control.next_sequence.saturating_add(1);
         let op_id = op.op_id.clone();
@@ -6249,13 +6320,20 @@ where
             ));
             state.control.events.extend(events.iter().cloned());
             state.append_control_runtime_events(&events);
-            return Ok(AgentSessionControlResult {
+            let result = AgentSessionControlResult {
                 sequence,
                 accepted: false,
                 events,
                 outcome: None,
                 snapshot: state.control.snapshot(),
-            });
+            };
+            if let Err(error) = self.agent.persist_control_result(&result) {
+                state.control = previous_control;
+                state.in_flight_input_ids = previous_in_flight_input_ids;
+                state.runtime_events.truncate(previous_runtime_event_count);
+                return Err(error);
+            }
+            return Ok(result);
         }
 
         let task = self.agent.config.run_context.task.clone();
@@ -6307,6 +6385,15 @@ where
             outcome: None,
             snapshot: state.control.snapshot(),
         };
+        if let Err(error) = self.agent.persist_control_result(&result) {
+            // A turn must never begin if its queued/running state cannot be
+            // made durable. Restore the complete pre-submit control view and
+            // leave no worker behind for the caller to discover later.
+            state.control = previous_control;
+            state.in_flight_input_ids = previous_in_flight_input_ids;
+            state.runtime_events.truncate(previous_runtime_event_count);
+            return Err(error);
+        }
         state.turn_worker_running = true;
 
         let worker_state = Arc::clone(&self.state);
@@ -6339,7 +6426,7 @@ where
                 });
             }
         });
-        let worker = thread::spawn(move || {
+        let worker = thread::spawn(move || -> Result<(), AgentError> {
             let mut completed_session = session_for_turn;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_agent.handle_op_with_cancellation_and_progress_and_persistence(
@@ -6360,7 +6447,7 @@ where
                 .lock()
                 .expect("agent session runtime lock poisoned");
             let persist_completed_session = outcome.is_ok();
-            state.finish_turn(AgentSessionRuntimeTurnCompletion {
+            let control_result = state.finish_turn(AgentSessionRuntimeTurnCompletion {
                 sequence,
                 op_id: worker_op_id,
                 action: worker_action,
@@ -6371,6 +6458,15 @@ where
                 base_state_revision,
                 outcome,
             });
+            let control_persistence = worker_agent.persist_control_result(&control_result);
+            if let Err(error) = &control_persistence {
+                state.push_runtime_event(AgentRuntimeEventPayload::WorkerFailed {
+                    sequence,
+                    op_id: persist_worker_op_id.clone(),
+                    action: persist_worker_action.clone(),
+                    detail: format!("persist agent control history failed: {error}"),
+                });
+            }
             if persist_completed_session
                 && let Err(error) = worker_agent.save_session(&state.control.session)
             {
@@ -6381,6 +6477,8 @@ where
                     detail: format!("persist merged completed agent session failed: {error}"),
                 });
             }
+            drop(state);
+            control_persistence
         });
         state.worker = Some(worker);
         Ok(result)
@@ -6464,10 +6562,14 @@ impl AgentSessionRuntimeState {
             }));
     }
 
-    fn finish_turn(&mut self, completion: AgentSessionRuntimeTurnCompletion) {
+    fn finish_turn(
+        &mut self,
+        completion: AgentSessionRuntimeTurnCompletion,
+    ) -> AgentSessionControlResult {
         self.turn_worker_running = false;
         self.control.active_turn = None;
         self.control.active_turn_cancellation = None;
+        let sequence = completion.sequence;
         let mut events = Vec::new();
         match completion.outcome {
             Ok(outcome) => {
@@ -6543,6 +6645,13 @@ impl AgentSessionRuntimeState {
         }
         self.control.events.extend(events.iter().cloned());
         self.append_control_runtime_events(&events);
+        AgentSessionControlResult {
+            sequence,
+            accepted: true,
+            events,
+            outcome: None,
+            snapshot: self.control.snapshot(),
+        }
     }
 
     fn replace_session_preserving_live_inputs(
@@ -6641,10 +6750,12 @@ impl AgentSessionRuntimeState {
     }
 }
 
-fn join_agent_session_worker(worker: thread::JoinHandle<()>) -> Result<(), AgentError> {
+fn join_agent_session_worker(
+    worker: thread::JoinHandle<Result<(), AgentError>>,
+) -> Result<(), AgentError> {
     worker.join().map_err(|_| AgentError::Runtime {
         detail: "agent session runtime worker panicked".to_string(),
-    })
+    })?
 }
 
 impl AgentTaskTerminalResult {
@@ -8351,6 +8462,14 @@ impl<M: InteractionModel> Agent<M> {
     ) -> Result<(), AgentError> {
         self.session_store
             .append_record(&AgentSessionStoreRecord::new(session_id.clone(), record))
+            .map_err(|source| AgentError::SessionStore {
+                detail: source.to_string(),
+            })
+    }
+
+    fn persist_control_result(&self, result: &AgentSessionControlResult) -> Result<(), AgentError> {
+        result
+            .persist_to_store(self.session_store.as_ref())
             .map_err(|source| AgentError::SessionStore {
                 detail: source.to_string(),
             })
@@ -11339,7 +11458,8 @@ mod tests {
         AgentCommandOutput, AgentTool, AgentToolArtifactRef, AgentToolKind, AgentToolRequest,
         AgentToolResult, AgentToolSpec, InteractionSurface, InteractionSurfaceKind,
         LocalWorkspaceAgentConfig, SkillCatalogStore, default_agent_tool_descriptors,
-        default_coding_agent_tools, user_interaction_input_event,
+        default_background_agent_tools, default_coding_agent_tools, default_main_agent_tools,
+        user_interaction_input_event,
     };
     use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
     use sinomo_memory::MemoryError;
@@ -11347,6 +11467,93 @@ mod tests {
     use sinomo_runtime::node::{LocalNodePermission, NodeId};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    enum ControlHistoryFailureMode {
+        Always,
+        TerminalTask,
+    }
+
+    struct FailingControlHistoryStore {
+        mode: ControlHistoryFailureMode,
+    }
+
+    impl FailingControlHistoryStore {
+        fn always() -> Self {
+            Self {
+                mode: ControlHistoryFailureMode::Always,
+            }
+        }
+
+        fn terminal_task() -> Self {
+            Self {
+                mode: ControlHistoryFailureMode::TerminalTask,
+            }
+        }
+
+        fn rejects(&self, record: &AgentSessionStoreRecord) -> bool {
+            match self.mode {
+                ControlHistoryFailureMode::Always => true,
+                ControlHistoryFailureMode::TerminalTask => match &record.record {
+                    AgentSessionStoreRecordKind::TaskStatusChanged { snapshot } => {
+                        is_terminal_task_status(&snapshot.status)
+                    }
+                    AgentSessionStoreRecordKind::ControlEventPublished { event } => matches!(
+                        &event.payload,
+                        AgentEventPayload::TaskStatusChanged { snapshot }
+                            if is_terminal_task_status(&snapshot.status)
+                    ),
+                    AgentSessionStoreRecordKind::ControlSnapshotSaved { snapshot } => snapshot
+                        .tasks
+                        .iter()
+                        .any(|task| is_terminal_task_status(&task.status)),
+                    _ => false,
+                },
+            }
+        }
+    }
+
+    impl AgentSessionStore for FailingControlHistoryStore {
+        fn load_session(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<Option<AgentSession>, AgentSessionStoreError> {
+            Ok(None)
+        }
+
+        fn save_session(&self, _session: &AgentSession) -> Result<(), AgentSessionStoreError> {
+            Ok(())
+        }
+
+        fn append_items(
+            &self,
+            _session_id: &SessionId,
+            _items: &[AgentItem],
+        ) -> Result<(), AgentSessionStoreError> {
+            Ok(())
+        }
+
+        fn append_projection(
+            &self,
+            _session_id: &SessionId,
+            _projection: &AgentSessionProjection,
+        ) -> Result<(), AgentSessionStoreError> {
+            Ok(())
+        }
+
+        fn append_record(
+            &self,
+            record: &AgentSessionStoreRecord,
+        ) -> Result<(), AgentSessionStoreError> {
+            if self.rejects(record) {
+                return Err(AgentSessionStoreError::Io {
+                    path: "control-history".to_string(),
+                    detail: "injected control-history persistence failure".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn new_session_prefers_agent_home_server_and_migration_does_not_move_sandbox() {
@@ -15804,6 +16011,7 @@ mod tests {
         let registry = AgentToolRegistry::local_workspace_with_config(
             LocalWorkspaceAgentConfig::new(&root).enabling_git_tools(),
         );
+        crate::readiness::register_readiness_recall_tools(&registry);
         let plan = AgentToolPlanner::plan(
             registry.descriptors(),
             &AgentModuleToolProjection::default(),
@@ -15819,6 +16027,15 @@ mod tests {
         assert!(plan.is_executable("changed_files"));
         assert!(plan.is_model_visible("git_diff"));
         assert!(plan.is_executable("git_diff"));
+        for recall_tool in [
+            "session_history_search",
+            "memory_search",
+            "memory_read",
+            "memory_write",
+        ] {
+            assert!(plan.is_model_visible(recall_tool));
+            assert!(plan.is_executable(recall_tool));
+        }
     }
 
     #[test]
@@ -15906,6 +16123,34 @@ mod tests {
         assert!(default_tool_names.contains(&"edit_file".to_string()));
         assert!(default_tool_names.contains(&"write_file".to_string()));
 
+        for (role, tools) in [
+            ("main", default_main_agent_tools()),
+            ("background", default_background_agent_tools()),
+            ("coding", default_coding_agent_tools()),
+            ("evolution", AgentDefinition::evolution().tools),
+            (
+                "custom",
+                AgentDefinition::custom("custom-defaults", AgentRole::Background, "Custom agent.")
+                    .tools,
+            ),
+        ] {
+            let names = tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            for expected in [
+                "session_history_search",
+                "memory_search",
+                "memory_read",
+                "memory_write",
+            ] {
+                assert!(
+                    names.contains(&expected),
+                    "{role} defaults are missing {expected}"
+                );
+            }
+        }
+
         let descriptors = default_agent_tool_descriptors();
         let names: Vec<_> = descriptors
             .iter()
@@ -15913,6 +16158,10 @@ mod tests {
             .collect();
 
         for expected in [
+            "session_history_search",
+            "memory_search",
+            "memory_read",
+            "memory_write",
             "read_file",
             "list_files",
             "search",
@@ -19158,7 +19407,8 @@ old
         let config = AgentConfig::new("fake", "fake").with_task_ref(task.clone());
         let agent = Agent::new(model, "fake", "fake").with_config(config);
         let input = agent_input("run under control plane");
-        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation)
+            .with_agent_definition_key("deliberation-agent");
         let mut control = AgentSessionControlPlane::new(session);
 
         let result = control
@@ -19189,6 +19439,8 @@ old
                 &event.payload,
                 AgentEventPayload::TaskStatusChanged { snapshot }
                     if snapshot.task.task_id == task.task_id
+                        && snapshot.agent_definition_key.as_deref()
+                            == Some("deliberation-agent")
                         && snapshot.status == AgentTaskLifecycleStatus::Running
                         && snapshot.active_op_id.is_some()
             )
@@ -19205,6 +19457,10 @@ old
         let snapshot = control.snapshot();
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].task.task_id, task.task_id);
+        assert_eq!(
+            snapshot.tasks[0].agent_definition_key.as_deref(),
+            Some("deliberation-agent")
+        );
         assert_eq!(
             snapshot.tasks[0].status,
             AgentTaskLifecycleStatus::Completed
@@ -19230,7 +19486,8 @@ old
         let config = AgentConfig::new("fake", "fake").with_task_ref(task.clone());
         let agent = Agent::new(model, "fake", "fake").with_config(config);
         let input = agent_input("persist control progress");
-        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation)
+            .with_agent_definition_key("deliberation-agent");
         let mut control = AgentSessionControlPlane::new(session);
         let cursor = AgentSessionControlEventCursor {
             offset: 0,
@@ -19267,6 +19524,10 @@ old
             .expect("control snapshot");
         assert_eq!(loaded_snapshot.next_sequence, 1);
         assert_eq!(loaded_snapshot.tasks[0].task.task_id, task.task_id);
+        assert_eq!(
+            loaded_snapshot.tasks[0].agent_definition_key.as_deref(),
+            Some("deliberation-agent")
+        );
         assert_eq!(
             loaded_snapshot.tasks[0].status,
             AgentTaskLifecycleStatus::Completed
@@ -19338,10 +19599,10 @@ old
             session_id: session_id.clone(),
             next_sequence: 7,
             active_turn: None,
-            tasks: vec![AgentTaskSnapshot::new(
-                task.clone(),
-                AgentTaskLifecycleStatus::Completed,
-            )],
+            tasks: vec![
+                AgentTaskSnapshot::new(task.clone(), AgentTaskLifecycleStatus::Completed)
+                    .with_agent_definition_key("deliberation-agent"),
+            ],
             buffered_event_count: 3,
         };
         let session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
@@ -19351,6 +19612,12 @@ old
 
         assert_eq!(control.snapshot().next_sequence, 7);
         assert_eq!(control.tasks().len(), 1);
+        assert_eq!(
+            control
+                .task_snapshot(&task.task_id)
+                .and_then(|snapshot| snapshot.agent_definition_key.as_deref()),
+            Some("deliberation-agent")
+        );
         assert_eq!(
             control
                 .task_snapshot(&task.task_id)
@@ -19371,6 +19638,84 @@ old
             error,
             AgentSessionControlRestoreError::SessionMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn agent_task_snapshot_owner_defaults_for_legacy_control_records() {
+        let owned = AgentTaskSnapshot::new(
+            AgentTaskRef::new("coding", "owned task"),
+            AgentTaskLifecycleStatus::Completed,
+        )
+        .with_agent_definition_key("coding-agent");
+        let mut legacy = serde_json::to_value(&owned).expect("serialize task snapshot");
+        legacy
+            .as_object_mut()
+            .expect("task snapshot object")
+            .remove("agent_definition_key");
+
+        let restored: AgentTaskSnapshot =
+            serde_json::from_value(legacy).expect("deserialize legacy task snapshot");
+
+        assert_eq!(owned.agent_definition_key.as_deref(), Some("coding-agent"));
+        assert_eq!(restored.agent_definition_key, None);
+    }
+
+    #[test]
+    fn agent_task_snapshot_owner_is_immutable_across_status_updates() {
+        let session_id =
+            SessionId::from_legacy_named("sess_immutable_task_owner").expect("session");
+        let session =
+            AgentSession::new(session_id, AgentRole::Main).with_agent_definition_key("main-agent");
+        let mut control = AgentSessionControlPlane::new(session);
+        let owned_task = AgentTaskRef::new("maintenance", "owned task");
+        let legacy_task = AgentTaskRef::new("maintenance", "legacy unowned task");
+        let op_id = TaskId::generate();
+
+        control.set_task_status(
+            &op_id,
+            owned_task.clone(),
+            AgentTaskLifecycleStatus::Running,
+            None,
+            Some(op_id.clone()),
+            None,
+            Vec::new(),
+        );
+        control.tasks.push(AgentTaskSnapshot::new(
+            legacy_task.clone(),
+            AgentTaskLifecycleStatus::Running,
+        ));
+        control.session_mut().agent_definition_key = Some("coding-agent".to_string());
+        control.set_task_status(
+            &op_id,
+            owned_task.clone(),
+            AgentTaskLifecycleStatus::Completed,
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        control.set_task_status(
+            &op_id,
+            legacy_task.clone(),
+            AgentTaskLifecycleStatus::Completed,
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            control
+                .task_snapshot(&owned_task.task_id)
+                .and_then(|snapshot| snapshot.agent_definition_key.as_deref()),
+            Some("main-agent")
+        );
+        assert_eq!(
+            control
+                .task_snapshot(&legacy_task.task_id)
+                .and_then(|snapshot| snapshot.agent_definition_key.as_deref()),
+            None
+        );
     }
 
     #[test]
@@ -19464,6 +19809,11 @@ old
         let data_dir = SinomoDataDir::new(&data_root);
         let input = agent_input("persist this completed runtime turn");
         let session_id = input.session.session_id.clone();
+        let task = AgentTaskRef::new(
+            "background_maintenance",
+            "persist a provider-neutral activity projection",
+        )
+        .with_owner_role(AgentRole::Background);
         let agent = Agent::new(
             SequencedModel::new([r#"{
                 "response_mode": "answer",
@@ -19474,10 +19824,16 @@ old
             }"#]),
             "fake",
             "fake",
+        )
+        .with_config(
+            AgentConfig::new("fake", "fake")
+                .with_agent_definition(AgentDefinition::background())
+                .with_task_ref(task.clone()),
         );
         let runtime = AgentSessionRuntime::with_data_dir_storage(
             agent,
-            AgentSession::new(session_id.clone(), AgentRole::Main),
+            AgentSession::new(session_id.clone(), AgentRole::Background)
+                .with_agent_definition_key("background-agent"),
             &data_dir,
         );
 
@@ -19535,6 +19891,132 @@ old
                     if final_decision.text == "Persisted runtime answer."
             )
         }));
+
+        let activity_path = paths.task_activity_path_for_agent("background-agent", &task.task_id);
+        let activity = fs::read_to_string(activity_path)
+            .expect("normal runtime persisted sanitized task activity");
+        let activity_json: serde_json::Value =
+            serde_json::from_str(&activity).expect("typed task activity JSON");
+        assert_eq!(
+            activity_json["activity"]["owner_agent_key"],
+            "background-agent"
+        );
+        assert_eq!(
+            activity_json["activity"]["activity_kind"],
+            "background_maintenance"
+        );
+        assert_eq!(activity_json["activity"]["status"], "completed");
+        let stable_activity = activity_json["activity"]
+            .as_object()
+            .expect("stable task activity object");
+        for private_field in [
+            "provider",
+            "model",
+            "provider_session_id",
+            "active_op_id",
+            "result_ref",
+            "event_ids",
+        ] {
+            assert!(
+                !stable_activity.contains_key(private_field),
+                "stable activity projection leaked {private_field}: {activity}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_control_history_failure_prevents_turn_start_and_surfaces_non_turn_failure() {
+        let input = agent_input("do not start without durable control history");
+        let session_id = input.session.session_id.clone();
+        let task = AgentTaskRef::new("maintenance", "durability-gated task")
+            .with_owner_role(AgentRole::Background);
+        let agent = Agent::new(PanickingModel, "fake", "fake")
+            .with_config(AgentConfig::new("fake", "fake").with_task_ref(task))
+            .with_session_store(FailingControlHistoryStore::always());
+        let runtime = AgentSessionRuntime::new(
+            agent,
+            AgentSession::new(session_id, AgentRole::Background)
+                .with_agent_definition_key("background-agent"),
+        );
+
+        let start_error = runtime
+            .submit_op(AgentOp::start_turn(input))
+            .expect_err("turn start must fail when its running state is not durable");
+        assert!(matches!(start_error, AgentError::SessionStore { .. }));
+        assert!(runtime.active_turn().expect("active turn").is_none());
+        runtime
+            .join_active_turn()
+            .expect("failed submission did not leave a worker");
+        assert!(
+            runtime
+                .progress_since(AgentSessionControlEventCursor {
+                    offset: 0,
+                    last_event_id: None,
+                })
+                .expect("control events")
+                .events
+                .is_empty(),
+            "uncommitted start events must not remain published in memory"
+        );
+
+        let snapshot_error = runtime
+            .submit_op(AgentOp::snapshot())
+            .expect_err("non-turn control persistence failure must be surfaced");
+        assert!(matches!(snapshot_error, AgentError::SessionStore { .. }));
+    }
+
+    #[test]
+    fn runtime_surfaces_terminal_control_history_failure_from_join() {
+        let input = agent_input("finish only after terminal control history is durable");
+        let session_id = input.session.session_id.clone();
+        let task = AgentTaskRef::new("maintenance", "terminal durability task")
+            .with_owner_role(AgentRole::Background);
+        let agent = Agent::new(
+            SequencedModel::new([r#"{
+                "response_mode": "answer",
+                "text": "Terminal state prepared.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#]),
+            "fake",
+            "fake",
+        )
+        .with_config(AgentConfig::new("fake", "fake").with_task_ref(task))
+        .with_session_store(FailingControlHistoryStore::terminal_task());
+        let runtime = AgentSessionRuntime::new(
+            agent,
+            AgentSession::new(session_id, AgentRole::Background)
+                .with_agent_definition_key("background-agent"),
+        );
+
+        assert!(
+            runtime
+                .submit_op(AgentOp::start_turn(input))
+                .expect("running control state persists")
+                .accepted
+        );
+        let error = runtime
+            .join_active_turn()
+            .expect_err("terminal control persistence failure must reach the caller");
+        assert!(matches!(error, AgentError::SessionStore { .. }));
+        assert!(runtime.active_turn().expect("active turn").is_none());
+        assert!(
+            runtime
+                .runtime_events_since(AgentRuntimeEventCursor {
+                    offset: 0,
+                    last_event_id: None,
+                })
+                .expect("runtime events")
+                .events
+                .iter()
+                .any(|event| matches!(
+                    &event.payload,
+                    AgentRuntimeEventPayload::WorkerFailed { detail, .. }
+                        if detail.contains("persist agent control history failed")
+                )),
+            "polling clients must also observe the persistence failure"
+        );
     }
 
     #[test]

@@ -68,10 +68,10 @@ use sui::{
 };
 
 #[cfg(test)]
-use sinomo_agent::{AGENT_CHANNEL_APP_USER_ID, AgentChannelSource};
+use sinomo_agent::AGENT_CHANNEL_APP_USER_ID;
 use sinomo_agent::{
     AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT, AgentChannel, AgentChannelAuthor, AgentChannelKind,
-    AgentChannelMessageKind, AgentChannelStore,
+    AgentChannelMessageKind, AgentChannelSource, AgentChannelStore, TaskId,
 };
 use sinomo_cli::app_api::{
     AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
@@ -80,7 +80,8 @@ use sinomo_cli::app_api::{
     ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
     ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
     ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries,
-    agent_summaries_with_error, built_in_agent_summaries, reasoning_efforts,
+    agent_summaries_with_error, built_in_agent_summaries, project_stable_chat_agent_message,
+    reasoning_efforts,
 };
 use sinomo_runtime::{
     api::{
@@ -547,6 +548,7 @@ enum ChatMediaCallControl {
 enum ChatMediaCallWorkerEvent {
     Ready(String),
     DeviceAccess(MediaAccessKind, MediaAccessState),
+    Notice(String),
     Error(String),
     Done(String),
 }
@@ -647,6 +649,249 @@ impl Default for ChatMediaRemoteVideoCadence {
             .expect("default realtime video frame rate is bounded");
         Self::new(interval)
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Clone)]
+struct StableRealtimeChatTarget {
+    channel_id: SessionId,
+    agent_key: String,
+    agent_name: String,
+    agent_session_id: SessionId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StableRealtimeTextTurn {
+    message_id: TaskId,
+    created_at: time::OffsetDateTime,
+    text: String,
+}
+
+/// Provider-neutral text projection for one full-duplex output turn.
+///
+/// Some providers attach text to audio chunks while others publish a distinct
+/// transcript stream (and a provider may publish both). The transcript lane is
+/// the visible UI's canonical lane whenever it exists; audio-attached text is
+/// only a fallback. This prevents overlapping streams from being concatenated
+/// into duplicate history content.
+#[derive(Default)]
+struct StableRealtimeTextAccumulator {
+    message_id: Option<TaskId>,
+    created_at: Option<time::OffsetDateTime>,
+    audio_text: String,
+    transcript_text: String,
+    last_end_of_turn_text: Option<String>,
+}
+
+impl StableRealtimeTextAccumulator {
+    fn observe(&mut self, event: &sinomo_lm::RealtimeAudioEvent) -> Option<StableRealtimeTextTurn> {
+        match event {
+            sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text, end_of_turn, ..
+            } => {
+                self.push_audio_text(text);
+                if *end_of_turn {
+                    self.flush(false)
+                } else {
+                    None
+                }
+            }
+            sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
+                self.push_transcript_text(delta);
+                None
+            }
+            sinomo_lm::RealtimeAudioEvent::ResponseDone => self.flush(true),
+            sinomo_lm::RealtimeAudioEvent::Closed { .. }
+            | sinomo_lm::RealtimeAudioEvent::Error { .. } => self.flush(true),
+            sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
+                // A new input turn proves any prior end-of-turn guard is stale.
+                self.last_end_of_turn_text = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn push_audio_text(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.ensure_identity();
+            self.audio_text.push_str(text);
+        }
+    }
+
+    fn push_transcript_text(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.ensure_identity();
+            self.transcript_text.push_str(text);
+        }
+    }
+
+    fn ensure_identity(&mut self) {
+        if self.message_id.is_none() {
+            self.message_id = Some(TaskId::generate());
+            self.created_at = Some(time::OffsetDateTime::now_utc());
+        }
+    }
+
+    fn flush(&mut self, response_done: bool) -> Option<StableRealtimeTextTurn> {
+        let mut text = if self.transcript_text.trim().is_empty() {
+            self.audio_text.trim().to_string()
+        } else {
+            self.transcript_text.trim().to_string()
+        };
+        self.audio_text.clear();
+        self.transcript_text.clear();
+        let message_id = self.message_id.take();
+        let created_at = self.created_at.take();
+        if text.is_empty() {
+            if response_done {
+                self.last_end_of_turn_text = None;
+            }
+            return None;
+        }
+
+        // A few realtime protocols emit an audio `end_of_turn`, then repeat or
+        // extend the same canonical transcript before `ResponseDone`. The first
+        // boundary already materialized an immutable message. Suppress an exact
+        // or shorter replay, but persist only the missing suffix of an extension
+        // so stable history is complete without duplicating its prefix.
+        if response_done && let Some(previous) = self.last_end_of_turn_text.as_deref() {
+            let Some(continuation) = stable_realtime_text_continuation(previous, &text) else {
+                self.last_end_of_turn_text = None;
+                return None;
+            };
+            text = continuation;
+        }
+        if response_done {
+            self.last_end_of_turn_text = None;
+        } else {
+            self.last_end_of_turn_text = Some(text.clone());
+        }
+        Some(StableRealtimeTextTurn {
+            message_id: message_id.expect("nonempty realtime text has a message id"),
+            created_at: created_at.expect("nonempty realtime text has a timestamp"),
+            text,
+        })
+    }
+}
+
+fn stable_realtime_text_continuation(previous: &str, current: &str) -> Option<String> {
+    let previous_words = previous
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    let current_tokens = current.split_whitespace().collect::<Vec<_>>();
+    let current_words = current_tokens
+        .iter()
+        .map(|word| word.to_lowercase())
+        .collect::<Vec<_>>();
+
+    if current_words.starts_with(&previous_words) {
+        let continuation = current_tokens[previous_words.len()..].join(" ");
+        (!continuation.is_empty()).then_some(continuation)
+    } else if previous_words.starts_with(&current_words) {
+        None
+    } else {
+        Some(current.trim().to_string())
+    }
+}
+
+const STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE: &str =
+    "stable chat history unavailable; media call continues";
+
+type StableRealtimeTurnWriter = Box<dyn FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send>;
+
+struct StableRealtimeChatProjection {
+    writer: Option<StableRealtimeTurnWriter>,
+    text: StableRealtimeTextAccumulator,
+}
+
+impl StableRealtimeChatProjection {
+    #[cfg_attr(test, allow(dead_code))]
+    fn new(store: SifsAgentChannelStore, target: StableRealtimeChatTarget) -> Self {
+        Self::with_writer(move |turn| persist_stable_realtime_turn(&store, &target, turn))
+    }
+
+    fn disabled() -> Self {
+        Self {
+            writer: None,
+            text: StableRealtimeTextAccumulator::default(),
+        }
+    }
+
+    fn with_writer(
+        writer: impl FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send + 'static,
+    ) -> Self {
+        Self {
+            writer: Some(Box::new(writer)),
+            text: StableRealtimeTextAccumulator::default(),
+        }
+    }
+
+    fn observe(&mut self, event: &sinomo_lm::RealtimeAudioEvent) -> Option<&'static str> {
+        if self.writer.is_none() {
+            return None;
+        }
+        let Some(turn) = self.text.observe(event) else {
+            return None;
+        };
+        self.persist(turn)
+    }
+
+    fn flush_partial(&mut self) -> Option<&'static str> {
+        if self.writer.is_none() {
+            return None;
+        }
+        let Some(turn) = self.text.flush(true) else {
+            return None;
+        };
+        self.persist(turn)
+    }
+
+    fn persist(&mut self, turn: StableRealtimeTextTurn) -> Option<&'static str> {
+        let result = self
+            .writer
+            .as_mut()
+            .expect("enabled realtime projection has a writer")(turn);
+        match result {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "stable realtime chat projection disabled");
+                self.writer = None;
+                Some(STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE)
+            }
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn persist_stable_realtime_turn(
+    store: &SifsAgentChannelStore,
+    target: &StableRealtimeChatTarget,
+    turn: StableRealtimeTextTurn,
+) -> Result<(), String> {
+    let source = AgentChannelSource {
+        adapter: "sinomo-app-realtime".to_string(),
+        external_channel_id: Some(target.channel_id.to_string()),
+        external_message_id: Some(turn.message_id.to_string()),
+        metadata: serde_json::json!({
+            "surface_event": "realtime_output_text_turn",
+            "text_source": "provider_neutral_visible_output",
+        }),
+        ..AgentChannelSource::default()
+    };
+    project_stable_chat_agent_message(
+        store,
+        &target.channel_id,
+        &target.agent_key,
+        &target.agent_name,
+        &target.agent_session_id,
+        turn.message_id,
+        turn.created_at,
+        &turn.text,
+        source,
+    )
+    .map_err(|error| format!("persist realtime text to stable chat failed: {error}"))
 }
 
 #[cfg(not(test))]
@@ -4462,6 +4707,38 @@ impl ChatState {
             } else {
                 model.to_string()
             };
+            let channel_id_text = self.ensure_visible_session_id();
+            let channel_id = match channel_id_text.parse::<SessionId>() {
+                Ok(channel_id) => channel_id,
+                Err(error) => {
+                    return (
+                        false,
+                        format!("stable realtime chat id is invalid: {error}"),
+                    );
+                }
+            };
+            let agent_key = if self.info.agent.trim().is_empty() {
+                "main-agent".to_string()
+            } else {
+                self.info.agent.clone()
+            };
+            let agent_name = self
+                .agents
+                .iter()
+                .find(|agent| agent.key == agent_key)
+                .map(|agent| agent.name.clone())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| agent_key.clone());
+            let stable_chat = StableRealtimeChatTarget {
+                channel_id: channel_id.clone(),
+                agent_key,
+                agent_name,
+                agent_session_id: SessionId::derived(
+                    "stable-realtime-surface-agent",
+                    channel_id.as_str().as_bytes(),
+                ),
+            };
+            let sifs_daemon = self.sifs_daemon.clone();
             let (event_tx, event_rx) = mpsc::channel();
             let (control_tx, control_rx) = mpsc::channel();
             let snapshots = Arc::new(Mutex::new(ChatMediaSnapshots::default()));
@@ -4491,6 +4768,8 @@ impl ChatState {
                         worker_microphone_enabled,
                         worker_camera_enabled,
                         camera_surface,
+                        stable_chat,
+                        sifs_daemon,
                         worker_waker,
                     );
                 }) {
@@ -4620,6 +4899,10 @@ impl ChatState {
                             }
                         }
                     }
+                }
+                ChatMediaCallWorkerEvent::Notice(detail) => {
+                    self.media_call.notice = Some(detail.clone());
+                    self.notice = Some(detail);
                 }
                 ChatMediaCallWorkerEvent::Error(detail) => {
                     self.media_call.active = false;
@@ -4931,6 +5214,7 @@ impl ChatState {
                 }
             }
             ChatEvent::ControlStatus(status) => {
+                let persistence_warning = status.warning.clone();
                 self.control.active_turn = status.active_turn;
                 self.control.task_count = status.task_count;
                 self.control.terminal_result_count = status.terminal_result_count;
@@ -4944,15 +5228,17 @@ impl ChatState {
                     self.queued_turn_inputs
                         .retain(|item| item.input_id.as_deref() != Some(removed_id.as_str()));
                 }
-                self.notice = Some(format!(
-                    "agent control {} at sequence {}",
-                    if status.accepted {
-                        "accepted"
-                    } else {
-                        "rejected"
-                    },
-                    status.sequence
-                ));
+                self.notice = persistence_warning.or_else(|| {
+                    Some(format!(
+                        "agent control {} at sequence {}",
+                        if status.accepted {
+                            "accepted"
+                        } else {
+                            "rejected"
+                        },
+                        status.sequence
+                    ))
+                });
                 self.push_activity(
                     "runtime control",
                     format!(
@@ -7469,6 +7755,8 @@ fn run_chat_media_call_worker(
     microphone_requested: Arc<AtomicBool>,
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
+    stable_chat: StableRealtimeChatTarget,
+    sifs_daemon: Option<SifsDaemonAccess>,
     waker: Option<sui::UiHandle>,
 ) {
     if let Some(shutdown) = setup_shutdown {
@@ -7492,26 +7780,45 @@ fn run_chat_media_call_worker(
         return;
     }
     let result_tx = event_tx.clone();
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("tokio runtime failed: {error}"))
-        .and_then(|runtime| {
-            runtime.block_on(run_chat_media_call_async(
-                data_dir,
-                provider_id,
-                model,
-                start_config,
-                event_tx,
-                control_rx,
-                snapshots,
-                cancelled,
-                microphone_requested,
-                camera_requested,
-                camera_surface,
-                waker.clone(),
-            ))
-        });
+    let result = (|| {
+        // Open daemon-backed SIFS before entering the call's Tokio runtime:
+        // the browser owns the app runtime handle and its synchronous facade
+        // must not nest `block_on` inside this worker runtime.
+        let stable_projection =
+            match open_agent_channel_store(data_dir.as_ref(), sifs_daemon.as_ref()) {
+                Ok(stable_store) => StableRealtimeChatProjection::new(stable_store, stable_chat),
+                Err(error) => {
+                    tracing::warn!(%error, "stable realtime chat projection unavailable");
+                    let _ = send_chat_media_call_event(
+                        &event_tx,
+                        &waker,
+                        ChatMediaCallWorkerEvent::Notice(
+                            STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE.to_string(),
+                        ),
+                    );
+                    StableRealtimeChatProjection::disabled()
+                }
+            };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("tokio runtime failed: {error}"))?;
+        runtime.block_on(run_chat_media_call_async(
+            data_dir,
+            provider_id,
+            model,
+            start_config,
+            event_tx,
+            control_rx,
+            snapshots,
+            cancelled,
+            microphone_requested,
+            camera_requested,
+            camera_surface,
+            stable_projection,
+            waker.clone(),
+        ))
+    })();
     match result {
         Ok(()) => {
             let _ = send_chat_media_call_event(
@@ -7784,6 +8091,7 @@ async fn run_chat_media_call_async(
     microphone_requested: Arc<AtomicBool>,
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
+    mut stable_projection: StableRealtimeChatProjection,
     waker: Option<sui::UiHandle>,
 ) -> Result<(), String> {
     let ChatMediaCallStartConfig {
@@ -8234,13 +8542,26 @@ async fn run_chat_media_call_async(
             progressed = true;
             match event {
                 ChatRealtimeSessionEvent::Realtime(event) => {
-                    if handle_chat_media_realtime_event(
+                    let handled = handle_chat_media_realtime_event(
                         event,
                         speaker.as_ref(),
                         &event_tx,
                         &snapshots,
+                        &mut stable_projection,
                         &waker,
-                    )? {
+                    );
+                    let closed = match handled {
+                        Ok(closed) => closed,
+                        Err(detail) => {
+                            report_stable_realtime_projection_notice(
+                                stable_projection.flush_partial(),
+                                &event_tx,
+                                &waker,
+                            );
+                            return Err(detail);
+                        }
+                    };
+                    if closed {
                         realtime_closed = true;
                         break;
                     }
@@ -8257,7 +8578,14 @@ async fn run_chat_media_call_async(
                             snapshots.input_video_frames.saturating_add(1);
                     });
                 }
-                ChatRealtimeSessionEvent::Error(detail) => return Err(detail),
+                ChatRealtimeSessionEvent::Error(detail) => {
+                    report_stable_realtime_projection_notice(
+                        stable_projection.flush_partial(),
+                        &event_tx,
+                        &waker,
+                    );
+                    return Err(detail);
+                }
             }
         }
         if realtime_closed {
@@ -8274,6 +8602,7 @@ async fn run_chat_media_call_async(
     drop(camera);
     drop(speaker);
     realtime_session.shutdown().await;
+    report_stable_realtime_projection_notice(stable_projection.flush_partial(), &event_tx, &waker);
     Ok(())
 }
 
@@ -8542,9 +8871,10 @@ fn handle_chat_media_realtime_event(
     speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
     event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
     snapshots: &Arc<Mutex<ChatMediaSnapshots>>,
+    stable_projection: &mut StableRealtimeChatProjection,
     waker: &Option<sui::UiHandle>,
 ) -> Result<bool, String> {
-    match event {
+    let event_result = match &event {
         sinomo_lm::RealtimeAudioEvent::SessionQueued {
             position,
             estimated_wait_s,
@@ -8557,19 +8887,24 @@ fn handle_chat_media_realtime_event(
                 _ => "realtime queued".to_string(),
             };
             publish_chat_media_notice(snapshots, waker, detail);
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::SessionCreated { .. } => {
             publish_chat_media_notice(snapshots, waker, "realtime session ready".to_string());
+            Ok(false)
         }
-        sinomo_lm::RealtimeAudioEvent::SessionUpdated => {}
+        sinomo_lm::RealtimeAudioEvent::SessionUpdated => Ok(false),
         sinomo_lm::RealtimeAudioEvent::Listening { .. } => {
             publish_chat_media_notice(snapshots, waker, "model listening".to_string());
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
             publish_chat_media_notice(snapshots, waker, "speech detected".to_string());
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::InputSpeechStopped => {
             publish_chat_media_notice(snapshots, waker, "speech ended".to_string());
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::OutputAudioDelta { audio, .. } => {
             if !audio.is_empty() {
@@ -8585,6 +8920,11 @@ fn handle_chat_media_realtime_event(
                             ),
                         );
                         publish_chat_media_notice(snapshots, waker, detail.clone());
+                        report_stable_realtime_projection_notice(
+                            stable_projection.observe(&event),
+                            event_tx,
+                            waker,
+                        );
                         return Err(detail);
                     }
                 }
@@ -8592,25 +8932,44 @@ fn handle_chat_media_realtime_event(
                     snapshots.output_audio_chunks = snapshots.output_audio_chunks.saturating_add(1);
                 });
             }
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
             if !delta.trim().is_empty() {
-                publish_chat_media_notice(snapshots, waker, delta);
+                publish_chat_media_notice(snapshots, waker, delta.clone());
             }
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::ResponseDone => {
             publish_chat_media_notice(snapshots, waker, "response complete".to_string());
+            Ok(false)
         }
         sinomo_lm::RealtimeAudioEvent::Closed { reason } => {
             publish_chat_media_notice(snapshots, waker, format!("realtime closed: {reason}"));
-            return Ok(true);
+            Ok(true)
         }
         sinomo_lm::RealtimeAudioEvent::Error { code, message } => {
-            return Err(format!("realtime error {code}: {message}"));
+            Err(format!("realtime error {code}: {message}"))
         }
-        sinomo_lm::RealtimeAudioEvent::Raw { .. } => {}
+        sinomo_lm::RealtimeAudioEvent::Raw { .. } => Ok(false),
+    };
+    report_stable_realtime_projection_notice(stable_projection.observe(&event), event_tx, waker);
+    event_result
+}
+
+#[cfg(not(test))]
+fn report_stable_realtime_projection_notice(
+    notice: Option<&'static str>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+    waker: &Option<sui::UiHandle>,
+) {
+    if let Some(notice) = notice {
+        let _ = send_chat_media_call_event(
+            event_tx,
+            waker,
+            ChatMediaCallWorkerEvent::Notice(notice.to_string()),
+        );
     }
-    Ok(false)
 }
 
 fn send_chat_media_call_event(
@@ -21588,6 +21947,7 @@ mod tests {
             tasks: Vec::new(),
             queued_input,
             removed_input_id,
+            warning: None,
         }
     }
 
@@ -23043,6 +23403,213 @@ mod tests {
     }
 
     #[test]
+    fn realtime_history_prefers_transcript_lane_over_overlapping_audio_text() {
+        let mut text = StableRealtimeTextAccumulator::default();
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text: "Hello ".to_string(),
+                audio: Vec::new(),
+                end_of_turn: false,
+                kv_cache_length: None,
+            })
+            .is_none()
+        );
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
+                delta: "Hello there".to_string(),
+            })
+            .is_none()
+        );
+
+        let turn = text
+            .observe(&sinomo_lm::RealtimeAudioEvent::ResponseDone)
+            .expect("response boundary flushes one stable text turn");
+        assert_eq!(turn.text, "Hello there");
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::ResponseDone)
+                .is_none(),
+            "a repeated response boundary must not duplicate the turn"
+        );
+    }
+
+    #[test]
+    fn realtime_history_persists_only_transcript_extension_after_audio_turn_boundary() {
+        let mut text = StableRealtimeTextAccumulator::default();
+        let audio_turn = text
+            .observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text: "Hello".to_string(),
+                audio: Vec::new(),
+                end_of_turn: true,
+                kv_cache_length: None,
+            })
+            .expect("audio turn boundary flushes fallback text");
+        assert_eq!(audio_turn.text, "Hello");
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
+                delta: "Hello there".to_string(),
+            })
+            .is_none()
+        );
+        let transcript_extension = text
+            .observe(&sinomo_lm::RealtimeAudioEvent::ResponseDone)
+            .expect("an extending canonical transcript persists its missing suffix");
+        assert_eq!(transcript_extension.text, "there");
+        assert_eq!(
+            format!("{} {}", audio_turn.text, transcript_extension.text),
+            "Hello there",
+            "stable visible history must contain the canonical text exactly once"
+        );
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::ResponseDone)
+                .is_none(),
+            "a repeated response boundary must not duplicate the extension"
+        );
+    }
+
+    #[test]
+    fn realtime_history_suppresses_exact_transcript_replay_after_audio_turn_boundary() {
+        let mut text = StableRealtimeTextAccumulator::default();
+        let audio_turn = text
+            .observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text: "Hello there".to_string(),
+                audio: Vec::new(),
+                end_of_turn: true,
+                kv_cache_length: None,
+            })
+            .expect("audio turn boundary flushes fallback text");
+        assert_eq!(audio_turn.text, "Hello there");
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
+                delta: "hello there".to_string(),
+            })
+            .is_none()
+        );
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::ResponseDone)
+                .is_none(),
+            "an exact transcript replay must not duplicate stable history"
+        );
+    }
+
+    #[test]
+    fn realtime_history_persists_audio_only_end_of_turn_without_response_done() {
+        let mut text = StableRealtimeTextAccumulator::default();
+        assert!(
+            text.observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text: "MiniCPM ".to_string(),
+                audio: Vec::new(),
+                end_of_turn: false,
+                kv_cache_length: None,
+            })
+            .is_none()
+        );
+        let audio_turn = text
+            .observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text: "audio-only reply".to_string(),
+                audio: Vec::new(),
+                end_of_turn: true,
+                kv_cache_length: None,
+            })
+            .expect("audio-only end_of_turn is itself a persistence boundary");
+        assert_eq!(audio_turn.text, "MiniCPM audio-only reply");
+    }
+
+    #[test]
+    fn realtime_history_flushes_partial_output_without_inventing_input_text() {
+        let mut closed = StableRealtimeTextAccumulator::default();
+        assert!(
+            closed
+                .observe(&sinomo_lm::RealtimeAudioEvent::InputSpeechStarted)
+                .is_none()
+        );
+        assert!(
+            closed
+                .observe(&sinomo_lm::RealtimeAudioEvent::InputSpeechStopped)
+                .is_none()
+        );
+        assert!(
+            closed
+                .observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
+                    delta: "partial before close".to_string(),
+                })
+                .is_none()
+        );
+        let closed_turn = closed
+            .observe(&sinomo_lm::RealtimeAudioEvent::Closed {
+                reason: "remote closed".to_string(),
+            })
+            .expect("closed flushes partial output");
+        assert_eq!(closed_turn.text, "partial before close");
+
+        let mut errored = StableRealtimeTextAccumulator::default();
+        assert!(
+            errored
+                .observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                    text: "partial before error".to_string(),
+                    audio: Vec::new(),
+                    end_of_turn: false,
+                    kv_cache_length: None,
+                })
+                .is_none()
+        );
+        let error_turn = errored
+            .observe(&sinomo_lm::RealtimeAudioEvent::Error {
+                code: "closed".to_string(),
+                message: "socket ended".to_string(),
+            })
+            .expect("error flushes partial output");
+        assert_eq!(error_turn.text, "partial before error");
+    }
+
+    #[test]
+    fn realtime_history_write_failure_is_nonfatal_and_disables_projection() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let writer_attempts = attempts.clone();
+        let mut projection = StableRealtimeChatProjection::with_writer(move |_| {
+            writer_attempts.fetch_add(1, Ordering::AcqRel);
+            Err("private SIFS backend detail".to_string())
+        });
+
+        let notice = projection.observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+            text: "visible reply".to_string(),
+            audio: Vec::new(),
+            end_of_turn: true,
+            kv_cache_length: None,
+        });
+        assert_eq!(notice, Some(STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE));
+        assert!(projection.writer.is_none());
+
+        assert_eq!(
+            projection.observe(&sinomo_lm::RealtimeAudioEvent::OutputAudioDelta {
+                text: "later reply".to_string(),
+                audio: Vec::new(),
+                end_of_turn: true,
+                kv_cache_length: None,
+            }),
+            None,
+            "disabled projection must not turn later media events into failures"
+        );
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            1,
+            "the failing backend must not be retried for the active call"
+        );
+        assert!(!STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE.contains("SIFS backend"));
+    }
+
+    #[test]
+    fn realtime_history_disabled_at_open_ignores_media_events() {
+        let mut projection = StableRealtimeChatProjection::disabled();
+        assert_eq!(
+            projection.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
+                delta: "call remains live".to_string(),
+            }),
+            None
+        );
+        assert_eq!(projection.flush_partial(), None);
+    }
+
+    #[test]
     fn media_call_audio_queue_drops_new_chunks_when_its_capture_bound_is_full() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(CHAT_MEDIA_AUDIO_SEND_QUEUE_CAPACITY);
 
@@ -24259,6 +24826,7 @@ mod tests {
                 tasks: Vec::new(),
                 queued_input: None,
                 removed_input_id: None,
+                warning: None,
             },
         ));
         assert!(state.streaming);
@@ -24304,6 +24872,7 @@ mod tests {
                 tasks: Vec::new(),
                 queued_input: None,
                 removed_input_id: None,
+                warning: None,
             },
         ));
 

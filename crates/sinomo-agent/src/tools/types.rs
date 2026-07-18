@@ -126,6 +126,10 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         AgentToolKind::ConfigSearch | AgentToolKind::ConfigGet | AgentToolKind::ConfigSet => {
             vec!["config", "local"]
         }
+        AgentToolKind::SessionHistorySearch => vec!["core", "memory"],
+        AgentToolKind::MemorySearch | AgentToolKind::MemoryRead | AgentToolKind::MemoryWrite => {
+            vec!["core", "memory"]
+        }
         AgentToolKind::ReadSifs | AgentToolKind::WriteSifs | AgentToolKind::ListSifs => {
             vec!["sifs", "cluster"]
         }
@@ -958,6 +962,9 @@ pub enum AgentToolCapability {
     InspectClusterState,
     ManageConfig,
     ManageSkills,
+    ReadSessionHistory,
+    ReadMemory,
+    WriteMemory,
 }
 
 impl AgentToolCapability {
@@ -977,6 +984,9 @@ impl AgentToolCapability {
             AgentToolCapability::InspectClusterState => "inspect_cluster_state",
             AgentToolCapability::ManageConfig => "manage_config",
             AgentToolCapability::ManageSkills => "manage_skills",
+            AgentToolCapability::ReadSessionHistory => "read_session_history",
+            AgentToolCapability::ReadMemory => "read_memory",
+            AgentToolCapability::WriteMemory => "write_memory",
         }
     }
 }

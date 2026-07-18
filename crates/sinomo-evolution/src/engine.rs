@@ -4662,6 +4662,17 @@ where
         let tool_registry = AgentToolRegistry::local_workspace_with_config(workspace_config);
         if let Some(data_dir) = &self.local_permission_data_dir {
             tool_registry.set_local_permission_data_dir(data_dir.root());
+            let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(
+                data_dir,
+                sinomo_agent::AgentDefinition::evolution().key(),
+            )
+            .map_err(|source| MutationModelError::Agent {
+                detail: format!("configure evolution-agent Markdown memory notes: {source}"),
+            })?;
+            sinomo_agent::memory_notes::register_tools(
+                &tool_registry,
+                sinomo_agent::MemoryNoteAgentToolConfig::from_backend(memory_backend),
+            );
         }
 
         let agent = Agent::new(
@@ -4683,7 +4694,7 @@ where
             transient_system_context: None,
             async_update: None,
             context_attachments: vec![evolution_agent_context_attachment(packet, bundle)],
-            tool_specs: evolution_agent_mutation_tools(),
+            tool_specs: evolution_agent_mutation_tools(self.local_permission_data_dir.is_some()),
         };
         let runtime = AgentSessionRuntime::new(
             agent,
@@ -4974,8 +4985,26 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
-fn evolution_agent_mutation_tools() -> Vec<AgentToolSpec> {
-    let mut tools = default_coding_agent_tools();
+fn evolution_agent_mutation_tools(markdown_memory_available: bool) -> Vec<AgentToolSpec> {
+    // The internal mutation harness has no host-injected stable activity
+    // backend. Do not advertise session_history_search through its per-turn
+    // tool projection: doing so would create a visible descriptor with no
+    // executor (or tempt this layer to read raw model-session storage). The
+    // three SIFS Markdown-note tools are registered above whenever the worker
+    // has an authoritative data directory.
+    let mut tools = default_coding_agent_tools()
+        .into_iter()
+        .filter(|tool| {
+            tool.kind != AgentToolKind::SessionHistorySearch
+                && (markdown_memory_available
+                    || !matches!(
+                        tool.kind,
+                        AgentToolKind::MemorySearch
+                            | AgentToolKind::MemoryRead
+                            | AgentToolKind::MemoryWrite
+                    ))
+        })
+        .collect::<Vec<_>>();
     tools.push(AgentToolSpec::new(
         AgentToolKind::ApplyPatch,
         "apply_patch",

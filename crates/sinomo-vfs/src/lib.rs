@@ -5,8 +5,10 @@
 //! root path, so callers can operate with local names while the backend remains
 //! local, remote, service-backed, or an in-memory test store.
 
-use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext};
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,6 +26,8 @@ pub enum VfsError {
     InvalidPath { path: String, detail: String },
     #[error("VFS path {path} is outside scoped root {root}")]
     OutsideScope { root: String, path: String },
+    #[error("invalid VFS directory cursor: {detail}")]
+    InvalidCursor { detail: String },
     #[error("VFS path not found: {path}")]
     NotFound { path: String },
     #[error("VFS path already exists: {path}")]
@@ -71,7 +75,7 @@ impl VfsError {
             | Self::Json { path, .. }
             | Self::Sobj { path, .. }
             | Self::Backend { path, .. } => Some(path),
-            Self::Unsupported { .. } => None,
+            Self::InvalidCursor { .. } | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -92,6 +96,8 @@ pub enum VfsObjectKind {
 pub struct VfsMetadata {
     pub path: String,
     pub kind: VfsObjectKind,
+    /// Stable backend object identity when the filesystem exposes one.
+    pub object_id: Option<String>,
     pub size_bytes: Option<u64>,
     pub content_hash: Option<String>,
     pub version: Option<String>,
@@ -105,8 +111,135 @@ pub struct VfsDirEntry {
     pub size_bytes: Option<u64>,
 }
 
+/// Opaque continuation for one backend and one resolved directory.
+///
+/// Callers may persist the encoded form, but only [`VfsHandle::list_page`]
+/// validates and unwraps it. A cursor cannot be reused for another backend or
+/// directory, including a path outside a scoped handle's root.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VfsDirectoryCursor {
+    schema_version: u8,
+    backend: String,
+    directory: String,
+    opaque: Vec<u8>,
+}
+
+impl VfsDirectoryCursor {
+    const SCHEMA_VERSION: u8 = 1;
+    const ENCODED_PREFIX: &'static str = "vfs-dir-v1.";
+    const MAX_ENCODED_BYTES: usize = 128 * 1024;
+    const MAX_BACKEND_BYTES: usize = 16 * 1024;
+
+    pub fn to_opaque_string(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(self).map_err(|source| VfsError::InvalidCursor {
+            detail: format!("cannot encode cursor: {source}"),
+        })?;
+        Ok(format!(
+            "{}{}",
+            Self::ENCODED_PREFIX,
+            URL_SAFE_NO_PAD.encode(bytes)
+        ))
+    }
+
+    pub fn from_opaque_string(encoded: &str) -> Result<Self> {
+        if encoded.len() > Self::MAX_ENCODED_BYTES {
+            return Err(VfsError::InvalidCursor {
+                detail: "encoded cursor exceeds the size limit".to_string(),
+            });
+        }
+        let payload =
+            encoded
+                .strip_prefix(Self::ENCODED_PREFIX)
+                .ok_or_else(|| VfsError::InvalidCursor {
+                    detail: "cursor has an unsupported encoding".to_string(),
+                })?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|source| VfsError::InvalidCursor {
+                detail: format!("cursor is not valid base64url: {source}"),
+            })?;
+        let cursor: Self =
+            serde_json::from_slice(&bytes).map_err(|source| VfsError::InvalidCursor {
+                detail: format!("cursor payload is invalid: {source}"),
+            })?;
+        if cursor.schema_version != Self::SCHEMA_VERSION {
+            return Err(VfsError::InvalidCursor {
+                detail: format!("cursor schema {} is unsupported", cursor.schema_version),
+            });
+        }
+        Ok(cursor)
+    }
+
+    fn new(backend: &str, directory: &str, opaque: Vec<u8>) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            backend: backend.to_string(),
+            directory: directory.to_string(),
+            opaque,
+        }
+    }
+
+    fn backend_token<'a>(&'a self, backend: &str, directory: &str) -> Result<&'a [u8]> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(VfsError::InvalidCursor {
+                detail: format!("cursor schema {} is unsupported", self.schema_version),
+            });
+        }
+        if self.opaque.len() > Self::MAX_BACKEND_BYTES {
+            return Err(VfsError::InvalidCursor {
+                detail: "backend cursor exceeds the size limit".to_string(),
+            });
+        }
+        if self.backend != backend {
+            return Err(VfsError::InvalidCursor {
+                detail: format!("cursor belongs to backend {}, not {backend}", self.backend),
+            });
+        }
+        if self.directory != directory {
+            return Err(VfsError::InvalidCursor {
+                detail: format!(
+                    "cursor belongs to directory {}, not {directory}",
+                    self.directory
+                ),
+            });
+        }
+        Ok(&self.opaque)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsDirectoryPage {
+    /// Exact directory generation that produced this page when the backend
+    /// exposes one. Guarded no-link listing requires this receipt whenever a
+    /// directory exists.
+    pub directory_metadata: Option<VfsMetadata>,
+    pub entries: Vec<VfsDirEntry>,
+    pub next_cursor: Option<VfsDirectoryCursor>,
+}
+
+/// Backend-facing page with a cursor payload that the VFS facade treats as
+/// uninterpreted bytes.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsBackendDirectoryPage {
+    pub directory_metadata: Option<VfsMetadata>,
+    pub entries: Vec<VfsDirEntry>,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VfsFileRead {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Bounded bytes plus the exact backend identity/version that was opened for
+/// that read. `truncated` means content remains after the returned range.
+/// Security-sensitive callers use this receipt instead of issuing a second
+/// stat that could observe a replacement object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsOpenedFileRead {
+    pub metadata: VfsMetadata,
     pub bytes: Vec<u8>,
     pub truncated: bool,
 }
@@ -261,11 +394,184 @@ impl VfsRemoveOptions {
 pub trait VfsBackend: Send + Sync + std::fmt::Debug {
     fn backend_name(&self) -> &'static str;
     fn stat(&self, path: &str) -> Result<VfsMetadata>;
+    /// Return metadata for the namespace entry itself without following a
+    /// final symbolic or backend-native hard link.
+    ///
+    /// Backends that do not distinguish link records may use the ordinary
+    /// stat projection. Capability-scoped callers must use a backend that
+    /// implements true no-follow semantics before treating a path as trusted.
+    fn lstat(&self, path: &str) -> Result<VfsMetadata> {
+        self.stat(path)
+    }
+    /// Return exact metadata after an authoritative component walk that
+    /// rejects every link record from `root` through `path`.
+    fn stat_beneath_no_links(&self, root: &str, path: &str) -> Result<VfsMetadata> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "no-link metadata lookup beneath scoped root {root} is unavailable for {path}"
+            ),
+        })
+    }
     fn list(&self, path: &str) -> Result<Vec<VfsDirEntry>>;
+    fn list_page(
+        &self,
+        path: &str,
+        after: Option<&[u8]>,
+        max_entries: usize,
+    ) -> Result<VfsBackendDirectoryPage> {
+        let mut entries = self.list(path)?;
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let start = after
+            .map(|cursor| entries.partition_point(|entry| entry.path.as_bytes() <= cursor))
+            .unwrap_or(0);
+        let end = start.saturating_add(max_entries).min(entries.len());
+        let has_more = end < entries.len();
+        let entries = entries[start..end].to_vec();
+        let next_cursor = has_more
+            .then(|| entries.last().map(|entry| entry.path.as_bytes().to_vec()))
+            .flatten();
+        Ok(VfsBackendDirectoryPage {
+            directory_metadata: None,
+            entries,
+            next_cursor,
+        })
+    }
+    /// List one bounded directory page beneath `root` after an authoritative
+    /// component walk that rejects every link record. The backend cursor must
+    /// remain bound to the exact opened directory generation.
+    fn list_page_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        _after: Option<&[u8]>,
+        _max_entries: usize,
+    ) -> Result<VfsBackendDirectoryPage> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "bounded no-link listing beneath scoped root {root} is unavailable for {path}"
+            ),
+        })
+    }
     fn read(&self, path: &str) -> Result<Vec<u8>>;
     fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead>;
+    /// Read through an authoritative component walk that rejects every link
+    /// record from `root` through `path` and never resolves the path again
+    /// after opening the exact file identity.
+    fn read_prefix_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        _max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "bounded no-link reads beneath scoped root {root} are unavailable for {path}"
+            ),
+        })
+    }
+    /// Read one bounded range through an authoritative component walk that
+    /// rejects every link record from `root` through `path`. The returned
+    /// metadata and bytes must describe the same exact opened object version.
+    /// An offset beyond end-of-file must fail instead of returning an empty
+    /// range that callers could mistake for EOF.
+    fn read_range_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        _offset: u64,
+        _max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "bounded no-link range reads beneath scoped root {root} are unavailable for {path}"
+            ),
+        })
+    }
     fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()>;
+    /// Atomically create a new file and return the exact committed identity
+    /// and version. Backends must not emulate the receipt with a later stat.
+    fn create_new_versioned(
+        &self,
+        path: &str,
+        _bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!("atomic versioned creation is unavailable for {path}"),
+        })
+    }
+    /// Atomically create a new file beneath `root` without following any link
+    /// component. Backends must not implement this as lstat-then-write.
+    fn create_new_versioned_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        _bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "atomic no-link creation beneath scoped root {root} is unavailable for {path}"
+            ),
+        })
+    }
+    /// Replace an existing file only if its opaque backend version still
+    /// matches `expected_version`.
+    ///
+    /// Backends without an atomic compare-and-replace primitive must leave
+    /// this unsupported; a stat-then-write emulation would lose updates.
+    fn replace_if_version(
+        &self,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        _bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "atomic versioned replacement is unavailable for {path} object {expected_object_id} at version {expected_version}"
+            ),
+        })
+    }
+    /// Atomically compare-and-replace an exact file beneath `root` without
+    /// following any link component. Backends must bind both the object
+    /// identity and version after the no-link open.
+    fn replace_if_version_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        _bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "atomic no-link replacement beneath scoped root {root} is unavailable for {path} object {expected_object_id} at version {expected_version}"
+            ),
+        })
+    }
     fn append(&self, path: &str, bytes: &[u8], options: &VfsAppendOptions) -> Result<()>;
+    /// Ensure a directory chain exists beneath `root` without following any
+    /// link component. Each missing component must be created relative to an
+    /// exact opened parent rather than by re-resolving the full path.
+    fn create_dir_all_beneath_no_links(&self, root: &str, path: &str) -> Result<()> {
+        Err(VfsError::Unsupported {
+            backend: self.backend_name().to_string(),
+            detail: format!(
+                "no-link directory creation beneath scoped root {root} is unavailable for {path}"
+            ),
+        })
+    }
     fn create_dir_all(&self, path: &str) -> Result<()>;
     fn rename(&self, from: &str, to: &str) -> Result<()>;
     fn remove(&self, path: &str, options: &VfsRemoveOptions) -> Result<()>;
@@ -315,9 +621,236 @@ impl VfsHandle {
         self.backend.stat(&path)
     }
 
+    /// Inspect the final namespace entry without following link records.
+    pub fn lstat(&self, path: impl AsRef<str>) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.lstat(&path)
+    }
+
+    /// Inspect an exact path within this handle's root without following any
+    /// symbolic, hardlink, or backend-native link component.
+    pub fn stat_beneath_no_links(&self, path: impl AsRef<str>) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.stat_beneath_no_links(&self.root, &path)
+    }
+
     pub fn list(&self, path: impl AsRef<str>) -> Result<Vec<VfsDirEntry>> {
         let path = self.resolve(path.as_ref())?;
         self.backend.list(&path)
+    }
+
+    pub fn list_page(
+        &self,
+        path: impl AsRef<str>,
+        after: Option<&VfsDirectoryCursor>,
+        max_entries: usize,
+    ) -> Result<VfsDirectoryPage> {
+        if max_entries == 0 {
+            return Err(VfsError::InvalidCursor {
+                detail: "directory page size must be greater than zero".to_string(),
+            });
+        }
+        let path = self.resolve(path.as_ref())?;
+        let backend_name = self.backend.backend_name();
+        let backend_cursor = after
+            .map(|cursor| cursor.backend_token(backend_name, &path))
+            .transpose()?;
+        let page = self.backend.list_page(&path, backend_cursor, max_entries)?;
+        if page.entries.len() > max_entries {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: format!(
+                    "backend returned {} entries for a page limited to {max_entries}",
+                    page.entries.len()
+                ),
+            });
+        }
+        if page
+            .next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > VfsDirectoryCursor::MAX_BACKEND_BYTES)
+        {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: "backend returned an oversized directory cursor".to_string(),
+            });
+        }
+        for entry in &page.entries {
+            let normalized =
+                normalize_absolute_path(&entry.path).map_err(|source| VfsError::Backend {
+                    backend: backend_name.to_string(),
+                    path: path.clone(),
+                    detail: format!("backend returned an invalid entry path: {source}"),
+                })?;
+            if normalized != entry.path
+                || parent_vfs_path(&normalized).as_deref() != Some(path.as_str())
+            {
+                return Err(VfsError::Backend {
+                    backend: backend_name.to_string(),
+                    path: path.clone(),
+                    detail: format!(
+                        "backend returned entry {} outside the listed directory",
+                        entry.path
+                    ),
+                });
+            }
+        }
+        if let (Some(previous), Some(next)) = (backend_cursor, page.next_cursor.as_deref())
+            && previous == next
+        {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: "backend returned a non-advancing directory cursor".to_string(),
+            });
+        }
+        Ok(VfsDirectoryPage {
+            directory_metadata: page.directory_metadata,
+            entries: page.entries,
+            next_cursor: page
+                .next_cursor
+                .map(|opaque| VfsDirectoryCursor::new(backend_name, &path, opaque)),
+        })
+    }
+
+    /// List a bounded page while treating this handle's root as a no-link
+    /// capability boundary. Returned entries and cursors receive the same
+    /// path and progress validation as ordinary VFS pages.
+    pub fn list_page_beneath_no_links(
+        &self,
+        path: impl AsRef<str>,
+        after: Option<&VfsDirectoryCursor>,
+        max_entries: usize,
+    ) -> Result<VfsDirectoryPage> {
+        if max_entries == 0 {
+            return Err(VfsError::InvalidCursor {
+                detail: "directory page size must be greater than zero".to_string(),
+            });
+        }
+        let path = self.resolve(path.as_ref())?;
+        let backend_name = self.backend.backend_name();
+        let backend_cursor = after
+            .map(|cursor| cursor.backend_token(backend_name, &path))
+            .transpose()?;
+        let page = self.backend.list_page_beneath_no_links(
+            &self.root,
+            &path,
+            backend_cursor,
+            max_entries,
+        )?;
+        let directory_metadata =
+            page.directory_metadata
+                .as_ref()
+                .ok_or_else(|| VfsError::Backend {
+                    backend: backend_name.to_string(),
+                    path: path.clone(),
+                    detail: "no-link directory page omitted its exact directory receipt"
+                        .to_string(),
+                })?;
+        if directory_metadata.path != path
+            || directory_metadata.kind != VfsObjectKind::Directory
+            || directory_metadata.object_id.is_none()
+            || directory_metadata.version.is_none()
+        {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: "no-link directory page returned an invalid directory receipt".to_string(),
+            });
+        }
+        if page.entries.len() > max_entries {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: format!(
+                    "backend returned {} entries for a page limited to {max_entries}",
+                    page.entries.len()
+                ),
+            });
+        }
+        if page
+            .next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > VfsDirectoryCursor::MAX_BACKEND_BYTES)
+        {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: "backend returned an oversized directory cursor".to_string(),
+            });
+        }
+        for entry in &page.entries {
+            let normalized =
+                normalize_absolute_path(&entry.path).map_err(|source| VfsError::Backend {
+                    backend: backend_name.to_string(),
+                    path: path.clone(),
+                    detail: format!("backend returned an invalid entry path: {source}"),
+                })?;
+            if normalized != entry.path
+                || parent_vfs_path(&normalized).as_deref() != Some(path.as_str())
+            {
+                return Err(VfsError::Backend {
+                    backend: backend_name.to_string(),
+                    path: path.clone(),
+                    detail: format!(
+                        "backend returned entry {} outside the listed directory",
+                        entry.path
+                    ),
+                });
+            }
+        }
+        if let (Some(previous), Some(next)) = (backend_cursor, page.next_cursor.as_deref())
+            && previous == next
+        {
+            return Err(VfsError::Backend {
+                backend: backend_name.to_string(),
+                path: path.clone(),
+                detail: "backend returned a non-advancing directory cursor".to_string(),
+            });
+        }
+        Ok(VfsDirectoryPage {
+            directory_metadata: page.directory_metadata,
+            entries: page.entries,
+            next_cursor: page
+                .next_cursor
+                .map(|opaque| VfsDirectoryCursor::new(backend_name, &path, opaque)),
+        })
+    }
+
+    pub fn list_page_beneath_no_links_if_exists(
+        &self,
+        path: impl AsRef<str>,
+        after: Option<&VfsDirectoryCursor>,
+        max_entries: usize,
+    ) -> Result<VfsDirectoryPage> {
+        match self.list_page_beneath_no_links(path, after, max_entries) {
+            Ok(page) => Ok(page),
+            Err(VfsError::NotFound { .. }) => Ok(VfsDirectoryPage {
+                directory_metadata: None,
+                entries: Vec::new(),
+                next_cursor: None,
+            }),
+            Err(source) => Err(source),
+        }
+    }
+
+    pub fn list_page_if_exists(
+        &self,
+        path: impl AsRef<str>,
+        after: Option<&VfsDirectoryCursor>,
+        max_entries: usize,
+    ) -> Result<VfsDirectoryPage> {
+        match self.list_page(path, after, max_entries) {
+            Ok(page) => Ok(page),
+            Err(VfsError::NotFound { .. }) => Ok(VfsDirectoryPage {
+                directory_metadata: None,
+                entries: Vec::new(),
+                next_cursor: None,
+            }),
+            Err(source) => Err(source),
+        }
     }
 
     pub fn list_if_exists(&self, path: impl AsRef<str>) -> Result<Vec<VfsDirEntry>> {
@@ -348,6 +881,32 @@ impl VfsHandle {
         self.backend.read_prefix(&path, max_bytes)
     }
 
+    /// Read a bounded prefix while treating this handle's scoped root as a
+    /// no-link capability boundary.
+    pub fn read_prefix_beneath_no_links(
+        &self,
+        path: impl AsRef<str>,
+        max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend
+            .read_prefix_beneath_no_links(&self.root, &path, max_bytes)
+    }
+
+    /// Read a bounded byte range while treating this handle's scoped root as a
+    /// no-link capability boundary. `truncated` is true exactly when the opened
+    /// file has bytes after this range.
+    pub fn read_range_beneath_no_links(
+        &self,
+        path: impl AsRef<str>,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend
+            .read_range_beneath_no_links(&self.root, &path, offset, max_bytes)
+    }
+
     pub fn write(&self, path: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Result<()> {
         self.write_with_options(path, bytes, VfsWriteOptions::default())
     }
@@ -360,6 +919,73 @@ impl VfsHandle {
     ) -> Result<()> {
         let path = self.resolve(path.as_ref())?;
         self.backend.write(&path, bytes.as_ref(), &options)
+    }
+
+    pub fn replace_if_version(
+        &self,
+        path: impl AsRef<str>,
+        expected_object_id: impl AsRef<str>,
+        expected_version: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        options: VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.replace_if_version(
+            &path,
+            expected_object_id.as_ref(),
+            expected_version.as_ref(),
+            bytes.as_ref(),
+            &options,
+        )
+    }
+
+    /// Compare-and-replace within this handle's root without following any
+    /// symbolic, hardlink, or backend-native link component.
+    pub fn replace_if_version_beneath_no_links(
+        &self,
+        path: impl AsRef<str>,
+        expected_object_id: impl AsRef<str>,
+        expected_version: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        options: VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.replace_if_version_beneath_no_links(
+            &self.root,
+            &path,
+            expected_object_id.as_ref(),
+            expected_version.as_ref(),
+            bytes.as_ref(),
+            &options,
+        )
+    }
+
+    pub fn create_new_versioned(
+        &self,
+        path: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        options: VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend
+            .create_new_versioned(&path, bytes.as_ref(), &options)
+    }
+
+    /// Exclusively create within this handle's root without following any
+    /// symbolic, hardlink, or backend-native link component.
+    pub fn create_new_versioned_beneath_no_links(
+        &self,
+        path: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        options: VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.create_new_versioned_beneath_no_links(
+            &self.root,
+            &path,
+            bytes.as_ref(),
+            &options,
+        )
     }
 
     pub fn append(&self, path: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Result<()> {
@@ -379,6 +1005,14 @@ impl VfsHandle {
     pub fn create_dir_all(&self, path: impl AsRef<str>) -> Result<()> {
         let path = self.resolve(path.as_ref())?;
         self.backend.create_dir_all(&path)
+    }
+
+    /// Ensure a directory chain exists while treating this handle's root as a
+    /// no-link capability boundary.
+    pub fn create_dir_all_beneath_no_links(&self, path: impl AsRef<str>) -> Result<()> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend
+            .create_dir_all_beneath_no_links(&self.root, &path)
     }
 
     pub fn rename(&self, from: impl AsRef<str>, to: impl AsRef<str>) -> Result<()> {
@@ -465,6 +1099,7 @@ impl VfsBackend for LocalVfsBackend {
         Ok(VfsMetadata {
             path: path.to_string(),
             kind: local_file_kind(&metadata),
+            object_id: None,
             size_bytes: metadata.is_file().then_some(metadata.len()),
             content_hash: None,
             version: None,
@@ -1252,6 +1887,7 @@ fn memory_metadata(path: &str, node: &MemoryNode) -> VfsMetadata {
     VfsMetadata {
         path: path.to_string(),
         kind: memory_kind(node),
+        object_id: None,
         size_bytes: match node {
             MemoryNode::File(bytes) => Some(bytes.len() as u64),
             MemoryNode::Directory => None,
@@ -1282,6 +1918,61 @@ mod tests {
     }
 
     #[test]
+    fn no_link_beneath_primitives_fail_closed_on_unsupported_backends() {
+        let handle = VfsHandle::memory().scoped("/scope").unwrap();
+        assert!(matches!(
+            handle.stat_beneath_no_links("note.md"),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.read_prefix_beneath_no_links("note.md", 16),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.read_range_beneath_no_links("note.md", 4, 16),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.list_page_beneath_no_links("", None, 16),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.create_new_versioned_beneath_no_links(
+                "note.md",
+                b"note",
+                VfsWriteOptions::default().create_new(),
+            ),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.create_dir_all_beneath_no_links("nested"),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.replace_if_version_beneath_no_links(
+                "note.md",
+                "object",
+                "version",
+                b"updated",
+                VfsWriteOptions::default().replace_existing(),
+            ),
+            Err(VfsError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            handle.read_prefix_beneath_no_links("/outside/note.md", 16),
+            Err(VfsError::OutsideScope { .. })
+        ));
+        assert!(matches!(
+            handle.read_range_beneath_no_links("/outside/note.md", 0, 16),
+            Err(VfsError::OutsideScope { .. })
+        ));
+        assert!(matches!(
+            handle.stat_beneath_no_links("/outside/note.md"),
+            Err(VfsError::OutsideScope { .. })
+        ));
+    }
+
+    #[test]
     fn memory_backend_reads_writes_lists_and_renames() {
         let handle = VfsHandle::memory()
             .scoped("/services/sinomo/agents")
@@ -1305,6 +1996,58 @@ mod tests {
             Err(VfsError::NotFound { .. })
         ));
         assert_eq!(handle.read("beta.txt").unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn directory_pages_are_ordered_opaque_and_bound_to_the_resolved_directory() {
+        let root = VfsHandle::memory();
+        root.create_dir_all("/scope/notes").unwrap();
+        root.create_dir_all("/scope/other").unwrap();
+        for name in ["charlie.md", "alpha.md", "bravo.md"] {
+            root.write(format!("/scope/notes/{name}"), name.as_bytes())
+                .unwrap();
+        }
+        let scoped = root.scoped("/scope").unwrap();
+
+        let first = scoped.list_page("notes", None, 2).unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha.md", "bravo.md"]
+        );
+        let encoded = first
+            .next_cursor
+            .as_ref()
+            .expect("continuation")
+            .to_opaque_string()
+            .expect("encode cursor");
+        let restored = VfsDirectoryCursor::from_opaque_string(&encoded).expect("decode cursor");
+        let second = scoped.list_page("notes", Some(&restored), 2).unwrap();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["charlie.md"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        assert!(matches!(
+            scoped.list_page("other", Some(&restored), 2),
+            Err(VfsError::InvalidCursor { .. })
+        ));
+        assert!(matches!(
+            scoped.list_page("/outside", Some(&restored), 2),
+            Err(VfsError::OutsideScope { .. })
+        ));
+        assert!(matches!(
+            scoped.list_page("notes", None, 0),
+            Err(VfsError::InvalidCursor { .. })
+        ));
     }
 
     #[test]

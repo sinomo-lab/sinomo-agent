@@ -268,6 +268,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
+mod agent_history;
+mod chat_activity;
 mod error;
 mod help;
 mod providers;
@@ -280,6 +282,7 @@ mod voice;
 /// GUI-facing surface over the main-agent chat runtime (used by `sinomo-app`).
 pub mod app_api;
 
+use chat_activity::StableChatProjection;
 use error::CliError;
 use help::*;
 pub use providers::*;
@@ -4319,6 +4322,12 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         InteractionSurface::new("cli.agent", InteractionSurfaceKind::CommandLine),
     );
     let input_event = user_interaction_input_event(&session, &options.prompt);
+    // `session.session_id` is the stable Sinomo interaction/activity identity.
+    // Provider-native session handles are neither required nor projected, so
+    // they may be ephemeral or unrelated without changing chat history.
+    let chat_projection = StableChatProjection::open(&data_dir, &session)?;
+    let input_message_id = input_event.event_id.clone();
+    let input_recorded_at = input_event.time;
     let input = AgentLoopInput {
         session,
         latest_event: input_event,
@@ -4364,7 +4373,26 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let runtime = AgentSessionRuntime::with_data_dir_storage(agent, agent_session, &data_dir);
     let op = AgentOp::start_turn(input);
     let op_id = op.op_id.clone();
-    let submit = runtime.submit_op(op)?;
+    // Persist the typed user input only after all local setup succeeds, but
+    // before dispatch. From this point every terminal dispatch path below is
+    // paired with either an agent message or a system-error message.
+    chat_projection.record_user_message(
+        definition.key(),
+        input_message_id,
+        input_recorded_at,
+        &options.prompt,
+    )?;
+    let submit = match runtime.submit_op(op) {
+        Ok(submit) => submit,
+        Err(source) => {
+            return Err(agent_run_error_with_projection(
+                &chat_projection,
+                definition.key(),
+                op_id,
+                source.into(),
+            ));
+        }
+    };
     if !submit.accepted {
         let reason = submit
             .events
@@ -4374,19 +4402,72 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
                 _ => None,
             })
             .unwrap_or_else(|| format!("agent `{}` turn was rejected", definition.key()));
-        return Err(CliError::Parse { detail: reason });
+        return Err(agent_run_error_with_projection(
+            &chat_projection,
+            definition.key(),
+            op_id,
+            CliError::Parse { detail: reason },
+        ));
     }
-    runtime.join_active_turn()?;
-    let decision = runtime
-        .turn_result(&op_id)?
+    if let Err(source) = runtime.join_active_turn() {
+        return Err(agent_run_error_with_projection(
+            &chat_projection,
+            definition.key(),
+            op_id,
+            source.into(),
+        ));
+    }
+    let final_recorded_at = OffsetDateTime::now_utc();
+    let turn_result = match runtime.turn_result(&op_id) {
+        Ok(result) => result,
+        Err(source) => {
+            return Err(agent_run_error_with_projection(
+                &chat_projection,
+                definition.key(),
+                op_id,
+                source.into(),
+            ));
+        }
+    };
+    let decision = turn_result
         .and_then(|outcome| outcome.run)
         .map(|run| run.final_decision)
-        .ok_or_else(|| CliError::Parse {
-            detail: format!(
-                "agent `{}` runtime turn `{op_id}` completed without a decision",
-                definition.key()
-            ),
+        .ok_or_else(|| {
+            agent_run_error_with_projection(
+                &chat_projection,
+                definition.key(),
+                op_id.clone(),
+                CliError::Parse {
+                    detail: format!(
+                        "agent `{}` runtime turn `{op_id}` completed without a decision",
+                        definition.key()
+                    ),
+                },
+            )
         })?;
+    match agent_run_activity_output(&decision)? {
+        AgentRunActivityOutput::Agent(text) => chat_projection.record_agent_message(
+            definition.key(),
+            op_id.clone(),
+            final_recorded_at,
+            text,
+        )?,
+        AgentRunActivityOutput::System(text) => chat_projection.record_system_message(
+            definition.key(),
+            op_id.clone(),
+            final_recorded_at,
+            &text,
+            false,
+        )?,
+    }
+    if let Some(handoff) = decision.background_handoff.as_ref() {
+        chat_projection.record_background_handoff_request(
+            definition.key(),
+            &op_id,
+            final_recorded_at,
+            handoff,
+        )?;
+    }
     let compaction_evidence = if options.compact_after {
         let compact_op = AgentOp::compact(format!(
             "CLI --compact-after following completed turn {op_id}"
@@ -4464,6 +4545,49 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AgentRunActivityOutput<'a> {
+    Agent(&'a str),
+    System(String),
+}
+
+/// Render only the stable, human-visible terminal chat output. Provider and
+/// model-session metadata deliberately stay out of the activity projection.
+fn agent_run_activity_output(
+    decision: &AgentLoopDecision,
+) -> Result<AgentRunActivityOutput<'_>, CliError> {
+    if decision.text.trim().is_empty() {
+        Ok(AgentRunActivityOutput::System(agent_decision_json(
+            decision,
+        )?))
+    } else {
+        Ok(AgentRunActivityOutput::Agent(&decision.text))
+    }
+}
+
+fn agent_run_error_with_projection(
+    projection: &StableChatProjection,
+    agent_key: &str,
+    message_id: TaskId,
+    error: CliError,
+) -> CliError {
+    let visible_error = error.to_string();
+    match projection.record_system_message(
+        agent_key,
+        message_id,
+        OffsetDateTime::now_utc(),
+        &visible_error,
+        true,
+    ) {
+        Ok(()) => error,
+        Err(projection_error) => CliError::Parse {
+            detail: format!(
+                "{visible_error}; recording the stable chat error also failed: {projection_error}"
+            ),
+        },
+    }
 }
 
 fn agent_run_compaction_evidence(
@@ -5100,6 +5224,10 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         sinomo_agent::local_workspace::provision_default_agent_session_sandbox(&config, mounts)
             .map_err(|detail| CliError::Parse { detail })?;
     }
+    // Stage every fallible principal-bound executor before touching the live
+    // registry. A failed SIFS/history setup must leave the previous agent's
+    // complete registry intact rather than exposing a partial rebuild.
+    let recall_tools = agent_recall_tool_registry(data_dir, definition)?;
     registry.clear();
     // Effect-boundary permissions are host-local state. Configure the
     // authoritative store after rebuilding the registry so unrestricted tools
@@ -5123,6 +5251,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         registry,
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
+    registry.replace_registered_tools_from(&recall_tools);
     let remote_transport: Arc<dyn sinomo_agent::AgentRemoteObjectRpcTransport> = Arc::new(
         sinomo_agent::TargetAwareAgentRemoteObjectRpcTransport::new(
             |target_node_id: Option<String>,
@@ -5144,6 +5273,23 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     sinomo_agent::register_remote_management_agent_tools(registry, remote_transport);
     registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+fn agent_recall_tool_registry(
+    data_dir: &SinomoDataDir,
+    definition: &AgentDefinition,
+) -> Result<AgentToolRegistry, CliError> {
+    let registry = AgentToolRegistry::new();
+    let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(data_dir, definition.key())
+        .map_err(|source| CliError::Parse {
+            detail: format!("configure agent Markdown memory notes: {source}"),
+        })?;
+    sinomo_agent::memory_notes::register_tools(
+        &registry,
+        sinomo_agent::MemoryNoteAgentToolConfig::from_backend(memory_backend),
+    );
+    agent_history::register_agent_history_search_tool(&registry, data_dir, definition.key())?;
+    Ok(registry)
 }
 
 fn sandbox_mounts_for_workspace_grants(

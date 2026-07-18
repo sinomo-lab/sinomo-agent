@@ -1,4 +1,5 @@
 use super::*;
+use crate::chat_activity::{StableChatProjection, background_handoff_notice};
 use crate::file_manager::{
     FileManagerEntryKind, FileManagerPreviewer, FileManagerPrompt, FileManagerState,
     format_file_size,
@@ -71,21 +72,15 @@ pub(super) fn run_tui_with_io_and_daemon_probe<R: BufRead, W: Write>(
     writer: &mut W,
     daemon: Option<DaemonStatus>,
 ) -> Result<(), CliError> {
-    let (handler, daemon) = main_agent_handler_for_tui(daemon)?;
-    run_tui_with_handler_io_and_daemon(reader, writer, handler, daemon)
-}
-
-fn main_agent_handler_for_tui(
-    daemon: Option<DaemonStatus>,
-) -> Result<
-    (
-        RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
-        Option<DaemonStatus>,
-    ),
-    CliError,
-> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    main_agent_handler_for_tui_with_data_dir(daemon, &data_dir)
+    let (handler, daemon) = main_agent_handler_for_tui_with_data_dir(daemon, &data_dir)?;
+    run_tui_with_handler_io_and_daemon_and_projection(
+        reader,
+        writer,
+        handler,
+        daemon,
+        Some(&data_dir),
+    )
 }
 
 fn runtime_main_agent_handler_for_tui(
@@ -159,13 +154,30 @@ pub(super) fn run_tui_with_handler_io_and_daemon<
     W: Write,
     H: InteractionEventHandler,
 >(
+    reader: R,
+    writer: W,
+    handler: H,
+    daemon: Option<DaemonStatus>,
+) -> Result<(), CliError> {
+    run_tui_with_handler_io_and_daemon_and_projection(reader, writer, handler, daemon, None)
+}
+
+fn run_tui_with_handler_io_and_daemon_and_projection<
+    R: BufRead,
+    W: Write,
+    H: InteractionEventHandler,
+>(
     mut reader: R,
     mut writer: W,
     handler: H,
     daemon: Option<DaemonStatus>,
+    data_dir: Option<&SinomoDataDir>,
 ) -> Result<(), CliError> {
     let mut runtime = new_interaction_runtime(handler, daemon.as_ref())?;
     let session = runtime.session().clone();
+    let projection = data_dir
+        .map(|data_dir| StableChatProjection::open(data_dir, &session))
+        .transpose()?;
 
     writeln!(writer, "Sinomo main agent").map_err(CliError::stdio)?;
     writeln!(writer, "session: {}", session.session_id).map_err(CliError::stdio)?;
@@ -211,7 +223,82 @@ pub(super) fn run_tui_with_handler_io_and_daemon<
                 streamed = true;
             }
         };
-        let outputs = runtime.ingest_user_input_streaming(line, &mut emit)?;
+        let stable_input_id = TaskId::generate();
+        let stable_input_at = OffsetDateTime::now_utc();
+        if !line.trim_start().starts_with('/')
+            && let Some(projection) = projection.as_ref()
+        {
+            projection.record_user_message(
+                runtime
+                    .handler()
+                    .stable_chat_agent_key()
+                    .as_deref()
+                    .unwrap_or("main-agent"),
+                stable_input_id.clone(),
+                stable_input_at,
+                line,
+            )?;
+        }
+        let is_command = line.trim_start().starts_with('/');
+        let interaction = (|| {
+            let outputs = if is_command {
+                runtime.ingest_user_input_streaming(line, &mut emit)?
+            } else {
+                runtime.ingest_user_input_with_item_id_and_context_attachments_streaming(
+                    line,
+                    stable_input_id.clone(),
+                    Vec::new(),
+                    &mut emit,
+                )?
+            };
+            runtime.handler_mut().join_stable_chat_turn()?;
+            let runtime_events = runtime.handler_mut().drain_stable_chat_runtime_events()?;
+            Ok::<_, CliError>((outputs, runtime_events))
+        })();
+        let (outputs, runtime_events) = match interaction {
+            Ok(result) => result,
+            Err(error) => {
+                if !is_command && let Some(projection) = projection.as_ref() {
+                    let projection_result = projection.record_system_message(
+                        runtime
+                            .handler()
+                            .stable_chat_agent_key()
+                            .as_deref()
+                            .unwrap_or("main-agent"),
+                        stable_tui_result_id(&stable_input_id, "failed")?,
+                        OffsetDateTime::now_utc(),
+                        &format!("Agent turn failed: {error}"),
+                        true,
+                    );
+                    if let Err(projection_error) = projection_result {
+                        return Err(combine_stable_chat_errors(error, projection_error));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let Some(projection) = projection.as_ref() {
+            let agent_key = runtime
+                .handler()
+                .stable_chat_agent_key()
+                .unwrap_or_else(|| "main-agent".to_string());
+            for event in &runtime_events {
+                projection.record_runtime_event(&agent_key, event)?;
+            }
+            if !is_command {
+                for (index, output) in outputs.iter().enumerate() {
+                    if let InteractionOutput::Line(line) = output {
+                        projection.record_system_message(
+                            &agent_key,
+                            stable_tui_result_id(&stable_input_id, &format!("output-{index}"))?,
+                            OffsetDateTime::now_utc(),
+                            line,
+                            false,
+                        )?;
+                    }
+                }
+            }
+        }
         if streamed {
             writeln!(writer).map_err(CliError::stdio)?;
         }
@@ -226,6 +313,11 @@ pub(super) fn run_tui_with_handler_io_and_daemon<
                 }
                 InteractionOutput::ModelUsage { .. } => {}
                 InteractionOutput::Exit => return Ok(()),
+            }
+        }
+        for event in runtime_events {
+            for line in stable_chat_runtime_event_lines(&event) {
+                writeln!(writer, "{line}").map_err(CliError::stdio)?;
             }
         }
     }
@@ -258,6 +350,37 @@ fn interaction_session_for_daemon(
     )
 }
 
+fn stable_chat_runtime_event_lines(event: &AgentRuntimeEvent) -> Vec<String> {
+    match &event.payload {
+        AgentRuntimeEventPayload::TurnFinalDecision {
+            decision,
+            stop_reason,
+            ..
+        } => {
+            let text = decision.text.trim();
+            let mut lines = vec![if !text.is_empty() {
+                text.to_string()
+            } else if *stop_reason == sinomo_agent::AgentStopReason::Cancelled {
+                "Agent turn cancelled.".to_string()
+            } else {
+                "No agent responded.".to_string()
+            }];
+            if let Some(handoff) = decision.background_handoff.as_ref() {
+                lines.push(background_handoff_notice(handoff));
+            }
+            lines
+        }
+        AgentRuntimeEventPayload::WorkerFailed { action, detail, .. } => {
+            vec![format!("Agent task failed: {action}: {detail}")]
+        }
+        AgentRuntimeEventPayload::WorkerStarted { .. }
+        | AgentRuntimeEventPayload::WorkerCompleted { .. }
+        | AgentRuntimeEventPayload::ModelProgress { .. }
+        | AgentRuntimeEventPayload::ToolProgress { .. }
+        | AgentRuntimeEventPayload::ControlEvent { .. } => Vec::new(),
+    }
+}
+
 fn new_tui_interaction_runtime<H: TuiAgentRuntimeControl>(
     handler: H,
     daemon: Option<&DaemonStatus>,
@@ -283,6 +406,7 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         daemon.as_ref(),
         runtime.handler.tui_agent_runtime_info(),
     );
+    let mut chat_projection = StableChatProjection::open(&data_dir, runtime.session())?;
     session_store.save_state(runtime.session(), &state)?;
     let mut terminal = TuiTerminalSession::enter()?;
 
@@ -291,7 +415,13 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         if state.exit_requested {
             break;
         }
-        if refresh_tui_runtime_events(&mut runtime, &mut state, &session_store)? {
+        if refresh_tui_runtime_events(
+            &mut runtime,
+            &mut state,
+            &session_store,
+            &data_dir,
+            &mut chat_projection,
+        )? {
             terminal.draw(&state)?;
         }
         if !event::poll(Duration::from_millis(250)).map_err(CliError::stdio)? {
@@ -307,6 +437,7 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
                     &data_dir,
                     &session_store,
                     daemon.as_ref(),
+                    &mut chat_projection,
                 )?;
                 terminal.draw(&state)?;
             }
@@ -321,6 +452,7 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
                     &data_dir,
                     &session_store,
                     daemon.as_ref(),
+                    &mut chat_projection,
                 )?;
                 terminal.draw(&state)?;
             }
@@ -344,6 +476,7 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
     data_dir: &SinomoDataDir,
     session_store: &TuiSessionStore,
     daemon: Option<&DaemonStatus>,
+    chat_projection: &mut StableChatProjection,
 ) -> Result<(), CliError> {
     match action {
         TuiInputAction::None => {}
@@ -356,6 +489,7 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
                 session_store,
                 daemon,
                 "/quit".to_string(),
+                chat_projection,
             )?;
         }
         TuiInputAction::Submit(line) => {
@@ -367,6 +501,7 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
                 session_store,
                 daemon,
                 line,
+                chat_projection,
             )?;
         }
         TuiInputAction::InterruptAgent => {
@@ -406,6 +541,7 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
             session_store.save_state(runtime.session(), state)?;
         }
     }
+    sync_stable_chat_projection(chat_projection, data_dir, runtime.session())?;
     Ok(())
 }
 
@@ -417,6 +553,7 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
     session_store: &TuiSessionStore,
     daemon: Option<&DaemonStatus>,
     line: String,
+    chat_projection: &mut StableChatProjection,
 ) -> Result<(), CliError> {
     let command = match parse_tui_slash_command(&line) {
         Ok(command) => command,
@@ -451,19 +588,28 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
 
     state.begin_submission(&line);
     terminal.draw(state)?;
-    let sandbox_node_id =
-        parse_tui_tool_runtime_state_node_id(state.tool_runtime_node_id.as_deref())?;
-    let session = runtime.session().clone();
-    runtime.handler.configure_tui_tool_runtime(
-        data_dir,
-        &session,
-        sandbox_node_id,
-        state.workspace_projection(),
-        state.daemon_connected,
+    sync_stable_chat_projection(chat_projection, data_dir, runtime.session())?;
+    let stable_input_id = TaskId::generate();
+    let stable_input_at = OffsetDateTime::now_utc();
+    chat_projection.record_user_message(
+        &state.runtime_info.agent,
+        stable_input_id.clone(),
+        stable_input_at,
+        &line,
     )?;
+    let result = (|| {
+        let sandbox_node_id =
+            parse_tui_tool_runtime_state_node_id(state.tool_runtime_node_id.as_deref())?;
+        let session = runtime.session().clone();
+        runtime.handler.configure_tui_tool_runtime(
+            data_dir,
+            &session,
+            sandbox_node_id,
+            state.workspace_projection(),
+            state.daemon_connected,
+        )?;
 
-    let mut render_error = None;
-    let result = {
+        let mut render_error = None;
         let mut emit = |output: InteractionOutput| {
             state.apply_output(output);
             if render_error.is_none() {
@@ -472,19 +618,46 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
                 }
             }
         };
-        runtime.ingest_user_input_streaming(&line, &mut emit)
-    };
-    if let Some(error) = render_error {
-        return Err(error);
-    }
+        let outputs = runtime.ingest_user_input_with_item_id_and_context_attachments_streaming(
+            &line,
+            stable_input_id.clone(),
+            Vec::new(),
+            &mut emit,
+        )?;
+        if let Some(error) = render_error {
+            return Err(error);
+        }
+        Ok::<_, CliError>(outputs)
+    })();
     match result {
         Ok(outputs) => {
-            for output in outputs {
+            let completed_at = OffsetDateTime::now_utc();
+            for (index, output) in outputs.into_iter().enumerate() {
+                if let InteractionOutput::Line(text) = &output {
+                    chat_projection.record_system_message(
+                        &state.runtime_info.agent,
+                        stable_tui_result_id(&stable_input_id, &format!("output-{index}"))?,
+                        completed_at,
+                        text,
+                        false,
+                    )?;
+                }
                 state.apply_output(output);
             }
         }
         Err(error) => {
-            state.apply_output(InteractionOutput::Line(format!("model failed: {error}")));
+            let message = format!("agent turn failed: {error}");
+            let projection_result = chat_projection.record_system_message(
+                &state.runtime_info.agent,
+                stable_tui_result_id(&stable_input_id, "failed")?,
+                OffsetDateTime::now_utc(),
+                &message,
+                true,
+            );
+            if let Err(projection_error) = projection_result {
+                return Err(combine_stable_chat_errors(error, projection_error));
+            }
+            state.apply_output(InteractionOutput::Line(message));
         }
     }
     state.finish_submission();
@@ -496,19 +669,50 @@ fn refresh_tui_runtime_events<H: TuiAgentRuntimeControl>(
     runtime: &mut InteractionRuntime<JsonlEventStore, H>,
     state: &mut TuiState,
     session_store: &TuiSessionStore,
+    data_dir: &SinomoDataDir,
+    chat_projection: &mut StableChatProjection,
 ) -> Result<bool, CliError> {
+    sync_stable_chat_projection(chat_projection, data_dir, runtime.session())?;
     let events = runtime.handler.drain_tui_runtime_events()?;
     if events.is_empty() {
         return Ok(false);
     }
     let mut changed = false;
     for event in events {
+        chat_projection.record_runtime_event(&state.runtime_info.agent, &event)?;
         changed |= state.apply_runtime_event(event);
     }
     if changed {
         session_store.save_state(runtime.session(), state)?;
     }
     Ok(changed)
+}
+
+fn sync_stable_chat_projection(
+    projection: &mut StableChatProjection,
+    data_dir: &SinomoDataDir,
+    session: &InteractionSession,
+) -> Result<(), CliError> {
+    if !projection.is_for_session(session) {
+        *projection = StableChatProjection::open(data_dir, session)?;
+    }
+    Ok(())
+}
+
+fn stable_tui_result_id(input_id: &TaskId, kind: &str) -> Result<TaskId, CliError> {
+    TaskId::from_legacy_named(format!("cli-chat:{input_id}:{kind}")).map_err(|source| {
+        CliError::Parse {
+            detail: format!("derive stable TUI result id: {source}"),
+        }
+    })
+}
+
+fn combine_stable_chat_errors(original: CliError, projection: CliError) -> CliError {
+    CliError::Parse {
+        detail: format!(
+            "{original}; recording the visible failure in stable chat history also failed: {projection}"
+        ),
+    }
 }
 
 struct TuiTerminalSession {
@@ -1119,6 +1323,21 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         self.switch_tui_agent(data_dir, daemon_connected, definition)
+    }
+
+    fn snapshot_tui_resume(
+        &mut self,
+        _session: &InteractionSession,
+    ) -> Result<Option<TuiAgentResumeSnapshot>, CliError> {
+        Ok(None)
+    }
+
+    fn rollback_tui_resume(
+        &mut self,
+        _data_dir: &SinomoDataDir,
+        _snapshot: Option<TuiAgentResumeSnapshot>,
+    ) -> Result<(), CliError> {
+        Ok(())
     }
 
     fn load_tui_agent_session(
@@ -2524,28 +2743,32 @@ impl TuiState {
     ) {
         self.suppress_structured_model_stream = false;
         let text = decision.text.trim();
-        if text.is_empty() {
-            return;
-        }
-        if let Some(index) = self.stream_message.take()
-            && let Some(message) = self.messages.get_mut(index)
-            && message.kind == TuiMessageKind::Agent
-        {
-            let streamed = message.text.trim();
-            if streamed == text {
-                return;
+        if !text.is_empty() {
+            let mut reconciled_stream = false;
+            if let Some(index) = self.stream_message.take()
+                && let Some(message) = self.messages.get_mut(index)
+                && message.kind == TuiMessageKind::Agent
+            {
+                let streamed = message.text.trim();
+                if streamed == text {
+                    reconciled_stream = true;
+                } else if text.starts_with(streamed) {
+                    message.text = text.to_string();
+                    reconciled_stream = true;
+                }
             }
-            if text.starts_with(streamed) {
-                message.text = text.to_string();
-                return;
+            if !reconciled_stream {
+                let kind = if stop_reason == sinomo_agent::AgentStopReason::Cancelled {
+                    TuiMessageKind::System
+                } else {
+                    TuiMessageKind::Agent
+                };
+                self.push_message(kind, text);
             }
         }
-        let kind = if stop_reason == sinomo_agent::AgentStopReason::Cancelled {
-            TuiMessageKind::System
-        } else {
-            TuiMessageKind::Agent
-        };
-        self.push_message(kind, text);
+        if let Some(handoff) = decision.background_handoff.as_ref() {
+            self.push_message(TuiMessageKind::System, background_handoff_notice(handoff));
+        }
     }
 
     fn apply_model_progress_event(&mut self, event: AgentModelEvent) {
@@ -3322,6 +3545,45 @@ fn save_tui_setting(
 }
 
 fn resume_tui_session<H: TuiAgentRuntimeControl>(
+    runtime: &mut InteractionRuntime<JsonlEventStore, H>,
+    state: &mut TuiState,
+    session_store: &TuiSessionStore,
+    data_dir: &SinomoDataDir,
+    daemon: Option<&DaemonStatus>,
+    session_id: SessionId,
+) -> Result<Vec<InteractionOutput>, CliError> {
+    if runtime.session().session_id == session_id {
+        state.close_session_list();
+        return Ok(vec![InteractionOutput::Line(format!(
+            "session already active: {session_id}"
+        ))]);
+    }
+
+    let previous_store = runtime.store().clone();
+    let previous_session = runtime.session().clone();
+    let previous_state = state.clone();
+    let handler_snapshot = runtime.handler.snapshot_tui_resume(&previous_session)?;
+    match resume_tui_session_inner(runtime, state, session_store, data_dir, daemon, session_id) {
+        Ok(outputs) => Ok(outputs),
+        Err(error) => {
+            let rollback = runtime
+                .handler
+                .rollback_tui_resume(data_dir, handler_snapshot);
+            runtime.replace_store_and_session(previous_store, previous_session);
+            *state = previous_state;
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(CliError::Parse {
+                    detail: format!(
+                        "resume TUI session failed: {error}; rollback failed: {rollback}"
+                    ),
+                }),
+            }
+        }
+    }
+}
+
+fn resume_tui_session_inner<H: TuiAgentRuntimeControl>(
     runtime: &mut InteractionRuntime<JsonlEventStore, H>,
     state: &mut TuiState,
     session_store: &TuiSessionStore,
@@ -4888,6 +5150,89 @@ mod tui_tests {
         AgentRuntimeEvent::new(SessionId::generate(), payload)
     }
 
+    struct StableProjectionLineHandler {
+        events: Vec<AgentRuntimeEvent>,
+    }
+
+    impl InteractionEventHandler for StableProjectionLineHandler {
+        fn handle_event<S: EventStore>(
+            &mut self,
+            _store: &mut S,
+            session: &InteractionSession,
+            event: &EventEnvelope,
+        ) -> Result<Vec<InteractionOutput>, CliError> {
+            let text = event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if text.trim_start().starts_with('/') {
+                return Ok(vec![InteractionOutput::Exit]);
+            }
+            self.events.push(AgentRuntimeEvent::new(
+                session.session_id.clone(),
+                AgentRuntimeEventPayload::TurnFinalDecision {
+                    sequence: 1,
+                    op_id: TaskId::from_legacy_named("line_projection_op").expect("op id"),
+                    decision: AgentLoopDecision {
+                        response_mode: sinomo_agent::AgentLoopResponseMode::Answer,
+                        text: "typed answer".to_string(),
+                        tool_calls: Vec::new(),
+                        background_handoff: None,
+                        next_state: sinomo_agent::AgentInteractionState::Listening,
+                    },
+                    stop_reason: sinomo_agent::AgentStopReason::FinalDecision,
+                },
+            ));
+            Ok(Vec::new())
+        }
+
+        fn stable_chat_agent_key(&self) -> Option<String> {
+            Some("main-agent".to_string())
+        }
+
+        fn drain_stable_chat_runtime_events(&mut self) -> Result<Vec<AgentRuntimeEvent>, CliError> {
+            Ok(std::mem::take(&mut self.events))
+        }
+    }
+
+    #[test]
+    fn line_mode_projects_typed_user_and_agent_messages_to_sifs_chat() {
+        use crate::app_api::SifsAgentChannelStore;
+        use sinomo_agent::{AgentChannelAuthor, AgentChannelKind, AgentChannelStore};
+
+        let root = sinomo_testdir::TestDir::new("sinomo-line-chat-projection");
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let mut output = Vec::new();
+        run_tui_with_handler_io_and_daemon_and_projection(
+            std::io::Cursor::new("question\n/quit\n"),
+            &mut output,
+            StableProjectionLineHandler { events: Vec::new() },
+            None,
+            Some(&data_dir),
+        )
+        .expect("line mode");
+
+        let channels = SifsAgentChannelStore::open(&data_dir)
+            .expect("store")
+            .list_channels()
+            .expect("channels");
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].channel_kind, AgentChannelKind::Chat);
+        assert_eq!(channels[0].transcript.len(), 2);
+        assert_eq!(channels[0].transcript[0].content, "question");
+        assert_eq!(channels[0].transcript[1].content, "typed answer");
+        assert!(matches!(
+            channels[0].transcript[1].author,
+            AgentChannelAuthor::Agent { ref agent_key, .. } if agent_key == "main-agent"
+        ));
+        assert!(
+            String::from_utf8(output)
+                .expect("utf8")
+                .contains("typed answer")
+        );
+    }
+
     fn process_snapshot(
         status: sinomo_agent::AgentProcessLifecycleStatus,
         stdout: &str,
@@ -5127,6 +5472,53 @@ mod tui_tests {
                 .iter()
                 .any(|message| message.kind == TuiMessageKind::Agent && message.text == "ready")
         );
+    }
+
+    #[test]
+    fn tui_keeps_text_and_sanitized_background_handoff_request_visible() {
+        let mut state = fixture_tui_state();
+        let event = runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+            sequence: 2,
+            op_id: sinomo_agent::TaskId::generate(),
+            decision: AgentLoopDecision {
+                response_mode: sinomo_agent::AgentLoopResponseMode::Acknowledge,
+                text: "I will continue this in the background.".to_string(),
+                tool_calls: Vec::new(),
+                background_handoff: Some(sinomo_agent::BackgroundHandoffRequest {
+                    reason: "observe recovery".to_string(),
+                    evidence_ref: "sifs:/private/evidence/secret.json".to_string(),
+                    priority: sinomo_agent::BackgroundHandoffPriority::Routine,
+                }),
+                next_state: sinomo_agent::AgentInteractionState::Delegating,
+            },
+            stop_reason: sinomo_agent::AgentStopReason::FinalDecision,
+        });
+
+        assert_eq!(
+            stable_chat_runtime_event_lines(&event),
+            vec![
+                "I will continue this in the background.".to_string(),
+                "Background handoff requested (routine): observe recovery".to_string(),
+            ]
+        );
+        state.apply_runtime_event(event);
+
+        assert!(state.messages.iter().any(|message| {
+            message.kind == TuiMessageKind::Agent
+                && message.text == "I will continue this in the background."
+        }));
+        let handoff = state
+            .messages
+            .iter()
+            .find(|message| message.text.starts_with("Background handoff requested"))
+            .expect("handoff notice");
+        assert_eq!(handoff.kind, TuiMessageKind::System);
+        assert_eq!(
+            handoff.text,
+            "Background handoff requested (routine): observe recovery"
+        );
+        assert!(!handoff.text.contains("evidence"));
+        assert!(!handoff.text.contains("secret"));
     }
 
     #[test]
@@ -6375,6 +6767,71 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_and_app_agent_switches_atomically_rebind_recall_tool_authority() {
+        let root = temp_file_browser_root("agent-switch-recall-authority");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_recall_rebind").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-recall-rebind",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let path = "switch/authority.md";
+
+        let main_write = execute_tui_workspace_tool(
+            &handler,
+            &session,
+            0,
+            "memory_write",
+            serde_json::json!({ "path": path, "markdown": "main authority" }),
+        );
+        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
+
+        handler
+            .switch_tui_agent(&data_dir, false, AgentDefinition::coding())
+            .expect("switch to coding agent");
+        let coding_write = execute_tui_workspace_tool(
+            &handler,
+            &session,
+            1,
+            "memory_write",
+            serde_json::json!({ "path": path, "markdown": "coding authority" }),
+        );
+        assert_eq!(
+            coding_write.status,
+            sinomo_agent::AgentToolStatus::Succeeded,
+            "a stale main-agent backend would report note_already_exists: {coding_write:?}"
+        );
+        let coding_read = execute_tui_workspace_tool(
+            &handler,
+            &session,
+            2,
+            "memory_read",
+            serde_json::json!({ "path": path }),
+        );
+        assert_eq!(coding_read.output["markdown"], "coding authority");
+
+        handler
+            .switch_tui_agent(&data_dir, false, AgentDefinition::main())
+            .expect("switch back to main agent");
+        let main_read = execute_tui_workspace_tool(
+            &handler,
+            &session,
+            3,
+            "memory_read",
+            serde_json::json!({ "path": path }),
+        );
+        assert_eq!(main_read.output["markdown"], "main authority");
+    }
+
+    #[test]
     fn tui_agent_switch_persists_identity_and_generic_workspace_immediately() {
         let root = temp_file_browser_root("durable-agent-switch");
         let data_dir = SinomoDataDir::new(root.join("data"));
@@ -6399,6 +6856,18 @@ mod tui_tests {
                 InteractionSurfaceKind::CommandLine,
             ),
         );
+        let recall_path = "switch/session-authority.md";
+        let main_write = execute_tui_workspace_tool(
+            &handler,
+            &session,
+            0,
+            "memory_write",
+            serde_json::json!({
+                "path": recall_path,
+                "markdown": "main session authority",
+            }),
+        );
+        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
 
         let info = handler
             .switch_tui_agent_for_session(
@@ -6432,6 +6901,21 @@ mod tui_tests {
                 .expect("live snapshot")
                 .expect("live session"),
             persisted
+        );
+        let coding_write = execute_tui_workspace_tool(
+            &handler,
+            &session,
+            1,
+            "memory_write",
+            serde_json::json!({
+                "path": recall_path,
+                "markdown": "coding session authority",
+            }),
+        );
+        assert_eq!(
+            coding_write.status,
+            sinomo_agent::AgentToolStatus::Succeeded,
+            "session-aware switch retained the previous principal: {coding_write:?}"
         );
     }
 
@@ -6517,6 +7001,21 @@ mod tui_tests {
             ModelRuntimeConfig::default(),
         )
         .expect("handler");
+        let recall_path = "resume/authority.md";
+        let main_recall_write = execute_tui_workspace_tool(
+            &handler,
+            &target_session,
+            0,
+            "memory_write",
+            serde_json::json!({
+                "path": recall_path,
+                "markdown": "main session memory",
+            }),
+        );
+        assert_eq!(
+            main_recall_write.status,
+            sinomo_agent::AgentToolStatus::Succeeded
+        );
         let mut runtime =
             new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
         let mut state = TuiState::new(
@@ -6550,6 +7049,21 @@ mod tui_tests {
             resumed.workspace_binding,
             Some(WorkspaceRef::local_path(conversation_workspace.clone()))
         );
+        let coding_recall_write = execute_tui_workspace_tool(
+            &runtime.handler,
+            &target_session,
+            1,
+            "memory_write",
+            serde_json::json!({
+                "path": recall_path,
+                "markdown": "coding session memory",
+            }),
+        );
+        assert_eq!(
+            coding_recall_write.status,
+            sinomo_agent::AgentToolStatus::Succeeded,
+            "resume must replace the previous agent's note backend before returning: {coding_recall_write:?}"
+        );
         let resumed_interaction = runtime.session().clone();
         runtime
             .handler
@@ -6564,6 +7078,115 @@ mod tui_tests {
         assert_eq!(
             runtime.handler.workspace_root.as_deref(),
             Some(conversation_workspace.as_path())
+        );
+    }
+
+    #[test]
+    fn tui_resume_failure_restores_outer_session_recall_authority_and_route() {
+        let root = temp_file_browser_root("resume-transaction-rollback");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session_store = TuiSessionStore::for_data_dir(&data_dir);
+        let target_session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_tui_resume_rollback").expect("node"),
+            InteractionSurface::new(
+                "surface.tui-resume-rollback",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let mut target_state = TuiState::new(
+            &target_session,
+            None,
+            TuiAgentRuntimeInfo {
+                agent: "coding-agent".to_string(),
+                ..TuiAgentRuntimeInfo::default()
+            },
+        );
+        target_state.push_message(TuiMessageKind::User, "corrupt this resume after prepare");
+        session_store
+            .save_state(&target_session, &target_state)
+            .expect("save target state");
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(
+                &AgentSession::new(target_session.session_id.clone(), AgentRole::Deliberation)
+                    .with_agent_definition_key("coding-agent"),
+            )
+            .expect("save target canonical session");
+        fs::write(
+            session_store.transcript_path_for_session(&target_session.session_id),
+            b"{not valid json",
+        )
+        .expect("corrupt target transcript");
+
+        let handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let memory_path = "resume/rollback.md";
+        let previous_memory = execute_tui_workspace_tool(
+            &handler,
+            &target_session,
+            0,
+            "memory_write",
+            serde_json::json!({
+                "path": memory_path,
+                "markdown": "main authority remains attached",
+            }),
+        );
+        assert_eq!(
+            previous_memory.status,
+            sinomo_agent::AgentToolStatus::Succeeded
+        );
+        let mut runtime =
+            new_tui_interaction_runtime(handler, None, &session_store).expect("runtime");
+        let previous_interaction_session = runtime.session().clone();
+        let mut state = TuiState::new(
+            runtime.session(),
+            None,
+            runtime.handler.tui_agent_runtime_info(),
+        );
+
+        resume_tui_session(
+            &mut runtime,
+            &mut state,
+            &session_store,
+            &data_dir,
+            None,
+            target_session.session_id.clone(),
+        )
+        .expect_err("corrupt transcript must reject resume");
+
+        assert_eq!(runtime.session(), &previous_interaction_session);
+        assert_eq!(runtime.handler.tui_agent_runtime_info().agent, "main-agent");
+        let restored = runtime
+            .handler
+            .agent_session_snapshot()
+            .expect("snapshot")
+            .expect("attached session");
+        assert_eq!(restored.session_id, previous_interaction_session.session_id);
+        assert_eq!(restored.agent_definition_key.as_deref(), Some("main-agent"));
+        let registry = runtime.handler.runtime_control_registry();
+        assert!(
+            registry
+                .contains_session(&previous_interaction_session.session_id)
+                .expect("previous route")
+        );
+        assert!(
+            !registry
+                .contains_session(&target_session.session_id)
+                .expect("target route")
+        );
+        let restored_memory = execute_tui_workspace_tool(
+            &runtime.handler,
+            &previous_interaction_session,
+            1,
+            "memory_read",
+            serde_json::json!({ "path": memory_path }),
+        );
+        assert_eq!(
+            restored_memory.output["markdown"],
+            "main authority remains attached"
         );
     }
 
@@ -6795,6 +7418,18 @@ pub trait InteractionEventHandler {
     ) -> Result<Vec<InteractionOutput>, CliError> {
         let _ = emit;
         self.handle_event(store, session, event)
+    }
+
+    fn stable_chat_agent_key(&self) -> Option<String> {
+        None
+    }
+
+    fn join_stable_chat_turn(&mut self) -> Result<(), CliError> {
+        Ok(())
+    }
+
+    fn drain_stable_chat_runtime_events(&mut self) -> Result<Vec<AgentRuntimeEvent>, CliError> {
+        Ok(Vec::new())
     }
 }
 
@@ -7117,6 +7752,25 @@ where
     workspace_root: Option<PathBuf>,
 }
 
+pub(crate) struct RuntimeMainAgentTransitionSnapshot<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    runtime: AgentSessionRuntime<M>,
+    runtime_session: AgentSession,
+    runtime_cursor: AgentRuntimeEventCursor,
+    agent_definition: AgentDefinition,
+    tool_registry: sinomo_agent::AgentToolRegistry,
+    provider: String,
+    model_name: String,
+    account: Option<String>,
+    reasoning_effort: Option<ProviderReasoningEffort>,
+    reasoning_budget_tokens: Option<u32>,
+    workspace_root: Option<PathBuf>,
+}
+
+type TuiAgentResumeSnapshot = RuntimeMainAgentTransitionSnapshot<DefaultMainAgentChatModel>;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ThinkingStreamDisplay {
@@ -7337,9 +7991,13 @@ where
         model_name: String,
         account: Option<String>,
         options: LanguageModelProviderOptions,
-        rebind_agent_identity: bool,
+        recall_transition: Option<&AgentRecallToolTransition>,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         let previous_runtime = self.runtime.take();
+        let previous_control_runtime = match previous_runtime.as_ref() {
+            Some(RuntimeMainAgentSlot::Ready(runtime)) => Some((*runtime).clone()),
+            Some(RuntimeMainAgentSlot::Pending(_)) | None => None,
+        };
         let preserved_session = match previous_runtime.as_ref() {
             Some(RuntimeMainAgentSlot::Ready(runtime)) => {
                 let snapshot = (|| {
@@ -7361,6 +8019,21 @@ where
             Some(RuntimeMainAgentSlot::Pending(_)) | None => None,
         };
 
+        // Detach the externally reachable old runtime before removing its
+        // principal-bound executors. New calls fail closed until the target
+        // runtime is published and the complete target bundle is installed.
+        if recall_transition.is_some()
+            && let Some(session) = preserved_session.as_ref()
+            && let Err(error) = self.unregister_runtime_control_session(&session.session_id)
+        {
+            self.runtime = previous_runtime;
+            return Err(error);
+        }
+        if recall_transition.is_some() {
+            self.tool_registry
+                .remove_registered_tools(AGENT_RECALL_TOOL_NAMES);
+        }
+
         let previous_provider = std::mem::replace(&mut self.provider, provider);
         let previous_model_name = std::mem::replace(&mut self.model_name, model_name);
         let previous_account = std::mem::replace(&mut self.account, account);
@@ -7372,7 +8045,7 @@ where
         );
         let next_runtime = match preserved_session {
             Some(mut session) => {
-                if rebind_agent_identity {
+                if recall_transition.is_some() {
                     // Only an explicit user agent switch may change the
                     // identity of the currently attached live session.
                     session.role = self.agent_definition.role.clone();
@@ -7380,19 +8053,37 @@ where
                 }
                 let runtime = self.build_runtime(model, session);
                 if let Err(error) = self.register_runtime_control(&runtime) {
+                    if let Some(transition) = recall_transition {
+                        self.tool_registry
+                            .replace_registered_tools_from(&transition.previous);
+                    }
+                    let control_rollback = previous_control_runtime
+                        .as_ref()
+                        .and_then(|runtime| self.register_runtime_control(runtime).err());
                     self.provider = previous_provider;
                     self.model_name = previous_model_name;
                     self.account = previous_account;
                     self.reasoning_effort = previous_reasoning_effort;
                     self.reasoning_budget_tokens = previous_reasoning_budget_tokens;
                     self.runtime = previous_runtime;
-                    return Err(error);
+                    return Err(match control_rollback {
+                        Some(rollback) => CliError::Parse {
+                            detail: format!(
+                                "replace agent runtime failed: {error}; restore previous runtime-control route failed: {rollback}"
+                            ),
+                        },
+                        None => error,
+                    });
                 }
                 RuntimeMainAgentSlot::Ready(runtime)
             }
             None => RuntimeMainAgentSlot::Pending(model),
         };
         self.runtime = Some(next_runtime);
+        if let Some(transition) = recall_transition {
+            self.tool_registry
+                .replace_registered_tools_from(&transition.next);
+        }
         self.runtime_cursor = AgentRuntimeEventCursor {
             offset: 0,
             last_event_id: None,
@@ -7433,20 +8124,7 @@ where
         agent_session.agent_definition_key = Some(self.agent_definition.key().to_string());
         agent_session.transcript = transcript.clone();
         agent_session.raw_transcript = transcript;
-        let (previous_session_id, cursor, runtime_handle) = {
-            let runtime = self.ensure_runtime(interaction_session)?;
-            let previous_session_id = runtime.session_snapshot()?.session_id;
-            runtime.replace_session(agent_session)?;
-            (
-                previous_session_id,
-                runtime.runtime_event_cursor()?,
-                runtime.clone(),
-            )
-        };
-        self.unregister_runtime_control_session(&previous_session_id)?;
-        self.register_runtime_control(&runtime_handle)?;
-        self.runtime_cursor = cursor;
-        Ok(())
+        self.replace_attached_agent_session(interaction_session, agent_session)
     }
 
     pub(crate) fn replace_full_agent_session(
@@ -7473,20 +8151,72 @@ where
             });
         }
         agent_session.role = self.agent_definition.role.clone();
-        let (previous_session_id, cursor, runtime_handle) = {
-            let runtime = self.ensure_runtime(interaction_session)?;
-            let previous_session_id = runtime.session_snapshot()?.session_id;
-            runtime.replace_session(agent_session)?;
-            (
-                previous_session_id,
-                runtime.runtime_event_cursor()?,
-                runtime.clone(),
-            )
+        self.replace_attached_agent_session(interaction_session, agent_session)
+    }
+
+    fn replace_attached_agent_session(
+        &mut self,
+        interaction_session: &InteractionSession,
+        agent_session: AgentSession,
+    ) -> Result<(), CliError> {
+        let runtime = self.ensure_runtime(interaction_session)?.clone();
+        let previous_session = runtime.session_snapshot()?;
+        self.unregister_runtime_control_session(&previous_session.session_id)?;
+
+        if let Err(error) = runtime.replace_session(agent_session) {
+            let route_rollback = self.register_runtime_control(&runtime).err();
+            return Err(match route_rollback {
+                Some(rollback) => CliError::Parse {
+                    detail: format!(
+                        "replace agent session failed: {error}; restoring the previous runtime-control route also failed: {rollback}"
+                    ),
+                },
+                None => error.into(),
+            });
+        }
+
+        let cursor = match runtime.runtime_event_cursor() {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                return Err(self.rollback_attached_agent_session(
+                    &runtime,
+                    previous_session,
+                    error.into(),
+                ));
+            }
         };
-        self.unregister_runtime_control_session(&previous_session_id)?;
-        self.register_runtime_control(&runtime_handle)?;
+        if let Err(error) = self.register_runtime_control(&runtime) {
+            return Err(self.rollback_attached_agent_session(&runtime, previous_session, error));
+        }
         self.runtime_cursor = cursor;
         Ok(())
+    }
+
+    fn rollback_attached_agent_session(
+        &self,
+        runtime: &AgentSessionRuntime<M>,
+        previous_session: AgentSession,
+        error: CliError,
+    ) -> CliError {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback) = runtime.replace_session(previous_session) {
+            rollback_errors.push(format!("restore previous live session: {rollback}"));
+        }
+        if let Err(rollback) = self.register_runtime_control(runtime) {
+            rollback_errors.push(format!(
+                "restore previous runtime-control route: {rollback}"
+            ));
+        }
+        if rollback_errors.is_empty() {
+            error
+        } else {
+            CliError::Parse {
+                detail: format!(
+                    "replace agent session failed: {error}; rollback failed: {}",
+                    rollback_errors.join("; ")
+                ),
+            }
+        }
     }
 
     pub(crate) fn agent_session_snapshot(&self) -> Result<Option<AgentSession>, CliError> {
@@ -7494,6 +8224,102 @@ where
             return Ok(None);
         };
         Ok(Some(runtime.session_snapshot()?))
+    }
+
+    pub(crate) fn transition_snapshot(
+        &mut self,
+        interaction_session: &InteractionSession,
+    ) -> Result<RuntimeMainAgentTransitionSnapshot<M>, CliError> {
+        let (runtime, runtime_session) = {
+            let runtime = self.ensure_runtime(interaction_session)?;
+            if runtime.active_turn()?.is_some() {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "cannot begin a session transition while agent session `{}` has an active turn",
+                        interaction_session.session_id
+                    ),
+                });
+            }
+            runtime.join_active_turn()?;
+            (runtime.clone(), runtime.session_snapshot()?)
+        };
+        if runtime_session.session_id != interaction_session.session_id {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent runtime session `{}` does not match transition request for `{}`",
+                    runtime_session.session_id, interaction_session.session_id
+                ),
+            });
+        }
+        Ok(RuntimeMainAgentTransitionSnapshot {
+            runtime,
+            runtime_session,
+            runtime_cursor: self.runtime_cursor.clone(),
+            agent_definition: self.agent_definition.clone(),
+            tool_registry: self.tool_registry.detached_snapshot(),
+            provider: self.provider.clone(),
+            model_name: self.model_name.clone(),
+            account: self.account.clone(),
+            reasoning_effort: self.reasoning_effort,
+            reasoning_budget_tokens: self.reasoning_budget_tokens,
+            workspace_root: self.workspace_root.clone(),
+        })
+    }
+
+    pub(crate) fn restore_transition_snapshot(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        snapshot: RuntimeMainAgentTransitionSnapshot<M>,
+    ) -> Result<(), CliError> {
+        let current_runtime = self.ready_runtime().cloned();
+        if let Some(runtime) = current_runtime.as_ref() {
+            if runtime.active_turn()?.is_some() {
+                let _ = runtime.interrupt_active_turn("session transition rolled back")?;
+            }
+            runtime.join_active_turn()?;
+        }
+
+        if let Some(runtime) = current_runtime.as_ref() {
+            let current_session_id = runtime.session_snapshot()?.session_id;
+            self.unregister_runtime_control_session(&current_session_id)?;
+        }
+        if current_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.session_snapshot().ok())
+            .is_none_or(|session| session.session_id != snapshot.runtime_session.session_id)
+        {
+            self.unregister_runtime_control_session(&snapshot.runtime_session.session_id)?;
+        }
+
+        // Once both possible routes are detached, remove every executor so a
+        // stale runtime handle also fails closed while the old state is restored.
+        self.tool_registry.clear();
+        if snapshot.runtime.session_snapshot()? != snapshot.runtime_session {
+            snapshot
+                .runtime
+                .replace_session(snapshot.runtime_session.clone())?;
+        }
+
+        self.agent_definition = snapshot.agent_definition;
+        self.provider = snapshot.provider;
+        self.model_name = snapshot.model_name;
+        self.account = snapshot.account;
+        self.reasoning_effort = snapshot.reasoning_effort;
+        self.reasoning_budget_tokens = snapshot.reasoning_budget_tokens;
+        self.workspace_root = snapshot.workspace_root;
+        self.runtime_cursor = snapshot.runtime_cursor;
+        self.runtime = Some(RuntimeMainAgentSlot::Ready(snapshot.runtime.clone()));
+
+        if let Err(error) = self.register_runtime_control(&snapshot.runtime) {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "restore previous runtime-control route failed: {error}; previous executors remain detached"
+                ),
+            });
+        }
+        self.tool_registry
+            .replace_all_registered_from(&snapshot.tool_registry);
+        self.persist_attached_agent_session(data_dir, &snapshot.runtime_session.session_id)
     }
 
     pub(crate) fn load_persisted_agent_session(
@@ -7554,6 +8380,31 @@ where
 fn runtime_control_cli_error(error: sinomo_agent::AgentRuntimeControlError) -> CliError {
     CliError::Parse {
         detail: format!("agent runtime control registry: {error}"),
+    }
+}
+
+const AGENT_RECALL_TOOL_NAMES: &[&str] = &[
+    "session_history_search",
+    "memory_search",
+    "memory_read",
+    "memory_write",
+];
+
+struct AgentRecallToolTransition {
+    previous: AgentToolRegistry,
+    next: AgentToolRegistry,
+}
+
+impl AgentRecallToolTransition {
+    fn stage(
+        data_dir: &SinomoDataDir,
+        previous: &AgentDefinition,
+        next: &AgentDefinition,
+    ) -> Result<Self, CliError> {
+        Ok(Self {
+            previous: agent_recall_tool_registry(data_dir, previous)?,
+            next: agent_recall_tool_registry(data_dir, next)?,
+        })
     }
 }
 
@@ -7639,6 +8490,15 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         rebind_agent_identity: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         let definition = self.validate_agent_definition(definition)?;
+        // Build every fallible principal-bound executor before changing the
+        // live definition/session. The model switch removes the old bundle
+        // while the runtime-control route is detached, then publishes the new
+        // runtime before installing the target bundle.
+        let recall_transition = rebind_agent_identity
+            .then(|| {
+                AgentRecallToolTransition::stage(data_dir, &self.agent_definition, &definition)
+            })
+            .transpose()?;
         let previous_definition = std::mem::replace(&mut self.agent_definition, definition);
         let selection = TuiModelSelection {
             provider: self.provider.clone(),
@@ -7652,7 +8512,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             data_dir,
             selection,
             daemon_connected,
-            rebind_agent_identity,
+            recall_transition.as_ref(),
         ) {
             Ok(info) => Ok(info),
             Err(error) => {
@@ -7737,8 +8597,14 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 },
             });
         }
+        // Apply non-principal session changes first, but keep the live role
+        // and identity on the old principal until `replace_model` has detached
+        // the runtime-control route and failed the recall bundle closed.
+        let mut attached_candidate = candidate;
+        attached_candidate.role = previous_session.role.clone();
+        attached_candidate.agent_definition_key = previous_session.agent_definition_key.clone();
         if let Some(runtime) = self.ready_runtime()
-            && let Err(error) = runtime.replace_session(candidate)
+            && let Err(error) = runtime.replace_session(attached_candidate)
         {
             let rollback = store.save_session(&previous_session).err();
             return Err(CliError::Parse {
@@ -7787,7 +8653,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         selection: TuiModelSelection,
         daemon_connected: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        self.switch_to_selection_with_agent_rebind(data_dir, selection, daemon_connected, false)
+        self.switch_to_selection_with_agent_rebind(data_dir, selection, daemon_connected, None)
     }
 
     fn switch_to_selection_with_agent_rebind(
@@ -7795,7 +8661,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         data_dir: &SinomoDataDir,
         selection: TuiModelSelection,
         daemon_connected: bool,
-        rebind_agent_identity: bool,
+        recall_transition: Option<&AgentRecallToolTransition>,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         with_tui_model_config_mode(daemon_connected, || {
             let (runtime_config, _) = load_model_runtime_config_for_node(data_dir)?;
@@ -7813,7 +8679,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         info.model,
                         info.account,
                         LanguageModelProviderOptions::default(),
-                        rebind_agent_identity,
+                        recall_transition,
                     )
                 }
                 MINICPM_PROVIDER_ID => {
@@ -7835,7 +8701,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         model_name,
                         None,
                         LanguageModelProviderOptions::default(),
-                        rebind_agent_identity,
+                        recall_transition,
                     )
                 }
                 provider => {
@@ -7857,7 +8723,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         selection.model,
                         Some(selection.account),
                         options,
-                        rebind_agent_identity,
+                        recall_transition,
                     )
                 }
             }
@@ -8141,17 +9007,16 @@ pub(crate) fn app_switch_agent(
     Ok((&info).into())
 }
 
-/// Load an agent definition for an immediately following durable-session
-/// restore without changing the identity of the session currently attached to
-/// the handler.
-pub(crate) fn app_prepare_agent(
+/// Attach a durable GUI session after switching its validated agent identity,
+/// and commit that agent's recall principal before returning to the app.
+pub(crate) fn app_restore_agent_session(
     handler: &mut RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
     data_dir: &SinomoDataDir,
-    definition: AgentDefinition,
-    daemon_connected: bool,
-) -> Result<AppRuntimeInfo, CliError> {
-    let info = handler.switch_agent_definition(data_dir, definition, daemon_connected, false)?;
-    Ok((&info).into())
+    session: &InteractionSession,
+    persisted: Option<AgentSession>,
+    transcript: sinomo_agent::AgentTranscript,
+) -> Result<(), CliError> {
+    handler.restore_tui_agent_session(data_dir, session, persisted, transcript)
 }
 
 /// Read the current runtime selection of a GUI chat handler.
@@ -8162,7 +9027,7 @@ pub(crate) fn app_runtime_info(
 }
 
 #[cfg(test)]
-fn execute_tui_workspace_tool(
+pub(crate) fn execute_tui_workspace_tool(
     handler: &RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
     session: &InteractionSession,
     call_index: usize,
@@ -8579,7 +9444,28 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         daemon_connected: bool,
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        self.switch_agent_definition(data_dir, definition, daemon_connected, false)
+        // Session restore preparation is externally observable through runtime
+        // control, so publish the target definition, session identity, and
+        // recall bundle together instead of retaining the old principal.
+        self.switch_agent_definition(data_dir, definition, daemon_connected, true)
+    }
+
+    fn snapshot_tui_resume(
+        &mut self,
+        session: &InteractionSession,
+    ) -> Result<Option<TuiAgentResumeSnapshot>, CliError> {
+        self.transition_snapshot(session).map(Some)
+    }
+
+    fn rollback_tui_resume(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        snapshot: Option<TuiAgentResumeSnapshot>,
+    ) -> Result<(), CliError> {
+        match snapshot {
+            Some(snapshot) => self.restore_transition_snapshot(data_dir, snapshot),
+            None => Ok(()),
+        }
     }
 
     fn load_tui_agent_session(
@@ -8622,10 +9508,16 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         persisted: Option<AgentSession>,
         transcript: sinomo_agent::AgentTranscript,
     ) -> Result<(), CliError> {
+        // `prepare_tui_agent` has already published the target principal and
+        // recall bundle. Stage once more before attaching the durable session
+        // so a missing SIFS/history backend fails before its route is changed.
+        let recall_tools = agent_recall_tool_registry(data_dir, &self.agent_definition)?;
         match persisted {
             Some(persisted) => self.replace_full_agent_session(session, persisted),
             None => self.replace_agent_session(session, transcript),
         }?;
+        self.tool_registry
+            .replace_registered_tools_from(&recall_tools);
         self.persist_attached_agent_session(data_dir, &session.session_id)
     }
 }
@@ -8641,6 +9533,21 @@ where
         event: &EventEnvelope,
     ) -> Result<Vec<InteractionOutput>, CliError> {
         self.handle_runtime_main_agent_event(store, session, event)
+    }
+
+    fn stable_chat_agent_key(&self) -> Option<String> {
+        Some(self.agent_definition.key().to_string())
+    }
+
+    fn join_stable_chat_turn(&mut self) -> Result<(), CliError> {
+        if let Some(runtime) = self.ready_runtime() {
+            runtime.join_active_turn()?;
+        }
+        Ok(())
+    }
+
+    fn drain_stable_chat_runtime_events(&mut self) -> Result<Vec<AgentRuntimeEvent>, CliError> {
+        self.drain_runtime_events()
     }
 }
 

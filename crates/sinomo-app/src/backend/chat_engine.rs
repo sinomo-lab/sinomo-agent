@@ -22,8 +22,9 @@ use sinomo_cli::app_api::{
     AgentChat, AgentChatSifsStorage, ChatAttachmentInput, ChatContextSnapshot, ChatControlState,
     ChatControlStatus, ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker,
     ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, chat_queued_input_from_events, chat_queued_inputs_from_session,
-    chat_removed_input_id_from_events,
+    ChatUsageSnapshot, SifsAgentChannelStore, chat_queued_input_from_events,
+    chat_queued_inputs_from_session, chat_removed_input_id_from_events,
+    project_accepted_chat_control_input,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -269,6 +270,8 @@ impl ChatHandle {
         let evt_tx = ChatEventSink::new(evt_tx, event_wake);
         let active_session_id = Arc::new(Mutex::new(None));
         let direct_control = DirectControl {
+            data_dir: data_dir.clone(),
+            sifs_storage: sifs_storage.clone(),
             runtime_control_registry: runtime_control_registry.clone(),
             active_session_id: active_session_id.clone(),
             evt_tx: evt_tx.clone(),
@@ -344,6 +347,8 @@ impl Drop for ChatHandle {
 
 #[derive(Clone)]
 struct DirectControl {
+    data_dir: SinomoDataDir,
+    sifs_storage: Option<AgentChatSifsStorage>,
     runtime_control_registry: AgentRuntimeControlRegistry,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
     evt_tx: ChatEventSink,
@@ -351,33 +356,75 @@ struct DirectControl {
 
 impl DirectControl {
     fn steer(&self, requested_session_id: String, message: String) {
+        let projection = self.clone();
+        let stable_channel_id = requested_session_id.clone();
         self.spawn(
             "steer",
             requested_session_id,
             move |registry, session_id| {
-                registry
-                    .steer(AgentSessionSteerRequest {
-                        session_id,
-                        message,
-                    })
-                    .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+                let result = registry.steer(AgentSessionSteerRequest {
+                    session_id,
+                    message,
+                })?;
+                projection.project_accepted_input_or_notice(&stable_channel_id, &result);
+                Ok(ChatEvent::ControlStatus(chat_control_status(result)))
             },
         );
     }
 
     fn follow_up(&self, requested_session_id: String, message: String) {
+        let projection = self.clone();
+        let stable_channel_id = requested_session_id.clone();
         self.spawn(
             "follow-up",
             requested_session_id,
             move |registry, session_id| {
-                registry
-                    .follow_up(AgentSessionFollowUpRequest {
-                        session_id,
-                        message,
-                    })
-                    .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+                let result = registry.follow_up(AgentSessionFollowUpRequest {
+                    session_id,
+                    message,
+                })?;
+                projection.project_accepted_input_or_notice(&stable_channel_id, &result);
+                Ok(ChatEvent::ControlStatus(chat_control_status(result)))
             },
         );
+    }
+
+    fn project_accepted_input_or_notice(
+        &self,
+        stable_channel_id: &str,
+        result: &AgentSessionControlResult,
+    ) {
+        if !result.accepted || chat_queued_input_from_events(&result.events).is_none() {
+            return;
+        }
+        let stable_channel_id = match stable_channel_id.parse::<SessionId>() {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                tracing::warn!(%error, "accepted chat control input has no stable channel id");
+                self.evt_tx.send(ChatEvent::Notice {
+                    session_id: stable_channel_id.to_string(),
+                    notice: "control accepted, but stable chat history is unavailable".to_string(),
+                });
+                return;
+            }
+        };
+        let store = match &self.sifs_storage {
+            Some(storage) => storage.open_channel_store(),
+            None => SifsAgentChannelStore::open(&self.data_dir),
+        };
+        let projection = store
+            .map_err(|detail| detail.to_string())
+            .and_then(|store| {
+                project_accepted_chat_control_input(&store, &stable_channel_id, result)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = projection {
+            tracing::warn!(%error, "accepted chat control input was not projected to stable history");
+            self.evt_tx.send(ChatEvent::Notice {
+                session_id: stable_channel_id.to_string(),
+                notice: "control accepted, but stable chat history is unavailable".to_string(),
+            });
+        }
     }
 
     fn remove_queued_input(&self, requested_session_id: String, input_id: String) {
@@ -536,6 +583,7 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
             .collect(),
         queued_input: chat_queued_input_from_events(&result.events),
         removed_input_id: chat_removed_input_id_from_events(&result.events),
+        warning: None,
     }
 }
 
@@ -768,6 +816,12 @@ fn worker(
             }
             ChatCommand::Steer { message, .. } => match chat.steer(message) {
                 Ok(status) => {
+                    if let Some(notice) = status.warning.clone() {
+                        let _ = evt_tx.send(ChatEvent::Notice {
+                            session_id: chat.session_id(),
+                            notice,
+                        });
+                    }
                     let _ = evt_tx.send(ChatEvent::ControlStatus(status));
                 }
                 Err(error) => {
@@ -779,6 +833,12 @@ fn worker(
             },
             ChatCommand::FollowUp { message, .. } => match chat.follow_up(message) {
                 Ok(status) => {
+                    if let Some(notice) = status.warning.clone() {
+                        let _ = evt_tx.send(ChatEvent::Notice {
+                            session_id: chat.session_id(),
+                            notice,
+                        });
+                    }
                     let _ = evt_tx.send(ChatEvent::ControlStatus(status));
                 }
                 Err(error) => {
@@ -960,6 +1020,7 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_agent::AgentChannelStore;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1026,10 +1087,29 @@ mod tests {
             matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id)
         })
         .expect("follow-up status");
-        assert!(matches!(
-            follow_up,
-            ChatEvent::ControlStatus(status) if status.accepted && status.runtime_attached
-        ));
+        let ChatEvent::ControlStatus(follow_up_status) = follow_up else {
+            panic!("follow-up wait returned a non-status event");
+        };
+        assert!(follow_up_status.accepted && follow_up_status.runtime_attached);
+
+        let stable_channel_id = SessionId::from_str(&session_id).expect("stable channel id");
+        let stable_channel = SifsAgentChannelStore::open(&temp.data_dir)
+            .expect("stable channel store")
+            .load_channel(&stable_channel_id)
+            .expect("load stable control history")
+            .expect("stable control channel");
+        let stable_user_messages = stable_channel
+            .transcript
+            .iter()
+            .filter_map(|message| match &message.author {
+                sinomo_agent::AgentChannelAuthor::User { .. } => Some(message.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stable_user_messages,
+            ["keep this constraint", "also mention tests"]
+        );
 
         handle.send_command(ChatCommand::ControlState {
             session_id: session_id.clone(),
@@ -1190,6 +1270,7 @@ mod tests {
 
     #[test]
     fn chat_handle_routes_live_control_without_worker_queue() {
+        let temp = TempDataDir::new("chat-direct-control");
         let runtime_control = AgentRuntimeControlRegistry::new();
         let session_id =
             SessionId::from_legacy_named("sess_chat_direct_control").expect("session id");
@@ -1203,6 +1284,8 @@ mod tests {
             tx: cmd_tx,
             rx: evt_rx,
             direct_control: DirectControl {
+                data_dir: temp.data_dir.clone(),
+                sifs_storage: None,
                 runtime_control_registry: runtime_control,
                 active_session_id: Arc::new(Mutex::new(Some(session_id.clone()))),
                 evt_tx: ChatEventSink::new(evt_tx, None),

@@ -149,7 +149,11 @@ impl AgentChannel {
                 let changed = participant.agent_name != agent_name || !participant.enabled;
                 if changed {
                     participant.agent_name = agent_name;
-                    participant.enabled = true;
+                    if !participant.enabled {
+                        participant.enabled = true;
+                        participant.membership_revision =
+                            participant.membership_revision.saturating_add(1);
+                    }
                 }
                 (participant.participant_id.clone(), changed)
             };
@@ -172,6 +176,7 @@ impl AgentChannel {
             agent_name,
             agent_session_id: SessionId::generate(),
             enabled: true,
+            membership_revision: 1,
             order,
             tool_runtime: AgentToolRuntimeDefinition::default(),
             observed_through_sequence: 0,
@@ -185,13 +190,22 @@ impl AgentChannel {
     }
 
     pub fn disable_participant(&mut self, participant_id: &TaskId) -> bool {
+        self.set_participant_enabled(participant_id, false)
+    }
+
+    /// Apply an explicit membership transition. Unrelated channel writes must
+    /// preserve this causal revision so stale snapshots cannot grant access.
+    pub fn set_participant_enabled(&mut self, participant_id: &TaskId, enabled: bool) -> bool {
         if let Some(participant) = self
             .participants
             .iter_mut()
             .find(|participant| &participant.participant_id == participant_id)
         {
-            participant.enabled = false;
-            self.touch();
+            if participant.enabled != enabled {
+                participant.enabled = enabled;
+                participant.membership_revision = participant.membership_revision.saturating_add(1);
+                self.touch();
+            }
             return true;
         }
         false
@@ -607,6 +621,10 @@ pub struct AgentChannelParticipant {
     pub agent_name: String,
     pub agent_session_id: SessionId,
     pub enabled: bool,
+    /// Causal revision for explicit enable/disable transitions. At equal
+    /// revision, disabled is the conservative merge winner.
+    #[serde(default)]
+    pub membership_revision: u64,
     pub order: u32,
     #[serde(
         default,
@@ -804,6 +822,22 @@ pub trait AgentChannelStore: Send + Sync {
         &self,
         channel_id: &SessionId,
     ) -> Result<Option<AgentChannel>, AgentChannelStoreError>;
+    /// Load one stable channel message by its surface-generated identity.
+    ///
+    /// Stores with immutable message records should override this so a replay
+    /// check never depends on a bounded transcript snapshot.
+    fn load_message(
+        &self,
+        channel_id: &SessionId,
+        message_id: &TaskId,
+    ) -> Result<Option<AgentChannelMessage>, AgentChannelStoreError> {
+        Ok(self.load_channel(channel_id)?.and_then(|channel| {
+            channel
+                .transcript
+                .into_iter()
+                .find(|message| &message.message_id == message_id)
+        }))
+    }
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError>;
     fn append_message(
         &self,
@@ -837,6 +871,14 @@ where
         channel_id: &SessionId,
     ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
         (**self).load_channel(channel_id)
+    }
+
+    fn load_message(
+        &self,
+        channel_id: &SessionId,
+        message_id: &TaskId,
+    ) -> Result<Option<AgentChannelMessage>, AgentChannelStoreError> {
+        (**self).load_message(channel_id, message_id)
     }
 
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
@@ -2342,6 +2384,7 @@ mod tests {
         let participant = value["participants"][0]
             .as_object_mut()
             .expect("participant object");
+        participant.remove("membership_revision");
         participant.remove("message_reconciliation_version");
         participant.remove("observed_message_ids");
 
@@ -2350,6 +2393,7 @@ mod tests {
             .participant(&participant_id)
             .expect("decoded participant");
         assert_eq!(participant.observed_through_sequence, 7);
+        assert_eq!(participant.membership_revision, 0);
         assert_eq!(participant.message_reconciliation_version, 0);
         assert!(participant.observed_message_ids.is_empty());
     }

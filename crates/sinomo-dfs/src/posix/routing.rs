@@ -9,7 +9,8 @@ use super::{POSIX_READ_FRESHNESS_SYNC_TIMEOUT, POSIX_ROUTED_SYNC_RETRY_ROUNDS};
 use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
 use crate::posix_model::{DfsPosixError, DfsStat, Result, posix_error_for_namespace_rejection};
 use crate::posix_path::{
-    normalized_posix_path_key, parent_posix_path, posix_path_is_at_or_under_prefix,
+    normalize_posix_path, normalized_posix_path_key, parent_posix_path,
+    posix_path_is_at_or_under_prefix,
 };
 use crate::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DfsControlPlaneStore, DfsError, DfsMessageTransport,
@@ -274,12 +275,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Ok(Some(object)) => return Ok((resolved, Some(object))),
                     Ok(None) => return Ok((resolved, None)),
                     Err(error) if namespace_lookup_error_is_uncorroborated_redirect(&error) => {
-                        // The response was discarded, so refresh membership
-                        // again and use no response-derived state. A current
-                        // replica may preserve availability only for an
-                        // already-live local hit; outsiders and missing or
-                        // tombstoned local state must surface the integrity
-                        // error rather than laundering it into NotFound.
                         let current_shard =
                             self.select_sifs_metadata_shard_for_path_fresh(&resolved)?;
                         if current_shard.as_ref().is_some_and(|current| {
@@ -346,6 +341,117 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let object = self.lookup_sifs_path(&resolved)?;
         Ok((resolved, object))
+    }
+
+    /// Fetch one exact normalized namespace path from its current metadata
+    /// authority without applying POSIX symbolic- or hard-link resolution.
+    ///
+    /// Capability-style callers use this as the primitive for an `openat2`
+    /// `RESOLVE_NO_SYMLINKS` walk. Keeping the freshness/routing behavior here
+    /// prevents those callers from falling back to a stale local mirror merely
+    /// to avoid the ordinary path resolver.
+    pub(super) fn lookup_sifs_path_direct_distributed_synced(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let path = normalize_posix_path(path)?;
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
+            let local_object = self.lookup_sifs_path(&path)?;
+            let Some(shard) = shard_snapshot
+                .as_deref()
+                .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(&path, shards))
+                .transpose()?
+                .flatten()
+            else {
+                if let Some(object) = local_object
+                    && object.kind != DfsObjectKind::Tombstone
+                {
+                    return Ok(Some(object));
+                }
+                break;
+            };
+            if shard.primary_node_id != self.node_id {
+                match self.route_namespace_lookup_path_to_metadata_primary(
+                    sifs_file_system_id(),
+                    shard.primary_node_id.clone(),
+                    path.clone(),
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                ) {
+                    Ok(Some(object)) if object.kind != DfsObjectKind::Tombstone => {
+                        return Ok(Some(object));
+                    }
+                    Ok(Some(object)) => return Ok(Some(object)),
+                    Ok(None) => return Ok(None),
+                    Err(error) if namespace_lookup_error_is_uncorroborated_redirect(&error) => {
+                        // The response was discarded, so refresh membership
+                        // again and use no response-derived state. A current
+                        // replica may preserve availability only for an
+                        // already-live local hit; outsiders and missing or
+                        // tombstoned local state must surface the integrity
+                        // error rather than laundering it into NotFound.
+                        let current_shard =
+                            self.select_sifs_metadata_shard_for_path_fresh(&path)?;
+                        if current_shard.as_ref().is_some_and(|current| {
+                            self.is_local_metadata_replica_for_shard(current)
+                        }) && local_object
+                            .as_ref()
+                            .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
+                        {
+                            return Ok(local_object);
+                        }
+                        return Err(error.into());
+                    }
+                    Err(error)
+                        if self.is_local_metadata_replica_for_shard(&shard)
+                            && !namespace_lookup_error_allows_local_replica_fallback(&error) =>
+                    {
+                        return Err(error.into());
+                    }
+                    Err(_) => {}
+                }
+            }
+            if self.is_local_metadata_replica_for_shard(&shard)
+                && let Some(object) = local_object.as_ref()
+                && object.kind != DfsObjectKind::Tombstone
+            {
+                return Ok(local_object);
+            }
+            if let Some(object) = local_object
+                && object.kind != DfsObjectKind::Tombstone
+            {
+                return Ok(Some(object));
+            }
+            if self.is_local_metadata_replica_for_shard(&shard) {
+                break;
+            }
+            if !self.should_attempt_read_freshness_sync(&shard) {
+                break;
+            }
+            let cursor_before = self.metadata_shard_cursor_for_path_from_snapshot(
+                &path,
+                shard_snapshot.as_deref().unwrap_or_default(),
+            )?;
+            if self
+                .route_namespace_operation_to_metadata_primary_with_timeout(
+                    sifs_file_system_id(),
+                    shard.primary_node_id,
+                    DfsNamespaceOperation::SyncPath { path: path.clone() },
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                )
+                .is_err()
+            {
+                break;
+            }
+            if self.metadata_shard_cursor_for_path_from_snapshot(
+                &path,
+                shard_snapshot.as_deref().unwrap_or_default(),
+            )? <= cursor_before
+            {
+                break;
+            }
+        }
+        self.lookup_sifs_path(&path)
     }
 
     /// Routes a namespace mutation to the shard primary, blocks for the
@@ -626,6 +732,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::Mkdir { path } => self.posix_mkdir_local(path).map(drop),
             DfsNamespaceOperation::MkdirWithAttrs { path, attrs } => self
                 .posix_mkdir_local_with_create_attrs(path, *attrs)
+                .map(drop),
+            DfsNamespaceOperation::MkdirAtNoLinks {
+                path,
+                expected_parent_object_id,
+                expected_parent_version,
+            } => self
+                .posix_mkdir_at_no_links_local(
+                    path,
+                    expected_parent_object_id,
+                    expected_parent_version,
+                )
                 .map(drop),
             DfsNamespaceOperation::MkdirAll { path } => self.posix_mkdir_all_local(path),
             DfsNamespaceOperation::Rmdir { path } => self.posix_rmdir_local(path).map(drop),

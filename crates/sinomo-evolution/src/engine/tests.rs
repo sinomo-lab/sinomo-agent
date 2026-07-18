@@ -5257,6 +5257,35 @@ fn agent_mutation_worker_binds_local_permission_store_for_host_commands() {
 }
 
 #[test]
+fn internal_evolution_tool_projection_only_advertises_backed_recall_tools() {
+    let tools = evolution_agent_mutation_tools(true);
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"memory_search"));
+    assert!(names.contains(&"memory_read"));
+    assert!(names.contains(&"memory_write"));
+    assert!(
+        !names.contains(&"session_history_search"),
+        "the internal mutation harness must not advertise history until a stable host backend is injected"
+    );
+
+    let unbacked_tools = evolution_agent_mutation_tools(false);
+    let unbacked_names = unbacked_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for memory_tool in ["memory_search", "memory_read", "memory_write"] {
+        assert!(
+            !unbacked_names.contains(&memory_tool),
+            "the internal mutation harness must not advertise {memory_tool} without an authoritative data directory"
+        );
+    }
+}
+
+#[test]
 fn git_workspace_adapter_places_worktree_inside_job_folder() {
     let source = git_repo("git-workspace-layout-source");
     fs::write(source.join("README.md"), "# source\n").expect("readme");

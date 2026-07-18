@@ -47,8 +47,9 @@ use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
+use sinomo_runtime::vfs::{VfsDirectoryCursor, VfsError, VfsHandle, VfsObjectKind};
 use std::collections::{BTreeMap, BTreeSet};
-use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::commands::{
     ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, cluster_invite_with_paths,
@@ -67,6 +68,7 @@ const APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES: usize = 24 * 1024;
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
 const SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE: u64 = 128;
 const SIFS_AGENT_CHANNEL_METADATA_SCHEMA_VERSION: u32 = 1;
+const SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION: u32 = 1;
 const SIFS_AGENT_SESSION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 /// The daemon deliberately rejects a browser read quickly when its route limit is saturated or
 /// another SIFS request holds the shared service lock. Files and chat-list workers routinely
@@ -150,6 +152,172 @@ impl AgentChannelMessagePage {
             total_messages,
             chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
         }
+    }
+}
+
+/// One bounded page of immutable channel-message records for history search.
+///
+/// `record_offset` is the stable ascending directory position consumed by the
+/// history cursor.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentChannelImmutableMessageRecord {
+    pub record_offset: usize,
+    pub message: AgentChannelMessage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentChannelImmutableMessageRecordPage {
+    pub records: Vec<AgentChannelImmutableMessageRecord>,
+    pub next_cursor: Option<VfsDirectoryCursor>,
+    pub consumed_entries: usize,
+    /// Actual message-body bytes read, including bodies later omitted as
+    /// truncated or malformed. Callers must charge this value to their scan
+    /// budget instead of summing only successfully decoded records.
+    pub read_bytes: u64,
+    pub omitted_records: usize,
+    /// Serialized size of the first valid record that did not fit this
+    /// invocation's remaining body budget. The directory cursor has not been
+    /// consumed; callers can retry it with a fresh hard budget or explicitly
+    /// account for and skip an intrinsically oversized record.
+    pub required_bytes: Option<u64>,
+}
+
+/// One message decoded from a bounded legacy stable-channel JSONL chunk.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentChannelLegacyMessageRecord {
+    pub record_offset: usize,
+    /// Byte position immediately after this JSONL record, or zero when this
+    /// record finishes the chunk.
+    pub next_byte_offset: usize,
+    pub message: AgentChannelMessage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentChannelLegacyMessageRecordPage {
+    pub records: Vec<AgentChannelLegacyMessageRecord>,
+    /// Directory continuation after the current chunk. It is consumed only
+    /// when `next_byte_offset` is zero.
+    pub next_cursor: Option<VfsDirectoryCursor>,
+    pub current_entry_name: Option<String>,
+    pub current_object_id: Option<String>,
+    pub current_version: Option<String>,
+    pub next_byte_offset: usize,
+    pub next_discarding_line: bool,
+    pub deferred_for_fresh_budget: bool,
+    pub consumed_entries: usize,
+    pub read_bytes: u64,
+    pub omitted_records: usize,
+}
+
+/// Bounded authorization projection used only by historical activity search.
+///
+/// An incomplete projection never carries a channel: callers must fail closed
+/// instead of trusting a stale snapshot when the immutable metadata fold does
+/// not fit the supplied scan budget.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentChannelHistoryMetadataRead {
+    pub channel: Option<AgentChannelHistoryMetadata>,
+    pub scanned_items: usize,
+    pub scanned_bytes: u64,
+    pub omitted_records: usize,
+    pub complete: bool,
+}
+
+/// Compact, transcript-free current channel state used by history search.
+///
+/// This intentionally excludes message bodies, workspace state, provider
+/// sessions, and participant observation sets. The source-record and
+/// metadata-directory versions make a stale cache fail closed (or fall back to
+/// the bounded immutable metadata fold) after any concurrent metadata append.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct AgentChannelHistoryMetadata {
+    pub channel_id: SessionId,
+    pub title: String,
+    pub channel_kind: AgentChannelKind,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub deleted_at: Option<time::OffsetDateTime>,
+    pub participants: Vec<AgentChannelHistoryParticipant>,
+}
+
+impl AgentChannelHistoryMetadata {
+    fn from_channel(channel: &AgentChannel) -> Self {
+        Self {
+            channel_id: channel.channel_id.clone(),
+            title: channel.title.clone(),
+            channel_kind: channel.channel_kind.clone(),
+            updated_at: channel.updated_at,
+            deleted_at: channel.deleted_at,
+            participants: channel
+                .participants
+                .iter()
+                .map(|participant| AgentChannelHistoryParticipant {
+                    agent_key: participant.agent_key.clone(),
+                    enabled: participant.enabled,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct AgentChannelHistoryParticipant {
+    pub agent_key: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct SifsAgentChannelHistoryMetadataProjection {
+    schema_version: u32,
+    channel: AgentChannelHistoryMetadata,
+    source_record_id: String,
+    metadata_records_object_id: String,
+    metadata_records_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AgentChannelMetadataNamespaceRevision {
+    Missing,
+    Versioned {
+        object_id: String,
+        version: String,
+    },
+    /// A namespace without both identity fields cannot prove a stable fold.
+    Unversioned,
+}
+
+fn incomplete_channel_history_metadata(
+    scanned_items: usize,
+    scanned_bytes: u64,
+    omitted_records: usize,
+) -> AgentChannelHistoryMetadataRead {
+    AgentChannelHistoryMetadataRead {
+        channel: None,
+        scanned_items,
+        scanned_bytes,
+        omitted_records,
+        complete: false,
+    }
+}
+
+fn channel_metadata_namespace_revision(
+    history_vfs: &VfsHandle,
+    records_dir: &str,
+) -> Result<AgentChannelMetadataNamespaceRevision, AgentChannelStoreError> {
+    match history_vfs.stat_beneath_no_links(records_dir) {
+        Ok(metadata) => match (metadata.object_id, metadata.version) {
+            (Some(object_id), Some(version)) => {
+                Ok(AgentChannelMetadataNamespaceRevision::Versioned { object_id, version })
+            }
+            _ => Ok(AgentChannelMetadataNamespaceRevision::Unversioned),
+        },
+        Err(VfsError::NotFound { .. }) => Ok(AgentChannelMetadataNamespaceRevision::Missing),
+        Err(source) => Err(channel_store_io(records_dir, source.to_string())),
     }
 }
 
@@ -518,6 +686,9 @@ pub struct ChatControlStatus {
     pub queued_input: Option<ChatQueuedTurnInput>,
     /// The queue id this control call removed, if any.
     pub removed_input_id: Option<String>,
+    /// Concise model/UI-safe warning after an accepted control operation whose
+    /// durable stable-history/checkpoint follow-up could not be completed.
+    pub warning: Option<String>,
 }
 
 /// Which session queue a pending turn input rides in.
@@ -734,6 +905,13 @@ impl SifsAgentChannelStore {
         )
     }
 
+    fn history_metadata_projection_path(channel_id: &SessionId) -> String {
+        format!(
+            "{}/metadata/history-current.json",
+            Self::channel_dir(channel_id)
+        )
+    }
+
     fn message_chunks_dir(channel_id: &SessionId) -> String {
         format!("{}/messages", Self::channel_dir(channel_id))
     }
@@ -865,6 +1043,33 @@ impl SifsAgentChannelStore {
         )
     }
 
+    pub(crate) fn load_immutable_message_record(
+        &self,
+        channel_id: &SessionId,
+        message_id: &TaskId,
+    ) -> Result<Option<AgentChannelMessage>, AgentChannelStoreError> {
+        let path = Self::message_record_path(channel_id, message_id);
+        let bytes = match self.browser.read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
+            Err(detail) => return Err(channel_store_io(&path, detail)),
+        };
+        let message = serde_json::from_slice::<AgentChannelMessage>(&bytes).map_err(|source| {
+            AgentChannelStoreError::Serialization {
+                detail: format!("deserialize immutable channel message {path}: {source}"),
+            }
+        })?;
+        if &message.message_id != message_id {
+            return Err(AgentChannelStoreError::Serialization {
+                detail: format!(
+                    "immutable channel message id {} does not match path {path}",
+                    message.message_id
+                ),
+            });
+        }
+        Ok(Some(message))
+    }
+
     fn append_turn_record(
         &self,
         channel_id: &SessionId,
@@ -895,6 +1100,100 @@ impl SifsAgentChannelStore {
             &record,
         )?;
         Ok(record)
+    }
+
+    fn write_history_metadata_projection(
+        &self,
+        channel_id: &SessionId,
+        source_record_id: &str,
+    ) -> Result<(), AgentChannelStoreError> {
+        const STABLE_FOLD_ATTEMPTS: usize = 3;
+
+        let records_dir = Self::metadata_records_dir(channel_id);
+        for _ in 0..STABLE_FOLD_ATTEMPTS {
+            let before = self
+                .browser
+                .stat(&records_dir)
+                .map_err(|detail| channel_store_io(&records_dir, detail))?;
+            // Fold immutable records only. The materialized snapshot can be
+            // ahead of this node's directory view after a routed write, so it
+            // cannot be paired with the visible directory watermark.
+            let record_paths = self.paths_in_dir_with_suffix(&records_dir, ".json")?;
+            let mut channel = None;
+            let mut source_record_seen = false;
+            for (path, record) in self
+                .load_json_documents_with_paths::<SifsAgentChannelMetadataRecord>(&record_paths)?
+            {
+                if record.schema_version != SIFS_AGENT_CHANNEL_METADATA_SCHEMA_VERSION {
+                    return Err(AgentChannelStoreError::Serialization {
+                        detail: format!(
+                            "unsupported channel metadata record schema version {} at {path}",
+                            record.schema_version
+                        ),
+                    });
+                }
+                let Some(path_record_id) = json_record_id_from_path(&path) else {
+                    return Err(AgentChannelStoreError::Serialization {
+                        detail: format!("channel metadata record path has no id: {path}"),
+                    });
+                };
+                if path_record_id != record.record_id {
+                    return Err(AgentChannelStoreError::Serialization {
+                        detail: format!(
+                            "channel metadata record id {} does not match path {path}",
+                            record.record_id
+                        ),
+                    });
+                }
+                if &record.channel.channel_id != channel_id {
+                    return Err(AgentChannelStoreError::Serialization {
+                        detail: format!(
+                            "channel metadata record {} belongs to {} instead of {channel_id}",
+                            record.record_id, record.channel.channel_id
+                        ),
+                    });
+                }
+                source_record_seen |= record.record_id == source_record_id;
+                channel = Some(match channel {
+                    Some(existing) => merge_channel_snapshot(existing, record.channel)?,
+                    None => record.channel,
+                });
+            }
+            let after = self
+                .browser
+                .stat(&records_dir)
+                .map_err(|detail| channel_store_io(&records_dir, detail))?;
+            if before.object_id != after.object_id
+                || before.version != after.version
+                || !source_record_seen
+            {
+                continue;
+            }
+            let Some(channel) = channel else {
+                continue;
+            };
+            let projection = SifsAgentChannelHistoryMetadataProjection {
+                schema_version: SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION,
+                channel: AgentChannelHistoryMetadata::from_channel(&channel),
+                source_record_id: source_record_id.to_string(),
+                metadata_records_object_id: after.object_id,
+                metadata_records_version: after.version,
+            };
+            let bytes = serde_json::to_vec_pretty(&projection).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?;
+            // An append after the second stat only makes this older watermark
+            // fail validation. It can never stamp this fold as covering the
+            // newer record, even if this cache write wins the race.
+            return self.write_file(&Self::history_metadata_projection_path(channel_id), &bytes);
+        }
+
+        // This projection is an optimization. Under sustained concurrent
+        // metadata writes, leave it stale so readers reject it and use their
+        // bounded immutable fold instead of failing the channel mutation.
+        Ok(())
     }
 
     fn paths_in_dir_with_suffix(
@@ -1220,6 +1519,253 @@ impl SifsAgentChannelStore {
             .map(|(channel, _)| AgentChannelSummary::from_channel(&channel)))
     }
 
+    /// Load authoritative channel metadata without message or turn bodies.
+    /// This ordinary loader may repair the materialized metadata cache; bounded
+    /// history authorization uses [`Self::load_channel_metadata_for_history`].
+    pub fn load_channel_metadata_only(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+        Ok(self
+            .load_channel_metadata(channel_id)?
+            .map(|(mut channel, _)| {
+                channel.transcript.clear();
+                channel
+            }))
+    }
+
+    /// Prove current channel authorization within explicit metadata budgets.
+    ///
+    /// The repairable `snapshot.json` cache deliberately retains a bounded
+    /// transcript for legacy readers, so an authorization check must not read
+    /// it before membership is known. This projection instead folds only the
+    /// immutable metadata records, whose transcripts are cleared at write
+    /// time. If the proof does not fit, it returns an incomplete projection
+    /// with no channel and the caller must skip it.
+    pub(crate) fn load_channel_metadata_for_history(
+        &self,
+        history_vfs: &VfsHandle,
+        channel_id: &SessionId,
+        max_items: usize,
+        max_bytes: u64,
+    ) -> Result<AgentChannelHistoryMetadataRead, AgentChannelStoreError> {
+        const METADATA_PAGE_SIZE: usize = 128;
+
+        let mut scanned_items = 0usize;
+        let mut scanned_bytes = 0u64;
+        let omitted_records = 0usize;
+        let projection_path = Self::history_metadata_projection_path(channel_id);
+        let projection_metadata = match history_vfs.stat_beneath_no_links(&projection_path) {
+            Ok(metadata) => Some(metadata),
+            Err(VfsError::NotFound { .. }) => None,
+            Err(source) => {
+                return Err(channel_store_io(&projection_path, source.to_string()));
+            }
+        };
+        if let Some(before) = projection_metadata {
+            scanned_items = scanned_items.saturating_add(1);
+            let Some(size_bytes) = before.size_bytes else {
+                return Ok(incomplete_channel_history_metadata(
+                    scanned_items,
+                    scanned_bytes,
+                    1,
+                ));
+            };
+            if scanned_items > max_items || size_bytes > max_bytes {
+                let charged_items = scanned_items.min(max_items);
+                return Ok(incomplete_channel_history_metadata(
+                    charged_items,
+                    scanned_bytes,
+                    usize::from(charged_items > 0),
+                ));
+            }
+            let read = history_vfs
+                .read_range_beneath_no_links(&projection_path, 0, size_bytes)
+                .map_err(|source| channel_store_io(&projection_path, source.to_string()))?;
+            scanned_bytes = scanned_bytes.saturating_add(read.bytes.len() as u64);
+            let stable_read = !read.truncated
+                && read.bytes.len() as u64 == size_bytes
+                && before.object_id == read.metadata.object_id
+                && before.version == read.metadata.version
+                && read.metadata.size_bytes == Some(size_bytes)
+                && matches!(
+                    read.metadata.kind,
+                    VfsObjectKind::File | VfsObjectKind::Artifact
+                );
+            let projection = stable_read
+                .then(|| {
+                    serde_json::from_slice::<SifsAgentChannelHistoryMetadataProjection>(&read.bytes)
+                        .ok()
+                })
+                .flatten();
+            if let Some(projection) = projection {
+                let records_dir = Self::metadata_records_dir(channel_id);
+                let source_record =
+                    Self::metadata_record_path(channel_id, &projection.source_record_id);
+                let current_records = history_vfs.stat_beneath_no_links(&records_dir);
+                let source_exists = history_vfs.stat_beneath_no_links(&source_record).is_ok();
+                let current_matches = current_records.is_ok_and(|metadata| {
+                    metadata.object_id.as_deref()
+                        == Some(projection.metadata_records_object_id.as_str())
+                        && metadata.version.as_deref()
+                            == Some(projection.metadata_records_version.as_str())
+                });
+                if projection.schema_version == SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION
+                    && projection.channel.channel_id == *channel_id
+                    && source_exists
+                    && current_matches
+                {
+                    return Ok(AgentChannelHistoryMetadataRead {
+                        channel: Some(projection.channel),
+                        scanned_items,
+                        scanned_bytes,
+                        omitted_records,
+                        complete: true,
+                    });
+                }
+            }
+            // The cache changed, is malformed, or does not cover the current
+            // immutable metadata namespace. Fall back to the bounded fold;
+            // never authorize from stale compact state.
+        }
+        let records_dir = Self::metadata_records_dir(channel_id);
+        let records_revision_before =
+            channel_metadata_namespace_revision(history_vfs, &records_dir)?;
+        let mut channel = None;
+        let mut after = None;
+        loop {
+            let remaining_items = max_items.saturating_sub(scanned_items);
+            if remaining_items == 0 {
+                return Ok(incomplete_channel_history_metadata(
+                    scanned_items,
+                    scanned_bytes,
+                    omitted_records,
+                ));
+            }
+            let page = history_vfs
+                .list_page_beneath_no_links_if_exists(
+                    &records_dir,
+                    after.as_ref(),
+                    remaining_items.min(METADATA_PAGE_SIZE),
+                )
+                .map_err(|source| channel_store_io(&records_dir, source.to_string()))?;
+            if page.entries.is_empty() {
+                break;
+            }
+            for entry in page.entries {
+                scanned_items = scanned_items.saturating_add(1);
+                if !matches!(entry.kind, VfsObjectKind::File | VfsObjectKind::Artifact)
+                    || !entry.name.ends_with(".json")
+                {
+                    return Ok(incomplete_channel_history_metadata(
+                        scanned_items,
+                        scanned_bytes,
+                        omitted_records.saturating_add(1),
+                    ));
+                }
+                let Some(path_record_id) = json_record_id_from_path(&entry.path) else {
+                    return Ok(incomplete_channel_history_metadata(
+                        scanned_items,
+                        scanned_bytes,
+                        omitted_records.saturating_add(1),
+                    ));
+                };
+                let Some(size_bytes) = entry.size_bytes else {
+                    return Ok(incomplete_channel_history_metadata(
+                        scanned_items,
+                        scanned_bytes,
+                        omitted_records.saturating_add(1),
+                    ));
+                };
+                if size_bytes > max_bytes.saturating_sub(scanned_bytes) {
+                    return Ok(incomplete_channel_history_metadata(
+                        scanned_items,
+                        scanned_bytes,
+                        omitted_records.saturating_add(1),
+                    ));
+                }
+                let read = history_vfs
+                    .read_range_beneath_no_links(&entry.path, 0, size_bytes)
+                    .map_err(|source| channel_store_io(&entry.path, source.to_string()))?;
+                scanned_bytes = scanned_bytes.saturating_add(read.bytes.len() as u64);
+                if read.truncated
+                    || read.bytes.len() as u64 != size_bytes
+                    || read.metadata.size_bytes != Some(size_bytes)
+                    || !matches!(
+                        read.metadata.kind,
+                        VfsObjectKind::File | VfsObjectKind::Artifact
+                    )
+                {
+                    return Ok(incomplete_channel_history_metadata(
+                        scanned_items,
+                        scanned_bytes,
+                        omitted_records.saturating_add(1),
+                    ));
+                }
+                let record = serde_json::from_slice::<SifsAgentChannelMetadataRecord>(&read.bytes)
+                    .map_err(|source| AgentChannelStoreError::Serialization {
+                        detail: source.to_string(),
+                    })?;
+                if record.schema_version != SIFS_AGENT_CHANNEL_METADATA_SCHEMA_VERSION
+                    || path_record_id != record.record_id
+                    || &record.channel.channel_id != channel_id
+                {
+                    return Err(AgentChannelStoreError::Serialization {
+                        detail: "channel metadata record identity is inconsistent".to_string(),
+                    });
+                }
+                channel = Some(match channel {
+                    Some(existing) => merge_channel_snapshot(existing, record.channel)?,
+                    None => record.channel,
+                });
+            }
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            after = Some(next);
+        }
+
+        let records_revision_after =
+            channel_metadata_namespace_revision(history_vfs, &records_dir)?;
+        let namespace_is_stable = match (&records_revision_before, &records_revision_after) {
+            (
+                AgentChannelMetadataNamespaceRevision::Versioned {
+                    object_id: before_object,
+                    version: before_version,
+                },
+                AgentChannelMetadataNamespaceRevision::Versioned {
+                    object_id: after_object,
+                    version: after_version,
+                },
+            ) => before_object == after_object && before_version == after_version,
+            (
+                AgentChannelMetadataNamespaceRevision::Missing,
+                AgentChannelMetadataNamespaceRevision::Missing,
+            ) => channel.is_none(),
+            _ => false,
+        };
+        if !namespace_is_stable {
+            // A concurrent metadata append can revoke membership. Never mark a
+            // mixed or stale immutable fold complete; the caller retries from
+            // the same activity cursor with a fresh bounded proof.
+            return Ok(incomplete_channel_history_metadata(
+                scanned_items,
+                scanned_bytes,
+                omitted_records,
+            ));
+        }
+
+        Ok(AgentChannelHistoryMetadataRead {
+            channel: channel
+                .as_ref()
+                .map(AgentChannelHistoryMetadata::from_channel),
+            scanned_items,
+            scanned_bytes,
+            omitted_records,
+            complete: true,
+        })
+    }
+
     pub fn load_recent_messages(
         &self,
         channel_id: &SessionId,
@@ -1411,6 +1957,390 @@ impl SifsAgentChannelStore {
         ))
     }
 
+    /// Read at most `limit` immutable message-record bodies in stable
+    /// ascending record-id order.
+    ///
+    /// This is intentionally separate from the app timeline pager above. The
+    /// timeline still folds legacy JSONL chunks for presentation compatibility;
+    /// an agent history search must never turn a bounded request into an
+    /// unbounded legacy transcript read. The supplied VFS cursor bounds both
+    /// directory metadata and selected body reads.
+    pub(crate) fn load_immutable_message_record_page(
+        &self,
+        history_vfs: &VfsHandle,
+        channel_id: &SessionId,
+        after: Option<&VfsDirectoryCursor>,
+        record_offset: usize,
+        limit: usize,
+        max_serialized_bytes: u64,
+    ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
+        let dir = Self::message_records_dir(channel_id);
+        let page = history_vfs
+            .list_page_beneath_no_links_if_exists(&dir, after, limit)
+            .map_err(|source| channel_store_io(&dir, source.to_string()))?;
+        let mut consumed_entries = 0usize;
+        let mut remaining_serialized_bytes = max_serialized_bytes;
+        let mut read_bytes = 0u64;
+        let mut omitted_records = 0usize;
+        let mut records = Vec::with_capacity(page.entries.len());
+        for (index, entry) in page.entries.iter().enumerate() {
+            if !matches!(entry.kind, VfsObjectKind::File | VfsObjectKind::Artifact)
+                || !entry.name.ends_with(".json")
+            {
+                consumed_entries = consumed_entries.saturating_add(1);
+                omitted_records = omitted_records.saturating_add(1);
+                continue;
+            }
+            let Some(serialized_bytes) = entry.size_bytes else {
+                consumed_entries = consumed_entries.saturating_add(1);
+                omitted_records = omitted_records.saturating_add(1);
+                continue;
+            };
+            if serialized_bytes > remaining_serialized_bytes {
+                return Ok(AgentChannelImmutableMessageRecordPage {
+                    records,
+                    next_cursor: page.next_cursor,
+                    consumed_entries,
+                    read_bytes,
+                    omitted_records,
+                    required_bytes: Some(serialized_bytes),
+                });
+            }
+            remaining_serialized_bytes =
+                remaining_serialized_bytes.saturating_sub(serialized_bytes);
+            // Directory metadata is only a discovery hint. Bound the actual
+            // body read as well, then require the immutable record to still
+            // have exactly the advertised size before deserializing it.
+            #[cfg(test)]
+            self.message_record_body_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let read = history_vfs
+                .read_range_beneath_no_links(&entry.path, 0, serialized_bytes)
+                .map_err(|source| channel_store_io(&entry.path, source.to_string()))?;
+            read_bytes = read_bytes.saturating_add(read.bytes.len() as u64);
+            if read.truncated
+                || read.bytes.len() as u64 != serialized_bytes
+                || read.metadata.size_bytes != Some(serialized_bytes)
+                || !matches!(
+                    read.metadata.kind,
+                    VfsObjectKind::File | VfsObjectKind::Artifact
+                )
+            {
+                consumed_entries = consumed_entries.saturating_add(1);
+                omitted_records = omitted_records.saturating_add(1);
+                continue;
+            }
+            let message: AgentChannelMessage = match serde_json::from_slice(&read.bytes) {
+                Ok(message) => message,
+                Err(_) => {
+                    consumed_entries = consumed_entries.saturating_add(1);
+                    omitted_records = omitted_records.saturating_add(1);
+                    continue;
+                }
+            };
+            if json_record_id_from_path(&entry.path) != Some(message.message_id.as_str()) {
+                return Err(AgentChannelStoreError::Serialization {
+                    detail: format!(
+                        "channel message record {} does not match path {}",
+                        message.message_id, entry.path
+                    ),
+                });
+            }
+            records.push(AgentChannelImmutableMessageRecord {
+                record_offset: record_offset.saturating_add(index),
+                message,
+            });
+            consumed_entries = consumed_entries.saturating_add(1);
+        }
+        Ok(AgentChannelImmutableMessageRecordPage {
+            records,
+            next_cursor: page.next_cursor,
+            consumed_entries,
+            read_bytes,
+            omitted_records,
+            required_bytes: None,
+        })
+    }
+
+    /// Read a bounded slice of the pre-immutable stable-channel JSONL log.
+    ///
+    /// Only `messages/*.jsonl` is eligible: the materialized channel snapshot,
+    /// provider sessions, and mutable legacy index are never opened. Guarded
+    /// range reads page arbitrarily large chunks without following links. Once
+    /// a chunk is opened, its exact object/version is bound into the cursor so
+    /// a continuation cannot mix bytes from a replacement object.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_legacy_message_record_page(
+        &self,
+        history_vfs: &VfsHandle,
+        channel_id: &SessionId,
+        after: Option<&VfsDirectoryCursor>,
+        expected_entry_name: Option<&str>,
+        expected_object_id: Option<&str>,
+        expected_version: Option<&str>,
+        record_offset: usize,
+        byte_offset: usize,
+        discarding_line: bool,
+        allow_discard_partial_line: bool,
+        limit: usize,
+        max_serialized_bytes: u64,
+    ) -> Result<AgentChannelLegacyMessageRecordPage, AgentChannelStoreError> {
+        let dir = Self::message_chunks_dir(channel_id);
+        let page = history_vfs
+            .list_page_beneath_no_links_if_exists(&dir, after, 1)
+            .map_err(|source| channel_store_io(&dir, source.to_string()))?;
+        let Some(entry) = page.entries.first() else {
+            if byte_offset != 0
+                || discarding_line
+                || expected_entry_name.is_some()
+                || expected_object_id.is_some()
+                || expected_version.is_some()
+            {
+                return Err(channel_store_io(
+                    &dir,
+                    "invalid legacy message cursor: chunk is unavailable".to_string(),
+                ));
+            }
+            return Ok(AgentChannelLegacyMessageRecordPage {
+                records: Vec::new(),
+                next_cursor: None,
+                current_entry_name: None,
+                current_object_id: None,
+                current_version: None,
+                next_byte_offset: 0,
+                next_discarding_line: false,
+                deferred_for_fresh_budget: false,
+                consumed_entries: 0,
+                read_bytes: 0,
+                omitted_records: 0,
+            });
+        };
+        if expected_entry_name.is_some_and(|expected| expected != entry.name.as_str()) {
+            return Err(channel_store_io(
+                &entry.path,
+                "invalid legacy message cursor: chunk changed".to_string(),
+            ));
+        }
+
+        let is_chunk = matches!(entry.kind, VfsObjectKind::File | VfsObjectKind::Artifact)
+            && entry.name.ends_with(".jsonl");
+        if !is_chunk {
+            if byte_offset != 0
+                || discarding_line
+                || expected_entry_name.is_some()
+                || expected_object_id.is_some()
+                || expected_version.is_some()
+            {
+                return Err(channel_store_io(
+                    &entry.path,
+                    "invalid legacy message cursor: expected JSONL chunk".to_string(),
+                ));
+            }
+            return Ok(AgentChannelLegacyMessageRecordPage {
+                records: Vec::new(),
+                next_cursor: page.next_cursor,
+                current_entry_name: None,
+                current_object_id: None,
+                current_version: None,
+                next_byte_offset: 0,
+                next_discarding_line: false,
+                deferred_for_fresh_budget: false,
+                consumed_entries: 1,
+                read_bytes: 0,
+                omitted_records: 0,
+            });
+        }
+        let read = history_vfs
+            .read_range_beneath_no_links(&entry.path, byte_offset as u64, max_serialized_bytes)
+            .map_err(|source| channel_store_io(&entry.path, source.to_string()))?;
+        let read_bytes = read.bytes.len() as u64;
+        if !matches!(
+            read.metadata.kind,
+            VfsObjectKind::File | VfsObjectKind::Artifact
+        ) || read.metadata.size_bytes != entry.size_bytes
+        {
+            return Err(channel_store_io(
+                &entry.path,
+                "invalid legacy message cursor: chunk metadata changed".to_string(),
+            ));
+        }
+        let object_id = read.metadata.object_id.clone().ok_or_else(|| {
+            channel_store_io(
+                &entry.path,
+                "invalid legacy message cursor: chunk has no stable object identity".to_string(),
+            )
+        })?;
+        let version = read.metadata.version.clone().ok_or_else(|| {
+            channel_store_io(
+                &entry.path,
+                "invalid legacy message cursor: chunk has no stable version".to_string(),
+            )
+        })?;
+        if expected_object_id.is_some_and(|expected| expected != object_id.as_str())
+            || expected_version.is_some_and(|expected| expected != version.as_str())
+        {
+            return Err(channel_store_io(
+                &entry.path,
+                "invalid legacy message cursor: chunk identity changed".to_string(),
+            ));
+        }
+
+        let mut records = Vec::new();
+        let mut consumed_entries = 0usize;
+        let mut omitted_records = 0usize;
+        let mut cursor = 0usize;
+        let mut discarding = discarding_line;
+        if discarding {
+            if let Some(line_end) = read.bytes.iter().position(|byte| *byte == b'\n') {
+                cursor = line_end.saturating_add(1);
+                consumed_entries = consumed_entries.saturating_add(1);
+                omitted_records = omitted_records.saturating_add(1);
+                discarding = false;
+            } else if read.truncated {
+                return Ok(AgentChannelLegacyMessageRecordPage {
+                    records,
+                    next_cursor: page.next_cursor,
+                    current_entry_name: Some(entry.name.clone()),
+                    current_object_id: Some(object_id),
+                    current_version: Some(version),
+                    next_byte_offset: byte_offset.saturating_add(read.bytes.len()),
+                    next_discarding_line: true,
+                    deferred_for_fresh_budget: false,
+                    consumed_entries,
+                    read_bytes,
+                    omitted_records,
+                });
+            } else {
+                consumed_entries = consumed_entries.saturating_add(1);
+                omitted_records = omitted_records.saturating_add(1);
+                cursor = read.bytes.len();
+                discarding = false;
+            }
+        }
+        while cursor < read.bytes.len() && consumed_entries < limit {
+            let relative_end = read.bytes[cursor..].iter().position(|byte| *byte == b'\n');
+            let Some(relative_end) = relative_end else {
+                if read.truncated {
+                    // A fresh-range budget proves this line is intrinsically
+                    // oversized only when the line began at the range start.
+                    // Complete earlier records can consume enough of an
+                    // otherwise fresh range to split a normal following line;
+                    // defer that tail so its own fresh range starts here.
+                    if allow_discard_partial_line && cursor == 0 {
+                        return Ok(AgentChannelLegacyMessageRecordPage {
+                            records,
+                            next_cursor: page.next_cursor,
+                            current_entry_name: Some(entry.name.clone()),
+                            current_object_id: Some(object_id),
+                            current_version: Some(version),
+                            next_byte_offset: byte_offset.saturating_add(read.bytes.len()),
+                            next_discarding_line: true,
+                            deferred_for_fresh_budget: false,
+                            consumed_entries,
+                            read_bytes,
+                            omitted_records,
+                        });
+                    }
+                    return Ok(AgentChannelLegacyMessageRecordPage {
+                        records,
+                        next_cursor: page.next_cursor,
+                        current_entry_name: Some(entry.name.clone()),
+                        current_object_id: Some(object_id),
+                        current_version: Some(version),
+                        next_byte_offset: byte_offset.saturating_add(cursor),
+                        next_discarding_line: false,
+                        deferred_for_fresh_budget: true,
+                        consumed_entries,
+                        read_bytes,
+                        omitted_records,
+                    });
+                }
+                // A final JSONL record need not end with a newline.
+                let line = &read.bytes[cursor..];
+                let line_record_offset = record_offset.saturating_add(consumed_entries);
+                consumed_entries = consumed_entries.saturating_add(1);
+                cursor = read.bytes.len();
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    omitted_records = omitted_records.saturating_add(1);
+                } else if let Ok(message) = serde_json::from_slice::<AgentChannelMessage>(line) {
+                    let immutable_path = Self::message_record_path(channel_id, &message.message_id);
+                    match history_vfs.stat_beneath_no_links(&immutable_path) {
+                        Ok(_) => {}
+                        Err(VfsError::NotFound { .. }) => {
+                            records.push(AgentChannelLegacyMessageRecord {
+                                record_offset: line_record_offset,
+                                next_byte_offset: 0,
+                                message,
+                            });
+                        }
+                        Err(source) => {
+                            return Err(channel_store_io(&immutable_path, source.to_string()));
+                        }
+                    }
+                } else {
+                    omitted_records = omitted_records.saturating_add(1);
+                }
+                break;
+            };
+            let line_end = cursor.saturating_add(relative_end);
+            let following = if line_end < read.bytes.len() {
+                line_end.saturating_add(1)
+            } else {
+                line_end
+            };
+            let line = &read.bytes[cursor..line_end];
+            let line_record_offset = record_offset.saturating_add(consumed_entries);
+            consumed_entries = consumed_entries.saturating_add(1);
+            cursor = following;
+            if line.iter().all(u8::is_ascii_whitespace) {
+                omitted_records = omitted_records.saturating_add(1);
+                continue;
+            }
+            let message = match serde_json::from_slice::<AgentChannelMessage>(line) {
+                Ok(message) => message,
+                Err(_) => {
+                    omitted_records = omitted_records.saturating_add(1);
+                    continue;
+                }
+            };
+            let immutable_path = Self::message_record_path(channel_id, &message.message_id);
+            match history_vfs.stat_beneath_no_links(&immutable_path) {
+                Ok(_) => continue,
+                Err(VfsError::NotFound { .. }) => {}
+                Err(source) => {
+                    return Err(channel_store_io(&immutable_path, source.to_string()));
+                }
+            }
+            records.push(AgentChannelLegacyMessageRecord {
+                record_offset: line_record_offset,
+                next_byte_offset: if cursor < read.bytes.len() || read.truncated {
+                    byte_offset.saturating_add(cursor)
+                } else {
+                    0
+                },
+                message,
+            });
+        }
+        let next_byte_offset = if cursor < read.bytes.len() || read.truncated {
+            byte_offset.saturating_add(cursor)
+        } else {
+            0
+        };
+        Ok(AgentChannelLegacyMessageRecordPage {
+            records,
+            next_cursor: page.next_cursor,
+            current_entry_name: Some(entry.name.clone()),
+            current_object_id: Some(object_id),
+            current_version: Some(version),
+            next_byte_offset,
+            next_discarding_line: discarding,
+            deferred_for_fresh_budget: false,
+            consumed_entries,
+            read_bytes,
+            omitted_records,
+        })
+    }
+
     pub fn load_timeline_overview(
         &self,
         channel_id: &SessionId,
@@ -1494,6 +2424,7 @@ impl SifsAgentChannelStore {
 impl AgentChannelStore for SifsAgentChannelStore {
     fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
         let record = self.append_metadata_record(channel)?;
+        let source_record_id = record.record_id.clone();
         let loaded = self.load_channel_metadata(&channel.channel_id)?;
         // A routed DFS write can commit before this node's namespace view has
         // observed the immutable record. Fold the exact record we just wrote
@@ -1501,6 +2432,7 @@ impl AgentChannelStore for SifsAgentChannelStore {
         // delay into a failed chat send. A later read still enumerates and
         // reconciles all immutable records, including concurrent writers.
         let (mut merged, applied) = reconcile_written_metadata_record(loaded, record)?;
+        self.write_history_metadata_projection(&channel.channel_id, &source_record_id)?;
         // Preserve a bounded transcript in the materialized cache for legacy
         // readers. Current readers replace it from immutable message records.
         merged.transcript = channel
@@ -1532,6 +2464,14 @@ impl AgentChannelStore for SifsAgentChannelStore {
             channel.next_sequence = recent.total_messages.saturating_add(1);
         }
         Ok(Some(channel))
+    }
+
+    fn load_message(
+        &self,
+        channel_id: &SessionId,
+        message_id: &TaskId,
+    ) -> Result<Option<AgentChannelMessage>, AgentChannelStoreError> {
+        self.load_immutable_message_record(channel_id, message_id)
     }
 
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
@@ -1574,6 +2514,135 @@ impl AgentChannelStore for SifsAgentChannelStore {
         self.write_file(&path, bytes)?;
         Ok(path)
     }
+}
+
+/// Materialize one provider-neutral user message in a stable SIFS chat.
+///
+/// The message id and timestamp must come from the stable surface event that
+/// accepted the input. Replaying the same event is idempotent; a conflicting
+/// body under the same id is rejected instead of rewriting history.
+pub fn project_stable_chat_user_message(
+    store: &dyn AgentChannelStore,
+    channel_id: &SessionId,
+    message_id: TaskId,
+    created_at: OffsetDateTime,
+    content: &str,
+    source: AgentChannelSource,
+) -> Result<(), AgentChannelStoreError> {
+    let channel = store
+        .load_channel(channel_id)?
+        .ok_or_else(|| AgentChannelStoreError::Io {
+            path: channel_id.to_string(),
+            detail: "stable chat channel does not exist".to_string(),
+        })?;
+    project_stable_chat_message(
+        store,
+        channel,
+        message_id,
+        created_at,
+        AgentChannelAuthor::User {
+            user_id: AGENT_CHANNEL_APP_USER_ID.to_string(),
+            display_name: "User".to_string(),
+        },
+        content,
+        source,
+    )
+}
+
+/// Materialize one provider-neutral agent message in a stable SIFS chat.
+///
+/// The channel's current durable membership is the authority. Realtime/provider
+/// output may never create or re-enable a participant.
+#[allow(clippy::too_many_arguments)]
+pub fn project_stable_chat_agent_message(
+    store: &SifsAgentChannelStore,
+    channel_id: &SessionId,
+    agent_key: &str,
+    agent_name: &str,
+    agent_session_id: &SessionId,
+    message_id: TaskId,
+    created_at: OffsetDateTime,
+    content: &str,
+    source: AgentChannelSource,
+) -> Result<(), AgentChannelStoreError> {
+    let channel = store
+        .load_channel(channel_id)?
+        .ok_or_else(|| AgentChannelStoreError::Io {
+            path: channel_id.to_string(),
+            detail: "stable chat channel does not exist".to_string(),
+        })?;
+    let agent_key = if agent_key.trim().is_empty() {
+        "main-agent"
+    } else {
+        agent_key.trim()
+    };
+    let _ = (agent_name, agent_session_id);
+    let participant = channel
+        .participants
+        .iter()
+        .find(|participant| participant.agent_key == agent_key && participant.enabled)
+        .ok_or_else(|| AgentChannelStoreError::Serialization {
+            detail: format!(
+                "stable chat agent `{agent_key}` is not an enabled channel participant"
+            ),
+        })?;
+    let author = AgentChannelAuthor::Agent {
+        participant_id: participant.participant_id.clone(),
+        agent_key: participant.agent_key.clone(),
+        agent_name: participant.agent_name.clone(),
+        agent_session_id: participant.agent_session_id.clone(),
+    };
+    project_stable_chat_message(
+        store, channel, message_id, created_at, author, content, source,
+    )
+}
+
+fn project_stable_chat_message(
+    store: &dyn AgentChannelStore,
+    channel: AgentChannel,
+    message_id: TaskId,
+    created_at: OffsetDateTime,
+    author: AgentChannelAuthor,
+    content: &str,
+    source: AgentChannelSource,
+) -> Result<(), AgentChannelStoreError> {
+    if channel.is_deleted() {
+        return Err(AgentChannelStoreError::Io {
+            path: channel.channel_id.to_string(),
+            detail: "stable chat channel is deleted".to_string(),
+        });
+    }
+    if let Some(existing) = store.load_message(&channel.channel_id, &message_id)? {
+        if existing.author != author
+            || existing.message_kind != AgentChannelMessageKind::Normal
+            || existing.content != content
+            || existing.created_at != created_at
+            || existing.source != source
+            || !existing.attachments.is_empty()
+        {
+            return Err(AgentChannelStoreError::Serialization {
+                detail: format!(
+                    "stable chat message {message_id} already exists with different content"
+                ),
+            });
+        }
+        return Ok(());
+    }
+
+    let message = AgentChannelMessage {
+        message_id,
+        sequence: channel.next_sequence,
+        author,
+        message_kind: AgentChannelMessageKind::Normal,
+        content: content.to_string(),
+        created_at,
+        source,
+        attachments: Vec::new(),
+    };
+    // Surface projection is not an authority-changing operation. Append only
+    // the immutable message record: saving a channel snapshot derived before a
+    // concurrent revocation could otherwise restore stale membership.
+    store.append_message(&channel.channel_id, &message)
 }
 
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, AgentChannelStoreError> {
@@ -1659,6 +2728,19 @@ fn merge_channel_snapshot(
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let merged_participant = entry.get_mut();
+                let merged_membership = (
+                    merged_participant.membership_revision,
+                    merged_participant.enabled,
+                );
+                let candidate_membership = (participant.membership_revision, participant.enabled);
+                if candidate_membership.0 > merged_membership.0
+                    || (candidate_membership.0 == merged_membership.0
+                        && !candidate_membership.1
+                        && merged_membership.1)
+                {
+                    merged_participant.enabled = candidate_membership.1;
+                    merged_participant.membership_revision = candidate_membership.0;
+                }
                 merged_participant.observed_through_sequence = merged_participant
                     .observed_through_sequence
                     .max(participant.observed_through_sequence);
@@ -2423,6 +3505,48 @@ impl AgentChat {
         session_id: &str,
         history: &[ChatHistoryMessage],
     ) -> Result<(), CliError> {
+        let previous_store = self.runtime.store().clone();
+        let previous_interaction_session = self.runtime.session().clone();
+        let previous_channel = self.channel.clone();
+        let previous_tool_runtime = self.tool_runtime.clone();
+        let previous_tool_runtime_explicit_override = self.tool_runtime_explicit_override;
+        let previous_resume_sync_warnings = self.resume_sync_warnings.clone();
+        let handler_snapshot = self
+            .runtime
+            .handler_mut()
+            .transition_snapshot(&previous_interaction_session)?;
+
+        match self.resume_session_inner(session_id, history) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let data_dir = self.data_dir.clone();
+                let rollback = self
+                    .runtime
+                    .handler_mut()
+                    .restore_transition_snapshot(&data_dir, handler_snapshot);
+                self.runtime
+                    .replace_store_and_session(previous_store, previous_interaction_session);
+                self.channel = previous_channel;
+                self.tool_runtime = previous_tool_runtime;
+                self.tool_runtime_explicit_override = previous_tool_runtime_explicit_override;
+                self.resume_sync_warnings = previous_resume_sync_warnings;
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(CliError::Parse {
+                        detail: format!(
+                            "resume chat session failed: {error}; rollback failed: {rollback}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn resume_session_inner(
+        &mut self,
+        session_id: &str,
+        history: &[ChatHistoryMessage],
+    ) -> Result<(), CliError> {
         self.resume_sync_warnings.clear();
         let session = app_session(&self.data_dir, Some(session_id));
         let info = self.runtime_info();
@@ -2505,7 +3629,6 @@ impl AgentChat {
             .map_err(|detail| CliError::Parse {
                 detail: format!("select canonical agent session failed: {detail}"),
             })?;
-        let previous_agent_key = self.runtime_info().agent;
         match persisted_session {
             Some(mut persisted) => {
                 let persisted_agent_key = match persisted.agent_definition_key.clone() {
@@ -2600,27 +3723,19 @@ impl AgentChat {
                     .map_err(|source| CliError::Parse {
                         detail: format!("persist reconciled chat session failed: {source}"),
                     })?;
-                tui::app_prepare_agent(
+                tui::app_switch_agent(
                     self.runtime.handler_mut(),
                     &self.data_dir,
                     definition,
                     self.daemon_connected,
                 )?;
-                if let Err(error) = self
-                    .runtime
-                    .handler_mut()
-                    .replace_full_agent_session(&session, persisted)
-                {
-                    if let Some(previous) = resolve_agent(&self.data_dir, &previous_agent_key) {
-                        let _ = tui::app_prepare_agent(
-                            self.runtime.handler_mut(),
-                            &self.data_dir,
-                            previous,
-                            self.daemon_connected,
-                        );
-                    }
-                    return Err(error);
-                }
+                tui::app_restore_agent_session(
+                    self.runtime.handler_mut(),
+                    &self.data_dir,
+                    &session,
+                    Some(persisted),
+                    sinomo_agent::AgentTranscript::new(),
+                )?;
             }
             None => {
                 let definition =
@@ -2632,30 +3747,26 @@ impl AgentChat {
                             ),
                         }
                     })?;
-                tui::app_prepare_agent(
+                tui::app_switch_agent(
                     self.runtime.handler_mut(),
                     &self.data_dir,
                     definition,
                     self.daemon_connected,
                 )?;
-                if let Err(error) = self.runtime.handler_mut().replace_agent_session(
+                tui::app_restore_agent_session(
+                    self.runtime.handler_mut(),
+                    &self.data_dir,
                     &session,
+                    None,
                     agent_transcript_from_channel(&channel, history),
-                ) {
-                    if let Some(previous) = resolve_agent(&self.data_dir, &previous_agent_key) {
-                        let _ = tui::app_prepare_agent(
-                            self.runtime.handler_mut(),
-                            &self.data_dir,
-                            previous,
-                            self.daemon_connected,
-                        );
-                    }
-                    return Err(error);
-                }
+                )?;
             }
         }
         self.channel = channel;
-        self.configure_tool_runtime_for_session(&session.session_id)?;
+        self.configure_tool_runtime_for_session(&session.session_id)
+            .map_err(|error| CliError::Parse {
+                detail: format!("configure resumed chat tool runtime failed: {error}"),
+            })?;
         if !loaded_existing_channel || self.channel != channel_before_resume {
             if let Err(error) = self.save_channel() {
                 self.resume_sync_warnings
@@ -2910,8 +4021,24 @@ impl AgentChat {
                 message: message.into(),
             })
             .map_err(agent_control_cli_error)?;
-        let status = chat_control_status(result);
-        self.persist_current_session_checkpoint(false)?;
+        let mut persistence_degraded = false;
+        if let Err(error) = project_accepted_chat_control_input(
+            self.channel_store.as_ref(),
+            &self.channel.channel_id,
+            &result,
+        ) {
+            tracing::warn!(%error, "accepted steering was not projected to stable chat history");
+            persistence_degraded = true;
+        }
+        let mut status = chat_control_status(result);
+        if let Err(error) = self.persist_current_session_checkpoint(false) {
+            tracing::warn!(%error, "accepted steering checkpoint was not persisted");
+            persistence_degraded = true;
+        }
+        if persistence_degraded {
+            status.warning =
+                Some("control accepted, but durable chat persistence is unavailable".to_string());
+        }
         Ok(status)
     }
 
@@ -2925,8 +4052,24 @@ impl AgentChat {
                 message: message.into(),
             })
             .map_err(agent_control_cli_error)?;
-        let status = chat_control_status(result);
-        self.persist_current_session_checkpoint(false)?;
+        let mut persistence_degraded = false;
+        if let Err(error) = project_accepted_chat_control_input(
+            self.channel_store.as_ref(),
+            &self.channel.channel_id,
+            &result,
+        ) {
+            tracing::warn!(%error, "accepted follow-up was not projected to stable chat history");
+            persistence_degraded = true;
+        }
+        let mut status = chat_control_status(result);
+        if let Err(error) = self.persist_current_session_checkpoint(false) {
+            tracing::warn!(%error, "accepted follow-up checkpoint was not persisted");
+            persistence_degraded = true;
+        }
+        if persistence_degraded {
+            status.warning =
+                Some("control accepted, but durable chat persistence is unavailable".to_string());
+        }
         Ok(status)
     }
 
@@ -3241,7 +4384,7 @@ impl AgentChat {
             previous_interaction_session.clone(),
         );
         if let Some(definition) = resolve_agent(&data_dir, &previous_agent) {
-            tui::app_prepare_agent(
+            tui::app_switch_agent(
                 self.runtime.handler_mut(),
                 &data_dir,
                 definition,
@@ -3254,16 +4397,13 @@ impl AgentChat {
                 ),
             });
         }
-        match previous_agent_session {
-            Some(previous_agent_session) => self.runtime.handler_mut().replace_full_agent_session(
-                &previous_interaction_session,
-                previous_agent_session,
-            )?,
-            None => self.runtime.handler_mut().replace_agent_session(
-                &previous_interaction_session,
-                sinomo_agent::AgentTranscript::new(),
-            )?,
-        }
+        tui::app_restore_agent_session(
+            self.runtime.handler_mut(),
+            &data_dir,
+            &previous_interaction_session,
+            previous_agent_session,
+            sinomo_agent::AgentTranscript::new(),
+        )?;
         self.configure_tool_runtime_for_session(&previous_interaction_session.session_id)?;
         result.map(|_| ()).map_err(|source| CliError::Parse {
             detail: format!("channel turn failed: {source}"),
@@ -3414,8 +4554,14 @@ impl AgentChat {
             let tool_runtime = ChatToolRuntimeSelection::from_agent_definition(&definition);
             set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
         } else {
-            for participant in &mut self.channel.participants {
-                participant.enabled = false;
+            let participant_ids = self
+                .channel
+                .participants
+                .iter()
+                .map(|participant| participant.participant_id.clone())
+                .collect::<Vec<_>>();
+            for participant_id in participant_ids {
+                self.channel.set_participant_enabled(&participant_id, false);
             }
             if !self.tool_runtime_explicit_override {
                 self.tool_runtime = ChatToolRuntimeSelection::from_agent_definition(&definition);
@@ -3662,7 +4808,7 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
             }
             Some(_) => {}
         }
-        tui::app_prepare_agent(
+        tui::app_switch_agent(
             self.runtime.handler_mut(),
             self.data_dir,
             definition,
@@ -3691,10 +4837,14 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
             parse_chat_tool_runtime_selection(&tool_runtime).map_err(channel_executor_cli_error)?;
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), interaction_session.clone());
-        self.runtime
-            .handler_mut()
-            .replace_full_agent_session(&interaction_session, session.clone())
-            .map_err(channel_executor_cli_error)?;
+        tui::app_restore_agent_session(
+            self.runtime.handler_mut(),
+            self.data_dir,
+            &interaction_session,
+            Some(session.clone()),
+            sinomo_agent::AgentTranscript::new(),
+        )
+        .map_err(channel_executor_cli_error)?;
         let workspace_projection = channel
             .has_authoritative_workspace_projection()
             .then_some(channel.workspaces.as_slice());
@@ -3862,7 +5012,65 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
             .collect(),
         queued_input: chat_queued_input_from_events(&result.events),
         removed_input_id: chat_removed_input_id_from_events(&result.events),
+        warning: None,
     }
+}
+
+/// Persist the user-visible input accepted by a steering/follow-up control
+/// event into the stable chat timeline.
+///
+/// Queue ids and event timestamps are generated by the agent control plane and
+/// remain stable across retries. Raw agent/model session records are neither
+/// opened nor copied into the channel projection.
+pub fn project_accepted_chat_control_input(
+    store: &dyn AgentChannelStore,
+    stable_channel_id: &SessionId,
+    result: &AgentSessionControlResult,
+) -> Result<(), AgentChannelStoreError> {
+    if !result.accepted {
+        return Ok(());
+    }
+    let queued = result.events.iter().find_map(|event| match &event.payload {
+        AgentEventPayload::SteeringQueued { steering } => Some((
+            &steering.steering_id,
+            steering.message.as_str(),
+            "steering",
+            event,
+        )),
+        AgentEventPayload::FollowUpQueued { follow_up } => Some((
+            &follow_up.follow_up_id,
+            follow_up.message.as_str(),
+            "follow_up",
+            event,
+        )),
+        _ => None,
+    });
+    let Some((input_id, message, input_kind, event)) = queued else {
+        return Ok(());
+    };
+    if event.session_id != result.snapshot.session_id {
+        return Err(AgentChannelStoreError::Serialization {
+            detail: "accepted chat control event belongs to a different session".to_string(),
+        });
+    }
+    let source = AgentChannelSource {
+        adapter: "sinomo-chat-control".to_string(),
+        external_channel_id: Some(stable_channel_id.to_string()),
+        external_message_id: Some(input_id.to_string()),
+        metadata: serde_json::json!({
+            "surface_event": "queued_turn_input",
+            "input_kind": input_kind,
+        }),
+        ..AgentChannelSource::default()
+    };
+    project_stable_chat_user_message(
+        store,
+        stable_channel_id,
+        input_id.clone(),
+        event.emitted_at,
+        message,
+        source,
+    )
 }
 
 /// Extract the steering/follow-up input a control call queued, if any.
@@ -4348,7 +5556,6 @@ fn ensure_primary_participant(
         if let Some(participant) = channel.participant_mut(&participant_id) {
             participant.agent_session_id = channel_id;
             participant.order = 1;
-            participant.enabled = true;
         }
     }
     participant_id
@@ -4445,6 +5652,7 @@ fn outer_channel_runtime_participant(
         agent_name: agent_key,
         agent_session_id: channel.channel_id.clone(),
         enabled: true,
+        membership_revision: 1,
         order: 0,
         tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
         observed_through_sequence: 0,
@@ -4529,6 +5737,7 @@ fn participant_from_speaker(speaker: &ChatSpeaker) -> AgentChannelParticipant {
         agent_name: speaker.agent_name.clone(),
         agent_session_id,
         enabled: true,
+        membership_revision: 1,
         order: 1,
         tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
         observed_through_sequence: 0,
@@ -7285,6 +8494,65 @@ mod tests {
         fail_next_materialization: AtomicBool,
     }
 
+    struct RejectMessageChannelStore {
+        inner: SifsAgentChannelStore,
+    }
+
+    impl AgentChannelStore for RejectMessageChannelStore {
+        fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+            self.inner.save_channel(channel)
+        }
+
+        fn load_channel(
+            &self,
+            channel_id: &SessionId,
+        ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+            self.inner.load_channel(channel_id)
+        }
+
+        fn load_message(
+            &self,
+            channel_id: &SessionId,
+            message_id: &TaskId,
+        ) -> Result<Option<AgentChannelMessage>, AgentChannelStoreError> {
+            self.inner.load_message(channel_id, message_id)
+        }
+
+        fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
+            self.inner.list_channels()
+        }
+
+        fn append_message(
+            &self,
+            channel_id: &SessionId,
+            message: &AgentChannelMessage,
+        ) -> Result<(), AgentChannelStoreError> {
+            Err(AgentChannelStoreError::Io {
+                path: format!("simulated://{channel_id}/{}", message.message_id),
+                detail: "simulated stable history outage".to_string(),
+            })
+        }
+
+        fn append_turn(
+            &self,
+            channel_id: &SessionId,
+            turn: &AgentChannelTurn,
+        ) -> Result<(), AgentChannelStoreError> {
+            self.inner.append_turn(channel_id, turn)
+        }
+
+        fn save_attachment(
+            &self,
+            channel_id: &SessionId,
+            attachment_id: &TaskId,
+            file_name: &str,
+            bytes: &[u8],
+        ) -> Result<String, AgentChannelStoreError> {
+            self.inner
+                .save_attachment(channel_id, attachment_id, file_name, bytes)
+        }
+    }
+
     impl CrashAfterTurnChannelStore {
         fn new(inner: SifsAgentChannelStore) -> Self {
             Self {
@@ -8430,6 +9698,46 @@ mod tests {
     }
 
     #[test]
+    fn accepted_control_returns_warning_when_stable_projection_fails() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-control-history-warning");
+        let data_dir = SinomoDataDir::new(&root);
+        let channel_store = RejectMessageChannelStore {
+            inner: SifsAgentChannelStore::open(&data_dir).expect("open channel store"),
+        };
+        let checkpoint_store =
+            SifsAgentSessionCheckpointStore::open(&data_dir).expect("checkpoint store");
+        let chat = AgentChat::with_runtime_control_registry_and_stores(
+            data_dir,
+            false,
+            AgentRuntimeControlRegistry::new(),
+            Box::new(channel_store),
+            checkpoint_store,
+        )
+        .expect("chat runtime");
+        chat.save_channel().expect("save initial channel");
+
+        let status = chat
+            .steer("accepted despite history outage")
+            .expect("accepted control remains successful");
+        assert!(status.accepted);
+        assert_eq!(
+            status.warning.as_deref(),
+            Some("control accepted, but durable chat persistence is unavailable")
+        );
+        let session = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("session snapshot")
+            .expect("session");
+        assert_eq!(session.steering_queue.len(), 1);
+        assert_eq!(
+            session.steering_queue[0].message,
+            "accepted despite history outage"
+        );
+    }
+
+    #[test]
     fn app_chat_group_controls_publish_exact_member_checkpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-control-member");
         let data_dir = SinomoDataDir::new(&root);
@@ -8748,6 +10056,150 @@ mod tests {
             .expect("load roaming checkpoint")
             .expect("roaming checkpoint");
         assert_eq!(roaming_checkpoint.workspace_binding, None);
+    }
+
+    #[test]
+    fn app_chat_resume_configuration_failure_restores_previous_recall_authority() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-resume-authority-rollback");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        let previous_interaction_session = chat.runtime.session().clone();
+        let previous_channel = chat.channel.clone();
+        let previous_tool_runtime = chat.tool_runtime.clone();
+        let memory_path = "resume/rollback-authority.md";
+        let main_write = tui::execute_tui_workspace_tool(
+            chat.runtime.handler(),
+            &previous_interaction_session,
+            0,
+            "memory_write",
+            serde_json::json!({
+                "path": memory_path,
+                "markdown": "main authority survives failed resume",
+            }),
+        );
+        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
+
+        let target_session_id = SessionId::generate();
+        let mut target_channel = AgentChannel::with_default_title(target_session_id.clone());
+        let participant_id = target_channel.ensure_participant("coding-agent", "coding-agent");
+        let participant = target_channel
+            .participant_mut(&participant_id)
+            .expect("coding participant");
+        participant.agent_session_id = target_session_id.clone();
+        // An explicitly present but empty node id reaches configuration only
+        // after the target agent/session has been restored, then fails parsing.
+        participant.tool_runtime.sandbox_node_id = Some(String::new());
+        chat.channel_store
+            .save_channel(&target_channel)
+            .expect("save target channel");
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(
+                &AgentSession::new(target_session_id.clone(), AgentRole::Deliberation)
+                    .with_agent_definition_key("coding-agent"),
+            )
+            .expect("save target coding session");
+
+        let error = chat
+            .resume_session(target_session_id.as_str(), &[])
+            .expect_err("invalid target tool runtime must reject resume");
+
+        assert!(
+            error
+                .to_string()
+                .contains("configure resumed chat tool runtime failed"),
+            "unexpected resume error: {error}"
+        );
+        assert_eq!(chat.runtime_info().agent, "main-agent");
+        assert_eq!(chat.runtime.session(), &previous_interaction_session);
+        assert_eq!(chat.channel, previous_channel);
+        assert_eq!(chat.tool_runtime, previous_tool_runtime);
+        let restored = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("restored main session");
+        assert_eq!(restored.agent_definition_key.as_deref(), Some("main-agent"));
+        assert_eq!(restored.session_id, previous_interaction_session.session_id);
+        let main_read = tui::execute_tui_workspace_tool(
+            chat.runtime.handler(),
+            &previous_interaction_session,
+            1,
+            "memory_read",
+            serde_json::json!({ "path": memory_path }),
+        );
+        assert_eq!(
+            main_read.output["markdown"],
+            "main authority survives failed resume"
+        );
+    }
+
+    #[test]
+    fn app_chat_resume_validation_failure_restores_outer_and_canonical_runtime() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-resume-validation-rollback");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        let previous_interaction_session = chat.runtime.session().clone();
+        let previous_channel = chat.channel.clone();
+        let previous_tool_runtime = chat.tool_runtime.clone();
+        let memory_path = "resume/validation-rollback.md";
+        let main_write = tui::execute_tui_workspace_tool(
+            chat.runtime.handler(),
+            &previous_interaction_session,
+            0,
+            "memory_write",
+            serde_json::json!({
+                "path": memory_path,
+                "markdown": "main authority survives validation failure",
+            }),
+        );
+        assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
+
+        let target_session_id = SessionId::generate();
+        FileAgentSessionStore::for_data_dir(&data_dir)
+            .save_session(&AgentSession::new(
+                target_session_id.clone(),
+                AgentRole::Deliberation,
+            ))
+            .expect("save identity-less target session");
+
+        chat.resume_session(target_session_id.as_str(), &[])
+            .expect_err("identity-less canonical session must reject resume");
+
+        assert_eq!(chat.runtime_info().agent, "main-agent");
+        assert_eq!(chat.runtime.session(), &previous_interaction_session);
+        assert_eq!(chat.channel, previous_channel);
+        assert_eq!(chat.tool_runtime, previous_tool_runtime);
+        let restored = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("runtime snapshot")
+            .expect("restored main session");
+        assert_eq!(restored.session_id, previous_interaction_session.session_id);
+        assert_eq!(restored.agent_definition_key.as_deref(), Some("main-agent"));
+        let registry = chat.runtime_control_registry();
+        assert!(
+            registry
+                .contains_session(&previous_interaction_session.session_id)
+                .expect("previous route")
+        );
+        assert!(
+            !registry
+                .contains_session(&target_session_id)
+                .expect("target route")
+        );
+        let main_read = tui::execute_tui_workspace_tool(
+            chat.runtime.handler(),
+            &previous_interaction_session,
+            1,
+            "memory_read",
+            serde_json::json!({ "path": memory_path }),
+        );
+        assert_eq!(
+            main_read.output["markdown"],
+            "main authority survives validation failure"
+        );
     }
 
     #[test]
@@ -9772,6 +11224,423 @@ mod tests {
                 .iter()
                 .any(|message| &message.message_id == message_id)
         }));
+    }
+
+    #[test]
+    fn accepted_chat_control_input_projects_idempotent_user_message() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-stable-control-input");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let agent_session_id = SessionId::generate();
+        let mut channel = AgentChannel::with_default_title(channel_id.clone());
+        channel.ensure_participant("main-agent", "Main");
+        store.save_channel(&channel).expect("save channel");
+        let input_id = TaskId::generate();
+        let event = AgentEvent::new(
+            TaskId::generate(),
+            agent_session_id.clone(),
+            AgentEventPayload::SteeringQueued {
+                steering: sinomo_agent::AgentSteeringMessage {
+                    steering_id: input_id.clone(),
+                    message: "preserve this constraint".to_string(),
+                },
+            },
+        );
+        let result = AgentSessionControlResult {
+            sequence: 3,
+            accepted: true,
+            events: vec![event.clone()],
+            outcome: None,
+            snapshot: sinomo_agent::AgentSessionControlSnapshot {
+                session_id: agent_session_id,
+                next_sequence: 4,
+                active_turn: None,
+                tasks: Vec::new(),
+                buffered_event_count: 0,
+            },
+        };
+
+        project_accepted_chat_control_input(&store, &channel_id, &result)
+            .expect("first projection");
+        project_accepted_chat_control_input(&store, &channel_id, &result)
+            .expect("idempotent replay");
+
+        let loaded = store
+            .load_channel(&channel_id)
+            .expect("load projected channel")
+            .expect("projected channel");
+        let matches = loaded
+            .transcript
+            .iter()
+            .filter(|message| message.message_id == input_id)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].content, "preserve this constraint");
+        assert_eq!(matches[0].created_at, event.emitted_at);
+        assert!(matches!(
+            &matches[0].author,
+            AgentChannelAuthor::User { .. }
+        ));
+        assert_eq!(matches[0].source.adapter, "sinomo-chat-control");
+        assert_eq!(
+            matches[0].source.external_channel_id.as_deref(),
+            Some(channel_id.as_str())
+        );
+        assert_eq!(matches[0].source.metadata["input_kind"], "steering");
+    }
+
+    #[test]
+    fn late_realtime_projection_cannot_restore_revoked_membership() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-late-realtime-revocation");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::with_default_title(channel_id.clone());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let participant_session_id = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .agent_session_id
+            .clone();
+        store.save_channel(&channel).expect("save enabled channel");
+
+        assert!(channel.disable_participant(&participant_id));
+        channel.updated_at += time::Duration::nanoseconds(1);
+        store.save_channel(&channel).expect("save revocation");
+
+        let error = project_stable_chat_agent_message(
+            &store,
+            &channel_id,
+            "main-agent",
+            "Main",
+            &participant_session_id,
+            TaskId::generate(),
+            time::OffsetDateTime::now_utc(),
+            "late provider output",
+            AgentChannelSource::app(),
+        )
+        .expect_err("revoked member must reject late output");
+        assert!(
+            error
+                .to_string()
+                .contains("not an enabled channel participant")
+        );
+
+        let loaded = store
+            .load_channel(&channel_id)
+            .expect("load revoked channel")
+            .expect("channel");
+        assert!(
+            loaded
+                .participants
+                .iter()
+                .any(|participant| participant.agent_key == "main-agent" && !participant.enabled)
+        );
+        assert!(
+            !loaded
+                .transcript
+                .iter()
+                .any(|message| { message.content == "late provider output" })
+        );
+    }
+
+    #[test]
+    fn participant_membership_revision_survives_stale_newer_metadata() {
+        let channel_id = SessionId::generate();
+        let mut enabled = AgentChannel::with_default_title(channel_id);
+        let participant_id = enabled.ensure_participant("main-agent", "Main");
+        let mut revoked = enabled.clone();
+        assert!(revoked.disable_participant(&participant_id));
+        revoked.updated_at = enabled.updated_at + time::Duration::nanoseconds(1);
+
+        let mut stale_unrelated = enabled.clone();
+        stale_unrelated.title = "newer unrelated title".to_string();
+        stale_unrelated.updated_at = revoked.updated_at + time::Duration::nanoseconds(1);
+        let merged = merge_channel_snapshot(revoked.clone(), stale_unrelated)
+            .expect("merge stale unrelated metadata");
+        let participant = merged.participant(&participant_id).expect("participant");
+        assert!(
+            !participant.enabled,
+            "stale metadata must not restore access"
+        );
+        assert_eq!(
+            participant.membership_revision,
+            revoked
+                .participant(&participant_id)
+                .expect("revoked participant")
+                .membership_revision
+        );
+
+        let mut explicitly_reenabled = revoked;
+        explicitly_reenabled.ensure_participant("main-agent", "Main");
+        let reenabled = merge_channel_snapshot(merged, explicitly_reenabled)
+            .expect("merge causally newer re-enable");
+        assert!(
+            reenabled
+                .participant(&participant_id)
+                .is_some_and(|participant| participant.enabled),
+            "an explicit causally newer re-enable must still win"
+        );
+    }
+
+    #[test]
+    fn history_message_page_uses_directory_size_and_skips_oversized_bodies() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-history-bounded-message-page");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "History bounds");
+        store.save_channel(&channel).expect("save channel");
+        let message = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "bounded immutable history body",
+            AgentChannelSource::app(),
+        );
+        store
+            .append_message(&channel_id, &message)
+            .expect("append immutable message");
+        let history_vfs = sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root().to_path_buf()))
+            .expect("open history VFS");
+
+        let reads_before = store.message_record_body_read_count();
+        let omitted = store
+            .load_immutable_message_record_page(&history_vfs, &channel_id, None, 0, 1, 1)
+            .expect("scan oversized record");
+        assert!(omitted.records.is_empty());
+        assert_eq!(omitted.consumed_entries, 1);
+        assert_eq!(omitted.read_bytes, 0);
+        assert_eq!(omitted.omitted_records, 1);
+        assert_eq!(
+            store.message_record_body_read_count(),
+            reads_before,
+            "an entry larger than the remaining budget must advance without a body read"
+        );
+
+        let loaded = store
+            .load_immutable_message_record_page(&history_vfs, &channel_id, None, 0, 1, u64::MAX)
+            .expect("read bounded record");
+        assert_eq!(loaded.records.len(), 1);
+        assert_eq!(loaded.records[0].message.message_id, message.message_id);
+        assert!(loaded.read_bytes > 1);
+        assert_eq!(store.message_record_body_read_count(), reads_before + 1);
+    }
+
+    #[test]
+    fn history_message_page_charges_malformed_body_bytes_to_the_scan() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-history-malformed-message");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let malformed_path = format!(
+            "{}/malformed.json",
+            SifsAgentChannelStore::message_records_dir(&channel_id)
+        );
+        let malformed = b"{not valid channel message json";
+        store
+            .write_file(&malformed_path, malformed)
+            .expect("write malformed immutable record fixture");
+        let history_vfs = sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root().to_path_buf()))
+            .expect("open history VFS");
+
+        let page = store
+            .load_immutable_message_record_page(&history_vfs, &channel_id, None, 0, 1, u64::MAX)
+            .expect("scan malformed record");
+        assert!(page.records.is_empty());
+        assert_eq!(page.consumed_entries, 1);
+        assert_eq!(page.read_bytes, malformed.len() as u64);
+        assert_eq!(page.omitted_records, 1);
+    }
+
+    #[test]
+    fn bounded_history_metadata_ignores_snapshot_transcript_and_fails_closed() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-history-bounded-authorization");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Private history");
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "private transcript sentinel",
+            AgentChannelSource::app(),
+        );
+        store
+            .save_channel(&channel)
+            .expect("save authorized channel");
+
+        let mut revoked = channel.clone();
+        assert!(revoked.disable_participant(&participant_id));
+        revoked.updated_at = channel.updated_at + time::Duration::nanoseconds(1);
+        store
+            .append_metadata_record(&revoked)
+            .expect("append revocation without refreshing snapshot cache");
+        let stale_snapshot = store
+            .load_channel_snapshot_only(&channel_id)
+            .expect("read stale snapshot")
+            .expect("snapshot exists");
+        assert!(
+            stale_snapshot
+                .participants
+                .iter()
+                .any(|participant| participant.agent_key == "main-agent" && participant.enabled)
+        );
+        assert!(
+            stale_snapshot
+                .transcript
+                .iter()
+                .any(|message| message.content == "private transcript sentinel")
+        );
+        store
+            .write_file(
+                &SifsAgentChannelStore::snapshot_path(&channel_id),
+                b"private transcript sentinel; not valid snapshot JSON",
+            )
+            .expect("replace repairable snapshot with unreadable transcript fixture");
+
+        let history_vfs = sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root().to_path_buf()))
+            .expect("open history VFS");
+        let no_item_budget = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, 0, u64::MAX)
+            .expect("bounded metadata read");
+        assert!(!no_item_budget.complete);
+        assert!(no_item_budget.channel.is_none());
+        assert_eq!(no_item_budget.scanned_items, 0);
+        assert_eq!(no_item_budget.omitted_records, 0);
+
+        let oversized_metadata = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, usize::MAX, 1)
+            .expect("oversized metadata read");
+        assert!(!oversized_metadata.complete);
+        assert!(oversized_metadata.channel.is_none());
+        assert_eq!(oversized_metadata.scanned_items, 1);
+        assert_eq!(oversized_metadata.scanned_bytes, 0);
+        assert_eq!(oversized_metadata.omitted_records, 1);
+        assert!(oversized_metadata.omitted_records <= oversized_metadata.scanned_items);
+
+        let single_record_budget = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, 1, u64::MAX)
+            .expect("single-record metadata read");
+        assert!(!single_record_budget.complete);
+        assert!(single_record_budget.channel.is_none());
+
+        let folded = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, usize::MAX, u64::MAX)
+            .expect("fold complete metadata history");
+        assert!(folded.complete);
+        assert_eq!(folded.omitted_records, 0);
+        let folded_channel = folded.channel.expect("folded channel");
+        assert!(
+            folded_channel
+                .participants
+                .iter()
+                .any(|participant| participant.agent_key == "main-agent" && !participant.enabled)
+        );
+    }
+
+    #[test]
+    fn compact_history_metadata_proves_current_membership_in_one_bounded_item() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-history-compact-authorization");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Compact history");
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "transcript body must not enter compact authorization",
+            AgentChannelSource::app(),
+        );
+        store.save_channel(&channel).expect("save channel");
+
+        let projection_bytes = store
+            .browser
+            .read_file(&SifsAgentChannelStore::history_metadata_projection_path(
+                &channel_id,
+            ))
+            .expect("read compact projection");
+        let projection_text = String::from_utf8(projection_bytes).expect("projection text");
+        assert!(!projection_text.contains("transcript body"));
+
+        let history_vfs = sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root().to_path_buf()))
+            .expect("open history VFS");
+        let authorized = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, 1, u64::MAX)
+            .expect("load compact authorization");
+        assert!(authorized.complete);
+        assert_eq!(authorized.scanned_items, 1);
+        assert!(
+            authorized
+                .channel
+                .expect("channel")
+                .participants
+                .iter()
+                .any(|participant| participant.agent_key == "main-agent" && participant.enabled)
+        );
+
+        assert!(channel.disable_participant(&participant_id));
+        channel.updated_at += time::Duration::nanoseconds(1);
+        store.save_channel(&channel).expect("save revocation");
+        let revoked = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, 1, u64::MAX)
+            .expect("load compact revocation");
+        assert!(revoked.complete);
+        assert_eq!(revoked.scanned_items, 1);
+        assert!(
+            revoked
+                .channel
+                .expect("channel")
+                .participants
+                .iter()
+                .any(|participant| participant.agent_key == "main-agent" && !participant.enabled)
+        );
+    }
+
+    #[test]
+    fn compact_history_projection_refolds_immutable_revocation_before_publish() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-history-projection-revocation-race");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Concurrent revocation");
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        store.save_channel(&channel).expect("save enabled channel");
+        let stale_source = store
+            .append_metadata_record(&channel)
+            .expect("retain stale writer source");
+
+        let mut revoked = channel.clone();
+        assert!(revoked.disable_participant(&participant_id));
+        revoked.updated_at = channel.updated_at + time::Duration::nanoseconds(1);
+        store
+            .append_metadata_record(&revoked)
+            .expect("append concurrent revocation");
+
+        // A writer that began from the old source must fold the immutable
+        // namespace again. It may not stamp its stale membership with the
+        // post-revocation directory watermark.
+        store
+            .write_history_metadata_projection(&channel_id, &stale_source.record_id)
+            .expect("publish stable projection");
+
+        let history_vfs = sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root().to_path_buf()))
+            .expect("open history VFS");
+        let current = store
+            .load_channel_metadata_for_history(&history_vfs, &channel_id, 1, u64::MAX)
+            .expect("load compact current authorization");
+        assert!(current.complete);
+        assert_eq!(current.scanned_items, 1);
+        assert!(
+            current
+                .channel
+                .expect("channel")
+                .participants
+                .iter()
+                .any(|participant| participant.agent_key == "main-agent" && !participant.enabled)
+        );
     }
 
     #[test]

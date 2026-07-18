@@ -5500,6 +5500,107 @@ fn open_shared_metadata_posix_service(
 }
 
 #[test]
+fn no_link_beneath_posix_primitives_confine_reads_lists_and_mutations() {
+    let root = temp_root("no-link-beneath-primitives");
+    let node = NodeId::from_legacy_named("node_no_link_beneath").expect("node id");
+    let mut dfs =
+        open_shared_metadata_posix_service(&root, &root.join("metadata"), node.clone(), "content");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+    let options = DfsWriteOptions::replicated_eventual(vec![node]);
+
+    dfs.posix_mkdir_all_beneath_no_links("/scope", "/scope/notes/nested")
+        .expect("create missing scoped root and directory chain");
+    let created = dfs
+        .posix_create_file_beneath_no_links(
+            "/scope",
+            "/scope/notes/note.md",
+            b"inside note",
+            options.clone(),
+        )
+        .expect("guarded exclusive create");
+    let (opened, prefix) = dfs
+        .posix_read_file_prefix_beneath_no_links_distributed("/scope", "/scope/notes/note.md", 6)
+        .expect("guarded exact prefix read");
+    assert_eq!(opened.object_id, created.object_id);
+    assert_eq!(opened.version, created.version);
+    assert_eq!(prefix.bytes, b"inside");
+    assert!(prefix.truncated);
+    let (range_opened, range) = dfs
+        .posix_read_file_range_beneath_no_links_distributed("/scope", "/scope/notes/note.md", 7, 64)
+        .expect("guarded exact tail read");
+    assert_eq!(range_opened.object_id, created.object_id);
+    assert_eq!(range_opened.version, created.version);
+    assert_eq!(range.bytes, b"note");
+    assert!(!range.truncated);
+    assert!(matches!(
+        dfs.posix_read_file_range_beneath_no_links_distributed(
+            "/scope",
+            "/scope/notes/note.md",
+            12,
+            64,
+        ),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+
+    let (directory, page) = dfs
+        .posix_list_dir_beneath_no_links_distributed_page("/scope", "/scope/notes", None, 16)
+        .expect("guarded directory page");
+    assert_eq!(directory.kind, DfsObjectKind::Directory);
+    assert!(page.entries.iter().any(|entry| {
+        entry.name == "note.md"
+            && entry.object_id == created.object_id
+            && entry.version == created.version
+    }));
+
+    dfs.posix_mkdir_all("/outside").expect("create outside");
+    dfs.posix_create_file("/outside/secret.md", b"outside", options.clone())
+        .expect("create outside secret");
+    dfs.posix_symlink("/outside", "/scope/escape", options.clone())
+        .expect("create escaping link");
+    assert!(matches!(
+        dfs.posix_read_file_prefix_beneath_no_links_distributed(
+            "/scope",
+            "/scope/escape/secret.md",
+            64,
+        ),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        dfs.posix_list_dir_beneath_no_links_distributed_page("/scope", "/scope/escape", None, 16,),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        dfs.posix_create_file_beneath_no_links(
+            "/scope",
+            "/scope/escape/new.md",
+            b"must not escape",
+            options,
+        ),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        dfs.posix_namespace_lstat_distributed("/outside/new.md"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    let operation = DfsNamespaceOperation::MkdirAtNoLinks {
+        path: "/scope/notes/routed".to_string(),
+        expected_parent_object_id: directory.object_id,
+        expected_parent_version: directory.version,
+    };
+    assert_eq!(operation.routing_path(), Some("/scope/notes/routed"));
+    assert_eq!(operation.involved_paths(), vec!["/scope/notes/routed"]);
+    let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+    let encoded = codec.encode(&operation).expect("encode no-link mkdir");
+    assert_eq!(
+        codec
+            .decode::<DfsNamespaceOperation>(&encoded)
+            .expect("decode no-link mkdir"),
+        operation
+    );
+}
+
+#[test]
 fn networked_dfs_builds_routed_messages_without_transport_send() {
     let root = temp_root("networked-dfs-builds-routed-messages");
     let local = NodeId::from_legacy_named("node_build_frame_local").expect("local");

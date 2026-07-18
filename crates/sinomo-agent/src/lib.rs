@@ -298,6 +298,10 @@ pub enum AgentToolKind {
     ConfigSearch,
     ConfigGet,
     ConfigSet,
+    SessionHistorySearch,
+    MemorySearch,
+    MemoryRead,
+    MemoryWrite,
     RequestUserInput,
     ToolSearch,
     ToolDescribe,
@@ -737,7 +741,7 @@ impl AgentDefinition {
             description: String::new(),
             role,
             system_prompt: system_prompt.into(),
-            tools: Vec::new(),
+            tools: default_agent_recall_tools(),
             tool_surface: AgentToolSurfaceDefinition::default(),
             skills: Vec::new(),
             context: AgentContextDefinition::default(),
@@ -1546,7 +1550,8 @@ fn parse_agent_role(value: &str) -> Option<AgentRole> {
 }
 
 pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
-    vec![
+    let mut tools = default_agent_recall_tools();
+    tools.extend([
         AgentToolSpec::new(
             AgentToolKind::ReadFile,
             "read_file",
@@ -1583,7 +1588,8 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
             "Update a registered Sinomo configuration value through the shared config resolver.",
             true,
         ),
-    ]
+    ]);
+    tools
 }
 
 pub fn default_background_agent_tools() -> Vec<AgentToolSpec> {
@@ -1598,7 +1604,8 @@ pub fn default_background_agent_tools() -> Vec<AgentToolSpec> {
 }
 
 pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
-    vec![
+    let mut tools = default_agent_recall_tools();
+    tools.extend([
         AgentToolSpec::new(
             AgentToolKind::ReadFile,
             "read_file",
@@ -1675,6 +1682,36 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             AgentToolKind::SkillActivate,
             "skill_activate",
             "Request activation of a disclosed skill through the host runtime when an activation executor is attached.",
+            true,
+        ),
+    ]);
+    tools
+}
+
+fn default_agent_recall_tools() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec::new(
+            AgentToolKind::SessionHistorySearch,
+            "session_history_search",
+            "Search chats, channels, and background activities this agent engaged in without exposing raw model-session records.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::MemorySearch,
+            "memory_search",
+            "Search this agent's Markdown memory notes in its SIFS home.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::MemoryRead,
+            "memory_read",
+            "Read a bounded versioned Markdown memory note from this agent's SIFS home.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::MemoryWrite,
+            "memory_write",
+            "Create or compare-and-replace a Markdown memory note in this agent's SIFS home.",
             true,
         ),
     ]

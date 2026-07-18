@@ -243,6 +243,77 @@ home instead of receiving a new node-local directory. A runtime that cannot
 project the live SIFS filesystem must report the home as unavailable; it must
 not silently substitute a session-scoped or host-scoped directory.
 
+## Historical Recall and Markdown Notes
+
+Every normal agent runtime, including one created from a custom agent
+definition, exposes four recall tools by default:
+`session_history_search`, `memory_search`, `memory_read`, and `memory_write`.
+Their authority is supplied by the host from the active agent identity; an
+agent cannot select another agent id or storage root in tool input.
+
+Historical search is deliberately an agent-activity search, not a model-session
+reader. Its stable input is the agent's chat timelines, currently authorized
+shared-channel timelines, and typed background-activity projections for work
+the agent engaged in. Results use the
+normalized activity kinds `chat`, `channel`, and `background_activity`. Provider
+session records, compaction records, raw realtime media state, and other private
+model-session data are not part of this contract. Provider-neutral output text
+that the realtime UI actually receives is aggregated at stable turn boundaries
+and projected as ordinary agent-authored chat messages. Speech-start/stop events
+do not invent user transcripts: spoken input enters history only when a future
+provider-neutral surface supplies an actual input transcript. This keeps recall
+stable across text, full-duplex, realtime, image, and future model runtimes whose
+internal session formats may differ substantially.
+
+Shared-channel recall is authorized from current durable participant
+membership, not from message authorship or an old session association.
+Participant enable/disable transitions carry their own causal revision, so a
+later unrelated save from a stale replica cannot resurrect revoked history
+access. Authorization metadata and message bodies are read through no-link
+SIFS walks to prevent one channel from aliasing another channel's records.
+The pager covers both current immutable channel-message records and older
+stable channel JSONL chunks through bounded byte continuations; it never falls
+back to a materialized transcript snapshot or a provider session.
+
+Chat, channel, and background-activity read models live in SIFS so recall
+follows an agent when placement changes. A background activity is sanitized
+before projection: its stable id, owner, kind, summary, lifecycle status,
+status-derived progress label, and update time are retained, while raw runtime
+progress, model-session handles,
+result artifacts, active operation ids, and raw event ids remain in the private
+execution store. A durable node-local typed projection is written first, then
+each activity update records a local pending marker before attempting its
+best-effort SIFS mirror. A later activity write for the same agent retries a
+bounded page of pending mirrors and clears each marker only after the roaming
+write succeeds. Mirror failure never makes ordinary session persistence depend
+on cluster storage availability. Same-node search reports a partial result
+while any pending marker remains, instead of reading private model-session
+files. A pending marker stranded on another unavailable node cannot be detected
+globally, which is why this backend advertises best-effort rather than complete
+consistency.
+
+Markdown notes live below the owning agent's SIFS home at
+`/sinomo/agents/<agent-id>/home/memory/`; the sandbox projection is
+`/home/agent/memory/`. Note paths are safe relative lowercase `.md` paths, and
+every directory listing, read, parent creation, and write walks the scoped SIFS
+tree without following symbolic or hard-link records. `memory_search` streams
+bounded, version-bound byte ranges so it can reach matches anywhere in a large
+note, and an empty query lists notes for discovery. `memory_read` similarly
+returns `next_offset` plus an opaque note version, allowing callers to page an
+arbitrarily large existing note without mixing versions. Each `memory_write`
+currently accepts at most 1 MiB of complete Markdown as a tool-managed
+create/replace operation cap; that cap is not a SIFS storage or read limit.
+Writes either create a new path exclusively or
+compare-and-replace an existing note using the opaque version returned by a
+prior read or write, so concurrent agents do not silently overwrite each
+other's notes. If SIFS is unavailable, these tools fail closed rather than
+falling back to node-local storage.
+
+This is the immediately useful recall layer, not the long-term indexed-memory
+architecture. Search and storage sit behind backend contracts so the indexed
+memory system can later supply catalogs, ranking, and richer retrieval without
+changing the agent-visible note or activity abstractions.
+
 ## Tool Surface and Progressive Disclosure
 
 The primary availability surface is `AgentToolSurface`. It projects the tools

@@ -282,6 +282,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Read a bounded prefix through a no-link scoped open.
+    ///
+    /// The namespace walk returns an exact object/version identity and the
+    /// content transfer consumes that identity directly. A concurrent rename
+    /// or link replacement after the open therefore cannot redirect the read
+    /// outside `root`.
+    pub fn posix_read_file_prefix_beneath_no_links_distributed(
+        &mut self,
+        root: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
+        self.posix_read_file_range_beneath_no_links_distributed(root, path, 0, max_bytes)
+    }
+
+    /// Read one bounded range through a no-link scoped open.
+    ///
+    /// The receipt identifies the exact immutable object/version consumed by
+    /// the content transfer. `truncated` is true exactly when bytes remain
+    /// after the returned range. Offsets beyond the exact opened size fail so
+    /// callers cannot confuse an invalid continuation with EOF.
+    pub fn posix_read_file_range_beneath_no_links_distributed(
+        &mut self,
+        root: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
+        let opened = self.posix_open_beneath_no_links_distributed(root, path)?;
+        if opened.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory {
+                path: opened.path.clone(),
+            });
+        }
+        let size_bytes = opened
+            .size_bytes
+            .ok_or_else(|| DfsPosixError::InvalidPath {
+                path: opened.path.clone(),
+            })?;
+        if offset > size_bytes {
+            return Err(DfsPosixError::InvalidPath {
+                path: opened.path.clone(),
+            });
+        }
+        let bytes =
+            self.posix_read_file_range_for_opened_stat(&opened.path, &opened, offset, max_bytes)?;
+        let range_end = offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let truncated = size_bytes > range_end;
+        Ok((opened, DfsPosixFilePrefixRead { bytes, truncated }))
+    }
+
     /// Reads one bounded range from the authoritative version of `path`, fetching
     /// it from a healthy replica when the content is not local.
     pub fn posix_read_file_range_distributed(

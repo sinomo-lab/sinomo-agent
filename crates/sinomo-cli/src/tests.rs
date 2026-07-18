@@ -5746,6 +5746,61 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
 }
 
 #[test]
+fn agent_run_activity_output_is_human_visible_and_model_session_free() {
+    let text_decision = sinomo_agent::AgentLoopDecision {
+        response_mode: sinomo_agent::AgentLoopResponseMode::Answer,
+        text: "stable answer".to_string(),
+        tool_calls: Vec::new(),
+        background_handoff: None,
+        next_state: sinomo_agent::AgentInteractionState::Idle,
+    };
+    assert_eq!(
+        super::agent_run_activity_output(&text_decision).expect("text activity output"),
+        super::AgentRunActivityOutput::Agent("stable answer")
+    );
+
+    let handoff_decision = sinomo_agent::AgentLoopDecision {
+        background_handoff: Some(sinomo_agent::BackgroundHandoffRequest {
+            reason: "inspect cluster health".to_string(),
+            evidence_ref: "sifs:/private/evidence/secret.json".to_string(),
+            priority: sinomo_agent::BackgroundHandoffPriority::Emergency,
+        }),
+        ..text_decision.clone()
+    };
+    assert_eq!(
+        super::agent_run_activity_output(&handoff_decision).expect("text activity output"),
+        super::AgentRunActivityOutput::Agent("stable answer")
+    );
+    let notice = super::chat_activity::background_handoff_notice(
+        handoff_decision
+            .background_handoff
+            .as_ref()
+            .expect("handoff"),
+    );
+    assert_eq!(
+        notice,
+        "Background handoff requested (emergency): inspect cluster health"
+    );
+    assert!(!notice.contains("evidence"));
+    assert!(!notice.contains("secret"));
+
+    let empty_decision = sinomo_agent::AgentLoopDecision {
+        text: String::new(),
+        ..text_decision
+    };
+    let super::AgentRunActivityOutput::System(serialized) =
+        super::agent_run_activity_output(&empty_decision).expect("system activity output")
+    else {
+        panic!("empty decisions use the structured system fallback");
+    };
+    let output: serde_json::Value = serde_json::from_str(&serialized).expect("decision JSON");
+    assert_eq!(output["text"], "");
+    assert!(output.get("provider").is_none());
+    assert!(output.get("model").is_none());
+    assert!(output.get("session").is_none());
+}
+
+#[test]
 fn agent_run_session_loader_creates_then_resumes_a_durable_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-run-resume");
     let data_dir = SinomoDataDir::new(&root);
@@ -14998,6 +15053,10 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
         .map(|descriptor| descriptor.spec.name)
         .collect();
     for expected in [
+        "session_history_search",
+        "memory_search",
+        "memory_read",
+        "memory_write",
         "config_search",
         "config_get",
         "config_set",
@@ -15073,6 +15132,68 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
             .and_then(serde_json::Value::as_str),
         Some("workspace tool content\n")
     );
+}
+
+#[test]
+fn normal_agent_registries_attach_all_recall_tool_executors() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-recall-tools");
+    let data_dir = SinomoDataDir::new(&root);
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_agent_recall_tools").expect("node"),
+        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+    );
+
+    for definition in [
+        sinomo_agent::AgentDefinition::main(),
+        sinomo_agent::AgentDefinition::background(),
+        sinomo_agent::AgentDefinition::coding(),
+        sinomo_agent::AgentDefinition::evolution(),
+    ] {
+        let registry = super::agent_tool_registry_for_workspace(
+            &data_dir,
+            root.path(),
+            &definition,
+            None,
+            None,
+            false,
+        )
+        .expect("normal agent tool registry");
+
+        for tool in [
+            "session_history_search",
+            "memory_search",
+            "memory_read",
+            "memory_write",
+        ] {
+            assert!(
+                registry.contains(tool),
+                "{} registry is missing {tool}",
+                definition.key()
+            );
+            let outcome = registry.execute(
+                &session,
+                0,
+                0,
+                &sinomo_agent::AgentToolCall {
+                    call_id: None,
+                    tool: tool.to_string(),
+                    input: serde_json::json!({}),
+                    r#async: false,
+                    summary: format!("probe {tool} executor"),
+                },
+            );
+            assert_ne!(
+                outcome
+                    .output
+                    .get("error")
+                    .and_then(serde_json::Value::as_str),
+                Some("missing_executor"),
+                "{} advertises {tool} without a concrete executor",
+                definition.key()
+            );
+        }
+    }
 }
 
 #[test]

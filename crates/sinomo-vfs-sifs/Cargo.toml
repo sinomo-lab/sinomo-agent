@@ -13,6 +13,7 @@ ring = "r1"
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-dfs = { path = "../sinomo-dfs" }

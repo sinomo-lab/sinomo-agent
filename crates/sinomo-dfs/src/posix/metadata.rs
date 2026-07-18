@@ -867,6 +867,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object_for_path(object, &object.path)
     }
 
+    /// Project the namespace record itself instead of resolving the internal
+    /// hardlink record to its target. This is intentionally separate from the
+    /// POSIX stat projection: capability-scoped VFS users need to recognize
+    /// every kind of link before following it.
+    pub(super) fn namespace_lstat_object_for_path(
+        &self,
+        object: &DfsObjectMetadata,
+        path: &str,
+    ) -> Result<DfsStat> {
+        let size_bytes = self.object_content_size_hint(object)?;
+        let link_count = self.link_count_for_object(object)?;
+        Ok(DfsStat {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            path: normalize_posix_path(path)?,
+            kind: object.kind.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes,
+            link_count,
+            mode: object_mode_or_default(object),
+            uid: object.uid,
+            gid: object.gid,
+            accessed_at_unix_nanos: object_timestamp_or_default(object.accessed_at_unix_nanos),
+            modified_at_unix_nanos: object_timestamp_or_default(object.modified_at_unix_nanos),
+            created_at_unix_nanos: object_timestamp_or_default(object.created_at_unix_nanos),
+            changed_at_unix_nanos: object_timestamp_or_default(object.changed_at_unix_nanos),
+            policy: object.policy.clone(),
+            current_locations: object.current_locations.clone(),
+        })
+    }
+
     pub(super) fn stat_object_for_path(
         &self,
         object: &DfsObjectMetadata,

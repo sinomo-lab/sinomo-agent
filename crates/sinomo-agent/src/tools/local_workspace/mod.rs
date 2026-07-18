@@ -20,6 +20,8 @@ use crate::{
     AgentProcessStart, AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec,
     InteractionSession, TaskId, default_coding_agent_tools,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
@@ -53,6 +55,11 @@ const DEFAULT_LOCAL_MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_LOCAL_MAX_LIST_ENTRIES: usize = 200;
 const AGENT_SANDBOX_TOOLCHAIN_ID: &str = "agent_tools";
 const AGENT_HOME_SIFS_ROOT: &str = "/sinomo/agents";
+const ENCODED_AGENT_HOME_ID_PREFIX: &str = "__sinomo_encoded__";
+const HASHED_AGENT_HOME_ID_PREFIX: &str = "__sinomo_hashed__";
+// Leave headroom below the usual 255-byte POSIX component ceiling for
+// backends that reserve a few bytes for their own namespace encoding.
+const MAX_AGENT_HOME_ID_COMPONENT_BYTES: usize = 240;
 const SIMPLE_SANDBOX_RUNTIME: &str = "simple_sandbox";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1828,20 +1835,38 @@ pub fn agent_home_sifs_path_for_id(agent_id: &str) -> String {
 }
 
 fn sanitize_agent_home_id(agent_id: &str) -> String {
-    let sanitized: String = agent_id
-        .trim()
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
-            _ => '-',
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('-').trim_matches('.').to_string();
-    if sanitized.is_empty() {
-        "default".to_string()
-    } else {
-        sanitized
+    let is_path_safe = !agent_id.is_empty()
+        && agent_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if is_path_safe
+        && agent_id.len() <= MAX_AGENT_HOME_ID_COMPONENT_BYTES
+        && !agent_id.starts_with(ENCODED_AGENT_HOME_ID_PREFIX)
+        && !agent_id.starts_with(HASHED_AGENT_HOME_ID_PREFIX)
+    {
+        return agent_id.to_string();
     }
+
+    // Agent package identifiers also allow ':'. Reserve path-safe namespaces
+    // and encode every transformed ID, including safe IDs beginning with a
+    // reserved prefix. This keeps ordinary mappings injective while preserving
+    // the established home paths of short path-safe agent IDs.
+    let encoded = format!(
+        "{ENCODED_AGENT_HOME_ID_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(agent_id.as_bytes())
+    );
+    if encoded.len() <= MAX_AGENT_HOME_ID_COMPONENT_BYTES {
+        return encoded;
+    }
+
+    // A definition id has no declared length ceiling. Bound its filesystem
+    // component without truncating a shared prefix; the full digest retains a
+    // collision-resistant identity and the reserved namespace prevents a
+    // literal safe id from aliasing it.
+    format!(
+        "{HASHED_AGENT_HOME_ID_PREFIX}{}",
+        blake3::hash(agent_id.as_bytes()).to_hex()
+    )
 }
 
 fn normalize_agent_home_sifs_path(path: String) -> String {
@@ -3080,6 +3105,46 @@ mod tests {
         assert_ne!(
             agent_home_sifs_path_for_id(agent_id),
             agent_home_sifs_path_for_id("main-agent")
+        );
+    }
+
+    #[test]
+    fn agent_home_path_keeps_transformed_agent_identities_distinct() {
+        assert_eq!(
+            agent_home_sifs_path_for_id("foo-bar"),
+            "/sinomo/agents/foo-bar/home"
+        );
+        assert_ne!(
+            agent_home_sifs_path_for_id("foo:bar"),
+            agent_home_sifs_path_for_id("foo-bar")
+        );
+        assert_eq!(
+            agent_home_sifs_path_for_id("foo:bar"),
+            agent_home_sifs_path_for_id("foo:bar")
+        );
+        let encoded_component = sanitize_agent_home_id("foo:bar");
+        assert_ne!(
+            agent_home_sifs_path_for_id(&encoded_component),
+            agent_home_sifs_path_for_id("foo:bar"),
+            "the reserved encoded namespace must not collide with a literal safe id"
+        );
+        assert_ne!(
+            agent_home_sifs_path_for_id(" foo-bar"),
+            agent_home_sifs_path_for_id("foo-bar"),
+            "invalid callers must not collapse distinct identities by trimming"
+        );
+        let long_id = format!("agent:{}", "x".repeat(2_048));
+        let long_component = sanitize_agent_home_id(&long_id);
+        assert!(long_component.starts_with(HASHED_AGENT_HOME_ID_PREFIX));
+        assert!(long_component.len() <= MAX_AGENT_HOME_ID_COMPONENT_BYTES);
+        assert_ne!(
+            agent_home_sifs_path_for_id(&long_id),
+            agent_home_sifs_path_for_id(&format!("agent:{}", "y".repeat(2_048)))
+        );
+        assert_ne!(
+            agent_home_sifs_path_for_id(&long_component),
+            agent_home_sifs_path_for_id(&long_id),
+            "the reserved hashed namespace must not collide with a literal safe id"
         );
     }
 

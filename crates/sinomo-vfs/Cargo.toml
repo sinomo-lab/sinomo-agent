@@ -12,6 +12,7 @@ include = ["src/**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }

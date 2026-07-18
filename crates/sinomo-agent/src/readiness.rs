@@ -7173,12 +7173,89 @@ fn check_model_visible_evidence_redaction_smoke(_workspace_root: &Path) -> Agent
 }
 
 fn readiness_local_registry(workspace_root: &Path) -> AgentToolRegistry {
-    fixed_command_readiness_registry(
+    let registry = fixed_command_readiness_registry(
         LocalWorkspaceAgentConfig::new(workspace_root)
             .using_local_process_commands()
             .allowing_file_writes(true)
             .allowing_shell_commands(true),
-    )
+    );
+    register_readiness_recall_tools(&registry);
+    registry
+}
+
+/// Attach the real host-bound recall executors to deterministic readiness
+/// backends. Production agents still have to inject their authorized SIFS and
+/// activity-history backends; the readiness harness must exercise the same
+/// executor boundary rather than hiding default tools from the plan.
+pub(crate) fn register_readiness_recall_tools(registry: &AgentToolRegistry) {
+    crate::memory_notes::register_tools(
+        registry,
+        crate::MemoryNoteAgentToolConfig::from_backend(ReadinessMemoryNoteBackend),
+    );
+    crate::register_session_history_search_tool(
+        registry,
+        crate::SessionHistorySearchPrincipal::new("readiness-agent")
+            .expect("constant readiness principal"),
+        Arc::new(ReadinessSessionHistoryBackend),
+    );
+}
+
+/// Empty but contract-valid storage for deterministic executor-readiness
+/// checks. It does not stand in for production SIFS: search observes an empty
+/// authorized note root, reads report absence, and writes report unavailable.
+struct ReadinessMemoryNoteBackend;
+
+impl crate::MemoryNoteBackend for ReadinessMemoryNoteBackend {
+    fn search(
+        &self,
+        _request: crate::MemoryNoteSearchRequest,
+        cancellation: &AgentCancellationToken,
+    ) -> Result<crate::MemoryNoteSearchPage, crate::MemoryNoteBackendError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::MemoryNoteBackendError::Cancelled);
+        }
+        Ok(crate::MemoryNoteSearchPage::default())
+    }
+
+    fn read(
+        &self,
+        request: crate::MemoryNoteReadRequest,
+        cancellation: &AgentCancellationToken,
+    ) -> Result<crate::MemoryNoteDocument, crate::MemoryNoteBackendError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::MemoryNoteBackendError::Cancelled);
+        }
+        Err(crate::MemoryNoteBackendError::NotFound { path: request.path })
+    }
+
+    fn write(
+        &self,
+        _request: crate::MemoryNoteWriteRequest,
+        cancellation: &AgentCancellationToken,
+    ) -> Result<crate::MemoryNoteWriteReceipt, crate::MemoryNoteBackendError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::MemoryNoteBackendError::Cancelled);
+        }
+        Err(crate::MemoryNoteBackendError::Unavailable {
+            detail: "the deterministic readiness backend does not persist notes".to_string(),
+        })
+    }
+}
+
+struct ReadinessSessionHistoryBackend;
+
+impl crate::SessionHistorySearchBackend for ReadinessSessionHistoryBackend {
+    fn search(
+        &self,
+        _principal: &crate::SessionHistorySearchPrincipal,
+        _request: &crate::SessionHistorySearchRequest,
+        cancellation: &AgentCancellationToken,
+    ) -> Result<crate::SessionHistorySearchPage, crate::SessionHistorySearchError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::SessionHistorySearchError::Cancelled);
+        }
+        Ok(crate::SessionHistorySearchPage::complete(Vec::new()))
+    }
 }
 
 fn readiness_session() -> InteractionSession {

@@ -257,6 +257,14 @@ pub enum DfsNamespaceOperation {
         path: String,
         attrs: DfsPosixCreateAttrs,
     },
+    /// Create one directory at an exact opened parent without resolving any
+    /// link component. The metadata primary revalidates the parent identity
+    /// and version before mutating the child path.
+    MkdirAtNoLinks {
+        path: String,
+        expected_parent_object_id: DfsObjectId,
+        expected_parent_version: DfsVersion,
+    },
     MkdirAll {
         path: String,
     },
@@ -432,6 +440,7 @@ impl DfsNamespaceOperation {
         match self {
             DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
+            | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
             | DfsNamespaceOperation::MkdirAll { path }
             | DfsNamespaceOperation::Rmdir { path }
             | DfsNamespaceOperation::Unlink { path }
@@ -473,6 +482,7 @@ impl DfsNamespaceOperation {
         match self {
             DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
+            | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
             | DfsNamespaceOperation::MkdirAll { path }
             | DfsNamespaceOperation::Rmdir { path }
             | DfsNamespaceOperation::Unlink { path }

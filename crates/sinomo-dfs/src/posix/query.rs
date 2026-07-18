@@ -11,13 +11,101 @@ use crate::namespace::next_version;
 use crate::posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsPosixError, DfsStat, Result, read_conflict_error,
 };
-use crate::posix_path::normalize_posix_path;
+use crate::posix_path::{join_posix_path, normalize_posix_path, posix_path_is_at_or_under_prefix};
 use crate::{
     DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsReadData,
     NetworkedDfsReadOutcome, NetworkedDfsService,
 };
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Open one exact namespace object beneath `root` without following any
+    /// symbolic-link or DFS hardlink record in either the root or target path.
+    ///
+    /// Every component is fetched directly from its current metadata
+    /// authority. The returned stat therefore acts as an immutable opened
+    /// identity for content reads; callers must not resolve `path` again after
+    /// this succeeds.
+    pub fn posix_open_beneath_no_links_distributed(
+        &mut self,
+        root: &str,
+        path: &str,
+    ) -> Result<DfsStat> {
+        self.check_cancelled("distributed no-link beneath open")?;
+        let root = normalize_posix_path(root)?;
+        let path = normalize_posix_path(path)?;
+        if !posix_path_is_at_or_under_prefix(&path, &root) {
+            return Err(DfsPosixError::InvalidPath { path });
+        }
+
+        let components = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let mut current = "/".to_string();
+        // The filesystem root is part of every capability path. Validate it
+        // explicitly instead of assuming the ordinary resolver's invariant.
+        let file_system_root = self
+            .lookup_sifs_path_direct_distributed_synced(&current)?
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: current.clone(),
+            })?;
+        if file_system_root.kind != DfsObjectKind::Directory {
+            return Err(
+                if matches!(
+                    &file_system_root.kind,
+                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                ) {
+                    DfsPosixError::InvalidPath {
+                        path: current.clone(),
+                    }
+                } else {
+                    DfsPosixError::NotDirectory {
+                        path: current.clone(),
+                    }
+                },
+            );
+        }
+        let mut final_object = Some(file_system_root);
+
+        if !components.is_empty() {
+            for (index, component) in components.iter().enumerate() {
+                current = join_posix_path(&current, component);
+                let object = self
+                    .lookup_sifs_path_direct_distributed_synced(&current)?
+                    .ok_or_else(|| DfsPosixError::NotFound {
+                        path: current.clone(),
+                    })?;
+                if object.kind == DfsObjectKind::Tombstone {
+                    return Err(DfsPosixError::NotFound {
+                        path: current.clone(),
+                    });
+                }
+                if matches!(
+                    &object.kind,
+                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                ) {
+                    return Err(DfsPosixError::InvalidPath {
+                        path: current.clone(),
+                    });
+                }
+                let final_component = index + 1 == components.len();
+                let scoped_root_component = current == root;
+                if (!final_component || scoped_root_component)
+                    && object.kind != DfsObjectKind::Directory
+                {
+                    return Err(DfsPosixError::NotDirectory {
+                        path: current.clone(),
+                    });
+                }
+                final_object = Some(object);
+            }
+        }
+
+        let object = final_object.expect("a normalized absolute path has a final object");
+        self.namespace_lstat_object_for_path(&object, &path)
+    }
+
     pub fn posix_readlink(&self, path: &str) -> Result<String> {
         let path = self.resolve_existing_posix_path(path, false)?;
         let object = self
@@ -128,6 +216,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object_for_path(&object, &path)
     }
 
+    /// Inspect the final DFS namespace record without resolving either a
+    /// symbolic link or the DFS hardlink marker to its target.
+    ///
+    /// Ordinary POSIX `lstat` still projects hardlinks as their shared inode.
+    /// This stricter surface exists for capability boundaries that must reject
+    /// all link records before performing a follow operation.
+    pub fn posix_namespace_lstat(&self, path: &str) -> Result<DfsStat> {
+        self.with_metadata_lookup_cache(|service| {
+            let path = service.resolve_existing_posix_path(path, false)?;
+            let object = service
+                .lookup_sifs_path(&path)?
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            if object.kind == DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::NotFound { path });
+            }
+            service.namespace_lstat_object_for_path(&object, &path)
+        })
+    }
+
+    pub fn posix_namespace_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        self.namespace_lstat_object_for_path(&object, &path)
+    }
+
     pub fn posix_stat_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsStat>> {
         let Some(object) = self.object_by_id(object_id)? else {
             return Ok(None);
@@ -179,6 +295,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.sync_remote_namespace_path_until_quiet(&path)?;
         self.posix_list_resolved_dir_page(&path, after, max_entries)
+    }
+
+    /// List one bounded page from an exact no-link directory open beneath
+    /// `root`. Child hardlink records are returned as links rather than being
+    /// projected as their targets, and the opened path is never resolved
+    /// again after the component walk.
+    pub fn posix_list_dir_beneath_no_links_distributed_page(
+        &mut self,
+        root: &str,
+        path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<(DfsStat, DfsDirEntryPage)> {
+        let opened = self.posix_open_beneath_no_links_distributed(root, path)?;
+        if opened.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory {
+                path: opened.path.clone(),
+            });
+        }
+        if let Some(shard) = self.routed_namespace_shard_for_path(&opened.path)?
+            && !self.is_local_metadata_replica_for_shard(&shard)
+        {
+            self.sync_remote_namespace_path_until_quiet(&opened.path)?;
+        }
+        let page = self.posix_list_opened_dir_no_links_page(&opened, after, max_entries)?;
+        Ok((opened, page))
     }
 
     fn local_metadata_replica_can_list_resolved_dir(&mut self, path: &str) -> Result<bool> {
@@ -252,6 +394,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 modified_at_unix_nanos: target.modified_at_unix_nanos,
                 policy: target.policy.clone(),
                 current_locations: target.current_locations.clone(),
+            });
+        }
+        Ok(DfsDirEntryPage {
+            entries,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    fn posix_list_opened_dir_no_links_page(
+        &self,
+        opened: &DfsStat,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsDirEntryPage> {
+        if opened.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory {
+                path: opened.path.clone(),
+            });
+        }
+        let path = normalize_posix_path(&opened.path)?;
+        let page = self.child_objects_for_sifs_dir_page(&path, after, max_entries)?;
+        let mut entries = Vec::with_capacity(page.objects.len());
+        for object in page.objects {
+            let object_path = normalize_posix_path(&object.path)?;
+            if object.kind == DfsObjectKind::Tombstone {
+                continue;
+            }
+            entries.push(DfsDirEntry {
+                name: object_path
+                    .rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("/")
+                    .to_string(),
+                path: object_path,
+                kind: object.kind.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                size_bytes: object.content_size_bytes,
+                modified_at_unix_nanos: object.modified_at_unix_nanos,
+                policy: object.policy.clone(),
+                current_locations: object.current_locations.clone(),
             });
         }
         Ok(DfsDirEntryPage {

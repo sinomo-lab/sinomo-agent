@@ -30,7 +30,7 @@ use crate::posix_object::{
 };
 use crate::posix_path::{
     join_posix_path, normalize_posix_path, normalize_posix_path_with_trailing_directory,
-    parent_posix_path,
+    parent_posix_path, posix_path_is_at_or_under_prefix,
 };
 use crate::{
     DfsControlPlaneStore, DfsError, DfsFileSystem, DfsMessageTransport, DfsNamespaceOperation,
@@ -506,6 +506,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let path = normalize_posix_path(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
+        self.posix_mkdir_local_at_normalized_path(&path, attrs)
+    }
+
+    pub(crate) fn posix_mkdir_at_no_links_local(
+        &mut self,
+        path: &str,
+        expected_parent_object_id: &DfsObjectId,
+        expected_parent_version: &DfsVersion,
+    ) -> Result<DfsStat> {
+        let path = normalize_posix_path(path)?;
+        let parent = parent_posix_path(&path)
+            .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
+        let current_parent =
+            self.lookup_sifs_path(&parent)?
+                .ok_or_else(|| DfsPosixError::MissingParent {
+                    path: parent.clone(),
+                })?;
+        if current_parent.kind != DfsObjectKind::Directory {
+            return Err(
+                if matches!(
+                    &current_parent.kind,
+                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                ) {
+                    DfsPosixError::InvalidPath { path: parent }
+                } else {
+                    DfsPosixError::NotDirectory { path: parent }
+                },
+            );
+        }
+        if &current_parent.object_id != expected_parent_object_id
+            || &current_parent.version != expected_parent_version
+        {
+            return Err(DfsPosixError::Conflict {
+                path: parent,
+                reason: "opened parent directory changed before no-link mkdir".to_string(),
+            });
+        }
+        self.posix_mkdir_local_at_normalized_path(&path, DfsPosixCreateAttrs::directory_default())
+    }
+
+    fn posix_mkdir_local_at_normalized_path(
+        &mut self,
+        path: &str,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<DfsStat> {
+        let path = normalize_posix_path(path)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         self.ensure_parent_directory(&path)?;
         if let Some(mut object) = self.lookup_sifs_path(&path)? {
@@ -578,6 +624,142 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         self.posix_mkdir_all_local(path)
+    }
+
+    /// Ensure a directory chain exists beneath `root` without following any
+    /// link component, including while creating a missing scoped root.
+    ///
+    /// Each component is opened from the filesystem root and each missing
+    /// directory is created relative to an exact opened parent. A concurrent
+    /// replacement therefore yields a bounded retry or conflict rather than a
+    /// pathname traversal through the replacement.
+    pub fn posix_mkdir_all_beneath_no_links(&mut self, root: &str, path: &str) -> Result<()> {
+        const MAX_ATTEMPTS_PER_COMPONENT: usize = 3;
+
+        let root = normalize_posix_path(root)?;
+        let path = normalize_posix_path(path)?;
+        if !posix_path_is_at_or_under_prefix(&path, &root) {
+            return Err(DfsPosixError::InvalidPath { path });
+        }
+        self.posix_open_beneath_no_links_distributed("/", "/")?;
+        if path == "/" {
+            return Ok(());
+        }
+
+        let mut current = "/".to_string();
+        for child in path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            let candidate = join_posix_path(&current, child);
+            let mut completed = false;
+            for attempt in 0..MAX_ATTEMPTS_PER_COMPONENT {
+                let opened_parent = self.posix_open_beneath_no_links_distributed("/", &current)?;
+                match self.posix_open_beneath_no_links_distributed("/", &candidate) {
+                    Ok(opened) if opened.kind == DfsObjectKind::Directory => {
+                        completed = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(DfsPosixError::NotDirectory {
+                            path: candidate.clone(),
+                        });
+                    }
+                    Err(DfsPosixError::NotFound { .. }) => {
+                        match self.posix_mkdir_at_opened_directory_no_links(&opened_parent, child) {
+                            Ok(_) => {
+                                completed = true;
+                                break;
+                            }
+                            Err(DfsPosixError::AlreadyExists { .. })
+                            | Err(DfsPosixError::Conflict { .. })
+                                if attempt + 1 < MAX_ATTEMPTS_PER_COMPONENT =>
+                            {
+                                self.check_cancelled("no-link mkdir-all retry")?;
+                                self.hydrate_from_metadata_backend()?;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !completed {
+                return Err(DfsPosixError::Conflict {
+                    path: candidate,
+                    reason: "directory component kept changing during no-link mkdir-all"
+                        .to_string(),
+                });
+            }
+            current = candidate;
+        }
+        Ok(())
+    }
+
+    /// Create one direct child directory relative to an exact opened parent.
+    pub fn posix_mkdir_at_opened_directory_no_links(
+        &mut self,
+        opened_parent: &DfsStat,
+        child: &str,
+    ) -> Result<DfsStat> {
+        if child.is_empty()
+            || matches!(child, "." | "..")
+            || child.contains('/')
+            || child.bytes().any(|byte| byte == 0)
+        {
+            return Err(DfsPosixError::InvalidPath {
+                path: child.to_string(),
+            });
+        }
+        if opened_parent.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory {
+                path: opened_parent.path.clone(),
+            });
+        }
+        let parent = normalize_posix_path(&opened_parent.path)?;
+        let current_parent = self
+            .lookup_sifs_path_direct_distributed_synced(&parent)?
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: parent.clone(),
+            })?;
+        if current_parent.kind != DfsObjectKind::Directory {
+            return Err(
+                if matches!(
+                    &current_parent.kind,
+                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                ) {
+                    DfsPosixError::InvalidPath {
+                        path: parent.clone(),
+                    }
+                } else {
+                    DfsPosixError::NotDirectory {
+                        path: parent.clone(),
+                    }
+                },
+            );
+        }
+        if current_parent.object_id != opened_parent.object_id
+            || current_parent.version != opened_parent.version
+        {
+            return Err(DfsPosixError::Conflict {
+                path: parent.clone(),
+                reason: "opened parent directory changed before no-link mkdir".to_string(),
+            });
+        }
+        let path = join_posix_path(&parent, child);
+        if let Some(primary) = self.routed_namespace_primary_for_path(&path)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::MkdirAtNoLinks {
+                    path: path.clone(),
+                    expected_parent_object_id: opened_parent.object_id.clone(),
+                    expected_parent_version: opened_parent.version.clone(),
+                },
+            )?;
+            return self.stat_routed_namespace_result(&path, false);
+        }
+        self.posix_mkdir_at_no_links_local(&path, &opened_parent.object_id, &opened_parent.version)
     }
 
     fn posix_mkdir_all_chain_exists_locally(&self, path: &str) -> Result<bool> {
@@ -667,6 +849,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             false,
             false,
             Some((expected_object_id, expected_version)),
+            true,
         )
     }
 
@@ -711,6 +894,219 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             true,
             Some(attrs),
             true,
+            false,
+        )
+    }
+
+    /// Create a new regular file with content and final POSIX attributes in
+    /// one exclusive namespace operation.
+    ///
+    /// This is the content-bearing counterpart to
+    /// [`Self::posix_create_file_with_attrs`]. It never opens or overwrites an
+    /// existing object, including when two writers race to create the same
+    /// path.
+    pub fn posix_create_file_with_contents_and_attrs(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent(
+            path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            true,
+            false,
+        )
+    }
+
+    /// Create a new regular file with content, inheriting the ordinary
+    /// filesystem create attributes. Existing paths are rejected atomically.
+    pub fn posix_create_file(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent(
+            path, bytes, options, true, true, true, None, true, false,
+        )
+    }
+
+    /// Exclusively create one regular file beneath a no-link scoped root.
+    ///
+    /// The parent is opened component-by-component without following links,
+    /// then the child mutation is issued directly against that opened
+    /// directory path. Retrying restarts the complete open so a concurrent
+    /// namespace change can never turn a stale validation into a followed
+    /// link.
+    pub fn posix_create_file_beneath_no_links(
+        &mut self,
+        root: &str,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        const MAX_ATTEMPTS: usize = 3;
+
+        let path = normalize_posix_path(path)?;
+        let parent = parent_posix_path(&path)
+            .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
+        let child = path
+            .rsplit_once('/')
+            .map(|(_, child)| child)
+            .filter(|child| !child.is_empty())
+            .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let opened_parent = self.posix_open_beneath_no_links_distributed(root, &parent)?;
+            match self.posix_create_file_at_opened_directory_no_links(
+                &opened_parent,
+                child,
+                bytes,
+                options.clone(),
+            ) {
+                Ok(stat) => return Ok(stat),
+                Err(error)
+                    if attempt + 1 < MAX_ATTEMPTS
+                        && (posix_error_is_retryable_write_serialization(&error)
+                            || matches!(&error, DfsPosixError::Conflict { .. })) =>
+                {
+                    self.check_cancelled("no-link beneath create retry")?;
+                    self.hydrate_from_metadata_backend()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded no-link create loop returns on its final attempt")
+    }
+
+    /// Exclusively create a direct child of an exact opened directory without
+    /// performing path resolution after the open.
+    ///
+    /// This is intentionally `openat`-shaped: `child` must be one basename,
+    /// and the current directory record must still match the opened identity.
+    pub fn posix_create_file_at_opened_directory_no_links(
+        &mut self,
+        opened_parent: &DfsStat,
+        child: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        if child.is_empty()
+            || matches!(child, "." | "..")
+            || child.contains('/')
+            || child.bytes().any(|byte| byte == 0)
+        {
+            return Err(DfsPosixError::InvalidPath {
+                path: child.to_string(),
+            });
+        }
+        if opened_parent.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory {
+                path: opened_parent.path.clone(),
+            });
+        }
+        let parent = normalize_posix_path(&opened_parent.path)?;
+        let current_parent = self
+            .lookup_sifs_path_direct_distributed_synced(&parent)?
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: parent.clone(),
+            })?;
+        if current_parent.kind != DfsObjectKind::Directory {
+            return Err(
+                if matches!(
+                    &current_parent.kind,
+                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                ) {
+                    DfsPosixError::InvalidPath {
+                        path: parent.clone(),
+                    }
+                } else {
+                    DfsPosixError::NotDirectory {
+                        path: parent.clone(),
+                    }
+                },
+            );
+        }
+        if current_parent.object_id != opened_parent.object_id
+            || current_parent.version != opened_parent.version
+        {
+            return Err(DfsPosixError::Conflict {
+                path: parent.clone(),
+                reason: "opened parent directory changed before exclusive create".to_string(),
+            });
+        }
+        let path = join_posix_path(&parent, child);
+        self.posix_write_file_bytes_checked_parent_once(
+            &path, bytes, options, true, true, true, None, true, false, None, false,
+        )
+    }
+
+    /// Compare-and-replace a file beneath `root` without following any link
+    /// record. The caller's identity/version must match the exact no-link open
+    /// before the content write begins.
+    pub fn posix_replace_file_if_version_beneath_no_links(
+        &mut self,
+        root: &str,
+        path: &str,
+        expected_object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        let opened = self.posix_open_beneath_no_links_distributed(root, path)?;
+        if &opened.object_id != expected_object_id || &opened.version != expected_version {
+            return Err(DfsPosixError::Conflict {
+                path: opened.path.clone(),
+                reason: "file identity or version changed before no-link replace".to_string(),
+            });
+        }
+        self.posix_replace_opened_file_if_version_no_links(&opened, bytes, options)
+    }
+
+    /// Replace the exact file/version captured by a no-link open without
+    /// resolving its pathname again.
+    pub fn posix_replace_opened_file_if_version_no_links(
+        &mut self,
+        opened: &DfsStat,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        match &opened.kind {
+            DfsObjectKind::Directory => {
+                return Err(DfsPosixError::IsDirectory {
+                    path: opened.path.clone(),
+                });
+            }
+            DfsObjectKind::Symlink | DfsObjectKind::Hardlink | DfsObjectKind::Mount => {
+                return Err(DfsPosixError::InvalidPath {
+                    path: opened.path.clone(),
+                });
+            }
+            DfsObjectKind::Tombstone => {
+                return Err(DfsPosixError::NotFound {
+                    path: opened.path.clone(),
+                });
+            }
+            DfsObjectKind::File | DfsObjectKind::Artifact => {}
+        }
+        self.posix_write_file_bytes_checked_parent_once(
+            &opened.path,
+            bytes,
+            options,
+            true,
+            false,
+            true,
+            None,
+            false,
+            false,
+            Some((&opened.object_id, &opened.version)),
             false,
         )
     }
@@ -1152,6 +1548,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 exclusive_create,
                 follow_final_for_exclusive_create,
                 None,
+                true,
             ) {
                 Ok(stat) => return Ok(stat),
                 Err(error) if posix_error_is_retryable_write_serialization(&error) => {
@@ -1183,12 +1580,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusive_create: bool,
         follow_final_for_exclusive_create: bool,
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        resolve_links: bool,
     ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
-        let path = self.resolve_posix_path_distributed(
-            &path,
-            !exclusive_create || follow_final_for_exclusive_create,
-        )?;
+        let path = if resolve_links {
+            self.resolve_posix_path_distributed(
+                &path,
+                !exclusive_create || follow_final_for_exclusive_create,
+            )?
+        } else {
+            path
+        };
         if requires_directory {
             return match self.ensure_resolved_path_is_directory(&path) {
                 Ok(()) => Err(DfsPosixError::IsDirectory { path }),
@@ -1209,6 +1611,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut object = match self.lookup_sifs_path(&path)? {
             Some(object) if exclusive_create && object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path });
+            }
+            Some(object)
+                if !resolve_links
+                    && matches!(
+                        &object.kind,
+                        DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                    ) =>
+            {
+                return Err(DfsPosixError::InvalidPath { path });
             }
             Some(object) if object.kind == DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory { path });
