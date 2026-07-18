@@ -316,11 +316,10 @@ impl LocalNodePermissionStore {
                 detail: source.to_string(),
             }
         })?;
-        lock.lock_exclusive()
-            .map_err(|source| LocalNodePermissionError::Io {
-                path: lock_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
+        FileExt::lock_exclusive(&lock).map_err(|source| LocalNodePermissionError::Io {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
         Ok(lock)
     }
 

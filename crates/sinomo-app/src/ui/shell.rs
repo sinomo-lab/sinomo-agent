@@ -148,6 +148,16 @@ impl BackgroundWorkController {
 
 impl CommandController for BackgroundWorkController {
     fn command(&mut self, ctx: &mut CommandCtx, command: &Command<'_>) {
+        #[cfg(all(target_os = "android", feature = "mobile"))]
+        if let Some(insets) = command.get(crate::ANDROID_SAFE_AREA_CHANGED) {
+            crate::set_android_safe_area_insets(*insets);
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_semantics();
+            ctx.request_paint();
+            ctx.set_handled();
+            return;
+        }
         if command.is(chat::CHAT_WORK_READY) {
             self.pump(ctx);
             ctx.set_handled();
@@ -347,6 +357,23 @@ impl Shell {
                     }
                     _ => false,
                 }
+            }
+            _ => false,
+        }
+    }
+
+    /// Consume Android/browser Back while the active surface has an internal
+    /// destination. Unhandled Back is left to the platform, which closes the
+    /// root window once overlays and focused text input have had first refusal.
+    fn handle_navigation_back(&self) -> bool {
+        if !self.shared.is_ready() {
+            return false;
+        }
+        match self.shared.active_tab() {
+            Tab::Settings => self.shared.settings_mut().navigate_back(),
+            Tab::Files => {
+                let waker = { self.shared.borrow().waker.clone() };
+                self.shared.files_mut().navigate_back(waker)
             }
             _ => false,
         }
@@ -571,12 +598,13 @@ fn build_loading_view(shared: Shared) -> Surface {
 impl Widget for Shell {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let size = constraints.max;
-        let compact = compact_chrome(size.width);
+        let safe_size = crate::platform_safe_area_insets().inset(size);
+        let compact = compact_chrome(safe_size.width);
         self.sync_tab_bar_density(compact);
 
         self.titlebar.measure(
             ctx,
-            Constraints::tight(Size::new(size.width, TOPBAR_HEIGHT)),
+            Constraints::tight(Size::new(safe_size.width, TOPBAR_HEIGHT)),
         );
 
         self.logo
@@ -593,7 +621,7 @@ impl Widget for Shell {
         // The tab strip lays itself out at its natural width within the title bar.
         let tab_strip = self.tabs.measure(
             ctx,
-            Constraints::new(Size::ZERO, Size::new(size.width, TAB_SEG_HEIGHT)),
+            Constraints::new(Size::ZERO, Size::new(safe_size.width, TAB_SEG_HEIGHT)),
         );
         self.tab_strip_rect = Rect::new(0.0, 0.0, tab_strip.width, TAB_SEG_HEIGHT);
 
@@ -602,20 +630,27 @@ impl Widget for Shell {
             Constraints::new(
                 Size::new(COMPACT_STATUS_PILL_W, STATUS_PILL_H),
                 Size::new(
-                    (size.width - EDGE_PAD * 2.0).max(0.0),
-                    (size.height - TOPBAR_HEIGHT / 2.0).max(0.0),
+                    (safe_size.width - EDGE_PAD * 2.0).max(0.0),
+                    (safe_size.height - TOPBAR_HEIGHT / 2.0).max(0.0),
                 ),
             ),
         );
 
-        let body_h = (size.height - TOPBAR_HEIGHT).max(0.0);
+        let body_h = (safe_size.height - TOPBAR_HEIGHT).max(0.0);
         self.body
-            .measure(ctx, Constraints::tight(Size::new(size.width, body_h)));
+            .measure(ctx, Constraints::tight(Size::new(safe_size.width, body_h)));
 
         size
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let safe_area = crate::platform_safe_area_insets();
+        let bounds = Rect::new(
+            bounds.x() + safe_area.left,
+            bounds.y() + safe_area.top,
+            (bounds.width() - safe_area.left - safe_area.right).max(0.0),
+            (bounds.height() - safe_area.top - safe_area.bottom).max(0.0),
+        );
         let bar_rect = Rect::new(bounds.x(), bounds.y(), bounds.width(), TOPBAR_HEIGHT);
         self.titlebar.arrange(ctx, bar_rect);
         let compact = compact_chrome(bounds.width());
@@ -698,6 +733,20 @@ impl Widget for Shell {
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if let Event::Keyboard(key) = event
+            && matches!(ctx.phase(), EventPhase::Target | EventPhase::Bubble)
+            && key.state == KeyState::Pressed
+            && !key.repeat
+            && key.key == "BrowserBack"
+            && self.handle_navigation_back()
+        {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_semantics();
+            ctx.request_paint();
+            ctx.set_handled();
+            return;
+        }
         if ctx.phase() != EventPhase::Target {
             return;
         }
@@ -2013,6 +2062,55 @@ mod tests {
         assert_eq!(Tab::Sinomo.title(), "Chat");
         assert_eq!(tab_label(Tab::Sinomo, false), "Chat");
         assert_eq!(tab_label(Tab::Sinomo, true), "Chat");
+    }
+
+    #[test]
+    fn platform_back_returns_settings_detail_to_menu() {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Settings;
+        let shared = Shared::new(state);
+        shared.settings_mut().open(SettingsSection::Providers);
+        let shell = Shell::new(shared.clone());
+
+        assert!(shell.handle_navigation_back());
+        assert_eq!(shared.settings().selected, None);
+        assert!(!shell.handle_navigation_back());
+    }
+
+    #[test]
+    fn platform_back_bubbles_from_focused_child_to_settings_navigation() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Settings;
+        let shared = Shared::new(state);
+        shared
+            .settings_mut()
+            .open(SettingsSection::RemoteManagement);
+
+        let mut runtime = crate::build_runtime(shared.clone())?;
+        let window_id = runtime.window_ids()[0];
+        let output = runtime.render(window_id)?;
+        let focused_child = output
+            .semantics
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button && node.actions.contains(&SemanticsAction::Focus)
+            })
+            .expect("settings shell should expose a focusable child")
+            .id;
+        assert!(runtime.handle_semantics_action(
+            window_id,
+            focused_child,
+            SemanticsActionRequest::Focus,
+        )?);
+
+        assert!(runtime.dispatch_event(
+            window_id,
+            Event::Keyboard(sui::KeyboardEvent::new("BrowserBack", KeyState::Pressed,)),
+        )?);
+        assert_eq!(shared.settings().selected, None);
+        Ok(())
     }
 
     #[test]

@@ -1720,8 +1720,7 @@ impl SettingsState {
     /// and may already have committed, so its result lane is retained until the authoritative
     /// post-mutation document arrives.
     pub(crate) fn rebind_backend(&mut self, backend: &Backend) {
-        let retry_message =
-            "Connection changed while the action was in flight; verify refreshed state before retrying.";
+        let retry_message = "Connection changed while the action was in flight; verify refreshed state before retrying.";
         self.operation_epoch.fetch_add(1, Ordering::AcqRel);
         let pending_scopes = self.pending_operations.keys().cloned().collect::<Vec<_>>();
         let preserve_permission_write = self
@@ -2394,53 +2393,51 @@ impl SettingsState {
                 SettingsOperationPayload::Modules(Err(error)) => {
                     self.apply_operation_queue_error(&result.scope, error);
                 }
-                SettingsOperationPayload::RemoteManagement(Ok(success)) => {
-                    match success {
-                        RemoteManagementOperationSuccess::Refreshed {
-                            snapshot,
-                            local_module_snapshot,
-                        } => {
-                            self.server_generations.remote_management_permission = self
-                                .server_generations
-                                .remote_management_permission
-                                .wrapping_add(1);
-                            self.server_generations
-                                .bump(SettingsOperationDomain::RemoteManagement);
-                            self.remote_management = snapshot;
-                            self.apply_local_module_snapshot_if_selected(local_module_snapshot);
-                            self.remote_management_permission_error = None;
-                            self.remote_management_permission_status = None;
-                            self.remote_management_module_error = None;
-                            self.remote_management_module_status = None;
-                        }
-                        RemoteManagementOperationSuccess::PermissionChanged {
-                            permissions,
-                            message,
-                        } => {
-                            self.server_generations.remote_management_permission = self
-                                .server_generations
-                                .remote_management_permission
-                                .wrapping_add(1);
-                            self.remote_management
-                                .replace_permission_document(&permissions);
-                            self.remote_management_permission_error = None;
-                            self.remote_management_permission_status = Some(message);
-                            self.remote_management_enable_confirming = false;
-                        }
-                        RemoteManagementOperationSuccess::ModuleChanged {
-                            snapshot,
-                            local_module_snapshot,
-                            message,
-                        } => {
-                            self.server_generations
-                                .bump(SettingsOperationDomain::RemoteManagement);
-                            self.remote_management.replace_module_state(&snapshot);
-                            self.apply_local_module_snapshot_if_selected(local_module_snapshot);
-                            self.remote_management_module_error = None;
-                            self.remote_management_module_status = Some(message);
-                        }
+                SettingsOperationPayload::RemoteManagement(Ok(success)) => match success {
+                    RemoteManagementOperationSuccess::Refreshed {
+                        snapshot,
+                        local_module_snapshot,
+                    } => {
+                        self.server_generations.remote_management_permission = self
+                            .server_generations
+                            .remote_management_permission
+                            .wrapping_add(1);
+                        self.server_generations
+                            .bump(SettingsOperationDomain::RemoteManagement);
+                        self.remote_management = snapshot;
+                        self.apply_local_module_snapshot_if_selected(local_module_snapshot);
+                        self.remote_management_permission_error = None;
+                        self.remote_management_permission_status = None;
+                        self.remote_management_module_error = None;
+                        self.remote_management_module_status = None;
                     }
-                }
+                    RemoteManagementOperationSuccess::PermissionChanged {
+                        permissions,
+                        message,
+                    } => {
+                        self.server_generations.remote_management_permission = self
+                            .server_generations
+                            .remote_management_permission
+                            .wrapping_add(1);
+                        self.remote_management
+                            .replace_permission_document(&permissions);
+                        self.remote_management_permission_error = None;
+                        self.remote_management_permission_status = Some(message);
+                        self.remote_management_enable_confirming = false;
+                    }
+                    RemoteManagementOperationSuccess::ModuleChanged {
+                        snapshot,
+                        local_module_snapshot,
+                        message,
+                    } => {
+                        self.server_generations
+                            .bump(SettingsOperationDomain::RemoteManagement);
+                        self.remote_management.replace_module_state(&snapshot);
+                        self.apply_local_module_snapshot_if_selected(local_module_snapshot);
+                        self.remote_management_module_error = None;
+                        self.remote_management_module_status = Some(message);
+                    }
+                },
                 SettingsOperationPayload::RemoteManagement(Err(error)) => {
                     self.apply_operation_queue_error(&result.scope, error);
                 }
@@ -3002,6 +2999,24 @@ impl SettingsState {
     /// Return to the menu level (narrow layout).
     fn back_to_menu(&mut self) {
         self.selected = None;
+    }
+
+    /// Apply platform back navigation before the window is allowed to close.
+    ///
+    /// The provider form is a nested destination inside the Providers section,
+    /// so it closes first. A second back returns a narrow Settings view to its
+    /// section menu. Wide layouts normally have no back affordance, but clearing
+    /// `selected` is harmless because the wide view always supplies a fallback.
+    pub(crate) fn navigate_back(&mut self) -> bool {
+        if self.provider_add_open {
+            self.close_provider_add();
+            return true;
+        }
+        if self.selected.is_some() {
+            self.back_to_menu();
+            return true;
+        }
+        false
     }
 
     fn set_join_invite(&mut self, value: String) {
@@ -3854,8 +3869,8 @@ fn execute_settings_operation(
             let module_snapshot = backend.module_config_snapshot(None);
             SettingsOperationPayload::RemoteManagement(Ok(
                 RemoteManagementOperationSuccess::Refreshed {
-                snapshot: backend
-                    .remote_management_settings_snapshot_from_modules(&module_snapshot),
+                    snapshot: backend
+                        .remote_management_settings_snapshot_from_modules(&module_snapshot),
                     local_module_snapshot: module_snapshot,
                 },
             ))
@@ -13701,18 +13716,35 @@ fn open_provider_login_url(url: &str) {
 }
 
 fn open_external_url(url: &str) -> Result<(), String> {
+    let url = validate_external_http_url(url)?;
+    open_url_with_system_browser(url)
+}
+
+fn validate_external_http_url(url: &str) -> Result<&str, String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".to_string());
     }
-    let scheme = url
-        .split_once(':')
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
-        .ok_or_else(|| "URL is missing a scheme".to_string())?;
-    if scheme != "https" && scheme != "http" {
+    if url
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("URL contains whitespace or control characters".to_string());
+    }
+    let (scheme, location) = url
+        .split_once("://")
+        .ok_or_else(|| "URL must be an absolute http or https URL".to_string())?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
         return Err("only http and https URLs can be opened".to_string());
     }
-    open_url_with_system_browser(url)
+    let authority = location
+        .split(|character| matches!(character, '/' | '?' | '#'))
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return Err("URL is missing a host".to_string());
+    }
+    Ok(url)
 }
 
 #[cfg(target_os = "windows")]
@@ -13734,7 +13766,17 @@ fn open_url_with_system_browser(url: &str) -> Result<(), String> {
         .map_err(|error| format!("failed to launch browser: {error}"))
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(target_os = "android", feature = "mobile"))]
+fn open_url_with_system_browser(url: &str) -> Result<(), String> {
+    crate::open_android_external_url(url)
+}
+
+#[cfg(all(target_os = "android", not(feature = "mobile")))]
+fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
+    Err("opening URLs requires the Android mobile app surface".to_string())
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 fn open_url_with_system_browser(url: &str) -> Result<(), String> {
     std::process::Command::new("xdg-open")
         .arg(url)
@@ -13893,6 +13935,37 @@ mod tests {
     fn reload_config_state(state: &mut SettingsState) {
         state.config_items = resolve_items(state.config.as_ref());
         state.provider_forms = provider_forms(state.config.as_ref());
+    }
+
+    #[test]
+    fn provider_login_url_validation_accepts_absolute_http_urls() {
+        assert_eq!(
+            validate_external_http_url(" https://example.test/device?code=ABCD "),
+            Ok("https://example.test/device?code=ABCD")
+        );
+        assert_eq!(
+            validate_external_http_url("HTTP://localhost:8080/login"),
+            Ok("HTTP://localhost:8080/login")
+        );
+    }
+
+    #[test]
+    fn provider_login_url_validation_rejects_unsafe_or_incomplete_urls() {
+        for url in [
+            "",
+            "example.test/device",
+            "https:example.test/device",
+            "https:///device",
+            "file:///tmp/device",
+            "mailto:user@example.test",
+            "https://example.test/device code",
+            "https://example.test/device\0code",
+        ] {
+            assert!(
+                validate_external_http_url(url).is_err(),
+                "{url:?} should be rejected"
+            );
+        }
     }
 
     fn apply_test_operation(
@@ -14462,7 +14535,10 @@ mod tests {
 
         state.apply_local_module_snapshot_if_selected(backend.module_config_snapshot(None));
 
-        assert_eq!(state.module_selected_node_id.as_deref(), Some("remote-node"));
+        assert_eq!(
+            state.module_selected_node_id.as_deref(),
+            Some("remote-node")
+        );
     }
 
     #[test]
@@ -16239,6 +16315,21 @@ mod tests {
             state.provider_add_can_submit(),
             "device-login providers collect credentials after the account is added"
         );
+    }
+
+    #[test]
+    fn platform_back_closes_provider_form_before_settings_section() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.open_provider_add();
+
+        assert!(state.navigate_back());
+        assert!(!state.provider_add_open);
+        assert_eq!(state.selected, Some(SettingsSection::Providers));
+
+        assert!(state.navigate_back());
+        assert_eq!(state.selected, None);
+        assert!(!state.navigate_back());
     }
 
     #[test]

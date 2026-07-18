@@ -404,9 +404,9 @@ fn stale_daemon_lock_probe(paths: &DaemonPaths, status: Option<DaemonStatus>) ->
         return DaemonProbeStatus::Locked { status };
     };
 
-    match file.try_lock_exclusive() {
+    match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
-            let _ = file.unlock();
+            let _ = FileExt::unlock(&file);
             let _ = fs::remove_file(&paths.lock);
             let _ = fs::remove_file(&paths.status);
             DaemonProbeStatus::NotRunning

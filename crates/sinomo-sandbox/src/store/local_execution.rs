@@ -68,7 +68,7 @@ pub fn try_acquire_sandbox_local_execution_lease(
         .write(true)
         .open(&path)
         .map_err(|source| local_execution_io_error(&path, source))?;
-    match file.try_lock_exclusive() {
+    match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(SandboxLocalExecutionLease {
             sandbox_id: sandbox_id.clone(),
             _file: file,

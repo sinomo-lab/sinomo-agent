@@ -314,10 +314,9 @@ mod tests {
     #[test]
     fn persisted_native_loader_record_is_not_claimed_as_running() {
         let backend = Backend::local_fallback();
-        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named(
-            REMOTE_MANAGEMENT_MODULE_ID,
-        )
-        .expect("remote-management module id");
+        let module_id =
+            sinomo_runtime::module::ModuleId::from_legacy_named(REMOTE_MANAGEMENT_MODULE_ID)
+                .expect("remote-management module id");
         sinomo_runtime::module::write_native_dylib_module_loader_state(
             &backend.data_dir.root(),
             &sinomo_runtime::module::NativeDylibModuleLoaderState {
@@ -352,10 +351,9 @@ mod tests {
     #[test]
     fn native_rust_state_with_same_id_does_not_override_native_dylib_backend() {
         let backend = Backend::local_fallback();
-        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named(
-            REMOTE_MANAGEMENT_MODULE_ID,
-        )
-        .expect("remote-management module id");
+        let module_id =
+            sinomo_runtime::module::ModuleId::from_legacy_named(REMOTE_MANAGEMENT_MODULE_ID)
+                .expect("remote-management module id");
         sinomo_runtime::module::set_native_rust_module_enabled(
             &backend.data_dir.root(),
             &module_id,

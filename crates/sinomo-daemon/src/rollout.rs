@@ -1572,9 +1572,9 @@ fn main_data_owner_lock_released(main_paths: &DaemonPaths) -> bool {
     else {
         return true;
     };
-    match file.try_lock_exclusive() {
+    match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
-            let _ = file.unlock();
+            let _ = FileExt::unlock(&file);
             true
         }
         Err(_) => false,

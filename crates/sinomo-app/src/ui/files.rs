@@ -3005,6 +3005,15 @@ impl FilesState {
         self.apply_location(location.source, location.path, waker);
     }
 
+    /// Follow the same history stack as the Files header's back button.
+    pub(crate) fn navigate_back(&mut self, waker: Option<sui::UiHandle>) -> bool {
+        if !self.can_go_back() {
+            return false;
+        }
+        self.go_back(waker);
+        true
+    }
+
     fn go_forward(&mut self, waker: Option<sui::UiHandle>) {
         let Some(location) = self.history_forward.pop() else {
             return;
@@ -6237,8 +6246,13 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn default_local_path(fallback: impl AsRef<Path>) -> String {
-    std::env::current_dir()
-        .or_else(|_| Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf()))
+    #[cfg(target_os = "android")]
+    let initial_path = Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf());
+    #[cfg(not(target_os = "android"))]
+    let initial_path = std::env::current_dir()
+        .or_else(|_| Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf()));
+
+    initial_path
         .and_then(|path| path.canonicalize().or(Ok(path)))
         .map(|path| display_local_path(path.to_string_lossy().into_owned()))
         .unwrap_or_else(|_| ".".to_string())
@@ -23453,6 +23467,24 @@ mod tests {
         assert_eq!(shared.files().path, "/services");
 
         Ok(())
+    }
+
+    #[test]
+    fn platform_back_uses_files_history_and_reports_root() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.loaded = true;
+        files.loading = false;
+        files.path = "/services".to_string();
+        files.sifs_path = "/services".to_string();
+        files.history_back.push(FilesLocation {
+            source: FilesSourceKind::Sifs,
+            path: "/".to_string(),
+        });
+
+        assert!(files.navigate_back(None));
+        assert_eq!(files.path, "/");
+        assert!(!files.navigate_back(None));
     }
 
     #[test]

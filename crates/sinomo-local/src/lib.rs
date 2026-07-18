@@ -3,7 +3,20 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use thiserror::Error;
+
+static PROCESS_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install a process-local data directory for hosts that do not expose a home
+/// directory, such as Android NativeActivity applications.
+///
+/// An explicit `SINOMO_DATA_DIR` environment variable still takes precedence.
+/// The first installed path wins so every subsystem in the process observes a
+/// stable storage root without mutating the process environment after startup.
+pub fn install_process_data_dir(root: impl Into<PathBuf>) -> PathBuf {
+    PROCESS_DATA_DIR.get_or_init(|| root.into()).clone()
+}
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -41,17 +54,14 @@ impl SinomoDataDir {
     }
 
     pub fn from_env_or_home() -> Result<Self, LocalDataError> {
-        if let Ok(path) = env::var("SINOMO_DATA_DIR") {
-            let path = path.trim();
-            if !path.is_empty() {
-                return Ok(Self::new(path));
-            }
-        }
-
-        let home = env::var("USERPROFILE")
-            .or_else(|_| env::var("HOME"))
-            .map_err(|_| LocalDataError::HomeUnavailable)?;
-        Ok(Self::new(PathBuf::from(home).join(".sinomo")))
+        let explicit = env::var("SINOMO_DATA_DIR").ok();
+        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok();
+        resolve_data_dir(
+            explicit.as_deref(),
+            PROCESS_DATA_DIR.get().map(PathBuf::as_path),
+            home.as_deref(),
+        )
+        .map(Self::new)
     }
 
     pub fn root(&self) -> PathBuf {
@@ -131,6 +141,21 @@ impl SinomoDataDir {
     }
 }
 
+fn resolve_data_dir(
+    explicit: Option<&str>,
+    process_default: Option<&std::path::Path>,
+    home: Option<&str>,
+) -> Result<PathBuf, LocalDataError> {
+    if let Some(path) = explicit.map(str::trim).filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = process_default {
+        return Ok(path.to_path_buf());
+    }
+    home.map(|path| PathBuf::from(path).join(".sinomo"))
+        .ok_or(LocalDataError::HomeUnavailable)
+}
+
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum LocalDataError {
     #[error("could not resolve a home directory; set SINOMO_DATA_DIR")]
@@ -142,6 +167,28 @@ pub enum LocalDataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_dir_resolution_prefers_explicit_then_process_then_home() {
+        let process = PathBuf::from("process");
+
+        assert_eq!(
+            resolve_data_dir(Some(" explicit "), Some(&process), Some("home")),
+            Ok(PathBuf::from("explicit"))
+        );
+        assert_eq!(
+            resolve_data_dir(Some("  "), Some(&process), Some("home")),
+            Ok(process)
+        );
+        assert_eq!(
+            resolve_data_dir(None, None, Some("home")),
+            Ok(PathBuf::from("home").join(".sinomo"))
+        );
+        assert_eq!(
+            resolve_data_dir(None, None, None),
+            Err(LocalDataError::HomeUnavailable)
+        );
+    }
 
     #[test]
     fn provider_credentials_live_under_shared_configs_dir() {

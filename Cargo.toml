@@ -95,6 +95,7 @@ base64 = "0.22.1"
 blake3 = "1.8.5"
 cpal = "0.18.1"
 image = { version = "0.25.10", default-features = false }
+jni = "0.22.4"
 nokhwa = { version = "0.10.11", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"

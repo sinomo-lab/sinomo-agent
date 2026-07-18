@@ -500,7 +500,7 @@ pub(crate) fn read_wal_entries(
             });
         }
     };
-    file.lock_shared().map_err(|source| KvError::Io {
+    fs2::FileExt::lock_shared(&file).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
@@ -586,7 +586,7 @@ pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<
         return Ok(());
     }
     let mut file = open_wal_file_for_append(path)?;
-    file.lock_exclusive().map_err(|source| KvError::Io {
+    fs2::FileExt::lock_exclusive(&file).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
@@ -708,7 +708,7 @@ pub(crate) fn wal_file_matches_entries(
         }
         Err(_) => return Ok(false),
     };
-    if file.lock_shared().is_err() {
+    if fs2::FileExt::lock_shared(&file).is_err() {
         return Ok(false);
     }
 
@@ -934,7 +934,7 @@ pub(crate) fn lock_node_exclusive(lock: &File, path: &Path, wait: Duration) -> R
     let deadline = Instant::now() + wait;
     let mut attempts = 0_u32;
     loop {
-        match lock.try_lock_exclusive() {
+        match fs2::FileExt::try_lock_exclusive(lock) {
             Ok(()) => return Ok(()),
             Err(source) if file_lock_is_busy(&source) => {
                 let now = Instant::now();

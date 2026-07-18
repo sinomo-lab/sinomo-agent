@@ -264,7 +264,7 @@ fn acquire_rollout_activation_file_guard(
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-    match file.try_lock_exclusive() {
+    match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
             return Err(RolloutError::InvalidTransition {

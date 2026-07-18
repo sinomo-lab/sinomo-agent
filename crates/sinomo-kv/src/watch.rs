@@ -111,9 +111,14 @@ pub fn collect_cluster_kv_watch_drain_events(
     max_payload_bytes: usize,
 ) -> Result<Vec<KvEvent>, KvError> {
     let mut events = Vec::new();
-    for event in persisted_events.iter().chain(snapshot.events.iter()).filter(|event| {
-        event.revision >= registration.next_revision && event.key.starts_with(&registration.prefix)
-    }) {
+    for event in persisted_events
+        .iter()
+        .chain(snapshot.events.iter())
+        .filter(|event| {
+            event.revision >= registration.next_revision
+                && event.key.starts_with(&registration.prefix)
+        })
+    {
         try_reserve_kv_items(&mut events, 1, "collect watch drain events")?;
         events.push(event);
     }
@@ -574,7 +579,7 @@ pub fn lock_cluster_kv_watch_allocator(paths: &ClusterKvPaths) -> Result<File, K
             path: paths.watches_lock.display().to_string(),
             detail: source.to_string(),
         })?;
-    file.lock_exclusive().map_err(|source| KvError::Io {
+    fs2::FileExt::lock_exclusive(&file).map_err(|source| KvError::Io {
         path: paths.watches_lock.display().to_string(),
         detail: source.to_string(),
     })?;
