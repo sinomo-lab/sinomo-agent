@@ -9,6 +9,7 @@ pub(crate) const BUILTIN_TOP_LEVEL_USAGE_COMMANDS: &[&str] = &[
     "debug",
     "rollout",
     "dfs",
+    "memory",
     "models",
     "model",
     "usage",
@@ -50,6 +51,18 @@ pub fn print_usage() {
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!("  NVIDIA_API_KEY              Used by `providers auth/test nvidia`");
     println!("  Cluster runtime settings live in KV; see `sinomo models runtime`.");
+}
+
+pub(super) fn print_memory_help() {
+    println!("Memory:");
+    println!("  sinomo memory root add <path>");
+    println!("      Register a local Markdown/text source root with cluster-local visibility.");
+    println!("  sinomo memory root list [--limit <count>] [--after <root-id>]");
+    println!("      List one bounded page of registered local memory roots as JSON.");
+    println!("  sinomo memory index <root-id>");
+    println!("      Scan a registered root and publish immutable lexical index generations.");
+    println!("  sinomo memory query <text> [--max-records <count>] [--max-bytes <bytes>]");
+    println!("      Retrieve source-versioned evidence from the local indexed-file memory store.");
 }
 
 pub(super) fn print_agent_help() {

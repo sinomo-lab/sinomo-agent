@@ -976,6 +976,40 @@ impl ModuleRegistration {
                 });
             }
         }
+        for export in &self.surfaces.interface_exports {
+            for operation in &export.operations {
+                let unroutable = match (&operation.target, &self.backend) {
+                    (
+                        sinomo_module_api::ModuleInterfaceOperationTarget::NativeInvoke { .. },
+                        ModuleBackendRegistration::NativeDylib { .. },
+                    ) => None,
+                    (
+                        sinomo_module_api::ModuleInterfaceOperationTarget::NativeInvoke { .. },
+                        ModuleBackendRegistration::NativeRust { .. },
+                    ) => Some(
+                        "native Rust registrations do not expose a generic invocation operation table",
+                    ),
+                    (sinomo_module_api::ModuleInterfaceOperationTarget::NativeInvoke { .. }, _) => {
+                        Some("the selected backend does not support native invocation")
+                    }
+                    (sinomo_module_api::ModuleInterfaceOperationTarget::SandboxEntry { .. }, _) => {
+                        Some(
+                            "sandbox and Wasm registrations do not yet expose a validated entry table and invocation adapter",
+                        )
+                    }
+                    (sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc { .. }, _) => {
+                        None
+                    }
+                };
+                if let Some(detail) = unroutable {
+                    return Err(ModuleSurfaceError::InterfaceTargetNotRoutable {
+                        export_id: export.export_id.clone(),
+                        logical_operation: operation.logical_operation.clone(),
+                        detail: detail.to_string(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1109,6 +1143,11 @@ pub struct ModuleSurfaces {
     /// `NetworkModuleRegistry`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network_transports: Vec<String>,
+    /// Versioned typed interfaces discoverable through the generic module
+    /// registry. This remains data-only; the target selects an existing
+    /// native, object-RPC, or sandbox invocation path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface_exports: Vec<sinomo_module_api::ModuleInterfaceExport>,
 }
 
 impl ModuleSurfaces {
@@ -1121,6 +1160,7 @@ impl ModuleSurfaces {
             && self.settings.is_empty()
             && self.capabilities.is_empty()
             && self.network_transports.is_empty()
+            && self.interface_exports.is_empty()
     }
 
     pub fn with_object_rpc_route(mut self, route: ModuleObjectRpcRoute) -> Self {
@@ -1258,6 +1298,14 @@ impl ModuleSurfaces {
         self
     }
 
+    pub fn with_interface_export(
+        mut self,
+        export: sinomo_module_api::ModuleInterfaceExport,
+    ) -> Self {
+        self.interface_exports.push(export);
+        self
+    }
+
     pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
         self.capabilities.imports.push(capability);
         self
@@ -1357,6 +1405,33 @@ impl ModuleSurfaces {
                 return Err(ModuleSurfaceError::DuplicateSettingsDefinition {
                     key: key.to_string(),
                 });
+            }
+        }
+
+        sinomo_module_api::validate_module_interface_exports(&self.interface_exports).map_err(
+            |source| ModuleSurfaceError::InvalidInterfaceExport {
+                detail: source.to_string(),
+            },
+        )?;
+        for export in &self.interface_exports {
+            for operation in &export.operations {
+                if let sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc {
+                    route,
+                    operation: target_operation,
+                } = &operation.target
+                {
+                    let target_exists = self.object_rpc_routes.iter().any(|candidate| {
+                        candidate.route == *route && candidate.operation == *target_operation
+                    });
+                    if !target_exists {
+                        return Err(ModuleSurfaceError::InterfaceObjectRpcTargetNotExported {
+                            export_id: export.export_id.clone(),
+                            logical_operation: operation.logical_operation.clone(),
+                            route: route.clone(),
+                            operation: target_operation.clone(),
+                        });
+                    }
+                }
             }
         }
 
@@ -2098,6 +2173,25 @@ pub enum ModuleSurfaceError {
     DuplicateCapabilityImport { capability: String },
     #[error("duplicate module capability export `{capability}`")]
     DuplicateCapabilityExport { capability: String },
+    #[error("invalid module interface export: {detail}")]
+    InvalidInterfaceExport { detail: String },
+    #[error(
+        "module interface export `{export_id}` operation `{logical_operation}` targets object RPC `{route}` / `{operation}`, which is not exported"
+    )]
+    InterfaceObjectRpcTargetNotExported {
+        export_id: String,
+        logical_operation: String,
+        route: String,
+        operation: String,
+    },
+    #[error(
+        "module interface export `{export_id}` operation `{logical_operation}` is not routable: {detail}"
+    )]
+    InterfaceTargetNotRoutable {
+        export_id: String,
+        logical_operation: String,
+        detail: String,
+    },
 }
 
 fn validate_module_object_rpc_route_path(route: &str) -> Result<(), ModuleSurfaceError> {
@@ -3270,6 +3364,38 @@ fn validate_native_dylib_descriptor_matches_state(
 fn native_descriptor_surfaces_to_module_surfaces(
     descriptor: &NativeModuleDescriptor,
 ) -> Result<ModuleSurfaces, NativeDylibModuleInstallError> {
+    sinomo_module_api::validate_module_interface_exports(&descriptor.surfaces.interface_exports)
+        .map_err(|source| NativeDylibModuleInstallError::Descriptor {
+            detail: source.to_string(),
+        })?;
+    for export in &descriptor.surfaces.interface_exports {
+        for operation in &export.operations {
+            match &operation.target {
+                sinomo_module_api::ModuleInterfaceOperationTarget::NativeInvoke {
+                    operation: target_operation,
+                } => {
+                    if !descriptor.supported_operations.contains(target_operation) {
+                        return Err(NativeDylibModuleInstallError::Descriptor {
+                            detail: format!(
+                                "module interface export `{}` operation `{}` targets native operation `{target_operation}`, which is not listed in supported_operations",
+                                export.export_id, operation.logical_operation
+                            ),
+                        });
+                    }
+                }
+                sinomo_module_api::ModuleInterfaceOperationTarget::SandboxEntry { entry } => {
+                    return Err(NativeDylibModuleInstallError::Descriptor {
+                        detail: format!(
+                            "native dylib interface export `{}` operation `{}` cannot target sandbox entry `{entry}`",
+                            export.export_id, operation.logical_operation
+                        ),
+                    });
+                }
+                sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc { .. } => {}
+            }
+        }
+    }
+
     let mut surfaces = ModuleSurfaces::default();
     for owner in &descriptor.surfaces.storage_owners {
         surfaces = surfaces.with_storage_owner(owner.clone());
@@ -3285,6 +3411,7 @@ fn native_descriptor_surfaces_to_module_surfaces(
     for transport in &descriptor.surfaces.network_transports {
         surfaces = surfaces.with_network_transport(transport.clone());
     }
+    surfaces.interface_exports = descriptor.surfaces.interface_exports.clone();
     surfaces.capabilities = ModuleCapabilities {
         imports: descriptor
             .surfaces
@@ -5465,7 +5592,90 @@ mod tests {
 
         assert_eq!(decoded.storage_owners, vec!["legacy-owner"]);
         assert!(decoded.settings.is_empty());
+        assert!(decoded.interface_exports.is_empty());
         decoded.validate().expect("legacy surfaces remain valid");
+    }
+
+    #[test]
+    fn module_interface_object_rpc_targets_must_be_exported_routes() {
+        let route = ModuleObjectRpcRoute::new(
+            "/memory/extract",
+            "memory",
+            "memory.extract",
+            ModuleRouteAuth::Admin,
+        );
+        let interface = sinomo_module_api::ModuleInterfaceExport::new(
+            "memory.extractor",
+            "sinomo.memory.content-extractor/v1",
+            "1.0.0",
+            vec![1],
+        )
+        .with_operation(sinomo_module_api::ModuleInterfaceOperationExport {
+            logical_operation: "extract".to_string(),
+            target: sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc {
+                route: "/memory/extract".to_string(),
+                operation: "memory.extract".to_string(),
+            },
+            request_schema_id: "sinomo.memory.extraction-request/v1".to_string(),
+            response_schema_id: "sinomo.memory.derived-fact-batch/v1".to_string(),
+            max_request_bytes: u64::MAX,
+            max_response_bytes: u64::MAX,
+            max_facts_per_batch: 128,
+            max_deadline_ms: 30_000,
+            supports_cancellation: true,
+            continuation_schema_id: Some("sinomo.memory.extraction-continuation/v1".to_string()),
+        });
+        let surfaces = ModuleSurfaces::default()
+            .with_capability_export(CapabilityName::new("memory.extract").expect("capability"))
+            .with_object_rpc_route(route)
+            .with_interface_export(interface.clone());
+        surfaces.validate().expect("exported route target");
+
+        let missing_target = ModuleSurfaces::default().with_interface_export(interface);
+        assert!(matches!(
+            missing_target.validate(),
+            Err(ModuleSurfaceError::InterfaceObjectRpcTargetNotExported { .. })
+        ));
+    }
+
+    #[test]
+    fn module_interface_rejects_native_targets_without_an_operation_table() {
+        let interface = sinomo_module_api::ModuleInterfaceExport::new(
+            "memory.extractor",
+            "sinomo.memory.content-extractor/v1",
+            "1.0.0",
+            vec![1],
+        )
+        .with_operation(sinomo_module_api::ModuleInterfaceOperationExport {
+            logical_operation: "extract".to_string(),
+            target: sinomo_module_api::ModuleInterfaceOperationTarget::NativeInvoke {
+                operation: "memory.extract".to_string(),
+            },
+            request_schema_id: "sinomo.memory.extraction-request/v1".to_string(),
+            response_schema_id: "sinomo.memory.derived-fact-batch/v1".to_string(),
+            max_request_bytes: u64::MAX,
+            max_response_bytes: u64::MAX,
+            max_facts_per_batch: 128,
+            max_deadline_ms: 30_000,
+            supports_cancellation: true,
+            continuation_schema_id: Some("sinomo.memory.extraction-continuation/v1".to_string()),
+        });
+        let registration = ModuleRegistration::native_rust(
+            ModuleId::from_legacy_named("module.memory.extractor").expect("module id"),
+            "0.1.0",
+            "sinomo-module-test",
+            "sinomo-module-test",
+            "sinomo.test.memory.v1",
+            TrustRing::R1TrustedRuntime,
+            "module.memory.extractor",
+        )
+        .with_surfaces(ModuleSurfaces::default().with_interface_export(interface));
+
+        assert!(matches!(
+            registration.validate_surfaces(),
+            Err(ModuleSurfaceError::InterfaceTargetNotRoutable { ref detail, .. })
+                if detail.contains("operation table")
+        ));
     }
 
     #[test]
@@ -5814,7 +6024,27 @@ mod tests {
             activated_at: "2026-06-11T00:00:00Z".to_string(),
             source: "test".to_string(),
         };
-        let descriptor = NativeModuleDescriptor {
+        let interface_export = sinomo_module_api::ModuleInterfaceExport::new(
+            "dynamic.native.interface",
+            "sinomo.test.dynamic-native/v1",
+            "1.0.0",
+            vec![1],
+        )
+        .with_operation(sinomo_module_api::ModuleInterfaceOperationExport {
+            logical_operation: "inspect".to_string(),
+            target: sinomo_module_api::ModuleInterfaceOperationTarget::NativeInvoke {
+                operation: "dynamic.native.inspect".to_string(),
+            },
+            request_schema_id: "sinomo.test.inspect-request/v1".to_string(),
+            response_schema_id: "sinomo.test.inspect-response/v1".to_string(),
+            max_request_bytes: u64::MAX,
+            max_response_bytes: u64::MAX,
+            max_facts_per_batch: 1,
+            max_deadline_ms: 1_000,
+            supports_cancellation: true,
+            continuation_schema_id: None,
+        });
+        let mut descriptor = NativeModuleDescriptor {
             module_id: "module.dynamic-native".to_string(),
             module_version: "0.1.0".to_string(),
             owner: "dynamic-native".to_string(),
@@ -5852,6 +6082,7 @@ mod tests {
                 capability_exports: vec!["dynamic.native.inspect".to_string()],
                 settings: vec![settings_export],
                 network_transports: vec!["iroh".to_string()],
+                interface_exports: vec![interface_export.clone()],
             },
         };
 
@@ -5893,6 +6124,10 @@ mod tests {
         );
         assert_eq!(registration.surfaces.storage_owners, vec!["dynamic-native"]);
         assert_eq!(
+            registration.surfaces.interface_exports,
+            vec![interface_export]
+        );
+        assert_eq!(
             registration
                 .surfaces
                 .config_definitions()
@@ -5918,6 +6153,11 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str() == "filesystem.read")
         );
+
+        descriptor.supported_operations.clear();
+        let error = native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
+            .expect_err("native interface target must name a supported operation");
+        assert!(error.to_string().contains("supported_operations"));
     }
 
     #[test]

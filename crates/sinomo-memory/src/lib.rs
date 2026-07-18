@@ -1,5 +1,9 @@
 //! Hot memory, immutable memory records, and memory context retrieval.
 
+mod indexed;
+
+pub use indexed::*;
+
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
     ContextPacket, EventEnvelope, Id, MemoryId, MemoryRecord, MemoryScope, MemorySourceRef,
@@ -19,6 +23,7 @@ use time::OffsetDateTime;
 
 const DEFAULT_RETRIEVAL_RECORD_LIMIT: usize = 8;
 const DEFAULT_RETRIEVAL_BYTE_LIMIT: usize = 16 * 1024;
+const DEFAULT_RETRIEVAL_PARTITION_LIMIT: usize = 64;
 const DEFAULT_MEMORY_RECORDS_PER_SEGMENT: u64 = 1024;
 const MEMORY_STORAGE_SCHEMA_VERSION: u32 = 1;
 const MEMORY_SOBJ_VERSION: u16 = 1;
@@ -235,6 +240,10 @@ pub struct MemoryQuery {
     pub task_hint: Option<String>,
     pub max_records: usize,
     pub max_bytes: usize,
+    #[serde(default = "default_retrieval_partition_limit")]
+    pub max_partitions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<MemoryQueryContinuation>,
 }
 
 impl Default for MemoryQuery {
@@ -251,8 +260,14 @@ impl Default for MemoryQuery {
             task_hint: None,
             max_records: DEFAULT_RETRIEVAL_RECORD_LIMIT,
             max_bytes: DEFAULT_RETRIEVAL_BYTE_LIMIT,
+            max_partitions: DEFAULT_RETRIEVAL_PARTITION_LIMIT,
+            continuation: None,
         }
     }
+}
+
+const fn default_retrieval_partition_limit() -> usize {
+    DEFAULT_RETRIEVAL_PARTITION_LIMIT
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1228,7 +1243,6 @@ impl DurableMemoryStore {
             .access_records
             .insert(access.access_id.clone(), access);
         self.write_index_snapshot(&state)?;
-
         Ok(record)
     }
 
@@ -2852,6 +2866,36 @@ pub fn register_storage_paths(
         StorageRing::R2,
         "memory/index.sobj",
         ObjectSchema::new("MemoryIndexSnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_escape_path(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/catalog",
+        "paged indexed-file roots and source descriptors",
+    )?;
+    layout.register_escape_path(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/partitions",
+        "immutable per-source index generations and serving manifests",
+    )?;
+    layout.register_escape_path(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/routing",
+        "versioned lexical router shards and atomic manifests",
+    )?;
+    layout.register_escape_path(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/traces",
+        "append-only indexed-memory retrieval traces",
+    )?;
+    layout.register_escape_path(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/overlays",
+        "append-only user and agent memory overlays",
     )
 }
 
@@ -3855,6 +3899,58 @@ fn collect_text(value: &serde_json::Value, text: &mut String) {
 pub enum MemoryError {
     #[error("memory context is empty")]
     EmptyContext,
+    #[error("invalid memory index root {path}: {detail}")]
+    InvalidIndexRoot { path: String, detail: String },
+    #[error("memory source changed while acquiring a verified snapshot: {path}")]
+    SourceChanged { path: String },
+    #[error("memory source {path} is {bytes} bytes, exceeding the {limit} byte root limit")]
+    SourceTooLarge {
+        path: String,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("invalid memory source content at {path}: {detail}")]
+    InvalidSourceContent { path: String, detail: String },
+    #[error("invalid memory source candidate at {path}: {detail}")]
+    InvalidSourceCandidate { path: String, detail: String },
+    #[error("missing indexed memory {kind} at {path}")]
+    MissingIndexedMemoryObject { kind: &'static str, path: String },
+    #[error(
+        "immutable memory generation {generation_id} collides with different content at {path}"
+    )]
+    ImmutableGenerationCollision { generation_id: Id, path: String },
+    #[error("memory overlay operation id is not canonical: expected {expected}, got {actual}")]
+    NonCanonicalOverlayOperationId { expected: Id, actual: Id },
+    #[error(
+        "immutable memory overlay operation {operation_id} collides with different content at {path}"
+    )]
+    ImmutableOverlayOperationCollision { operation_id: Id, path: String },
+    #[error(
+        "memory overlay operation at {path} is {bytes} bytes, exceeding the {limit} byte bound"
+    )]
+    OverlayOperationTooLarge {
+        path: String,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("invalid memory overlay object at {path}: {detail}")]
+    InvalidOverlayObject { path: String, detail: String },
+    #[error("invalid memory overlay page limit {limit}; expected 1..={max}")]
+    InvalidOverlayPageLimit { limit: usize, max: usize },
+    #[error("invalid {surface} page limit {limit}; expected 1..={max}")]
+    InvalidMemoryPageLimit {
+        surface: &'static str,
+        limit: usize,
+        max: usize,
+    },
+    #[error("invalid indexed-memory continuation: {detail}")]
+    InvalidMemoryContinuation { detail: String },
+    #[error(
+        "serialized memory evidence bundle requires {required} bytes, exceeding the {limit} byte query budget"
+    )]
+    MemoryEvidenceBundleTooLarge { required: usize, limit: usize },
+    #[error("invalid memory anchor: {detail}")]
+    InvalidMemoryAnchor { detail: String },
     #[error("memory id is not canonical for record content: expected {expected}, got {actual}")]
     NonCanonicalMemoryId {
         expected: MemoryId,
@@ -4553,6 +4649,8 @@ mod tests {
                 task_hint: Some("deployment recovery".to_string()),
                 max_records: 8,
                 max_bytes: 64 * 1024,
+                max_partitions: DEFAULT_RETRIEVAL_PARTITION_LIMIT,
+                continuation: None,
             })
             .expect("retrieve");
 

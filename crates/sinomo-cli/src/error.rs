@@ -44,6 +44,7 @@ pub enum CliError {
     },
     LocalData(sinomo_runtime::local::LocalDataError),
     EventStore(sinomo_runtime::events::EventStoreError),
+    Memory(sinomo_memory::MemoryError),
     DfsMetadata(sinomo_runtime::dfs::MetadataBackendError),
     DfsPin(sinomo_runtime::dfs::DfsPinStoreError),
     DfsExpose(sinomo_runtime::dfs::DfsExposeStoreError),
@@ -86,6 +87,12 @@ impl From<sinomo_runtime::local::LocalDataError> for CliError {
 impl From<sinomo_runtime::events::EventStoreError> for CliError {
     fn from(error: sinomo_runtime::events::EventStoreError) -> Self {
         Self::EventStore(error)
+    }
+}
+
+impl From<sinomo_memory::MemoryError> for CliError {
+    fn from(error: sinomo_memory::MemoryError) -> Self {
+        Self::Memory(error)
     }
 }
 
@@ -497,6 +504,7 @@ impl std::fmt::Display for CliError {
             Self::Json { path, detail } => write!(formatter, "json error at {path}: {detail}"),
             Self::LocalData(error) => write!(formatter, "{error}"),
             Self::EventStore(error) => write!(formatter, "{error}"),
+            Self::Memory(error) => write!(formatter, "{error}"),
             Self::DfsMetadata(error) => write!(formatter, "{error}"),
             Self::DfsPin(error) => write!(formatter, "{error}"),
             Self::DfsExpose(error) => write!(formatter, "{error}"),

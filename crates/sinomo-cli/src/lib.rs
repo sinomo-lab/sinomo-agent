@@ -1259,6 +1259,7 @@ pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
         | CliCommand::Debug(DebugCliCommand::Help)
         | CliCommand::Rollout(RolloutCliCommand::Help)
         | CliCommand::Dfs(DfsCliCommand::Help)
+        | CliCommand::Memory(MemoryCliCommand::Help)
         | CliCommand::Models(ModelsCliCommand::Help)
         | CliCommand::Providers(ProviderCliCommand::Help)
         | CliCommand::Voice(VoiceCliCommand::Help)
@@ -1373,6 +1374,7 @@ pub(crate) enum CliCommand {
     Debug(DebugCliCommand),
     Rollout(RolloutCliCommand),
     Dfs(DfsCliCommand),
+    Memory(MemoryCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Voice(VoiceCliCommand),
@@ -1631,6 +1633,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
         }
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
+        Some((command, rest)) if command == "memory" => {
+            Ok(CliCommand::Memory(parse_memory_command(rest)?))
+        }
         Some((command, rest)) if matches!(command.as_str(), "models" | "model") => {
             Ok(CliCommand::Models(parse_models_command(rest)?))
         }
@@ -5462,6 +5467,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Debug(command) => run_debug_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
+        CliCommand::Memory(command) => run_memory_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Voice(command) => run_voice_command(command),

@@ -4,6 +4,7 @@
 //! can depend on it without inheriting any dynamic loader, sandbox, Wasm, or
 //! service implementation dependency.
 
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::ptr;
 use std::slice;
@@ -14,6 +15,10 @@ use thiserror::Error;
 
 pub const SINOMO_NATIVE_MODULE_ABI_VERSION: u32 = 2;
 pub const SINOMO_MODULE_OBJECT_VERSION: u16 = 1;
+/// Interface descriptors are catalog metadata, not an attachment transport.
+/// Keep them independently bounded so a malformed module cannot make registry
+/// discovery allocate an unbounded payload.
+pub const MAX_MODULE_INTERFACE_DESCRIPTOR_BYTES: usize = 256 * 1024;
 
 pub type SinomoModuleStatusCode = i32;
 
@@ -168,6 +173,254 @@ pub enum NativeModuleBackend {
     NativeDylib,
 }
 
+/// One versioned typed interface exported by a module.
+///
+/// The descriptor is deliberately generic: hosts discover memory, media, or
+/// future extension protocols without teaching the module registry a
+/// service-specific callback. `descriptor_sobj` is interpreted only by the
+/// owner of `interface_id`.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleInterfaceExport {
+    pub export_id: String,
+    pub interface_id: String,
+    pub interface_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<ModuleInterfaceOperationExport>,
+    pub descriptor_sobj: Vec<u8>,
+}
+
+impl ModuleInterfaceExport {
+    pub fn new(
+        export_id: impl Into<String>,
+        interface_id: impl Into<String>,
+        interface_version: impl Into<String>,
+        descriptor_sobj: Vec<u8>,
+    ) -> Self {
+        Self {
+            export_id: export_id.into(),
+            interface_id: interface_id.into(),
+            interface_version: interface_version.into(),
+            operations: Vec::new(),
+            descriptor_sobj,
+        }
+    }
+
+    pub fn with_operation(mut self, operation: ModuleInterfaceOperationExport) -> Self {
+        self.operations.push(operation);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ModuleInterfaceContractError> {
+        validate_interface_token(&self.export_id, "interface export id")
+            .map_err(ModuleInterfaceContractError::InvalidText)?;
+        validate_interface_token(&self.interface_id, "interface id")
+            .map_err(ModuleInterfaceContractError::InvalidText)?;
+        validate_interface_token(&self.interface_version, "interface version")
+            .map_err(ModuleInterfaceContractError::InvalidText)?;
+        if self.operations.is_empty() {
+            return Err(ModuleInterfaceContractError::InvalidExport {
+                export_id: self.export_id.clone(),
+                detail: "at least one operation is required".to_string(),
+            });
+        }
+        if self.descriptor_sobj.is_empty() {
+            return Err(ModuleInterfaceContractError::InvalidExport {
+                export_id: self.export_id.clone(),
+                detail: "descriptor_sobj must be non-empty".to_string(),
+            });
+        }
+        if self.descriptor_sobj.len() > MAX_MODULE_INTERFACE_DESCRIPTOR_BYTES {
+            return Err(ModuleInterfaceContractError::InvalidExport {
+                export_id: self.export_id.clone(),
+                detail: format!(
+                    "descriptor_sobj is {} bytes; the limit is {MAX_MODULE_INTERFACE_DESCRIPTOR_BYTES}",
+                    self.descriptor_sobj.len()
+                ),
+            });
+        }
+
+        let mut logical_operations = BTreeSet::new();
+        for operation in &self.operations {
+            operation.validate().map_err(|error| {
+                ModuleInterfaceContractError::InvalidOperation {
+                    export_id: self.export_id.clone(),
+                    logical_operation: operation.logical_operation.clone(),
+                    detail: error.to_string(),
+                }
+            })?;
+            if !logical_operations.insert(operation.logical_operation.as_str()) {
+                return Err(ModuleInterfaceContractError::DuplicateLogicalOperation {
+                    export_id: self.export_id.clone(),
+                    logical_operation: operation.logical_operation.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A bounded logical operation within a typed module interface.
+///
+/// Limits are part of the ABI contract. They are intentionally `u64` so the
+/// interface itself does not impose a transport-sized ceiling; the declared
+/// values are enforced by the service invoking the operation.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleInterfaceOperationExport {
+    pub logical_operation: String,
+    pub target: ModuleInterfaceOperationTarget,
+    pub request_schema_id: String,
+    pub response_schema_id: String,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
+    pub max_facts_per_batch: u64,
+    pub max_deadline_ms: u64,
+    pub supports_cancellation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_schema_id: Option<String>,
+}
+
+impl ModuleInterfaceOperationExport {
+    pub fn validate(&self) -> Result<(), ModuleInterfaceOperationError> {
+        validate_interface_token(&self.logical_operation, "logical operation")
+            .map_err(ModuleInterfaceOperationError::InvalidText)?;
+        validate_interface_token(&self.request_schema_id, "request schema id")
+            .map_err(ModuleInterfaceOperationError::InvalidText)?;
+        validate_interface_token(&self.response_schema_id, "response schema id")
+            .map_err(ModuleInterfaceOperationError::InvalidText)?;
+        if let Some(schema_id) = &self.continuation_schema_id {
+            validate_interface_token(schema_id, "continuation schema id")
+                .map_err(ModuleInterfaceOperationError::InvalidText)?;
+        }
+        self.target.validate()?;
+        if self.max_request_bytes == 0 {
+            return Err(ModuleInterfaceOperationError::MissingLimit {
+                field: "max_request_bytes",
+            });
+        }
+        if self.max_response_bytes == 0 {
+            return Err(ModuleInterfaceOperationError::MissingLimit {
+                field: "max_response_bytes",
+            });
+        }
+        if self.max_facts_per_batch == 0 {
+            return Err(ModuleInterfaceOperationError::MissingLimit {
+                field: "max_facts_per_batch",
+            });
+        }
+        if self.max_deadline_ms == 0 {
+            return Err(ModuleInterfaceOperationError::MissingLimit {
+                field: "max_deadline_ms",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Runtime target for one logical typed-interface operation.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModuleInterfaceOperationTarget {
+    /// Invoke `NativeModuleRequest::Invoke` with the named operation.
+    NativeInvoke { operation: String },
+    /// Dispatch through an exported module object-RPC route and operation.
+    ObjectRpc { route: String, operation: String },
+    /// Invoke a named entry in a sandbox process or Wasm component artifact.
+    SandboxEntry { entry: String },
+}
+
+impl ModuleInterfaceOperationTarget {
+    pub fn validate(&self) -> Result<(), ModuleInterfaceOperationError> {
+        match self {
+            Self::NativeInvoke { operation } => {
+                validate_interface_token(operation, "native invoke operation")
+                    .map_err(ModuleInterfaceOperationError::InvalidText)
+            }
+            Self::ObjectRpc { route, operation } => {
+                if !route.starts_with('/')
+                    || route != route.trim()
+                    || route
+                        .chars()
+                        .any(|character| character.is_control() || character.is_whitespace())
+                {
+                    return Err(ModuleInterfaceOperationError::InvalidObjectRpcRoute {
+                        route: route.clone(),
+                    });
+                }
+                validate_interface_token(operation, "object RPC operation")
+                    .map_err(ModuleInterfaceOperationError::InvalidText)
+            }
+            Self::SandboxEntry { entry } => validate_interface_token(entry, "sandbox entry")
+                .map_err(ModuleInterfaceOperationError::InvalidText),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ModuleInterfaceContractError {
+    #[error("invalid module interface text: {0}")]
+    InvalidText(String),
+    #[error("module interface export `{export_id}` is invalid: {detail}")]
+    InvalidExport { export_id: String, detail: String },
+    #[error(
+        "module interface export `{export_id}` operation `{logical_operation}` is invalid: {detail}"
+    )]
+    InvalidOperation {
+        export_id: String,
+        logical_operation: String,
+        detail: String,
+    },
+    #[error(
+        "module interface export `{export_id}` repeats logical operation `{logical_operation}`"
+    )]
+    DuplicateLogicalOperation {
+        export_id: String,
+        logical_operation: String,
+    },
+    #[error("duplicate module interface export id `{export_id}`")]
+    DuplicateExportId { export_id: String },
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ModuleInterfaceOperationError {
+    #[error("{0}")]
+    InvalidText(String),
+    #[error("object RPC route `{route}` must be absolute and contain no control characters")]
+    InvalidObjectRpcRoute { route: String },
+    #[error("{field} must be greater than zero")]
+    MissingLimit { field: &'static str },
+}
+
+pub fn validate_module_interface_exports(
+    exports: &[ModuleInterfaceExport],
+) -> Result<(), ModuleInterfaceContractError> {
+    let mut export_ids = BTreeSet::new();
+    for export in exports {
+        export.validate()?;
+        if !export_ids.insert(export.export_id.as_str()) {
+            return Err(ModuleInterfaceContractError::DuplicateExportId {
+                export_id: export.export_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_interface_token(value: &str, context: &str) -> Result<(), String> {
+    if value.is_empty() || value != value.trim() {
+        return Err(format!(
+            "{context} must be non-empty without surrounding whitespace"
+        ));
+    }
+    if !value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':' | '/' | '@')
+    }) {
+        return Err(format!(
+            "{context} must contain only ASCII letters, digits, '.', '-', '_', ':', '/', or '@'"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NativeModuleSurfaces {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -192,6 +445,10 @@ pub struct NativeModuleSurfaces {
     /// compatible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network_transports: Vec<String>,
+    /// Generic typed interfaces exported by this module. The default is
+    /// load-bearing for descriptors produced before interface discovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface_exports: Vec<ModuleInterfaceExport>,
 }
 
 impl NativeModuleSurfaces {
@@ -203,6 +460,7 @@ impl NativeModuleSurfaces {
             && self.capability_exports.is_empty()
             && self.settings.is_empty()
             && self.network_transports.is_empty()
+            && self.interface_exports.is_empty()
     }
 }
 
@@ -419,6 +677,113 @@ mod tests {
         category: String,
         operation: String,
         auth: String,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct LegacyNativeModuleSurfaces {
+        object_rpc_routes: Vec<NativeModuleObjectRpcRoute>,
+        declarative_resources: Vec<NativeModuleDeclarativeResource>,
+        storage_owners: Vec<String>,
+        capability_imports: Vec<String>,
+        capability_exports: Vec<String>,
+        settings: Vec<ModuleSettingsExport>,
+        network_transports: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyNativeModuleDescriptor {
+        module_id: String,
+        module_version: String,
+        owner: String,
+        native_abi_version: u32,
+        backend: NativeModuleBackend,
+        interface_version: String,
+        platform_triple: String,
+        supported_operations: Vec<String>,
+        capabilities: Vec<String>,
+        surfaces: LegacyNativeModuleSurfaces,
+    }
+
+    fn test_interface_export() -> ModuleInterfaceExport {
+        ModuleInterfaceExport::new(
+            "memory.content-extractor.markdown",
+            "sinomo.memory.content-extractor/v1",
+            "1.0.0",
+            vec![0x53, 0x4f, 0x42, 0x4a],
+        )
+        .with_operation(ModuleInterfaceOperationExport {
+            logical_operation: "extract".to_string(),
+            target: ModuleInterfaceOperationTarget::NativeInvoke {
+                operation: "memory.extract.markdown".to_string(),
+            },
+            request_schema_id: "sinomo.memory.extraction-request/v1".to_string(),
+            response_schema_id: "sinomo.memory.derived-fact-batch/v1".to_string(),
+            max_request_bytes: u64::MAX,
+            max_response_bytes: u64::MAX,
+            max_facts_per_batch: 1_024,
+            max_deadline_ms: 30_000,
+            supports_cancellation: true,
+            continuation_schema_id: Some("sinomo.memory.extraction-continuation/v1".to_string()),
+        })
+    }
+
+    #[test]
+    fn typed_interface_export_roundtrips_and_validates() {
+        let export = test_interface_export();
+        export.validate().expect("valid interface export");
+
+        let encoded = encode_sobj(&export).expect("encode interface export");
+        let decoded: ModuleInterfaceExport =
+            decode_sobj(&encoded).expect("decode interface export");
+
+        assert_eq!(decoded, export);
+    }
+
+    #[test]
+    fn typed_interface_export_requires_explicit_resource_contracts() {
+        let mut export = test_interface_export();
+        export.operations[0].max_deadline_ms = 0;
+
+        let error = export.validate().expect_err("zero deadline must fail");
+        assert!(error.to_string().contains("max_deadline_ms"));
+
+        let duplicates = vec![test_interface_export(), test_interface_export()];
+        assert!(matches!(
+            validate_module_interface_exports(&duplicates),
+            Err(ModuleInterfaceContractError::DuplicateExportId { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_native_descriptor_defaults_interface_exports() {
+        let legacy = LegacyNativeModuleDescriptor {
+            module_id: "module.legacy".to_string(),
+            module_version: "0.1.0".to_string(),
+            owner: "legacy".to_string(),
+            native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
+            backend: NativeModuleBackend::NativeDylib,
+            interface_version: "sinomo.legacy.v1".to_string(),
+            platform_triple: "test-platform".to_string(),
+            supported_operations: Vec::new(),
+            capabilities: Vec::new(),
+            surfaces: LegacyNativeModuleSurfaces {
+                object_rpc_routes: Vec::new(),
+                declarative_resources: Vec::new(),
+                storage_owners: vec!["legacy".to_string()],
+                capability_imports: Vec::new(),
+                capability_exports: Vec::new(),
+                settings: Vec::new(),
+                network_transports: Vec::new(),
+            },
+        };
+
+        let encoded = encode_sobj(&legacy).expect("encode legacy descriptor");
+        let decoded: NativeModuleDescriptor =
+            decode_sobj(&encoded).expect("decode current descriptor");
+
+        assert_eq!(decoded.module_id, "module.legacy");
+        assert_eq!(decoded.surfaces.storage_owners, vec!["legacy"]);
+        assert!(decoded.surfaces.interface_exports.is_empty());
     }
 
     #[test]

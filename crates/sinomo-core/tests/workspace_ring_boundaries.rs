@@ -278,6 +278,10 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
         "the generic native module ABI crate should remain in default builds"
     );
     assert!(
+        default_members.contains(&"crates/sinomo-memory-extension-api".to_string()),
+        "the data-only memory extension ABI crate should remain in default builds"
+    );
+    assert!(
         default_members.contains(&"crates/sinomo-dfs-cloud-files-api".to_string()),
         "the lightweight Cloud Files module API crate should remain in default builds"
     );

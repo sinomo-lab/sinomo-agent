@@ -14,8 +14,10 @@ agent context, and collaborative maintenance by conventional software and a
 specialized memory agent.
 
 This replaces the record-first target described by earlier versions of this
-document. The current Rust implementation remains record-centric during the
-migration. Delivery order and compatibility gates live in the
+document. The current Rust implementation includes the first local
+file-to-evidence slice; the old record subsystem remains isolated and is not a
+serving or write-compatibility layer. Delivery order and readiness gates live
+in the
 [indexed-file memory implementation plan](plans/indexed-file-memory-implementation.md).
 The research basis lives in the
 [indexed-file memory literature note](research_notes/indexed_file_memory_literature.md).
@@ -679,12 +681,12 @@ Trusted built-ins can register Rust implementations directly with
 `sinomo-memory`. Dynamic, sandboxed, Wasm, declarative, and future backends use
 the normal module lifecycle and a versioned SOBJ request/response protocol.
 
-The R1 module system carries a generic opaque extension descriptor and declared
-object-RPC operations; it does not learn memory semantics and does not depend
-on the R2 memory crate. `sinomo-memory` discovers and interprets descriptors of
-kind `sinomo.memory.extension.v1` through `sinomo-runtime`. This preserves the
-trust-ring direction while allowing a module to add formats and workspace
-detectors.
+The R1 module system carries generic `ModuleInterfaceExport` metadata with
+typed operation targets and an opaque SOBJ descriptor; it does not learn memory
+semantics and does not depend on the R2 memory crate. Memory roles use
+versioned `sinomo.memory.<role>/v1` interface ids through `sinomo-runtime`. This
+preserves the trust-ring direction while allowing modules to add formats and
+workspace detectors.
 
 The versioned wire vocabulary may live in a data/ABI-only R1 package such as
 `sinomo-memory-extension-api`, re-exported by `sinomo-runtime`. That package
@@ -731,8 +733,8 @@ memory/
     generations/<id>/      # immutable fact/index segments
     staging/<job_id>/      # unpublished bounded job output
   traces/                  # append-oriented retrieval and maintenance audit
-  records/...              # existing legacy record paths remain in place
-  index.sobj               # existing legacy global index remains readable
+  records/...              # old subsystem data; ignored by indexed serving
+  index.sobj               # old subsystem index; ignored by indexed serving
 ```
 
 Exact paths and schemas are registered by `sinomo-memory` through the storage
@@ -1073,10 +1075,10 @@ API:
 | `MemoryIndexStore` | Staging, atomic generation publication, partition queries, compaction, and rebuild |
 | `MemoryOverlayStore` | Append, validate, scope, replay, and materialize authoritative overlay operations |
 | `MemoryRetriever` | Plan, authorize, fuse, expand, materialize, pack, and trace evidence bundles |
-| `MemoryContextProvider` | Adapt bounded evidence bundles into the agent context-assembly boundary |
 
 Storage engines, parsers, vector providers, graph providers, and models remain
-behind these boundaries. `sinomo-agent` must not depend on their internals.
+behind these boundaries. `sinomo-agent` consumes `MemoryRetriever` directly and
+must not depend on their internals or on the old record-serving interface.
 
 ## Crate and Trust-Ring Ownership
 
@@ -1122,44 +1124,17 @@ No acceptance benchmark may hide a full-root scan behind a query or startup.
 Scale thresholds belong in versioned benchmark presets so they can evolve with
 hardware while the bounded-work invariant remains architectural.
 
-## Compatibility and Migration
+## Storage Transition
 
-The existing `MemoryRecord`, `MemoryLinkRecord`, embedding snapshot,
-supersession, consolidation, and `DurableMemoryStore` surfaces remain readable
-during migration.
+The indexed-file system is a clean break from the old `MemoryRecord` and
+`DurableMemoryStore` subsystem. It does not project old records as virtual
+files, dual-read results, or dual-write an outbox. Lower-ring record types are
+not expanded into the new R2 index schema.
 
-A legacy connector projects each immutable record as a file-like source with a
-whole-record anchor. Existing mappings are:
-
-| Legacy concept | Indexed-file projection |
-|---|---|
-| `MemoryRecord` | Legacy virtual file, then optionally a managed SOBJ/Markdown memory document |
-| Token/embedding index | Automatic lexical or embedding generation over the projected file |
-| `MemoryLinkRecord` | Evidence-backed relation with the closest namespaced type |
-| Supersession | Explicit supersession relation/overlay operation |
-| Consolidation summary | Derived summary generation or managed memory document when deliberately promoted |
-| Retrieval result | Compatibility record projection from a `MemoryEvidenceBundle` |
-
-New data is file-first. Compatibility is an outbox projection, not two equal
-authoritative writes:
-
-1. Commit the managed file or overlay operation with a durable canonical write
-   or conversion id.
-2. Durably enqueue (or make reconstructable from that source version) an
-   idempotent legacy-projection outbox item.
-3. Derive the legacy `MemoryRecord` id deterministically from the canonical
-   source/conversion id and record a projection watermark.
-4. On replay, retry missing projections and deduplicate dual-read results by the
-   canonical id; the file/overlay representation wins.
-
-A legacy-write failure never rolls back or contradicts the authoritative file.
-Reconciliation can recreate an outbox item after a crash between the first two
-steps. Existing `memory/records/...` and `memory/index.sobj` files remain
-readable in place; migration does not move them into a new directory.
-
-Migration is complete only after restart/rebuild, scope, retrieval, context,
-outbox replay, and comparison tests pass from files and overlays alone.
-Lower-ring legacy types are not expanded into the new R2 index schema.
+The indexed-file serving path ignores existing `memory/records/...` and
+`memory/index.sobj` files. There is no reader, importer, migration shim, or
+preservation guarantee for that data. Deployments discard it and rebuild the
+new indexes from their source files.
 
 ## Failure Modes
 
@@ -1187,8 +1162,8 @@ The implementation must explicitly defend against:
 - relation/entity explosion and low-value agent-generated index pollution;
 - raw media transfer when a derived local result would satisfy the query;
 - provider loss making authoritative memory unreadable;
-- a compatibility projection failure creating a second authority or duplicate
-  context result;
+- accidental reads or writes to the old record store creating a second
+  authority or duplicate context result;
 - multi-agent contradiction collapse or one agent silently suppressing another.
 
 ## Architectural Invariants
@@ -1224,8 +1199,8 @@ The implementation must explicitly defend against:
     that version or policy authorized a durable pin.
 18. Retrieval pins a coherent query snapshot and reports incomplete or
     approximate corpus coverage explicitly.
-19. Legacy records are idempotent compatibility projections; file/overlay
-    writes remain authoritative during migration.
+19. The indexed-file system does not dual-read or dual-write the old record
+    store; files and overlays are its only authorities.
 
 ## Non-Goals
 

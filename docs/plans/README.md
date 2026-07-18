@@ -11,7 +11,7 @@ tests for that.
 | [R0/R1 crate boundary refactor](r0-r1-crate-boundary-refactor.md) | Completed implementation record. |
 | [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | Proposed follow-up work. |
 | [DFS policy and authority hardening](dfs-policy-and-authority-hardening.md) | Proposed follow-up work. |
-| [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Proposed follow-up work. |
+| [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Active; foundational contracts and the first local file-to-evidence slice are implemented. |
 | [Node health, device monitoring, and DFS storage locations](device-health-and-dfs-storage-locations.md) | Proposed follow-up work. |
 | [Agent session placement and workspace projection](agent-session-placement-and-workspaces.md) | Active implementation plan. |
 | [Formal verification roadmap](formal-verification-roadmap.md) | Active verification backlog. |

@@ -223,6 +223,7 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
                 .collect(),
             settings: Vec::new(),
             network_transports: Vec::new(),
+            interface_exports: Vec::new(),
         },
     }
 }

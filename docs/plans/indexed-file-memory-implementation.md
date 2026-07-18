@@ -1,15 +1,32 @@
 # Indexed-File Memory Implementation Plan
 
-Status: proposed follow-up work. Last reviewed 2026-07-14.
+Status: in progress. Last reviewed 2026-07-18.
+
+The foundational Phase 0 contracts needed by the Recommended First Slice and
+the slice itself are implemented: local Markdown/text roots can be registered,
+scanned through capability-rooted no-follow traversal with bounded cursors,
+read through verified current-only snapshots, and published through a
+recoverable journal into immutable per-file generations and a persistent paged
+lexical router. Queries use authenticated snapshot-pinned continuations,
+recheck current policy epochs, return byte-bounded exact evidence and durable
+traces, and inject that evidence into agent context. Overlay append/replay is
+immutable, recoverable, authenticated, and snapshot-pinned. The cross-ring
+extension ABI is available. Legacy record compatibility is deliberately
+excluded: the indexed-file system neither reads nor dual-writes the old record
+store. Phases 2 through 6 below remain the ordered follow-up for automatic
+maintenance, richer formats and relations, optional providers, federation,
+and file-first writes. Extension invocation and host-side resource enforcement
+are not active in this slice; declarations whose route cannot already be
+proven are rejected at registration.
 
 The target design is defined by the
-[memory architecture](../memory-architecture.md). This plan sequences the
-migration from the current immutable-record prototype to file-first,
-automatically maintained, extensible multimodal memory.
+[memory architecture](../memory-architecture.md). This plan sequences delivery
+of file-first, automatically maintained, extensible multimodal memory as a new
+storage and serving boundary.
 
 ## Goal and Completion Criteria
 
-The migration is complete when:
+The implementation is complete when:
 
 - ordinary local and SIFS files can be registered, discovered, versioned,
   incrementally indexed, and retrieved as exact evidence anchors;
@@ -25,12 +42,12 @@ The migration is complete when:
 - agent context assembly uses bounded evidence bundles with full retrieval
   traces;
 - placement-aware local and federated retrieval preserve source policy;
-- the legacy record store can be read through a compatibility connector and is
-  no longer required for new memory writes.
+- new memory writes are file-first and do not depend on the old record store.
 
 ## Current Baseline
 
-The existing system is a useful correctness and compatibility skeleton:
+The existing record-first prototype is a useful correctness and provenance
+reference:
 
 - base `MemoryScope`, `MemoryTier`, `MemorySourceRef`, and `MemoryRecord` are in
   `crates/sinomo-base/src/domain.rs`;
@@ -61,15 +78,15 @@ It is not yet a filesystem index:
 - scope matching does not constitute a full authorization check, and promoted
   events currently lose important routing/privacy detail.
 
-The migration must preserve the deterministic tests around replay, scope,
-supersession, consolidation, provenance, stable context ordering, and storage
-ownership while replacing the serving shape.
+The indexed-file implementation is a clean serving boundary. It does not reuse
+the isolated record-first subsystem, and that subsystem is not a compatibility
+or acceptance gate for the new memory system.
 
 ## Fixed Design Decisions
 
 1. New file/index domain types live in R2 `sinomo-memory` unless they are
-   required on an extension wire boundary. The R0 `MemoryRecord` contract is
-   compatibility state and does not grow into the new schema.
+   required on an extension wire boundary. The R0 `MemoryRecord` contract does
+   not grow into, or get projected through, the new schema.
 2. SIFS source identity is filesystem id + object id + immutable version;
    paths are mutable aliases. `DfsObjectMetadata`, `DfsObjectVersionRecord`,
    and metadata-subscription cursors are reused through `sinomo-runtime`.
@@ -155,7 +172,7 @@ containment boundary.
 interim descriptor during development, but it is migration scaffolding rather
 than the permanent discovery contract.
 
-## Phase 0: Contracts, Fixtures, and Compatibility
+## Phase 0: Contracts, Fixtures, and Clean Boundary
 
 Introduce the logical types before replacing storage:
 
@@ -174,11 +191,6 @@ Introduce the logical types before replacing storage:
   complete/approximate/budget-truncated coverage contracts;
 - paged/cursor-based source, index, overlay, and trace interfaces.
 
-Implement a read-only legacy connector that exposes each `MemoryRecord` as a
-file-like source with a whole-record anchor. Map current link, supersession,
-consolidation, token, and embedding state into compatibility facts without
-changing their persisted format.
-
 Add deterministic fixtures for:
 
 - rename with and without stable object identity;
@@ -189,8 +201,8 @@ Add deterministic fixtures for:
 - freshness and source deletion;
 - deterministic evidence packing.
 
-Expected outcome: new APIs and compatibility projections compile and can be
-tested without changing the production agent write path.
+Expected outcome: new APIs compile and can be tested independently of the old
+record store.
 
 ## Phase 1: First File-to-Evidence Vertical Slice
 
@@ -209,8 +221,8 @@ Build the smallest useful serving path before graph or model work:
 6. Build a versioned term/range-to-partition router and query metadata and
    lexical postings without replaying source facts.
 7. Return exact text/structured anchors in a `MemoryEvidenceBundle`.
-8. Adapt the existing `MemoryContextProvider` and context assembler to consume
-   evidence bundles while retaining a legacy record projection.
+8. Use the indexed `MemoryRetriever` boundary and adapt the context assembler
+   to consume evidence bundles directly.
 9. Append retrieval traces independently from serving indexes.
 
 Split the monolithic `sinomo-memory/src/lib.rs` by domain boundary as these
@@ -229,7 +241,7 @@ Verification gates:
 - compaction/publication during a query cannot mix partition generations;
 - a large synthetic root is processed with bounded memory and cursor-based
   enumeration;
-- legacy record retrieval and existing context tests continue to pass.
+- evidence-only context assembly remains deterministic and byte-bounded.
 
 Expected outcome: a user can index a large text/structured root, modify one
 file, publish a replacement generation manually, and retrieve source-backed
@@ -400,39 +412,31 @@ on cluster KV for high-cardinality state.
 Expected outcome: a single node remains the base case, while a cluster can
 index and retrieve near data without centralizing raw files.
 
-## Phase 6: File-First Writes and Legacy Retirement
+## Phase 6: File-First Writes and Old-Store Removal
 
 Change completed-turn and explicit memory writes to create scope-appropriate
 managed memory documents or overlay operations. Preserve full session/tool
 evidence in its owning files; do not reduce every turn to a mandatory warm
 summary.
 
-During a bounded compatibility window, commit the managed file/overlay as the
-only authority and project a legacy record through a durable idempotent outbox.
-Use a canonical conversion id, deterministic legacy record id, projection
-watermark, replay, and dual-read deduplication with the file representation
-winning. Reconciliation must recreate an outbox item after a crash between the
-source commit and enqueue. Add migration inspection, resumable conversion,
-comparison, and rollback-boundary tools.
+Do not dual-write or dual-read the old record store. Existing
+`memory/records/...` and `memory/index.sobj` data is outside the indexed-file
+serving path. No reader, importer, migration shim, or preservation guarantee is
+provided for it; discard it and rebuild the indexed-file state from its source
+files.
 
-Do not delete, move, or rename legacy storage automatically. Existing
-`memory/records/...` and `memory/index.sobj` remain readable in place for old
-binaries and migration tools.
-
-Retire legacy serving only after:
+Complete the file-first write transition after:
 
 - file/overlay rebuild passes without record storage;
 - scope, temporal, supersession, procedural, and context-cache evaluations
   match or improve on the legacy baseline;
-- operator tools can explain converted and unconverted records;
-- old binaries either remain compatible or the storage-version transition is
-  explicit;
-- storage registry and data-dir migration tests cover both layouts;
-- crash matrices cover every source-commit/outbox/projection/watermark boundary
-  without duplicate context blocks or divergent authority.
+- operator tools can explain managed documents and overlay operations;
+- the storage-version transition is explicit;
+- crash matrices cover every file/overlay commit and indexing boundary without
+  duplicate context blocks or divergent authority.
 
-Expected outcome: legacy records remain importable history, while all new
-memory is file-first.
+Expected outcome: all new memory is file-first, with no live dependency on the
+old record subsystem.
 
 ## Recommended First Slice
 
@@ -453,7 +457,7 @@ register root
 ```
 
 This slice validates the hardest cross-cutting choices—identity, anchors,
-generation publication, bounded serving, compatibility, and agent context—
+generation publication, bounded serving, and agent context—
 before code graphs, models, vectors, media, or federation add more variables.
 
 ## Benchmark and Readiness Work

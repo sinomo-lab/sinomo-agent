@@ -35,6 +35,7 @@ sinomo-agent = { path = "../sinomo-agent" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-dfs-fuse = { path = "../sinomo-dfs-fuse", optional = true, default-features = false }
 sinomo-lm = { path = "../sinomo-lm" }
+sinomo-memory = { path = "../sinomo-memory" }
 sinomo-models = { path = "../sinomo-models", optional = true }
 sinomo-pytorch = { path = "../sinomo-pytorch" }
 sinomo-video = { path = "../sinomo-video" }

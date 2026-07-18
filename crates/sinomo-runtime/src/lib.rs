@@ -37,6 +37,7 @@ pub mod r1 {
     pub use sinomo_dfs as dfs;
     pub use sinomo_dfs_cloud_files_api as dfs_cloud_files_api;
     pub use sinomo_eval as eval;
+    pub use sinomo_memory_extension_api as memory_extension_api;
     pub use sinomo_module as module;
     pub use sinomo_module_api as module_api;
     pub mod network_module {
@@ -102,9 +103,9 @@ pub use r0::{core, object};
 pub use r1::sandbox_wasix_host;
 pub use r1::{
     api, build, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv,
-    local, module, module_api, modules, network, network_module, node, observe, policy, registry,
-    remote_management, rollout, sandbox, sandbox_simple, sandbox_wasix_api, service, storage,
-    supervision, test, vfs,
+    local, memory_extension_api, module, module_api, modules, network, network_module, node,
+    observe, policy, registry, remote_management, rollout, sandbox, sandbox_simple,
+    sandbox_wasix_api, service, storage, supervision, test, vfs,
 };
 
 #[cfg(test)]
@@ -116,8 +117,18 @@ mod tests {
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
     use super::{
-        build, core, daemon, dfs, module, network, network_module, observe, rollout, service,
+        build, core, daemon, dfs, memory_extension_api, module, network, network_module, observe,
+        rollout, service,
     };
+
+    #[test]
+    fn runtime_facade_exports_memory_extension_contracts() {
+        let _ = memory_extension_api::MemoryExtensionDescriptor::new(
+            "memory.test",
+            "1.0.0",
+            memory_extension_api::MEMORY_CONTENT_EXTRACTOR_INTERFACE_ID_V1,
+        );
+    }
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {

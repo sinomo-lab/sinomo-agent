@@ -28,12 +28,12 @@ use sinomo_lm::{
     inferred_model_context_window_tokens, language_model_system_instructions,
 };
 use sinomo_memory::{
-    DurableMemoryStore, MemoryContextProvider, MemoryPolicy, MemoryQuery, MemoryRecordStore,
-    MemoryRetrievalReport, MemoryRetrievalResult,
+    EvidenceCoverage, IndexedFileMemoryStore, MemoryAccessContext, MemoryEvidence,
+    MemoryEvidenceBundle, MemoryQuery, MemoryRetriever,
 };
 use sinomo_runtime::core::{
-    Confidence, EventEnvelope, EventKind, LatencyClass, MemoryRecord, MemoryScope, MemorySourceRef,
-    MemoryTier, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source, TrustDomain,
+    Confidence, EventEnvelope, EventKind, LatencyClass, MemoryScope, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
@@ -1208,10 +1208,8 @@ pub struct TurnContext {
     pub prompt_references: Vec<PromptReferenceContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_attachments: Vec<AgentContextAttachment>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retrieved_memories: Vec<MemoryRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_retrieval_report: Option<MemoryRetrievalReport>,
+    pub memory_evidence_bundle: Option<MemoryEvidenceBundle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_update: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2103,14 +2101,32 @@ fn context_frame(
     }
 }
 
-fn memory_context_block(record: &MemoryRecord) -> ContextBlock {
+fn memory_evidence_context_block(
+    evidence: &MemoryEvidence,
+    bundle: &MemoryEvidenceBundle,
+) -> ContextBlock {
+    let cache_policy = bundle
+        .files
+        .iter()
+        .find(|file| file.source.version == evidence.anchor.source_version)
+        .map(|file| memory_cache_policy(&file.source.policy.scope))
+        .unwrap_or(ContextCachePolicy::AppendOnly);
     context_block(
         ContextBlockKind::RetrievedMemory,
-        format!("memory/{}", record.memory_id),
-        format!("memory {}", record.memory_id),
+        format!("memory/evidence/{}", evidence.anchor.anchor_id),
+        format!(
+            "memory evidence {} ({})",
+            evidence.anchor.anchor_id, evidence.anchor.source_version.file_ref.path_hint
+        ),
         1,
-        memory_cache_policy(&record.scope),
-        serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
+        cache_policy,
+        // Ranking, freshness, coverage and the query trace are intentionally
+        // absent. The exact source version, selector and content are stable
+        // model context; volatile retrieval details remain in the bundle.
+        serde_json::json!({
+            "anchor": &evidence.anchor,
+            "content": &evidence.content,
+        }),
     )
 }
 
@@ -2145,17 +2161,64 @@ fn refresh_context_budget_block(context: &mut TurnContext) {
     }
 }
 
-fn apply_memory_retrieval_to_context(context: &mut TurnContext, retrieval: MemoryRetrievalResult) {
-    if retrieval.records.is_empty() {
-        context.memory_retrieval_report = Some(retrieval.report);
+fn apply_memory_evidence_to_context(
+    context: &mut TurnContext,
+    bundle: MemoryEvidenceBundle,
+    byte_budget: usize,
+) {
+    let mut memory_blocks = Vec::new();
+    let mut accepted_keys = BTreeSet::new();
+    let mut omitted_count = 0usize;
+    let mut retrieved_memory_bytes = 0usize;
+    let mut model_visible_payloads = Vec::new();
+
+    for evidence in &bundle.evidence {
+        if memory_blocks.len() >= DEFAULT_RETRIEVED_MEMORY_RECORDS
+            || !accepted_keys.insert(evidence.anchor.anchor_id.to_string())
+        {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        }
+        let block = memory_evidence_context_block(evidence, &bundle);
+        let mut candidate_payloads = model_visible_payloads.clone();
+        candidate_payloads.push(block.payload.clone());
+        let rendered_bytes = serde_json::to_vec(&candidate_payloads)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if rendered_bytes > byte_budget {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        }
+        model_visible_payloads = candidate_payloads;
+        retrieved_memory_bytes = retrieved_memory_bytes.saturating_add(block.content_bytes);
+        memory_blocks.push(block);
+    }
+    if let Some(reason) = memory_coverage_omission_reason(&bundle.coverage) {
+        context.report.omitted.push(ContextOmission {
+            kind: "memory_coverage".to_string(),
+            label: "memory evidence retrieval".to_string(),
+            reason,
+        });
+    }
+    // Preserve the provider's complete bounded bundle and trace for
+    // inspection. Only the defensively packed ContextBlocks are rendered to
+    // the model.
+    context.memory_evidence_bundle = Some(bundle);
+
+    if omitted_count > 0 {
+        context.report.omitted.push(ContextOmission {
+            kind: "retrieved_memory".to_string(),
+            label: format!("{omitted_count} memory evidence item(s)"),
+            reason: format!(
+                "agent context packing omitted evidence beyond the {byte_budget} byte and {} item limits",
+                DEFAULT_RETRIEVED_MEMORY_RECORDS
+            ),
+        });
+    }
+    if memory_blocks.is_empty() {
         return;
     }
 
-    let retrieved_memory_bytes = retrieval
-        .records
-        .iter()
-        .map(|record| record.bytes)
-        .sum::<usize>();
     context.budget_estimate.retrieved_memory_bytes += retrieved_memory_bytes;
     context.budget_estimate.total_bytes += retrieved_memory_bytes;
     if let Some(lane) = context
@@ -2165,11 +2228,11 @@ fn apply_memory_retrieval_to_context(context: &mut TurnContext, retrieval: Memor
         .find(|lane| lane.kind == "retrieved_memories")
     {
         lane.bytes += retrieved_memory_bytes;
-        lane.label = format!("{} retrieved memory record(s)", retrieval.records.len());
+        lane.label = format!("{} retrieved memory evidence item(s)", memory_blocks.len());
     } else {
         context.budget_estimate.lanes.push(ContextBudgetLane {
             kind: "retrieved_memories".to_string(),
-            label: format!("{} retrieved memory record(s)", retrieval.records.len()),
+            label: format!("{} retrieved memory evidence item(s)", memory_blocks.len()),
             bytes: retrieved_memory_bytes,
             priority: 3,
         });
@@ -2177,7 +2240,7 @@ fn apply_memory_retrieval_to_context(context: &mut TurnContext, retrieval: Memor
 
     context.report.included.push(ContextSource {
         kind: "retrieved_memory".to_string(),
-        label: format!("{} retrieved memory record(s)", retrieval.records.len()),
+        label: format!("{} retrieved memory evidence item(s)", memory_blocks.len()),
         bytes: retrieved_memory_bytes,
     });
     context.report.budget_estimate = context.budget_estimate.clone();
@@ -2188,22 +2251,75 @@ fn apply_memory_retrieval_to_context(context: &mut TurnContext, retrieval: Memor
         .iter()
         .position(|block| block.kind == ContextBlockKind::TranscriptItem)
         .unwrap_or(context.context_frame.blocks.len());
-    let memory_blocks = retrieval
-        .records
-        .iter()
-        .map(|record| memory_context_block(&record.record))
-        .collect::<Vec<_>>();
     context
         .context_frame
         .blocks
         .splice(insertion_index..insertion_index, memory_blocks);
-    context.retrieved_memories = retrieval
-        .records
-        .iter()
-        .map(|record| record.record.clone())
-        .collect();
-    context.memory_retrieval_report = Some(retrieval.report);
     refresh_context_budget_block(context);
+}
+
+fn memory_coverage_omission_reason(coverage: &EvidenceCoverage) -> Option<String> {
+    match coverage {
+        EvidenceCoverage::Complete => None,
+        EvidenceCoverage::Approximate { reason } => {
+            Some(format!("memory evidence coverage is approximate: {reason}"))
+        }
+        EvidenceCoverage::BudgetTruncated { reason } => Some(format!(
+            "memory evidence coverage is budget truncated: {reason}"
+        )),
+    }
+}
+
+fn memory_context_byte_budget(context: &TurnContext) -> usize {
+    context
+        .budget_estimate
+        .max_context_bytes
+        .map(|max_context_bytes| {
+            DEFAULT_RETRIEVED_MEMORY_BYTES
+                .min(max_context_bytes.saturating_sub(context.budget_estimate.total_bytes))
+        })
+        .unwrap_or(DEFAULT_RETRIEVED_MEMORY_BYTES)
+}
+
+fn memory_query_and_access(
+    input: &AgentLoopInput,
+    config: &AgentConfig,
+    max_bytes: usize,
+) -> (MemoryQuery, MemoryAccessContext) {
+    let agent_id = config.definition.key().to_string();
+    let task_id = config
+        .run_context
+        .task
+        .as_ref()
+        .map(|task| task.task_id.to_string());
+    let workspace_id = config
+        .run_context
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.id.clone());
+    let query = MemoryQuery {
+        session_id: Some(input.session.session_id.clone()),
+        agent_id: Some(agent_id.clone()),
+        task_id: task_id.clone(),
+        workspace_id: workspace_id.clone(),
+        task_hint: memory_task_hint(input),
+        max_records: DEFAULT_RETRIEVED_MEMORY_RECORDS,
+        max_bytes,
+        ..MemoryQuery::default()
+    };
+
+    let mut access = MemoryAccessContext::cluster_local();
+    access.subject_agent_id = Some(agent_id.clone());
+    access.allowed_scopes.push(MemoryScope::Agent { agent_id });
+    if let Some(task_id) = task_id {
+        access.allowed_scopes.push(MemoryScope::Task { task_id });
+    }
+    if let Some(workspace_id) = workspace_id {
+        access
+            .allowed_scopes
+            .push(MemoryScope::Workspace { workspace_id });
+    }
+    (query, access)
 }
 
 fn memory_task_hint(input: &AgentLoopInput) -> Option<String> {
@@ -2752,8 +2868,7 @@ impl ContextAssembler {
             loaded_instruction_files,
             prompt_references,
             context_attachments,
-            retrieved_memories: Vec::new(),
-            memory_retrieval_report: None,
+            memory_evidence_bundle: None,
             async_update,
             available_tool_specs: tool_descriptors,
             budget_estimate,
@@ -5876,7 +5991,7 @@ where
 
 #[derive(Clone, Default)]
 pub struct AgentRuntimeStorage {
-    memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
+    memory_retriever: Option<Arc<dyn MemoryRetriever>>,
     durable_paths: Option<AgentStoragePaths>,
 }
 
@@ -5887,26 +6002,26 @@ impl AgentRuntimeStorage {
 
     pub fn from_data_dir(data_dir: &SinomoDataDir) -> Self {
         Self {
-            memory_record_store: Some(Arc::new(DurableMemoryStore::from_data_dir(data_dir))),
+            memory_retriever: Some(Arc::new(IndexedFileMemoryStore::from_data_dir(data_dir))),
             durable_paths: Some(AgentStoragePaths::from_data_dir(data_dir)),
         }
     }
 
-    pub fn with_memory_record_store<T>(mut self, store: T) -> Self
+    pub fn with_memory_retriever<T>(mut self, retriever: T) -> Self
     where
-        T: MemoryRecordStore + 'static,
+        T: MemoryRetriever + 'static,
     {
-        self.memory_record_store = Some(Arc::new(store));
+        self.memory_retriever = Some(Arc::new(retriever));
         self
     }
 
-    pub fn with_shared_memory_record_store(mut self, store: Arc<dyn MemoryRecordStore>) -> Self {
-        self.memory_record_store = Some(store);
+    pub fn with_shared_memory_retriever(mut self, retriever: Arc<dyn MemoryRetriever>) -> Self {
+        self.memory_retriever = Some(retriever);
         self
     }
 
-    pub fn memory_record_store(&self) -> Option<Arc<dyn MemoryRecordStore>> {
-        self.memory_record_store.clone()
+    pub fn memory_retriever(&self) -> Option<Arc<dyn MemoryRetriever>> {
+        self.memory_retriever.clone()
     }
 
     pub fn load_session(
@@ -5923,13 +6038,11 @@ impl AgentRuntimeStorage {
     where
         M: InteractionModel,
     {
-        agent = match (
-            agent.memory_record_store.is_some() || agent.memory_context_provider.is_some(),
-            &self.memory_record_store,
-        ) {
-            (false, Some(store)) => agent.with_shared_memory_store(store.clone()),
-            _ => agent,
-        };
+        if agent.memory_retriever.is_none()
+            && let Some(retriever) = &self.memory_retriever
+        {
+            agent = agent.with_shared_memory_retriever(retriever.clone());
+        }
         if let Some(paths) = &self.durable_paths {
             if !agent.session_store_configured {
                 agent = agent.with_session_store(FileAgentSessionStore::new(paths.clone()));
@@ -7864,8 +7977,7 @@ pub struct Agent<M> {
     tool_surface: AgentToolSurface,
     tools: AgentToolRegistry,
     context_assembler: ContextAssembler,
-    memory_context_provider: Option<Arc<dyn MemoryContextProvider>>,
-    memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
+    memory_retriever: Option<Arc<dyn MemoryRetriever>>,
     compactor: AgentCompactor,
     compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
     trace_store: Box<dyn AgentTraceStore>,
@@ -7886,8 +7998,7 @@ impl<M: InteractionModel> Agent<M> {
             tool_surface,
             tools: AgentToolRegistry::new(),
             context_assembler: ContextAssembler,
-            memory_context_provider: None,
-            memory_record_store: None,
+            memory_retriever: None,
             compactor: AgentCompactor::default(),
             compaction_engine: Arc::new(RwLock::new(Box::new(
                 CodexStyleAgentCompactionEngine::default(),
@@ -7954,26 +8065,16 @@ impl<M: InteractionModel> Agent<M> {
         self
     }
 
-    pub fn with_memory_context_provider<T>(mut self, provider: T) -> Self
+    pub fn with_memory_retriever<T>(mut self, retriever: T) -> Self
     where
-        T: MemoryContextProvider + 'static,
+        T: MemoryRetriever + 'static,
     {
-        self.memory_context_provider = Some(Arc::new(provider));
+        self.memory_retriever = Some(Arc::new(retriever));
         self
     }
 
-    pub fn with_memory_store<T>(mut self, store: T) -> Self
-    where
-        T: MemoryRecordStore + 'static,
-    {
-        let store = Arc::new(store);
-        self = self.with_shared_memory_store(store);
-        self
-    }
-
-    pub fn with_shared_memory_store(mut self, store: Arc<dyn MemoryRecordStore>) -> Self {
-        self.memory_context_provider = Some(store.clone());
-        self.memory_record_store = Some(store);
+    pub fn with_shared_memory_retriever(mut self, retriever: Arc<dyn MemoryRetriever>) -> Self {
+        self.memory_retriever = Some(retriever);
         self
     }
 
@@ -8279,22 +8380,6 @@ impl<M: InteractionModel> Agent<M> {
             })
     }
 
-    fn record_completed_turn_memories(&self, input: &AgentLoopInput, run: &AgentRun) {
-        let Some(store) = &self.memory_record_store else {
-            return;
-        };
-        let policy = MemoryPolicy::default();
-        if transient_system_context(input).is_none() {
-            let _ = store.promote_event(&input.latest_event, &policy);
-        }
-        // Keep useful turn outcomes, but never promote surface orchestration
-        // instructions themselves into durable user memory.
-        if let Some(record) = completed_turn_memory_record(self.config.definition.key(), input, run)
-        {
-            let _ = store.write_record(record);
-        }
-    }
-
     pub fn start_turn(
         &self,
         session: &mut AgentSession,
@@ -8412,7 +8497,6 @@ impl<M: InteractionModel> Agent<M> {
                 event_count: run.events.len(),
             },
         )?;
-        self.record_completed_turn_memories(input, &run);
         if persist_completed_turn {
             self.save_session(session)?;
         }
@@ -9471,24 +9555,6 @@ impl<M: InteractionModel> Agent<M> {
             tool_descriptors,
             step_index,
         )?;
-        if let Some(provider) = &self.memory_context_provider {
-            let query = MemoryQuery {
-                session_id: Some(input.session.session_id.clone()),
-                agent_id: Some(self.config.definition.key().to_string()),
-                task_hint: memory_task_hint(input),
-                max_records: DEFAULT_RETRIEVED_MEMORY_RECORDS,
-                max_bytes: DEFAULT_RETRIEVED_MEMORY_BYTES,
-                ..MemoryQuery::default()
-            };
-            match provider.retrieve(&query) {
-                Ok(retrieval) => apply_memory_retrieval_to_context(&mut context, retrieval),
-                Err(source) => context.report.omitted.push(ContextOmission {
-                    kind: "retrieved_memory".to_string(),
-                    label: "memory context provider".to_string(),
-                    reason: format!("memory retrieval failed: {source}"),
-                }),
-            }
-        }
         let policy_bytes = serde_json::to_vec(&self.tool_surface)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
@@ -9535,6 +9601,28 @@ impl<M: InteractionModel> Agent<M> {
         context.budget_estimate.total_bytes += policy_bytes;
         context.report.budget_estimate = context.budget_estimate.clone();
         refresh_context_budget_block(&mut context);
+        if let Some(retriever) = &self.memory_retriever {
+            let byte_budget = memory_context_byte_budget(&context);
+            if byte_budget == 0 {
+                context.report.omitted.push(ContextOmission {
+                    kind: "retrieved_memory".to_string(),
+                    label: "memory retriever".to_string(),
+                    reason: "no model context byte budget remains for memory evidence".to_string(),
+                });
+            } else {
+                let (query, access) = memory_query_and_access(input, &self.config, byte_budget);
+                match retriever.retrieve_evidence(&access, &query) {
+                    Ok(bundle) => {
+                        apply_memory_evidence_to_context(&mut context, bundle, byte_budget)
+                    }
+                    Err(source) => context.report.omitted.push(ContextOmission {
+                        kind: "retrieved_memory".to_string(),
+                        label: "memory retriever".to_string(),
+                        reason: format!("memory retrieval failed: {source}"),
+                    }),
+                }
+            }
+        }
         apply_context_parent(&mut context, None);
         Ok(context)
     }
@@ -10157,6 +10245,38 @@ fn render_turn_context_message(
     _input: &AgentLoopInput,
     turn_context: &TurnContext,
 ) -> Result<String, AgentError> {
+    let mut session_context = serde_json::Map::new();
+    session_context.insert(
+        "session_projection".to_string(),
+        serde_json::to_value(&turn_context.session_projection).unwrap_or(serde_json::Value::Null),
+    );
+    session_context.insert(
+        "current_work".to_string(),
+        serde_json::to_value(
+            turn_context
+                .session_projection
+                .as_ref()
+                .map(|projection| &projection.working_state),
+        )
+        .unwrap_or(serde_json::Value::Null),
+    );
+    session_context.insert(
+        "prompt_references".to_string(),
+        serde_json::to_value(&turn_context.prompt_references).unwrap_or(serde_json::Value::Null),
+    );
+    session_context.insert(
+        "context_attachments".to_string(),
+        serde_json::to_value(&turn_context.context_attachments).unwrap_or(serde_json::Value::Null),
+    );
+    let evidence = turn_context
+        .context_frame
+        .blocks
+        .iter()
+        .filter(|block| block.kind == ContextBlockKind::RetrievedMemory)
+        .map(|block| block.payload.clone())
+        .collect::<Vec<_>>();
+    session_context.insert("memory_evidence".to_string(), serde_json::json!(evidence));
+
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "turn_context",
         "stable_prefix": {
@@ -10170,16 +10290,7 @@ fn render_turn_context_message(
             "run_context": &turn_context.run_context,
             "loaded_instruction_files": turn_context.loaded_instruction_files,
         },
-        "session_context": {
-            "session_projection": turn_context.session_projection,
-            "current_work": turn_context
-                .session_projection
-                .as_ref()
-                .map(|projection| &projection.working_state),
-            "prompt_references": turn_context.prompt_references,
-            "context_attachments": turn_context.context_attachments,
-            "retrieved_memories": turn_context.retrieved_memories,
-        },
+        "session_context": session_context,
         "volatile_tail": {
             "step_index": turn_context.report.step_index,
             "workspace_facts": turn_context.workspace_facts,
@@ -11140,80 +11251,6 @@ fn build_candidate_evidence_bundle(
     })
 }
 
-fn completed_turn_memory_record(
-    agent_id: &str,
-    input: &AgentLoopInput,
-    run: &AgentRun,
-) -> Option<MemoryRecord> {
-    let mut parts = vec![format!("Agent turn completed with {:?}.", run.stop_reason)];
-    let final_text = run.final_decision.text.trim();
-    if !final_text.is_empty() {
-        parts.push(format!(
-            "Final response: {}",
-            model_visible_text_excerpt(final_text, 2048)
-        ));
-    }
-    if !run.tool_results.is_empty() {
-        let summaries = run
-            .tool_results
-            .iter()
-            .take(3)
-            .map(|outcome| {
-                format!(
-                    "{}: {:?}: {}",
-                    outcome.call.tool,
-                    outcome.status,
-                    model_visible_text_excerpt(outcome.summary.trim(), 256)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        parts.push(format!(
-            "Tool results: {} total. {}",
-            run.tool_results.len(),
-            summaries
-        ));
-    }
-    if let Some(bundle) = &run.candidate_evidence_bundle {
-        if let Some(summary) = bundle.context_summary.as_deref() {
-            parts.push(format!(
-                "Task evidence: {}",
-                model_visible_text_excerpt(summary.trim(), 512)
-            ));
-        }
-    }
-    if parts.len() == 1 && final_text.is_empty() {
-        return None;
-    }
-
-    let created_at = run
-        .events
-        .last()
-        .map(|event| event.time)
-        .unwrap_or_else(time::OffsetDateTime::now_utc);
-    let mut source_refs = vec![
-        MemorySourceRef::new("session", input.session.session_id.to_string()),
-        MemorySourceRef::new("event", input.latest_event.event_id.to_string()),
-    ];
-    if let Some(completed_event) = run.events.last() {
-        source_refs.push(MemorySourceRef::new(
-            "agent_event",
-            completed_event.event_id.to_string(),
-        ));
-    }
-
-    Some(MemoryRecord::new(
-        MemoryScope::Agent {
-            agent_id: agent_id.to_string(),
-        },
-        MemoryTier::Warm,
-        parts.join(" "),
-        source_refs,
-        TrustDomain::new("trust.local").expect("valid trust domain"),
-        created_at,
-    ))
-}
-
 fn agent_session_event(
     op_id: &TaskId,
     session_id: &SessionId,
@@ -11305,7 +11342,7 @@ mod tests {
         default_coding_agent_tools, user_interaction_input_event,
     };
     use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
-    use sinomo_memory::DurableMemoryStore;
+    use sinomo_memory::MemoryError;
     use sinomo_runtime::events::SessionId;
     use sinomo_runtime::node::{LocalNodePermission, NodeId};
     use std::collections::VecDeque;
@@ -11431,6 +11468,91 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingMemoryRetriever {
+        result: Arc<Mutex<MemoryEvidenceBundle>>,
+        calls: Arc<Mutex<Vec<(MemoryAccessContext, MemoryQuery)>>>,
+    }
+
+    impl RecordingMemoryRetriever {
+        fn new(result: MemoryEvidenceBundle) -> Self {
+            Self {
+                result: Arc::new(Mutex::new(result)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl MemoryRetriever for RecordingMemoryRetriever {
+        fn retrieve_evidence(
+            &self,
+            access: &MemoryAccessContext,
+            query: &MemoryQuery,
+        ) -> Result<MemoryEvidenceBundle, MemoryError> {
+            self.calls
+                .lock()
+                .expect("memory calls")
+                .push((access.clone(), query.clone()));
+            Ok(self.result.lock().expect("memory result").clone())
+        }
+    }
+
+    fn evidence_bundle(summary: &str) -> MemoryEvidenceBundle {
+        let file_id =
+            sinomo_runtime::core::Id::derived("agent-test-memory-file", summary.as_bytes());
+        let version = sinomo_memory::MemoryFileVersionRef {
+            file_ref: sinomo_memory::MemoryFileRef {
+                connector_id: "agent-test-memory/v1".to_string(),
+                root_id: sinomo_runtime::core::Id::derived("agent-test-root", b"root"),
+                object_id: file_id,
+                path_hint: "fixture.md".to_string(),
+            },
+            version_id: sinomo_runtime::core::Id::derived(
+                "agent-test-memory-version",
+                summary.as_bytes(),
+            ),
+            content_hash: blake3::hash(summary.as_bytes()).to_hex().to_string(),
+            byte_length: summary.len() as u64,
+        };
+        let anchor = sinomo_memory::MemoryAnchor::canonical(
+            version.clone(),
+            sinomo_memory::MemoryAnchorSelector::WholeFile,
+            "text/markdown",
+        )
+        .expect("valid fixture anchor");
+        let source = sinomo_memory::SourceDescriptor {
+            version,
+            media_type: "text/markdown".to_string(),
+            policy: sinomo_memory::IndexRootPolicy {
+                scope: MemoryScope::Agent {
+                    agent_id: "main-agent".to_string(),
+                },
+                visibility: sinomo_runtime::core::TrustDomain::new("trust.local").expect("trust"),
+                allow_model_context: true,
+                allow_relation_traversal: false,
+            },
+            retention: sinomo_memory::SourceRetentionCapability::NativeVersioned,
+            freshness: sinomo_memory::SourceFreshness::Current,
+            platform_identity: "agent-test-file".to_string(),
+            source_version_hint: "fixture-v1".to_string(),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        MemoryEvidenceBundle {
+            snapshot: None,
+            files: vec![sinomo_memory::MemoryEvidenceFile {
+                source,
+                evidence_anchor_ids: vec![anchor.anchor_id.clone()],
+            }],
+            evidence: vec![MemoryEvidence {
+                anchor,
+                content: summary.to_string(),
+                score: 100,
+                reason: "indexed test fixture".to_string(),
+            }],
+            ..MemoryEvidenceBundle::default()
         }
     }
 
@@ -16264,151 +16386,238 @@ mod tests {
     }
 
     #[test]
-    fn context_assembler_includes_retrieved_memory_blocks() {
-        let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-context");
-        let store = DurableMemoryStore::new(root.join("memory"));
-        store
-            .put_record(
-                MemoryScope::Agent {
-                    agent_id: "main-agent".to_string(),
-                },
-                sinomo_runtime::core::MemoryTier::Warm,
-                "Remember that scoped patches are preferred for large files",
-                vec![sinomo_runtime::core::MemorySourceRef::new(
-                    "session",
-                    "sess_agent",
-                )],
-                sinomo_runtime::core::TrustDomain::new("trust.local").expect("trust"),
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("memory record");
-        let input = agent_input("inspect");
+    fn context_assembler_uses_canonical_evidence_once_with_typed_access() {
+        let summary = "Exact indexed evidence must be model visible once";
+        let mut bundle = evidence_bundle(summary);
+        let continuation = sinomo_memory::MemoryQueryContinuation {
+            router_manifest_id: TaskId::generate(),
+            query_fingerprint: TaskId::generate(),
+            next_partition_id: TaskId::generate(),
+            next_generation_id: TaskId::generate(),
+            resume_after_partition: false,
+            next_anchor: 2,
+            authenticator: "fixture-authenticator".to_string(),
+        };
+        bundle.coverage = EvidenceCoverage::BudgetTruncated {
+            reason: "fixture has another partition".to_string(),
+        };
+        bundle.continuation = Some(continuation.clone());
+        bundle.trace.terms = vec!["exact".to_string(), "indexed".to_string()];
+        let provider = RecordingMemoryRetriever::new(bundle);
+        let calls = provider.calls.clone();
+        let task = AgentTaskRef::new("coding", "wire indexed memory evidence");
+        let workspace = WorkspaceRef::sifs("workspace-alpha", "/workspaces/alpha");
+        let config = AgentConfig::new("fake", "fake")
+            .with_task_ref(task.clone())
+            .with_workspace_ref(workspace.clone());
+        let input = agent_input("inspect indexed memory");
+        let transcript = vec![AgentTranscriptItem::user(0, "Earlier request")];
         let agent = Agent::new(
             SequencedModel::new(std::iter::empty::<String>()),
             "fake",
             "fake",
         )
-        .with_memory_context_provider(store);
+        .with_config(config)
+        .with_memory_retriever(provider);
 
-        let context = agent.assemble_context(&input, &[], 0).expect("context");
+        let context = agent
+            .assemble_context(&input, &transcript, 0)
+            .expect("context");
 
-        assert_eq!(context.retrieved_memories.len(), 1);
+        let retained_bundle = context
+            .memory_evidence_bundle
+            .as_ref()
+            .expect("retained evidence bundle");
+        assert_eq!(retained_bundle.continuation, Some(continuation));
+        assert_eq!(
+            retained_bundle.trace.terms,
+            vec!["exact".to_string(), "indexed".to_string()]
+        );
+        assert!(context.report.omitted.iter().any(|omission| {
+            omission.kind == "memory_coverage" && omission.reason.contains("budget truncated")
+        }));
+        let memory_blocks = context
+            .context_frame
+            .blocks
+            .iter()
+            .filter(|block| block.kind == ContextBlockKind::RetrievedMemory)
+            .collect::<Vec<_>>();
+        assert_eq!(memory_blocks.len(), 1);
+        assert_eq!(memory_blocks[0].payload["content"], summary);
+        assert!(memory_blocks[0].payload.get("score").is_none());
+        assert!(memory_blocks[0].payload.get("reason").is_none());
+        assert!(memory_blocks[0].payload.get("trace").is_none());
+        let memory_position = context
+            .context_frame
+            .blocks
+            .iter()
+            .position(|block| block.kind == ContextBlockKind::RetrievedMemory)
+            .expect("memory block");
+        let transcript_position = context
+            .context_frame
+            .blocks
+            .iter()
+            .position(|block| block.kind == ContextBlockKind::TranscriptItem)
+            .expect("transcript block");
+        assert!(memory_position < transcript_position);
         assert_eq!(
             context.budget_estimate.retrieved_memory_bytes,
-            context
-                .context_frame
-                .blocks
+            memory_blocks
                 .iter()
-                .filter(|block| block.kind == ContextBlockKind::RetrievedMemory)
                 .map(|block| block.content_bytes)
                 .sum::<usize>()
         );
-        assert!(
-            context
-                .context_frame
-                .blocks
-                .iter()
-                .any(|block| block.kind == ContextBlockKind::RetrievedMemory
-                    && block.cache_policy == ContextCachePolicy::AppendOnly)
-        );
 
-        let request = agent.request(&input, &[], 0).expect("request");
+        let calls = calls.lock().expect("memory calls");
+        assert_eq!(calls.len(), 1);
+        let (access, query) = &calls[0];
+        assert_eq!(access.subject_agent_id.as_deref(), Some("main-agent"));
+        assert!(access.allowed_scopes.contains(&MemoryScope::Cluster));
+        assert!(access.allowed_scopes.contains(&MemoryScope::Agent {
+            agent_id: "main-agent".to_string(),
+        }));
+        assert!(access.allowed_scopes.contains(&MemoryScope::Task {
+            task_id: task.task_id.to_string(),
+        }));
+        assert!(access.allowed_scopes.contains(&MemoryScope::Workspace {
+            workspace_id: workspace.id,
+        }));
+        assert_eq!(query.task_id.as_deref(), Some(task.task_id.as_str()));
+        assert_eq!(query.workspace_id.as_deref(), Some("workspace-alpha"));
+        drop(calls);
+
+        let request = agent.request(&input, &transcript, 0).expect("request");
         let request_text = request
             .messages
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(request_text.contains("\"retrieved_memories\""));
-        assert!(request_text.contains("scoped patches are preferred"));
+        assert!(request_text.contains("\"memory_evidence\""));
+        assert!(!request_text.contains("\"retrieved_memories\": ["));
+        assert_eq!(request_text.matches(summary).count(), 1);
     }
 
     #[test]
-    fn agent_writes_completed_turn_summary_to_memory_store() {
-        let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-write");
-        let store = DurableMemoryStore::new(root.join("memory"));
-        let model = SequencedModel::new([r#"{
-            "response_mode": "answer",
-            "text": "Remembered outcome.",
-            "tool_calls": [],
-            "background_handoff": null,
-            "next_state": "listening"
-        }"#]);
-        let agent = Agent::new(model, "fake", "fake").with_memory_store(store.clone());
-        let input = agent_input("remember this outcome");
-        let mut session = AgentSession::new(input.session.session_id.clone(), AgentRole::Main);
-
-        let run = agent.start_turn(&mut session, &input).expect("turn");
-
-        assert_eq!(run.final_decision.text, "Remembered outcome.");
-        let result = sinomo_memory::MemoryContextProvider::retrieve(
-            &store,
-            &sinomo_memory::MemoryQuery {
-                session_id: Some(input.session.session_id.clone()),
-                agent_id: Some("main-agent".to_string()),
-                task_hint: Some("outcome".to_string()),
-                ..sinomo_memory::MemoryQuery::default()
-            },
+    fn context_assembler_keeps_evidence_block_stable_when_trace_changes() {
+        let bundle = evidence_bundle("Stable versioned evidence");
+        let provider = RecordingMemoryRetriever::new(bundle);
+        let mutable_result = provider.result.clone();
+        let input = agent_input("inspect stable evidence");
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
         )
-        .expect("retrieve memory");
-        assert_eq!(result.records.len(), 1);
-        assert!(
-            result.records[0]
-                .record
-                .summary
-                .contains("Remembered outcome.")
+        .with_memory_retriever(provider);
+
+        let first = agent.assemble_context(&input, &[], 0).expect("first");
+        {
+            let mut bundle = mutable_result.lock().expect("memory result");
+            bundle.trace.terms = vec!["volatile".to_string(), "trace".to_string()];
+            bundle.trace.routed_partitions = 99;
+            bundle.evidence[0].score = 999;
+            bundle.evidence[0].reason = "volatile reranker explanation".to_string();
+            bundle.files[0].source.observed_at = time::OffsetDateTime::now_utc();
+        }
+        let second = agent.assemble_context(&input, &[], 0).expect("second");
+        let first_block = first
+            .context_frame
+            .blocks
+            .iter()
+            .find(|block| block.kind == ContextBlockKind::RetrievedMemory)
+            .expect("first memory block");
+        let second_block = second
+            .context_frame
+            .blocks
+            .iter()
+            .find(|block| block.kind == ContextBlockKind::RetrievedMemory)
+            .expect("second memory block");
+
+        assert_eq!(first_block.block_id, second_block.block_id);
+        assert_eq!(first_block.payload, second_block.payload);
+        assert_ne!(
+            first
+                .memory_evidence_bundle
+                .as_ref()
+                .expect("first bundle")
+                .trace,
+            second
+                .memory_evidence_bundle
+                .as_ref()
+                .expect("second bundle")
+                .trace
         );
     }
 
     #[test]
-    fn agent_session_runtime_injects_default_memory_store() {
+    fn context_assembler_defensively_enforces_actual_evidence_bytes() {
+        let input = agent_input("inspect bounded evidence");
+        let base_config = AgentConfig::new("fake", "fake");
+        let baseline = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(base_config.clone())
+        .assemble_context(&input, &[], 0)
+        .expect("baseline context");
+        let byte_budget = 256usize;
+        let mut config = base_config;
+        config.context_budget.max_context_bytes = Some(
+            baseline
+                .budget_estimate
+                .total_bytes
+                .saturating_add(byte_budget),
+        );
+        let oversized = format!("MUST_NOT_REACH_MODEL {}", "x".repeat(4096));
+        let bundle = evidence_bundle(&oversized);
+        let provider = RecordingMemoryRetriever::new(bundle);
+        let calls = provider.calls.clone();
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(config)
+        .with_memory_retriever(provider);
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+
+        assert_eq!(calls.lock().expect("calls")[0].1.max_bytes, byte_budget);
+        assert_eq!(context.budget_estimate.retrieved_memory_bytes, 0);
+        assert!(
+            !context
+                .context_frame
+                .blocks
+                .iter()
+                .any(|block| block.kind == ContextBlockKind::RetrievedMemory)
+        );
+        assert!(context.report.omitted.iter().any(|omission| {
+            omission.kind == "retrieved_memory"
+                && omission
+                    .reason
+                    .contains("agent context packing omitted evidence")
+        }));
+        let rendered = render_turn_context_message(&input, &context).expect("render context");
+        assert!(!rendered.contains("MUST_NOT_REACH_MODEL"));
+    }
+
+    #[test]
+    fn agent_session_runtime_injects_default_indexed_memory_retriever() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-memory");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
-        let model = SequencedModel::new([r#"{
-            "response_mode": "answer",
-            "text": "Runtime memory outcome.",
-            "tool_calls": [],
-            "background_handoff": null,
-            "next_state": "listening"
-        }"#]);
-        let agent =
-            Agent::new(model, "fake", "fake").with_agent_definition(AgentDefinition::main());
-        let input = agent_input("remember runtime storage");
-        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Main);
-        let runtime = AgentSessionRuntime::with_data_dir_storage(agent, session, &data_dir);
-        let op = AgentOp::start_turn(input.clone());
-        let op_id = op.op_id.clone();
-
-        let submit = runtime.submit_op(op).expect("submit");
-        assert!(submit.accepted);
-        runtime.join_active_turn().expect("join");
-        let outcome = runtime
-            .turn_result(&op_id)
-            .expect("turn result")
-            .expect("outcome");
-        assert_eq!(
-            outcome.run.as_ref().expect("run").final_decision.text,
-            "Runtime memory outcome."
+        let storage = AgentRuntimeStorage::from_data_dir(&data_dir);
+        let session_id = SessionId::generate();
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
         );
+        let agent = storage.apply_to_agent(agent, &session_id);
 
-        let store = DurableMemoryStore::from_data_dir(&data_dir);
-        let result = sinomo_memory::MemoryContextProvider::retrieve(
-            &store,
-            &sinomo_memory::MemoryQuery {
-                session_id: Some(input.session.session_id.clone()),
-                agent_id: Some("main-agent".to_string()),
-                task_hint: Some("runtime storage".to_string()),
-                ..sinomo_memory::MemoryQuery::default()
-            },
-        )
-        .expect("retrieve memory");
-        assert_eq!(result.records.len(), 1);
-        assert!(
-            result.records[0]
-                .record
-                .summary
-                .contains("Runtime memory outcome.")
-        );
+        assert!(storage.memory_retriever().is_some());
+        assert!(agent.memory_retriever.is_some());
     }
 
     #[test]
