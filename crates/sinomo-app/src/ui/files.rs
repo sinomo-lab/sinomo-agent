@@ -4,8 +4,8 @@
 //! shows where an object lives and its placement / replication policy.
 //!
 //! Like the Settings tab, this is a fully *composed* `sui-widgets` tree: [`view`]
-//! returns a responsive host ([`FilesView`]) over pre-built pods (wide split with
-//! the inspector, narrow list-only), each assembled from stock `Breadcrumb` /
+//! retains wide-split and narrow-list presentations through `ConstraintView`, while
+//! [`FilesView`] remains only as the lazy-load boundary. Both branches use stock `Breadcrumb` /
 //! `IconButton` / `VirtualTable` / `ScrollView` / `SideSheet` / `PanelSection` /
 //! `DetailRow` / `StatusBadge` widgets. State lives entirely in [`FilesState`]; the
 //! interactive app lists SIFS on a background worker so tab layout never blocks
@@ -17,7 +17,6 @@
 //! requested through the worker/daemon boundary instead of doing heavy listing
 //! work on the UI path.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -33,21 +32,22 @@ use std::time::Duration;
 use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
-    CheckboxIndicatorState, CollectionWindow, Color, Constraints, ControlSize, DefaultTheme,
-    DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, FixedPaneSplit, Flex, FlexItem,
-    FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, LeadingLabelCellPaint,
-    ListItem, ListView, MeasureCtx, NumberInput, Observable, PaintCtx, PanelSection,
-    PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment, RadioButton, RebuildOnChange,
-    Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
-    SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
-    Separator, SideSheet, SideSheetPlacement, Size, SizedBox, Stack, StackHostOptions, StatusBadge,
-    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint,
-    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow,
-    VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable,
-    VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
-    VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, paint_checkbox_indicator,
-    paint_leading_label_cell, paint_placement_badge_with, paint_text_cell,
+    CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView, Constraints,
+    ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase,
+    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState,
+    Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, NumberInput, Observable,
+    PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment,
+    RadioButton, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
+    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction,
+    SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size,
+    SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
+    SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, ToggleState,
+    Tooltip, TooltipPlacement, TrailingSlotRow, VirtualCollectionModel, VirtualList,
+    VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
+    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
+    VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
+    paint_placement_badge_with, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -13740,68 +13740,13 @@ fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget
 }
 
 /// Chooses only the desktop command-row density; the surrounding wide Files body and inspector
-/// stay mounted. This avoids making the 640px inspector breakpoint also carry the much wider
-/// complete-toolbar requirement.
-struct FilesDesktopHeader {
-    full: WidgetPod,
-    picker_first: WidgetPod,
-    use_full: Cell<bool>,
-}
-
-impl FilesDesktopHeader {
-    fn new(shared: &Shared, reader: &ThemeReader) -> Self {
-        Self {
-            full: WidgetPod::new(header_bar(shared, reader)),
-            picker_first: WidgetPod::new(picker_first_header_bar(shared, reader)),
-            use_full: Cell::new(true),
-        }
-    }
-
-    fn active(&self) -> &WidgetPod {
-        if self.use_full.get() {
-            &self.full
-        } else {
-            &self.picker_first
-        }
-    }
-
-    fn active_mut(&mut self) -> &mut WidgetPod {
-        if self.use_full.get() {
-            &mut self.full
-        } else {
-            &mut self.picker_first
-        }
-    }
-}
-
-impl Widget for FilesDesktopHeader {
-    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.use_full
-            .set(constraints.max.width >= FULL_HEADER_INNER_MIN_W + CONTENT_PAD * 2.0);
-        self.active_mut().measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.active_mut().arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.active().paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.active().semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(self.active());
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(self.active_mut());
-    }
+/// stay mounted. SUI retains and focus-scopes both header variants independently of the wider
+/// 640px inspector breakpoint.
+fn desktop_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    ConstraintView::new(picker_first_header_bar(shared, reader)).when(
+        ConstraintQuery::new().min_width(FULL_HEADER_INNER_MIN_W + CONTENT_PAD * 2.0),
+        header_bar(shared, reader),
+    )
 }
 
 fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -13859,7 +13804,7 @@ fn wide_pod(
     scroll_state: &ScrollState,
     places_scroll_state: &ScrollState,
     inspector_scroll_state: &ScrollState,
-) -> WidgetPod {
+) -> impl Widget + use<> {
     let places_scroll =
         ScrollView::vertical(files_places_rail(shared, reader)).state(places_scroll_state.clone());
     let places = Background::new(Color::TRANSPARENT, places_scroll).brush_when({
@@ -13885,19 +13830,21 @@ fn wide_pod(
         .with_child(
             SizedBox::new()
                 .height(HEADER_H)
-                .with_child(FilesDesktopHeader::new(shared, reader)),
+                .with_child(desktop_header(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
-    WidgetPod::new(
-        Dock::new(body)
-            .top(HEADER_H + 1.0, header)
-            .bottom(FILES_STATUS_H, files_status_bar(shared, reader)),
-    )
+    Dock::new(body)
+        .top(HEADER_H + 1.0, header)
+        .bottom(FILES_STATUS_H, files_status_bar(shared, reader))
 }
 
 /// Narrow: compact header + list body. Commands and the inspector remain
 /// reachable through overlays owned by `FilesDialogHost`.
-fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
+fn narrow_pod(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(
@@ -13906,11 +13853,9 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
                 .with_child(compact_header_bar(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
-    WidgetPod::new(
-        Dock::new(list_column(shared, reader, scroll_state))
-            .top(HEADER_H + 1.0, header)
-            .bottom(FILES_STATUS_H, files_status_bar(shared, reader)),
-    )
+    Dock::new(list_column(shared, reader, scroll_state))
+        .top(HEADER_H + 1.0, header)
+        .bottom(FILES_STATUS_H, files_status_bar(shared, reader))
 }
 
 fn compact_command_button<E, F>(
@@ -14536,7 +14481,9 @@ fn placement_impact_widget(preview: &SifsPlacementPreview, reader: &ThemeReader)
                 .padding(Insets::all(10.0))
                 .theme_when(clone_reader(reader))
                 .fill_width(),
-                FlexItem::flex(1.0).basis(170.0).min_width(150.0),
+                FlexItem::flex(1.0)
+                    .basis_gap_aware_fraction(0.5)
+                    .min_width(150.0),
             )
         },
     );
@@ -17313,15 +17260,12 @@ impl Widget for FilesDialogHost {
     }
 }
 
-/// The files tab: a thin responsive host owning two pre-built pods (wide split / narrow list-only)
-/// and delegating to the one chosen by the available width. The choice is made in `measure`
-/// (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync. Mirrors the
-/// Settings `SettingsView` host.
+/// The files tab's lazy-load boundary. SUI's retained [`ConstraintView`] owns the responsive
+/// wide/narrow branch selection; this wrapper only keeps the important rule that opening SIFS is
+/// deferred until the Files tab is actually measured.
 pub struct FilesView {
     shared: Shared,
-    wide: WidgetPod,
-    narrow: WidgetPod,
-    use_wide: Cell<bool>,
+    child: WidgetPod,
 }
 
 impl FilesView {
@@ -17336,6 +17280,7 @@ impl FilesView {
         let scroll_state = ScrollState::new();
         let places_scroll_state = ScrollState::new();
         let inspector_scroll_state = ScrollState::new();
+        let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         let wide = wide_pod(
             &shared,
             &theme_reader,
@@ -17343,29 +17288,12 @@ impl FilesView {
             &places_scroll_state,
             &inspector_scroll_state,
         );
-        let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         Self {
             shared,
-            wide,
-            narrow,
-            // Default to wide before the first measure.
-            use_wide: Cell::new(true),
-        }
-    }
-
-    fn active(&self) -> &WidgetPod {
-        if self.use_wide.get() {
-            &self.wide
-        } else {
-            &self.narrow
-        }
-    }
-
-    fn active_mut(&mut self) -> &mut WidgetPod {
-        if self.use_wide.get() {
-            &mut self.wide
-        } else {
-            &mut self.narrow
+            child: WidgetPod::new(
+                ConstraintView::new(narrow)
+                    .when(ConstraintQuery::new().min_width(WIDE_THRESHOLD), wide),
+            ),
         }
     }
 }
@@ -17379,34 +17307,27 @@ impl Widget for FilesView {
         if changed {
             self.shared.publish_files_signals();
         }
-        let use_wide = constraints.max.width >= WIDE_THRESHOLD;
-        self.use_wide.set(use_wide);
-        self.active_mut().measure(ctx, constraints)
+        self.child.measure(ctx, constraints)
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.active_mut().arrange(ctx, bounds);
+        self.child.arrange(ctx, bounds);
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
-        self.active().paint(ctx);
+        self.child.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.active().semantics(ctx);
+        self.child.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(self.active());
+        visitor.visit(&self.child);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        // CRITICAL: forward to the active pod so pointer / keyboard / focus reach the controls.
-        if self.use_wide.get() {
-            visitor.visit(&mut self.wide);
-        } else {
-            visitor.visit(&mut self.narrow);
-        }
+        visitor.visit(&mut self.child);
     }
 }
 
@@ -19974,6 +19895,92 @@ mod tests {
                 .count()?,
             1,
             "compact inspector sheet should expose the same preview and recovery surface"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn responsive_files_view_restores_compact_header_identity() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+        }
+        shared.publish_files_signals();
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Retained files breakpoint")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let more = || {
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("More file commands")
+        };
+
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(639.0, 720.0))))?;
+        app.run_until_idle()?;
+        more().expect().to_be_visible()?;
+        let compact_id = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("More file commands")
+            })
+            .expect("compact file command semantics")
+            .id;
+
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(640.0, 720.0))))?;
+        app.run_until_idle()?;
+        let wide_id = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("More file commands")
+            })
+            .expect("wide file command semantics")
+            .id;
+        assert_ne!(
+            wide_id, compact_id,
+            "each retained branch has its own controls"
+        );
+
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(639.0, 720.0))))?;
+        app.run_until_idle()?;
+        more().expect().to_be_visible()?;
+        let restored_id = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("More file commands")
+            })
+            .expect("restored compact file command semantics")
+            .id;
+        assert_eq!(
+            restored_id, compact_id,
+            "returning below the breakpoint should reuse the compact widget tree"
         );
         Ok(())
     }
