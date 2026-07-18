@@ -2695,12 +2695,16 @@ fn publish_dfs_metadata_journal_from_data_dir(
     data_dir: &SinomoDataDir,
 ) -> Result<sinomo_runtime::dfs::DfsMetadataJournalReplicationReport, CliError> {
     let cluster_paths = sinomo_runtime::network::ClusterPaths::new(data_dir);
+    let options = sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions {
+        probe_caught_up_replicas: true,
+        ..sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default()
+    };
     Ok(
         sinomo_runtime::dfs::publish_cluster_dfs_metadata_journal_with_peer_transport(
             data_dir,
             &cluster_paths,
             cli_dfs_peer_transport(),
-            sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default(),
+            options,
         )?,
     )
 }

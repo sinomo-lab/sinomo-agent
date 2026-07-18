@@ -5,14 +5,14 @@
 //! wall-clock nanoseconds, and whether a tombstone still has live metadata
 //! references that make it unsafe to compact.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Included, Unbounded};
 
 use time::OffsetDateTime;
 
 use crate::metadata_keys::{
-    id_lower_bound, normalize_path, object_inode_id, path_record_for_object,
+    dentry_key, id_lower_bound, normalize_path, object_inode_id, path_record_for_object,
 };
-use crate::metadata_object_index::remove_dentry_index_ops;
 use crate::metadata_records::{
     DfsMetadataTableOp, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
 };
@@ -100,15 +100,14 @@ pub(crate) fn plan_tombstone_compaction(
     let mut report = DfsTombstoneCompactionReport::for_options(options);
     let mut compacted_object_ids = Vec::new();
     let mut table_ops = Vec::new();
-    let mut scratch = tables.clone();
-    let candidates = scratch
+    let mut removed_dentries = BTreeSet::new();
+    let mut adjusted_dirfrags = BTreeMap::new();
+
+    for object in tables
         .objects
         .values()
         .filter(|object| object.kind == DfsObjectKind::Tombstone)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    for object in candidates {
+    {
         report.scanned_tombstone_count = report.scanned_tombstone_count.saturating_add(1);
         let age_nanos = now.saturating_sub(object_timestamp_for_retention(&object));
         if age_nanos < options.min_tombstone_age_nanos {
@@ -116,7 +115,7 @@ pub(crate) fn plan_tombstone_compaction(
                 report.retained_young_tombstone_count.saturating_add(1);
             continue;
         }
-        if tombstone_has_live_references(&scratch, &object.object_id) {
+        if tombstone_has_live_references(tables, &object.object_id) {
             report.retained_referenced_tombstone_count =
                 report.retained_referenced_tombstone_count.saturating_add(1);
             continue;
@@ -138,13 +137,31 @@ pub(crate) fn plan_tombstone_compaction(
         }
 
         let path_record = path_record_for_object(&object);
-        let mut dentry_ops = Vec::new();
-        remove_dentry_index_ops(&scratch, &path_record, &mut dentry_ops);
-        for op in dentry_ops {
-            scratch.apply(op.clone());
-            table_ops.push(op);
+        let dentry_key = dentry_key(&path_record);
+        if tables.dentries.contains_key(&dentry_key) && removed_dentries.insert(dentry_key.clone())
+        {
+            table_ops.push(DfsMetadataTableOp::RemoveDentry {
+                parent_inode_id: path_record.parent_inode_id.clone(),
+                dirfrag_id: path_record.dirfrag_id.clone(),
+                name_hash: path_record.name_hash,
+                name: path_record.name.clone(),
+            });
+            let dirfrag_key = (
+                path_record.parent_inode_id.clone(),
+                path_record.dirfrag_id.clone(),
+            );
+            if let Some(dirfrag) = adjusted_dirfrags
+                .entry(dirfrag_key.clone())
+                .or_insert_with(|| tables.dirfrags.get(&dirfrag_key).cloned())
+                .as_mut()
+            {
+                dirfrag.entry_count = dirfrag.entry_count.saturating_sub(1);
+                table_ops.push(DfsMetadataTableOp::PutDirFragment {
+                    dirfrag: dirfrag.clone(),
+                });
+            }
         }
-        if scratch
+        if tables
             .file_system_objects
             .contains_key(&(object.file_system_id.clone(), object.object_id.clone()))
         {
@@ -155,26 +172,23 @@ pub(crate) fn plan_tombstone_compaction(
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
             };
-            scratch.apply(op.clone());
             table_ops.push(op);
         }
-        if scratch.objects.contains_key(&object.object_id) {
+        if tables.objects.contains_key(&object.object_id) {
             report.removed_object_record_count =
                 report.removed_object_record_count.saturating_add(1);
             let op = DfsMetadataTableOp::RemoveObject {
                 object_id: object.object_id.clone(),
             };
-            scratch.apply(op.clone());
             table_ops.push(op);
         }
         let inode_id = object_inode_id(&object.object_id);
-        if scratch.inodes.contains_key(&inode_id) {
+        if tables.inodes.contains_key(&inode_id) {
             report.removed_inode_record_count = report.removed_inode_record_count.saturating_add(1);
             let op = DfsMetadataTableOp::RemoveInode { inode_id };
-            scratch.apply(op.clone());
             table_ops.push(op);
         }
-        if scratch
+        if tables
             .paths
             .contains_key(&(object.file_system_id.clone(), normalize_path(&object.path)))
         {
@@ -184,11 +198,10 @@ pub(crate) fn plan_tombstone_compaction(
         let op = DfsMetadataTableOp::PutCompactedTombstone {
             object: object.clone(),
         };
-        scratch.apply(op.clone());
         table_ops.push(op);
         report.compacted_marker_count = report.compacted_marker_count.saturating_add(1);
         report.compacted_tombstone_count = report.compacted_tombstone_count.saturating_add(1);
-        compacted_object_ids.push(object.object_id);
+        compacted_object_ids.push(object.object_id.clone());
     }
 
     DfsTombstoneCompactionPlan {
@@ -203,7 +216,8 @@ mod tests {
     use super::*;
     use crate::metadata_keys::{dentry_key, object_inode_id, path_record_for_object};
     use crate::metadata_records::{
-        DfsInodeRecord, DfsMetadataTableOp, DfsObjectVersionRecord, DfsTombstoneCompactionOptions,
+        DfsDirFragmentRecord, DfsInodeRecord, DfsMetadataTableOp, DfsObjectVersionRecord,
+        DfsTombstoneCompactionOptions,
     };
     use crate::{DfsFileSystemId, DfsObjectKind, DfsVersion};
     use sinomo_core::DfsObjectPolicy;
@@ -344,5 +358,72 @@ mod tests {
                 .contains_key(&(object.file_system_id.clone(), path_record.path.clone()))
         );
         assert!(compacted.compacted_tombstone_matches(&object));
+    }
+
+    #[test]
+    fn compaction_plan_accumulates_dirfrag_counts_without_cloning_tables() {
+        let first = object();
+        let mut second = object();
+        second.object_id =
+            DfsObjectId::from_legacy_named("obj_tombstone_second").expect("object id");
+        second.path = "/docs/deleted-second.md".to_string();
+        let first_path = path_record_for_object(&first);
+        let second_path = path_record_for_object(&second);
+        assert_eq!(first_path.parent_inode_id, second_path.parent_inode_id);
+        assert_eq!(first_path.dirfrag_id, second_path.dirfrag_id);
+
+        let mut tables = DfsMetadataTables::default();
+        for (object, path_record) in [(&first, &first_path), (&second, &second_path)] {
+            tables.apply(DfsMetadataTableOp::PutObject {
+                object: object.clone(),
+            });
+            tables.apply(DfsMetadataTableOp::PutFileSystemObject {
+                path_record: path_record.clone(),
+            });
+            tables.apply(DfsMetadataTableOp::PutPath {
+                path_record: path_record.clone(),
+            });
+            tables.apply(DfsMetadataTableOp::PutInode {
+                inode: DfsInodeRecord::from(object),
+            });
+            tables.apply(DfsMetadataTableOp::PutDentry {
+                path_record: path_record.clone(),
+            });
+        }
+        tables.apply(DfsMetadataTableOp::PutDirFragment {
+            dirfrag: DfsDirFragmentRecord {
+                file_system_id: first.file_system_id.clone(),
+                dir_inode_id: first_path.parent_inode_id.clone(),
+                dirfrag_id: first_path.dirfrag_id.clone(),
+                hash_start_inclusive: 0,
+                hash_end_exclusive: u64::MAX,
+                entry_count: 2,
+                split_after_count: 1024,
+            },
+        });
+
+        let plan = plan_tombstone_compaction(
+            &tables,
+            &DfsTombstoneCompactionOptions::compact_eligible(Duration::from_nanos(50)),
+            100,
+        );
+        let mut compacted = tables;
+        for op in plan.table_ops {
+            compacted.apply(op);
+        }
+
+        assert_eq!(plan.report.compacted_tombstone_count, 2);
+        assert!(compacted.dentries.is_empty());
+        assert_eq!(
+            compacted
+                .dirfrags
+                .get(&(
+                    first_path.parent_inode_id.clone(),
+                    first_path.dirfrag_id.clone(),
+                ))
+                .expect("dirfrag")
+                .entry_count,
+            0
+        );
     }
 }

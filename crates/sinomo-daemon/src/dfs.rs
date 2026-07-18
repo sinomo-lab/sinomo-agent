@@ -63,6 +63,8 @@ use time::OffsetDateTime;
 const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_PROMOTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
+const DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
 const DAEMON_DFS_MAINTENANCE_LEASE_KEY: &str = "/dfs/runtime/maintenance-lease";
 const DAEMON_DFS_MAINTENANCE_LEASE_TTL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_MAINTENANCE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
@@ -3855,6 +3857,10 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
 fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     let mut options = DfsMaintenanceTickOptions::default();
     options.repair_max_jobs = DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK;
+    options.lifecycle.compact_tombstones = true;
+    options.lifecycle.tombstone_compaction_min_age = DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE;
+    options.lifecycle.tombstone_compaction_max_records =
+        DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS;
     options.metadata_replication = daemon_dfs_metadata_replication_options();
     options
 }
@@ -3864,6 +3870,7 @@ fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOpt
         max_batches_per_target: DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
         attempt_timeout: DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT,
         target_timeout: DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT,
+        probe_caught_up_replicas: true,
         ..DfsMetadataJournalReplicationOptions::default()
     }
 }
@@ -5197,6 +5204,23 @@ mod tests {
             daemon_dfs_maintenance_tick_options().repair_max_jobs,
             DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK
         );
+        assert!(
+            daemon_dfs_maintenance_tick_options()
+                .lifecycle
+                .compact_tombstones
+        );
+        assert_eq!(
+            daemon_dfs_maintenance_tick_options()
+                .lifecycle
+                .tombstone_compaction_min_age,
+            DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE
+        );
+        assert_eq!(
+            daemon_dfs_maintenance_tick_options()
+                .lifecycle
+                .tombstone_compaction_max_records,
+            DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS
+        );
         assert_eq!(
             daemon_dfs_metadata_replication_options().attempt_timeout,
             DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT
@@ -5205,6 +5229,7 @@ mod tests {
             daemon_dfs_metadata_replication_options().target_timeout,
             DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT
         );
+        assert!(daemon_dfs_metadata_replication_options().probe_caught_up_replicas);
         assert_eq!(
             daemon_dfs_metadata_publish_schedule_options().max_retry_rounds,
             DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS

@@ -349,6 +349,7 @@ impl VfsBackend for DaemonSifsVfsBackend {
             sinomo_api::DAEMON_DFS_BROWSER_STAT_ROUTE,
             &sinomo_api::DaemonDfsBrowserStatRequest {
                 path: path.to_string(),
+                max_staleness_millis: 0,
             },
         )?;
         Ok(VfsMetadata {
