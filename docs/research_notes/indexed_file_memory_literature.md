@@ -101,6 +101,12 @@ file anchors, embeddings, relation edges, and model-derived metadata.
 This also argues against making the relation graph the only durable memory. The
 file remains auditable, portable, and re-indexable; the graph is an access layer.
 
+The focused follow-up note
+[Semantic Filesystem Catalogs for Indexed Memory](semantic_filesystem_catalogs_for_indexed_memory.md)
+compares filesystem-integrated, sidecar, and hybrid catalog designs and proposes
+the low-level DFS catalog, logical change feed, and exact-revision boundary for
+Sinomo.
+
 ### Haystack and Semex
 
 [Haystack](https://ceur-ws.org/Vol-55/huynh.pdf) modeled personal information

@@ -6,6 +6,7 @@ contracts.
 
 - [Channel and multi-agent benchmarks](channel_multi_agent_benchmark_literature.md)
 - [Indexed file memory](indexed_file_memory_literature.md)
+- [Semantic filesystem catalogs for indexed memory](semantic_filesystem_catalogs_for_indexed_memory.md)
 - [Real-time multimodal agents](literature_realtime_multimodal_agents.md)
 - [Long-horizon streaming agents](long_horizon_streaming_agent_lit.md)
 - [Real-time computer use and gaming](realtime_computer_use_gaming_options.md)

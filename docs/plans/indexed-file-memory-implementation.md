@@ -13,11 +13,12 @@ traces, and inject that evidence into agent context. Overlay append/replay is
 immutable, recoverable, authenticated, and snapshot-pinned. The cross-ring
 extension ABI is available. Legacy record compatibility is deliberately
 excluded: the indexed-file system neither reads nor dual-writes the old record
-store. Phases 2 through 6 below remain the ordered follow-up for automatic
-maintenance, richer formats and relations, optional providers, federation,
-and file-first writes. Extension invocation and host-side resource enforcement
-are not active in this slice; declarations whose route cannot already be
-proven are rejected at registration.
+store. The scale-hardening requirements below define the storage and serving
+shape used by Phases 2 through 5. Phases 2 through 6 remain the ordered
+follow-up for automatic maintenance, richer formats and relations, optional
+providers, federation, and file-first writes. Extension invocation and
+host-side resource enforcement are not active in this slice; declarations
+whose route cannot already be proven are rejected at registration.
 
 The target design is defined by the
 [memory architecture](../memory-architecture.md). This plan sequences delivery
@@ -243,9 +244,423 @@ Verification gates:
   enumeration;
 - evidence-only context assembly remains deterministic and byte-bounded.
 
-Expected outcome: a user can index a large text/structured root, modify one
-file, publish a replacement generation manually, and retrieve source-backed
-evidence efficiently.
+Expected outcome: a user can index a representative bounded text/structured
+root, modify one file, publish a replacement generation manually, and retrieve
+source-backed evidence through the final contracts. This phase proves the
+correctness path, not final large-root efficiency.
+
+## Scale-Efficient Storage and Serving Shape
+
+Phase 1 is a correctness baseline, not the intended storage shape for roots
+with very large files or millions of files. Its bounded APIs, immutable
+generations, policy checks, authenticated continuations, and evidence contracts
+remain useful. The per-source catalog files, whole-file snapshots, per-file
+partitions, and per-file router publication do not.
+
+This section constrains work across later phases rather than adding a separate
+phase. Ordered catalog, streaming source, segment, and maintenance foundations
+belong in [Phase 2](#phase-2-automatic-maintenance-and-workspaces); the
+distributed pieces constrain [Phase 5](#phase-5-placement-and-federation).
+The owning architecture sections remain
+[Partitions](../memory-architecture.md#partitions),
+[Automatic Maintenance](../memory-architecture.md#automatic-maintenance),
+[Physical Storage](../memory-architecture.md#physical-storage), and
+[Retrieval Architecture](../memory-architecture.md#retrieval-architecture).
+
+Scale hardening keeps the architecture's authority model unchanged:
+
+- files and overlay operations remain authoritative;
+- `MemoryFileVersion` and `MemoryAnchor` remain the evidence identities;
+- chunks, catalogs, jobs, segments, routers, and provider databases are
+  rebuildable node-local derived state;
+- policy gates candidate generation and is rechecked before materialization;
+- deletion and policy restriction fence serving immediately rather than
+  waiting for compaction;
+- queries pin coherent generations and report complete, approximate, or
+  budget-truncated coverage honestly.
+
+The target flow is:
+
+```text
+source files / DFS versions
+  -> ordered catalog and durable change journal
+  -> verified bounded readers and content-addressed chunk derivations
+  -> immutable multi-file index segments
+  -> compact term/range-to-partition routing
+  -> ranked anchor candidates
+  -> range-materialized evidence bundle
+```
+
+### Current First-Slice Scaling Gaps
+
+The following implementation choices must be replaced before claiming
+million-file scale or processing files larger than memory under explicit
+resource budgets:
+
+| Area | First-slice behavior | Required scale shape |
+|---|---|---|
+| Catalog pagination | `bounded_ids` walks a flat directory and sorts candidates again for every page | Ordered packed catalog with manifest-pinned keyset cursors |
+| Reconciliation | Metadata-unchanged files are still opened, read, and hashed | Change-driven scheduling plus metadata reconciliation and periodic integrity scrubs |
+| Source acquisition | One `VerifiedSourceSnapshot` owns the complete file bytes | Verified streaming/range reader with bounded buffers |
+| Extraction generation | One generation serializes every anchor and term for one file | Content-addressed chunk outputs and bounded immutable segment files |
+| Partitioning | One source file is one serving partition | Stable policy-domain shards containing many source/chunk documents |
+| Routing publication | Every file change rewrites term-to-file postings and publishes a router manifest | Term-to-coarse-partition routing, batched publication, and partition-local postings |
+| Retrieval | Candidate partitions load all anchors and reread whole source files | Postings-first top-k selection followed by selected-range materialization |
+| Evidence packing | The growing bundle is cloned and serialized for every candidate | Incremental accounting and one final serialization |
+| Concurrency | A store-wide writer lock covers scans, hashing, extraction, and publication | Work outside locks plus short per-root/partition compare-and-publish commits |
+| Lifecycle | Immutable generations and router pages have no bounded reclamation lease | Expiring snapshot leases, compaction, and reachable-manifest garbage collection |
+
+For example, with one million catalog objects and a 64-object page, rescanning
+the complete unordered directory for every page can require roughly 15.6
+billion directory-entry visits for one sweep.
+
+Page-size and source-size constants do not repair these asymptotic paths.
+Increasing a whole-file limit can instead increase peak memory and query I/O.
+
+### Ordered Packed Catalog
+
+The source catalog needs an ordered embedded representation rather than one
+filesystem object per source. A catalog page pins a catalog manifest and uses
+a cursor equivalent to `(shard, last_key)`. Page work must be proportional to
+the requested page plus index height, not to the total number of sources.
+
+The logical source row contains at least:
+
+- root and stable source identity;
+- current locator aliases and connector version hints;
+- byte length, media type, timestamps, workspace facets, and placement;
+- policy and scope derivation epochs;
+- desired and currently published pipeline generations;
+- catalog status plus searchable, enriched, pending, failed, and stale status
+  per index family and pipeline, and source tombstone status.
+
+The physical implementation may initially use an embedded ordered database,
+such as SQLite in WAL mode with key-oriented tables, or a custom paged
+SOBJ/LSM catalog. That choice is private to `sinomo-memory`: it is replaceable
+derived state and cannot become a public API or authority.
+
+Reconciliation writes an ordered observed-identity run and merge-diffs it
+against the previously committed catalog generation. A deletion becomes
+visible only when the complete pass commits. This avoids both false deletion
+after an interrupted walk and rewriting every unchanged row merely to update a
+scan marker.
+
+For connectors without atomic scans:
+
+1. start or buffer watcher/change hints;
+2. perform the bounded catalog walk with a durable directory checkpoint;
+3. replay changes after the starting watermark;
+4. repeat until the catalog and feed converge;
+5. atomically publish the completed catalog generation and feed checkpoint.
+
+OS directory handles are process-local implementation details, not durable
+continuations. A restart resumes from completed directory/key checkpoints and
+may safely replay the last incomplete directory.
+
+Normal reconciliation compares connector identity and version metadata; it
+does not parse or hash every unchanged file. Exact content publication still
+requires a verified version. Periodic low-priority scrubs detect same-size or
+same-time mutations that weak local metadata could miss.
+
+### Bounded Source Readers and Chunk Manifests
+
+Whole-file ownership should be replaced by a private connector interface with
+the semantics of:
+
+```text
+VerifiedSourceReader {
+  source_version
+  retention_capability
+  verify_identity_before_read()
+  read_range(offset, max_bytes)
+  stream_chunks(chunk_policy, byte_budget)
+  verify_identity_after_read()
+  establish_content_hash_before_publish()
+}
+```
+
+The reader pins an immutable SIFS version or a verified current-only local
+lease and never requires one allocation proportional to file size. Extractors
+consume bounded buffers and may spill sorted output runs to staging storage.
+
+Chunk boundaries are extractor-owned when the format has useful structure:
+
+- Markdown headings, paragraphs, and bounded line groups;
+- source-code declarations or syntax regions;
+- JSON/JSONL records and bounded structured subtrees;
+- PDF pages;
+- image tiles or regions;
+- audio/video scenes and time windows;
+- content-defined chunks as the fallback for unstructured streams.
+
+Every chunk carries its source range, content hash, extractor-owned boundary
+identity, and `pipeline_fingerprint`. A version manifest references immutable
+derived chunk outputs; indexing does not automatically retain a copy of all
+source bytes. Reusable content-only extraction is keyed by chunk content hash
+and pipeline fingerprint. Any reuse across source versions or aliases is
+rebound to new exact-version anchors and facts and reauthorized for that
+`MemoryFileVersion`. Path, scope, workspace, policy, and placement projections
+remain per file even when two files contain identical bytes.
+
+Chunks are derived processing units, not source identities. Exact evidence
+still cites the `MemoryFileVersion` and bounded source anchor. Long records or
+lines must be split into bounded anchors so one pathological record cannot
+make a continuation permanently unable to deliver progress.
+
+An edit affecting a small portion of a file should cause approximately that
+portion to be re-extracted and republished when chunk identity proves reuse.
+It does not always imply equally small source I/O: a current-only local
+connector without authoritative block hashes or changed-range information may
+still need to stream the complete file to verify its new content. SIFS range
+reads avoid that full read only when paired with authoritative chunk manifests,
+change extents, or a format index that proves the changed ranges; range access
+alone does not discover new chunk boundaries.
+
+### Multi-File Immutable Serving Segments
+
+An `IndexPartition` remains derived from root, policy domain, and a stable
+shard key. Workspace may influence routing and placement, but mutable
+workspace membership must not destabilize content identity. A partition owns
+many source or chunk documents rather than exactly one file.
+
+Updates append bounded immutable delta segments containing query-oriented
+state such as:
+
+- a compact term dictionary;
+- compressed term-to-document/anchor postings and optional positions;
+- source, chunk, and anchor ordinal tables;
+- metadata/time columns and range handles;
+- tombstones, generation metadata, and score/block statistics.
+
+The partition manifest atomically selects a complete set of segments. Small
+updates publish delta segments; background LSM-style compaction merges them
+according to measured segment count, tombstone ratio, read amplification, and
+bytes. Segment sizes and compaction thresholds belong in versioned benchmark
+presets, not architecture constants.
+
+A physical segment may pack facts from many logical per-source and
+per-pipeline `IndexGeneration`s. Publication and query selection still expose
+exactly one complete successful generation for every active pipeline; segment
+packing and compaction cannot weaken generation atomicity.
+
+GC roots include current and retained serving manifests, bounded query/export
+or remote-serving leases, active job/staging leases, and policy-retained audit
+or snapshot references. A mark-and-sweep pass deletes objects outside those
+roots; abandoned staging becomes collectible only after its attempt is
+terminal or its lease expires. Compaction is never the security boundary: a
+current policy/deletion fence excludes stale postings immediately.
+
+SOBJ remains the portable contract and manifest/segment envelope. A provider
+may store specialized internal dictionaries and postings, but it must preserve
+atomic publication, provenance, bounded cursors, rebuild, and export/import
+compatibility.
+
+### Coarse Routing and Batched Publication
+
+The global lexical router maps a term to policy-domain partition ids, not to
+every file generation. Routing data does not grant access: authorization
+selects which policy domains and router pages a query may inspect, and routing
+summaries remain access-controlled so term or partition existence cannot leak.
+Exact document and anchor postings live inside the partition. The router does
+not duplicate a current generation id or full root policy in every posting;
+the pinned partition-generation table supplies that state.
+
+A normal source change therefore appends a partition delta and swaps the
+partition manifest. The global router changes only when a term first appears
+or finally disappears from that partition. A maintenance commit batches these
+term-boundary changes and publishes one router generation rather than one
+generation per source.
+
+Catalog, router, and partition publication are paired by one atomically
+published top-level serving snapshot. A new partition generation that changes
+term boundaries cannot coexist with an older router still claiming complete
+coverage. If publication is staged across multiple durable steps, the router
+is marked incomplete and exhaustive paged fallback remains required until the
+matching serving snapshot commits. Crash recovery never exposes a complete
+router with unmatched partition manifests.
+
+Scope, policy domain, time, and explicit source or workspace filters route
+before lexical candidate work. Active-workspace focus without an explicit
+filter is a relevance prior and cannot silently prune other eligible
+partitions. Policy-domain separation prevents denied postings from consuming
+query budgets or exposing hidden-corpus volume. Unconstrained authorized
+enumeration uses the ordered catalog rather than a synthetic all-files term
+posting.
+
+If a router is incomplete, exhaustive search pages eligible partition
+manifests and returns a continuation. It never reports complete coverage after
+searching only a convenient fixed subset.
+
+### Postings-First Retrieval and Late Materialization
+
+Retrieval selects anchor candidates before reading source evidence:
+
+1. pin catalog, router, policy, and partition generations;
+2. authorize and select eligible partitions;
+3. choose selective terms and intersect or advance posting lists;
+4. use a bounded top-k algorithm such as DAAT/WAND or Block-Max WAND;
+5. apply stable score features, contextual priors, deduplication, and
+   diversification;
+6. reauthorize the selected source versions;
+7. batch and range-read only selected anchors;
+8. pack and serialize the evidence bundle once.
+
+Posting encodings may use delta/bit-packed ordinals or bitmaps according to
+density. Ranking may use BM25-style statistics, but the public contract carries
+stable feature/reason data rather than provider-specific scores alone.
+
+Continuation state pins the query snapshot and contains bounded per-provider
+or per-partition cursors. Work allocation is query-plan-aware: dividing one
+global scan budget equally across every term is not sufficient for selective
+intersection or a very common term.
+
+Evidence packing maintains a source-id-to-bundle-slot map and exact incremental
+encoded-byte accounting, or a conservative upper bound followed by
+deterministic hard-limit enforcement. It does not clone and serialize every
+prefix of the bundle, cannot emit an oversized result, and serializes the final
+bundle once. Final materialization and tracing remain bounded independently.
+
+### Scale-Specific Maintenance Requirements
+
+[Phase 2](#phase-2-automatic-maintenance-and-workspaces) owns checkpoint,
+watcher, job-recovery, policy-fence, and workspace semantics. The scale-specific
+requirements are coalesced desired state, short publication locks, byte-based
+backpressure, and packed lifecycle storage.
+
+Maintenance keeps a compact desired-state record keyed by source and pipeline
+plus immutable execution attempts. The idempotency key is equivalent to:
+
+```text
+(root_id, source_id, source_version_id, pipeline_fingerprint, stage)
+```
+
+A newer version supersedes queued work for an older version. Deletion and
+policy restrictions outrank all extraction work and install serving fences
+immediately. At-least-once execution is safe because generation identity and
+compare-and-publish validation are deterministic.
+
+Job leases carry owner, lease epoch, expiry, heartbeat, and cancellation.
+Publication succeeds only if the desired source version, pipeline, lease, and
+current policy epoch still match. Scanning, source verification, extraction,
+and segment construction occur outside serving locks; publication uses short
+per-root or per-partition manifest commits.
+
+Backpressure is byte- and resource-based, not only job-count-based:
+
+- source-read, output, staging, memory, accelerator, and temporary-byte
+  budgets;
+- open-handle and per-extractor concurrency limits;
+- weighted fairness between roots and active workspaces;
+- separate immediate-fence, interactive lexical, reconciliation, enrichment,
+  and compaction lanes;
+- high-water behavior that pauses enrichment first and coalesces changes to
+  the newest desired version;
+- a durable `reconciliation_required` state when a feed overruns rather than
+  silently dropping correctness-relevant work.
+
+Derived traces use rotated append segments, bounded pages, and group commit
+where durability permits. Authoritative overlay operations retain the
+architecture's immutable one-operation objects or independently fenced
+per-writer streams. Group commit may batch durable acknowledgement, but an
+overlay operation is never acknowledged before its local or DFS durability
+contract is satisfied, and it never relies on concurrent append to one shared
+file.
+
+### Distributed Summaries and Candidate-First Federation
+
+[Phase 5](#phase-5-placement-and-federation) owns placement, offline leases,
+snapshot transfer, and federation semantics. The scale-specific serving shape
+is hierarchical routing followed by candidate-first remote retrieval.
+
+Cluster KV contains only compact service advertisements, capabilities, policy
+epochs, coarse root/partition groups, resource state, and a digest/pointer to a
+content-addressed routing summary. It never contains source catalog rows,
+terms, postings, jobs, or per-file placement state.
+
+Federated routing is hierarchical:
+
+```text
+service discovery
+  -> authorized nodes by scope, capability, locality, and policy
+  -> pinned node routing-summary generation
+  -> node-local exact router
+  -> partition segments
+```
+
+Queries search local partitions first and then bounded remote waves. Each node
+reauthorizes before returning candidate ids, scores, counts, omissions, or
+other metadata. Authorized responses carry compact candidate ids, feature
+components, freshness, coverage, and authenticated continuations. The
+coordinator performs deterministic rank fusion and deduplication before asking
+the owning nodes to reauthorize and materialize the final evidence. Sensitive
+or large content may remain behind an opaque handle and the second
+authorization check.
+
+Bloom-like summaries may eliminate obvious remote misses only when their
+pinned generation declares the relevant coverage complete. A stale,
+unavailable, or fanout-truncated node reports incomplete coverage rather than
+an empty result.
+
+### Provider Spike Direction
+
+Within the replaceable-provider boundary defined by
+[Physical Storage](../memory-architecture.md#physical-storage), the initial
+scale benchmark should compare a split such as:
+
+- an embedded ordered store, with SQLite as one candidate, for catalog, jobs,
+  checkpoints, desired state, and leases;
+- a Tantivy-like embedded provider or custom immutable segments for lexical
+  dictionaries, postings, and top-k retrieval;
+- SOBJ for public contracts, durable manifests, portable metadata, and
+  snapshot/export envelopes;
+- optional graph and vector providers added behind the same generation and
+  policy contracts.
+
+No provider is a source of truth, mandatory external service, or exposed
+storage API. Provider loss triggers rebuild or compatible snapshot import from
+authorized sources and overlays. Final selections remain tracked in
+[Implementation Choices Still Requiring Spikes](#implementation-choices-still-requiring-spikes).
+
+### Delivery Order and Scale Gates
+
+Implement scale hardening in this order:
+
+1. ordered packed catalog, durable catalog cursors, and complete-scan deletion
+   semantics;
+2. durable change/checkpoint journal and coalesced desired-state scheduler;
+3. verified streaming/range readers and content-addressed format-chunk
+   derivations/manifests;
+4. multi-file immutable delta segments and batched partition/router
+   publication;
+5. postings-first top-k retrieval and selected-range evidence materialization;
+6. compaction, snapshot leases, garbage collection, and byte-based
+   backpressure;
+7. read-only federated candidates and explicit coverage reporting;
+8. derived segment placement, snapshot replication, and advanced providers.
+
+Scale acceptance uses operation counters in addition to wall-clock numbers:
+
+- a catalog page examines work proportional to the page plus index height;
+- a complete unchanged reconciliation reads approximately zero source content
+  bytes during its normal path;
+- peak indexing resident memory is independent of the largest permitted source
+  through streaming and spill;
+- one source update rewrites no global corpus and causes write amplification
+  proportional to changed chunks and changed partition terms plus index
+  height, not total corpus size;
+- for retained range-addressable sources, query source bytes are proportional
+  to selected anchor evidence rather than candidate-file sizes; current-only
+  local verification bytes are reported separately and remain streamed;
+- index inode count grows with packed catalogs and segments, not with
+  files multiplied by terms or revisions;
+- interrupted scans cannot tombstone unseen live files;
+- policy restriction and deletion fence serving before cleanup;
+- query and compaction can run concurrently without mixing generations;
+- unreachable generations are reclaimed after bounded continuation/export
+  leases expire.
+
+The workload matrix and measured counters live in
+[Benchmark and Readiness Work](#benchmark-and-readiness-work).
 
 ## Phase 2: Automatic Maintenance and Workspaces
 
@@ -466,15 +881,27 @@ Create versioned benchmark presets rather than embedding hardware-specific
 numbers in architecture. At minimum measure:
 
 - cold/warm startup work versus file/fact count;
-- catalog throughput and resident memory on deep and wide trees;
-- single-file update write amplification;
-- lexical query latency and bytes read by partition count;
+- catalog throughput, entries examined per page, and resident memory on deep
+  and wide trees;
+- unchanged-reconciliation source bytes read and hashed;
+- localized large-file update extraction, segment, and router write
+  amplification;
+- lexical query latency, segment fanout, source bytes read, and evidence bytes
+  returned by partition count;
 - change-to-searchable lag under burst and continuous load;
-- compaction debt and query behavior during compaction;
+- index inode growth, publication lock time, router page rewrites, compaction
+  debt, and query behavior during compaction;
 - workspace detection accuracy and bounded probing;
 - graph path recall/cost, vector recall/cost, and multimodal anchor accuracy;
 - source-reference coverage, policy leakage, stale-hit rate, and context bytes;
 - agent task quality, citations, abstention, and cache churn.
+
+Presets must cover at least millions of tiny files, deep and wide trees, a very
+large source with a localized edit, burst and continuous changes, an extremely
+common term, cold restart, crash during reconciliation, query during
+compaction, and policy restriction during remote retrieval. Record the
+coverage state for every query workload rather than treating missing or timed
+out providers as empty results.
 
 Extend `modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py` so some
 cases exercise real file candidate generation rather than only preselected
@@ -484,7 +911,8 @@ Rust gates.
 ## Implementation Choices Still Requiring Spikes
 
 These choices do not alter the architectural contracts and should be decided
-with Phase 1 benchmarks:
+with the scale-hardening benchmark presets before a backend becomes the
+default:
 
 - custom SOBJ term/posting segments versus an embedded lexical engine;
 - local watcher implementation and platform-specific identity quality;

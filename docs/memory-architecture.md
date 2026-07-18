@@ -299,6 +299,11 @@ Partition rules are load-bearing:
   bounded work is achieved through paging and continuations, not silent
   partition omission.
 
+The concrete transition from the first per-file implementation slice to an
+ordered catalog, chunked extraction, multi-file immutable segments, coarse
+routing, and postings-first retrieval is sequenced in
+[Scale-Efficient Storage and Serving Shape](plans/indexed-file-memory-implementation.md#scale-efficient-storage-and-serving-shape).
+
 ## Automatic Index Model
 
 ### Generations and Pipeline Identity
