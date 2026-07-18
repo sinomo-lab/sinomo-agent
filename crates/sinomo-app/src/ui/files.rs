@@ -5508,6 +5508,15 @@ fn files_worker_loop(
             .unwrap_or_else(|| "SIFS browsing requires a daemon connection".to_string())
     });
     while let Ok(command) = command_rx.recv() {
+        // A daemon-backed browser is only an address plus a runtime handle. Opening it can fail
+        // transiently when Files/chat traffic saturates the browser route or owns the daemon's
+        // SIFS service lock. Keep the error for this command, but let the next interaction
+        // reconnect naturally.
+        clear_files_worker_transient_open_error(
+            browser.as_ref(),
+            daemon_address.as_deref(),
+            &mut open_error,
+        );
         match command {
             FilesWorkerCommand::List {
                 request_id,
@@ -6175,6 +6184,16 @@ fn ensure_files_worker_browser(
             Err(error) => *open_error = Some(error),
         },
         None => *open_error = Some("SIFS browsing requires a daemon connection".to_string()),
+    }
+}
+
+fn clear_files_worker_transient_open_error(
+    browser: Option<&SifsBrowser>,
+    daemon_address: Option<&str>,
+    open_error: &mut Option<String>,
+) {
+    if browser.is_none() && daemon_address.is_some() {
+        *open_error = None;
     }
 }
 
@@ -22838,6 +22857,21 @@ mod tests {
         assert_eq!(state.node_id, "");
         assert_eq!(state.path, "/services");
         assert!(!state.inspector_details_open);
+    }
+
+    #[test]
+    fn daemon_backed_files_worker_retries_a_transient_open_failure() {
+        let mut open_error =
+            Some("DFS browser service is busy after waiting 100ms; retry the read".to_string());
+        clear_files_worker_transient_open_error(None, Some("127.0.0.1:21353"), &mut open_error);
+        assert_eq!(open_error, None);
+
+        let mut unavailable = Some("SIFS browsing requires a daemon connection".to_string());
+        clear_files_worker_transient_open_error(None, None, &mut unavailable);
+        assert_eq!(
+            unavailable.as_deref(),
+            Some("SIFS browsing requires a daemon connection")
+        );
     }
 
     #[test]
