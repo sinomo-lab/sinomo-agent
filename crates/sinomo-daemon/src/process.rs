@@ -14,6 +14,24 @@ use std::time::{Duration, Instant};
 
 pub const SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS: &[&str] = &["daemon", "__complete-shadow-rollout"];
 
+/// Resource shape for a daemon runtime. This is intentionally separate from
+/// [`DaemonRunOptions`], which describes the network-visible listener and is
+/// persisted in daemon status files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DaemonExecutionProfile {
+    /// Normal workstation/server daemon sizing.
+    #[default]
+    Standard,
+    /// Lean embedded runtime for battery- and memory-constrained mobile apps.
+    Mobile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DaemonRuntimeLimits {
+    worker_threads: usize,
+    max_blocking_threads: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CandidateMainDiagnostics {
     pub stdout_log: PathBuf,
@@ -63,16 +81,42 @@ pub(crate) fn prepare_noninteractive_command(command: &mut Command) {
 pub(crate) fn build_daemon_async_runtime(
     label: &str,
 ) -> Result<tokio::runtime::Runtime, DaemonError> {
-    let worker_threads = daemon_async_runtime_worker_threads();
-    tokio::runtime::Builder::new_multi_thread()
+    build_daemon_async_runtime_with_profile(label, DaemonExecutionProfile::Standard)
+}
+
+pub(crate) fn build_daemon_async_runtime_with_profile(
+    label: &str,
+    profile: DaemonExecutionProfile,
+) -> Result<tokio::runtime::Runtime, DaemonError> {
+    let limits = daemon_async_runtime_limits(profile);
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .thread_name(format!("sinomo-{label}-async"))
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonError::Io {
-            path: format!("build sinomo {label} async runtime"),
-            detail: source.to_string(),
-        })
+        .worker_threads(limits.worker_threads)
+        .enable_all();
+    if let Some(max_blocking_threads) = limits.max_blocking_threads {
+        builder.max_blocking_threads(max_blocking_threads);
+    }
+    builder.build().map_err(|source| DaemonError::Io {
+        path: format!("build sinomo {label} async runtime"),
+        detail: source.to_string(),
+    })
+}
+
+fn daemon_async_runtime_limits(profile: DaemonExecutionProfile) -> DaemonRuntimeLimits {
+    match profile {
+        DaemonExecutionProfile::Standard => DaemonRuntimeLimits {
+            worker_threads: daemon_async_runtime_worker_threads(),
+            // Preserve Tokio's existing desktop/server blocking-pool default.
+            max_blocking_threads: None,
+        },
+        DaemonExecutionProfile::Mobile => DaemonRuntimeLimits {
+            worker_threads: 2,
+            // The default Tokio blocking pool may grow to hundreds of threads.
+            // Mobile work is expected to queue behind a small bounded pool.
+            max_blocking_threads: Some(8),
+        },
+    }
 }
 
 fn daemon_async_runtime_worker_threads() -> usize {
@@ -511,5 +555,26 @@ mod tests {
         let shadow = test_binary_path(&root, "sinomo-shadow");
 
         assert_eq!(daemon_main_binary_for_shadow_start(&shadow), main);
+    }
+
+    #[test]
+    fn mobile_execution_profile_has_bounded_runtime_threads() {
+        assert_eq!(
+            daemon_async_runtime_limits(DaemonExecutionProfile::Mobile),
+            DaemonRuntimeLimits {
+                worker_threads: 2,
+                max_blocking_threads: Some(8),
+            }
+        );
+    }
+
+    #[test]
+    fn mobile_execution_profile_builds_a_two_worker_runtime() {
+        let runtime = build_daemon_async_runtime_with_profile(
+            "mobile-profile-test",
+            DaemonExecutionProfile::Mobile,
+        )
+        .expect("mobile runtime");
+        assert_eq!(runtime.metrics().num_workers(), 2);
     }
 }

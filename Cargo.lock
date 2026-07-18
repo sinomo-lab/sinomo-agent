@@ -8349,8 +8349,10 @@ dependencies = [
 name = "sinomo-app"
 version = "0.1.0"
 dependencies = [
+ "android-build",
  "blake3",
  "jni 0.22.4",
+ "netwatcher",
  "pulldown-cmark 0.13.4",
  "rfd",
  "serde",

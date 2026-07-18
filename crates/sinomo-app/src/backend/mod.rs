@@ -23,27 +23,66 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sinomo_runtime::api::{
-    DaemonApiClient, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
-    DaemonStatus, RemoteConfigClient, probe_daemon_status, probe_daemon_status_at_address,
+    DaemonApiClient, DaemonApiError, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus,
+    DaemonRunOptions, DaemonStatus, RemoteConfigClient, probe_daemon_status,
+    probe_daemon_status_at_address,
 };
-use sinomo_runtime::cluster::ClusterControlInitRequest;
+use sinomo_runtime::cluster::{
+    CLUSTER_CONTROL_ROLE_ROUTE, ClusterControlInitRequest, ClusterControlRoleRequest,
+};
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
+use sinomo_runtime::core::ClusterNodeRole;
 use sinomo_runtime::daemon::{
-    DaemonClusterProcess, DaemonServiceRegistryHook, daemon_cluster_status,
-    run_daemon_control_loop_with_services,
+    DaemonClusterProcess, DaemonExecutionProfile, DaemonServiceRegistryHook, daemon_cluster_status,
+    run_daemon_control_loop_with_services_and_profile,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ClusterPaths;
-use sinomo_runtime::node::NodeProfile;
+use sinomo_runtime::node::{NodeId, NodeProfile};
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
-/// Timeout for config RPCs to a connected daemon.
+/// Timeout for bounded startup/config RPCs to a connected daemon.
 const DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for an app-started in-process daemon to bind and publish its status.
 const IN_PROCESS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cluster initialization replaces the identity captured by foundational daemon services. Give
 /// the old embedded daemon time to drain before binding its replacement to the same address.
 const IN_PROCESS_DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// A legacy Android node only needs this migration once. Keep transient retries
+/// bounded and sparse so a disconnected phone does not turn compatibility work
+/// into an unbounded background wake source.
+const MOBILE_ROLE_MIGRATION_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(5 * 60),
+];
+
+/// Android nodes opt into the cluster's mobile maintenance cadence at their
+/// first typed init/join transaction. Other app targets omit the field and
+/// retain the control API's workstation default.
+pub(crate) fn app_requested_cluster_node_role() -> Option<ClusterNodeRole> {
+    #[cfg(target_os = "android")]
+    {
+        Some(ClusterNodeRole::Mobile)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
+
+fn embedded_daemon_execution_profile() -> DaemonExecutionProfile {
+    #[cfg(target_os = "android")]
+    {
+        DaemonExecutionProfile::Mobile
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        DaemonExecutionProfile::Standard
+    }
+}
 
 /// Owns the thread running an app-started in-process daemon, keeping it alive for the lifetime
 /// of the [`Backend`]. The OS reclaims the thread on process exit; a clean shutdown RPC is a
@@ -191,6 +230,7 @@ impl Backend {
                 }
             }
         }
+        reconcile_android_cluster_node_role(&connection, data_dir.as_ref());
         progress("Preparing configuration…");
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
 
@@ -337,6 +377,196 @@ impl Backend {
     /// Whether the runtime is healthy enough to talk to.
     pub fn is_online(&self) -> bool {
         true
+    }
+}
+
+/// Produces the idempotent role update used to migrate Android nodes that were
+/// initialized before cluster init/join accepted a typed node role. Supplying
+/// no requested role short-circuits before inspecting cluster state, keeping
+/// non-Android app startup unchanged.
+fn app_cluster_node_role_migration_request(
+    status: &sinomo_cli::app_api::AppClusterStatus,
+    requested_role: Option<ClusterNodeRole>,
+) -> Result<Option<ClusterControlRoleRequest>, String> {
+    let Some(role) = requested_role else {
+        return Ok(None);
+    };
+    if !status.clustered {
+        return Ok(None);
+    }
+    let node_id = status
+        .local_node_id
+        .as_deref()
+        .ok_or_else(|| "cluster status omitted the local node id".to_string())?
+        .parse::<NodeId>()
+        .map_err(|error| format!("cluster status has an invalid local node id: {error}"))?;
+    Ok(Some(ClusterControlRoleRequest { node_id, role }))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MobileRoleMigrationFailureOutcome {
+    RetryAfter(Duration),
+    Exhausted,
+    Unsupported,
+    Permanent,
+}
+
+fn mobile_role_migration_failure_outcome(
+    error: &DaemonApiError,
+    failed_attempt_index: usize,
+) -> MobileRoleMigrationFailureOutcome {
+    if mobile_role_migration_route_is_unsupported(error) {
+        return MobileRoleMigrationFailureOutcome::Unsupported;
+    }
+    if matches!(
+        error,
+        DaemonApiError::Network { address, .. } if address == CLUSTER_CONTROL_ROLE_ROUTE
+    ) {
+        // An RPC error response uses the request route as its address. It is a
+        // semantic rejection, not a transport failure that backoff can heal.
+        return MobileRoleMigrationFailureOutcome::Permanent;
+    }
+
+    let retryable = matches!(
+        error,
+        DaemonApiError::Network { .. }
+            | DaemonApiError::NetworkDelivery { .. }
+            | DaemonApiError::ForwardNetwork { .. }
+            | DaemonApiError::NotRunning { .. }
+            | DaemonApiError::ClusterOrphan
+            | DaemonApiError::ClusterReadOnly { .. }
+    );
+    if !retryable {
+        return MobileRoleMigrationFailureOutcome::Permanent;
+    }
+
+    MOBILE_ROLE_MIGRATION_RETRY_DELAYS
+        .get(failed_attempt_index)
+        .copied()
+        .map(MobileRoleMigrationFailureOutcome::RetryAfter)
+        .unwrap_or(MobileRoleMigrationFailureOutcome::Exhausted)
+}
+
+fn mobile_role_migration_route_is_unsupported(error: &DaemonApiError) -> bool {
+    let detail = match error {
+        DaemonApiError::Parse { detail }
+        | DaemonApiError::Network { detail, .. }
+        | DaemonApiError::NetworkDelivery { detail, .. }
+        | DaemonApiError::ForwardNetwork { detail, .. } => detail,
+        _ => return false,
+    };
+    let detail = detail.to_ascii_lowercase();
+    detail.contains(CLUSTER_CONTROL_ROLE_ROUTE)
+        && ["unknown", "unsupported", "not registered", "no handler"]
+            .iter()
+            .any(|marker| detail.contains(marker))
+}
+
+fn wait_until_mobile_role_migration_is_interactive() {
+    #[cfg(target_os = "android")]
+    {
+        let _ = crate::mobile_runtime::wait_until_interactive_blocking();
+    }
+}
+
+fn wait_for_mobile_role_migration_retry(delay: Duration) {
+    #[cfg(target_os = "android")]
+    {
+        let generation = crate::mobile_runtime::wait_until_interactive_blocking();
+        crate::mobile_runtime::wait_for_change_or_timeout(generation, delay);
+        // A network-change notification may wake the retry early. A transition
+        // to the background may not: park until the Activity is interactive
+        // again before the next cluster mutation.
+        let _ = crate::mobile_runtime::wait_until_interactive_blocking();
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        thread::sleep(delay);
+    }
+}
+
+/// Best-effort Android compatibility migration. New daemons normally persist
+/// the mobile role during init/join, while older daemons may reject the role
+/// route entirely; neither outcome is allowed to make app startup fail.
+fn reconcile_android_cluster_node_role(connection: &Connection, data_dir: &SinomoDataDir) {
+    let requested_role = app_requested_cluster_node_role();
+    if requested_role.is_none() {
+        return;
+    }
+    let Some(address) = connection.daemon_address() else {
+        return;
+    };
+    let status = sinomo_cli::app_api::cluster_status(data_dir);
+    let request = match app_cluster_node_role_migration_request(&status, requested_role) {
+        Ok(Some(request)) => request,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "sinomo-app could not prepare Android node-role migration");
+            return;
+        }
+    };
+    let address = address.to_string();
+    if let Err(error) = thread::Builder::new()
+        .name("sinomo-app-mobile-role-migration".to_string())
+        .spawn(move || {
+            let client = DaemonApiClient::at_address(address).with_timeout(DAEMON_RPC_TIMEOUT);
+            let mut failed_attempt_index = 0;
+            wait_until_mobile_role_migration_is_interactive();
+            loop {
+                match client.cluster_role(request.clone()) {
+                    Ok(update) if update.changed => {
+                        tracing::info!(
+                            node_id = %update.node_id,
+                            previous_role = ?update.previous_role,
+                            "sinomo-app migrated the Android cluster node to the mobile role"
+                        );
+                        return;
+                    }
+                    Ok(_) => return,
+                    Err(error) => match mobile_role_migration_failure_outcome(
+                        &error,
+                        failed_attempt_index,
+                    ) {
+                        MobileRoleMigrationFailureOutcome::RetryAfter(delay) => {
+                            tracing::debug!(
+                                %error,
+                                retry_after_ms = delay.as_millis(),
+                                "sinomo-app Android node-role migration will retry after a transient failure"
+                            );
+                            wait_for_mobile_role_migration_retry(delay);
+                            failed_attempt_index = failed_attempt_index.saturating_add(1);
+                        }
+                        MobileRoleMigrationFailureOutcome::Unsupported => {
+                            tracing::debug!(
+                                %error,
+                                "attached daemon does not support Android node-role migration"
+                            );
+                            return;
+                        }
+                        MobileRoleMigrationFailureOutcome::Exhausted => {
+                            tracing::debug!(
+                                %error,
+                                attempts = failed_attempt_index + 1,
+                                "sinomo-app exhausted this launch's Android node-role migration retries"
+                            );
+                            return;
+                        }
+                        MobileRoleMigrationFailureOutcome::Permanent => {
+                            tracing::warn!(
+                                %error,
+                                "sinomo-app could not migrate the Android cluster node role; startup will continue"
+                            );
+                            return;
+                        }
+                    },
+                }
+            }
+        })
+    {
+        tracing::warn!(
+            %error,
+            "sinomo-app could not start the Android node-role migration; startup will continue"
+        );
     }
 }
 
@@ -489,6 +719,7 @@ fn ensure_app_cluster_through_daemon(
         .cluster_init(ClusterControlInitRequest {
             cluster_name: name.to_string(),
             node_display_name: Some(name.to_string()),
+            node_role: app_requested_cluster_node_role(),
         })
         .map(|_| true)
         .map_err(|error| error.to_string())
@@ -576,6 +807,7 @@ fn start_in_process_daemon(
     agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
 ) -> Result<(DaemonStatus, InProcessDaemon), String> {
     let options = DaemonRunOptions::default();
+    let execution_profile = embedded_daemon_execution_profile();
     let cluster = in_process_daemon_cluster_status(paths)?;
     let loop_paths = paths.clone();
     let control_host = agent_runtime_control.clone();
@@ -584,9 +816,14 @@ fn start_in_process_daemon(
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
             let hooks = vec![agent_runtime_control_service_hook(control_host)];
-            if let Err(error) =
-                run_daemon_control_loop_with_services(options, loop_paths, "daemon", cluster, hooks)
-            {
+            if let Err(error) = run_daemon_control_loop_with_services_and_profile(
+                options,
+                loop_paths,
+                "daemon",
+                cluster,
+                hooks,
+                execution_profile,
+            ) {
                 let detail = error.to_string();
                 tracing::warn!(%error, "in-process daemon exited");
                 let _ = exit_tx.send(detail);
@@ -669,6 +906,105 @@ mod tests {
     use sinomo_runtime::node::NodeRole;
     use sinomo_runtime::service::ServiceRegistry;
     use time::OffsetDateTime;
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn desktop_embedded_daemon_keeps_standard_execution_defaults() {
+        assert_eq!(app_requested_cluster_node_role(), None);
+        assert_eq!(
+            embedded_daemon_execution_profile(),
+            DaemonExecutionProfile::Standard
+        );
+    }
+
+    #[test]
+    fn cluster_node_role_migration_builds_mobile_update_for_clustered_node() {
+        let node_id = Id::generate();
+        let status = sinomo_cli::app_api::AppClusterStatus {
+            clustered: true,
+            local_node_id: Some(node_id.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            app_cluster_node_role_migration_request(&status, Some(ClusterNodeRole::Mobile))
+                .expect("migration request"),
+            Some(ClusterControlRoleRequest {
+                node_id,
+                role: ClusterNodeRole::Mobile,
+            })
+        );
+    }
+
+    #[test]
+    fn cluster_node_role_migration_is_noop_without_android_role_or_cluster() {
+        let malformed_clustered_status = sinomo_cli::app_api::AppClusterStatus {
+            clustered: true,
+            local_node_id: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            app_cluster_node_role_migration_request(&malformed_clustered_status, None)
+                .expect("desktop migration is disabled"),
+            None,
+            "desktop startup must not inspect or mutate cluster role state"
+        );
+
+        let unclustered_status = sinomo_cli::app_api::AppClusterStatus::default();
+        assert_eq!(
+            app_cluster_node_role_migration_request(
+                &unclustered_status,
+                Some(ClusterNodeRole::Mobile),
+            )
+            .expect("unclustered migration is skipped"),
+            None
+        );
+    }
+
+    #[test]
+    fn mobile_role_migration_transient_backoff_is_sparse_and_bounded() {
+        let error = DaemonApiError::NotRunning {
+            detail: "daemon is restarting".to_string(),
+        };
+        assert_eq!(
+            (0..=MOBILE_ROLE_MIGRATION_RETRY_DELAYS.len() + 1)
+                .map(|attempt| mobile_role_migration_failure_outcome(&error, attempt))
+                .collect::<Vec<_>>(),
+            vec![
+                MobileRoleMigrationFailureOutcome::RetryAfter(Duration::from_secs(2)),
+                MobileRoleMigrationFailureOutcome::RetryAfter(Duration::from_secs(10)),
+                MobileRoleMigrationFailureOutcome::RetryAfter(Duration::from_secs(30)),
+                MobileRoleMigrationFailureOutcome::RetryAfter(Duration::from_secs(2 * 60)),
+                MobileRoleMigrationFailureOutcome::RetryAfter(Duration::from_secs(5 * 60)),
+                MobileRoleMigrationFailureOutcome::Exhausted,
+                MobileRoleMigrationFailureOutcome::Exhausted,
+            ]
+        );
+    }
+
+    #[test]
+    fn mobile_role_migration_stops_for_unsupported_or_permanent_failures() {
+        let unsupported = DaemonApiError::Network {
+            address: CLUSTER_CONTROL_ROLE_ROUTE.to_string(),
+            detail: format!("unknown object rpc route: {CLUSTER_CONTROL_ROLE_ROUTE}"),
+        };
+        assert_eq!(
+            mobile_role_migration_failure_outcome(&unsupported, 0),
+            MobileRoleMigrationFailureOutcome::Unsupported
+        );
+        let legacy_parse_error = DaemonApiError::Parse {
+            detail: format!("unknown service route: {CLUSTER_CONTROL_ROLE_ROUTE}"),
+        };
+        assert_eq!(
+            mobile_role_migration_failure_outcome(&legacy_parse_error, 0),
+            MobileRoleMigrationFailureOutcome::Unsupported
+        );
+
+        assert_eq!(
+            mobile_role_migration_failure_outcome(&DaemonApiError::AuthDenied, 0),
+            MobileRoleMigrationFailureOutcome::Permanent
+        );
+    }
 
     #[test]
     fn run_with_timeout_returns_result_within_budget() {

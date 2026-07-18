@@ -20,7 +20,7 @@ use sinomo_runtime::node::{
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::backend::{Backend, Connection};
+use crate::backend::{Backend, Connection, app_requested_cluster_node_role};
 
 const CLUSTER_LOCAL_SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_millis(1200);
 const CLUSTER_REFRESH_RPC_TIMEOUT: Duration = Duration::from_secs(8);
@@ -137,6 +137,7 @@ impl Backend {
             .cluster_join(cluster::ClusterControlJoinRequest {
                 invite: invite.to_string(),
                 node_display_name: Some(self.node.display_name.clone()),
+                node_role: app_requested_cluster_node_role(),
             })
             .map_err(|error| error.to_string())?;
         Ok(sinomo_cli::app_api::cluster_status(self.data_dir.as_ref()))

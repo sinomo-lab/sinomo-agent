@@ -3936,7 +3936,17 @@ impl FilesState {
         let active_poll_generation = Arc::clone(&self.placement_activity_poll_generation);
         let in_flight_generation = Arc::clone(&self.placement_activity_in_flight_generation);
         self.app_runtime.spawn(async move {
-            tokio::time::sleep(delay).await;
+            crate::mobile_runtime::wait_for_interactive().await;
+            let paused = tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = crate::mobile_runtime::wait_for_background() => true,
+            };
+            if paused {
+                // A foreground transition is a useful reason to refresh the
+                // open activity center immediately; its durable cursor removes
+                // the need to spend radio time polling while hidden.
+                crate::mobile_runtime::wait_for_interactive().await;
+            }
             if active_poll_generation.load(Ordering::Acquire) != poll_generation {
                 return;
             }
@@ -4445,7 +4455,7 @@ impl FilesState {
         let _ = thread::Builder::new()
             .name("sinomo-app-files-placement-progress".to_string())
             .spawn(move || {
-                thread::sleep(Duration::from_millis(500));
+                crate::mobile_runtime::wait_for_interactive_delay(Duration::from_millis(500));
                 let _ = tx.send(FilesWorkerCommand::PlacementProgress { request_id, job_id });
                 if let Some(waker) = waker {
                     waker.wake();
@@ -5443,33 +5453,41 @@ fn spawn_files_dfs_event_subscription(
         };
         let mut retry_delay = Duration::from_millis(250);
         loop {
+            crate::mobile_runtime::wait_for_interactive().await;
             let mut received_ready = false;
             let mut consumer_closed = false;
-            let result = send_daemon_rpc_stream_from_data_dir_async(
-                data_dir.clone(),
-                &address,
-                &request,
-                DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
-                |response| {
-                    response.error_detail()?;
-                    let item = response
-                        .decode_body::<DaemonEventStreamItem>()
-                        .map_err(DaemonApiError::from)?;
-                    received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
-                    if tx
-                        .send(FilesWorkerResult::LiveUpdate(FilesLiveUpdate::Item(item)))
-                        .is_err()
-                    {
-                        consumer_closed = true;
-                        return Ok(false);
-                    }
-                    if let Some(waker) = waker.as_ref() {
-                        waker.wake();
-                    }
-                    Ok(true)
-                },
-            )
-            .await;
+            let result = tokio::select! {
+                result = send_daemon_rpc_stream_from_data_dir_async(
+                    data_dir.clone(),
+                    &address,
+                    &request,
+                    DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
+                    |response| {
+                        response.error_detail()?;
+                        let item = response
+                            .decode_body::<DaemonEventStreamItem>()
+                            .map_err(DaemonApiError::from)?;
+                        received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
+                        if tx
+                            .send(FilesWorkerResult::LiveUpdate(FilesLiveUpdate::Item(item)))
+                            .is_err()
+                        {
+                            consumer_closed = true;
+                            return Ok(false);
+                        }
+                        if let Some(waker) = waker.as_ref() {
+                            waker.wake();
+                        }
+                        Ok(true)
+                    },
+                ) => Some(result),
+                _ = crate::mobile_runtime::wait_for_background() => None,
+            };
+            let Some(result) = result else {
+                // Dropping the stream future closes its local daemon session.
+                // Resume reconnects from the durable event snapshot.
+                continue;
+            };
             if consumer_closed {
                 return;
             }

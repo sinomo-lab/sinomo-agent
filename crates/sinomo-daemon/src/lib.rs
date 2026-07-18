@@ -220,6 +220,7 @@ pub use control::{
     handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
     run_daemon_control_loop, run_daemon_control_loop_with_services,
+    run_daemon_control_loop_with_services_and_profile,
 };
 pub use error::DaemonError;
 pub(crate) use idle_stats::{
@@ -249,11 +250,14 @@ pub(crate) use process::prepare_noninteractive_command;
 #[cfg(not(unix))]
 pub(crate) use process::spawn_shadow_rollout_completion_helper_process;
 pub(crate) use process::{
-    CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
-    prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+    CandidateMainDiagnostics, build_daemon_async_runtime, build_daemon_async_runtime_with_profile,
+    main_exit_observation_from_status, prepare_background_command,
+    spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
-pub use process::{daemon_main_binary_for_shadow_start, start_daemon_command_process};
+pub use process::{
+    DaemonExecutionProfile, daemon_main_binary_for_shadow_start, start_daemon_command_process,
+};
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request, handle_deferred_shadow_rollout_completion,

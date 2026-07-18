@@ -8769,6 +8769,7 @@ mod tests {
             &sinomo_core::cluster::ClusterControlInitRequest {
                 cluster_name: "cluster-control-service-test".to_string(),
                 node_display_name: Some("cluster-control-node".to_string()),
+                node_role: Some(sinomo_core::ClusterNodeRole::Mobile),
             },
         )
         .expect("init payload");
@@ -8803,6 +8804,10 @@ mod tests {
         assert_eq!(state.local_node_id, init.node_id);
         assert_eq!(state.cluster_name, "cluster-control-service-test");
         assert_eq!(state.local_node_display_name, "cluster-control-node");
+        assert_eq!(
+            state.members[0].node_role,
+            sinomo_core::ClusterNodeRole::Mobile
+        );
 
         let rename_payload = sinomo_core::cluster::cluster_control_rename_rpc_payload(
             &sinomo_core::cluster::ClusterControlRenameRequest {

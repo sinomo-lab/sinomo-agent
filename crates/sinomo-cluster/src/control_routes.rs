@@ -95,6 +95,10 @@ pub struct ClusterControlInitRequest {
     /// Display name for the local node; defaults to the cluster name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_display_name: Option<String>,
+    /// Optional execution shape for the local node. Older clients omit this
+    /// field and continue to initialize workstation nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_role: Option<ClusterNodeRole>,
 }
 
 /// Result of a cluster init.
@@ -114,6 +118,11 @@ pub struct ClusterControlJoinRequest {
     /// required to activate the new cluster identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_display_name: Option<String>,
+    /// Optional execution shape to persist for this node as part of the join
+    /// transaction. Older clients omit this field and retain the workstation
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_role: Option<ClusterNodeRole>,
 }
 
 /// Result of a cluster join.
@@ -439,6 +448,7 @@ mod tests {
         let init = ClusterControlInitRequest {
             cluster_name: "test-cluster".to_string(),
             node_display_name: Some("test-node".to_string()),
+            node_role: Some(ClusterNodeRole::Mobile),
         };
         let payload = cluster_control_init_rpc_payload(&init).expect("encode init");
         assert_eq!(payload.route, CLUSTER_CONTROL_INIT_ROUTE);
@@ -446,6 +456,37 @@ mod tests {
         assert_eq!(
             decode_cluster_control_init_rpc_request_body(&payload.body).expect("decode init"),
             init
+        );
+
+        let join = ClusterControlJoinRequest {
+            invite: "sinomo-join://example".to_string(),
+            node_display_name: Some("mobile-node".to_string()),
+            node_role: Some(ClusterNodeRole::Mobile),
+        };
+        let payload = cluster_control_join_rpc_payload(&join).expect("encode join");
+        assert_eq!(
+            decode_cluster_control_join_rpc_request_body(&payload.body).expect("decode join"),
+            join
+        );
+
+        #[derive(serde::Serialize)]
+        struct LegacyInitRequest<'a> {
+            cluster_name: &'a str,
+            node_display_name: Option<&'a str>,
+        }
+        let legacy_init_body = encode_cluster_control_rpc_body(&LegacyInitRequest {
+            cluster_name: "legacy-cluster",
+            node_display_name: Some("legacy-node"),
+        })
+        .expect("encode legacy init request");
+        assert_eq!(
+            decode_cluster_control_init_rpc_request_body(&legacy_init_body)
+                .expect("decode legacy init request"),
+            ClusterControlInitRequest {
+                cluster_name: "legacy-cluster".to_string(),
+                node_display_name: Some("legacy-node".to_string()),
+                node_role: None,
+            }
         );
 
         let rename = ClusterControlRenameRequest {
