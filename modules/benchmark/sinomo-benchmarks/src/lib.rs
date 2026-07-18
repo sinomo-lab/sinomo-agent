@@ -61,6 +61,7 @@ pub enum BenchmarkFamily {
     VisionAction,
     AgentDiscussion,
     AgentSkill,
+    Memory,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -176,12 +177,14 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
             swebench_verified_10_descriptor(),
             agent_channel_discussion_descriptor(),
             agent_skill_quality_descriptor(),
+            longmemeval_s_descriptor(),
         ],
         plans: vec![
             swebench_verified_10_plan(),
             agent_skill_quality_plan(),
             agent_compaction_quality_plan(),
             agent_memory_quality_plan(),
+            longmemeval_s_plan(),
             agent_channel_discussion_plan(),
             terminalbench_harbor_plan(),
             mcu_minestudio_plan(),
@@ -211,6 +214,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.agent.cancel-probe".to_string(),
             "benchmark.agent.compaction.plan".to_string(),
             "benchmark.agent.memory.plan".to_string(),
+            "benchmark.agent.memory.longmemeval-s.plan".to_string(),
             "benchmark.agent.channel-discussion.plan".to_string(),
             "benchmark.agent.skill.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
@@ -279,6 +283,20 @@ pub fn agent_skill_quality_descriptor() -> BenchmarkSuiteDescriptor {
     }
 }
 
+pub fn longmemeval_s_descriptor() -> BenchmarkSuiteDescriptor {
+    BenchmarkSuiteDescriptor {
+        name: "agent-memory-longmemeval-s".to_string(),
+        family: BenchmarkFamily::Memory,
+        task_count: 500,
+        dataset: Some(
+            "xiaowu0162/longmemeval-cleaned@98d7416c24c778c2fee6e6f3006e7a073259d48f".to_string(),
+        ),
+        split: Some("longmemeval_s_cleaned".to_string()),
+        runner: benchmark_module_path("agent/run_longmemeval_s.py"),
+        baseline: Some("Sinomo indexed-file lexical retrieval".to_string()),
+    }
+}
+
 pub fn agent_skill_quality_plan() -> BenchmarkHarnessPlan {
     BenchmarkHarnessPlan {
         name: "agent-skill-quality".to_string(),
@@ -329,11 +347,10 @@ pub fn agent_channel_discussion_plan() -> BenchmarkHarnessPlan {
             "python3 {} --mode run --suite clembench-lite --provider codex --model gpt-5.4-mini --summary-out benchmark-results/agent-channel-discussion/summary.json --progress-out benchmark-results/agent-channel-discussion/progress.jsonl",
             benchmark_module_path("agent/run_channel_discussion_eval.py")
         ),
-        required_tools: default_main_agent_tools()
-            .into_iter()
-            .filter(|tool| matches!(tool.kind, AgentToolKind::RunShellCommand))
-            .map(|tool| tool.kind)
-            .collect(),
+        required_tools: required_tool_kinds(
+            default_main_agent_tools(),
+            &[AgentToolKind::RunShellCommand],
+        ),
         notes: vec![
             "This is a live/model eval harness for channel and multi-agent discussion behavior, not a Rust unit test.".to_string(),
             "Fixture mode covers native consensus, hidden-info merge, useful silence, response-limit containment, and final handoff cases.".to_string(),
@@ -397,16 +414,43 @@ pub fn agent_memory_quality_plan() -> BenchmarkHarnessPlan {
             "python3 {} --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-memory/summary.json --progress-out benchmark-results/agent-memory/progress.jsonl",
             benchmark_module_path("agent/run_memory_eval.py")
         ),
-        required_tools: default_main_agent_tools()
-            .into_iter()
-            .filter(|tool| matches!(tool.kind, AgentToolKind::RunShellCommand))
-            .map(|tool| tool.kind)
-            .collect(),
+        required_tools: required_tool_kinds(
+            default_main_agent_tools(),
+            &[AgentToolKind::RunShellCommand],
+        ),
         notes: vec![
             "This is a live/model eval harness for long-horizon memory quality, not a Rust unit test.".to_string(),
             "The checked-in scenarios cover information extraction, multi-session reasoning, knowledge updates, temporal reasoning, scope-boundary abstention, and procedural workflow recall.".to_string(),
             "The axes are inspired by LongMemEval, LoCoMo, BEAM, MemoryAgentBench, MemoryArena, LongMemEval-V2, and RAGAS retrieval metrics.".to_string(),
             "Default plan/fixture modes are deterministic; --mode run calls the configured Sinomo agent and scores marker use, citations, forbidden leakage, source coverage, and cache churn.".to_string(),
+        ],
+    }
+}
+
+pub fn longmemeval_s_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "agent-memory-longmemeval-s".to_string(),
+        setup_commands: vec![
+            "cargo build -p sinomo".to_string(),
+            format!(
+                "python3 {} --mode plan --summary-out benchmark-results/agent-memory/longmemeval-s/plan.json",
+                benchmark_module_path("agent/run_longmemeval_s.py")
+            ),
+        ],
+        run_command: format!(
+            "python3 {} --mode run --dataset benchmark-results/datasets/longmemeval_s_cleaned.json --reader none --summary-out benchmark-results/agent-memory/longmemeval-s/summary.json --retrieval-out benchmark-results/agent-memory/longmemeval-s/retrieval.jsonl --progress-out benchmark-results/agent-memory/longmemeval-s/progress.jsonl",
+            benchmark_module_path("agent/run_longmemeval_s.py")
+        ),
+        required_tools: vec![AgentToolKind::RunShellCommand],
+        notes: vec![
+            "The cleaned LongMemEval-S suite contains 500 questions and requires an explicit path to the pinned external dataset; the harness never downloads it implicitly."
+                .to_string(),
+            "The catalog command is the deterministic retrieval-only baseline; add --reader sinomo and --predictions-out to emit the official question_id/hypothesis reader contract."
+                .to_string(),
+            "Every question runs in a fresh disposable SINOMO_DATA_DIR, HOME, XDG, temporary, and workspace tree so synthetic histories cannot mix with one another or normal operational data."
+                .to_string(),
+            "Only the explicitly selected account configuration and selected provider credential files may be copied into a reader case; unrelated accounts plus cluster, DFS, permissions, events, chats, sessions, memory, and index state are never copied from the operator data directory."
+                .to_string(),
         ],
     }
 }
@@ -445,19 +489,15 @@ pub fn terminalbench_harbor_plan() -> BenchmarkHarnessPlan {
         ],
         run_command: "harbor run -d terminal-bench/terminal-bench-2 --agent-import-path sinomo_harbor_agent:SinomoHarborAgent"
             .to_string(),
-        required_tools: default_main_agent_tools()
-            .into_iter()
-            .filter(|tool| {
-                matches!(
-                    tool.kind,
-                    AgentToolKind::RunShellCommand
-                        | AgentToolKind::StartAsyncTask
-                        | AgentToolKind::ReadSifs
-                        | AgentToolKind::WriteSifs
-                )
-            })
-            .map(|tool| tool.kind)
-            .collect(),
+        required_tools: required_tool_kinds(
+            default_main_agent_tools(),
+            &[
+                AgentToolKind::RunShellCommand,
+                AgentToolKind::StartAsyncTask,
+                AgentToolKind::ReadSifs,
+                AgentToolKind::WriteSifs,
+            ],
+        ),
         notes: vec![
             "Harbor custom agents implement BaseAgent or BaseInstalledAgent; current Terminal-Bench 2 dataset id is terminal-bench/terminal-bench-2.".to_string(),
             "The generated adapter uses an external agent so Sinomo can keep tools outside the task container."
@@ -1399,6 +1439,46 @@ mod tests {
     }
 
     #[test]
+    fn longmemeval_s_suite_and_plan_use_isolated_external_data() {
+        let descriptor = longmemeval_s_descriptor();
+        assert_eq!(descriptor.name, "agent-memory-longmemeval-s");
+        assert_eq!(descriptor.family, BenchmarkFamily::Memory);
+        assert_eq!(descriptor.task_count, 500);
+        assert_eq!(
+            descriptor.dataset.as_deref(),
+            Some("xiaowu0162/longmemeval-cleaned@98d7416c24c778c2fee6e6f3006e7a073259d48f")
+        );
+        assert_eq!(descriptor.split.as_deref(), Some("longmemeval_s_cleaned"));
+        assert!(descriptor.runner.ends_with("agent/run_longmemeval_s.py"));
+
+        let plan = longmemeval_s_plan();
+        assert_eq!(plan.name, "agent-memory-longmemeval-s");
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("run_longmemeval_s.py --mode plan"))
+        );
+        assert!(plan.run_command.contains("run_longmemeval_s.py --mode run"));
+        assert!(
+            plan.run_command
+                .contains("benchmark-results/datasets/longmemeval_s_cleaned.json")
+        );
+        assert!(plan.run_command.contains("--reader none"));
+        assert!(plan.run_command.contains("--retrieval-out"));
+        assert_eq!(plan.required_tools, vec![AgentToolKind::RunShellCommand]);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("fresh disposable SINOMO_DATA_DIR"))
+        );
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("normal operational data"))
+        );
+    }
+
+    #[test]
     fn minestudio_plan_keeps_vision_path_explicit() {
         let plan = minestudio_plan();
         assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
@@ -1478,10 +1558,11 @@ mod tests {
     }
 
     #[test]
-    fn default_environment_prompt_mentions_async_and_tools() {
+    fn default_environment_prompt_mentions_async_and_memory_tools() {
         let config = AgentEnvironmentConfig::default();
         assert!(config.prompt.contains("async"));
-        assert!(config.prompt.contains("run_shell_command"));
+        assert!(config.prompt.contains("session_history_search"));
+        assert!(config.prompt.contains("memory_search"));
     }
 
     #[test]
@@ -1527,6 +1608,11 @@ mod tests {
         assert!(
             descriptor
                 .capabilities
+                .contains(&"benchmark.agent.memory.longmemeval-s.plan".to_string())
+        );
+        assert!(
+            descriptor
+                .capabilities
                 .contains(&"benchmark.agent.channel-discussion.plan".to_string())
         );
         assert!(
@@ -1557,10 +1643,11 @@ mod tests {
         let catalog = benchmark_module_catalog();
 
         assert_eq!(catalog.module_root, SINOMO_BENCHMARKS_MODULE_ROOT);
-        assert_eq!(catalog.suites.len(), 3);
+        assert_eq!(catalog.suites.len(), 4);
         assert_eq!(catalog.suites[0].name, "swebench-verified-10");
         assert_eq!(catalog.suites[1].name, "agent-channel-discussion");
         assert_eq!(catalog.suites[2].name, "agent-skill-quality");
+        assert_eq!(catalog.suites[3].name, "agent-memory-longmemeval-s");
         assert!(
             catalog
                 .plans
@@ -1584,6 +1671,12 @@ mod tests {
                 .plans
                 .iter()
                 .any(|plan| plan.name == "agent-memory-quality")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "agent-memory-longmemeval-s")
         );
         assert!(
             catalog

@@ -908,6 +908,15 @@ cases exercise real file candidate generation rather than only preselected
 memory blocks. Keep fixture and live-model results separate from deterministic
 Rust gates.
 
+The first external baseline is implemented by
+`modules/benchmark/sinomo-benchmarks/agent/run_longmemeval_s.py`. It streams the
+pinned cleaned LongMemEval-S dataset, builds and queries the real indexed-file
+store, and can optionally run the Sinomo reader. Every question receives a
+fresh disposable data directory, corpus, workspace, home, and environment; no
+cluster, DFS, permission, activity, session, or operational memory state is
+copied. Retrieval-only results and optional reader hypotheses remain separate,
+and the latter use the upstream evaluator rather than becoming a Rust gate.
+
 ## Implementation Choices Still Requiring Spikes
 
 These choices do not alter the architectural contracts and should be decided

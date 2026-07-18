@@ -3,8 +3,9 @@
 
 The default plan mode is deterministic and safe for CI. Fixture mode exercises
 the scoring path without model calls. Run mode calls the configured Sinomo CLI
-and scores whether a model uses visible memory, cites memory ids, avoids stale
-or forbidden memory, and abstains when memory is absent.
+in a fresh contained data directory per scenario and scores whether a model
+uses visible memory, cites memory ids, avoids stale or forbidden memory, and
+abstains when memory is absent.
 
 This harness is evaluation evidence, not a Rust unit-test assertion. The
 deterministic memory-store invariants live in `crates/sinomo-memory`; this file
@@ -18,11 +19,27 @@ import datetime
 import json
 import os
 import shlex
-import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from eval_isolation import (  # noqa: E402
+    IsolatedSinomoCase,
+    default_config_source_data_dir,
+    install_cleanup_signal_handlers,
+    isolated_sinomo_case,
+    run_isolated_process,
+    validate_explicit_environment_names,
+    validate_isolation_boundaries,
+    validate_operational_path_separation,
+    validate_pairwise_disjoint_paths,
+)
 
 
 def find_repo_root(start: Path) -> Path:
@@ -34,6 +51,9 @@ def find_repo_root(start: Path) -> Path:
 
 REPO_ROOT = find_repo_root(Path(__file__).resolve())
 DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmark-results" / "agent-memory"
+DEFAULT_SINOMO_BIN = REPO_ROOT / "target" / "debug" / (
+    "sinomo.exe" if os.name == "nt" else "sinomo"
+)
 
 REQUIRED_SCENARIO_IDS = {
     "information-extraction",
@@ -500,7 +520,7 @@ def scenario_plan(scenario: MemoryEvalScenario) -> dict[str, object]:
 
 def build_plan(args: argparse.Namespace) -> dict[str, object]:
     scenarios = selected_scenarios(args.scenario)
-    summary_out = args.summary_out or DEFAULT_RESULTS_DIR / "summary.json"
+    summary_out = args.summary_out or args.results_dir / "summary.json"
     return {
         "schema_version": 1,
         "generated_at": utc_now(),
@@ -527,6 +547,15 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
             "marker_aliases_score_equivalent_phrasing": True,
             "retrieval_metrics_are_id_based": True,
             "model_run_requires_explicit_mode": True,
+        },
+        "containment": {
+            "fresh_data_dir_per_scenario": True,
+            "fresh_home_xdg_tmp_workspace_per_scenario": True,
+            "copies_cluster_dfs_permissions_events_sessions_memory": False,
+            "inherits_sinomo_environment": False,
+            "local_permissions_start_deny_all": True,
+            "operational_path_overlap_rejected_before_writes": True,
+            "cleanup_after_every_scenario": True,
         },
         "scenarios": [scenario_plan(scenario) for scenario in scenarios],
         "example_run_command": example_run_command(args, summary_out),
@@ -585,7 +614,11 @@ def marker_violations(text: str, markers: list[str]) -> dict[str, bool]:
     return {marker: contains_marker(text, marker) for marker in markers}
 
 
-def run_agent_prompt(args: argparse.Namespace, prompt: str) -> dict[str, object]:
+def run_agent_prompt(
+    args: argparse.Namespace,
+    prompt: str,
+    isolated: IsolatedSinomoCase,
+) -> dict[str, object]:
     command = [
         str(args.sinomo_bin),
         "agent",
@@ -599,34 +632,31 @@ def run_agent_prompt(args: argparse.Namespace, prompt: str) -> dict[str, object]
     ]
     if args.account:
         command.extend(["--account", args.account])
+    display_command = [
+        "<memory-eval-prompt>" if index > 0 and command[index - 1] == "--prompt" else part
+        for index, part in enumerate(command)
+    ]
     started = utc_now()
     if args.dry_run:
         return {
-            "command": command,
+            "command": display_command,
             "started_at": started,
             "completed_at": utc_now(),
             "exit_code": 0,
             "stdout": "",
             "stderr": "",
             "dry_run": True,
+            "timed_out": False,
+            "isolation": isolated.manifest(),
         }
-    completed = subprocess.run(
+    invocation = run_isolated_process(
         command,
-        cwd=REPO_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
+        isolated,
+        timeout_seconds=args.model_timeout_seconds,
+        display_command=display_command,
     )
-    return {
-        "command": command,
-        "started_at": started,
-        "completed_at": utc_now(),
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "dry_run": False,
-    }
+    invocation["dry_run"] = False
+    return invocation
 
 
 def fixture_response(scenario: MemoryEvalScenario) -> str:
@@ -683,10 +713,27 @@ def evaluate_scenario(
             "stdout": output,
             "stderr": "",
             "dry_run": True,
+            "timed_out": False,
+            "isolation": None,
         }
     else:
-        invocation = run_agent_prompt(args, prompt)
-        output = str(invocation["stdout"])
+        protected_paths = [
+            args.results_dir,
+            args.summary_out or args.results_dir / "summary.json",
+            *([args.progress_out] if args.progress_out else []),
+        ]
+        with isolated_sinomo_case(
+            scenario.scenario_id,
+            scratch_root=args.scratch_root,
+            config_source_data_dir=args.config_source_data_dir,
+            provider=args.provider,
+            account=args.account,
+            copy_provider_config=not args.dry_run,
+            pass_environment=args.pass_env,
+            protected_paths=protected_paths,
+        ) as isolated:
+            invocation = run_agent_prompt(args, prompt, isolated)
+            output = str(invocation["stdout"])
 
     required_marker_details = marker_hit_details(
         output, scenario.expected_markers, scenario.marker_aliases
@@ -741,6 +788,8 @@ def evaluate_scenario(
         "started_at": invocation["started_at"],
         "completed_at": invocation["completed_at"],
         "dry_run": invocation["dry_run"],
+        "timed_out": invocation.get("timed_out", False),
+        "isolation": invocation.get("isolation"),
     }
 
 
@@ -823,24 +872,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("SINOMO_AGENT_MODEL", "gpt-5.2-codex"))
     parser.add_argument("--account")
     parser.add_argument(
-        "--sinomo-bin", type=Path, default=REPO_ROOT / "target" / "debug" / "sinomo"
+        "--sinomo-bin", type=Path, default=DEFAULT_SINOMO_BIN
     )
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--summary-out", type=Path)
     parser.add_argument("--progress-out", type=Path)
+    parser.add_argument("--config-source-data-dir", type=Path)
+    parser.add_argument("--scratch-root", type=Path)
+    parser.add_argument("--pass-env", action="append", default=[])
+    parser.add_argument("--model-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.model_timeout_seconds <= 0:
+        parser.error("--model-timeout-seconds must be positive")
+    try:
+        args.pass_env = validate_explicit_environment_names(args.pass_env)
+    except ValueError as source:
+        parser.error(str(source))
+    args.sinomo_bin = args.sinomo_bin.expanduser().resolve(strict=False)
+    args.results_dir = args.results_dir.expanduser().resolve(strict=False)
+    for attribute in ("summary_out", "progress_out", "scratch_root"):
+        value = getattr(args, attribute)
+        if value is not None:
+            setattr(args, attribute, value.expanduser().resolve(strict=False))
+    args.config_source_data_dir = (
+        args.config_source_data_dir.expanduser().resolve(strict=False)
+        if args.config_source_data_dir
+        else default_config_source_data_dir().resolve(strict=False)
+    )
+    return args
 
 
 def main() -> int:
+    install_cleanup_signal_handlers()
     validate_scenario_definitions()
     args = parse_args()
     plan = build_plan(args)
     if args.mode == "plan":
+        if args.summary_out:
+            validate_operational_path_separation(
+                config_source_data_dir=args.config_source_data_dir,
+                protected_paths=[args.summary_out],
+            )
         print(json.dumps(plan, indent=2))
         write_json(args.summary_out, plan)
         return 0
 
+    summary_out = args.summary_out or args.results_dir / "summary.json"
+    protected_paths = [
+        args.results_dir,
+        summary_out,
+        *([args.progress_out] if args.progress_out else []),
+    ]
+    validate_pairwise_disjoint_paths(
+        [summary_out, *([args.progress_out] if args.progress_out else [])]
+    )
+    validate_isolation_boundaries(
+        scratch_root=args.scratch_root,
+        config_source_data_dir=args.config_source_data_dir,
+        protected_paths=protected_paths,
+    )
     progress = ProgressWriter(args.progress_out)
     scenarios = selected_scenarios(args.scenario)
     results = [evaluate_scenario(args, scenario, progress) for scenario in scenarios]
@@ -853,7 +944,7 @@ def main() -> int:
         "evaluated_at": utc_now(),
         "results": results,
     }
-    write_json(args.summary_out or DEFAULT_RESULTS_DIR / "summary.json", summary)
+    write_json(summary_out, summary)
     print(json.dumps(summary, indent=2))
     return 0 if passed else 1
 
