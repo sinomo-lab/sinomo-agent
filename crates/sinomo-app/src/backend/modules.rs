@@ -1,6 +1,7 @@
 //! Module runtime configuration snapshot and mutations for the Settings UI.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -22,6 +23,7 @@ use sinomo_runtime::node::NodeId;
 use crate::backend::Backend;
 
 const MODULE_CONFIG_RPC_TIMEOUT: Duration = Duration::from_secs(8);
+static LOCAL_MODULE_OVERRIDE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Default)]
 pub struct ModuleConfigSnapshot {
@@ -112,7 +114,8 @@ impl Backend {
             })
         });
 
-        let modules = self.module_config_catalog(&cluster_config, selected_node.as_ref());
+        let modules =
+            self.module_config_catalog(&cluster_config, selected_node.as_ref(), &mut warnings);
         ModuleConfigSnapshot {
             cluster_config,
             selected_node,
@@ -138,20 +141,40 @@ impl Backend {
         module_id: &str,
         enabled: Option<bool>,
     ) -> Result<(), String> {
-        let mut config = self.load_node_module_config(node_id)?;
-        match enabled {
-            Some(enabled) => config.set(module_id, ModuleRuntimeConfigEntry::enabled(enabled))?,
-            None => config.clear(module_id)?,
-        }
         if self.module_config_node_is_local(node_id) {
-            let value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
-            return self
-                .config
-                .set(MODULE_NODE_CONFIG_KEY, value, ConfigWriteTarget::Local)
-                .map(|_| ())
-                .map_err(|error| error.to_string());
+            return self.set_local_module_override(module_id, enabled);
         }
+        let mut config = self.load_node_module_config(node_id)?;
+        apply_module_override(&mut config, module_id, enabled)?;
         self.set_remote_node_module_config(node_id, &config)
+    }
+
+    /// Writes a node override to the attached host's local configuration
+    /// target. This path deliberately takes no node ID and can never fall back
+    /// to the signed remote-config relay for another node.
+    pub fn set_local_module_override(
+        &self,
+        module_id: &str,
+        enabled: Option<bool>,
+    ) -> Result<(), String> {
+        // Settings can have more than one retained surface. Serialize their
+        // whole-document edits so the shortcut and Modules page cannot lose
+        // one another's unrelated overrides inside this process.
+        let _write_guard = LOCAL_MODULE_OVERRIDE_WRITE_LOCK
+            .lock()
+            .map_err(|_| "local module override write lock is poisoned".to_string())?;
+        let resolution = self
+            .config
+            .get(MODULE_NODE_CONFIG_KEY)
+            .map_err(|error| error.to_string())?;
+        let mut config: ModuleRuntimeConfig =
+            serde_json::from_value(resolution.value).map_err(|error| error.to_string())?;
+        apply_module_override(&mut config, module_id, enabled)?;
+        let value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
+        self.config
+            .set(MODULE_NODE_CONFIG_KEY, value, ConfigWriteTarget::Local)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn load_cluster_module_config(&self) -> Result<ModuleRuntimeConfig, String> {
@@ -206,9 +229,13 @@ impl Backend {
         &self,
         cluster_config: &ModuleRuntimeConfig,
         selected_node: Option<&ModuleConfigNode>,
+        warnings: &mut Vec<String>,
     ) -> Vec<ModuleConfigModuleSummary> {
         let mut modules = BTreeMap::<String, ModuleConfigModuleSummary>::new();
         let mut observations = BTreeMap::<String, (ModuleObservedState, String)>::new();
+        let mut native_dylib_observations =
+            BTreeMap::<String, (ModuleObservedState, String)>::new();
+        let mut native_dylib_observation_error = None;
         for module_id in cluster_config.module_ids() {
             insert_module_summary(
                 &mut modules,
@@ -227,44 +254,66 @@ impl Backend {
                 );
             }
         }
-        if let Ok(states) = read_native_dylib_module_loader_states(&self.data_dir.root()) {
-            let mut active_cache_keys = BTreeSet::new();
-            for state in states {
-                active_cache_keys.insert(state.cache_key.clone());
-                observations.insert(
-                    state.module_id.to_string(),
-                    (
-                        ModuleObservedState::Running,
-                        format!("Active native library · {}", state.interface_version),
-                    ),
-                );
-                insert_module_summary(
-                    &mut modules,
-                    &state.module_id.to_string(),
-                    "native-dylib",
-                    format!("Active native dylib · {}", state.interface_version),
-                );
-            }
-            if let Ok(entries) = read_native_dylib_module_cache_entries_excluding_cache_keys(
-                &self.data_dir.root(),
-                &active_cache_keys,
-            ) {
-                for entry in entries {
-                    observations
-                        .entry(entry.module_id.to_string())
-                        .or_insert_with(|| {
-                            (
-                                ModuleObservedState::Installed,
-                                format!("Installed but not active · {}", entry.interface_version),
-                            )
-                        });
-                    insert_module_summary(
+        match read_native_dylib_module_loader_states(&self.data_dir.root()) {
+            Ok(states) => {
+                let mut active_cache_keys = BTreeSet::new();
+                for state in states {
+                    active_cache_keys.insert(state.cache_key.clone());
+                    native_dylib_observations.insert(
+                        state.module_id.to_string(),
+                        (
+                            ModuleObservedState::NotReported,
+                            format!(
+                                "Native loader activation record present · {} · daemon registration is not independently reported",
+                                state.interface_version
+                            ),
+                        ),
+                    );
+                    insert_native_dylib_module_summary(
                         &mut modules,
-                        &entry.module_id.to_string(),
-                        "native-dylib",
-                        format!("Installed native dylib · {}", entry.interface_version),
+                        &state.module_id.to_string(),
+                        format!(
+                            "Native dylib activation record · {}",
+                            state.interface_version
+                        ),
                     );
                 }
+                match read_native_dylib_module_cache_entries_excluding_cache_keys(
+                    &self.data_dir.root(),
+                    &active_cache_keys,
+                ) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            native_dylib_observations
+                                .entry(entry.module_id.to_string())
+                                .or_insert_with(|| {
+                                    (
+                                        ModuleObservedState::Installed,
+                                        format!(
+                                            "Installed but not active · {}",
+                                            entry.interface_version
+                                        ),
+                                    )
+                                });
+                            insert_native_dylib_module_summary(
+                                &mut modules,
+                                &entry.module_id.to_string(),
+                                format!("Installed native dylib · {}", entry.interface_version),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let detail =
+                            format!("native module cache observations unavailable: {error}");
+                        warnings.push(detail.clone());
+                        native_dylib_observation_error = Some(detail);
+                    }
+                }
+            }
+            Err(error) => {
+                let detail = format!("native module loader observations unavailable: {error}");
+                warnings.push(detail.clone());
+                native_dylib_observation_error = Some(detail);
             }
         }
         if let Ok(states) = read_native_rust_module_runtime_states(&self.data_dir.root()) {
@@ -328,6 +377,18 @@ impl Backend {
             "wasix",
             "WASIX sandbox runtime module",
         );
+        insert_module_summary(
+            &mut modules,
+            sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID,
+            "native-dylib",
+            "Privileged node administration module",
+        );
+        if let Some(module) =
+            modules.get_mut(sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID)
+        {
+            module.backend = "native-dylib".to_string();
+            module.detail = "Privileged node administration module".to_string();
+        }
 
         let selected_is_local = selected_node.is_some_and(|node| node.summary.local);
         let empty_node_config = ModuleRuntimeConfig::default();
@@ -343,10 +404,22 @@ impl Backend {
             module.effective_enabled = effective.enabled;
             module.effective_source = effective.source;
             if selected_is_local {
-                let (state, detail) = observations.remove(&module.module_id).unwrap_or((
-                    ModuleObservedState::NotReported,
-                    "The local loader has not published an observation".to_string(),
-                ));
+                let observation = if module.backend == "native-dylib" {
+                    native_dylib_observations.remove(&module.module_id)
+                } else {
+                    observations.remove(&module.module_id)
+                };
+                let (state, detail) = observation.unwrap_or_else(|| {
+                    if module.backend == "native-dylib" {
+                        if let Some(error) = native_dylib_observation_error.as_ref() {
+                            return (ModuleObservedState::Unavailable, error.clone());
+                        }
+                    }
+                    (
+                        ModuleObservedState::NotReported,
+                        "The local loader has not published an observation".to_string(),
+                    )
+                });
                 module.observed = state;
                 module.observed_detail = detail;
             } else {
@@ -422,7 +495,25 @@ impl Backend {
         let paths = ClusterPaths::new(self.data_dir.as_ref());
         sinomo_runtime::cluster::read_cluster_state(&paths)
             .map(|state| state.local_node_id.to_string() == node_id)
-            .unwrap_or(true)
+            .unwrap_or_else(|_| {
+                matches!(
+                    &self.connection,
+                    crate::backend::Connection::LocalFallback { .. }
+                ) && self.node.node_id.to_string() == node_id
+            })
+    }
+}
+
+fn apply_module_override(
+    config: &mut ModuleRuntimeConfig,
+    module_id: &str,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    match enabled {
+        Some(enabled) => config
+            .set(module_id, ModuleRuntimeConfigEntry::enabled(enabled))
+            .map_err(|error| error.to_string()),
+        None => config.clear(module_id).map_err(|error| error.to_string()),
     }
 }
 
@@ -449,6 +540,21 @@ fn insert_module_summary(
             observed: ModuleObservedState::Unavailable,
             observed_detail: String::new(),
         });
+}
+
+fn insert_native_dylib_module_summary(
+    modules: &mut BTreeMap<String, ModuleConfigModuleSummary>,
+    module_id: &str,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    insert_module_summary(modules, module_id, "native-dylib", detail.clone());
+    if let Some(module) = modules.get_mut(module_id.trim()) {
+        if module.backend != "native-dylib" {
+            module.backend = "native-dylib".to_string();
+            module.detail = detail;
+        }
+    }
 }
 
 fn parse_node_id(node_id: &str) -> Result<NodeId, String> {
@@ -504,6 +610,13 @@ mod tests {
     }
 
     #[test]
+    fn missing_cluster_state_never_classifies_an_arbitrary_node_as_local() {
+        let backend = Backend::local_fallback();
+        assert!(backend.module_config_node_is_local(&backend.node.node_id.to_string()));
+        assert!(!backend.module_config_node_is_local("remote-node"));
+    }
+
+    #[test]
     fn catalog_keeps_desired_effective_and_observed_state_separate() {
         let backend = Backend::local_fallback();
         let module_id = "module.test-lifecycle";
@@ -526,7 +639,7 @@ mod tests {
             error: None,
         };
 
-        let modules = backend.module_config_catalog(&cluster, Some(&node));
+        let modules = backend.module_config_catalog(&cluster, Some(&node), &mut Vec::new());
         let module = modules
             .iter()
             .find(|module| module.module_id == module_id)
@@ -557,12 +670,68 @@ mod tests {
             error: None,
         };
 
-        let modules = backend.module_config_catalog(&cluster, Some(&node));
+        let modules = backend.module_config_catalog(&cluster, Some(&node), &mut Vec::new());
         let module = modules
             .iter()
             .find(|module| module.module_id == module_id)
             .expect("configured module");
         assert_eq!(module.observed, ModuleObservedState::Unavailable);
         assert!(module.observed_detail.contains("does not publish"));
+    }
+
+    #[test]
+    fn configured_native_dylib_keeps_its_loader_observation() {
+        let backend = Backend::local_fallback();
+        let module_id = "module.configured-native-test";
+        let typed_module_id = sinomo_runtime::module::ModuleId::from_legacy_named(module_id)
+            .expect("configured native module id");
+        sinomo_runtime::module::write_native_dylib_module_loader_state(
+            &backend.data_dir.root(),
+            &sinomo_runtime::module::NativeDylibModuleLoaderState {
+                module_id: typed_module_id,
+                artifact_id: None,
+                content_hash: "00".repeat(32),
+                cache_key: "configured/native-test".to_string(),
+                library_name: "configured-native-test.test".to_string(),
+                platform_triple: format!(
+                    "{}-{}-{}",
+                    std::env::consts::ARCH,
+                    std::env::consts::OS,
+                    std::env::consts::FAMILY
+                ),
+                native_abi_version: sinomo_runtime::module::NATIVE_DYLIB_HOST_ABI_VERSION,
+                interface_version: "sinomo.configured-native-test.test".to_string(),
+                activated_at: "2026-07-18T00:00:00Z".to_string(),
+                source: "test".to_string(),
+            },
+        )
+        .expect("write native loader record");
+        let mut cluster = ModuleRuntimeConfig::default();
+        cluster
+            .set(module_id, ModuleRuntimeConfigEntry::enabled(true))
+            .expect("cluster desired state");
+        let node = ModuleConfigNode {
+            summary: ModuleConfigNodeSummary {
+                node_id: backend.node.node_id.to_string(),
+                display_name: "Local workstation".to_string(),
+                availability: "online".to_string(),
+                local: true,
+            },
+            config: ModuleRuntimeConfig::default(),
+            error: None,
+        };
+
+        let modules = backend.module_config_catalog(&cluster, Some(&node), &mut Vec::new());
+        let module = modules
+            .iter()
+            .find(|module| module.module_id == module_id)
+            .expect("configured native module");
+        assert_eq!(module.backend, "native-dylib");
+        assert_eq!(module.observed, ModuleObservedState::NotReported);
+        assert!(
+            module
+                .observed_detail
+                .contains("daemon registration is not independently reported")
+        );
     }
 }

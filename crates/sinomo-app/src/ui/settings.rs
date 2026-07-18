@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -47,6 +48,7 @@ use sinomo_runtime::config::{
     ConfigClient, ConfigKey, ConfigSchema, ConfigSchemaField, ConfigSchemaValue, ConfigWriteTarget,
 };
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::node::LocalNodePermissions;
 
 use crate::backend::Backend;
 use crate::backend::agents::{
@@ -66,6 +68,10 @@ use crate::backend::config::{
     set_value, test_provider_connection, text_verbosity_index,
 };
 use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState};
+use crate::backend::remote_management::{
+    REMOTE_MANAGEMENT_ALLOW_COMMAND, REMOTE_MANAGEMENT_DENY_COMMAND,
+    RemoteManagementSettingsSnapshot,
+};
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
 use crate::theme::{AppTextScale, AppThemeMode, Palette};
@@ -89,8 +95,11 @@ const AGENT_SPLIT_THRESHOLD: f32 = 820.0;
 
 const GENERAL_SETTINGS: &[SettingsSection] =
     &[SettingsSection::Appearance, SettingsSection::Connection];
-const INSTALLATION_SETTINGS: &[SettingsSection] =
-    &[SettingsSection::Node, SettingsSection::Cluster];
+const INSTALLATION_SETTINGS: &[SettingsSection] = &[
+    SettingsSection::Node,
+    SettingsSection::RemoteManagement,
+    SettingsSection::Cluster,
+];
 const AUTOMATION_SETTINGS: &[SettingsSection] =
     &[SettingsSection::Providers, SettingsSection::Agents];
 const EXTENSION_SETTINGS: &[SettingsSection] = &[SettingsSection::Modules, SettingsSection::Skills];
@@ -107,6 +116,7 @@ pub enum SettingsSection {
     Appearance,
     Connection,
     Node,
+    RemoteManagement,
     Cluster,
     Providers,
     Agents,
@@ -117,10 +127,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Appearance,
         SettingsSection::Connection,
         SettingsSection::Node,
+        SettingsSection::RemoteManagement,
         SettingsSection::Cluster,
         SettingsSection::Providers,
         SettingsSection::Agents,
@@ -135,6 +146,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Connection => "Connectivity",
             SettingsSection::Node => "This device",
+            SettingsSection::RemoteManagement => "Remote management",
             SettingsSection::Cluster => "Cluster",
             SettingsSection::Providers => "Providers",
             SettingsSection::Agents => "Agents",
@@ -153,6 +165,9 @@ impl SettingsSection {
             }
             SettingsSection::Node => {
                 "Inspect this installation's runtime identity and local connection."
+            }
+            SettingsSection::RemoteManagement => {
+                "Control local host access and the remote-management module on this node."
             }
             SettingsSection::Cluster => {
                 "Manage cluster membership, invitations, and this device's participation."
@@ -183,6 +198,7 @@ impl SettingsSection {
             SettingsSection::Appearance => IconGlyph::Brush,
             SettingsSection::Connection => IconGlyph::Link,
             SettingsSection::Node => IconGlyph::Monitor,
+            SettingsSection::RemoteManagement => IconGlyph::Lock,
             SettingsSection::Cluster => IconGlyph::Storage,
             SettingsSection::Providers => IconGlyph::Chat,
             SettingsSection::Agents => IconGlyph::Sparkles,
@@ -254,6 +270,12 @@ pub struct SettingsState {
     pub module_selected_node_id: Option<String>,
     pub module_action_error: Option<String>,
     pub module_action_status: Option<String>,
+    pub remote_management: RemoteManagementSettingsSnapshot,
+    pub remote_management_permission_error: Option<String>,
+    pub remote_management_permission_status: Option<String>,
+    pub remote_management_module_error: Option<String>,
+    pub remote_management_module_status: Option<String>,
+    pub remote_management_enable_confirming: bool,
     pub skills: Vec<SkillSummary>,
     pub skill_detail: Option<SkillDetail>,
     pub skill_selected: Option<(String, String)>,
@@ -276,6 +298,10 @@ pub struct SettingsState {
     initial_load_rx: Option<Receiver<SettingsInitialLoadResult>>,
     initial_load_started: bool,
     operation_lane: Option<SettingsOperationLane>,
+    /// Invalidates queued daemon-backed requests after reconnect. The
+    /// node-local permission mutation is intentionally exempt and returns its
+    /// exact post-lock document through the retained result lane.
+    operation_epoch: Arc<AtomicU64>,
     next_operation_request_id: u64,
     pending_operations: HashMap<SettingsOperationScope, u64>,
     provider_refresh_needed: bool,
@@ -367,6 +393,19 @@ struct SettingsClusterStructure {
     invite: Option<(String, String, String, String)>,
     leave_confirming: bool,
     join_confirming: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsRemoteManagementStructure {
+    theme: (AppThemeMode, AppTextScale),
+    snapshot: RemoteManagementSettingsSnapshot,
+    permission_error: Option<String>,
+    permission_status: Option<String>,
+    module_error: Option<String>,
+    module_status: Option<String>,
+    enable_confirming: bool,
+    permission_pending: bool,
+    module_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -485,6 +524,7 @@ struct SettingsStructureSnapshot {
     navigation_previews: Vec<(SettingsSection, String)>,
     connection: SettingsConnectionStructure,
     node: SettingsNodeStructure,
+    remote_management: SettingsRemoteManagementStructure,
     cluster: SettingsClusterStructure,
     configuration: SettingsConfigurationStructure,
     providers: SettingsProviderStructure,
@@ -520,6 +560,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
         selected,
         connection,
         node,
+        remote_management,
         cluster,
         configuration,
         providers,
@@ -672,6 +713,17 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                 cluster_summary: settings.cluster_summary.clone(),
                 expanded: settings.node_detail_expanded,
             },
+            SettingsRemoteManagementStructure {
+                theme,
+                snapshot: settings.remote_management.clone(),
+                permission_error: settings.remote_management_permission_error.clone(),
+                permission_status: settings.remote_management_permission_status.clone(),
+                module_error: settings.remote_management_module_error.clone(),
+                module_status: settings.remote_management_module_status.clone(),
+                enable_confirming: settings.remote_management_enable_confirming,
+                permission_pending: settings.remote_management_permission_pending(),
+                module_pending: settings.remote_management_module_pending(),
+            },
             SettingsClusterStructure {
                 theme,
                 clustered: settings.clustered,
@@ -708,6 +760,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
         navigation_previews,
         connection,
         node,
+        remote_management,
         cluster,
         configuration,
         providers,
@@ -727,6 +780,8 @@ struct SettingsGenerations {
     providers: u64,
     agents: u64,
     modules: u64,
+    remote_management_permission: u64,
+    remote_management: u64,
     skills: u64,
     cluster: u64,
 }
@@ -738,6 +793,7 @@ impl SettingsGenerations {
             SettingsOperationDomain::Providers => self.providers,
             SettingsOperationDomain::Agents => self.agents,
             SettingsOperationDomain::Modules => self.modules,
+            SettingsOperationDomain::RemoteManagement => self.remote_management,
             SettingsOperationDomain::Skills => self.skills,
             SettingsOperationDomain::Cluster => self.cluster,
         }
@@ -749,6 +805,7 @@ impl SettingsGenerations {
             SettingsOperationDomain::Providers => &mut self.providers,
             SettingsOperationDomain::Agents => &mut self.agents,
             SettingsOperationDomain::Modules => &mut self.modules,
+            SettingsOperationDomain::RemoteManagement => &mut self.remote_management,
             SettingsOperationDomain::Skills => &mut self.skills,
             SettingsOperationDomain::Cluster => &mut self.cluster,
         };
@@ -762,6 +819,7 @@ enum SettingsOperationDomain {
     Providers,
     Agents,
     Modules,
+    RemoteManagement,
     Skills,
     Cluster,
 }
@@ -772,6 +830,9 @@ enum SettingsOperationScope {
     Providers,
     Agents,
     Modules,
+    RemoteManagementRefresh,
+    RemoteManagementPermission,
+    RemoteManagementModule,
     Skills,
     Cluster,
 }
@@ -783,6 +844,9 @@ impl SettingsOperationScope {
             Self::Providers => SettingsOperationDomain::Providers,
             Self::Agents => SettingsOperationDomain::Agents,
             Self::Modules => SettingsOperationDomain::Modules,
+            Self::RemoteManagementRefresh
+            | Self::RemoteManagementPermission
+            | Self::RemoteManagementModule => SettingsOperationDomain::RemoteManagement,
             Self::Skills => SettingsOperationDomain::Skills,
             Self::Cluster => SettingsOperationDomain::Cluster,
         }
@@ -804,6 +868,8 @@ struct SettingsOperationRequest {
     request_id: u64,
     scope: SettingsOperationScope,
     draft_generation: u64,
+    operation_epoch: u64,
+    operation_epoch_source: Arc<AtomicU64>,
     backend: Backend,
     operation: SettingsOperation,
 }
@@ -905,6 +971,13 @@ enum SettingsOperation {
         module_id: String,
         enabled: Option<bool>,
     },
+    RefreshRemoteManagement,
+    SetRemoteManagementPermission {
+        enabled: bool,
+    },
+    SetRemoteManagementModuleOverride {
+        enabled: Option<bool>,
+    },
     RefreshSkills {
         include_all: bool,
         selected: Option<(String, String)>,
@@ -943,6 +1016,7 @@ enum SettingsOperationPayload {
     ProviderHealth(ProviderHealthOperationResult),
     Agents(Result<AgentOperationSuccess, String>),
     Modules(Result<ModuleOperationSuccess, String>),
+    RemoteManagement(Result<RemoteManagementOperationSuccess, String>),
     Skills(Result<SkillOperationSuccess, String>),
     Cluster(Result<ClusterOperationSuccess, String>),
 }
@@ -1028,7 +1102,24 @@ enum AgentOperationEffect {
 
 struct ModuleOperationSuccess {
     snapshot: ModuleConfigSnapshot,
+    remote_management: RemoteManagementSettingsSnapshot,
     message: Option<String>,
+}
+
+enum RemoteManagementOperationSuccess {
+    Refreshed {
+        snapshot: RemoteManagementSettingsSnapshot,
+        local_module_snapshot: ModuleConfigSnapshot,
+    },
+    PermissionChanged {
+        permissions: LocalNodePermissions,
+        message: String,
+    },
+    ModuleChanged {
+        snapshot: RemoteManagementSettingsSnapshot,
+        local_module_snapshot: ModuleConfigSnapshot,
+        message: String,
+    },
 }
 
 struct SkillOperationSuccess {
@@ -1352,6 +1443,8 @@ impl SettingsState {
             .selected_node
             .as_ref()
             .map(|node| node.summary.node_id.clone());
+        let remote_management =
+            backend.remote_management_settings_snapshot_from_modules(&module_snapshot);
 
         let cluster_status = backend.app_cluster_status();
         let (clustered, cluster_summary) = if cluster_status.clustered {
@@ -1421,6 +1514,12 @@ impl SettingsState {
             module_selected_node_id,
             module_action_error: None,
             module_action_status: None,
+            remote_management,
+            remote_management_permission_error: None,
+            remote_management_permission_status: None,
+            remote_management_module_error: None,
+            remote_management_module_status: None,
+            remote_management_enable_confirming: false,
             skills,
             skill_detail,
             skill_selected,
@@ -1436,6 +1535,7 @@ impl SettingsState {
             initial_load_rx: None,
             initial_load_started: false,
             operation_lane: None,
+            operation_epoch: Arc::new(AtomicU64::new(0)),
             next_operation_request_id: 0,
             pending_operations: HashMap::new(),
             provider_refresh_needed: false,
@@ -1526,6 +1626,12 @@ impl SettingsState {
             module_selected_node_id: None,
             module_action_error: None,
             module_action_status: None,
+            remote_management: RemoteManagementSettingsSnapshot::default(),
+            remote_management_permission_error: None,
+            remote_management_permission_status: None,
+            remote_management_module_error: None,
+            remote_management_module_status: None,
+            remote_management_enable_confirming: false,
             skills: Vec::new(),
             skill_detail: None,
             skill_selected: None,
@@ -1541,6 +1647,7 @@ impl SettingsState {
             initial_load_rx: None,
             initial_load_started: false,
             operation_lane: None,
+            operation_epoch: Arc::new(AtomicU64::new(0)),
             next_operation_request_id: 0,
             pending_operations: HashMap::new(),
             provider_refresh_needed: false,
@@ -1608,12 +1715,18 @@ impl SettingsState {
     }
 
     /// Rebind Settings after the connection state machine installs a new daemon backend. In-flight
-    /// calls cannot be cancelled while an RPC is blocked, so dropping the lane/result receiver is
-    /// the synchronization boundary: old results can finish, but can no longer mutate live UI
-    /// state. Drafts remain intact and affected actions become explicitly retryable.
+    /// daemon calls cannot be cancelled, so their request IDs are abandoned and late results are
+    /// ignored. A node-local permission write is the exception: it is independent of the daemon
+    /// and may already have committed, so its result lane is retained until the authoritative
+    /// post-mutation document arrives.
     pub(crate) fn rebind_backend(&mut self, backend: &Backend) {
-        let retry_message = "Connection changed before the action completed; retry it.";
+        let retry_message =
+            "Connection changed while the action was in flight; verify refreshed state before retrying.";
+        self.operation_epoch.fetch_add(1, Ordering::AcqRel);
         let pending_scopes = self.pending_operations.keys().cloned().collect::<Vec<_>>();
+        let preserve_permission_write = self
+            .pending_operations
+            .contains_key(&SettingsOperationScope::RemoteManagementPermission);
         for scope in &pending_scopes {
             match scope {
                 SettingsOperationScope::ConfigField(key) => {
@@ -1632,6 +1745,21 @@ impl SettingsState {
                     self.module_action_error = Some(retry_message.to_string());
                     self.module_action_status = None;
                 }
+                SettingsOperationScope::RemoteManagementPermission => {
+                    self.remote_management_permission_error = None;
+                    self.remote_management_permission_status =
+                        Some("Finishing the node-local permission change…".to_string());
+                }
+                SettingsOperationScope::RemoteManagementModule => {
+                    self.remote_management_module_error = Some(retry_message.to_string());
+                    self.remote_management_module_status = None;
+                }
+                SettingsOperationScope::RemoteManagementRefresh => {
+                    self.remote_management_permission_error = Some(retry_message.to_string());
+                    self.remote_management_permission_status = None;
+                    self.remote_management_module_error = Some(retry_message.to_string());
+                    self.remote_management_module_status = None;
+                }
                 SettingsOperationScope::Skills => {
                     self.skill_action_error = Some(retry_message.to_string());
                     self.skill_action_status = None;
@@ -1641,8 +1769,13 @@ impl SettingsState {
                 }
             }
         }
-        self.pending_operations.clear();
-        self.operation_lane = None;
+        if preserve_permission_write {
+            self.pending_operations
+                .retain(|scope, _| *scope == SettingsOperationScope::RemoteManagementPermission);
+        } else {
+            self.pending_operations.clear();
+            self.operation_lane = None;
+        }
         self.provider_refresh_needed = false;
         self.provider_refresh_health_invalidation = None;
         self.initial_load_rx = None;
@@ -1654,11 +1787,16 @@ impl SettingsState {
             SettingsOperationDomain::Providers,
             SettingsOperationDomain::Agents,
             SettingsOperationDomain::Modules,
+            SettingsOperationDomain::RemoteManagement,
             SettingsOperationDomain::Skills,
             SettingsOperationDomain::Cluster,
         ] {
             self.server_generations.bump(domain);
         }
+        self.server_generations.remote_management_permission = self
+            .server_generations
+            .remote_management_permission
+            .wrapping_add(1);
     }
 
     /// Merge only server-owned fields whose domain has not advanced since the preload began.
@@ -1711,6 +1849,17 @@ impl SettingsState {
                 self.module_selected_node_id = loaded.module_selected_node_id;
             }
         }
+        if self.server_generations.remote_management_permission
+            == result.server_generations.remote_management_permission
+        {
+            self.remote_management
+                .replace_permission_state(&loaded.remote_management);
+        }
+        if self.server_generations.remote_management == result.server_generations.remote_management
+        {
+            self.remote_management
+                .replace_module_state(&loaded.remote_management);
+        }
         if self.server_generations.skills == result.server_generations.skills {
             self.skills = loaded.skills;
             if result.draft_generations.skills == 0
@@ -1751,6 +1900,37 @@ impl SettingsState {
             .any(|scope| scope.domain() == domain)
     }
 
+    fn remote_management_permission_pending(&self) -> bool {
+        self.operation_pending(&SettingsOperationScope::RemoteManagementPermission)
+            || self.operation_pending(&SettingsOperationScope::RemoteManagementRefresh)
+    }
+
+    fn remote_management_module_pending(&self) -> bool {
+        self.operation_pending(&SettingsOperationScope::RemoteManagementModule)
+            || self.operation_pending(&SettingsOperationScope::RemoteManagementRefresh)
+    }
+
+    fn apply_local_module_snapshot_if_selected(&mut self, snapshot: ModuleConfigSnapshot) {
+        let Some(local_node_id) = snapshot
+            .selected_node
+            .as_ref()
+            .filter(|node| node.summary.local)
+            .map(|node| node.summary.node_id.clone())
+        else {
+            return;
+        };
+        self.server_generations
+            .bump(SettingsOperationDomain::Modules);
+        if self
+            .module_selected_node_id
+            .as_deref()
+            .is_none_or(|selected| selected == local_node_id.as_str())
+        {
+            self.module_selected_node_id = Some(local_node_id);
+            self.module_snapshot = snapshot;
+        }
+    }
+
     fn queue_operation(
         &mut self,
         backend: Backend,
@@ -1787,12 +1967,15 @@ impl SettingsState {
         let request_id = self.next_operation_request_id;
         self.next_operation_request_id = self.next_operation_request_id.wrapping_add(1);
         let draft_generation = self.draft_generations.get(scope.domain());
+        let operation_epoch = self.operation_epoch.load(Ordering::Acquire);
         self.mark_operation_pending(&operation);
         self.pending_operations.insert(scope.clone(), request_id);
         let request = SettingsOperationRequest {
             request_id,
             scope: scope.clone(),
             draft_generation,
+            operation_epoch,
+            operation_epoch_source: Arc::clone(&self.operation_epoch),
             backend,
             operation,
         };
@@ -1896,6 +2079,25 @@ impl SettingsState {
                 self.module_action_error = None;
                 self.module_action_status = Some("Saving module configuration…".to_string());
             }
+            SettingsOperation::RefreshRemoteManagement => {
+                self.remote_management_permission_error = None;
+                self.remote_management_permission_status = None;
+                self.remote_management_module_error = None;
+                self.remote_management_module_status = None;
+            }
+            SettingsOperation::SetRemoteManagementPermission { enabled } => {
+                self.remote_management_permission_error = None;
+                self.remote_management_permission_status = Some(if *enabled {
+                    "Allowing remote management…".to_string()
+                } else {
+                    "Revoking remote management…".to_string()
+                });
+            }
+            SettingsOperation::SetRemoteManagementModuleOverride { .. } => {
+                self.remote_management_module_error = None;
+                self.remote_management_module_status =
+                    Some("Saving the local module override…".to_string());
+            }
             SettingsOperation::RefreshSkills { .. } => {
                 self.skill_action_error = None;
                 self.skill_action_status = Some("Refreshing skills…".to_string());
@@ -1946,6 +2148,23 @@ impl SettingsState {
                 self.module_action_error = Some(error);
                 self.module_action_status = None;
             }
+            SettingsOperationDomain::RemoteManagement => match scope {
+                SettingsOperationScope::RemoteManagementPermission => {
+                    self.remote_management_permission_error = Some(error);
+                    self.remote_management_permission_status = None;
+                }
+                SettingsOperationScope::RemoteManagementModule => {
+                    self.remote_management_module_error = Some(error);
+                    self.remote_management_module_status = None;
+                }
+                SettingsOperationScope::RemoteManagementRefresh => {
+                    self.remote_management_permission_error = Some(error.clone());
+                    self.remote_management_permission_status = None;
+                    self.remote_management_module_error = Some(error);
+                    self.remote_management_module_status = None;
+                }
+                _ => unreachable!("remote-management domain has a remote-management scope"),
+            },
             SettingsOperationDomain::Skills => {
                 self.skill_action_error = Some(error);
                 self.skill_action_status = None;
@@ -2157,7 +2376,11 @@ impl SettingsState {
                 SettingsOperationPayload::Modules(Ok(success)) => {
                     self.server_generations
                         .bump(SettingsOperationDomain::Modules);
+                    self.server_generations
+                        .bump(SettingsOperationDomain::RemoteManagement);
                     self.module_snapshot = success.snapshot;
+                    self.remote_management
+                        .replace_module_state(&success.remote_management);
                     if self.draft_generations.modules == result.draft_generation {
                         self.module_selected_node_id = self
                             .module_snapshot
@@ -2169,6 +2392,56 @@ impl SettingsState {
                     self.module_action_status = success.message;
                 }
                 SettingsOperationPayload::Modules(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::RemoteManagement(Ok(success)) => {
+                    match success {
+                        RemoteManagementOperationSuccess::Refreshed {
+                            snapshot,
+                            local_module_snapshot,
+                        } => {
+                            self.server_generations.remote_management_permission = self
+                                .server_generations
+                                .remote_management_permission
+                                .wrapping_add(1);
+                            self.server_generations
+                                .bump(SettingsOperationDomain::RemoteManagement);
+                            self.remote_management = snapshot;
+                            self.apply_local_module_snapshot_if_selected(local_module_snapshot);
+                            self.remote_management_permission_error = None;
+                            self.remote_management_permission_status = None;
+                            self.remote_management_module_error = None;
+                            self.remote_management_module_status = None;
+                        }
+                        RemoteManagementOperationSuccess::PermissionChanged {
+                            permissions,
+                            message,
+                        } => {
+                            self.server_generations.remote_management_permission = self
+                                .server_generations
+                                .remote_management_permission
+                                .wrapping_add(1);
+                            self.remote_management
+                                .replace_permission_document(&permissions);
+                            self.remote_management_permission_error = None;
+                            self.remote_management_permission_status = Some(message);
+                            self.remote_management_enable_confirming = false;
+                        }
+                        RemoteManagementOperationSuccess::ModuleChanged {
+                            snapshot,
+                            local_module_snapshot,
+                            message,
+                        } => {
+                            self.server_generations
+                                .bump(SettingsOperationDomain::RemoteManagement);
+                            self.remote_management.replace_module_state(&snapshot);
+                            self.apply_local_module_snapshot_if_selected(local_module_snapshot);
+                            self.remote_management_module_error = None;
+                            self.remote_management_module_status = Some(message);
+                        }
+                    }
+                }
+                SettingsOperationPayload::RemoteManagement(Err(error)) => {
                     self.apply_operation_queue_error(&result.scope, error);
                 }
                 SettingsOperationPayload::Skills(Ok(success)) => {
@@ -2265,6 +2538,18 @@ impl SettingsState {
 
     fn toggle_node_detail(&mut self) {
         self.node_detail_expanded = !self.node_detail_expanded;
+    }
+
+    fn confirm_remote_management_enable(&mut self) {
+        self.remote_management_enable_confirming = true;
+        self.remote_management_permission_error = None;
+        self.remote_management_permission_status = None;
+        self.mark_draft_changed(SettingsOperationDomain::RemoteManagement);
+    }
+
+    fn cancel_remote_management_enable(&mut self) {
+        self.remote_management_enable_confirming = false;
+        self.mark_draft_changed(SettingsOperationDomain::RemoteManagement);
     }
 
     fn set_advanced_query(&mut self, query: String) {
@@ -3218,6 +3503,9 @@ fn settings_operation_worker(
     waker: Option<sui::UiHandle>,
 ) {
     while let Ok(request) = request_rx.recv() {
+        if !settings_operation_request_is_current(&request) {
+            continue;
+        }
         let payload = execute_settings_operation(&request.backend, request.operation);
         let result = SettingsOperationResult {
             request_id: request.request_id,
@@ -3232,6 +3520,13 @@ fn settings_operation_worker(
             waker.wake();
         }
     }
+}
+
+fn settings_operation_request_is_current(request: &SettingsOperationRequest) -> bool {
+    matches!(
+        &request.scope,
+        SettingsOperationScope::RemoteManagementPermission
+    ) || request.operation_epoch_source.load(Ordering::Acquire) == request.operation_epoch
 }
 
 fn execute_settings_operation(
@@ -3511,10 +3806,8 @@ fn execute_settings_operation(
             ))
         })()),
         SettingsOperation::RefreshModules { selected_node_id } => {
-            SettingsOperationPayload::Modules(Ok(ModuleOperationSuccess {
-                snapshot: backend.module_config_snapshot(selected_node_id.as_deref()),
-                message: None,
-            }))
+            let snapshot = backend.module_config_snapshot(selected_node_id.as_deref());
+            SettingsOperationPayload::Modules(Ok(module_operation_success(backend, snapshot, None)))
         }
         SettingsOperation::SetClusterModuleDefault {
             selected_node_id,
@@ -3522,13 +3815,15 @@ fn execute_settings_operation(
             enabled,
         } => SettingsOperationPayload::Modules((|| {
             backend.set_cluster_module_default(&module_id, enabled)?;
-            Ok(ModuleOperationSuccess {
-                snapshot: backend.module_config_snapshot(selected_node_id.as_deref()),
-                message: Some(format!(
+            let snapshot = backend.module_config_snapshot(selected_node_id.as_deref());
+            Ok(module_operation_success(
+                backend,
+                snapshot,
+                Some(format!(
                     "Cluster default saved for {}",
                     module_display_id(&module_id)
                 )),
-            })
+            ))
         })()),
         SettingsOperation::SetNodeModuleOverride {
             node_id,
@@ -3552,11 +3847,51 @@ fn execute_settings_operation(
                     module_display_id(&module_id)
                 ),
             };
-            Ok(ModuleOperationSuccess {
-                snapshot: backend.module_config_snapshot(Some(&node_id)),
-                message: Some(message),
-            })
+            let snapshot = backend.module_config_snapshot(Some(&node_id));
+            Ok(module_operation_success(backend, snapshot, Some(message)))
         })()),
+        SettingsOperation::RefreshRemoteManagement => {
+            let module_snapshot = backend.module_config_snapshot(None);
+            SettingsOperationPayload::RemoteManagement(Ok(
+                RemoteManagementOperationSuccess::Refreshed {
+                snapshot: backend
+                    .remote_management_settings_snapshot_from_modules(&module_snapshot),
+                    local_module_snapshot: module_snapshot,
+                },
+            ))
+        }
+        SettingsOperation::SetRemoteManagementPermission { enabled } => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                let mutation = backend.set_local_remote_management_permission(enabled)?;
+                let message = match (enabled, mutation.changed) {
+                    (true, true) => "Remote management is now allowed on this node",
+                    (true, false) => "Remote management was already allowed on this node",
+                    (false, true) => "Remote management was revoked on this node",
+                    (false, false) => "Remote management was already denied on this node",
+                };
+                Ok(RemoteManagementOperationSuccess::PermissionChanged {
+                    permissions: mutation.permissions,
+                    message: message.to_string(),
+                })
+            })())
+        }
+        SettingsOperation::SetRemoteManagementModuleOverride { enabled } => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                backend.set_local_remote_management_module_override(enabled)?;
+                let message = match enabled {
+                    Some(true) => "Local module override set to enabled",
+                    Some(false) => "Local module override set to disabled",
+                    None => "Local module override cleared; the cluster default now applies",
+                };
+                let module_snapshot = backend.module_config_snapshot(None);
+                Ok(RemoteManagementOperationSuccess::ModuleChanged {
+                    snapshot: backend
+                        .remote_management_settings_snapshot_from_modules(&module_snapshot),
+                    local_module_snapshot: module_snapshot,
+                    message: message.to_string(),
+                })
+            })())
+        }
         SettingsOperation::RefreshSkills {
             include_all,
             selected,
@@ -3671,6 +4006,27 @@ fn agent_operation_success(
         snapshot: backend.agent_config_snapshot(selected_id),
         chat_agents: agent_summaries(backend.data_dir.as_ref()),
         effect,
+    }
+}
+
+fn module_operation_success(
+    backend: &Backend,
+    snapshot: ModuleConfigSnapshot,
+    message: Option<String>,
+) -> ModuleOperationSuccess {
+    let remote_management = if snapshot
+        .selected_node
+        .as_ref()
+        .is_some_and(|node| node.summary.local)
+    {
+        backend.remote_management_settings_snapshot_from_modules(&snapshot)
+    } else {
+        backend.remote_management_settings_snapshot()
+    };
+    ModuleOperationSuccess {
+        snapshot,
+        remote_management,
+        message,
     }
 }
 
@@ -4482,6 +4838,27 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             }
         }
         SettingsSection::Node => app_surface_summary(&shared.settings().role),
+        SettingsSection::RemoteManagement => {
+            let settings = shared.settings();
+            let snapshot = &settings.remote_management;
+            if snapshot.permission_loading || snapshot.module_loading {
+                "Loading".to_string()
+            } else if snapshot.permission_error.is_some()
+                || snapshot.module_error.is_some()
+                || settings.remote_management_permission_error.is_some()
+                || settings.remote_management_module_error.is_some()
+            {
+                "Needs attention".to_string()
+            } else if snapshot.permission_enabled
+                && snapshot.module_observed == ModuleObservedState::Running
+            {
+                "Allowed · active".to_string()
+            } else if snapshot.permission_enabled {
+                "Permission allowed".to_string()
+            } else {
+                "Denied".to_string()
+            }
+        }
         SettingsSection::Cluster => {
             let settings = shared.settings();
             if settings.clustered {
@@ -5606,6 +5983,465 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
     FormSection::new("Node", body)
         .description("App surface identity and the attached daemon or cluster connection.")
         .theme_when(clone_reader(reader))
+}
+
+fn section_remote_management(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared.signals().settings_structure.select_named(
+        "settings remote management structure",
+        |key| {
+            key.0
+                .as_deref()
+                .map(|snapshot| snapshot.remote_management.clone())
+        },
+    );
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(section_remote_management_body(&s, &r))
+    })
+}
+
+fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (
+        snapshot,
+        permission_action_error,
+        permission_action_status,
+        module_action_error,
+        module_action_status,
+        confirming,
+        permission_pending,
+        module_pending,
+    ) = {
+        let settings = shared.settings();
+        (
+            settings.remote_management.clone(),
+            settings.remote_management_permission_error.clone(),
+            settings.remote_management_permission_status.clone(),
+            settings.remote_management_module_error.clone(),
+            settings.remote_management_module_status.clone(),
+            settings.remote_management_enable_confirming,
+            settings.remote_management_permission_pending(),
+            settings.remote_management_module_pending(),
+        )
+    };
+
+    let permission_status = if snapshot.permission_loading {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Loading",
+            SemanticTone::Neutral,
+            "Reading the node-local permission document",
+        )
+    } else if snapshot.permission_error.is_some() {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Unavailable",
+            SemanticTone::Danger,
+            "Permission state could not be read, so access remains fail-closed",
+        )
+    } else if snapshot.permission_enabled {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Allowed",
+            SemanticTone::Warning,
+            "Signed local or voter administrators may use unrestricted host-management routes",
+        )
+    } else {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Denied",
+            SemanticTone::Neutral,
+            "Remote host-management effects are blocked on this node",
+        )
+    };
+
+    let permission_control = if permission_pending {
+        WidgetPod::new(
+            FormRow::new(
+                "Allow remote management",
+                Stack::horizontal()
+                    .spacing(8.0)
+                    .with_child(
+                        Spinner::new("remote-management-permission-pending")
+                            .theme_when(clone_reader(reader)),
+                    )
+                    .with_child(muted_label(shared, "Applying local permission…")),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        )
+    } else if snapshot.permission_loading || snapshot.permission_error.is_some() {
+        let refresh = {
+            let s = shared.clone();
+            sui::Button::new("Refresh")
+                .icon(IconGlyph::Redo)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::RemoteManagementRefresh,
+                        SettingsOperation::RefreshRemoteManagement,
+                    );
+                })
+        };
+        WidgetPod::new(
+            FormRow::new("Permission", Stack::horizontal().with_child(refresh))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    } else if snapshot.permission_enabled {
+        let s = shared.clone();
+        let control = Switch::new("Allow remote management")
+            .on(true)
+            .theme_when(clone_reader(reader))
+            .on_toggle(move |enabled| {
+                if !enabled {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::RemoteManagementPermission,
+                        SettingsOperation::SetRemoteManagementPermission { enabled: false },
+                    );
+                }
+            });
+        WidgetPod::new(
+            FormRow::new("Permission", control)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    } else {
+        let s = shared.clone();
+        let allow = sui::Button::new("Allow remote management…")
+            .icon(IconGlyph::Lock)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Warning)
+            .on_press(move || s.settings_mut().confirm_remote_management_enable());
+        WidgetPod::new(
+            FormRow::new("Permission", Stack::horizontal().with_child(allow))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    };
+
+    let mut permission_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Local permission", permission_status)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(PodHost::new(permission_control));
+
+    if confirming && !snapshot.permission_enabled && !permission_pending {
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new("Confirm allow")
+                .icon(IconGlyph::Lock)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
+                .on_press(move || {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::RemoteManagementPermission,
+                        SettingsOperation::SetRemoteManagementPermission { enabled: true },
+                    );
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || s.settings_mut().cancel_remote_management_enable())
+        };
+        let confirmation_body = Stack::vertical()
+            .spacing(7.0)
+            .alignment(Alignment::Stretch)
+            .with_child(muted_label(
+                shared,
+                "This permits signed local or voter administrators to run shell commands, transfer files, inspect the host, and change ordinary node configuration.",
+            ))
+            .with_child(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .with_child(confirm)
+                    .with_child(cancel),
+            );
+        permission_body = permission_body.with_child(
+            SemanticRegion::new(
+                "Allow remote management confirmation",
+                FormRow::new("Confirm access", confirmation_body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+            .description("Confirmation is required before changing the local host permission")
+            .role(SemanticsRole::Dialog),
+        );
+    }
+
+    if snapshot.resource_exposure_count > 0 {
+        permission_body = permission_body.with_child(value_row(
+            shared,
+            reader,
+            "Other device exposure",
+            format!(
+                "{} operation{} across {} resource{} · managed separately from remote management",
+                snapshot.resource_operation_count,
+                if snapshot.resource_operation_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                snapshot.resource_exposure_count,
+                if snapshot.resource_exposure_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+        ));
+    }
+    if let Some(error) = snapshot.permission_error.clone() {
+        permission_body = permission_body.with_child(copyable_area_row(
+            reader,
+            "remote-management-permission-error",
+            "Permission error",
+            error,
+        ));
+    }
+    if let Some(error) = permission_action_error.clone() {
+        permission_body = permission_body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = permission_action_status.clone() {
+        permission_body = permission_body.with_child(value_row(shared, reader, "Status", status));
+    }
+
+    let permission_section = FormSection::new("Local permission", permission_body)
+        .description(
+            "This grant is stored only on this node, applies immediately, and is never changed by module activation or a remote request.",
+        )
+        .theme_when(clone_reader(reader));
+
+    let effective = module_lifecycle_value(
+        shared,
+        reader,
+        if snapshot.module_effective_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if snapshot.module_effective_enabled {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Neutral
+        },
+        module_effective_source_label(snapshot.module_effective_source),
+    );
+    let observed = module_lifecycle_value(
+        shared,
+        reader,
+        remote_management_observed_label(snapshot.module_observed),
+        module_observed_tone(snapshot.module_observed),
+        snapshot.module_observed_detail.clone(),
+    );
+    let module_override = if module_pending {
+        WidgetPod::new(
+            FormRow::new(
+                "Node override",
+                Stack::horizontal()
+                    .spacing(8.0)
+                    .with_child(
+                        Spinner::new("remote-management-module-pending")
+                            .theme_when(clone_reader(reader)),
+                    )
+                    .with_child(muted_label(shared, "Saving desired state…")),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        )
+    } else if snapshot.module_loading || snapshot.module_node_id.is_none() {
+        let content = if snapshot.module_loading {
+            Stack::horizontal()
+                .spacing(8.0)
+                .with_child(
+                    Spinner::new("remote-management-module-loading")
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_child(muted_label(shared, "Reading local module state…"))
+        } else {
+            let s = shared.clone();
+            Stack::horizontal()
+                .spacing(8.0)
+                .with_child(muted_label(shared, "Local node configuration unavailable"))
+                .with_child(
+                    sui::Button::new("Refresh")
+                        .icon(IconGlyph::Redo)
+                        .theme_when(clone_reader(reader))
+                        .appearance(sui::ButtonAppearance::Tonal)
+                        .tone(SemanticTone::Neutral)
+                        .on_press(move || {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::RemoteManagementRefresh,
+                                SettingsOperation::RefreshRemoteManagement,
+                            );
+                        }),
+                )
+        };
+        WidgetPod::new(
+            FormRow::new("Node override", content)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    } else {
+        let s = shared.clone();
+        let select = Select::new("Remote management node override")
+            .options(MODULE_OVERRIDE_OPTIONS.iter().copied())
+            .selected_when({
+                let s = s.clone();
+                move || {
+                    Some(match s.settings().remote_management.module_override {
+                        Some(true) => 1,
+                        Some(false) => 2,
+                        None => 0,
+                    })
+                }
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| {
+                let enabled = match index {
+                    1 => Some(true),
+                    2 => Some(false),
+                    _ => None,
+                };
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::RemoteManagementModule,
+                    SettingsOperation::SetRemoteManagementModuleOverride { enabled },
+                );
+            });
+        WidgetPod::new(
+            FormRow::new("Node override", select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    };
+
+    let open_modules = {
+        let s = shared.clone();
+        sui::Button::new("Open Modules")
+            .icon(IconGlyph::Storage)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || s.settings_mut().open(SettingsSection::Modules))
+    };
+    let mut module_body = FieldGroup::new().spacing(8.0);
+    if !snapshot.module_loading {
+        module_body = module_body
+            .with_child(value_row(
+                shared,
+                reader,
+                "Node",
+                format!(
+                    "{} · {}",
+                    snapshot.module_node_label,
+                    snapshot
+                        .module_node_id
+                        .as_deref()
+                        .map(|id| short(id, 18))
+                        .unwrap_or_else(|| "identity unavailable".to_string())
+                ),
+            ))
+            .with_child(
+                FormRow::new("Effective desired state", effective)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                FormRow::new("Observed loader activation", observed)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+    }
+    module_body = module_body
+        .with_child(PodHost::new(module_override))
+        .with_child(
+            FormRow::new(
+                "Full module settings",
+                Stack::horizontal().with_child(open_modules),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    if !snapshot.module_loading
+        && let Some((label, detail)) = remote_management_module_attention(&snapshot)
+    {
+        module_body = module_body.with_child(
+            FormRow::new(
+                "Desired and observed state",
+                module_lifecycle_value(shared, reader, label, SemanticTone::Warning, detail),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    if let Some(error) = snapshot.module_error.clone() {
+        module_body = module_body.with_child(value_row(shared, reader, "Module error", error));
+    }
+    if let Some(error) = module_action_error.clone() {
+        module_body = module_body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = module_action_status.clone() {
+        module_body = module_body.with_child(value_row(shared, reader, "Status", status));
+    }
+
+    let module_section = FormSection::new("Module on this node", module_body)
+        .description(
+            "The node override controls desired module enablement. It does not grant host permission or install a missing module artifact.",
+        )
+        .theme_when(clone_reader(reader));
+
+    let commands = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(copyable_text_row(
+            reader,
+            "remote-management-allow-command",
+            "Allow host permission command",
+            REMOTE_MANAGEMENT_ALLOW_COMMAND,
+        ))
+        .with_child(copyable_text_row(
+            reader,
+            "remote-management-deny-command",
+            "Deny host permission command",
+            REMOTE_MANAGEMENT_DENY_COMMAND,
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Where to run",
+            "Run directly on the receiving node with its normal SINOMO_DATA_DIR. Permission commands intentionally do not accept --target or --node; module installation and desired state remain separate.",
+        ));
+    let commands_section = FormSection::new("Other nodes", commands)
+        .description(
+            "Copy the command into a trusted shell on each receiving node. Remote callers cannot grant themselves access.",
+        )
+        .theme_when(clone_reader(reader));
+
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(permission_section)
+        .with_child(module_section)
+        .with_child(commands_section)
 }
 
 struct ClusterJoinPreview {
@@ -9460,6 +10296,40 @@ fn module_observed_label(state: ModuleObservedState) -> &'static str {
     }
 }
 
+fn remote_management_observed_label(state: ModuleObservedState) -> &'static str {
+    match state {
+        ModuleObservedState::Running => "Active",
+        ModuleObservedState::Stopped => "Inactive",
+        ModuleObservedState::Installed => "Installed, not active",
+        ModuleObservedState::NotReported => "Not reported",
+        ModuleObservedState::Unavailable => "Unavailable",
+    }
+}
+
+fn remote_management_module_attention(
+    snapshot: &RemoteManagementSettingsSnapshot,
+) -> Option<(&'static str, &'static str)> {
+    match (snapshot.module_effective_enabled, snapshot.module_observed) {
+        (_, ModuleObservedState::Unavailable | ModuleObservedState::NotReported) => Some((
+            "Runtime state unknown",
+            "The desired node setting is known, but loader activation cannot currently be verified.",
+        )),
+        (true, ModuleObservedState::Installed) => Some((
+            "Activation required",
+            "The module artifact is installed, but the loader has not activated it.",
+        )),
+        (true, ModuleObservedState::Stopped) => Some((
+            "Desired enabled · observed inactive",
+            "The node override is desired state; the loader currently reports the module inactive.",
+        )),
+        (false, ModuleObservedState::Running) => Some((
+            "Desired disabled · observed active",
+            "The loader remains active even though desired state is disabled.",
+        )),
+        _ => None,
+    }
+}
+
 fn module_observed_tone(state: ModuleObservedState) -> SemanticTone {
     match state {
         ModuleObservedState::Running => SemanticTone::Success,
@@ -11903,7 +12773,7 @@ fn short_one_line(value: &str, max: usize) -> String {
 fn section_body(
     shared: &Shared,
     reader: &ThemeReader,
-    scroll_states: &[ScrollState; 10],
+    scroll_states: &[ScrollState; SettingsSection::ALL.len()],
 ) -> impl Widget + use<> {
     let selected =
         shared
@@ -11937,6 +12807,13 @@ fn section_body(
             SettingsSection::Node,
             section_node(shared, reader),
             &scroll_states[SettingsSection::Node.index()],
+        ))
+        .with_child(section_page(
+            shared,
+            reader,
+            SettingsSection::RemoteManagement,
+            section_remote_management(shared, reader),
+            &scroll_states[SettingsSection::RemoteManagement.index()],
         ))
         .with_child(section_page(
             shared,
@@ -12063,6 +12940,19 @@ fn section_status_tone(shared: &Shared, section: SettingsSection) -> SemanticTon
         SettingsSection::Cluster => {
             if settings.clustered {
                 SemanticTone::Success
+            } else {
+                SemanticTone::Neutral
+            }
+        }
+        SettingsSection::RemoteManagement => {
+            if settings.remote_management.permission_error.is_some()
+                || settings.remote_management.module_error.is_some()
+                || settings.remote_management_permission_error.is_some()
+                || settings.remote_management_module_error.is_some()
+            {
+                SemanticTone::Danger
+            } else if settings.remote_management.permission_enabled {
+                SemanticTone::Warning
             } else {
                 SemanticTone::Neutral
             }
@@ -12430,7 +13320,11 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     ScrollView::vertical(groups).state(ScrollState::new())
 }
 
-fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_states: &[ScrollState; 10]) -> WidgetPod {
+fn wide_pod(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_states: &[ScrollState; SettingsSection::ALL.len()],
+) -> WidgetPod {
     let detail = section_body(shared, reader, scroll_states);
     let row = Stack::horizontal()
         .alignment(Alignment::Stretch)
@@ -12449,7 +13343,7 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_states: &[ScrollState;
 fn narrow_pod(
     shared: &Shared,
     reader: &ThemeReader,
-    scroll_states: &[ScrollState; 10],
+    scroll_states: &[ScrollState; SettingsSection::ALL.len()],
 ) -> WidgetPod {
     let back_button = {
         let s = shared.clone();
@@ -12880,7 +13774,8 @@ impl SettingsView {
         // Preserve an independent reading position for each destination. Wide and narrow pods
         // share each destination's state, so crossing the breakpoint keeps the right position
         // without carrying Appearance's offset into Providers or System configuration.
-        let scroll_states: [ScrollState; 10] = std::array::from_fn(|_| ScrollState::new());
+        let scroll_states: [ScrollState; SettingsSection::ALL.len()] =
+            std::array::from_fn(|_| ScrollState::new());
         let wide = wide_pod(&shared, &wide_theme_reader, &scroll_states);
         let narrow = narrow_pod(&shared, &narrow_theme_reader, &scroll_states);
         Self {
@@ -13444,11 +14339,15 @@ mod tests {
         );
         assert_eq!(
             state.field_errors.get(&draft_key).map(String::as_str),
-            Some("Connection changed before the action completed; retry it.")
+            Some(
+                "Connection changed while the action was in flight; verify refreshed state before retrying."
+            )
         );
         assert_eq!(
             state.agent_action_error.as_deref(),
-            Some("Connection changed before the action completed; retry it.")
+            Some(
+                "Connection changed while the action was in flight; verify refreshed state before retrying."
+            )
         );
 
         let reconnect_server_generations = state.server_generations;
@@ -13460,6 +14359,110 @@ mod tests {
         });
         assert_eq!(state.agent_form.id, "reconnect-draft");
         assert_eq!(state.agent_form.name, "Keep across reconnect");
+    }
+
+    #[test]
+    fn reconnect_rebind_preserves_an_in_flight_local_permission_result() {
+        let old_backend = Backend::local_fallback();
+        let new_backend =
+            Backend::local_fallback_for_data_dir(SinomoDataDir::new(old_backend.data_dir.root()));
+        let mut state = SettingsState::new(&old_backend);
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        state.operation_lane = Some(SettingsOperationLane {
+            tx: request_tx,
+            rx: result_rx,
+        });
+        state
+            .pending_operations
+            .insert(SettingsOperationScope::RemoteManagementPermission, 19);
+
+        state.rebind_backend(&new_backend);
+
+        assert!(state.operation_lane.is_some());
+        assert_eq!(state.pending_operations.len(), 1);
+        assert!(state.remote_management_permission_pending());
+        assert_eq!(
+            state.remote_management_permission_status.as_deref(),
+            Some("Finishing the node-local permission change…")
+        );
+        let reconnect_server_generations = state.server_generations;
+        let reconnect_draft_generations = state.draft_generations;
+
+        let mutation = old_backend
+            .set_local_remote_management_permission(true)
+            .expect("complete local permission write");
+        result_tx
+            .send(SettingsOperationResult {
+                request_id: 19,
+                scope: SettingsOperationScope::RemoteManagementPermission,
+                draft_generation: 0,
+                payload: SettingsOperationPayload::RemoteManagement(Ok(
+                    RemoteManagementOperationSuccess::PermissionChanged {
+                        permissions: mutation.permissions,
+                        message: "Remote management is now allowed on this node".to_string(),
+                    },
+                )),
+            })
+            .expect("send retained local result");
+
+        assert!(state.pump_operations().changed);
+        assert!(state.remote_management.permission_enabled);
+        assert!(!state.remote_management_permission_pending());
+
+        let mut refreshed = SettingsState::new(&new_backend);
+        refreshed.remote_management.module_observed = ModuleObservedState::Stopped;
+        state.merge_initial_load(SettingsInitialLoadResult {
+            settings: refreshed,
+            server_generations: reconnect_server_generations,
+            draft_generations: reconnect_draft_generations,
+        });
+        assert!(state.remote_management.permission_enabled);
+        assert_eq!(
+            state.remote_management.module_observed,
+            ModuleObservedState::Stopped
+        );
+    }
+
+    #[test]
+    fn reconnect_epoch_skips_queued_daemon_work_but_keeps_local_permission_work() {
+        let backend = Backend::local_fallback();
+        let epoch_source = Arc::new(AtomicU64::new(4));
+        let daemon_request = SettingsOperationRequest {
+            request_id: 1,
+            scope: SettingsOperationScope::RemoteManagementRefresh,
+            draft_generation: 0,
+            operation_epoch: 4,
+            operation_epoch_source: Arc::clone(&epoch_source),
+            backend: backend.clone(),
+            operation: SettingsOperation::RefreshRemoteManagement,
+        };
+        assert!(settings_operation_request_is_current(&daemon_request));
+
+        epoch_source.store(5, Ordering::Release);
+        assert!(!settings_operation_request_is_current(&daemon_request));
+
+        let permission_request = SettingsOperationRequest {
+            request_id: 2,
+            scope: SettingsOperationScope::RemoteManagementPermission,
+            draft_generation: 0,
+            operation_epoch: 4,
+            operation_epoch_source: epoch_source,
+            backend,
+            operation: SettingsOperation::SetRemoteManagementPermission { enabled: true },
+        };
+        assert!(settings_operation_request_is_current(&permission_request));
+    }
+
+    #[test]
+    fn local_module_refresh_does_not_restore_an_abandoned_local_selection() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.module_selected_node_id = Some("remote-node".to_string());
+
+        state.apply_local_module_snapshot_if_selected(backend.module_config_snapshot(None));
+
+        assert_eq!(state.module_selected_node_id.as_deref(), Some("remote-node"));
     }
 
     #[test]
@@ -14972,6 +15975,91 @@ mod tests {
     }
 
     #[test]
+    fn remote_management_section_exposes_copyable_local_commands() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Remote management settings")
+                    .root(
+                        SizedBox::new().size(Size::new(1000.0, 720.0)).with_child(
+                            ScrollView::vertical(section_remote_management_body(&shared, &reader))
+                                .name("remote-management-settings-scroll")
+                                .state(ScrollState::new())
+                                .theme(reader()),
+                        ),
+                    ),
+            )
+            .build()?;
+        let clipboard = runtime.clipboard();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(window.get_by_text("Local permission").count()? >= 1);
+        assert_eq!(window.get_by_text("Module on this node").count()?, 1);
+        assert_eq!(window.get_by_text("Other nodes").count()?, 1);
+        window
+            .get_by_role(sui::SemanticsRole::ScrollView)
+            .with_name("remote-management-settings-scroll")
+            .scroll_pixels(sui::Vector::new(0.0, -800.0))?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy Allow host permission command")
+            .click()?;
+        assert_eq!(
+            clipboard.text().as_deref(),
+            Some(REMOTE_MANAGEMENT_ALLOW_COMMAND)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_management_allow_control_opens_an_explicit_confirmation() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Remote management confirmation")
+                    .root(section_remote_management(&shared, &reader)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Allow remote management…")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::Dialog)
+            .with_name("Allow remote management confirmation")
+            .expect()
+            .to_have_count(1)?;
+        assert!(
+            !shared.settings().remote_management.permission_enabled,
+            "opening confirmation must not grant permission"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(!shared.settings().remote_management_enable_confirming);
+
+        Ok(())
+    }
+
+    #[test]
     fn appearance_exposes_text_scaling_without_a_global_ui_size() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -15196,6 +16284,115 @@ mod tests {
                 .setting(sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID)
                 .map(|setting| setting.enabled),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn remote_management_permission_requires_confirmation_and_revokes_immediately() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        assert!(!state.remote_management.permission_enabled);
+
+        state.confirm_remote_management_enable();
+        assert!(state.remote_management_enable_confirming);
+        state.cancel_remote_management_enable();
+        assert!(!state.remote_management_enable_confirming);
+        assert!(
+            !backend
+                .remote_management_settings_snapshot()
+                .permission_enabled,
+            "cancelling confirmation must not write permission state"
+        );
+
+        state.confirm_remote_management_enable();
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::RemoteManagementPermission,
+            SettingsOperation::SetRemoteManagementPermission { enabled: true },
+        );
+        assert!(state.remote_management.permission_enabled);
+        assert!(!state.remote_management_enable_confirming);
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::RemoteManagementPermission,
+            SettingsOperation::SetRemoteManagementPermission { enabled: false },
+        );
+        assert!(!state.remote_management.permission_enabled);
+    }
+
+    #[test]
+    fn remote_management_module_shortcut_sets_local_node_override() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::RemoteManagementModule,
+            SettingsOperation::SetRemoteManagementModuleOverride {
+                enabled: Some(true),
+            },
+        );
+
+        assert_eq!(state.remote_management.module_override, Some(true));
+        assert!(state.remote_management.module_effective_enabled);
+        assert_eq!(
+            state.remote_management.module_effective_source,
+            ModuleRuntimeConfigSource::Node
+        );
+        assert_eq!(
+            state
+                .module_snapshot
+                .selected_node
+                .as_ref()
+                .and_then(|node| {
+                    node.config
+                        .setting(sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID)
+                        .map(|setting| setting.enabled)
+                }),
+            Some(true),
+            "the full Modules page must receive the shortcut's local override"
+        );
+
+        let node_id = state
+            .module_selected_node_id
+            .clone()
+            .expect("local module node");
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::Modules,
+            SettingsOperation::SetNodeModuleOverride {
+                node_id,
+                module_id: sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID
+                    .to_string(),
+                enabled: Some(false),
+            },
+        );
+        assert_eq!(
+            state.remote_management.module_override,
+            Some(false),
+            "the shortcut must receive local changes made from the full Modules page"
+        );
+    }
+
+    #[test]
+    fn remote_management_preview_requires_observed_activation_before_saying_active() {
+        let backend = Backend::local_fallback();
+        backend
+            .set_local_remote_management_permission(true)
+            .expect("allow local permission");
+        backend
+            .set_local_remote_management_module_override(Some(true))
+            .expect("request local module enablement");
+        let shared = Shared::new(AppState::ready(backend));
+
+        assert_eq!(
+            section_preview(&shared, SettingsSection::RemoteManagement),
+            "Permission allowed"
         );
     }
 
