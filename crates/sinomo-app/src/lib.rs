@@ -7,6 +7,7 @@
 //! desktop app surface so it stays daemon-backed during bootstrap.
 
 pub mod backend;
+mod mobile_runtime;
 mod native_picker;
 pub mod rendering;
 pub mod state;
@@ -144,14 +145,19 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
     let safe_area_app = android_app.clone();
+    let conditions_app = android_app.clone();
+    let lifecycle_app = android_app.clone();
     app.run_android_with_handle(android_app, move |ui| {
         shared.borrow_mut().waker = Some(ui.clone());
+        mobile_runtime::start_android_lifecycle_monitor(lifecycle_app);
         start_android_safe_area_monitor(safe_area_app, ui.clone());
+        mobile_runtime::start_android_operating_conditions_monitor(conditions_app);
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
         std::thread::Builder::new()
             .name("sinomo-app-connect".to_string())
             .spawn(move || {
+                mobile_runtime::wait_until_interactive_blocking();
                 let backend = Backend::connect(|status| {
                     let _ = tx.send(ConnectEvent::Status(status.to_string()));
                     ui.wake();
@@ -242,6 +248,7 @@ fn start_android_safe_area_monitor(android_app: sui::AndroidApp, ui: sui::UiHand
         .spawn(move || {
             let mut last = None;
             loop {
+                let generation = mobile_runtime::wait_until_interactive_blocking();
                 let insets = android_safe_area_insets(&android_app);
                 if last != Some(insets) {
                     last = Some(insets);
@@ -257,7 +264,12 @@ fn start_android_safe_area_monitor(android_app: sui::AndroidApp, ui: sui::UiHand
                     );
                     ui.broadcast_application(ANDROID_SAFE_AREA_CHANGED, insets);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                // Keep keyboard/cutout changes responsive while visible, but
+                // stop this JNI polling thread completely in the background.
+                mobile_runtime::wait_for_change_or_timeout(
+                    generation,
+                    std::time::Duration::from_millis(250),
+                );
             }
         })
         .expect("spawn Android safe-area monitor");

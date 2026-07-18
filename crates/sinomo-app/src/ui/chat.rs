@@ -6477,30 +6477,36 @@ fn spawn_daemon_event_subscription(
         };
         let mut retry_delay = Duration::from_millis(250);
         loop {
+            crate::mobile_runtime::wait_for_interactive().await;
             let mut received_ready = false;
             let mut consumer_closed = false;
-            let result = send_daemon_rpc_stream_from_data_dir_async(
-                data_dir.clone(),
-                &address,
-                &request,
-                DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
-                |response| {
-                    response.error_detail()?;
-                    let item = response
-                        .decode_body::<DaemonEventStreamItem>()
-                        .map_err(DaemonApiError::from)?;
-                    received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
-                    if tx.send(DaemonEventWorkerUpdate::Item(item)).is_err() {
-                        consumer_closed = true;
-                        return Ok(false);
-                    }
-                    if let Some(waker) = waker.as_ref() {
-                        waker.wake();
-                    }
-                    Ok(true)
-                },
-            )
-            .await;
+            let result = tokio::select! {
+                result = send_daemon_rpc_stream_from_data_dir_async(
+                    data_dir.clone(),
+                    &address,
+                    &request,
+                    DaemonRpcTimeouts::default().with_connect_timeout(Some(Duration::from_secs(3))),
+                    |response| {
+                        response.error_detail()?;
+                        let item = response
+                            .decode_body::<DaemonEventStreamItem>()
+                            .map_err(DaemonApiError::from)?;
+                        received_ready |= matches!(&item, DaemonEventStreamItem::Ready { .. });
+                        if tx.send(DaemonEventWorkerUpdate::Item(item)).is_err() {
+                            consumer_closed = true;
+                            return Ok(false);
+                        }
+                        if let Some(waker) = waker.as_ref() {
+                            waker.wake();
+                        }
+                        Ok(true)
+                    },
+                ) => Some(result),
+                _ = crate::mobile_runtime::wait_for_background() => None,
+            };
+            let Some(result) = result else {
+                continue;
+            };
             if consumer_closed {
                 return;
             }

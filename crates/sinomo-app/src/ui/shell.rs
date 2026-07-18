@@ -159,13 +159,17 @@ impl CommandController for BackgroundWorkController {
             return;
         }
         if command.is(chat::CHAT_WORK_READY) {
-            self.pump(ctx);
+            if crate::mobile_runtime::interactive() {
+                self.pump(ctx);
+            }
             ctx.set_handled();
         }
     }
 
     fn wake(&mut self, ctx: &mut CommandCtx) {
-        self.pump(ctx);
+        if crate::mobile_runtime::interactive() {
+            self.pump(ctx);
+        }
     }
 }
 const LOGO_SIZE: f32 = 24.0;
@@ -272,7 +276,10 @@ impl Shell {
     }
 
     fn schedule_connect_status_timer(&self, ctx: &mut EventCtx) {
-        if self.shared.is_ready() || self.connect_status_timer.get().is_some() {
+        if !crate::mobile_runtime::interactive()
+            || self.shared.is_ready()
+            || self.connect_status_timer.get().is_some()
+        {
             return;
         }
         let token = ctx.schedule_timer_after(1.0);
@@ -280,7 +287,8 @@ impl Shell {
     }
 
     fn schedule_health_probe_timer(&self, ctx: &mut EventCtx) {
-        if !self.shared.is_ready()
+        if !crate::mobile_runtime::interactive()
+            || !self.shared.is_ready()
             || self.health_probe_timer.get().is_some()
             || self.shared.borrow().waker.is_none()
         {
@@ -733,6 +741,21 @@ impl Widget for Shell {
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        #[cfg(all(target_os = "android", feature = "mobile"))]
+        if ctx.phase() == EventPhase::Target
+            && let Event::Window(WindowEvent::Focused(interactive)) = event
+        {
+            crate::mobile_runtime::set_window_focused(*interactive);
+            if *interactive {
+                self.schedule_connect_status_timer(ctx);
+                self.schedule_health_probe_timer(ctx);
+                if let Some(waker) = self.shared.borrow().waker.clone() {
+                    waker.wake();
+                }
+            } else if self.shared.is_ready() {
+                self.shared.chat_mut().sync_media_setup_visibility(false);
+            }
+        }
         if let Event::Keyboard(key) = event
             && matches!(ctx.phase(), EventPhase::Target | EventPhase::Bubble)
             && key.state == KeyState::Pressed
@@ -766,7 +789,7 @@ impl Widget for Shell {
             && self.connect_status_timer.get() == Some(*token)
         {
             self.connect_status_timer.set(None);
-            if !self.shared.is_ready() {
+            if crate::mobile_runtime::interactive() && !self.shared.is_ready() {
                 self.shared
                     .publish_loading_stall_lines(loading_stall_lines_for(&self.shared));
                 self.schedule_connect_status_timer(ctx);
@@ -777,7 +800,7 @@ impl Widget for Shell {
             && self.health_probe_timer.get() == Some(*token)
         {
             self.health_probe_timer.set(None);
-            if self.shared.request_connection_probe(false) {
+            if crate::mobile_runtime::interactive() && self.shared.request_connection_probe(false) {
                 ctx.request_semantics();
             }
             self.schedule_health_probe_timer(ctx);

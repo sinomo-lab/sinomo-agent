@@ -909,6 +909,7 @@ pub(crate) fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> 
         let response = client.cluster_init(cluster::ClusterControlInitRequest {
             cluster_name: options.name.clone(),
             node_display_name: Some(options.name),
+            node_role: None,
         })?;
         println!("cluster initialized: {}", response.cluster_id);
         println!("local node: {}", response.node_id);
@@ -1308,6 +1309,7 @@ fn cluster_join_via_daemon(
     let response = client.cluster_join(cluster::ClusterControlJoinRequest {
         invite: invite_uri,
         node_display_name: options.name_explicit.then_some(options.name.clone()),
+        node_role: None,
     })?;
     if let Some(endpoint) = &response.accepted_endpoint {
         println!("introducer accepted join: {endpoint}");

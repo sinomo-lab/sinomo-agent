@@ -5021,6 +5021,7 @@ fn initialize_local_cluster(
         node_id,
         name.clone(),
         name,
+        ClusterNodeRole::default(),
         now,
         runtime.handle(),
     )
@@ -5035,6 +5036,7 @@ pub(crate) fn initialize_local_cluster_on_runtime(
     node_id: Option<NodeId>,
     cluster_name: String,
     node_display_name: String,
+    node_role: ClusterNodeRole,
     now: OffsetDateTime,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterBootstrapState, DaemonError> {
@@ -5063,6 +5065,13 @@ pub(crate) fn initialize_local_cluster_on_runtime(
         main_identity.public_key.clone(),
         now,
     );
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == state.local_node_id)
+    {
+        sinomo_core::cluster::apply_cluster_node_role(member, node_role, now);
+    }
     let (main_options, shadow_options) =
         current_daemon_cluster_options(data_dir).unwrap_or_else(|| {
             (
@@ -5165,6 +5174,7 @@ pub(crate) fn handle_daemon_cluster_control_init_on_runtime(
         None,
         cluster_name,
         node_display_name,
+        request.node_role.unwrap_or_default(),
         OffsetDateTime::now_utc(),
         runtime,
     )?;
@@ -5196,6 +5206,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string);
+    let requested_node_role = request.node_role.unwrap_or_default();
     let invite = sinomo_core::cluster::decode_cluster_join_invite(
         sinomo_core::cluster::extract_invite_from_join_command(request.invite.trim()),
     )
@@ -5239,6 +5250,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
                 &invite,
                 existing,
                 requested_node_display_name,
+                requested_node_role,
                 timestamp,
                 runtime,
             );
@@ -5251,6 +5263,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
         &invite,
         preserved_node_id,
         requested_node_display_name,
+        requested_node_role,
         timestamp,
         runtime,
     )
@@ -5265,6 +5278,7 @@ fn daemon_cluster_control_join_fresh_on_runtime(
     invite: &sinomo_core::ClusterJoinInvite,
     preserved_node_id: Option<NodeId>,
     requested_node_display_name: Option<String>,
+    requested_node_role: ClusterNodeRole,
     timestamp: OffsetDateTime,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterControlJoinResponse, DaemonError> {
@@ -5289,6 +5303,13 @@ fn daemon_cluster_control_join_fresh_on_runtime(
         shadow_identity.public_key,
         timestamp,
     );
+    if let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == state.local_node_id)
+    {
+        sinomo_core::cluster::apply_cluster_node_role(member, requested_node_role, timestamp);
+    }
     let (main_options, shadow_options) =
         current_daemon_cluster_options(data_dir).unwrap_or_else(|| {
             (
@@ -5352,6 +5373,7 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
     invite: &sinomo_core::ClusterJoinInvite,
     source: ClusterBootstrapState,
     requested_node_display_name: Option<String>,
+    requested_node_role: ClusterNodeRole,
     timestamp: OffsetDateTime,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterControlJoinResponse, DaemonError> {
@@ -5412,6 +5434,7 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
         invite,
         Some(migration.target_node_id.clone()),
         target_node_display_name,
+        requested_node_role,
         timestamp,
         runtime,
     ) {
@@ -5663,14 +5686,29 @@ pub(crate) fn handle_daemon_cluster_control_role_on_runtime(
 ) -> Result<ClusterControlRoleResponse, DaemonError> {
     let paths = cluster_paths_from_daemon_paths(daemon_paths)?;
     let state = daemon_cluster_control_state(&paths)?;
+    let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime);
+    // Older single-node app clusters can have a valid local member in
+    // state.sobj but no corresponding materialized KV row. Repair that
+    // authority gap before applying the typed role update so an app upgrade
+    // can opt the existing node into the mobile maintenance policy.
+    let local_member_missing_from_kv = request.node_id == state.local_node_id
+        && !sinomo_core::cluster::read_cluster_members_from_kv(&paths)?
+            .iter()
+            .any(|member| member.node_id == request.node_id);
+    if local_member_missing_from_kv {
+        sinomo_core::cluster::sync_cluster_state_to_kv_with_host(&paths, &state, &mut host)?;
+    }
     let update = sinomo_core::cluster::update_cluster_node_role_with_host(
         &paths,
         state,
         request.node_id,
         request.role,
         OffsetDateTime::now_utc(),
-        &mut DaemonClusterMemberMutationHost::new_on_runtime(runtime),
+        &mut host,
     )?;
+    if update.changed {
+        crate::control::request_daemon_cluster_maintenance_refresh();
+    }
     Ok(ClusterControlRoleResponse {
         node_id: update.node_id,
         previous_role: update.previous_role,
@@ -5737,6 +5775,16 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
         })
         .map(str::to_string)
         .unwrap_or_else(|| daemon_cluster_control_node_display_name("sinomo-local"));
+    let node_role = existing
+        .as_ref()
+        .and_then(|state| {
+            state
+                .members
+                .iter()
+                .find(|member| member.node_id == state.local_node_id)
+        })
+        .map(|member| member.node_role.clone())
+        .unwrap_or_default();
 
     // Hold the storage-mutation lock across quarantine + re-init so the
     // maintenance tick cannot commit into files being moved aside (this
@@ -5758,6 +5806,7 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
         Some(local_node_id),
         name.clone(),
         name,
+        node_role,
         OffsetDateTime::now_utc(),
         runtime,
     ) {
@@ -7898,6 +7947,7 @@ mod tests {
             ClusterControlJoinRequest {
                 invite: uri,
                 node_display_name: None,
+                node_role: None,
             },
             runtime.handle(),
         )
@@ -10107,6 +10157,68 @@ mod tests {
             ClusterNodeRole::Mobile,
             "role updates must patch local state so maintenance adopts mobile cadence"
         );
+    }
+
+    #[test]
+    fn cluster_control_role_repairs_missing_kv_member_before_update() {
+        let root = unique_cluster_test_root("sinomo-daemon-role-repairs-kv-member");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let now = OffsetDateTime::now_utc();
+        let state = initialize_local_cluster(
+            &paths,
+            Some(
+                ClusterId::from_legacy_named("cluster_daemon_role_repairs_kv_member")
+                    .expect("cluster"),
+            ),
+            Some(NodeId::from_legacy_named("node_daemon_role_repairs_kv_member").expect("node")),
+            "role repair".to_string(),
+            now,
+        )
+        .expect("initialize cluster");
+        let local_node = state.local_node_id.clone();
+        let mut commit_state = state.clone();
+        commit_cluster_kv_txn_with_quorum(
+            &paths,
+            &mut commit_state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Delete {
+                    key: cluster_member_key(&local_node),
+                }],
+                failure: Vec::new(),
+            },
+        )
+        .expect("remove legacy-missing member row");
+
+        let runtime = daemon_cluster_test_runtime();
+        let update = handle_daemon_cluster_control_role_on_runtime(
+            &daemon_paths,
+            ClusterControlRoleRequest {
+                node_id: local_node.clone(),
+                role: ClusterNodeRole::Mobile,
+            },
+            runtime.handle(),
+        )
+        .expect("repair member and update role");
+
+        assert!(update.changed);
+        assert_eq!(update.role, ClusterNodeRole::Mobile);
+        let snapshot = sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
+            &paths.kv_paths(),
+            local_node.clone(),
+        )
+        .expect("read repaired snapshot");
+        let member = snapshot
+            .get(&cluster_member_key(&local_node))
+            .expect("repaired member row")
+            .decode::<ClusterMemberRecord>()
+            .expect("decode repaired member");
+        assert_eq!(member.node_role, ClusterNodeRole::Mobile);
     }
 
     #[test]

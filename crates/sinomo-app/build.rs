@@ -5,9 +5,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use android_build::{DebugInfo, Dexer, JavaBuild};
+
 const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
 
 fn main() {
+    build_android_lifecycle_bridge();
     embed_macos_privacy_plist();
     println!("cargo:rerun-if-env-changed={ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV}");
     let commit = std::env::var(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV)
@@ -18,6 +22,68 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=SINOMO_GIT_COMMIT={commit}");
     watch_git_head();
+}
+
+fn build_android_lifecycle_bridge() {
+    println!("cargo:rerun-if-changed=java/");
+    if !std::env::var("TARGET").is_ok_and(|target| target.contains("android")) {
+        return;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    panic!("Android Java build is only supported from Linux, macOS, or Windows hosts");
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    build_android_lifecycle_java();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn build_android_lifecycle_java() {
+    let android_jar = android_build::android_jar(None).expect("locate Android android.jar");
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    let java_path = "java/net/sinomo/app/runtime/SinomoLifecycleCallbacks.java";
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    let classes_out_dir = out_dir.join("java/net/sinomo/app/runtime");
+    let _ = fs::remove_dir_all(&classes_out_dir);
+    fs::create_dir_all(&classes_out_dir).expect("create Android Java classes directory");
+    JavaBuild::new()
+        .file(java_path)
+        .class_path(&android_jar)
+        .classes_out_dir(&classes_out_dir)
+        .java_source_version(8)
+        .java_target_version(8)
+        .debug_info(DebugInfo {
+            line_numbers: !release,
+            source_files: !release,
+            variables: !release,
+        })
+        .compile()
+        .expect("compile Android lifecycle bridge");
+
+    let dex_output_dir = out_dir.join("lifecycle-dex");
+    fs::create_dir_all(&dex_output_dir).expect("create Android lifecycle DEX directory");
+    let java_classes_root = out_dir.join("java");
+    Dexer::new()
+        .android_jar(&android_jar)
+        .class_path(&java_classes_root)
+        .collect_classes(&java_classes_root)
+        .expect("collect Android lifecycle classes")
+        .release(release)
+        .android_min_api(26)
+        .out_dir(&dex_output_dir)
+        .run()
+        .expect("dex Android lifecycle bridge");
+
+    let dex_path = dex_output_dir.join("classes.dex");
+    assert!(
+        dex_path.exists(),
+        "Android lifecycle DEX was not created at {}",
+        dex_path.display()
+    );
+    println!(
+        "cargo:rustc-env=SINOMO_ANDROID_LIFECYCLE_DEX_PATH={}",
+        dex_path.display()
+    );
 }
 
 fn embed_macos_privacy_plist() {

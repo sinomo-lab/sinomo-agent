@@ -52,6 +52,7 @@ const DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration:
 const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT: Duration = Duration::from_secs(20);
 pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
+pub const DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
 pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
@@ -115,6 +116,7 @@ fn daemon_cluster_maintenance_notify() -> Arc<tokio::sync::Notify> {
 }
 
 pub(crate) fn request_daemon_cluster_maintenance_refresh() {
+    crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh();
     daemon_cluster_maintenance_notify().notify_one();
 }
 
@@ -182,6 +184,7 @@ async fn start_daemon_network_environment_watch(
                 update.diff.removed.len(),
                 update.diff.modified.len()
             );
+            crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh();
             task_notify.notify_one();
         }
     });
@@ -801,6 +804,27 @@ pub fn run_daemon_control_loop_with_services(
     cluster: Option<DaemonClusterStatus>,
     service_hooks: Vec<crate::DaemonServiceRegistryHook>,
 ) -> Result<(), DaemonError> {
+    run_daemon_control_loop_with_services_and_profile(
+        options,
+        paths,
+        label,
+        cluster,
+        service_hooks,
+        crate::DaemonExecutionProfile::Standard,
+    )
+}
+
+/// Runs the daemon with an explicit resource profile. Embedded application
+/// hosts use this entry point so mobile process constraints do not change the
+/// standard standalone daemon defaults.
+pub fn run_daemon_control_loop_with_services_and_profile(
+    options: crate::DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+    cluster: Option<DaemonClusterStatus>,
+    service_hooks: Vec<crate::DaemonServiceRegistryHook>,
+    execution_profile: crate::DaemonExecutionProfile,
+) -> Result<(), DaemonError> {
     crate::cluster::ensure_cluster_directory_installed();
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     let _data_owner_lock = if label == "daemon" {
@@ -828,7 +852,7 @@ pub fn run_daemon_control_loop_with_services(
     if daemon_role_owns_default_dfs(label) {
         ensure_default_local_dfs_expose(&paths)?;
     }
-    let daemon_runtime = crate::build_daemon_async_runtime(label)?;
+    let daemon_runtime = crate::build_daemon_async_runtime_with_profile(label, execution_profile)?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
     if daemon_role_owns_default_dfs(label) {
         // Both process-lifetime locks are held and no listener or background
@@ -1007,6 +1031,7 @@ pub fn run_daemon_control_loop_with_services(
             maintenance_idle_stats,
             maintenance_service_registry,
             maintenance_runtime,
+            execution_profile,
             shutdown_rx.clone(),
         )),
     ));
@@ -1302,6 +1327,13 @@ fn daemon_dfs_maintenance_should_launch(
     periodic_due || (triggered_due && triggered_work_revalidated)
 }
 
+fn daemon_rollout_telemetry_interval(execution_profile: crate::DaemonExecutionProfile) -> Duration {
+    match execution_profile {
+        crate::DaemonExecutionProfile::Standard => DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
+        crate::DaemonExecutionProfile::Mobile => DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL,
+    }
+}
+
 async fn run_daemon_background_maintenance_loop(
     paths: DaemonPaths,
     options: crate::DaemonRunOptions,
@@ -1309,12 +1341,14 @@ async fn run_daemon_background_maintenance_loop(
     idle_stats: Arc<crate::IdleStatsAtomics>,
     service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     runtime: tokio::runtime::Handle,
+    execution_profile: crate::DaemonExecutionProfile,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone())
         .await
         .with_service_registry(service_registry);
     let maintenance_started = std::time::Instant::now();
+    let rollout_telemetry_interval = daemon_rollout_telemetry_interval(execution_profile);
     let initial_dfs_maintenance_phase = if daemon_role_owns_default_dfs(&label) {
         let phase_paths = paths.clone();
         match tokio::task::spawn_blocking(move || {
@@ -1350,7 +1384,7 @@ async fn run_daemon_background_maintenance_loop(
     // retry cadence.
     let mut next_dfs_maintenance_probe = maintenance_started;
     let mut last_rollout_telemetry = maintenance_started
-        .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
+        .checked_sub(rollout_telemetry_interval)
         .unwrap_or(maintenance_started);
     #[cfg(feature = "sandbox")]
     let mut last_sandbox_lifecycle_maintenance = maintenance_started
@@ -1667,9 +1701,7 @@ async fn run_daemon_background_maintenance_loop(
             break;
         }
 
-        if label == "daemon"
-            && last_rollout_telemetry.elapsed() >= DAEMON_ROLLOUT_TELEMETRY_INTERVAL
-        {
+        if label == "daemon" && last_rollout_telemetry.elapsed() >= rollout_telemetry_interval {
             let telemetry_paths = paths.clone();
             match tokio::task::spawn_blocking(move || {
                 run_daemon_rollout_telemetry_maintenance_tick(&telemetry_paths)
@@ -1759,6 +1791,7 @@ async fn run_daemon_background_maintenance_loop(
             cluster_network.next_due_duration(sleep_started),
             dfs_schedule_anchor,
             last_rollout_telemetry,
+            rollout_telemetry_interval,
             dfs_triggered_maintenance_due,
             dfs_maintenance_probe_due,
             dfs_maintenance_task_completion_due,
@@ -2435,6 +2468,7 @@ fn daemon_maintenance_sleep_duration(
     cluster_next_due: Duration,
     last_dfs_maintenance: Instant,
     last_rollout_telemetry: Instant,
+    rollout_telemetry_interval: Duration,
     dfs_triggered_maintenance_due: Option<Duration>,
     dfs_maintenance_probe_due: Option<Duration>,
     dfs_maintenance_task_completion_due: Option<Duration>,
@@ -2451,7 +2485,7 @@ fn daemon_maintenance_sleep_duration(
         .min(daemon_maintenance_interval_remaining(
             now,
             last_rollout_telemetry,
-            DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
+            rollout_telemetry_interval,
         ));
     if let Some(dfs_triggered_maintenance_due) = dfs_triggered_maintenance_due {
         next_due = next_due.min(dfs_triggered_maintenance_due);
@@ -6939,6 +6973,7 @@ mod tests {
                 Duration::from_secs(30),
                 last_dfs,
                 last_rollout,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
                 None,
@@ -6954,6 +6989,7 @@ mod tests {
                 Duration::from_secs(30),
                 last_dfs,
                 last_rollout,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
                 None,
@@ -6969,6 +7005,7 @@ mod tests {
                 Duration::from_secs(600),
                 last_dfs,
                 last_rollout,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 Some(Duration::from_secs(3)),
                 Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
                 None,
@@ -6987,6 +7024,7 @@ mod tests {
                 Duration::from_secs(600),
                 almost_due_dfs,
                 now,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
                 None,
@@ -7002,6 +7040,7 @@ mod tests {
                 Duration::ZERO,
                 last_dfs,
                 last_rollout,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 None,
                 None,
@@ -7017,6 +7056,7 @@ mod tests {
                 Duration::from_secs(600),
                 last_dfs,
                 last_rollout,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 None,
                 None,
@@ -7026,6 +7066,19 @@ mod tests {
             Duration::from_secs(2),
             "pending sandbox lifecycle recovery must wake on its own cadence"
         );
+    }
+
+    #[test]
+    fn mobile_profile_reduces_rollout_telemetry_wake_frequency() {
+        assert_eq!(
+            daemon_rollout_telemetry_interval(crate::DaemonExecutionProfile::Standard),
+            DAEMON_ROLLOUT_TELEMETRY_INTERVAL
+        );
+        assert_eq!(
+            daemon_rollout_telemetry_interval(crate::DaemonExecutionProfile::Mobile),
+            DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL
+        );
+        assert!(DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL >= Duration::from_secs(5 * 60));
     }
 
     #[cfg(feature = "sandbox")]
@@ -7245,6 +7298,7 @@ mod tests {
                 converged_cluster_due,
                 now,
                 now,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 None,
                 Some(DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL),
