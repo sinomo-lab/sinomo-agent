@@ -6317,6 +6317,10 @@ impl RemoteSifsBrowser {
             sinomo_runtime::api::DAEMON_DFS_BROWSER_STAT_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserStatRequest {
                 path: path.to_string(),
+                // File-detail panes commonly ask for the same object several
+                // times while rendering. Reuse only a very recent result;
+                // callers that require strict freshness use zero.
+                max_staleness_millis: 250,
             },
         )?;
         Ok(sifs_details_from_rpc(response))

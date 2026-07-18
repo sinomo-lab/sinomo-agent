@@ -398,6 +398,9 @@ pub const DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS: usize = 128;
 pub const DEFAULT_DFS_WRITE_INTENT_MAINTENANCE_MAX_RECORDS: usize = 256;
 pub const DEFAULT_DFS_PLACEMENT_RECONCILIATION_MAX_OBJECTS: usize = 256;
 pub const DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration =
+    Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsAntiEntropyCursorRecord {
@@ -880,6 +883,9 @@ pub struct DfsMaintenanceRunOptions {
     pub repair_metadata: bool,
     pub cleanup_stale_staging: bool,
     pub stale_staging_min_age: Duration,
+    pub compact_tombstones: bool,
+    pub tombstone_compaction_min_age: Duration,
+    pub tombstone_compaction_max_records: u64,
 }
 
 impl Default for DfsMaintenanceRunOptions {
@@ -890,6 +896,9 @@ impl Default for DfsMaintenanceRunOptions {
             repair_metadata: true,
             cleanup_stale_staging: true,
             stale_staging_min_age: DFS_PENDING_TRANSFER_STALE_AFTER,
+            compact_tombstones: false,
+            tombstone_compaction_min_age: DEFAULT_DFS_TOMBSTONE_COMPACTION_MIN_AGE,
+            tombstone_compaction_max_records: DEFAULT_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS,
         }
     }
 }
@@ -935,6 +944,10 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
     let mut stale_staging_gc = options
         .cleanup_stale_staging
         .then(|| ContentStoreStagingGcOptions::delete_eligible(options.stale_staging_min_age));
+    let mut tombstone_compaction = options.compact_tombstones.then(|| {
+        DfsTombstoneCompactionOptions::compact_eligible(options.tombstone_compaction_min_age)
+            .with_max_compactions(options.tombstone_compaction_max_records)
+    });
 
     for file_system in file_systems {
         let saved_cursor = host.load_anti_entropy_cursor(&file_system.file_system_id)?;
@@ -958,6 +971,7 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
                 max_issues: options.anti_entropy_max_issues,
                 repair_metadata: options.repair_metadata,
             }),
+            tombstone_compaction: tombstone_compaction.take(),
             ..DfsLifecycleMaintenanceOptions::default()
         })?;
 

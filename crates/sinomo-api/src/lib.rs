@@ -321,6 +321,10 @@ pub struct DaemonDfsBrowserEntryMetadata {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserStatRequest {
     pub path: String,
+    /// Maximum age of a previously authoritative result that the resident
+    /// daemon browser may reuse. Zero preserves strict DFS stat semantics.
+    #[serde(default)]
+    pub max_staleness_millis: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

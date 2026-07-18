@@ -1753,6 +1753,13 @@ struct DaemonDfsBrowserBackend {
     data_dir: SinomoDataDir,
     service: Mutex<sinomo_dfs::MountedSifsService>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
+    stat_cache: Mutex<HashMap<String, DaemonDfsBrowserCachedStat>>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonDfsBrowserCachedStat {
+    cached_at: Instant,
+    response: crate::DaemonDfsBrowserStatResponse,
 }
 
 #[derive(Clone, Debug)]
@@ -1834,6 +1841,7 @@ static DAEMON_DFS_BROWSER_BACKENDS: OnceLock<
 // bound only; it does not impose an end-to-end timeout on an admitted DFS read.
 const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
+const DAEMON_DFS_BROWSER_STAT_CACHE_MAX_ENTRIES: usize = 256;
 
 impl DaemonDfsBrowserBackend {
     fn open(
@@ -1858,6 +1866,7 @@ impl DaemonDfsBrowserBackend {
             data_dir,
             service: Mutex::new(opened.service),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+            stat_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2021,6 +2030,9 @@ impl DaemonDfsBrowserBackend {
         request: crate::DaemonDfsBrowserStatRequest,
     ) -> Result<crate::DaemonDfsBrowserStatResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
+        if let Some(response) = self.cached_stat(&path, request.max_staleness_millis) {
+            return Ok(response);
+        }
         let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
         let stat = service
@@ -2043,13 +2055,52 @@ impl DaemonDfsBrowserBackend {
             .ok()
             .flatten()
             .map(|shard| daemon_dfs_browser_metadata_shard(shard, &local_node_id));
-        Ok(daemon_dfs_browser_stat_response(
-            stat,
-            local_pins,
-            health,
-            metadata_shard,
-            placement,
-        ))
+        let response =
+            daemon_dfs_browser_stat_response(stat, local_pins, health, metadata_shard, placement);
+        self.cache_stat(path, response.clone());
+        Ok(response)
+    }
+
+    fn cached_stat(
+        &self,
+        path: &str,
+        max_staleness_millis: u64,
+    ) -> Option<crate::DaemonDfsBrowserStatResponse> {
+        if max_staleness_millis == 0 {
+            return None;
+        }
+        let max_staleness = Duration::from_millis(max_staleness_millis);
+        let cache = self.stat_cache.lock().ok()?;
+        let cached = cache.get(path)?;
+        (cached.cached_at.elapsed() <= max_staleness).then(|| cached.response.clone())
+    }
+
+    fn cache_stat(&self, path: String, response: crate::DaemonDfsBrowserStatResponse) {
+        let Ok(mut cache) = self.stat_cache.lock() else {
+            return;
+        };
+        if cache.len() >= DAEMON_DFS_BROWSER_STAT_CACHE_MAX_ENTRIES
+            && !cache.contains_key(&path)
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.cached_at)
+                .map(|(path, _)| path.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            path,
+            DaemonDfsBrowserCachedStat {
+                cached_at: Instant::now(),
+                response,
+            },
+        );
+    }
+
+    fn invalidate_stat_cache(&self) {
+        if let Ok(mut cache) = self.stat_cache.lock() {
+            cache.clear();
+        }
     }
 
     fn metadata_shard_for_path(
@@ -2142,22 +2193,30 @@ impl DaemonDfsBrowserBackend {
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service_for_read()?;
         self.refresh_peer_targets(&mut service);
+        let normalized_paths = paths
+            .iter()
+            .map(|(_, normalized)| normalized.clone())
+            .collect::<Vec<_>>();
+        // Keep one browser request as one DFS bulk read. Besides grouping
+        // content fetches by source, this lets the DFS layer issue one
+        // LookupPaths request per metadata primary instead of holding the
+        // resident browser service lock across one routed lookup per file.
+        let results = service.posix_read_files_distributed(&normalized_paths);
         let files = paths
             .into_iter()
-            .map(
-                |(requested_path, path)| match service.posix_read_file_distributed(&path) {
-                    Ok(bytes) => crate::DaemonDfsBrowserFileRead {
-                        path: requested_path,
-                        bytes: Some(bytes),
-                        error: None,
-                    },
-                    Err(error) => crate::DaemonDfsBrowserFileRead {
-                        path: requested_path,
-                        bytes: None,
-                        error: Some(error.to_string()),
-                    },
+            .zip(results)
+            .map(|((requested_path, _), result)| match result {
+                Ok(bytes) => crate::DaemonDfsBrowserFileRead {
+                    path: requested_path,
+                    bytes: Some(bytes),
+                    error: None,
                 },
-            )
+                Err(error) => crate::DaemonDfsBrowserFileRead {
+                    path: requested_path,
+                    bytes: None,
+                    error: Some(error.to_string()),
+                },
+            })
             .collect();
         Ok(crate::DaemonDfsBrowserReadFilesResponse { files })
     }
@@ -2332,6 +2391,7 @@ impl DaemonDfsBrowserBackend {
             },
         )
         .map_err(dfs_browser_service_error)?;
+        self.invalidate_stat_cache();
         Ok(node_id.to_string())
     }
 
@@ -2347,14 +2407,18 @@ impl DaemonDfsBrowserBackend {
             .map_err(dfs_browser_service_error)?;
         let node_id = service.node_id().clone();
         drop(service);
-        sinomo_dfs::remove_local_dfs_pin(
+        let removed = sinomo_dfs::remove_local_dfs_pin(
             sinomo_dfs::default_dfs_pin_root(&self.data_dir),
             &stat.file_system_id,
             &stat.path,
             Some(&node_id),
             Some(&mode),
         )
-        .map_err(dfs_browser_service_error)
+        .map_err(dfs_browser_service_error)?;
+        if removed {
+            self.invalidate_stat_cache();
+        }
+        Ok(removed)
     }
 
     fn pin_metadata(
@@ -2463,6 +2527,7 @@ impl DaemonDfsBrowserBackend {
         if let Ok(mut service) = self.lock_service() {
             service.invalidate_sifs_metadata_shard_cache();
         }
+        self.invalidate_stat_cache();
         Ok(crate::DaemonDfsBrowserTransferMetadataPrimaryResponse {
             file_system_id: previous.file_system_id.to_string(),
             shard_id: previous.shard_id,
@@ -2595,6 +2660,7 @@ impl DaemonDfsBrowserBackend {
                     .to_string(),
             ));
         }
+        self.invalidate_stat_cache();
         let reconciliation = store
             .placement_reconciliation(&desired.file_system_id, &reconciliation.job_id)
             .map_err(dfs_browser_service_error)?
@@ -2794,6 +2860,9 @@ impl DaemonDfsBrowserBackend {
         &self,
         service: &mut sinomo_dfs::MountedSifsService,
     ) -> Result<(), ServiceError> {
+        // The namespace mutation has already committed by the time this
+        // helper runs, even if a follow-up durability/maintenance step fails.
+        self.invalidate_stat_cache();
         service
             .flush_deferred_content_durability()
             .map_err(dfs_browser_service_error)?;
@@ -7500,6 +7569,7 @@ mod tests {
         let stat = backend
             .stat(crate::DaemonDfsBrowserStatRequest {
                 path: "/users/report.txt".to_string(),
+                max_staleness_millis: 0,
             })
             .expect("stat browser file");
 
@@ -7525,6 +7595,57 @@ mod tests {
         assert_eq!(metadata.modified_at_unix_nanos, stat.modified_at_unix_nanos);
         assert_eq!(metadata.policy, stat.policy);
         assert_eq!(metadata.current_locations, stat.current_locations);
+    }
+
+    #[test]
+    fn dfs_browser_stat_reuses_only_explicitly_bounded_results() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-bounded-stat");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let backend = DaemonDfsBrowserBackend::open(SinomoDataDir::new(&root), runtime.handle())
+            .expect("open DFS browser backend");
+        backend
+            .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+                path: "/users/bounded.txt".to_string(),
+                bytes: b"bounded".to_vec(),
+            })
+            .expect("write browser file");
+        let request = crate::DaemonDfsBrowserStatRequest {
+            path: "/users/bounded.txt".to_string(),
+            max_staleness_millis: 1_000,
+        };
+        let expected = backend.stat(request.clone()).expect("seed bounded stat");
+
+        let held_service = backend.lock_service().expect("hold DFS browser service");
+        assert_eq!(
+            backend
+                .stat(request.clone())
+                .expect("bounded stat bypasses busy service"),
+            expected
+        );
+        let strict_error = backend
+            .stat(crate::DaemonDfsBrowserStatRequest {
+                path: "/users/bounded.txt".to_string(),
+                max_staleness_millis: 0,
+            })
+            .expect_err("strict stat must not use the bounded cache");
+        assert!(strict_error.to_string().contains("service is busy"));
+        drop(held_service);
+
+        backend
+            .pin_metadata(crate::DaemonDfsBrowserPinMetadataRequest {
+                path: "/users/bounded.txt".to_string(),
+            })
+            .expect("pin browser metadata");
+        let held_service = backend.lock_service().expect("hold DFS browser service");
+        let invalidated_error = backend
+            .stat(request)
+            .expect_err("pinning must invalidate the bounded stat cache");
+        assert!(invalidated_error.to_string().contains("service is busy"));
+        drop(held_service);
     }
 
     #[test]

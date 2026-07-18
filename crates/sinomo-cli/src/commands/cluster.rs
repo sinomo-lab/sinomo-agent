@@ -2009,6 +2009,16 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     let mut findings = cluster_doctor_findings(&state, &graph, &rows);
     if let Some(data_dir) = paths.root.parent() {
         findings.extend(data_dir_storage_contract_findings(data_dir)?);
+        match inspect_cluster_dfs_status_with_data_dir(SinomoDataDir::new(data_dir)) {
+            Ok(report) => findings.extend(dfs_reachability_findings(&rows, &report)),
+            Err(error) => findings.push(ClusterDoctorFinding {
+                severity: "warning".to_string(),
+                code: "dfs-status-unavailable".to_string(),
+                detail: format!(
+                    "cluster health succeeded, but the DFS reachability gate could not run: {error}"
+                ),
+            }),
+        }
     }
     println!(
         "cluster doctor: {}",
@@ -2025,6 +2035,33 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn dfs_reachability_findings(
+    health: &[ClusterHealthRow],
+    dfs: &DfsClusterStatusReport,
+) -> Vec<ClusterDoctorFinding> {
+    let online = health
+        .iter()
+        .filter(|row| row.availability == ClusterNodeAvailability::Online)
+        .map(|row| row.member.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    dfs.nodes
+        .iter()
+        .filter_map(|node| {
+            let error = node.error.as_deref()?;
+            online
+                .contains(&node.node_id)
+                .then(|| ClusterDoctorFinding {
+                    severity: "warning".to_string(),
+                    code: "dfs-route-unavailable".to_string(),
+                    detail: format!(
+                        "node {} is online in cluster health but unavailable to the DFS object-RPC probe: {error}",
+                        node.node_id
+                    ),
+                })
+        })
+        .collect()
 }
 
 fn cluster_doctor_summary_label(findings: &[ClusterDoctorFinding]) -> &'static str {
@@ -3106,6 +3143,64 @@ mod tests {
             ..info
         };
         assert_eq!(cluster_doctor_summary_label(&[warning]), "warnings");
+    }
+
+    #[test]
+    fn cluster_doctor_warns_when_an_online_node_fails_the_dfs_probe() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_cli_dfs_gate").expect("cluster id");
+        let online_node =
+            NodeId::from_legacy_named("node_cli_dfs_gate_online").expect("online node id");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "cli DFS gate",
+            online_node.clone(),
+            "online",
+            "public-key",
+            now,
+        );
+        let online_member = state.members[0].clone();
+        let mut offline_member = online_member.clone();
+        offline_member.node_id =
+            NodeId::from_legacy_named("node_cli_dfs_gate_offline").expect("offline node id");
+        state.members.push(offline_member.clone());
+        let row = |member: ClusterMemberRecord, availability: ClusterNodeAvailability| {
+            let mut status = cluster::unknown_cluster_node_status(&state, &member, now);
+            status.availability = availability.clone();
+            ClusterHealthRow {
+                member,
+                status,
+                availability,
+                live_probe_observed: true,
+            }
+        };
+        let rows = vec![
+            row(online_member, ClusterNodeAvailability::Online),
+            row(offline_member.clone(), ClusterNodeAvailability::Offline),
+        ];
+        let report = DfsClusterStatusReport {
+            nodes: vec![
+                DfsClusterNodeStatus {
+                    node_id: online_node,
+                    local: true,
+                    endpoint: None,
+                    status: None,
+                    error: Some("no healthy route".to_string()),
+                },
+                DfsClusterNodeStatus {
+                    node_id: offline_member.node_id,
+                    local: false,
+                    endpoint: None,
+                    status: None,
+                    error: Some("offline".to_string()),
+                },
+            ],
+        };
+
+        let findings = dfs_reachability_findings(&rows, &report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "dfs-route-unavailable");
+        assert!(findings[0].detail.contains("no healthy route"));
     }
 
     #[test]

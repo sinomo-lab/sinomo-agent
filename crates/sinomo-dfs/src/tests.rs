@@ -5995,6 +5995,56 @@ fn lifecycle_maintenance_host_clears_completed_anti_entropy_cursor() {
 }
 
 #[test]
+fn lifecycle_maintenance_host_applies_bounded_tombstone_compaction_options() {
+    let root = temp_root("lifecycle-maintenance-host-tombstone-compaction");
+    let node_id = NodeId::from_legacy_named("node_lifecycle_tombstone_host").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_file_system(&DfsFileSystem {
+            file_system_id: DfsFileSystemId::from_legacy_named(
+                "fs_lifecycle_tombstone_host_second",
+            )
+            .expect("second filesystem"),
+            display_name: "second".to_string(),
+            owner_node_id: node_id,
+            subtree_policies: Vec::new(),
+        })
+        .expect("second filesystem metadata");
+    let mut host = RecordingMaintenanceHost::default();
+
+    let reports = run_dfs_lifecycle_maintenance_with_host(
+        &mut dfs,
+        &mut host,
+        DfsMaintenanceRunOptions {
+            compact_tombstones: true,
+            tombstone_compaction_min_age: std::time::Duration::from_nanos(17),
+            tombstone_compaction_max_records: 23,
+            ..DfsMaintenanceRunOptions::default()
+        },
+    )
+    .expect("lifecycle maintenance");
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| report.tombstone_compaction_requested)
+            .count(),
+        1
+    );
+    let report = reports
+        .iter()
+        .find_map(|report| report.tombstone_compaction.as_ref())
+        .expect("single tombstone compaction report");
+    assert_eq!(report.min_tombstone_age_nanos, 17);
+    assert_eq!(report.max_compactions, Some(23));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn local_maintenance_host_migrates_legacy_anti_entropy_cursor() {
     let root = temp_root("local-maintenance-host-cursor-migration");
     let data_dir = SinomoDataDir::new(root.join("data"));

@@ -9753,6 +9753,55 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_incrementally_advances_the_external_read_snapshot_cache() {
+        let root = temp_root("local_backend_advances_external_read_snapshot_cache");
+        let mut writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend");
+        writer.put_file_system(&file_system()).expect("filesystem");
+        let reader = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reader backend");
+
+        let mut first = object(version("version_1"));
+        first.object_id =
+            DfsObjectId::from_legacy_named("obj_cached_snapshot_first").expect("object id");
+        first.path = "/docs/cached-snapshot-first.md".to_string();
+        writer.put_object(&first).expect("first object");
+        assert_eq!(
+            reader.get_object(&first.object_id).expect("first read"),
+            Some(first)
+        );
+        let (first_tables, first_offset) = {
+            let cache = reader.read_snapshot_cache.lock().expect("snapshot cache");
+            let cache = cache.as_ref().expect("populated snapshot cache");
+            (Arc::as_ptr(&cache.tables), cache.table_log_offset)
+        };
+
+        let mut second = object(version("version_1"));
+        second.object_id =
+            DfsObjectId::from_legacy_named("obj_cached_snapshot_second").expect("object id");
+        second.path = "/docs/cached-snapshot-second.md".to_string();
+        writer.put_object(&second).expect("second object");
+        assert_eq!(
+            reader.get_object(&second.object_id).expect("second read"),
+            Some(second)
+        );
+        let (second_tables, second_offset) = {
+            let cache = reader.read_snapshot_cache.lock().expect("snapshot cache");
+            let cache = cache.as_ref().expect("advanced snapshot cache");
+            (Arc::as_ptr(&cache.tables), cache.table_log_offset)
+        };
+
+        assert_eq!(
+            first_tables, second_tables,
+            "sequential external reads should reuse the cached table allocation"
+        );
+        assert!(second_offset > first_offset);
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_serializes_concurrent_metadata_writers() {
         let root = temp_root("local_backend_serializes_concurrent_metadata_writers");
         let mut backend =

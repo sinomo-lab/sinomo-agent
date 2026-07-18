@@ -809,7 +809,7 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
 /// path.
 pub(crate) async fn open_object_rpc_session_stream_via_tcp_tunnel(
     endpoint: &ClusterEndpointRecord,
-    health: NetworkHealthPolicy,
+    mut health: NetworkHealthPolicy,
     runtime: &tokio::runtime::Handle,
     paths: Option<&DaemonPaths>,
 ) -> Result<Box<dyn NetworkDuplexStream>, NetworkError> {
@@ -842,6 +842,10 @@ pub(crate) async fn open_object_rpc_session_stream_via_tcp_tunnel(
             ),
         ));
     };
+    // A pooled tunnel is a fast path in front of a direct endpoint fallback.
+    // Do not let a half-open physical connection consume the caller's full
+    // connect budget before that definitely-not-sent fallback is attempted.
+    health.connect_timeout = health.connect_timeout.min(TCP_TUNNEL_CONNECT_TIMEOUT);
     handle.open_stream(health).await
 }
 
