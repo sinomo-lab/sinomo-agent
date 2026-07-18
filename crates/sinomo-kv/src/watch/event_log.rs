@@ -16,7 +16,7 @@ pub fn lock_cluster_kv_watch_event_log_for_append(
     paths: &ClusterKvPaths,
     file: &File,
 ) -> Result<(), KvError> {
-    file.lock_exclusive().map_err(|source| KvError::Io {
+    fs2::FileExt::lock_exclusive(file).map_err(|source| KvError::Io {
         path: paths.watch_events_log.display().to_string(),
         detail: source.to_string(),
     })
@@ -310,7 +310,7 @@ where
             });
         }
     };
-    file.lock_shared().map_err(|source| KvError::Io {
+    fs2::FileExt::lock_shared(&file).map_err(|source| KvError::Io {
         path: paths.watch_events_log.display().to_string(),
         detail: source.to_string(),
     })?;

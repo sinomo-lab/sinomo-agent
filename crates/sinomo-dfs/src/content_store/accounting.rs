@@ -280,8 +280,7 @@ impl LocalContentStore {
                 path: path.clone(),
                 source,
             })?;
-        file.lock_exclusive()
-            .map_err(|source| ContentStoreError::Io { path, source })?;
+        FileExt::lock_exclusive(&file).map_err(|source| ContentStoreError::Io { path, source })?;
         Ok(file)
     }
 

@@ -90,9 +90,12 @@ pub(crate) fn current_tables_snapshot<'a>(
                 return Ok(DfsMetadataTablesSnapshot::Borrowed(live_tables));
             }
             Some(len) => {
-                if let Some(tables) =
-                    cached_read_snapshot(read_snapshot_cache, &current_snapshot_fingerprint, len)
-                {
+                if let Some(tables) = cached_or_advanced_read_snapshot(
+                    read_snapshot_cache,
+                    &path,
+                    &current_snapshot_fingerprint,
+                    len,
+                )? {
                     return Ok(DfsMetadataTablesSnapshot::Shared(tables));
                 }
                 if len < table_log_offset {
@@ -118,30 +121,46 @@ pub(crate) fn current_tables_snapshot<'a>(
         }
     }
     let table_log_offset = metadata.as_ref().map(fs::Metadata::len).unwrap_or(0);
-    if let Some(tables) = cached_read_snapshot(
+    if let Some(tables) = cached_or_advanced_read_snapshot(
         read_snapshot_cache,
+        &path,
         &current_snapshot_fingerprint,
         table_log_offset,
-    ) {
+    )? {
         return Ok(DfsMetadataTablesSnapshot::Shared(tables));
     }
     let state = read_metadata_table_state_lenient(root)?;
     Ok(snapshot_from_state(read_snapshot_cache, state))
 }
 
-fn cached_read_snapshot(
+fn cached_or_advanced_read_snapshot(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
+    path: &Path,
     snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     table_log_offset: u64,
-) -> Option<Arc<DfsMetadataTables>> {
-    let cache = read_snapshot_cache.lock().ok()?;
-    let cache = cache.as_ref()?;
-    if cache.snapshot_fingerprint == *snapshot_fingerprint
-        && cache.table_log_offset == table_log_offset
+) -> Result<Option<Arc<DfsMetadataTables>>> {
+    let Ok(mut cache) = read_snapshot_cache.lock() else {
+        return Ok(None);
+    };
+    let Some(cache) = cache.as_mut() else {
+        return Ok(None);
+    };
+    if cache.snapshot_fingerprint != *snapshot_fingerprint
+        || cache.table_log_offset > table_log_offset
     {
-        return Some(Arc::clone(&cache.tables));
+        return Ok(None);
     }
-    None
+    if cache.table_log_offset < table_log_offset {
+        // A long-lived reader may trail an external writer by many batches.
+        // Advance the owned snapshot instead of cloning the complete live
+        // metadata tables on every observation. Arc::make_mut preserves
+        // snapshot isolation for any concurrent reader that still holds the
+        // previous view, while the common sequential path reuses allocations.
+        let tables = Arc::make_mut(&mut cache.tables);
+        let replay = replay_metadata_table_batches_from(path, cache.table_log_offset, tables)?;
+        cache.table_log_offset = replay.offset;
+    }
+    Ok(Some(Arc::clone(&cache.tables)))
 }
 
 fn snapshot_from_state<'a>(

@@ -85,6 +85,9 @@ const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
 const DEFAULT_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS: usize = 16;
 const DEFAULT_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES: usize = 64;
+const MAX_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 10_000;
+const MAX_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS: usize = 1_000;
+const MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES: usize = 64 * 1024;
 const DEFAULT_LARGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
@@ -2814,46 +2817,137 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "warmup-iterations",
         DEFAULT_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS,
     )?;
-    let payload_bytes = optional_usize_parameter(
+    let requested_payload_bytes = optional_usize_parameter(
         ctx,
         "payload-bytes",
         DEFAULT_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES,
     )?;
+    let existing_file = ctx
+        .parameter("existing-file")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
     let max_p50_us = optional_usize_parameter(ctx, "max-p50-us", 0)? as u64;
     let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 0)? as u64;
     let max_max_us = optional_usize_parameter(ctx, "max-max-us", 0)? as u64;
     require_positive("iterations", iterations)?;
-    require_positive("payload-bytes", payload_bytes)?;
+    require_positive("payload-bytes", requested_payload_bytes)?;
+    if iterations > MAX_LIGHTWEIGHT_LATENCY_ITERATIONS {
+        return Err(SinomoTestError::failed(format!(
+            "iterations must not exceed {MAX_LIGHTWEIGHT_LATENCY_ITERATIONS}"
+        )));
+    }
+    if warmup_iterations > MAX_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS {
+        return Err(SinomoTestError::failed(format!(
+            "warmup-iterations must not exceed {MAX_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS}"
+        )));
+    }
+    if requested_payload_bytes > MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES {
+        return Err(SinomoTestError::failed(format!(
+            "payload-bytes must not exceed {MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES}"
+        )));
+    }
 
     let backend_open_started = Instant::now();
     let backend = open_backend(ctx)?;
     let backend_open_elapsed = backend_open_started.elapsed();
     let node = backend.node_label();
-    let nonce = probe_nonce();
-    let fixture_dir = format!("{base}/latency-{nonce}");
-    let file_name = "tiny.txt";
-    let file_path = format!("{fixture_dir}/{file_name}");
-    let payload = pattern_payload(
-        &format!("dfs-lightweight-latency-{node}-{nonce}"),
-        payload_bytes,
-    );
-
     let setup_started = Instant::now();
-    backend
-        .create_dir_all(&fixture_dir)
-        .map_err(SinomoTestError::failed)?;
-    backend
-        .write_file(&file_path, &payload)
-        .map_err(SinomoTestError::failed)?;
+    let (
+        fixture_dir,
+        file_name,
+        file_path,
+        payload,
+        file_bytes,
+        read_prefix_truncated,
+        reused_fixture,
+    ) = if let Some(file_path) = existing_file {
+        let normalized = file_path.trim_end_matches('/');
+        let (parent, file_name) = normalized.rsplit_once('/').ok_or_else(|| {
+            SinomoTestError::failed(format!(
+                "existing-file `{file_path}` must include an absolute parent directory"
+            ))
+        })?;
+        if file_name.is_empty() {
+            return Err(SinomoTestError::failed(format!(
+                "existing-file `{file_path}` has no file name"
+            )));
+        }
+        let fixture_dir = if parent.is_empty() { "/" } else { parent };
+        let metadata = backend.stat(normalized).map_err(SinomoTestError::failed)?;
+        if metadata.kind != crate::file_manager::FileManagerEntryKind::File {
+            return Err(SinomoTestError::failed(format!(
+                "existing-file `{file_path}` is not a file"
+            )));
+        }
+        let file_bytes = metadata.size.ok_or_else(|| {
+            SinomoTestError::failed(format!(
+                "existing-file `{file_path}` did not report its size"
+            ))
+        })?;
+        let preview = backend
+            .read_file_prefix(normalized, requested_payload_bytes as u64)
+            .map_err(SinomoTestError::failed)?;
+        let expected_truncated = file_bytes > requested_payload_bytes as u64;
+        if preview.truncated != expected_truncated {
+            return Err(SinomoTestError::failed(format!(
+                "existing-file `{file_path}` prefix truncation was {}, expected {expected_truncated}",
+                preview.truncated
+            )));
+        }
+        let payload = preview.bytes;
+        if payload.is_empty() {
+            return Err(SinomoTestError::failed(format!(
+                "existing-file `{file_path}` must not be empty"
+            )));
+        }
+        (
+            fixture_dir.to_string(),
+            file_name.to_string(),
+            normalized.to_string(),
+            payload,
+            file_bytes,
+            expected_truncated,
+            true,
+        )
+    } else {
+        let nonce = probe_nonce();
+        let fixture_dir = format!("{base}/latency-{nonce}");
+        let file_name = "tiny.txt".to_string();
+        let file_path = format!("{fixture_dir}/{file_name}");
+        let payload = pattern_payload(
+            &format!("dfs-lightweight-latency-{node}-{nonce}"),
+            requested_payload_bytes,
+        );
+        backend
+            .create_dir_all(&fixture_dir)
+            .map_err(SinomoTestError::failed)?;
+        backend
+            .write_file(&file_path, &payload)
+            .map_err(SinomoTestError::failed)?;
+        let file_bytes = payload.len() as u64;
+        (
+            fixture_dir,
+            file_name,
+            file_path,
+            payload,
+            file_bytes,
+            false,
+            false,
+        )
+    };
     let setup_elapsed = setup_started.elapsed();
+    let read_prefix_bytes = payload.len();
 
     for _ in 0..warmup_iterations {
         run_lightweight_latency_operations(
             &backend,
             &fixture_dir,
             &file_path,
-            file_name,
+            &file_name,
             &payload,
+            file_bytes,
+            read_prefix_truncated,
         )?;
     }
 
@@ -2861,16 +2955,16 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let measurement_started = Instant::now();
     for _ in 0..iterations {
         record_lightweight_operation_latency(&mut latency_us, "stat_file", || {
-            validate_lightweight_stat_file(&backend, &file_path, payload_bytes)
+            validate_lightweight_stat_file(&backend, &file_path, file_bytes)
         })?;
         record_lightweight_operation_latency(&mut latency_us, "stat_dir", || {
             validate_lightweight_stat_dir(&backend, &fixture_dir)
         })?;
         record_lightweight_operation_latency(&mut latency_us, "list_dir", || {
-            validate_lightweight_list_dir(&backend, &fixture_dir, file_name)
+            validate_lightweight_list_dir(&backend, &fixture_dir, &file_name)
         })?;
         record_lightweight_operation_latency(&mut latency_us, "read_prefix", || {
-            validate_lightweight_read_prefix(&backend, &file_path, &payload)
+            validate_lightweight_read_prefix(&backend, &file_path, &payload, read_prefix_truncated)
         })?;
     }
     let measurement_elapsed = measurement_started.elapsed();
@@ -2879,9 +2973,12 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("base", &base);
     ctx.record("fixture_dir", &fixture_dir);
     ctx.record("file_path", &file_path);
+    ctx.record("reused_fixture", reused_fixture);
     ctx.record("iterations", iterations);
     ctx.record("warmup_iterations", warmup_iterations);
-    ctx.record("payload_bytes", payload_bytes);
+    ctx.record("payload_bytes", file_bytes);
+    ctx.record("read_prefix_bytes", read_prefix_bytes);
+    ctx.record("read_prefix_truncated", read_prefix_truncated);
     ctx.record("max_p50_us", max_p50_us);
     ctx.record("max_p95_us", max_p95_us);
     ctx.record("max_max_us", max_max_us);
@@ -2967,11 +3064,13 @@ fn run_lightweight_latency_operations(
     file_path: &str,
     file_name: &str,
     payload: &[u8],
+    file_bytes: u64,
+    read_prefix_truncated: bool,
 ) -> Result<(), SinomoTestError> {
-    validate_lightweight_stat_file(backend, file_path, payload.len())?;
+    validate_lightweight_stat_file(backend, file_path, file_bytes)?;
     validate_lightweight_stat_dir(backend, fixture_dir)?;
     validate_lightweight_list_dir(backend, fixture_dir, file_name)?;
-    validate_lightweight_read_prefix(backend, file_path, payload)?;
+    validate_lightweight_read_prefix(backend, file_path, payload, read_prefix_truncated)?;
     Ok(())
 }
 
@@ -2995,7 +3094,7 @@ where
 fn validate_lightweight_stat_file(
     backend: &SifsFileManagerBackend,
     path: &str,
-    expected_bytes: usize,
+    expected_bytes: u64,
 ) -> Result<(), SinomoTestError> {
     let metadata = backend.stat(path).map_err(SinomoTestError::failed)?;
     if metadata.kind != crate::file_manager::FileManagerEntryKind::File {
@@ -3004,7 +3103,7 @@ fn validate_lightweight_stat_file(
             metadata.kind
         )));
     }
-    if metadata.size != Some(expected_bytes as u64) {
+    if metadata.size != Some(expected_bytes) {
         return Err(SinomoTestError::failed(format!(
             "{path} stat size {:?}, expected {expected_bytes}",
             metadata.size
@@ -3047,13 +3146,15 @@ fn validate_lightweight_read_prefix(
     backend: &SifsFileManagerBackend,
     path: &str,
     expected: &[u8],
+    expected_truncated: bool,
 ) -> Result<(), SinomoTestError> {
     let read = backend
         .read_file_prefix(path, expected.len() as u64)
         .map_err(SinomoTestError::failed)?;
-    if read.truncated {
+    if read.truncated != expected_truncated {
         return Err(SinomoTestError::failed(format!(
-            "{path} read-prefix unexpectedly truncated"
+            "{path} read-prefix truncation was {}, expected {expected_truncated}",
+            read.truncated
         )));
     }
     if read.bytes != expected {

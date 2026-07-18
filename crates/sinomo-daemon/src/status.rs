@@ -621,11 +621,10 @@ impl DaemonLock {
                 path: paths.lock.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.try_lock_exclusive()
-            .map_err(|source| DaemonError::AlreadyRunning {
-                lock_file: paths.lock.display().to_string(),
-                detail: source.to_string(),
-            })?;
+        FileExt::try_lock_exclusive(&file).map_err(|source| DaemonError::AlreadyRunning {
+            lock_file: paths.lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
 
         let status = DaemonStatus::new(options, paths, cluster);
         write_daemon_status(paths, &status)?;
@@ -676,13 +675,12 @@ impl DaemonDataOwnerLock {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.try_lock_exclusive()
-            .map_err(|source| DaemonError::AlreadyRunning {
-                lock_file: path.display().to_string(),
-                detail: format!(
-                    "main daemon data directory is already owned by another process: {source}"
-                ),
-            })?;
+        FileExt::try_lock_exclusive(&file).map_err(|source| DaemonError::AlreadyRunning {
+            lock_file: path.display().to_string(),
+            detail: format!(
+                "main daemon data directory is already owned by another process: {source}"
+            ),
+        })?;
         file.set_len(0).map_err(|source| DaemonError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
@@ -709,7 +707,7 @@ impl DaemonDataOwnerLock {
 
 impl Drop for DaemonDataOwnerLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
         // Keep the lock inode stable. Unlinking after unlock races a new owner
         // which can acquire the old inode before removal, allowing a third
         // process to create and lock a different inode at the same path.
@@ -721,7 +719,7 @@ impl Drop for DaemonDataOwnerLock {
 impl Drop for DaemonLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.paths.status);
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
         let _ = fs::remove_file(&self.paths.lock);
     }
 }

@@ -1,4 +1,3 @@
-use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_base::{
@@ -208,7 +207,8 @@ mod model;
 mod paths;
 mod raft;
 mod rpc;
-mod snapshot;mod wal;
+mod snapshot;
+mod wal;
 mod watch;
 #[cfg(any(test, feature = "test-support"))]
 mod watch_store;

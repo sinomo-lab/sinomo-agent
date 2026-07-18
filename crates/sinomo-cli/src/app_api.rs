@@ -68,6 +68,13 @@ pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
 const SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE: u64 = 128;
 const SIFS_AGENT_CHANNEL_METADATA_SCHEMA_VERSION: u32 = 1;
 const SIFS_AGENT_SESSION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+/// The daemon deliberately rejects a browser read quickly when its route limit is saturated or
+/// another SIFS request holds the shared service lock. Files and chat-list workers routinely
+/// overlap, so absorb those explicit transient signals here instead of presenting normal UI
+/// concurrency as SIFS unavailability.
+const SIFS_BROWSER_READ_RETRY_BUDGET: Duration = Duration::from_secs(3);
+const SIFS_BROWSER_READ_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const SIFS_BROWSER_READ_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
 
 /// Lightweight channel metadata for list views.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -6201,10 +6208,18 @@ impl SifsBrowser {
 
 impl RemoteSifsBrowser {
     fn status(&self) -> Result<sinomo_runtime::api::DaemonDfsBrowserStatusResponse, String> {
-        self.rpc(
+        self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::with_health(),
         )
+    }
+
+    fn read_rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        retry_transient_sifs_browser_read(|| self.rpc(route, body))
     }
 
     fn rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
@@ -6237,7 +6252,7 @@ impl RemoteSifsBrowser {
         shallow: bool,
         missing_is_empty: bool,
     ) -> Result<Vec<SifsEntry>, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = self.rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_LIST_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserListRequest {
                 path: path.to_string(),
@@ -6264,7 +6279,7 @@ impl RemoteSifsBrowser {
         missing_is_empty: bool,
         options: SifsListOptions,
     ) -> Result<SifsEntryPage, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = self.rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_LIST_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserListRequest {
                 path: path.to_string(),
@@ -6298,17 +6313,21 @@ impl RemoteSifsBrowser {
     }
 
     fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserStatResponse = self.rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserStatResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_STAT_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserStatRequest {
                 path: path.to_string(),
+                // File-detail panes commonly ask for the same object several
+                // times while rendering. Reuse only a very recent result;
+                // callers that require strict freshness use zero.
+                max_staleness_millis: 250,
             },
         )?;
         Ok(sifs_details_from_rpc(response))
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserReadFileResponse = self.rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadFileResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserReadFileRequest {
                 path: path.to_string(),
@@ -6324,20 +6343,21 @@ impl RemoteSifsBrowser {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<Vec<u8>, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionResponse = self.rpc(
-            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
-            &sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionRequest {
-                object_id: object_id.to_string(),
-                version: version.to_string(),
-                content_hash: content_hash.to_string(),
-                size_bytes: Some(size_bytes),
-            },
-        )?;
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionResponse = self
+            .read_rpc(
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+                &sinomo_runtime::api::DaemonDfsBrowserReadObjectVersionRequest {
+                    object_id: object_id.to_string(),
+                    version: version.to_string(),
+                    content_hash: content_hash.to_string(),
+                    size_bytes: Some(size_bytes),
+                },
+            )?;
         Ok(response.bytes)
     }
 
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixRequest {
                 path: path.to_string(),
@@ -6354,7 +6374,7 @@ impl RemoteSifsBrowser {
         &self,
         paths: &[String],
     ) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserReadFilesResponse = self.rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadFilesResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserReadFilesRequest {
                 paths: paths.to_vec(),
@@ -6584,14 +6604,15 @@ impl RemoteSifsBrowser {
         policy: Option<SifsPlacementPolicy>,
         scope: SifsPlacementScope,
     ) -> Result<SifsPlacementPreview, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementPreviewResponse = self.rpc(
-            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
-            &sinomo_runtime::api::DaemonDfsBrowserPlacementPreviewRequest {
-                path: path.to_string(),
-                policy,
-                scope,
-            },
-        )?;
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementPreviewResponse = self
+            .read_rpc(
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+                &sinomo_runtime::api::DaemonDfsBrowserPlacementPreviewRequest {
+                    path: path.to_string(),
+                    policy,
+                    scope,
+                },
+            )?;
         Ok(response.preview)
     }
 
@@ -6618,12 +6639,13 @@ impl RemoteSifsBrowser {
     }
 
     fn placement_progress(&self, job_id: &str) -> Result<SifsPlacementReconciliationJob, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementProgressResponse = self.rpc(
-            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
-            &sinomo_runtime::api::DaemonDfsBrowserPlacementProgressRequest {
-                job_id: job_id.to_string(),
-            },
-        )?;
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementProgressResponse = self
+            .read_rpc(
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+                &sinomo_runtime::api::DaemonDfsBrowserPlacementProgressRequest {
+                    job_id: job_id.to_string(),
+                },
+            )?;
         Ok(response.reconciliation)
     }
 
@@ -6631,12 +6653,56 @@ impl RemoteSifsBrowser {
         &self,
         request: SifsPlacementActivityRequest,
     ) -> Result<SifsPlacementActivityPage, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementActivityResponse = self.rpc(
-            sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
-            &request,
-        )?;
+        let response: sinomo_runtime::api::DaemonDfsBrowserPlacementActivityResponse = self
+            .read_rpc(
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
+                &request,
+            )?;
         Ok(response.page)
     }
+}
+
+fn retry_transient_sifs_browser_read<T>(
+    work: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    retry_transient_sifs_browser_read_with_policy(
+        work,
+        SIFS_BROWSER_READ_RETRY_BUDGET,
+        SIFS_BROWSER_READ_RETRY_INITIAL_DELAY,
+        SIFS_BROWSER_READ_RETRY_MAX_DELAY,
+    )
+}
+
+fn retry_transient_sifs_browser_read_with_policy<T>(
+    mut work: impl FnMut() -> Result<T, String>,
+    budget: Duration,
+    initial_delay: Duration,
+    max_delay: Duration,
+) -> Result<T, String> {
+    let started = Instant::now();
+    let mut delay = initial_delay.min(max_delay);
+    loop {
+        match work() {
+            Ok(value) => return Ok(value),
+            Err(error) if sifs_browser_read_should_retry(&error) => {
+                let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+                    return Err(error);
+                };
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(max_delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sifs_browser_read_should_retry(error: &str) -> bool {
+    (error.contains("DFS browser service is busy") && error.contains("retry the read"))
+        || (error.contains("object rpc route /daemon/dfs/browser/")
+            && error.contains(" is saturated:"))
 }
 
 fn reconcile_conditional_replace_bytes(
@@ -7081,6 +7147,82 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn remote_sifs_reads_retry_only_transient_browser_admission_failures() {
+        let mut attempts = 0;
+        let value = retry_transient_sifs_browser_read_with_policy(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(
+                        "DFS browser service is busy after waiting 100ms; retry the read"
+                            .to_string(),
+                    )
+                } else {
+                    Ok("ready")
+                }
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .expect("an admitted retry should recover");
+        assert_eq!(value, "ready");
+        assert_eq!(attempts, 3);
+
+        let mut saturation_attempts = 0;
+        let value = retry_transient_sifs_browser_read_with_policy(
+            || {
+                saturation_attempts += 1;
+                if saturation_attempts == 1 {
+                    Err(
+                        "object rpc route /daemon/dfs/browser/status is saturated: max 4 in-flight requests"
+                            .to_string(),
+                    )
+                } else {
+                    Ok("admitted")
+                }
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .expect("route saturation should be retried");
+        assert_eq!(value, "admitted");
+        assert_eq!(saturation_attempts, 2);
+
+        let mut unrelated_saturation_attempts = 0;
+        let error = retry_transient_sifs_browser_read_with_policy(
+            || {
+                unrelated_saturation_attempts += 1;
+                Err::<(), _>(
+                    "object rpc route /daemon/agent/session is saturated: max 4 in-flight requests"
+                        .to_string(),
+                )
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .expect_err("unrelated route saturation must not be retried");
+        assert!(error.contains("/daemon/agent/session"));
+        assert_eq!(unrelated_saturation_attempts, 1);
+
+        let mut terminal_attempts = 0;
+        let error = retry_transient_sifs_browser_read_with_policy(
+            || {
+                terminal_attempts += 1;
+                Err::<(), _>("device authorization was denied".to_string())
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .expect_err("non-busy failures must not be retried");
+        assert_eq!(error, "device authorization was denied");
+        assert_eq!(terminal_attempts, 1);
+    }
 
     #[test]
     fn ambiguous_conditional_replace_only_commits_after_exact_byte_verification() {

@@ -3005,6 +3005,15 @@ impl FilesState {
         self.apply_location(location.source, location.path, waker);
     }
 
+    /// Follow the same history stack as the Files header's back button.
+    pub(crate) fn navigate_back(&mut self, waker: Option<sui::UiHandle>) -> bool {
+        if !self.can_go_back() {
+            return false;
+        }
+        self.go_back(waker);
+        true
+    }
+
     fn go_forward(&mut self, waker: Option<sui::UiHandle>) {
         let Some(location) = self.history_forward.pop() else {
             return;
@@ -5508,6 +5517,15 @@ fn files_worker_loop(
             .unwrap_or_else(|| "SIFS browsing requires a daemon connection".to_string())
     });
     while let Ok(command) = command_rx.recv() {
+        // A daemon-backed browser is only an address plus a runtime handle. Opening it can fail
+        // transiently when Files/chat traffic saturates the browser route or owns the daemon's
+        // SIFS service lock. Keep the error for this command, but let the next interaction
+        // reconnect naturally.
+        clear_files_worker_transient_open_error(
+            browser.as_ref(),
+            daemon_address.as_deref(),
+            &mut open_error,
+        );
         match command {
             FilesWorkerCommand::List {
                 request_id,
@@ -6178,6 +6196,16 @@ fn ensure_files_worker_browser(
     }
 }
 
+fn clear_files_worker_transient_open_error(
+    browser: Option<&SifsBrowser>,
+    daemon_address: Option<&str>,
+    open_error: &mut Option<String>,
+) {
+    if browser.is_none() && daemon_address.is_some() {
+        *open_error = None;
+    }
+}
+
 fn send_task_progress(
     result_tx: &Sender<FilesWorkerResult>,
     waker: &sui::UiHandle,
@@ -6237,8 +6265,13 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn default_local_path(fallback: impl AsRef<Path>) -> String {
-    std::env::current_dir()
-        .or_else(|_| Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf()))
+    #[cfg(target_os = "android")]
+    let initial_path = Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf());
+    #[cfg(not(target_os = "android"))]
+    let initial_path = std::env::current_dir()
+        .or_else(|_| Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf()));
+
+    initial_path
         .and_then(|path| path.canonicalize().or(Ok(path)))
         .map(|path| display_local_path(path.to_string_lossy().into_owned()))
         .unwrap_or_else(|_| ".".to_string())
@@ -22841,6 +22874,21 @@ mod tests {
     }
 
     #[test]
+    fn daemon_backed_files_worker_retries_a_transient_open_failure() {
+        let mut open_error =
+            Some("DFS browser service is busy after waiting 100ms; retry the read".to_string());
+        clear_files_worker_transient_open_error(None, Some("127.0.0.1:21353"), &mut open_error);
+        assert_eq!(open_error, None);
+
+        let mut unavailable = Some("SIFS browsing requires a daemon connection".to_string());
+        clear_files_worker_transient_open_error(None, None, &mut unavailable);
+        assert_eq!(
+            unavailable.as_deref(),
+            Some("SIFS browsing requires a daemon connection")
+        );
+    }
+
+    #[test]
     fn refresh_queues_current_sifs_path_without_navigation() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -23453,6 +23501,24 @@ mod tests {
         assert_eq!(shared.files().path, "/services");
 
         Ok(())
+    }
+
+    #[test]
+    fn platform_back_uses_files_history_and_reports_root() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.loaded = true;
+        files.loading = false;
+        files.path = "/services".to_string();
+        files.sifs_path = "/services".to_string();
+        files.history_back.push(FilesLocation {
+            source: FilesSourceKind::Sifs,
+            path: "/".to_string(),
+        });
+
+        assert!(files.navigate_back(None));
+        assert_eq!(files.path, "/");
+        assert!(!files.navigate_back(None));
     }
 
     #[test]

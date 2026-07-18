@@ -2517,11 +2517,10 @@ fn acquire_native_dylib_module_state_lock(
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-    file.lock_exclusive()
-        .map_err(|source| ModuleLoaderStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    FileExt::lock_exclusive(&file).map_err(|source| ModuleLoaderStoreError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
     Ok(NativeDylibModuleStateLock { file })
 }
 

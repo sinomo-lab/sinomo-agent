@@ -34,11 +34,10 @@ pub(crate) fn metadata_write_lock(root: PathBuf, lock_path: PathBuf) -> Result<M
             path: lock_path.clone(),
             source,
         })?;
-    file.lock_exclusive()
-        .map_err(|source| MetadataBackendError::Io {
-            path: lock_path.clone(),
-            source,
-        })?;
+    FileExt::lock_exclusive(&file).map_err(|source| MetadataBackendError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
     Ok(MetadataWriteLock {
         _path_guard: path_guard,
         _file: file,

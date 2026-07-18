@@ -471,8 +471,7 @@ fn append_jsonl_record_with_config<T: Serialize>(
         })?;
     }
     let lock = open_jsonl_lock(path)?;
-    lock.lock_exclusive()
-        .map_err(|source| lock_error(path, source))?;
+    FileExt::lock_exclusive(&lock).map_err(|source| lock_error(path, source))?;
     let result = (|| {
         rotate_jsonl_if_needed(path, rotation)?;
         let mut file = fs::OpenOptions::new()
@@ -496,7 +495,7 @@ fn append_jsonl_record_with_config<T: Serialize>(
             detail: source.to_string(),
         })
     })();
-    let unlock = lock.unlock().map_err(|source| lock_error(path, source));
+    let unlock = FileExt::unlock(&lock).map_err(|source| lock_error(path, source));
     match (result, unlock) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -522,8 +521,7 @@ where
     F: FnMut(&T) -> bool,
 {
     let lock = open_jsonl_lock(&path)?;
-    lock.lock_shared()
-        .map_err(|source| lock_error(&path, source))?;
+    FileExt::lock_shared(&lock).map_err(|source| lock_error(&path, source))?;
     let result = (|| {
         let mut records = VecDeque::new();
         for path in jsonl_read_paths_chronological(&path, rotation.retained_files) {
@@ -531,7 +529,7 @@ where
         }
         Ok(records.into_iter().collect())
     })();
-    let unlock = lock.unlock().map_err(|source| lock_error(&path, source));
+    let unlock = FileExt::unlock(&lock).map_err(|source| lock_error(&path, source));
     match (result, unlock) {
         (Ok(records), Ok(())) => Ok(records),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),

@@ -127,8 +127,7 @@ impl LocalContentStore {
                 source,
             })?;
         let wait_started_at = crate::dfs_perf_trace_enabled().then(Instant::now);
-        file.lock_exclusive()
-            .map_err(|source| ContentStoreError::Io { path, source })?;
+        FileExt::lock_exclusive(&file).map_err(|source| ContentStoreError::Io { path, source })?;
         let hold_started_at = wait_started_at.map(|wait_started_at| {
             let acquired_at = Instant::now();
             crate::dfs_perf_trace(format_args!(
@@ -153,8 +152,7 @@ impl LocalContentStore {
             }
         };
         let wait_started_at = crate::dfs_perf_trace_enabled().then(Instant::now);
-        file.lock_shared()
-            .map_err(|source| ContentStoreError::Io { path, source })?;
+        FileExt::lock_shared(&file).map_err(|source| ContentStoreError::Io { path, source })?;
         let hold_started_at = wait_started_at.map(|wait_started_at| {
             let acquired_at = Instant::now();
             crate::dfs_perf_trace(format_args!(
