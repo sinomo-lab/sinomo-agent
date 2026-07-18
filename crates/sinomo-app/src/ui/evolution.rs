@@ -1077,24 +1077,20 @@ fn evolution_header_host(
     let s = shared.clone();
     let r = Rc::clone(reader);
     sui::RebuildOnChange::new_observable(source, move |_key| {
-        let build_s = s.clone();
-        let build_r = Rc::clone(&r);
-        WidgetPod::new(sui::RebuildOnConstraints::new(
-            true,
-            move |constraints| {
-                let width = if constraints.max.width.is_finite() {
-                    constraints.max.width
-                } else {
-                    constraints.min.width
-                };
-                width >= 740.0
-            },
-            move |show_metrics| build_evolution_header(&build_s, &build_r, *show_metrics),
-        ))
+        WidgetPod::new(
+            sui::ConstraintView::new(build_evolution_header(&s, &r, false)).when(
+                sui::ConstraintQuery::new().min_width(740.0),
+                build_evolution_header(&s, &r, true),
+            ),
+        )
     })
 }
 
-fn build_evolution_header(shared: &Shared, reader: &ThemeReader, show_metrics: bool) -> WidgetPod {
+fn build_evolution_header(
+    shared: &Shared,
+    reader: &ThemeReader,
+    show_metrics: bool,
+) -> impl Widget + use<> {
     let (dashboard, refresh_pending, refresh_error) = {
         let state = shared.evolution();
         (
@@ -1155,18 +1151,16 @@ fn build_evolution_header(shared: &Shared, reader: &ThemeReader, show_metrics: b
         );
     }
 
-    WidgetPod::new(
-        Surface::window(row)
-            .border(SurfaceBorder::Bottom)
-            .padding(Insets {
-                left: PAD,
-                right: PAD,
-                top: 10.0,
-                bottom: 10.0,
-            })
-            .fill()
-            .theme_when(clone_reader(reader)),
-    )
+    Surface::window(row)
+        .border(SurfaceBorder::Bottom)
+        .padding(Insets {
+            left: PAD,
+            right: PAD,
+            top: 10.0,
+            bottom: 10.0,
+        })
+        .fill()
+        .theme_when(clone_reader(reader))
 }
 
 fn evolution_queue_header_host(
@@ -1252,22 +1246,17 @@ fn evolution_start_chrome_host(
     let s = shared.clone();
     let r = Rc::clone(reader);
     sui::RebuildOnChange::new_observable(source, move |_key| {
-        let build_s = s.clone();
-        let build_r = Rc::clone(&r);
-        WidgetPod::new(sui::RebuildOnConstraints::new(
-            (true, true),
-            move |constraints| {
-                let width = if constraints.max.width.is_finite() {
-                    constraints.max.width
-                } else {
-                    constraints.min.width
-                };
-                (width >= 640.0, (width - PAD * 2.0) >= START_BREAKPOINT)
-            },
-            move |(inline, wide_header)| {
-                build_evolution_start_chrome(&build_s, &build_r, *inline, *wide_header)
-            },
-        ))
+        WidgetPod::new(
+            sui::AdaptiveView::new(
+                build_evolution_start_chrome(&s, &r, false, false),
+                build_evolution_start_chrome(&s, &r, true, false),
+                build_evolution_start_chrome(&s, &r, true, true),
+            )
+            .breakpoints(sui::AdaptiveBreakpoints::new(
+                640.0,
+                START_BREAKPOINT + PAD * 2.0,
+            )),
+        )
     })
 }
 
@@ -1326,7 +1315,7 @@ fn build_evolution_start_chrome(
     reader: &ThemeReader,
     inline: bool,
     wide_header: bool,
-) -> WidgetPod {
+) -> impl Widget + use<> {
     let theme = shared.theme();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let (status, tone) = evolution_start_status(shared);
@@ -1378,12 +1367,10 @@ fn build_evolution_start_chrome(
         .align_items(Alignment::Stretch)
         .with_child(SizedBox::new().height(header_height).with_child(header))
         .spacer();
-    WidgetPod::new(
-        Surface::window(body)
-            .border(SurfaceBorder::Bottom)
-            .fill()
-            .theme_when(clone_reader(reader)),
-    )
+    Surface::window(body)
+        .border(SurfaceBorder::Bottom)
+        .fill()
+        .theme_when(clone_reader(reader))
 }
 
 fn evolution_detail_host(

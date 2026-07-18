@@ -6,15 +6,14 @@
 //! narrow, it collapses to a single column: the menu, which you drill into to
 //! reach a detail page with a back affordance.
 //!
-//! The page is a fully *composed* `sui-widgets` tree: [`view`] returns a small
-//! responsive host ([`SettingsView`]) wrapping two pre-built pods (wide/narrow),
-//! each assembled from stock `FormSection` / `FormRow` / `TabBar` / `Switch` /
+//! The page is a fully *composed* `sui-widgets` tree: [`view`] uses a retained
+//! `ConstraintView` for its wide/narrow presentations, each assembled from stock
+//! `FormSection` / `FormRow` / `TabBar` / `Switch` /
 //! `TextInput` / `Select` / `Button` / `ListView` / `ScrollView` widgets. State lives
 //! entirely in [`SettingsState`]; controls bind to it via reactive `*_when` readers and
 //! snapshot-seed-plus-`on_change` writeback. Async provider device-login status is
 //! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -33,15 +32,16 @@ use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
 };
 use sui::{
-    Align, Alignment, ArrangeCtx, Checkbox, Command, Constraints, ContextMenu, ControlSize,
-    DefaultTheme, Event, EventCtx, FieldGroup, FixedPaneSplit, Flex, FlexItem, FlexWrap,
-    FontWeight, FormRow, FormSection, IconButton, IconGlyph, Label, ListItem, ListView, MeasureCtx,
-    MenuItem, NumberInput, PaintCtx, PasswordInput, ProgressBar, RebuildOnChange,
-    RebuildOnConstraints, Rect, RichText, ScrollState, ScrollView, SectionLabel, Select,
-    SelectionScope, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, Size,
-    SizedBox, Spinner, Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TabBar,
-    TextArea, TextCommand, TextDocument, TextInput, ThemeTextToken, Tooltip, TooltipPlacement,
-    TrailingSlotRow, VirtualList, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    Align, Alignment, ArrangeCtx, Checkbox, Command, ConstraintQuery, ConstraintView, Constraints,
+    ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, FieldGroup, FixedPaneSplit, Flex,
+    FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconButton, IconGlyph, Label, ListItem,
+    ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PasswordInput, ProgressBar,
+    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, Select, SelectionScope,
+    SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, Size, SizedBox, Spinner,
+    Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TabBar, TextArea, TextCommand,
+    TextDocument, TextInput, ThemeTextToken, Tooltip, TooltipPlacement, TrailingSlotRow,
+    VirtualList, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding,
 };
 
 use sinomo_runtime::config::{
@@ -8490,49 +8490,40 @@ fn agents_section_key(shared: &Shared) -> String {
 }
 
 fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnConstraints::new(
-        false,
-        |constraints| constraints.max.width >= AGENT_SPLIT_THRESHOLD,
-        move |wide| {
-            if *wide {
-                WidgetPod::new(
-                    FixedPaneSplit::horizontal(
-                        agent_catalog_section(&s, &r),
-                        Separator::vertical().theme_when(clone_reader(&r)),
-                        InsetX::new(agent_details_host(&s, &r), 18.0),
-                    )
-                    .fixed_first(AGENT_MENU_W)
-                    .divider_extent(1.0)
-                    .fallback_flexible_extent(560.0),
-                )
-            } else {
-                let back = {
-                    let s = s.clone();
-                    sui::Button::new("Agents")
-                        .icon(IconGlyph::ChevronLeft)
-                        .theme_when(clone_reader(&r))
-                        .appearance(sui::ButtonAppearance::Tonal)
-                        .tone(SemanticTone::Neutral)
-                        .on_press(move || s.settings_mut().back_to_agent_list())
-                };
-                let detail = Stack::vertical()
-                    .spacing(10.0)
-                    .alignment(Alignment::Stretch)
-                    .with_child(Stack::horizontal().with_child(back))
-                    .with_child(agent_details_host(&s, &r));
-                WidgetPod::new(
-                    SwitchView::new()
-                        .with_child(agent_catalog_section(&s, &r))
-                        .with_child(detail)
-                        .selected_when({
-                            let s = s.clone();
-                            move || usize::from(s.settings().agent_detail_open)
-                        }),
-                )
-            }
-        },
+    let wide = FixedPaneSplit::horizontal(
+        agent_catalog_section(shared, reader),
+        Separator::vertical().theme_when(clone_reader(reader)),
+        WidgetPadding::horizontal(18.0, agent_details_host(shared, reader)).fill_child(),
+    )
+    .fixed_first(AGENT_MENU_W)
+    .divider_extent(1.0)
+    .fallback_flexible_extent(560.0);
+
+    let back = {
+        let shared = shared.clone();
+        sui::Button::new("Agents")
+            .icon(IconGlyph::ChevronLeft)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || shared.settings_mut().back_to_agent_list())
+    };
+    let detail = Stack::vertical()
+        .spacing(10.0)
+        .alignment(Alignment::Stretch)
+        .with_child(Stack::horizontal().with_child(back))
+        .with_child(agent_details_host(shared, reader));
+    let narrow = SwitchView::new()
+        .with_child(agent_catalog_section(shared, reader))
+        .with_child(detail)
+        .selected_when({
+            let shared = shared.clone();
+            move || usize::from(shared.settings().agent_detail_open)
+        });
+
+    ConstraintView::new(narrow).when(
+        ConstraintQuery::new().min_width(AGENT_SPLIT_THRESHOLD),
+        wide,
     )
 }
 
@@ -12896,12 +12887,12 @@ where
         .spacing(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(CONTENT_PAD))
-        .with_child(InsetX::new(
+        .with_child(horizontal_inset(
             section_header(shared, reader, section),
             CONTENT_PAD,
         ))
         .with_child(SizedBox::new().height(18.0))
-        .with_child(InsetX::new(body, CONTENT_PAD))
+        .with_child(horizontal_inset(body, CONTENT_PAD))
         .with_child(SizedBox::new().height(CONTENT_PAD));
     ScrollView::vertical(inset).state(scroll_state.clone())
 }
@@ -13083,7 +13074,7 @@ fn section_group(
     Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Stretch)
-        .with_child(InsetX::new(
+        .with_child(horizontal_inset(
             SectionLabel::new(label).theme_when(clone_reader(reader)),
             10.0,
         ))
@@ -13254,7 +13245,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .spacing(6.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(14.0))
-        .with_child(InsetX::new(
+        .with_child(horizontal_inset(
             primary_section_groups_host(
                 shared,
                 reader,
@@ -13272,7 +13263,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             8.0,
         ))
         .with_child(SizedBox::new().height(12.0));
-    let about = InsetX::new(
+    let about = horizontal_inset(
         about_group_host(
             shared,
             reader,
@@ -13301,7 +13292,7 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .spacing(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(CONTENT_PAD))
-        .with_child(InsetX::new(
+        .with_child(horizontal_inset(
             primary_section_groups_host(
                 shared,
                 reader,
@@ -13319,7 +13310,7 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             CONTENT_PAD,
         ))
         .with_child(SizedBox::new().height(14.0))
-        .with_child(InsetX::new(
+        .with_child(horizontal_inset(
             about_group_host(
                 shared,
                 reader,
@@ -13339,9 +13330,9 @@ fn wide_pod(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_states: &[ScrollState; SettingsSection::ALL.len()],
-) -> WidgetPod {
+) -> impl Widget + use<> {
     let detail = section_body(shared, reader, scroll_states);
-    let row = Stack::horizontal()
+    Stack::horizontal()
         .alignment(Alignment::Stretch)
         .with_child(
             SizedBox::new().width(SIDEBAR_W).with_child(
@@ -13351,15 +13342,14 @@ fn wide_pod(
             ),
         )
         .with_child(Separator::vertical().theme_when(clone_reader(reader)))
-        .with_child(SizedBox::new().with_child(detail));
-    WidgetPod::new(row)
+        .with_child(SizedBox::new().with_child(detail))
 }
 
 fn narrow_pod(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_states: &[ScrollState; SettingsSection::ALL.len()],
-) -> WidgetPod {
+) -> impl Widget + use<> {
     let back_button = {
         let s = shared.clone();
         // A real leading Lucide ChevronLeft (Button's leading-icon slot) replaces the ‹ text rune.
@@ -13391,7 +13381,7 @@ fn narrow_pod(
     let detail_with_backbar = Stack::vertical()
         .spacing(0.0)
         .alignment(Alignment::Stretch)
-        .with_child(InsetX::new(
+        .with_child(horizontal_inset(
             Stack::vertical()
                 .with_child(SizedBox::new().height(8.0))
                 .with_child(SizedBox::new().height(40.0).with_child(backbar))
@@ -13410,11 +13400,10 @@ fn narrow_pod(
                     .as_deref()
                     .is_some_and(|snapshot| snapshot.selected.is_some()) as usize
             });
-    let switch = SwitchView::new()
+    SwitchView::new()
         .with_child(menu(shared, reader))
         .with_child(detail_with_backbar)
-        .selected_from(selected);
-    WidgetPod::new(switch)
+        .selected_from(selected)
 }
 
 // ---------------------------------------------------------------------------
@@ -13569,61 +13558,13 @@ impl Widget for PodHost {
     }
 }
 
-/// Insets a single child horizontally by `pad` on each side (the vertical axis is left to the
-/// caller). Keeps cards off the panel edges without pulling in the container `Padding` widget.
-struct InsetX {
-    child: WidgetPod,
-    pad: f32,
-}
-
-impl InsetX {
-    fn new<W>(child: W, pad: f32) -> Self
-    where
-        W: Widget + 'static,
-    {
-        Self {
-            child: WidgetPod::new(child),
-            pad: pad.max(0.0),
-        }
-    }
-}
-
-impl Widget for InsetX {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let inner_max = Size::new(
-            (constraints.max.width - self.pad * 2.0).max(0.0),
-            constraints.max.height,
-        );
-        let inner = Constraints::new(Size::ZERO, inner_max);
-        let child = self.child.measure(ctx, inner);
-        Size::new(child.width + self.pad * 2.0, child.height)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let inner = Rect::new(
-            bounds.x() + self.pad,
-            bounds.y(),
-            (bounds.width() - self.pad * 2.0).max(0.0),
-            bounds.height(),
-        );
-        self.child.arrange(ctx, inner);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
+/// Keeps the horizontal-inset call sites concise while delegating sizing and
+/// retained-child behavior to SUI's stock padding container.
+fn horizontal_inset<W>(child: W, pad: f32) -> WidgetPadding
+where
+    W: Widget + 'static,
+{
+    WidgetPadding::horizontal(pad, child).fill_child_width()
 }
 
 // ---------------------------------------------------------------------------
@@ -13791,94 +13732,29 @@ fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Responsive host
+// Responsive layout
 // ---------------------------------------------------------------------------
 
-/// The settings tab: a thin responsive host that owns two pre-built pods (wide master/detail and
-/// narrow drill-down) and delegates to the one chosen by the available width. The choice is made in
-/// `measure` (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync.
-pub struct SettingsView {
-    wide: WidgetPod,
-    narrow: WidgetPod,
-    use_wide: Cell<bool>,
-}
+/// Builds both settings presentations once and lets SUI retain, focus-scope, and switch the
+/// active branch from the layout's own incoming constraints.
+fn responsive_settings_view(shared: Shared) -> impl Widget {
+    let wide_theme_reader: ThemeReader = {
+        let shared = shared.clone();
+        Rc::new(move || settings_control_theme(&shared, ControlSize::Small))
+    };
+    let narrow_theme_reader: ThemeReader = {
+        let shared = shared.clone();
+        Rc::new(move || settings_control_theme(&shared, ControlSize::Medium))
+    };
+    // Preserve an independent reading position for each destination. Both retained branches share
+    // each destination's state, so crossing the breakpoint keeps the right position without
+    // carrying Appearance's offset into Providers or System configuration.
+    let scroll_states: [ScrollState; SettingsSection::ALL.len()] =
+        std::array::from_fn(|_| ScrollState::new());
+    let narrow = narrow_pod(&shared, &narrow_theme_reader, &scroll_states);
+    let wide = wide_pod(&shared, &wide_theme_reader, &scroll_states);
 
-impl SettingsView {
-    pub fn new(shared: Shared) -> Self {
-        let wide_theme_reader: ThemeReader = {
-            let s = shared.clone();
-            Rc::new(move || settings_control_theme(&s, ControlSize::Small))
-        };
-        let narrow_theme_reader: ThemeReader = {
-            let s = shared.clone();
-            Rc::new(move || settings_control_theme(&s, ControlSize::Medium))
-        };
-        // Preserve an independent reading position for each destination. Wide and narrow pods
-        // share each destination's state, so crossing the breakpoint keeps the right position
-        // without carrying Appearance's offset into Providers or System configuration.
-        let scroll_states: [ScrollState; SettingsSection::ALL.len()] =
-            std::array::from_fn(|_| ScrollState::new());
-        let wide = wide_pod(&shared, &wide_theme_reader, &scroll_states);
-        let narrow = narrow_pod(&shared, &narrow_theme_reader, &scroll_states);
-        Self {
-            wide,
-            narrow,
-            // Default to wide before the first measure (matches the old default).
-            use_wide: Cell::new(true),
-        }
-    }
-
-    fn active(&self) -> &WidgetPod {
-        if self.use_wide.get() {
-            &self.wide
-        } else {
-            &self.narrow
-        }
-    }
-
-    fn active_mut(&mut self) -> &mut WidgetPod {
-        if self.use_wide.get() {
-            &mut self.wide
-        } else {
-            &mut self.narrow
-        }
-    }
-}
-
-impl Widget for SettingsView {
-    fn event(&mut self, _ctx: &mut EventCtx, _event: &Event) {}
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let use_wide = constraints.max.width >= WIDE_THRESHOLD;
-        self.use_wide.set(use_wide);
-        self.active_mut().measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.active_mut().arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.active().paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.active().semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        // Visit only the active pod so layout/paint walks stay consistent with measure/arrange.
-        visitor.visit(self.active());
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        // CRITICAL: forward to the active pod so pointer / keyboard / focus reach the controls.
-        if self.use_wide.get() {
-            visitor.visit(&mut self.wide);
-        } else {
-            visitor.visit(&mut self.narrow);
-        }
-    }
+    ConstraintView::new(narrow).when(ConstraintQuery::new().min_width(WIDE_THRESHOLD), wide)
 }
 
 fn settings_control_theme(shared: &Shared, size: ControlSize) -> DefaultTheme {
@@ -13910,7 +13786,7 @@ fn app_surface_summary(role: &str) -> String {
 /// Build the settings tab content.
 pub fn view(shared: Shared) -> impl Widget {
     shared.publish_settings_signals();
-    SettingsView::new(shared)
+    responsive_settings_view(shared)
 }
 
 #[cfg(test)]
@@ -17522,6 +17398,18 @@ mod tests {
             ))))?;
         app.run_until_idle()?;
         search().expect().to_have_value("alpha")?;
+        search().focus()?;
+        let compact_search_id = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::TextInput
+                    && node.name.as_deref() == Some("advanced-config-search")
+            })
+            .expect("compact advanced search semantics")
+            .id;
 
         shared.settings_mut().set_advanced_query("beta".to_string());
         shared.publish_settings_signals();
@@ -17532,6 +17420,30 @@ mod tests {
             ))))?;
         app.run_until_idle()?;
         search().expect().to_have_value("beta")?;
+
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                520.0, 720.0,
+            ))))?;
+        app.run_until_idle()?;
+        search().expect().to_have_value("beta")?;
+        search().expect().to_be_focused()?;
+        let restored_search_id = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::TextInput
+                    && node.name.as_deref() == Some("advanced-config-search")
+            })
+            .expect("restored compact advanced search semantics")
+            .id;
+        assert_eq!(
+            restored_search_id, compact_search_id,
+            "the retained compact settings branch should keep its widget identity"
+        );
 
         Ok(())
     }
