@@ -11,6 +11,7 @@ subsystem specifications.
 | Prepare a toolchain, build the CLI or app, and run an isolated node | [Development setup](getting-started.md) |
 | Understand crate ownership, facades, and dependency rules | [Workspace and trust rings](workspace-and-trust-rings.md) |
 | Add a command, service, tool, provider, module, transport, backend, or test | [Extension points](extension-points.md) |
+| Understand object-RPC framing, flow control, buffers, and compatibility | [Network data-path reference](network-data-path.md) |
 | Choose unit, integration, formal, cluster, sandbox, and benchmark checks | [Testing and validation](testing.md) |
 | Understand research surfaces, evidence classes, and claim boundaries | [Research and evaluation](research-and-evaluation.md) |
 | Record a reproducible formal, cluster, benchmark, model, or agent experiment | [Experimental reproducibility](experimental-reproducibility.md) |

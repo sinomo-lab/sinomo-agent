@@ -88,6 +88,9 @@ The sandbox has its own [architecture document](../crates/sinomo-sandbox/docs/ar
 - [SIFS](sifs.md) defines the default cluster filesystem layout and policies.
 - [Storage architecture](storage-architecture.md) defines ownership and
   inspection of local data-directory paths.
+- [Network data-path reference](developer/network-data-path.md) records the
+  current private object-RPC carrier formats, flow-control bounds, and
+  compatibility sequence for developers.
 - [Cluster formal verification](formal/cluster-verification.md) documents the
   executable Quint specifications and their evidence boundaries.
 - Crate-specific operational or protocol references live with the owning crate,

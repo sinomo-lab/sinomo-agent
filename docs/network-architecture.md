@@ -4,6 +4,11 @@ This document defines the communication boundary, routing model, and transport
 invariants owned by `sinomo-network`. It describes stable behavior rather than
 individual Rust APIs or migration state.
 
+This is a developer-facing architecture document. Start with the
+[developer guide](developer/README.md) for repository navigation. Exact private
+carrier formats, tuning bounds, and compatibility behavior live in the
+[network data-path reference](developer/network-data-path.md).
+
 ## Purpose
 
 `sinomo-network` is a pure networking library. Domain crates define typed
@@ -35,33 +40,27 @@ payload size. The network incrementally carries each encoded value over the
 underlying duplex stream; object encoding, framing, flow control, retries, and
 transfer state remain inside the network boundary.
 
-Transfer chunk size and receive credit are independent negotiated values. A
-canonical bulk session negotiates 1--4 MiB chunks and starts with 16--64 MiB of
-receive credit. The starting credit is twice the measured bandwidth-delay
-product (BDP), clamped to that range; a path without enough observations starts
-at 16 MiB. These sizes control incremental I/O and resource use; they are not
+The application-visible semantic model remains a SOBJ request head and SOBJ
+response head, with an optional streaming attachment in either direction.
+Ordinary RPC values are still presented as one SOBJ value even when the network
+temporarily carries a large encoded body out of line and restores it before
+dispatch. Attachments remain explicitly attached to that same call. The private
+carrier distinction between control and Data frames does not add a second RPC
+API, expose frame boundaries, or require callers to choose a transport shape.
+
+Transfer chunk size and receive credit are independent negotiated values. The
+canonical bulk session derives bounded receive credit from measured path
+conditions. These values control incremental I/O and resource use; they are not
 aggregate message limits and are not visible as protocol choices. The network
 does not select a different API or wire protocol when a value crosses a byte
-threshold, and it has no payload-size enablement toggle. Object-frame heads use
-one `SOF2` prefix with an unsigned 64-bit length for every frame; there is no
-compact form, extended-length sentinel, or legacy prefix negotiation.
+threshold, and it has no payload-size enablement toggle.
 
-`sinomo-network` exposes a transport-neutral path estimator for reuse by other
-crates. Callers supply RTT samples and delivered-byte intervals, keyed by a
-stable path identity, and consume the smoothed RTT, delivery bandwidth, BDP,
-or a resource-bounded recommended window. Object RPC samples handshake RTT and
-cumulative transfer delivery through this same interface. Its process-shared
-registry is bounded; object RPC currently keys observations and receive-credit
-accounting by the authenticated immediate peer.
-
-Receivers return cumulative credit after 8--16 MiB of progress, or when the
-1--10 ms path-derived progress timer becomes due, rather than acknowledging
-every chunk. Completion always flushes the final progress. Active receive
-credit is bounded to 64 MiB per transfer and 256 MiB in aggregate per immediate
-peer. Credit is an admission bound, not a preallocated buffer: the existing
-bounded reader queue and spill path continue to control resident body memory.
-The pooled channel remains the small-message latency path; bulk and
-unknown-length attachments enter the canonical BDP-tuned session.
+`sinomo-network` exposes a transport-neutral, resource-bounded path estimator
+for reuse by other crates. Object RPC feeds it handshake and delivery progress
+and uses the result to tune admission without making observations a source of
+membership or routing authority. Credit is an admission bound, not a
+preallocated buffer; bounded queues and spill behavior separately control
+resident body memory.
 
 Files, readers, generated data, and typed encoded values all use the same
 session machinery and are framed incrementally in both directions. Domain
@@ -69,13 +68,20 @@ protocols may attach operation identities or domain-specific content
 identifiers, but do not define transport chunk sizes, per-chunk RPC routes, or
 separate small- and large-message calls.
 
-Ordered body frames first move through a bounded in-memory reader channel. If
-the application falls behind, the session lazily spills only the remaining
-suffix to a temporary file; a reader that deliberately drops a request body
-switches the session to bounded discard so transport acknowledgements and an
-early response can still complete. Normal completion and cancellation remove
-spill files. Crash-orphan collection is not treated as transfer resume state
-and must use process-ownership proof rather than deleting files by age.
+The persistent multiplexed channel carries control documents and body payloads
+on separate private representations while retaining the same object-RPC call
+interface. Per-call flow control and fair scheduling prevent one body from
+monopolizing a carrier. Peer-confirmed liveness isolates stalled calls, bounded
+reusable buffers limit resident memory, and relays forward ownership-bearing
+payloads without exposing carrier frame boundaries to applications. Versioned
+negotiation can fall back to the canonical session path without changing the
+domain API.
+
+Ordered bodies first use bounded in-memory delivery. A slow consumer can spill
+the unread suffix to temporary storage, while a deliberately dropped body is
+discarded under bounded transport credit so an early response can still
+complete. Normal completion and cancellation clean up spill state; orphan
+collection is not transfer resume and requires process-ownership evidence.
 
 Each route belongs to a discoverable service category and declares its input,
 output, and observation metadata. This gives the daemon one router and one
@@ -85,7 +91,9 @@ protocols.
 Plain-text framing is reserved for external systems that require it. New
 Sinomo-to-Sinomo protocols use the binary object boundary.
 
-See [Sinomo Object format](sinomo-object-format.md) for encoding details.
+See [Sinomo Object format](sinomo-object-format.md) for the stable encoding and
+the developer [network data-path reference](developer/network-data-path.md) for
+the current private carrier formats, bounds, and compatibility sequence.
 
 ## Canonical Routing
 

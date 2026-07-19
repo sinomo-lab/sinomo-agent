@@ -1,6 +1,14 @@
 use crate::{AuthenticatedDaemonCommand, DaemonError, DaemonPaths, daemon_rpc_body_sha256};
 use sinomo_core::cluster::{read_cluster_state_cached_shared, read_cluster_state_without_kv};
 use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::__channel_carrier::{
+    OBJECT_RPC_CHANNEL_DATA_MAGIC, ObjectRpcChannelDataFrame, ObjectRpcChannelReceiveBufferPool,
+    ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
+    write_object_rpc_channel_transport_frame_async,
+    write_object_rpc_channel_transport_frame_async_timed,
+};
+#[cfg(test)]
+use sinomo_core::network::ObjectRpcChannelWireFrame;
 use sinomo_core::network::{
     AsyncDaemonControlStream, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
     CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY,
@@ -12,6 +20,7 @@ use sinomo_core::network::{
     ObjectRpcChannelConfig, ObjectRpcChannelEgress, ObjectRpcChannelEndpoint,
     ObjectRpcChannelIngress, ObjectRpcChannelRole, ObjectRpcChannelServer, ObjectRpcRequest,
     ObjectRpcResponse, SinomoObjectCodec, cached_daemon_signing_public_key,
+    cluster_tcp_tunnel_protocol_supports_fixed_channel_data,
     cluster_tcp_tunnel_protocol_supports_object_rpc_channel, daemon_auth_encode_public_key,
     negotiate_cluster_tcp_tunnel_protocol, network_timeline_flag, read_object_frame_async,
     read_object_frame_async_with_max_bytes_after_first_byte_timed,
@@ -24,7 +33,7 @@ use sinomo_core::{
     ClusterTransportKind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io;
+use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -45,6 +54,10 @@ const TCP_TUNNEL_STREAM_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_TUNNEL_STREAM_FRAME_BYTES: usize = 32 * 1024;
 const TCP_TUNNEL_MAX_ACTIVE_STREAMS: usize = 64;
 const TCP_TUNNEL_STREAM_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+/// Last tunnel protocol before fixed Data and cumulative channel flow control.
+/// It remains a useful authenticated per-session stream fallback, but must not
+/// instantiate the incompatible legacy object-RPC channel dialect.
+const TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION: u16 = 3;
 const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 // Tunnel setup is an opportunistic fast path. Fail quickly so the route layer
 // can use the ordinary direct endpoint within its five-second network budget.
@@ -1796,19 +1809,39 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
-    let (stream, protocol_version) = match open_tcp_tunnel_physical_connection(
+    let current = open_tcp_tunnel_physical_connection(
         endpoint,
         runtime,
         paths,
         connect_timeout,
         CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
     )
-    .await
-    {
+    .await;
+    let (stream, protocol_version) = match current {
         Ok(negotiated) => negotiated,
         Err(error) if tcp_tunnel_protocol_rejected(&error) => {
-            open_tcp_tunnel_physical_connection(endpoint, runtime, paths, connect_timeout, 1)
-                .await?
+            match open_tcp_tunnel_physical_connection(
+                endpoint,
+                runtime,
+                paths,
+                connect_timeout,
+                TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION,
+            )
+            .await
+            {
+                Ok(negotiated) => negotiated,
+                Err(error) if tcp_tunnel_protocol_rejected(&error) => {
+                    open_tcp_tunnel_physical_connection(
+                        endpoint,
+                        runtime,
+                        paths,
+                        connect_timeout,
+                        1,
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            }
         }
         Err(error) => return Err(error),
     };
@@ -2117,6 +2150,14 @@ fn spawn_tcp_tunnel(
     Ok(handle)
 }
 
+#[derive(Debug)]
+enum TcpTunnelOutboundFrame {
+    /// Ordinary tunnel control or legacy stream data, encoded as SOBJ.
+    Tunnel(ClusterTcpTunnelFrame),
+    /// Tunnel-v4 channel Data, encoded as fixed SCDF plus its raw payload.
+    FixedChannelData(ObjectRpcChannelDataFrame),
+}
+
 async fn tcp_tunnel_writer_loop<W>(
     handle: Arc<TcpTunnelHandle>,
     mut write_half: W,
@@ -2157,35 +2198,35 @@ async fn tcp_tunnel_writer_loop<W>(
             if prefer_control {
                 tokio::select! {
                     biased;
-                    detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
-                    frame = stream_rx.recv() => (frame, OutboundLane::Stream),
-                    frame = rx.recv() => (frame, OutboundLane::Control),
-                    frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
+                    detail = &mut close_requested => (Some(TcpTunnelOutboundFrame::Tunnel(ClusterTcpTunnelFrame::Close { detail })), OutboundLane::Control),
+                    frame = stream_rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Stream),
+                    frame = rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Control),
+                    frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress, handle.protocol_version) => (frame, OutboundLane::ObjectRpc),
                 }
             } else {
                 tokio::select! {
                     biased;
-                    detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
-                    frame = stream_rx.recv() => (frame, OutboundLane::Stream),
-                    frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
-                    frame = rx.recv() => (frame, OutboundLane::Control),
+                    detail = &mut close_requested => (Some(TcpTunnelOutboundFrame::Tunnel(ClusterTcpTunnelFrame::Close { detail })), OutboundLane::Control),
+                    frame = stream_rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Stream),
+                    frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress, handle.protocol_version) => (frame, OutboundLane::ObjectRpc),
+                    frame = rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Control),
                 }
             }
         } else if prefer_control {
             tokio::select! {
                 biased;
-                detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
-                frame = rx.recv() => (frame, OutboundLane::Control),
-                frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
-                frame = stream_rx.recv() => (frame, OutboundLane::Stream),
+                detail = &mut close_requested => (Some(TcpTunnelOutboundFrame::Tunnel(ClusterTcpTunnelFrame::Close { detail })), OutboundLane::Control),
+                frame = rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Control),
+                frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress, handle.protocol_version) => (frame, OutboundLane::ObjectRpc),
+                frame = stream_rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Stream),
             }
         } else {
             tokio::select! {
                 biased;
-                detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
-                frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
-                frame = rx.recv() => (frame, OutboundLane::Control),
-                frame = stream_rx.recv() => (frame, OutboundLane::Stream),
+                detail = &mut close_requested => (Some(TcpTunnelOutboundFrame::Tunnel(ClusterTcpTunnelFrame::Close { detail })), OutboundLane::Control),
+                frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress, handle.protocol_version) => (frame, OutboundLane::ObjectRpc),
+                frame = rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Control),
+                frame = stream_rx.recv() => (frame.map(TcpTunnelOutboundFrame::Tunnel), OutboundLane::Stream),
             }
         };
         if frame.is_none() && matches!(lane, OutboundLane::ObjectRpc) {
@@ -2208,7 +2249,10 @@ async fn tcp_tunnel_writer_loop<W>(
                 prefer_control = !prefer_control;
             }
         }
-        let close = matches!(frame, ClusterTcpTunnelFrame::Close { .. });
+        let close = matches!(
+            frame,
+            TcpTunnelOutboundFrame::Tunnel(ClusterTcpTunnelFrame::Close { .. })
+        );
         let mut object_rpc_timeline = matches!(lane, OutboundLane::ObjectRpc)
             .then(|| {
                 object_rpc_egress
@@ -2219,15 +2263,37 @@ async fn tcp_tunnel_writer_loop<W>(
         if let Some(timeline) = object_rpc_timeline.as_mut() {
             timeline.flags |= network_timeline_flag::TUNNEL_CARRIER;
         }
-        let (write_result, write_timing) = if object_rpc_timeline.is_some() {
-            write_object_frame_async_timed(&mut write_half, &frame, ObjectFrameIoOptions::default())
+        let (write_result, write_timing) = match frame {
+            TcpTunnelOutboundFrame::Tunnel(frame) if object_rpc_timeline.is_some() => {
+                write_object_frame_async_timed(
+                    &mut write_half,
+                    &frame,
+                    ObjectFrameIoOptions::default(),
+                )
                 .await
-        } else {
-            (
+            }
+            TcpTunnelOutboundFrame::Tunnel(frame) => (
                 write_object_frame_async(&mut write_half, &frame, ObjectFrameIoOptions::default())
                     .await,
                 None,
-            )
+            ),
+            TcpTunnelOutboundFrame::FixedChannelData(frame) if object_rpc_timeline.is_some() => {
+                write_object_rpc_channel_transport_frame_async_timed(
+                    &mut write_half,
+                    &ObjectRpcChannelTransportFrame::Data(frame),
+                    ObjectFrameIoOptions::default(),
+                )
+                .await
+            }
+            TcpTunnelOutboundFrame::FixedChannelData(frame) => (
+                write_object_rpc_channel_transport_frame_async(
+                    &mut write_half,
+                    &ObjectRpcChannelTransportFrame::Data(frame),
+                    ObjectFrameIoOptions::default(),
+                )
+                .await,
+                None,
+            ),
         };
         if let Some(timeline) = object_rpc_timeline {
             timeline.record_frame_write_timing(write_timing, write_result.is_ok());
@@ -2257,13 +2323,32 @@ async fn tcp_tunnel_writer_loop<W>(
 
 async fn next_tcp_tunnel_object_rpc_frame(
     egress: &mut Option<ObjectRpcChannelEgress>,
-) -> Option<ClusterTcpTunnelFrame> {
+    protocol_version: u16,
+) -> Option<TcpTunnelOutboundFrame> {
     match egress.as_mut() {
         Some(egress) => egress
-            .next_frame_for_transport()
+            .next_transport_frame()
             .await
-            .map(|frame| ClusterTcpTunnelFrame::ObjectRpcChannel { frame }),
+            .map(|frame| tcp_tunnel_channel_transport_frame(frame, protocol_version)),
         None => std::future::pending().await,
+    }
+}
+
+fn tcp_tunnel_channel_transport_frame(
+    frame: ObjectRpcChannelTransportFrame,
+    protocol_version: u16,
+) -> TcpTunnelOutboundFrame {
+    match frame {
+        ObjectRpcChannelTransportFrame::Control(frame) => {
+            TcpTunnelOutboundFrame::Tunnel(ClusterTcpTunnelFrame::ObjectRpcChannel { frame })
+        }
+        ObjectRpcChannelTransportFrame::Data(frame) => {
+            debug_assert!(
+                cluster_tcp_tunnel_protocol_supports_fixed_channel_data(protocol_version),
+                "channel Data egress requires the tunnel-v4 fixed Data dialect"
+            );
+            TcpTunnelOutboundFrame::FixedChannelData(frame)
+        }
     }
 }
 
@@ -2283,21 +2368,134 @@ where
     .await
 }
 
+enum TcpTunnelInboundFrame {
+    Tunnel(ClusterTcpTunnelFrame),
+    FixedChannelData(ObjectRpcChannelDataFrame),
+}
+
 async fn read_tcp_tunnel_frame_timed<R>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
     readiness_probe: &ObjectFrameReadinessProbe,
-) -> Result<(ClusterTcpTunnelFrame, Option<ObjectFrameReadTiming>), NetworkError>
+    protocol_version: u16,
+    channel_ingress: Option<&ObjectRpcChannelIngress>,
+    receive_pool: &Arc<ObjectRpcChannelReceiveBufferPool>,
+) -> Result<(TcpTunnelInboundFrame, Option<ObjectFrameReadTiming>), NetworkError>
 where
     R: AsyncRead + Unpin,
 {
-    read_object_frame_async_with_max_bytes_after_first_byte_timed(
-        reader,
+    if !cluster_tcp_tunnel_protocol_supports_fixed_channel_data(protocol_version) {
+        return read_object_frame_async_with_max_bytes_after_first_byte_timed(
+            reader,
+            options,
+            MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
+            readiness_probe,
+        )
+        .await
+        .map(|(frame, timing)| (TcpTunnelInboundFrame::Tunnel(frame), timing));
+    }
+
+    // Tunnel v4 has two physical frame magics. The first read remains
+    // indefinitely idle-safe; after any progress, the carrier no-progress
+    // timeout applies while the rest of the discriminant arrives.
+    let magic = read_tcp_tunnel_frame_magic(reader, options.idle_timeout).await?;
+    let prefix = Cursor::new(magic);
+    let mut replay = prefix.chain(reader);
+    if magic == OBJECT_RPC_CHANNEL_DATA_MAGIC {
+        let ingress = channel_ingress.ok_or_else(|| NetworkError::Serialization {
+            detail: "peer sent fixed channel Data without an active object RPC channel".to_string(),
+        })?;
+        let frame = read_object_rpc_channel_transport_frame_async(
+            &mut replay,
+            options,
+            receive_pool,
+            |header| ingress.validate_data_header(header),
+        )
+        .await?;
+        return match frame {
+            ObjectRpcChannelTransportFrame::Data(frame) => {
+                Ok((TcpTunnelInboundFrame::FixedChannelData(frame), None))
+            }
+            ObjectRpcChannelTransportFrame::Control(_) => Err(NetworkError::Serialization {
+                detail: "SCDF tunnel reader decoded an unexpected control frame".to_string(),
+            }),
+        };
+    }
+
+    let (frame, timing) = read_object_frame_async_with_max_bytes_after_first_byte_timed(
+        &mut replay,
         options,
         MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
         readiness_probe,
     )
-    .await
+    .await?;
+    Ok((TcpTunnelInboundFrame::Tunnel(frame), timing))
+}
+
+async fn read_tcp_tunnel_frame_magic<R>(
+    reader: &mut R,
+    idle_timeout: Option<Duration>,
+) -> Result<[u8; 4], NetworkError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut magic = [0_u8; 4];
+    let first = loop {
+        match reader.read(&mut magic).await {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation: "read tcp tunnel frame magic".to_string(),
+                    detail: "peer closed before the next tunnel frame".to_string(),
+                });
+            }
+            Ok(bytes) => break bytes,
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation: "read tcp tunnel frame magic".to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    };
+    let mut filled = first;
+    while filled < magic.len() {
+        let read = async { reader.read(&mut magic[filled..]).await };
+        let result = match idle_timeout {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, read)
+                    .await
+                    .map_err(|_| NetworkError::Io {
+                        operation: "read tcp tunnel frame magic".to_string(),
+                        detail: format!(
+                            "timed out after {}ms without tunnel magic read progress",
+                            timeout.as_millis()
+                        ),
+                    })?
+            }
+            None => read.await,
+        };
+        match result {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation: "read tcp tunnel frame magic".to_string(),
+                    detail: format!(
+                        "peer closed during tunnel magic: read {filled} of {} bytes",
+                        magic.len()
+                    ),
+                });
+            }
+            Ok(bytes) => filled = filled.saturating_add(bytes),
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation: "read tcp tunnel frame magic".to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(magic)
 }
 
 async fn tcp_tunnel_reader_loop(
@@ -2391,6 +2589,7 @@ async fn tcp_tunnel_reader_loop(
     }
     let mut mark_unreachable_on_exit = false;
     let readiness_probe = ObjectFrameReadinessProbe::new();
+    let channel_receive_pool = ObjectRpcChannelReceiveBufferPool::default_for_carrier();
     loop {
         // This reader waits between independent multiplexed requests, so an
         // idle connection is healthy. Each active request carries its own
@@ -2399,6 +2598,9 @@ async fn tcp_tunnel_reader_loop(
             &mut read_half,
             ObjectFrameIoOptions::idle_timeout(TCP_TUNNEL_FRAME_NO_PROGRESS_TIMEOUT),
             &readiness_probe,
+            handle.protocol_version,
+            handle.object_rpc_channel_ingress.as_ref(),
+            &channel_receive_pool,
         )
         .await;
         let (frame, read_timing) = match frame {
@@ -2415,7 +2617,31 @@ async fn tcp_tunnel_reader_loop(
             }
         };
         match frame {
-            ClusterTcpTunnelFrame::ObjectRpcChannel { frame } => {
+            TcpTunnelInboundFrame::FixedChannelData(frame) => {
+                let receive = handle
+                    .object_rpc_channel_ingress
+                    .as_ref()
+                    .filter(|_| {
+                        cluster_tcp_tunnel_protocol_supports_fixed_channel_data(
+                            handle.protocol_version,
+                        )
+                    })
+                    .ok_or_else(|| NetworkError::Serialization {
+                        detail: format!(
+                            "peer sent fixed channel Data on tcp tunnel protocol {}",
+                            handle.protocol_version
+                        ),
+                    })
+                    .and_then(|ingress| ingress.receive_data(frame));
+                if let Err(error) = receive {
+                    let detail = format!("invalid fixed tcp tunnel channel Data: {error}");
+                    mark_unreachable_on_exit = !handle.clean_shutdown.load(Ordering::Acquire);
+                    handle.signal_physical_close(detail.clone());
+                    handle.fail_streams(&detail);
+                    break;
+                }
+            }
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::ObjectRpcChannel { frame }) => {
                 if let Some(ingress) = handle.object_rpc_channel_ingress.as_ref() {
                     ingress.record_frame_read_timeline(
                         &frame,
@@ -2437,7 +2663,18 @@ async fn tcp_tunnel_reader_loop(
                             handle.protocol_version
                         ),
                     })
-                    .and_then(|ingress| ingress.receive(frame));
+                    .and_then(|ingress| {
+                        if cluster_tcp_tunnel_protocol_supports_fixed_channel_data(
+                            handle.protocol_version,
+                        ) {
+                            ingress.receive_control(frame)
+                        } else {
+                            // Tunnel v3 nested channel Data in the SOBJ
+                            // envelope. Keep that compatibility path only for
+                            // a negotiated v3 peer.
+                            ingress.receive(frame)
+                        }
+                    });
                 if let Err(error) = receive {
                     let detail = format!("invalid tcp tunnel object RPC channel frame: {error}");
                     mark_unreachable_on_exit = !handle.clean_shutdown.load(Ordering::Acquire);
@@ -2446,7 +2683,7 @@ async fn tcp_tunnel_reader_loop(
                     break;
                 }
             }
-            ClusterTcpTunnelFrame::StreamOpen { id } => {
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::StreamOpen { id }) => {
                 let stream = match handle.accept_stream(id) {
                     Ok(stream) => stream,
                     Err(error) => {
@@ -2486,19 +2723,19 @@ async fn tcp_tunnel_reader_loop(
                     }
                 });
             }
-            ClusterTcpTunnelFrame::StreamAccept { id } => {
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::StreamAccept { id }) => {
                 handle.accept_stream_open(id);
             }
-            ClusterTcpTunnelFrame::StreamData { id, bytes } => {
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::StreamData { id, bytes }) => {
                 handle.deliver_stream_data(id, bytes);
             }
-            ClusterTcpTunnelFrame::StreamFinish { id } => {
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::StreamFinish { id }) => {
                 handle.deliver_stream_finish(id);
             }
-            ClusterTcpTunnelFrame::StreamReset { id, detail } => {
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::StreamReset { id, detail }) => {
                 handle.deliver_stream_reset(id, detail);
             }
-            ClusterTcpTunnelFrame::Close { detail } => {
+            TcpTunnelInboundFrame::Tunnel(ClusterTcpTunnelFrame::Close { detail }) => {
                 handle.closing.store(true, Ordering::Release);
                 handle.clean_shutdown.store(true, Ordering::Relaxed);
                 tracing::debug!("peer closed tcp tunnel: {detail}");
@@ -2674,6 +2911,107 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_v4_keeps_fixed_channel_data_out_of_sobj() {
+        let payload = vec![0x5a; 64 * 1024];
+        let data = ObjectRpcChannelDataFrame::new(
+            sinomo_core::network::ObjectRpcChannelCallId(1),
+            sinomo_core::network::ObjectRpcChannelBodyDirection::Request,
+            128,
+            payload.clone().into(),
+        )
+        .expect("fixed channel Data");
+
+        match tcp_tunnel_channel_transport_frame(
+            ObjectRpcChannelTransportFrame::Data(data.clone()),
+            CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+        ) {
+            TcpTunnelOutboundFrame::FixedChannelData(frame) => {
+                assert_eq!(frame.header, data.header);
+                assert_eq!(frame.bytes.as_ref(), payload.as_slice());
+            }
+            TcpTunnelOutboundFrame::Tunnel(_) => panic!("v4 Data must stay out of SOBJ"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_v4_mixed_reader_validates_and_delivers_fixed_channel_data() {
+        let ObjectRpcChannelEndpoint {
+            client: _client,
+            mut server,
+            ingress,
+            egress: _egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("object RPC channel");
+        let call_id = sinomo_core::network::ObjectRpcChannelCallId(1);
+        let payload = vec![0x73; 64 * 1024];
+        let request = ObjectRpcRequest::encode_body("/test/tunnel-v4/fixed-data", "test", &"head")
+            .expect("request head");
+        ingress
+            .receive_control(ObjectRpcChannelWireFrame::Request {
+                call_id,
+                request,
+                body: Some(sinomo_core::network::ObjectRpcChannelBodyDescriptor {
+                    kind: sinomo_core::network::ObjectRpcChannelBodyKind::Attachment,
+                    total_bytes: Some(payload.len() as u64),
+                }),
+            })
+            .expect("request control");
+
+        let frame = ObjectRpcChannelDataFrame::new(
+            call_id,
+            sinomo_core::network::ObjectRpcChannelBodyDirection::Request,
+            0,
+            payload.clone().into(),
+        )
+        .expect("fixed channel Data");
+        let (mut reader, mut writer) = tokio::io::duplex(128 * 1024);
+        write_object_rpc_channel_transport_frame_async(
+            &mut writer,
+            &ObjectRpcChannelTransportFrame::Data(frame),
+            ObjectFrameIoOptions::none(),
+        )
+        .await
+        .expect("write fixed Data");
+
+        let readiness_probe = ObjectFrameReadinessProbe::new();
+        let receive_pool = ObjectRpcChannelReceiveBufferPool::default_for_carrier();
+        let (frame, timing) = read_tcp_tunnel_frame_timed(
+            &mut reader,
+            ObjectFrameIoOptions::none(),
+            &readiness_probe,
+            CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+            Some(&ingress),
+            &receive_pool,
+        )
+        .await
+        .expect("read mixed tunnel frame");
+        assert!(timing.is_none(), "fixed Data bypasses SOBJ decode timing");
+        let TcpTunnelInboundFrame::FixedChannelData(frame) = frame else {
+            panic!("expected fixed tunnel Data");
+        };
+        ingress.receive_data(frame).expect("deliver fixed Data");
+        ingress
+            .receive_control(ObjectRpcChannelWireFrame::BodyEnd {
+                call_id,
+                direction: sinomo_core::network::ObjectRpcChannelBodyDirection::Request,
+                total_bytes: payload.len() as u64,
+            })
+            .expect("body end");
+
+        let inbound = server.accept().await.expect("inbound request");
+        let received = inbound
+            .request
+            .body
+            .collect_to_vec(128 * 1024)
+            .await
+            .expect("collect fixed Data");
+        assert_eq!(received, payload);
+    }
+
+    #[test]
     fn registry_retires_v2_tunnel_when_its_logical_rpc_channel_closes() {
         let peer = NodeId::from_legacy_named("tcp_tunnel_closed_logical_channel_peer")
             .expect("peer node id");
@@ -2804,7 +3142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_tunnel_dialer_retries_v1_once_after_v2_protocol_rejection() {
+    async fn tcp_tunnel_dialer_retries_v3_then_v1_after_v4_protocol_rejection() {
         let root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v2-downgrade-client");
         let data_dir = SinomoDataDir::new(root.path());
         data_dir.ensure_root_layout().expect("client data dir");
@@ -2839,7 +3177,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut requested_versions = Vec::new();
             let mut release_rx = Some(release_rx);
-            for expected_version in [CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1] {
+            for expected_version in [
+                CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+                TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION,
+                1,
+            ] {
                 let (mut stream, _) = listener.accept().await.expect("tunnel attempt");
                 let request: ObjectRpcRequest =
                     read_object_frame_async(&mut stream, ObjectFrameIoOptions::default())
@@ -2850,7 +3192,7 @@ mod tests {
                 requested_versions.push(open.protocol_version);
                 assert_eq!(open.protocol_version, expected_version);
 
-                if expected_version == CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION {
+                if expected_version != 1 {
                     let response = ObjectRpcResponse::encode_error(
                         CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
                         format!("unsupported tcp tunnel protocol {}", open.protocol_version),
@@ -2936,8 +3278,12 @@ mod tests {
             .expect("v1-only server task");
         assert_eq!(
             requested_versions,
-            vec![CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1],
-            "downgrade must make exactly one v2 attempt and one v1 retry"
+            vec![
+                CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+                TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION,
+                1,
+            ],
+            "downgrade must try the compatible v3 channel before legacy v1"
         );
         TCP_TUNNELS.remove(&peer);
     }
@@ -3090,7 +3436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_tunnel_dialer_falls_back_to_v1_when_legacy_v2_response_has_no_proof() {
+    async fn tcp_tunnel_dialer_falls_back_to_v3_stream_when_v4_response_has_no_proof() {
         let root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v2-no-proof-client");
         let data_dir = SinomoDataDir::new(root.path());
         data_dir.ensure_root_layout().expect("client data dir");
@@ -3125,7 +3471,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut requested_versions = Vec::new();
             let mut release_rx = Some(release_rx);
-            for expected_version in [CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1] {
+            for expected_version in [
+                CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+                TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION,
+            ] {
                 let (mut stream, _) = listener.accept().await.expect("tunnel attempt");
                 let request: ObjectRpcRequest =
                     read_object_frame_async(&mut stream, ObjectFrameIoOptions::default())
@@ -3143,7 +3492,7 @@ mod tests {
                 write_object_frame_async(&mut stream, &response, ObjectFrameIoOptions::default())
                     .await
                     .expect("write legacy acceptance");
-                if expected_version == 1 {
+                if expected_version == TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION {
                     let _ = release_rx.take().expect("one accepted tunnel").await;
                 }
             }
@@ -3163,8 +3512,11 @@ mod tests {
             Duration::from_secs(2),
         )
         .await
-        .expect("legacy v2 response must downgrade to authenticated v1 sessions");
-        assert_eq!(handle.protocol_version, 1);
+        .expect("unsigned v4 response must downgrade to legacy session streams");
+        assert_eq!(
+            handle.protocol_version,
+            TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION
+        );
         assert!(handle.object_rpc_channel_client.is_none());
         assert!(tcp_tunnel_object_rpc_channel_client(&peer).is_none());
         handle.request_close("test complete".to_string());
@@ -3176,8 +3528,11 @@ mod tests {
             .expect("legacy v2 server task");
         assert_eq!(
             requested_versions,
-            vec![CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1],
-            "an unsigned v2 acceptance must make exactly one safe v1 retry"
+            vec![
+                CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+                TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION,
+            ],
+            "v3 is safe only as a per-session stream transport without a logical channel"
         );
         TCP_TUNNELS.remove(&peer);
     }

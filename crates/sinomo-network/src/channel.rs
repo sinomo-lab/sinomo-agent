@@ -6,6 +6,9 @@
 //! once. Logical calls then use call ids, ordered offsets, declared lengths,
 //! and bounded flow control without signing or hashing data quanta.
 
+use crate::channel_wire::{
+    ObjectRpcChannelDataFrame, ObjectRpcChannelDataHeader, ObjectRpcChannelTransportFrame,
+};
 use crate::session::{BodyProducer, ObjectRpcChannelBodySender};
 use crate::{
     NetworkDeliveryState, NetworkError, NetworkTimelineEvent, NetworkTimelineTraceContext,
@@ -16,9 +19,11 @@ use crate::{
     network_timeline_trace_context_for_request, record_network_timeline_event,
     record_network_timeline_event_now,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::io::AsyncReadExt;
@@ -26,13 +31,26 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 /// Hard channel-wide logical-call limit.
 pub const OBJECT_RPC_CHANNEL_MAX_CALLS: usize = 64;
-/// Hard aggregate logical-byte bound for the outbound scheduler.
+/// Hard aggregate payload-byte bound for the outbound Data scheduler.
 pub const OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
-/// Backward-compatible name retained for the configuration field. The budget
-/// covers control heads as well as raw data across every logical call.
+/// Backward-compatible name retained for the Data configuration field.
 pub const OBJECT_RPC_CHANNEL_MAX_QUEUED_DATA_BYTES: usize = OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES;
-/// Raw body quanta never exceed 32 KiB.
-pub const OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES: usize = 32 * 1024;
+/// Control frames use an independent reservation so a full data window cannot
+/// prevent credit, cancellation, reset, or completion from reaching the wire.
+const OBJECT_RPC_CHANNEL_MAX_QUEUED_CONTROL_BYTES: usize = 1024 * 1024;
+/// Raw body frames preserve multiplexing fairness without forcing one RTT per
+/// small transport quantum.
+pub const OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES: usize = 256 * 1024;
+/// Each logical body may pipeline this many unacknowledged bytes.
+pub const OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+/// Receivers coalesce cumulative credit until this much body progress accrues.
+const OBJECT_RPC_CHANNEL_WINDOW_UPDATE_BYTES: usize = 1024 * 1024;
+/// A low-rate body still returns cumulative credit without waiting to fill the
+/// byte threshold.
+const OBJECT_RPC_CHANNEL_WINDOW_UPDATE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(2);
+/// One queue-budget reservation covers several independently scheduled frames.
+const OBJECT_RPC_CHANNEL_QUEUE_BATCH_BYTES: usize = 1024 * 1024;
 /// Values at or below this size stay in the Request/Response control exchange.
 pub const OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES: usize = 64 * 1024;
 /// Materialized typed values are bounded; larger payloads must use attachments.
@@ -46,7 +64,8 @@ const DEFAULT_DATA_QUEUE_DEPTH: usize = 256;
 const MAX_CONTROL_QUEUE_DEPTH: usize = 256;
 const MAX_DATA_QUEUE_DEPTH: usize = 256;
 const CONTROL_BURST_BEFORE_DATA: usize = 8;
-const INBOUND_BODY_EVENT_DEPTH: usize = 2;
+const INBOUND_BODY_EVENT_DEPTH: usize =
+    OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES / OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES + 1;
 const MAX_CONTROL_HEAD_BYTES: usize = 256 * 1024;
 const MAX_COMPLETED_CALL_TOMBSTONES: usize = OBJECT_RPC_CHANNEL_MAX_CALLS * 4;
 static NEXT_OBJECT_RPC_CHANNEL_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -54,8 +73,8 @@ static NEXT_OBJECT_RPC_CHANNEL_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 pub struct ObjectRpcChannelConfig {
     pub max_calls: usize,
-    /// Aggregate logical bytes across the control and data schedulers. The
-    /// field keeps its original data-specific name for source compatibility.
+    /// Aggregate payload bytes across all Data lanes. Control traffic has a
+    /// separate fixed reserve so a full Data queue cannot deadlock the call.
     pub max_queued_data_bytes: usize,
     pub control_queue_depth: usize,
     pub data_queue_depth: usize,
@@ -268,7 +287,7 @@ fn record_channel_timeline_event_at(
     record_network_timeline_event(event);
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObjectRpcChannelBodyDirection {
     Request,
@@ -321,12 +340,23 @@ pub enum ObjectRpcChannelWireFrame {
     WindowUpdate {
         call_id: ObjectRpcChannelCallId,
         direction: ObjectRpcChannelBodyDirection,
-        credit_bytes: u32,
+        received_offset: u64,
     },
     BodyEnd {
         call_id: ObjectRpcChannelCallId,
         direction: ObjectRpcChannelBodyDirection,
         total_bytes: u64,
+    },
+    /// Call-scoped carrier liveness challenge. This is an internal channel
+    /// control message, not an application RPC or transport-wide keepalive.
+    LivenessProbe {
+        call_id: ObjectRpcChannelCallId,
+        probe_id: u64,
+    },
+    /// Response to one outstanding call-scoped liveness challenge.
+    LivenessResponse {
+        call_id: ObjectRpcChannelCallId,
+        probe_id: u64,
     },
     Cancel {
         call_id: ObjectRpcChannelCallId,
@@ -347,6 +377,8 @@ impl ObjectRpcChannelWireFrame {
             | Self::Data { call_id, .. }
             | Self::WindowUpdate { call_id, .. }
             | Self::BodyEnd { call_id, .. }
+            | Self::LivenessProbe { call_id, .. }
+            | Self::LivenessResponse { call_id, .. }
             | Self::Cancel { call_id, .. }
             | Self::Reset { call_id, .. } => *call_id,
         }
@@ -385,7 +417,15 @@ impl ObjectRpcChannelEndpoint {
             connection_id,
             control_sender,
             data_sender,
-            queue_budget: Arc::new(Semaphore::new(config.max_queued_data_bytes)),
+            control_budget: Arc::new(Semaphore::new(OBJECT_RPC_CHANNEL_MAX_QUEUED_CONTROL_BYTES)),
+            data_budget: Arc::new(Semaphore::new(config.max_queued_data_bytes)),
+            data_frame_budget: Arc::new(Semaphore::new(config.data_queue_depth)),
+            data_batch_bytes: config
+                .max_queued_data_bytes
+                .min(OBJECT_RPC_CHANNEL_QUEUE_BATCH_BYTES),
+            data_batch_frames: config
+                .data_queue_depth
+                .min(OBJECT_RPC_CHANNEL_QUEUE_BATCH_BYTES / OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES),
             queued_control_frames: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             queued_data_bytes: Arc::new(AtomicUsize::new(0)),
@@ -394,6 +434,7 @@ impl ObjectRpcChannelEndpoint {
             connection_id,
             role,
             next_call_id: AtomicU64::new(role.first_call_id()),
+            next_liveness_probe_id: AtomicU64::new(1),
             request_admission: Mutex::new(()),
             call_permits: Arc::new(Semaphore::new(config.max_calls)),
             max_calls: config.max_calls,
@@ -426,6 +467,8 @@ impl ObjectRpcChannelEndpoint {
                 shared,
                 control_receiver,
                 data_receiver,
+                data_lanes: HashMap::new(),
+                ready_data_lanes: VecDeque::new(),
                 control_burst: 0,
                 closed,
                 pending_write: None,
@@ -529,6 +572,7 @@ impl ObjectRpcChannelClient {
                     result_sender: Some(result_sender),
                     request_window: request_window.as_ref().map(Arc::clone),
                     response_ingress: None,
+                    outstanding_liveness_probe: None,
                     lifetime: Arc::clone(&lifetime),
                 },
             );
@@ -616,6 +660,16 @@ impl ObjectRpcChannelClient {
 
     pub fn queue_snapshot(&self) -> ObjectRpcChannelQueueSnapshot {
         self.shared.queue_snapshot()
+    }
+
+    /// Queues a call-scoped physical-channel liveness challenge without
+    /// treating the local write as progress. Only the matching response can
+    /// advance this call's progress generation.
+    pub(crate) fn request_liveness_probe(
+        &self,
+        call_id: ObjectRpcChannelCallId,
+    ) -> Result<(), NetworkError> {
+        self.shared.request_liveness_probe(call_id)
     }
 }
 
@@ -836,6 +890,66 @@ impl ObjectRpcChannelIngress {
         Ok(())
     }
 
+    /// Ingests an SOBJ control frame. Raw Data is deliberately rejected at
+    /// this boundary so current carriers cannot accidentally serialize body
+    /// payloads through the control codec.
+    #[doc(hidden)]
+    pub fn receive_control(&self, frame: ObjectRpcChannelWireFrame) -> Result<(), NetworkError> {
+        if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed Data must use the fixed channel wire header".to_string(),
+            });
+        }
+        self.receive(frame)
+    }
+
+    /// Validates call state, ordering, declared length, and receiver credit
+    /// from a fixed Data header before the carrier acquires payload storage.
+    #[doc(hidden)]
+    pub fn validate_data_header(
+        &self,
+        header: &ObjectRpcChannelDataHeader,
+    ) -> Result<(), NetworkError> {
+        self.shared.ensure_open()?;
+        let result = self
+            .shared
+            .body_ingress(header.call_id, header.direction)
+            .and_then(|ingress| ingress.validate_data(header.offset, header.payload_len as usize));
+        match result {
+            Err(_)
+                if !self.shared.is_active_call(header.call_id)?
+                    && self.shared.is_retired_call(header.call_id) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Revalidates and moves an ownership-bearing raw Data payload into the
+    /// logical body queue. Cancellation may race the payload read, which is
+    /// why this repeats the header-state validation performed before acquire.
+    #[doc(hidden)]
+    pub fn receive_data(&self, frame: ObjectRpcChannelDataFrame) -> Result<(), NetworkError> {
+        if frame.bytes.len() != frame.header.payload_len as usize {
+            return Err(NetworkError::Serialization {
+                detail: "fixed channel Data payload length mismatch".to_string(),
+            });
+        }
+        let call_id = frame.header.call_id;
+        self.shared.ensure_open()?;
+        self.shared.receive_data(frame)?;
+        if let Err(error) = self.shared.ensure_open() {
+            if self.shared.role.owns_call_id(call_id) {
+                self.shared.abort_client(call_id, error.to_string(), false);
+            } else {
+                self.shared.reset_inbound(call_id, error.to_string(), false);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Records the physical receiver boundary for any decoded frame belonging
     /// to a sampled call, including streamed data and flow-control frames.
     /// Carriers call this immediately after object-frame decode and before
@@ -934,10 +1048,18 @@ impl ObjectRpcChannelIngress {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DataLaneKey {
+    call_id: ObjectRpcChannelCallId,
+    direction: ObjectRpcChannelBodyDirection,
+}
+
 pub struct ObjectRpcChannelEgress {
     shared: Arc<ChannelShared>,
     control_receiver: mpsc::Receiver<QueuedControl>,
     data_receiver: mpsc::Receiver<QueuedData>,
+    data_lanes: HashMap<DataLaneKey, VecDeque<QueuedData>>,
+    ready_data_lanes: VecDeque<DataLaneKey>,
     control_burst: usize,
     closed: watch::Receiver<bool>,
     pending_write: Option<PendingChannelWrite>,
@@ -947,7 +1069,7 @@ impl ObjectRpcChannelEgress {
     /// Returns the next logical frame with bounded control priority. At most
     /// eight controls bypass an already-queued data frame. This convenience
     /// method treats the returned frame as written immediately; physical
-    /// transports must use [`Self::next_frame_for_transport`] and report the
+    /// transports must use [`Self::next_transport_frame`] and report the
     /// actual socket-write result with [`Self::complete_frame_write`].
     pub async fn next_frame(&mut self) -> Option<ObjectRpcChannelWireFrame> {
         let frame = self.next_frame_for_transport().await?;
@@ -955,10 +1077,27 @@ impl ObjectRpcChannelEgress {
         Some(frame)
     }
 
+    /// Compatibility adapter for low-level carriers using the legacy logical
+    /// frame enum. Current physical carriers use [`Self::next_transport_frame`]
+    /// so raw Data retains its `Bytes` allocation.
+    pub async fn next_frame_for_transport(&mut self) -> Option<ObjectRpcChannelWireFrame> {
+        let frame = self.next_transport_frame().await?;
+        Some(match frame {
+            ObjectRpcChannelTransportFrame::Control(frame) => frame,
+            ObjectRpcChannelTransportFrame::Data(frame) => ObjectRpcChannelWireFrame::Data {
+                call_id: frame.header.call_id,
+                direction: frame.header.direction,
+                offset: frame.header.offset,
+                bytes: frame.bytes.to_vec(),
+            },
+        })
+    }
+
     /// Dequeues one frame while retaining its call completion and byte-budget
     /// accounting until the physical transport reports whether the encoded
     /// frame was written and flushed.
-    pub async fn next_frame_for_transport(&mut self) -> Option<ObjectRpcChannelWireFrame> {
+    #[doc(hidden)]
+    pub async fn next_transport_frame(&mut self) -> Option<ObjectRpcChannelTransportFrame> {
         if self.pending_write.take().is_some() {
             self.shared.close(
                 "physical transport requested another frame before completing the prior write"
@@ -966,68 +1105,81 @@ impl ObjectRpcChannelEgress {
             );
             return None;
         }
-        if *self.closed.borrow() {
-            return None;
-        }
-        if self.control_burst >= CONTROL_BURST_BEFORE_DATA
-            && let Ok(data) = self.data_receiver.try_recv()
-        {
-            self.control_burst = 0;
-            return Some(self.begin_write(PendingChannelWrite::Data(data)));
-        }
-        if self.control_burst < CONTROL_BURST_BEFORE_DATA
-            && let Ok(control) = self.control_receiver.try_recv()
-        {
-            self.control_burst += 1;
-            return Some(self.begin_write(PendingChannelWrite::Control(control)));
-        }
-        if let Ok(data) = self.data_receiver.try_recv() {
-            self.control_burst = 0;
-            return Some(self.begin_write(PendingChannelWrite::Data(data)));
-        }
-        if let Ok(control) = self.control_receiver.try_recv() {
-            self.control_burst += 1;
-            return Some(self.begin_write(PendingChannelWrite::Control(control)));
-        }
+        loop {
+            if *self.closed.borrow() {
+                return None;
+            }
+            self.drain_data_receiver();
+            if self.control_burst >= CONTROL_BURST_BEFORE_DATA
+                && let Some(data) = self.pop_data_lane()
+            {
+                self.control_burst = 0;
+                return Some(self.begin_write(PendingChannelWrite::Data(data)));
+            }
+            if self.control_burst < CONTROL_BURST_BEFORE_DATA
+                && let Ok(control) = self.control_receiver.try_recv()
+            {
+                self.control_burst += 1;
+                return Some(self.begin_write(PendingChannelWrite::Control(control)));
+            }
+            if let Some(data) = self.pop_data_lane() {
+                self.control_burst = 0;
+                return Some(self.begin_write(PendingChannelWrite::Data(data)));
+            }
+            if let Ok(control) = self.control_receiver.try_recv() {
+                self.control_burst += 1;
+                return Some(self.begin_write(PendingChannelWrite::Control(control)));
+            }
 
-        let pending = if self.control_burst >= CONTROL_BURST_BEFORE_DATA {
-            tokio::select! {
-                biased;
-                changed = self.closed.changed() => {
-                    let _ = changed;
-                    None
+            let pending = if self.control_burst >= CONTROL_BURST_BEFORE_DATA {
+                tokio::select! {
+                    biased;
+                    changed = self.closed.changed() => {
+                        let _ = changed;
+                        return None;
+                    }
+                    data = self.data_receiver.recv() => {
+                        let data = data?;
+                        self.push_data_lane(data);
+                        self.control_burst = 0;
+                        self.pop_data_lane().map(PendingChannelWrite::Data)
+                    }
+                    control = self.control_receiver.recv() => {
+                        let control = control?;
+                        self.control_burst += 1;
+                        Some(PendingChannelWrite::Control(control))
+                    }
                 }
-                data = self.data_receiver.recv() => {
-                    self.control_burst = 0;
-                    data.map(PendingChannelWrite::Data)
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = self.closed.changed() => {
+                        let _ = changed;
+                        return None;
+                    }
+                    control = self.control_receiver.recv() => {
+                        let control = control?;
+                        self.control_burst += 1;
+                        Some(PendingChannelWrite::Control(control))
+                    }
+                    data = self.data_receiver.recv() => {
+                        let data = data?;
+                        self.push_data_lane(data);
+                        self.control_burst = 0;
+                        self.pop_data_lane().map(PendingChannelWrite::Data)
+                    }
                 }
-                control = self.control_receiver.recv() => {
-                    self.control_burst += 1;
-                    control.map(PendingChannelWrite::Control)
-                }
+            };
+            if let Some(pending) = pending {
+                return Some(self.begin_write(pending));
             }
-        } else {
-            tokio::select! {
-                biased;
-                changed = self.closed.changed() => {
-                    let _ = changed;
-                    None
-                }
-                control = self.control_receiver.recv() => {
-                    self.control_burst += 1;
-                    control.map(PendingChannelWrite::Control)
-                }
-                data = self.data_receiver.recv() => {
-                    self.control_burst = 0;
-                    data.map(PendingChannelWrite::Data)
-                }
-            }
-        };
-        pending.map(|pending| self.begin_write(pending))
+            // A cancelled lane may be pruned after the receiver wakes. Keep
+            // waiting; an empty pruned lane is not physical-channel EOF.
+        }
     }
 
     /// Completes the frame most recently returned by
-    /// [`Self::next_frame_for_transport`]. A failed write drops acknowledgements
+    /// [`Self::next_transport_frame`]. A failed write drops acknowledgements
     /// and cancels bodyless call lifetime state; a successful write advances
     /// progress and releases the retained queue budget.
     pub fn complete_frame_write(&mut self, written: bool) {
@@ -1040,7 +1192,7 @@ impl ObjectRpcChannelEgress {
     }
 
     /// Returns correlation for the frame currently owned by the physical
-    /// carrier. It is available after `next_frame_for_transport` and before
+    /// carrier. It is available after `next_transport_frame` and before
     /// `complete_frame_write`.
     pub fn pending_write_timeline(&self) -> Option<ObjectRpcChannelWriteTimeline> {
         self.pending_write
@@ -1048,11 +1200,61 @@ impl ObjectRpcChannelEgress {
             .and_then(PendingChannelWrite::write_timeline)
     }
 
-    fn begin_write(&mut self, mut pending: PendingChannelWrite) -> ObjectRpcChannelWireFrame {
+    fn begin_write(&mut self, mut pending: PendingChannelWrite) -> ObjectRpcChannelTransportFrame {
         let frame = pending.take_frame();
         debug_assert!(self.pending_write.is_none());
         self.pending_write = Some(pending);
         frame
+    }
+
+    fn drain_data_receiver(&mut self) {
+        while let Ok(data) = self.data_receiver.try_recv() {
+            self.push_data_lane(data);
+        }
+    }
+
+    fn push_data_lane(&mut self, data: QueuedData) {
+        if data.prune_if_inactive
+            && !self
+                .shared
+                .is_active_call(data.lane.call_id)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        let lane = data.lane;
+        match self.data_lanes.get_mut(&lane) {
+            Some(queue) => queue.push_back(data),
+            None => {
+                self.data_lanes.insert(lane, VecDeque::from([data]));
+                self.ready_data_lanes.push_back(lane);
+            }
+        }
+    }
+
+    fn pop_data_lane(&mut self) -> Option<QueuedData> {
+        while let Some(lane) = self.ready_data_lanes.pop_front() {
+            let lane_inactive = !self.shared.is_active_call(lane.call_id).unwrap_or(false);
+            let Some(queue) = self.data_lanes.get_mut(&lane) else {
+                continue;
+            };
+            while queue
+                .front()
+                .is_some_and(|data| data.prune_if_inactive && lane_inactive)
+            {
+                queue.pop_front();
+            }
+            let data = queue.pop_front();
+            if queue.is_empty() {
+                self.data_lanes.remove(&lane);
+            } else {
+                self.ready_data_lanes.push_back(lane);
+            }
+            if data.is_some() {
+                return data;
+            }
+        }
+        None
     }
 
     pub fn queue_snapshot(&self) -> ObjectRpcChannelQueueSnapshot {
@@ -1064,6 +1266,7 @@ struct ChannelShared {
     connection_id: u64,
     role: ObjectRpcChannelRole,
     next_call_id: AtomicU64,
+    next_liveness_probe_id: AtomicU64,
     /// Serializes only id assignment through Request control-queue admission.
     /// The physical carrier is ordered, so this preserves the invariant used
     /// by the bounded retired-call high-water marks without serializing call
@@ -1256,6 +1459,47 @@ impl ChannelShared {
         Ok(ObjectRpcChannelCallId(value))
     }
 
+    fn next_liveness_probe_id(&self) -> Result<u64, NetworkError> {
+        let value = self.next_liveness_probe_id.fetch_add(1, Ordering::Relaxed);
+        if value == 0 || value == u64::MAX {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed object RPC liveness probe id overflow".to_string(),
+            });
+        }
+        Ok(value)
+    }
+
+    fn request_liveness_probe(&self, call_id: ObjectRpcChannelCallId) -> Result<(), NetworkError> {
+        self.ensure_open()?;
+        if !self.role.owns_call_id(call_id) {
+            return Err(unknown_call_error(call_id));
+        }
+        let (probe_id, timeline) = {
+            let mut pending = self.pending.lock().map_err(|_| channel_lock_error())?;
+            let call = pending
+                .get_mut(&call_id)
+                .ok_or_else(|| unknown_call_error(call_id))?;
+            if call.outstanding_liveness_probe.is_some() {
+                return Ok(());
+            }
+            let probe_id = self.next_liveness_probe_id()?;
+            call.outstanding_liveness_probe = Some(probe_id);
+            (probe_id, call.lifetime.timeline)
+        };
+        let queued = self.outbound.try_control_with_timeline(
+            ObjectRpcChannelWireFrame::LivenessProbe { call_id, probe_id },
+            timeline,
+        );
+        if queued.is_err()
+            && let Ok(mut pending) = self.pending.lock()
+            && let Some(call) = pending.get_mut(&call_id)
+            && call.outstanding_liveness_probe == Some(probe_id)
+        {
+            call.outstanding_liveness_probe = None;
+        }
+        queued
+    }
+
     fn queue_snapshot(&self) -> ObjectRpcChannelQueueSnapshot {
         ObjectRpcChannelQueueSnapshot {
             active_calls: self
@@ -1408,7 +1652,7 @@ impl ChannelShared {
                 let window = window.ok_or_else(|| NetworkError::Serialization {
                     detail: "bodyless multiplexed request received body credit".to_string(),
                 })?;
-                window.grant(credit_bytes as usize)?;
+                window.open(credit_bytes as usize)?;
                 lifetime.mark_progress();
                 Ok(())
             }
@@ -1425,15 +1669,15 @@ impl ChannelShared {
                 bytes,
             } => {
                 let ingress = self.body_ingress(call_id, direction)?;
-                ingress.accept_data(offset, bytes)
+                ingress.accept_data(offset, Bytes::from(bytes))
             }
             ObjectRpcChannelWireFrame::WindowUpdate {
                 call_id,
                 direction,
-                credit_bytes,
+                received_offset,
             } => {
                 let (window, lifetime) = self.send_window(call_id, direction)?;
-                window.grant(credit_bytes as usize)?;
+                window.acknowledge(received_offset)?;
                 lifetime.mark_progress();
                 Ok(())
             }
@@ -1444,6 +1688,52 @@ impl ChannelShared {
             } => self
                 .body_ingress(call_id, direction)?
                 .accept_end(total_bytes),
+            ObjectRpcChannelWireFrame::LivenessProbe { call_id, probe_id } => {
+                if self.role.owns_call_id(call_id) {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "peer sent a liveness probe for locally owned multiplexed call {call_id}"
+                        ),
+                    });
+                }
+                let timeline = self
+                    .inbound
+                    .lock()
+                    .map_err(|_| channel_lock_error())?
+                    .get(&call_id)
+                    .map(|call| call.lifetime.timeline)
+                    .ok_or_else(|| unknown_call_error(call_id))?;
+                self.outbound.try_control_with_timeline(
+                    ObjectRpcChannelWireFrame::LivenessResponse { call_id, probe_id },
+                    timeline,
+                )
+            }
+            ObjectRpcChannelWireFrame::LivenessResponse { call_id, probe_id } => {
+                if !self.role.owns_call_id(call_id) {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "peer sent a liveness response for peer-owned multiplexed call {call_id}"
+                        ),
+                    });
+                }
+                let lifetime = {
+                    let mut pending = self.pending.lock().map_err(|_| channel_lock_error())?;
+                    let call = pending
+                        .get_mut(&call_id)
+                        .ok_or_else(|| unknown_call_error(call_id))?;
+                    if call.outstanding_liveness_probe != Some(probe_id) {
+                        return Err(NetworkError::Serialization {
+                            detail: format!(
+                                "unexpected multiplexed liveness response {probe_id} for call {call_id}"
+                            ),
+                        });
+                    }
+                    call.outstanding_liveness_probe = None;
+                    Arc::clone(&call.lifetime)
+                };
+                lifetime.mark_progress();
+                Ok(())
+            }
             ObjectRpcChannelWireFrame::Cancel { call_id, reason } => {
                 if self.role.owns_call_id(call_id)
                     || !self.try_reset_inbound(call_id, reason, false)
@@ -1466,6 +1756,21 @@ impl ChannelShared {
                 }
             }
         })();
+        match result {
+            Err(_) if !self.is_active_call(call_id)? && self.is_retired_call(call_id) => Ok(()),
+            result => result,
+        }
+    }
+
+    fn receive_data(
+        self: &Arc<Self>,
+        frame: ObjectRpcChannelDataFrame,
+    ) -> Result<(), NetworkError> {
+        frame.validate()?;
+        let call_id = frame.header.call_id;
+        let result = self
+            .body_ingress(call_id, frame.header.direction)
+            .and_then(|ingress| ingress.accept_data(frame.header.offset, frame.bytes));
         match result {
             Err(_) if !self.is_active_call(call_id)? && self.is_retired_call(call_id) => Ok(()),
             result => result,
@@ -1560,7 +1865,7 @@ impl ChannelShared {
             if let Err(error) = self.outbound.try_control_with_timeline(
                 ObjectRpcChannelWireFrame::RequestAccepted {
                     call_id,
-                    credit_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32,
+                    credit_bytes: OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32,
                 },
                 timeline,
             ) {
@@ -1690,7 +1995,7 @@ impl ChannelShared {
         validate_response_head(&response)?;
         let materialized_value_reservation = if let Some(descriptor) = body_descriptor.as_ref() {
             validate_body_descriptor(descriptor)?;
-            if initial_credit_bytes as usize != OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
+            if initial_credit_bytes as usize != OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES {
                 return Err(NetworkError::Serialization {
                     detail: "invalid multiplexed response initial credit".to_string(),
                 });
@@ -1906,7 +2211,7 @@ impl ChannelShared {
                 .ok_or_else(|| unknown_call_error(call_id))?;
             let window = outgoing
                 .as_ref()
-                .map(|_| Arc::new(SendWindow::new(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)));
+                .map(|_| Arc::new(SendWindow::new(OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES)));
             call.response_window = window.as_ref().map(Arc::clone);
             (Arc::clone(&call.lifetime), window)
         };
@@ -1916,7 +2221,7 @@ impl ChannelShared {
             response,
             body: descriptor,
             initial_credit_bytes: if outgoing.is_some() {
-                OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32
+                OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32
             } else {
                 0
             },
@@ -2079,6 +2384,7 @@ struct PendingCallState {
     result_sender: Option<oneshot::Sender<Result<ObjectRpcSessionResult, NetworkError>>>,
     request_window: Option<Arc<SendWindow>>,
     response_ingress: Option<Arc<BodyIngress>>,
+    outstanding_liveness_probe: Option<u64>,
     lifetime: Arc<ChannelCallLifetime>,
 }
 
@@ -2226,33 +2532,51 @@ fn advance_progress(progress: &watch::Sender<u64>) {
 }
 
 struct SendWindow {
-    available: AtomicUsize,
+    window_bytes: AtomicUsize,
+    sent_offset: AtomicU64,
+    acknowledged_offset: AtomicU64,
     cancelled: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
 impl SendWindow {
-    fn new(available: usize) -> Self {
+    fn new(window_bytes: usize) -> Self {
         Self {
-            available: AtomicUsize::new(available),
+            window_bytes: AtomicUsize::new(window_bytes),
+            sent_offset: AtomicU64::new(0),
+            acknowledged_offset: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
 
-    fn grant(&self, bytes: usize) -> Result<(), NetworkError> {
-        if bytes == 0 || bytes > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
+    fn open(&self, window_bytes: usize) -> Result<(), NetworkError> {
+        if window_bytes != OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES {
             return Err(NetworkError::Serialization {
-                detail: format!("invalid multiplexed object RPC credit {bytes}"),
+                detail: format!("invalid multiplexed object RPC window {window_bytes}"),
             });
         }
-        let previous = self.available.fetch_add(bytes, Ordering::AcqRel);
-        if previous.saturating_add(bytes) > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
-            self.available.fetch_sub(bytes, Ordering::AcqRel);
+        self.window_bytes
+            .compare_exchange(0, window_bytes, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| NetworkError::Serialization {
+                detail: "multiplexed object RPC window was opened more than once".to_string(),
+            })?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    fn acknowledge(&self, received_offset: u64) -> Result<(), NetworkError> {
+        let sent_offset = self.sent_offset.load(Ordering::Acquire);
+        let previous = self.acknowledged_offset.load(Ordering::Acquire);
+        if received_offset < previous || received_offset > sent_offset {
             return Err(NetworkError::Serialization {
-                detail: "multiplexed object RPC credit exceeded per-call window".to_string(),
+                detail: format!(
+                    "invalid cumulative multiplexed credit offset {received_offset}; acknowledged={previous} sent={sent_offset}"
+                ),
             });
         }
+        self.acknowledged_offset
+            .store(received_offset, Ordering::Release);
         self.notify.notify_one();
         Ok(())
     }
@@ -2262,37 +2586,68 @@ impl SendWindow {
             if self.cancelled.load(Ordering::Acquire) {
                 return Err(channel_delivery_error("multiplexed call was cancelled"));
             }
-            let available = self.available.load(Ordering::Acquire);
+            let window_bytes = self.window_bytes.load(Ordering::Acquire);
+            let sent_offset = self.sent_offset.load(Ordering::Acquire);
+            let acknowledged_offset = self.acknowledged_offset.load(Ordering::Acquire);
+            let available = window_bytes.saturating_sub(
+                usize::try_from(sent_offset.saturating_sub(acknowledged_offset))
+                    .unwrap_or(usize::MAX),
+            );
             if available > 0 {
                 return Ok(available.min(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES));
             }
             let notified = self.notify.notified();
-            if self.available.load(Ordering::Acquire) > 0 {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(channel_delivery_error("multiplexed call was cancelled"));
+            }
+            let window_bytes = self.window_bytes.load(Ordering::Acquire);
+            let sent_offset = self.sent_offset.load(Ordering::Acquire);
+            let acknowledged_offset = self.acknowledged_offset.load(Ordering::Acquire);
+            if sent_offset.saturating_sub(acknowledged_offset)
+                < u64::try_from(window_bytes).unwrap_or(u64::MAX)
+            {
                 continue;
+            }
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(channel_delivery_error("multiplexed call was cancelled"));
             }
             notified.await;
         }
     }
 
     fn consume(&self, bytes: usize) -> Result<(), NetworkError> {
-        self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                (available >= bytes).then_some(available - bytes)
-            })
-            .map(|_| ())
-            .map_err(|_| NetworkError::Serialization {
-                detail: "multiplexed object RPC sender exceeded granted credit".to_string(),
-            })
+        let bytes = u64::try_from(bytes).map_err(|_| NetworkError::Serialization {
+            detail: "multiplexed object RPC body offset overflow".to_string(),
+        })?;
+        let sent_offset = self.sent_offset.load(Ordering::Acquire);
+        let acknowledged_offset = self.acknowledged_offset.load(Ordering::Acquire);
+        let next_offset =
+            sent_offset
+                .checked_add(bytes)
+                .ok_or_else(|| NetworkError::Serialization {
+                    detail: "multiplexed object RPC body offset overflow".to_string(),
+                })?;
+        let window_bytes =
+            u64::try_from(self.window_bytes.load(Ordering::Acquire)).unwrap_or(u64::MAX);
+        if next_offset.saturating_sub(acknowledged_offset) > window_bytes {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed object RPC sender exceeded granted window".to_string(),
+            });
+        }
+        self.sent_offset.store(next_offset, Ordering::Release);
+        Ok(())
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+        // One sender task waits on each logical body window. `notify_one`
+        // retains a permit when cancellation races waiter registration.
+        self.notify.notify_one();
     }
 }
 
 enum BodyIngressEvent {
-    Data(Vec<u8>),
+    Data(Bytes),
     End { total_bytes: u64 },
     Cancel,
 }
@@ -2306,29 +2661,44 @@ struct BodyIngress {
 
 struct BodyIngressState {
     next_offset: u64,
-    remaining_credit: usize,
+    acknowledged_offset: u64,
     ended: bool,
 }
 
 impl BodyIngress {
-    fn accept_data(&self, offset: u64, bytes: Vec<u8>) -> Result<(), NetworkError> {
-        if bytes.is_empty() || bytes.len() > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
+    fn validate_data(&self, offset: u64, bytes: usize) -> Result<(), NetworkError> {
+        let state = self.state.lock().map_err(|_| channel_lock_error())?;
+        self.validate_data_locked(&state, offset, bytes).map(|_| ())
+    }
+
+    fn validate_data_locked(
+        &self,
+        state: &BodyIngressState,
+        offset: u64,
+        bytes: usize,
+    ) -> Result<u64, NetworkError> {
+        if bytes == 0 || bytes > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
             return Err(NetworkError::Serialization {
-                detail: format!("invalid multiplexed data quantum {}", bytes.len()),
+                detail: format!("invalid multiplexed data quantum {bytes}"),
             });
         }
-        let mut state = self.state.lock().map_err(|_| channel_lock_error())?;
-        if state.ended || offset != state.next_offset || bytes.len() > state.remaining_credit {
+        if state.ended || offset != state.next_offset {
             return Err(NetworkError::Serialization {
                 detail: "invalid multiplexed body offset or flow-control credit".to_string(),
             });
         }
-        let next_offset = state
-            .next_offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| NetworkError::Serialization {
+        let next_offset = state.next_offset.checked_add(bytes as u64).ok_or_else(|| {
+            NetworkError::Serialization {
                 detail: "multiplexed body offset overflow".to_string(),
-            })?;
+            }
+        })?;
+        if next_offset.saturating_sub(state.acknowledged_offset)
+            > OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u64
+        {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed sender exceeded receiver window".to_string(),
+            });
+        }
         if self
             .descriptor
             .total_bytes
@@ -2338,12 +2708,16 @@ impl BodyIngress {
                 detail: "multiplexed body exceeded its declared length".to_string(),
             });
         }
-        let bytes_len = bytes.len();
+        Ok(next_offset)
+    }
+
+    fn accept_data(&self, offset: u64, bytes: Bytes) -> Result<(), NetworkError> {
+        let mut state = self.state.lock().map_err(|_| channel_lock_error())?;
+        let next_offset = self.validate_data_locked(&state, offset, bytes.len())?;
         self.sender
             .try_send(BodyIngressEvent::Data(bytes))
             .map_err(|_| channel_resource_error("queue multiplexed inbound body quantum", 1))?;
         state.next_offset = next_offset;
-        state.remaining_credit -= bytes_len;
         advance_progress(&self.progress);
         Ok(())
     }
@@ -2369,14 +2743,14 @@ impl BodyIngress {
         Ok(())
     }
 
-    fn grant(&self, bytes: usize) -> Result<(), NetworkError> {
+    fn acknowledge(&self, received_offset: u64) -> Result<(), NetworkError> {
         let mut state = self.state.lock().map_err(|_| channel_lock_error())?;
-        state.remaining_credit = state.remaining_credit.saturating_add(bytes);
-        if state.remaining_credit > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
+        if received_offset < state.acknowledged_offset || received_offset > state.next_offset {
             return Err(NetworkError::Serialization {
-                detail: "multiplexed receiver credit exceeded per-call window".to_string(),
+                detail: "invalid multiplexed receiver cumulative offset".to_string(),
             });
         }
+        state.acknowledged_offset = received_offset;
         Ok(())
     }
 
@@ -2397,7 +2771,7 @@ fn start_body_ingress(
         descriptor,
         state: Mutex::new(BodyIngressState {
             next_offset: 0,
-            remaining_credit: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES,
+            acknowledged_offset: 0,
             ended: false,
         }),
         sender: event_sender,
@@ -2427,15 +2801,46 @@ async fn run_body_ingress(
     lifetime: Arc<ChannelCallLifetime>,
 ) {
     let mut total_bytes = 0_u64;
+    let mut acknowledged_bytes = 0_u64;
+    let mut credit_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut consumer_open = true;
     loop {
-        let event = tokio::select! {
-            biased;
-            _ = lifetime.cancelled() => {
-                body_sender.fail("multiplexed object RPC body cancelled");
-                return;
+        let event = if let Some(timer) = credit_timer.as_mut() {
+            tokio::select! {
+                biased;
+                _ = lifetime.cancelled() => {
+                    body_sender.fail("multiplexed object RPC body cancelled");
+                    return;
+                }
+                _ = timer => {
+                    if let Err(error) = publish_channel_window_update(
+                        &shared,
+                        &ingress,
+                        call_id,
+                        direction,
+                        total_bytes,
+                        lifetime.timeline,
+                    ) {
+                        let reason = format!("multiplexed body credit failed: {error}");
+                        body_sender.fail(reason.clone());
+                        fail_incoming_body_call(&shared, call_id, direction, reason, true);
+                        return;
+                    }
+                    acknowledged_bytes = total_bytes;
+                    credit_timer = None;
+                    continue;
+                }
+                event = receiver.recv() => event,
             }
-            event = receiver.recv() => event,
+        } else {
+            tokio::select! {
+                biased;
+                _ = lifetime.cancelled() => {
+                    body_sender.fail("multiplexed object RPC body cancelled");
+                    return;
+                }
+                event = receiver.recv() => event,
+            }
         };
         let Some(event) = event else {
             let reason = "multiplexed object RPC body ended before completion".to_string();
@@ -2446,7 +2851,6 @@ async fn run_body_ingress(
         match event {
             BodyIngressEvent::Data(bytes) => {
                 total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-                let credit_bytes = bytes.len();
                 if consumer_open {
                     consumer_open = tokio::select! {
                         biased;
@@ -2467,23 +2871,28 @@ async fn run_body_ingress(
                         return;
                     }
                 }
-                // Publish the receiver-side window before exposing the credit
-                // frame. The peer may consume a queued WindowUpdate and send
-                // its next Data frame on another task immediately.
-                if let Err(error) = ingress.grant(credit_bytes).and_then(|()| {
-                    shared.outbound.try_control_with_timeline(
-                        ObjectRpcChannelWireFrame::WindowUpdate {
-                            call_id,
-                            direction,
-                            credit_bytes: credit_bytes as u32,
-                        },
+                if total_bytes.saturating_sub(acknowledged_bytes)
+                    >= OBJECT_RPC_CHANNEL_WINDOW_UPDATE_BYTES as u64
+                {
+                    if let Err(error) = publish_channel_window_update(
+                        &shared,
+                        &ingress,
+                        call_id,
+                        direction,
+                        total_bytes,
                         lifetime.timeline,
-                    )
-                }) {
-                    let reason = format!("multiplexed body credit failed: {error}");
-                    body_sender.fail(reason.clone());
-                    fail_incoming_body_call(&shared, call_id, direction, reason, true);
-                    return;
+                    ) {
+                        let reason = format!("multiplexed body credit failed: {error}");
+                        body_sender.fail(reason.clone());
+                        fail_incoming_body_call(&shared, call_id, direction, reason, true);
+                        return;
+                    }
+                    acknowledged_bytes = total_bytes;
+                    credit_timer = None;
+                } else if total_bytes > acknowledged_bytes && credit_timer.is_none() {
+                    credit_timer = Some(Box::pin(tokio::time::sleep(
+                        OBJECT_RPC_CHANNEL_WINDOW_UPDATE_INTERVAL,
+                    )));
                 }
             }
             BodyIngressEvent::End {
@@ -2495,6 +2904,10 @@ async fn run_body_ingress(
                     fail_incoming_body_call(&shared, call_id, direction, reason, true);
                     return;
                 }
+                // BodyEnd is terminal: the sender already waits for all Data
+                // writes before emitting it, so a final credit frame cannot
+                // unblock useful work. Omitting it also avoids turning a
+                // successfully delivered EOF into a control-queue failure.
                 if let Err(error) = body_sender.finish(total_bytes).await {
                     fail_incoming_body_call(&shared, call_id, direction, error.to_string(), true);
                     return;
@@ -2508,6 +2921,27 @@ async fn run_body_ingress(
             }
         }
     }
+}
+
+fn publish_channel_window_update(
+    shared: &ChannelShared,
+    ingress: &BodyIngress,
+    call_id: ObjectRpcChannelCallId,
+    direction: ObjectRpcChannelBodyDirection,
+    received_offset: u64,
+    timeline: Option<NetworkTimelineTraceContext>,
+) -> Result<(), NetworkError> {
+    // Commit the local receiver window before exposing its cumulative offset;
+    // the peer may consume the queued control on another task immediately.
+    ingress.acknowledge(received_offset)?;
+    shared.outbound.try_control_with_timeline(
+        ObjectRpcChannelWireFrame::WindowUpdate {
+            call_id,
+            direction,
+            received_offset,
+        },
+        timeline,
+    )
 }
 
 fn fail_incoming_body_call(
@@ -2720,50 +3154,112 @@ async fn run_outgoing_body(
     // A request-side producer is not even opened until RequestAccepted grants
     // the first credit. This is important for one-pass readers: a rejected
     // request must remain completely unconsumed.
-    let mut available = Some(window.wait_available().await?);
-    let mut producer: BodyProducer = source.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?;
+    let mut producer: Option<BodyProducer> =
+        Some(source.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?);
     drop(source);
     let mut offset = 0_u64;
-    let mut last_data_emitted: Option<oneshot::Receiver<()>> = None;
-    let mut pending_bytes: Option<Vec<u8>> = None;
+    let write_tracker = Arc::new(BodyWriteTracker::new());
+    let mut written = write_tracker.subscribe();
+    let mut pending_bytes: Option<Bytes> = None;
+    let mut producer_finished = false;
     loop {
-        let available = match available.take() {
-            Some(available) => available,
-            None => window.wait_available().await?,
-        };
-        let next = if let Some(bytes) = pending_bytes.take() {
-            Some(bytes)
-        } else {
-            tokio::select! {
-                biased;
-                _ = lifetime.cancelled() => {
-                    return Err(channel_delivery_error("multiplexed body send cancelled"));
-                }
-                next = producer.next() => next?,
-            }
-        };
-        let Some(mut bytes) = next else {
-            tokio::select! {
-                biased;
-                _ = lifetime.cancelled() => {
-                    return Err(channel_delivery_error("multiplexed body send cancelled"));
-                }
-                result = producer.finish() => result?,
-            }
-            if let Some(emitted) = last_data_emitted.take() {
+        let mut batch = Vec::with_capacity(shared.outbound.data_batch_frames);
+        let mut batch_bytes = 0_usize;
+        while batch_bytes < shared.outbound.data_batch_bytes
+            && batch.len() < shared.outbound.data_batch_frames
+            && !producer_finished
+        {
+            let available = window.wait_available().await?;
+            let next = if let Some(bytes) = pending_bytes.take() {
+                Some(bytes)
+            } else if batch.is_empty() {
                 tokio::select! {
                     biased;
                     _ = lifetime.cancelled() => {
                         return Err(channel_delivery_error("multiplexed body send cancelled"));
                     }
-                    result = emitted => {
-                        result.map_err(|_| {
-                            channel_delivery_error(
-                                "physical channel closed before final body data emission",
-                            )
-                        })?;
-                    }
+                    next = producer.as_mut().expect("body producer is active").next() => next?,
                 }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = lifetime.cancelled() => {
+                        return Err(channel_delivery_error("multiplexed body send cancelled"));
+                    }
+                    _ = tokio::time::sleep(OBJECT_RPC_CHANNEL_WINDOW_UPDATE_INTERVAL) => break,
+                    next = producer.as_mut().expect("body producer is active").next() => next?,
+                }
+            };
+            let Some(mut bytes) = next else {
+                tokio::select! {
+                    biased;
+                    _ = lifetime.cancelled() => {
+                        return Err(channel_delivery_error("multiplexed body send cancelled"));
+                    }
+                    result = producer.take().expect("body producer is active").finish() => result?,
+                }
+                producer_finished = true;
+                break;
+            };
+            if bytes.is_empty() || bytes.len() > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "body producer emitted invalid multiplexed channel quantum {}",
+                        bytes.len()
+                    ),
+                });
+            }
+            let remaining_batch = shared.outbound.data_batch_bytes - batch_bytes;
+            let send_bytes = available.min(remaining_batch).min(bytes.len());
+            if send_bytes < bytes.len() {
+                pending_bytes = Some(bytes.split_off(send_bytes));
+            }
+            window.consume(bytes.len())?;
+            let payload_len =
+                u32::try_from(bytes.len()).map_err(|_| NetworkError::Serialization {
+                    detail: "multiplexed Data payload length overflow".to_string(),
+                })?;
+            let next_offset = offset.checked_add(u64::from(payload_len)).ok_or_else(|| {
+                NetworkError::Serialization {
+                    detail: "multiplexed outgoing body offset overflow".to_string(),
+                }
+            })?;
+            batch.push(ObjectRpcChannelDataFrame {
+                header: ObjectRpcChannelDataHeader {
+                    call_id,
+                    direction,
+                    offset,
+                    payload_len,
+                },
+                bytes,
+            });
+            batch_bytes = batch_bytes.saturating_add(payload_len as usize);
+            offset = next_offset;
+        }
+
+        if !batch.is_empty() {
+            tokio::select! {
+                biased;
+                _ = lifetime.cancelled() => {
+                    return Err(channel_delivery_error("multiplexed body send cancelled"));
+                }
+                result = shared.outbound.queue_data_batch(
+                    batch,
+                    Arc::clone(&write_tracker),
+                    lifetime.progress_sender(),
+                    lifetime.timeline,
+                    true,
+                ) => result?,
+            }
+        }
+
+        if producer_finished {
+            tokio::select! {
+                biased;
+                _ = lifetime.cancelled() => {
+                    return Err(channel_delivery_error("multiplexed body send cancelled"));
+                }
+                result = BodyWriteTracker::wait_for(&mut written, offset) => result?,
             }
             drop(materialized_value_permit.take());
             let emitted = shared.outbound.try_control_with_ack_timeline(
@@ -2790,39 +3286,7 @@ async fn run_outgoing_body(
             }
             lifetime.mark_outgoing_done();
             return Ok(());
-        };
-        if bytes.len() > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
-            return Err(NetworkError::Serialization {
-                detail: "body producer exceeded multiplexed channel quantum".to_string(),
-            });
         }
-        if bytes.len() > available {
-            pending_bytes = Some(bytes.split_off(available));
-        }
-        window.consume(bytes.len())?;
-        let next_offset =
-            offset
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| NetworkError::Serialization {
-                    detail: "multiplexed outgoing body offset overflow".to_string(),
-                })?;
-        let queued = shared.outbound.queue_call_data(
-            ObjectRpcChannelWireFrame::Data {
-                call_id,
-                direction,
-                offset,
-                bytes,
-            },
-            lifetime.progress_sender(),
-            lifetime.timeline,
-        );
-        last_data_emitted = Some(tokio::select! {
-            result = queued => result?,
-            _ = lifetime.cancelled() => {
-                return Err(channel_delivery_error("multiplexed body send cancelled"));
-            }
-        });
-        offset = next_offset;
         if lifetime.cancelled.load(Ordering::Acquire) {
             return Err(channel_delivery_error("multiplexed body send cancelled"));
         }
@@ -2833,7 +3297,11 @@ struct OutboundQueues {
     connection_id: u64,
     control_sender: mpsc::Sender<QueuedControl>,
     data_sender: mpsc::Sender<QueuedData>,
-    queue_budget: Arc<Semaphore>,
+    control_budget: Arc<Semaphore>,
+    data_budget: Arc<Semaphore>,
+    data_frame_budget: Arc<Semaphore>,
+    data_batch_bytes: usize,
+    data_batch_frames: usize,
     queued_control_frames: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicUsize>,
     queued_data_bytes: Arc<AtomicUsize>,
@@ -2899,9 +3367,11 @@ impl OutboundQueues {
         let bytes = queued_frame_bytes(&frame);
         let permits = u32::try_from(bytes)
             .map_err(|_| channel_resource_error("reserve multiplexed queued bytes", bytes))?;
-        let permit = Arc::clone(&self.queue_budget)
+        let permit = Arc::clone(&self.control_budget)
             .try_acquire_many_owned(permits)
-            .map_err(|_| channel_resource_error("reserve multiplexed queued bytes", bytes))?;
+            .map_err(|_| {
+                channel_resource_error("reserve multiplexed queued control bytes", bytes)
+            })?;
         self.queued_control_frames.fetch_add(1, Ordering::Relaxed);
         self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
         let queued = QueuedControl {
@@ -2939,64 +3409,141 @@ impl OutboundQueues {
         &self,
         frame: ObjectRpcChannelWireFrame,
     ) -> Result<oneshot::Receiver<()>, NetworkError> {
-        self.queue_data_inner(frame, None, None).await
+        self.queue_call_data(frame, watch::channel(0).0, None).await
     }
 
+    #[cfg(test)]
     async fn queue_call_data(
         &self,
         frame: ObjectRpcChannelWireFrame,
         progress: watch::Sender<u64>,
         timeline: Option<NetworkTimelineTraceContext>,
     ) -> Result<oneshot::Receiver<()>, NetworkError> {
-        self.queue_data_inner(frame, Some(progress), timeline).await
+        let ObjectRpcChannelWireFrame::Data {
+            call_id,
+            direction,
+            offset,
+            bytes,
+        } = frame
+        else {
+            return Err(NetworkError::Serialization {
+                detail: "data scheduler accepted a control frame".to_string(),
+            });
+        };
+        let payload_len = u32::try_from(bytes.len()).map_err(|_| NetworkError::Serialization {
+            detail: "multiplexed Data payload length overflow".to_string(),
+        })?;
+        let frame = ObjectRpcChannelDataFrame {
+            header: ObjectRpcChannelDataHeader {
+                call_id,
+                direction,
+                offset,
+                payload_len,
+            },
+            bytes: Bytes::from(bytes),
+        };
+        let target = offset.saturating_add(u64::from(payload_len));
+        let tracker = Arc::new(BodyWriteTracker::new());
+        let mut written = tracker.subscribe();
+        self.queue_data_batch(vec![frame], Arc::clone(&tracker), progress, timeline, false)
+            .await?;
+        let (emitted, emission) = oneshot::channel();
+        tokio::spawn(async move {
+            if BodyWriteTracker::wait_for(&mut written, target)
+                .await
+                .is_ok()
+            {
+                let _ = emitted.send(());
+            }
+        });
+        Ok(emission)
     }
 
-    async fn queue_data_inner(
+    async fn queue_data_batch(
         &self,
-        frame: ObjectRpcChannelWireFrame,
-        progress: Option<watch::Sender<u64>>,
+        frames: Vec<ObjectRpcChannelDataFrame>,
+        tracker: Arc<BodyWriteTracker>,
+        progress: watch::Sender<u64>,
         timeline: Option<NetworkTimelineTraceContext>,
-    ) -> Result<oneshot::Receiver<()>, NetworkError> {
-        let call_id = frame.call_id();
-        let timeline_flags = channel_frame_timeline_flags(&frame);
-        let frame_id = timeline
-            .map(|_| channel_frame_timeline_id(&frame))
-            .unwrap_or(0);
-        let timeline_queued_ns = timeline
-            .map(|_| network_timeline_monotonic_ns())
-            .unwrap_or(0);
-        let bytes = match &frame {
-            ObjectRpcChannelWireFrame::Data { bytes, .. } => bytes.len(),
-            _ => 0,
-        };
-        let permits = u32::try_from(bytes)
-            .map_err(|_| channel_resource_error("reserve multiplexed queued data bytes", bytes))?;
-        let permit = Arc::clone(&self.queue_budget)
-            .acquire_many_owned(permits)
+        prune_if_inactive: bool,
+    ) -> Result<(), NetworkError> {
+        if frames.is_empty() || frames.len() > self.data_batch_frames {
+            return Err(NetworkError::Serialization {
+                detail: "invalid multiplexed queued Data batch frame count".to_string(),
+            });
+        }
+        let batch_bytes = frames.iter().try_fold(0_usize, |total, frame| {
+            frame.validate()?;
+            total
+                .checked_add(frame.bytes.len())
+                .ok_or_else(|| NetworkError::Serialization {
+                    detail: "multiplexed queued Data batch length overflow".to_string(),
+                })
+        })?;
+        if batch_bytes == 0 || batch_bytes > self.data_batch_bytes {
+            return Err(NetworkError::Serialization {
+                detail: format!("invalid multiplexed queued Data batch size {batch_bytes}"),
+            });
+        }
+        let byte_permits = u32::try_from(batch_bytes).map_err(|_| {
+            channel_resource_error("reserve multiplexed queued data batch", batch_bytes)
+        })?;
+        let frame_permits = u32::try_from(frames.len()).map_err(|_| {
+            channel_resource_error("reserve multiplexed queued data frames", frames.len())
+        })?;
+        let byte_permit = Arc::clone(&self.data_budget)
+            .acquire_many_owned(byte_permits)
             .await
             .map_err(|_| channel_delivery_error("multiplexed data queue closed"))?;
-        self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.queued_data_bytes.fetch_add(bytes, Ordering::Relaxed);
-        let (emitted, emission) = oneshot::channel();
-        let queued = QueuedData {
-            frame: Some(frame),
-            bytes,
-            permit,
-            queued_bytes: Arc::clone(&self.queued_bytes),
-            queued_data_bytes: Arc::clone(&self.queued_data_bytes),
-            emitted: Some(emitted),
-            progress,
-            timeline,
-            timeline_queued_ns,
-            timeline_flags,
-            connection_id: self.connection_id,
-            call_id,
-            frame_id,
-        };
-        self.data_sender.send(queued).await.map_err(|error| {
-            channel_delivery_error(&format!("multiplexed data scheduler closed: {error}"))
-        })?;
-        Ok(emission)
+        let frame_permit = Arc::clone(&self.data_frame_budget)
+            .acquire_many_owned(frame_permits)
+            .await
+            .map_err(|_| channel_delivery_error("multiplexed data frame queue closed"))?;
+        let reservation = Arc::new(QueuedDataBatchReservation {
+            _byte_permit: byte_permit,
+            _frame_permit: frame_permit,
+        });
+        for frame in frames {
+            let call_id = frame.header.call_id;
+            let lane = DataLaneKey {
+                call_id,
+                direction: frame.header.direction,
+            };
+            let timeline_flags = channel_data_timeline_flags(frame.header.direction);
+            let frame_id = timeline
+                .map(|_| channel_data_timeline_id(&frame.header))
+                .unwrap_or(0);
+            let timeline_queued_ns = timeline
+                .map(|_| network_timeline_monotonic_ns())
+                .unwrap_or(0);
+            let bytes = frame.bytes.len();
+            let end_offset = frame.header.offset + bytes as u64;
+            self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.queued_data_bytes.fetch_add(bytes, Ordering::Relaxed);
+            let queued = QueuedData {
+                frame: Some(frame),
+                lane,
+                bytes,
+                _reservation: Arc::clone(&reservation),
+                queued_bytes: Arc::clone(&self.queued_bytes),
+                queued_data_bytes: Arc::clone(&self.queued_data_bytes),
+                tracker: Arc::clone(&tracker),
+                end_offset,
+                written: false,
+                prune_if_inactive,
+                progress: Some(progress.clone()),
+                timeline,
+                timeline_queued_ns,
+                timeline_flags,
+                connection_id: self.connection_id,
+                call_id,
+                frame_id,
+            };
+            self.data_sender.send(queued).await.map_err(|error| {
+                channel_delivery_error(&format!("multiplexed data scheduler closed: {error}"))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -3011,10 +3558,10 @@ enum PendingChannelWrite {
 }
 
 impl PendingChannelWrite {
-    fn take_frame(&mut self) -> ObjectRpcChannelWireFrame {
+    fn take_frame(&mut self) -> ObjectRpcChannelTransportFrame {
         match self {
-            Self::Control(queued) => queued.take_frame(),
-            Self::Data(queued) => queued.take_frame(),
+            Self::Control(queued) => ObjectRpcChannelTransportFrame::Control(queued.take_frame()),
+            Self::Data(queued) => ObjectRpcChannelTransportFrame::Data(queued.take_frame()),
         }
     }
 
@@ -3105,13 +3652,79 @@ impl Drop for QueuedControl {
     }
 }
 
+struct QueuedDataBatchReservation {
+    _byte_permit: OwnedSemaphorePermit,
+    _frame_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyWriteState {
+    Written(u64),
+    Failed,
+}
+
+struct BodyWriteTracker {
+    state: watch::Sender<BodyWriteState>,
+}
+
+impl BodyWriteTracker {
+    fn new() -> Self {
+        Self {
+            state: watch::channel(BodyWriteState::Written(0)).0,
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<BodyWriteState> {
+        self.state.subscribe()
+    }
+
+    fn mark_written(&self, end_offset: u64) {
+        self.state.send_if_modified(|state| match state {
+            BodyWriteState::Written(written) if *written < end_offset => {
+                *written = end_offset;
+                true
+            }
+            _ => false,
+        });
+    }
+
+    fn fail(&self) {
+        self.state.send_replace(BodyWriteState::Failed);
+    }
+
+    async fn wait_for(
+        state: &mut watch::Receiver<BodyWriteState>,
+        target: u64,
+    ) -> Result<(), NetworkError> {
+        loop {
+            match *state.borrow_and_update() {
+                BodyWriteState::Written(written) if written >= target => return Ok(()),
+                BodyWriteState::Failed => {
+                    return Err(channel_delivery_error(
+                        "physical channel closed before final body data emission",
+                    ));
+                }
+                BodyWriteState::Written(_) => {}
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| channel_delivery_error("multiplexed body write progress stopped"))?;
+        }
+    }
+}
+
 struct QueuedData {
-    frame: Option<ObjectRpcChannelWireFrame>,
+    frame: Option<ObjectRpcChannelDataFrame>,
+    lane: DataLaneKey,
     bytes: usize,
-    permit: OwnedSemaphorePermit,
+    _reservation: Arc<QueuedDataBatchReservation>,
     queued_bytes: Arc<AtomicUsize>,
     queued_data_bytes: Arc<AtomicUsize>,
-    emitted: Option<oneshot::Sender<()>>,
+    tracker: Arc<BodyWriteTracker>,
+    end_offset: u64,
+    written: bool,
+    prune_if_inactive: bool,
     progress: Option<watch::Sender<u64>>,
     timeline: Option<NetworkTimelineTraceContext>,
     timeline_queued_ns: u64,
@@ -3122,7 +3735,7 @@ struct QueuedData {
 }
 
 impl QueuedData {
-    fn take_frame(&mut self) -> ObjectRpcChannelWireFrame {
+    fn take_frame(&mut self) -> ObjectRpcChannelDataFrame {
         if let Some(trace) = self.timeline {
             record_network_timeline_event_now(NetworkTimelineEvent::new(
                 trace,
@@ -3153,21 +3766,22 @@ impl QueuedData {
     }
 
     fn mark_written(&mut self) {
+        self.written = true;
+        self.tracker.mark_written(self.end_offset);
         if let Some(progress) = self.progress.take() {
             advance_progress(&progress);
-        }
-        if let Some(emitted) = self.emitted.take() {
-            let _ = emitted.send(());
         }
     }
 }
 
 impl Drop for QueuedData {
     fn drop(&mut self) {
+        if !self.written {
+            self.tracker.fail();
+        }
         self.queued_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
         self.queued_data_bytes
             .fetch_sub(self.bytes, Ordering::Relaxed);
-        let _ = &self.permit;
     }
 }
 
@@ -3184,7 +3798,10 @@ fn channel_frame_timeline_flags(frame: &ObjectRpcChannelWireFrame) -> u16 {
             ObjectRpcChannelBodyDirection::Request => network_timeline_flag::REQUEST,
             ObjectRpcChannelBodyDirection::Response => network_timeline_flag::RESPONSE,
         },
-        ObjectRpcChannelWireFrame::Cancel { .. } | ObjectRpcChannelWireFrame::Reset { .. } => 0,
+        ObjectRpcChannelWireFrame::LivenessProbe { .. }
+        | ObjectRpcChannelWireFrame::LivenessResponse { .. }
+        | ObjectRpcChannelWireFrame::Cancel { .. }
+        | ObjectRpcChannelWireFrame::Reset { .. } => 0,
     };
     direction
         | if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
@@ -3213,20 +3830,18 @@ fn channel_frame_timeline_id(frame: &ObjectRpcChannelWireFrame) -> u64 {
         } => (4, channel_body_direction_bit(*direction), *offset),
         ObjectRpcChannelWireFrame::WindowUpdate {
             direction,
-            credit_bytes,
+            received_offset,
             ..
-        } => (
-            5,
-            channel_body_direction_bit(*direction),
-            u64::from(*credit_bytes),
-        ),
+        } => (5, channel_body_direction_bit(*direction), *received_offset),
         ObjectRpcChannelWireFrame::BodyEnd {
             direction,
             total_bytes,
             ..
         } => (6, channel_body_direction_bit(*direction), *total_bytes),
-        ObjectRpcChannelWireFrame::Cancel { .. } => (7, 0, 0),
-        ObjectRpcChannelWireFrame::Reset { .. } => (8, 0, 0),
+        ObjectRpcChannelWireFrame::LivenessProbe { probe_id, .. } => (7, 0, *probe_id),
+        ObjectRpcChannelWireFrame::LivenessResponse { probe_id, .. } => (8, 0, *probe_id),
+        ObjectRpcChannelWireFrame::Cancel { .. } => (9, 0, 0),
+        ObjectRpcChannelWireFrame::Reset { .. } => (10, 0, 0),
     };
     let id = frame.call_id().0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ kind.wrapping_mul(0xbf58_476d_1ce4_e5b9)
@@ -3240,6 +3855,22 @@ const fn channel_body_direction_bit(direction: ObjectRpcChannelBodyDirection) ->
         ObjectRpcChannelBodyDirection::Request => 0,
         ObjectRpcChannelBodyDirection::Response => 1,
     }
+}
+
+fn channel_data_timeline_flags(direction: ObjectRpcChannelBodyDirection) -> u16 {
+    let direction = match direction {
+        ObjectRpcChannelBodyDirection::Request => network_timeline_flag::REQUEST,
+        ObjectRpcChannelBodyDirection::Response => network_timeline_flag::RESPONSE,
+    };
+    direction | network_timeline_flag::DATA_FRAME
+}
+
+fn channel_data_timeline_id(header: &ObjectRpcChannelDataHeader) -> u64 {
+    let id = header.call_id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ 4_u64.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ channel_body_direction_bit(header.direction).wrapping_mul(0x94d0_49bb_1331_11eb)
+        ^ header.offset.rotate_left(23);
+    id.max(1)
 }
 
 fn queued_frame_bytes(frame: &ObjectRpcChannelWireFrame) -> usize {
@@ -3257,7 +3888,9 @@ fn queued_frame_bytes(frame: &ObjectRpcChannelWireFrame) -> usize {
             .saturating_add(QUEUED_CONTROL_FRAME_OVERHEAD_BYTES),
         ObjectRpcChannelWireFrame::RequestAccepted { .. }
         | ObjectRpcChannelWireFrame::WindowUpdate { .. }
-        | ObjectRpcChannelWireFrame::BodyEnd { .. } => QUEUED_CONTROL_FRAME_OVERHEAD_BYTES,
+        | ObjectRpcChannelWireFrame::BodyEnd { .. }
+        | ObjectRpcChannelWireFrame::LivenessProbe { .. }
+        | ObjectRpcChannelWireFrame::LivenessResponse { .. } => QUEUED_CONTROL_FRAME_OVERHEAD_BYTES,
     }
 }
 
@@ -3307,14 +3940,20 @@ fn validate_wire_frame(frame: &ObjectRpcChannelWireFrame) -> Result<(), NetworkE
                 });
             }
         }
-        ObjectRpcChannelWireFrame::RequestAccepted { credit_bytes, .. }
-        | ObjectRpcChannelWireFrame::WindowUpdate { credit_bytes, .. } => {
-            if *credit_bytes == 0 || *credit_bytes as usize > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
-            {
+        ObjectRpcChannelWireFrame::RequestAccepted { credit_bytes, .. } => {
+            if *credit_bytes as usize != OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES {
                 return Err(NetworkError::Serialization {
-                    detail: "invalid multiplexed flow-control credit".to_string(),
+                    detail: "invalid multiplexed initial flow-control window".to_string(),
                 });
             }
+        }
+        ObjectRpcChannelWireFrame::LivenessProbe { probe_id, .. }
+        | ObjectRpcChannelWireFrame::LivenessResponse { probe_id, .. }
+            if *probe_id == 0 =>
+        {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed liveness probe id cannot be zero".to_string(),
+            });
         }
         ObjectRpcChannelWireFrame::Cancel { reason, .. }
         | ObjectRpcChannelWireFrame::Reset { reason, .. }
@@ -3446,7 +4085,18 @@ mod tests {
             .await
             .expect("queue data");
         let mut egress = endpoint.egress;
-        assert_eq!(egress.next_frame_for_transport().await, Some(data));
+        assert_eq!(
+            egress.next_transport_frame().await,
+            Some(ObjectRpcChannelTransportFrame::Data(
+                ObjectRpcChannelDataFrame::new(
+                    call_id,
+                    ObjectRpcChannelBodyDirection::Request,
+                    4096,
+                    Bytes::from(vec![7; 32]),
+                )
+                .expect("raw data frame"),
+            ))
+        );
         let timeline = egress.pending_write_timeline().expect("data timeline");
         assert_eq!(timeline.trace, trace);
         assert_eq!(timeline.call_id, call_id);
@@ -3468,13 +4118,148 @@ mod tests {
             .outbound
             .try_control_with_ack_timeline(body_end.clone(), Some(trace))
             .expect("queue body end");
-        assert_eq!(egress.next_frame_for_transport().await, Some(body_end));
+        assert_eq!(
+            egress.next_transport_frame().await,
+            Some(ObjectRpcChannelTransportFrame::Control(body_end))
+        );
         let timeline = egress.pending_write_timeline().expect("body-end timeline");
         assert_eq!(timeline.frame_id, body_end_frame_id);
         assert_ne!(timeline.frame_id, data_frame_id);
         assert_ne!(timeline.flags & network_timeline_flag::CONTROL_FRAME, 0);
         egress.complete_frame_write(true);
         acknowledged.await.expect("body end written");
+    }
+
+    #[tokio::test]
+    async fn send_window_uses_monotonic_cumulative_acknowledgements() {
+        let window = SendWindow::new(OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES);
+        let frame_count =
+            OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES / OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES;
+        for _ in 0..frame_count {
+            assert_eq!(
+                window.wait_available().await.expect("window capacity"),
+                OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
+            );
+            window
+                .consume(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
+                .expect("consume window capacity");
+        }
+        assert!(
+            timeout(Duration::from_millis(10), window.wait_available())
+                .await
+                .is_err(),
+            "a full call window must block"
+        );
+
+        let cumulative_ack = 2 * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u64;
+        window
+            .acknowledge(cumulative_ack)
+            .expect("cumulative acknowledgement");
+        assert_eq!(
+            window
+                .wait_available()
+                .await
+                .expect("capacity restored by cumulative acknowledgement"),
+            OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
+        );
+        window
+            .acknowledge(cumulative_ack)
+            .expect("duplicate cumulative acknowledgement is idempotent");
+        assert!(
+            window
+                .acknowledge(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u64)
+                .is_err(),
+            "acknowledgements must not move backwards"
+        );
+        assert!(
+            window
+                .acknowledge(OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u64 + 1)
+                .is_err(),
+            "acknowledgements must not pass the sent offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_window_coalesces_four_frames_into_one_cumulative_update() {
+        let ObjectRpcChannelEndpoint {
+            client: _,
+            mut server,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let call_id = ObjectRpcChannelCallId(1);
+        let total_bytes = OBJECT_RPC_CHANNEL_WINDOW_UPDATE_BYTES;
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Request {
+                call_id,
+                request: request("/channel/cumulative-window", Vec::new()),
+                body: Some(ObjectRpcChannelBodyDescriptor {
+                    kind: ObjectRpcChannelBodyKind::Attachment,
+                    total_bytes: Some(total_bytes as u64),
+                }),
+            })
+            .expect("request ingress");
+        assert!(matches!(
+            egress.next_frame().await,
+            Some(ObjectRpcChannelWireFrame::RequestAccepted {
+                call_id: accepted,
+                credit_bytes,
+            }) if accepted == call_id
+                && credit_bytes == OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32
+        ));
+        let mut incoming = server.accept().await.expect("incoming request");
+        let mut body = std::mem::take(&mut incoming.request.body);
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            body.read_to_end(&mut received).await.map(|_| received)
+        });
+
+        for frame_index in 0..4 {
+            ingress
+                .receive(ObjectRpcChannelWireFrame::Data {
+                    call_id,
+                    direction: ObjectRpcChannelBodyDirection::Request,
+                    offset: (frame_index * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) as u64,
+                    bytes: vec![frame_index as u8; OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES],
+                })
+                .expect("request data");
+        }
+        ingress
+            .receive(ObjectRpcChannelWireFrame::BodyEnd {
+                call_id,
+                direction: ObjectRpcChannelBodyDirection::Request,
+                total_bytes: total_bytes as u64,
+            })
+            .expect("request body end");
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), egress.next_frame())
+                .await
+                .expect("window update timeout"),
+            Some(ObjectRpcChannelWireFrame::WindowUpdate {
+                call_id: updated,
+                direction: ObjectRpcChannelBodyDirection::Request,
+                received_offset,
+            }) if updated == call_id && received_offset == total_bytes as u64
+        ));
+        assert_eq!(
+            reader
+                .await
+                .expect("body reader task")
+                .expect("read request body")
+                .len(),
+            total_bytes
+        );
+        assert!(
+            timeout(Duration::from_millis(10), egress.next_frame())
+                .await
+                .is_err(),
+            "the four-frame batch must not emit duplicate credit"
+        );
     }
 
     #[derive(Default)]
@@ -3485,6 +4270,8 @@ mod tests {
         data: AtomicUsize,
         window_updates: AtomicUsize,
         body_ends: AtomicUsize,
+        liveness_probes: AtomicUsize,
+        liveness_responses: AtomicUsize,
         cancels: AtomicUsize,
         resets: AtomicUsize,
     }
@@ -3498,6 +4285,8 @@ mod tests {
                 ObjectRpcChannelWireFrame::Data { .. } => &self.data,
                 ObjectRpcChannelWireFrame::WindowUpdate { .. } => &self.window_updates,
                 ObjectRpcChannelWireFrame::BodyEnd { .. } => &self.body_ends,
+                ObjectRpcChannelWireFrame::LivenessProbe { .. } => &self.liveness_probes,
+                ObjectRpcChannelWireFrame::LivenessResponse { .. } => &self.liveness_responses,
                 ObjectRpcChannelWireFrame::Cancel { .. } => &self.cancels,
                 ObjectRpcChannelWireFrame::Reset { .. } => &self.resets,
             };
@@ -4074,6 +4863,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn liveness_response_advances_only_its_matching_active_call() {
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _server,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+
+        let mut call_a = client
+            .call(ObjectRpcSessionCall::value(request(
+                "/channel/liveness/a",
+                Vec::new(),
+            )))
+            .await
+            .expect("call a");
+        let mut progress_a = call_a.progress();
+        let initial_a = *progress_a.borrow_and_update();
+        let call_a_id = match egress.next_frame().await.expect("call a request") {
+            ObjectRpcChannelWireFrame::Request { call_id, .. } => call_id,
+            frame => panic!("expected call a request, got {frame:?}"),
+        };
+        let generation_a =
+            expect_call_progress(&mut progress_a, initial_a, "call a request head").await;
+
+        let mut call_b = client
+            .call(ObjectRpcSessionCall::value(request(
+                "/channel/liveness/b",
+                Vec::new(),
+            )))
+            .await
+            .expect("call b");
+        let mut progress_b = call_b.progress();
+        let initial_b = *progress_b.borrow_and_update();
+        let call_b_id = match egress.next_frame().await.expect("call b request") {
+            ObjectRpcChannelWireFrame::Request { call_id, .. } => call_id,
+            frame => panic!("expected call b request, got {frame:?}"),
+        };
+        let generation_b =
+            expect_call_progress(&mut progress_b, initial_b, "call b request head").await;
+
+        client
+            .request_liveness_probe(call_a_id)
+            .expect("queue call a liveness probe");
+        let probe_id = match egress.next_frame().await.expect("call a liveness probe") {
+            ObjectRpcChannelWireFrame::LivenessProbe { call_id, probe_id }
+                if call_id == call_a_id =>
+            {
+                probe_id
+            }
+            frame => panic!("expected call a liveness probe, got {frame:?}"),
+        };
+        assert_no_call_progress(&mut progress_a, "local liveness probe write").await;
+        assert_no_call_progress(&mut progress_b, "call a probe on call b").await;
+
+        let error = ingress
+            .receive(ObjectRpcChannelWireFrame::LivenessResponse {
+                call_id: call_a_id,
+                probe_id: probe_id + 1,
+            })
+            .expect_err("mismatched liveness response must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected multiplexed liveness response")
+        );
+        assert_no_call_progress(&mut progress_a, "mismatched liveness response").await;
+        assert_no_call_progress(&mut progress_b, "mismatched response on call b").await;
+
+        ingress
+            .receive(ObjectRpcChannelWireFrame::LivenessResponse {
+                call_id: call_a_id,
+                probe_id,
+            })
+            .expect("matching liveness response");
+        let _ =
+            expect_call_progress(&mut progress_a, generation_a, "matching liveness response").await;
+        assert_no_call_progress(&mut progress_b, "call a liveness on call b").await;
+        assert_eq!(*progress_b.borrow(), generation_b);
+
+        call_a.cancel("liveness isolation test complete");
+        call_b.cancel("liveness isolation test complete");
+        assert_eq!(client.queue_snapshot().active_calls, 0);
+        let cancel_ids = [
+            match egress.next_frame().await.expect("first cancel") {
+                ObjectRpcChannelWireFrame::Cancel { call_id, .. } => call_id,
+                frame => panic!("expected cancel, got {frame:?}"),
+            },
+            match egress.next_frame().await.expect("second cancel") {
+                ObjectRpcChannelWireFrame::Cancel { call_id, .. } => call_id,
+                frame => panic!("expected cancel, got {frame:?}"),
+            },
+        ];
+        assert!(cancel_ids.contains(&call_a_id));
+        assert!(cancel_ids.contains(&call_b_id));
+    }
+
+    #[tokio::test]
     async fn streaming_body_frames_advance_call_progress() {
         let ObjectRpcChannelEndpoint {
             client,
@@ -4104,7 +4994,7 @@ mod tests {
         ingress
             .receive(ObjectRpcChannelWireFrame::RequestAccepted {
                 call_id,
-                credit_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32,
+                credit_bytes: OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32,
             })
             .expect("request accepted");
         generation = expect_call_progress(&mut progress, generation, "request accepted").await;
@@ -4124,7 +5014,7 @@ mod tests {
                 .receive(ObjectRpcChannelWireFrame::WindowUpdate {
                     call_id,
                     direction: ObjectRpcChannelBodyDirection::Request,
-                    credit_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32,
+                    received_offset: (offset + OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) as u64,
                 })
                 .expect("request window update");
             generation =
@@ -4247,7 +5137,7 @@ mod tests {
                     kind: ObjectRpcChannelBodyKind::Attachment,
                     total_bytes: Some(payload.len() as u64),
                 }),
-                initial_credit_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32,
+                initial_credit_bytes: OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32,
             })
             .expect("response head");
         let mut result = pending.result().await.expect("response result");
@@ -4421,7 +5311,71 @@ mod tests {
         assert_eq!(FrameCounts::load(&endpoints.counts.request_accepted), 1);
         assert_eq!(FrameCounts::load(&endpoints.counts.responses), 1);
         assert_eq!(FrameCounts::load(&endpoints.counts.body_ends), 2);
-        assert!(FrameCounts::load(&endpoints.counts.data) > 64);
+        let expected_data_frames = request_bytes.div_ceil(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
+            + response_bytes.div_ceil(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES);
+        assert_eq!(
+            FrameCounts::load(&endpoints.counts.data),
+            expected_data_frames
+        );
+        let window_updates = FrameCounts::load(&endpoints.counts.window_updates);
+        assert!(window_updates > 0);
+        assert!(window_updates <= FrameCounts::load(&endpoints.counts.data));
+    }
+
+    #[tokio::test]
+    async fn single_quantum_queue_streams_multi_quantum_body_without_batch_deadlock() {
+        let config = ObjectRpcChannelConfig {
+            max_calls: OBJECT_RPC_CHANNEL_MAX_CALLS,
+            max_queued_data_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES,
+            control_queue_depth: DEFAULT_CONTROL_QUEUE_DEPTH,
+            data_queue_depth: 1,
+        };
+        let mut endpoints = linked_endpoints(config);
+        let request_bytes = 3 * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES + 17;
+        let expected = patterned_body(request_bytes, 29);
+        let pending = endpoints
+            .left_client
+            .call(ObjectRpcSessionCall::new(
+                request("/channel/single-quantum-queue", Vec::new()),
+                ObjectRpcBodySource::bytes(expected.clone()),
+            ))
+            .await
+            .expect("queue constrained streaming call");
+
+        let mut incoming = timeout(Duration::from_secs(1), endpoints.right_server.accept())
+            .await
+            .expect("constrained streaming request timeout")
+            .expect("constrained streaming request");
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(5),
+            incoming.request.body.read_to_end(&mut received),
+        )
+        .await
+        .expect("constrained request body timeout")
+        .expect("read constrained request body");
+        assert_eq!(received, expected);
+
+        incoming
+            .respond(ObjectRpcSessionResponse::value(response(
+                "/channel/single-quantum-queue",
+                b"ok".to_vec(),
+            )))
+            .await
+            .expect("respond to constrained streaming call");
+        let result = timeout(Duration::from_secs(1), pending.result())
+            .await
+            .expect("constrained streaming result timeout")
+            .expect("constrained streaming result");
+        assert_eq!(result.response.body, b"ok");
+
+        assert_eq!(
+            FrameCounts::load(&endpoints.counts.data),
+            request_bytes.div_ceil(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
+        );
+        wait_for_active_calls(&endpoints.left_client, 0).await;
+        wait_for_active_calls(&endpoints.right_client, 0).await;
+        assert_eq!(endpoints.left_client.queue_snapshot().queued_data_bytes, 0);
     }
 
     #[tokio::test]
@@ -4555,10 +5509,8 @@ mod tests {
         wait_for_active_calls(&endpoints.right_client, 0).await;
         let expected_quanta = request_bytes.div_ceil(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES);
         assert_eq!(FrameCounts::load(&endpoints.counts.data), expected_quanta);
-        assert_eq!(
-            FrameCounts::load(&endpoints.counts.window_updates),
-            expected_quanta
-        );
+        let window_updates = FrameCounts::load(&endpoints.counts.window_updates);
+        assert!(window_updates <= expected_quanta);
         assert_eq!(FrameCounts::load(&endpoints.counts.body_ends), 1);
 
         let final_call = endpoints
@@ -4735,7 +5687,7 @@ mod tests {
         let late_frames = [
             ObjectRpcChannelWireFrame::RequestAccepted {
                 call_id: cancelled_id,
-                credit_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32,
+                credit_bytes: OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32,
             },
             ObjectRpcChannelWireFrame::Response {
                 call_id: cancelled_id,
@@ -4752,7 +5704,7 @@ mod tests {
             ObjectRpcChannelWireFrame::WindowUpdate {
                 call_id: cancelled_id,
                 direction: ObjectRpcChannelBodyDirection::Request,
-                credit_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u32,
+                received_offset: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u64,
             },
             ObjectRpcChannelWireFrame::BodyEnd {
                 call_id: cancelled_id,
@@ -5826,15 +6778,17 @@ mod tests {
         });
 
         let frame = egress
-            .next_frame_for_transport()
+            .next_transport_frame()
             .await
             .expect("queued response frame");
         assert!(matches!(
             frame,
-            ObjectRpcChannelWireFrame::Response {
-                call_id: response_call_id,
-                ..
-            } if response_call_id == call_id
+            ObjectRpcChannelTransportFrame::Control(
+                ObjectRpcChannelWireFrame::Response {
+                    call_id: response_call_id,
+                    ..
+                }
+            ) if response_call_id == call_id
         ));
         tokio::task::yield_now().await;
         assert!(
@@ -5877,7 +6831,7 @@ mod tests {
                 .await
         });
         let _frame = egress
-            .next_frame_for_transport()
+            .next_transport_frame()
             .await
             .expect("queued response frame");
         egress.complete_frame_write(false);
@@ -5888,5 +6842,290 @@ mod tests {
             .expect("response task")
             .expect_err("failed physical write must fail the waiter");
         assert!(error.to_string().contains("response write completed"));
+    }
+
+    #[tokio::test]
+    async fn data_scheduler_round_robins_one_frame_per_lane() {
+        let endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let outbound = Arc::clone(&endpoint.client.shared.outbound);
+        let mut egress = endpoint.egress;
+        let (progress, _) = watch::channel(0);
+
+        for call_id in [ObjectRpcChannelCallId(1), ObjectRpcChannelCallId(3)] {
+            let frames = [0_u64, 1]
+                .into_iter()
+                .map(|offset| {
+                    ObjectRpcChannelDataFrame::new(
+                        call_id,
+                        ObjectRpcChannelBodyDirection::Request,
+                        offset,
+                        Bytes::from_static(&[1]),
+                    )
+                    .expect("data frame")
+                })
+                .collect();
+            outbound
+                .queue_data_batch(
+                    frames,
+                    Arc::new(BodyWriteTracker::new()),
+                    progress.clone(),
+                    None,
+                    false,
+                )
+                .await
+                .expect("queue lane batch");
+        }
+
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            let frame = egress
+                .next_transport_frame()
+                .await
+                .expect("scheduled data frame");
+            let ObjectRpcChannelTransportFrame::Data(frame) = frame else {
+                panic!("data scheduler emitted a control frame");
+            };
+            order.push(frame.header.call_id);
+            egress.complete_frame_write(true);
+        }
+        assert_eq!(
+            order,
+            [
+                ObjectRpcChannelCallId(1),
+                ObjectRpcChannelCallId(3),
+                ObjectRpcChannelCallId(1),
+                ObjectRpcChannelCallId(3),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn data_batch_holds_one_exact_reservation_until_its_last_frame_is_written() {
+        let endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let outbound = Arc::clone(&endpoint.client.shared.outbound);
+        let mut egress = endpoint.egress;
+        let initial_byte_permits = outbound.data_budget.available_permits();
+        let initial_frame_permits = outbound.data_frame_budget.available_permits();
+        let frame_lengths = [10_usize, 20, 30, 40];
+        let batch_bytes = frame_lengths.into_iter().sum::<usize>();
+        let mut offset = 0_u64;
+        let frames = frame_lengths
+            .into_iter()
+            .map(|len| {
+                let frame = ObjectRpcChannelDataFrame::new(
+                    ObjectRpcChannelCallId(1),
+                    ObjectRpcChannelBodyDirection::Request,
+                    offset,
+                    Bytes::from(vec![7; len]),
+                )
+                .expect("data frame");
+                offset += len as u64;
+                frame
+            })
+            .collect();
+        let (progress, _) = watch::channel(0);
+
+        outbound
+            .queue_data_batch(
+                frames,
+                Arc::new(BodyWriteTracker::new()),
+                progress,
+                None,
+                false,
+            )
+            .await
+            .expect("queue data batch");
+        assert_eq!(
+            outbound.data_budget.available_permits(),
+            initial_byte_permits - batch_bytes
+        );
+        assert_eq!(
+            outbound.data_frame_budget.available_permits(),
+            initial_frame_permits - frame_lengths.len()
+        );
+
+        for remaining_frames in (1..=frame_lengths.len()).rev() {
+            assert!(matches!(
+                egress.next_transport_frame().await,
+                Some(ObjectRpcChannelTransportFrame::Data(_))
+            ));
+            egress.complete_frame_write(true);
+            if remaining_frames > 1 {
+                assert_eq!(
+                    outbound.data_budget.available_permits(),
+                    initial_byte_permits - batch_bytes,
+                    "a shared batch reservation must survive intermediate frame writes"
+                );
+                assert_eq!(
+                    outbound.data_frame_budget.available_permits(),
+                    initial_frame_permits - frame_lengths.len(),
+                    "all batch frame slots must remain reserved until the batch drains"
+                );
+            }
+        }
+        assert_eq!(
+            outbound.data_budget.available_permits(),
+            initial_byte_permits
+        );
+        assert_eq!(
+            outbound.data_frame_budget.available_permits(),
+            initial_frame_permits
+        );
+        assert_eq!(egress.queue_snapshot().queued_data_bytes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn low_rate_receive_window_publishes_cumulative_credit_on_timer() {
+        let ObjectRpcChannelEndpoint {
+            client: _,
+            mut server,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let call_id = ObjectRpcChannelCallId(1);
+        let payload_bytes = OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES / 2;
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Request {
+                call_id,
+                request: request("/channel/timed-window", Vec::new()),
+                body: Some(ObjectRpcChannelBodyDescriptor {
+                    kind: ObjectRpcChannelBodyKind::Attachment,
+                    total_bytes: Some(payload_bytes as u64),
+                }),
+            })
+            .expect("request ingress");
+        assert!(matches!(
+            egress.next_frame().await,
+            Some(ObjectRpcChannelWireFrame::RequestAccepted { .. })
+        ));
+        let incoming = server.accept().await.expect("incoming request");
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Data {
+                call_id,
+                direction: ObjectRpcChannelBodyDirection::Request,
+                offset: 0,
+                bytes: vec![3; payload_bytes],
+            })
+            .expect("request data");
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            egress.control_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            timeout(Duration::from_millis(1), egress.next_frame())
+                .await
+                .expect("timed cumulative update"),
+            Some(ObjectRpcChannelWireFrame::WindowUpdate {
+                call_id: updated,
+                direction: ObjectRpcChannelBodyDirection::Request,
+                received_offset,
+            }) if updated == call_id && received_offset == payload_bytes as u64
+        ));
+
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Cancel {
+                call_id,
+                reason: "timer test complete".to_string(),
+            })
+            .expect("cancel timed-window call");
+        drop(incoming);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_full_send_window_wakes_its_waiter() {
+        let window = Arc::new(SendWindow::new(OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES));
+        for _ in 0..OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES / OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
+            window
+                .consume(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
+                .expect("fill send window");
+        }
+        let waiting_window = Arc::clone(&window);
+        let waiter = tokio::spawn(async move { waiting_window.wait_available().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "a full window must park its waiter");
+
+        window.cancel();
+        let result = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled window waiter timeout")
+            .expect("window waiter task");
+        assert!(result.is_err(), "cancellation must fail the window waiter");
+    }
+
+    #[tokio::test]
+    async fn pruning_data_that_woke_egress_does_not_signal_channel_eof() {
+        let endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let outbound = Arc::clone(&endpoint.client.shared.outbound);
+        let mut egress = endpoint.egress;
+        let mut waiting = tokio::spawn(async move {
+            let frame = egress.next_transport_frame().await;
+            (frame, egress)
+        });
+        tokio::task::yield_now().await;
+
+        let stale = ObjectRpcChannelDataFrame::new(
+            ObjectRpcChannelCallId(1),
+            ObjectRpcChannelBodyDirection::Request,
+            0,
+            Bytes::from_static(&[1]),
+        )
+        .expect("stale data frame");
+        let (progress, _) = watch::channel(0);
+        outbound
+            .queue_data_batch(
+                vec![stale],
+                Arc::new(BodyWriteTracker::new()),
+                progress,
+                None,
+                true,
+            )
+            .await
+            .expect("queue stale data");
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "pruning an inactive lane must not end channel egress"
+        );
+
+        outbound
+            .try_control(ObjectRpcChannelWireFrame::Cancel {
+                call_id: ObjectRpcChannelCallId(3),
+                reason: "egress remains live".to_string(),
+            })
+            .expect("queue follow-up control");
+        let (frame, mut egress) = timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("live egress timeout")
+            .expect("egress task");
+        assert!(matches!(
+            frame,
+            Some(ObjectRpcChannelTransportFrame::Control(
+                ObjectRpcChannelWireFrame::Cancel { call_id, .. }
+            )) if call_id == ObjectRpcChannelCallId(3)
+        ));
+        egress.complete_frame_write(true);
     }
 }
