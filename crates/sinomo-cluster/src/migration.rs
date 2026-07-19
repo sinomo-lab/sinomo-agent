@@ -16,16 +16,20 @@
 
 use crate::control_plane_options::ClusterKvTxnQuorumOptions;
 use crate::invite::{invite_has_embedded_signature, verify_cluster_join_invite_signature};
-use crate::kv_local_store::append_cluster_raft_command;
+use crate::keyspace::cluster_member_key;
 use crate::kv_txn_quorum::{
     ClusterKvTxnQuorumHost, commit_cluster_kv_txn_with_quorum_response_with_host,
 };
-use crate::local_state_store::read_cluster_state;
+use crate::member_mutation::ClusterMemberMutationHost;
 use sinomo_base::cluster::{
     ClusterMigrationMode, ClusterMigrationPhase, ClusterMigrationRecord, cluster_migration_key,
 };
-use sinomo_base::{ClusterJoinInvite, ClusterMemberState, Id};
-use sinomo_kv::{KvCommand, KvOp, KvTxn};
+use sinomo_base::{
+    ClusterBootstrapState, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberState, Id,
+};
+use sinomo_kv::{
+    ClusterKvTxnCommitResult, KvAuthorityProof, KvCompare, KvOp, KvSnapshot, KvTxn, KvTxnRequest,
+};
 use sinomo_network::{
     ClusterPaths, NetworkError, cluster_is_settled_solo, cluster_state_needs_join_registration,
 };
@@ -38,6 +42,8 @@ use time::OffsetDateTime;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterMigrationPlanReport {
     pub migration: ClusterMigrationRecord,
+    /// Current-term quorum evidence for the source view used by this plan.
+    pub source_authority: KvAuthorityProof,
     pub target_invite_id: ClusterInviteId,
     pub source_member_count: usize,
     pub source_remote_member_count: usize,
@@ -61,19 +67,17 @@ fn migration_io_error(path: &Path, detail: impl std::fmt::Display) -> NetworkErr
 /// Validates `invite` against the local source cluster and produces the
 /// migration record for it. `mode` selects the planned strategy; only
 /// [`ClusterMigrationMode::SingleNode`] is executable today.
-pub fn plan_cluster_migration(
+pub fn plan_cluster_migration_with_host(
     paths: &ClusterPaths,
+    source: &mut ClusterBootstrapState,
     invite: &ClusterJoinInvite,
     mode: ClusterMigrationMode,
     now: OffsetDateTime,
+    host: &mut (impl ClusterMemberMutationHost + ?Sized),
 ) -> Result<ClusterMigrationPlanReport, NetworkError> {
     paths.ensure()?;
-    let source = read_cluster_state(paths).map_err(|error| match error {
-        NetworkError::ClusterOrphan => migration_error(
-            "local node has no initialized source cluster; use `sinomo cluster join <invite>` for a fresh node",
-        ),
-        other => other,
-    })?;
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, source)?;
+    apply_authoritative_migration_members(source, &authoritative.value)?;
     if cluster_state_needs_join_registration(&source) {
         return Err(migration_error(
             "local cluster state is an incomplete legacy join; run `sinomo cluster join <invite>` again for a fresh one-shot attempt or `sinomo cluster leave` to discard it",
@@ -126,7 +130,15 @@ pub fn plan_cluster_migration(
         target_node_id: source.local_node_id.clone(),
         preserved_node_ids: vec![source.local_node_id.clone()],
         remapped_node_ids: Vec::new(),
-        evidence_refs: vec![format!("cluster-state:{}", paths.state.display())],
+        evidence_refs: vec![
+            format!("cluster-state:{}", paths.state.display()),
+            format!(
+                "raft-authority:term={}:index={}:revision={}",
+                authoritative.authority.term,
+                authoritative.authority.commit_index,
+                authoritative.authority.revision.0
+            ),
+        ],
         detail: Some(
             "migration plan only; execution must freeze the source, quarantine old cluster KV/Raft state, register with the target cluster, then verify imported state"
                 .to_string(),
@@ -137,12 +149,59 @@ pub fn plan_cluster_migration(
 
     Ok(ClusterMigrationPlanReport {
         migration,
+        source_authority: authoritative.authority,
         target_invite_id: invite.invite_id.clone(),
         source_member_count,
         source_remote_member_count,
         target_introducer_count: invite.introducers.len(),
         target_communication_channel_count: invite.communication_channels.len(),
     })
+}
+
+fn apply_authoritative_migration_members(
+    source: &mut ClusterBootstrapState,
+    snapshot: &KvSnapshot,
+) -> Result<(), NetworkError> {
+    let mut members = Vec::new();
+    for entry in snapshot.prefix_entries("/cluster/members/") {
+        let member: ClusterMemberRecord = entry.decode().map_err(crate::kv_local_store::kv_err)?;
+        if member.cluster_id != source.cluster_id {
+            return Err(migration_error(format!(
+                "authoritative member `{}` belongs to cluster `{}` instead of source `{}`",
+                member.node_id, member.cluster_id, source.cluster_id
+            )));
+        }
+        sinomo_network::try_reserve_vec(
+            &mut members,
+            1,
+            "collect authoritative migration source members",
+        )?;
+        members.push(member);
+    }
+    if members.is_empty() {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "authoritative source KV contains no cluster members".to_string(),
+        });
+    }
+    if !members
+        .iter()
+        .any(|member| member.node_id == source.local_node_id && member.state.is_authorized())
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "local node `{}` is not an authorized member of the authoritative source view",
+                source.local_node_id
+            ),
+        });
+    }
+    members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    source.members = members;
+    source.kv_revision = source.kv_revision.max(authoritative_revision(snapshot));
+    Ok(())
+}
+
+fn authoritative_revision(snapshot: &KvSnapshot) -> u64 {
+    snapshot.revision.0
 }
 
 /// A reversible move of the source cluster's storage into the migration's
@@ -356,21 +415,88 @@ pub fn write_local_cluster_migration_record(
     fs::write(&path, json).map_err(|source| migration_io_error(&path, source))
 }
 
-/// Appends the migration record into the SOURCE cluster's KV (raft command on
-/// the local store) before the source is frozen, leaving departure evidence
-/// for any later audit of the source cluster.
-pub fn write_cluster_migration_record_to_source_kv(
+/// Commits the migration record into the source cluster before it is frozen.
+///
+/// A fresh authoritative barrier supplies the exact Raft-config and local
+/// member values used by the freeze decision. The transaction compares both,
+/// so a concurrent membership/config change makes migration fail closed
+/// instead of quarantining storage from a different source view.
+pub fn write_cluster_migration_record_to_source_kv_with_host(
     paths: &ClusterPaths,
+    source: &mut ClusterBootstrapState,
     migration: &ClusterMigrationRecord,
-) -> Result<(), NetworkError> {
+    host: &mut (impl ClusterMemberMutationHost + ?Sized),
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    if migration.source_cluster_id != source.cluster_id
+        || migration.source_local_node_id != source.local_node_id
+    {
+        return Err(migration_error(
+            "migration source identity no longer matches the active source cluster",
+        ));
+    }
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, source)?;
+    let config_key = sinomo_kv::cluster_kv_raft_config_key();
+    let config_entry =
+        authoritative
+            .value
+            .get(&config_key)
+            .ok_or_else(|| NetworkError::ClusterReadOnly {
+                detail: "authoritative source KV has no committed Raft config".to_string(),
+            })?;
+    let member_key = cluster_member_key(&migration.source_local_node_id);
+    let member_entry =
+        authoritative
+            .value
+            .get(&member_key)
+            .ok_or_else(|| NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "authoritative source KV has no local member `{}`",
+                    migration.source_local_node_id
+                ),
+            })?;
+    let member: ClusterMemberRecord = member_entry
+        .decode()
+        .map_err(crate::kv_local_store::kv_err)?;
+    if !member.state.is_authorized() {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "local member `{}` is not authorized in the current source view",
+                member.node_id
+            ),
+        });
+    }
     let op = KvOp::put_serde(
         cluster_migration_key(&migration.migration_id),
         migration,
         None,
     )
     .map_err(crate::kv_local_store::kv_err)?;
-    append_cluster_raft_command(paths, &migration.source_local_node_id, KvCommand::Op(op))
-        .map(|_| ())
+    let request = KvTxnRequest::generated(KvTxn {
+        compares: vec![
+            KvCompare::ValueEquals {
+                key: config_key,
+                value: config_entry.value.clone(),
+            },
+            KvCompare::ValueEquals {
+                key: member_key,
+                value: member_entry.value.clone(),
+            },
+        ],
+        success: vec![op],
+        failure: Vec::new(),
+    });
+    let result = host.commit_cluster_kv_txn_with_quorum(paths, source, request)?;
+    if !result
+        .txn_response
+        .as_ref()
+        .is_some_and(|response| response.succeeded)
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "source membership/config changed while committing migration evidence"
+                .to_string(),
+        });
+    }
+    Ok(result)
 }
 
 const CLUSTER_MIGRATION_NODE_LOCAL_CONFIG_ROOT: &str = "/config/nodes/";
@@ -509,11 +635,11 @@ pub fn import_node_local_configs_from_source_kv_with_host(
     commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         target_state,
-        KvTxn {
+        sinomo_kv::KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: import_ops,
             failure: Vec::new(),
-        },
+        }),
         options,
         host,
     )?;

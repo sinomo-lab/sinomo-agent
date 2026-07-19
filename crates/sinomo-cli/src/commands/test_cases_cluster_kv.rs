@@ -7,7 +7,7 @@
 
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
-use sinomo_runtime::kv::{KvOp, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{KvOp, KvTxn, KvTxnRequest, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::test::{
@@ -331,15 +331,19 @@ fn commit_daemon_cluster_kv_txn(
     client: &DaemonApiClient,
     txn: KvTxn,
 ) -> Result<KvTxnResponse, String> {
-    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn)
+    let request = KvTxnRequest::generated(txn);
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&request)
         .map_err(|source| format!("cannot encode cluster-KV transaction: {source}"))?;
     let request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = client
         .call_request(&request)
         .map_err(|source| format!("daemon-mediated cluster-KV transaction failed: {source}"))?;
-    sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)
-        .map_err(|source| format!("cannot decode cluster-KV transaction response: {source}"))
+    let commit = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)
+        .map_err(|source| format!("cannot decode cluster-KV transaction response: {source}"))?;
+    commit.txn_response.ok_or_else(|| {
+        "daemon returned a barrier result for a cluster-KV transaction request".to_string()
+    })
 }
 
 fn record_metrics(

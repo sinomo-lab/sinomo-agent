@@ -551,37 +551,24 @@ pub(crate) fn stop_daemon_with_paths(
     }
 }
 
-pub(crate) fn cli_current_cluster_kv_store(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<InProcessKvStore, network::NetworkError> {
-    let mut driver = cli_cluster_control_plane_driver(paths);
-    cluster::refresh_current_cluster_kv_store_with_host(
-        paths,
-        state,
-        cli_cluster_kv_snapshot_refresh_options(),
-        &mut driver,
-    )
-}
-
-pub(crate) fn cli_commit_cluster_kv_txn_with_quorum(
-    paths: &ClusterPaths,
-    state: &mut ClusterBootstrapState,
-    txn: KvTxn,
-) -> Result<KvSnapshot, network::NetworkError> {
-    Ok(cli_commit_cluster_kv_txn_with_quorum_response(paths, state, txn)?.snapshot)
-}
-
 pub(crate) fn cli_commit_cluster_kv_txn_with_quorum_response(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
 ) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
+    cli_commit_cluster_kv_request_with_quorum_response(paths, state, KvTxnRequest::generated(txn))
+}
+
+pub(crate) fn cli_commit_cluster_kv_request_with_quorum_response(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    request: KvTxnRequest,
+) -> Result<ClusterKvTxnCommitResult, network::NetworkError> {
     let mut driver = cli_cluster_control_plane_driver(paths);
     cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         state,
-        txn,
+        request,
         cli_cluster_kv_txn_quorum_options(true),
         &mut driver,
     )
@@ -606,10 +593,11 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
         })?;
     let mut state = state;
     let mut driver = cli_cluster_control_plane_driver(&cluster_paths);
+    let request = KvTxnRequest::generated(txn);
     let result = cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         &cluster_paths,
         &mut state,
-        txn,
+        request,
         cli_cluster_kv_txn_quorum_options(true),
         &mut driver,
     )?;
@@ -618,11 +606,9 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
         &result.snapshot,
         sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
     )?;
-    Ok(result.txn_response.unwrap_or(KvTxnResponse {
-        succeeded: true,
-        revision: result.snapshot.revision,
-        responses: Vec::new(),
-    }))
+    result.txn_response.ok_or_else(|| CliError::Parse {
+        detail: "cluster KV returned a barrier result for a transaction request".to_string(),
+    })
 }
 
 pub(crate) fn cli_cluster_control_plane_driver(
@@ -770,11 +756,11 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        let request = cluster_kv_snapshot_rpc_request()
+        let request = cluster_kv_local_snapshot_rpc_request()
             .map_err(sinomo_runtime::network::NetworkError::directory)?;
         let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
             .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot refresh", error))?;
-        decode_cluster_kv_snapshot_rpc_response(&response)
+        decode_cluster_kv_local_snapshot_rpc_response(&response).map(|read| read.value)
     }
 
     fn call_endpoint_object_rpc(
@@ -852,10 +838,6 @@ pub(crate) fn cli_cluster_kv_txn_quorum_options(
         .with_state_authority_reachability_options(
             cli_cluster_state_authority_reachability_options(),
         )
-}
-
-fn cli_cluster_kv_snapshot_refresh_options() -> cluster::ClusterKvSnapshotRefreshOptions {
-    cli_cluster_control_plane_timeouts().kv_snapshot_refresh_options()
 }
 
 fn cli_send_cluster_raft_append(
@@ -949,12 +931,52 @@ impl cluster::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
         })
     }
 
-    fn commit_join_registration_state(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_runtime::kv::KvAuthoritativeRead<KvSnapshot>, network::NetworkError> {
+        cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
+            &mut super::cluster::CliClusterMemberMutationHost,
+            paths,
+            state,
+        )
+    }
+
+    fn commit_join_registration_txn(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: sinomo_runtime::kv::KvTxnRequest,
+    ) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
+        cluster::ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
+            &mut super::cluster::CliClusterMemberMutationHost,
+            paths,
+            state,
+            request,
+        )
+    }
+
+    fn admit_cluster_raft_learner(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        now: OffsetDateTime,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        cluster::sync_cluster_state_to_local_kv_unchecked(paths, state)
+        let mut host = super::cluster::CliClusterMemberMutationHost;
+        cluster::update_cluster_state_authority_with_host(
+            paths,
+            state.clone(),
+            node_id.clone(),
+            ClusterMemberRole::Learner,
+            now,
+            &mut host,
+        )?;
+        cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
+            &mut host, paths, state,
+        )
+        .map(|read| read.value)
     }
 }
 

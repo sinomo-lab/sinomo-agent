@@ -12,11 +12,11 @@ use sinomo_network::{ClusterFileMark, cluster_file_mark};
 
 use sinomo_base::ClusterBootstrapState;
 #[cfg(any(test, feature = "test-support"))]
-use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvLogEntry, KvWalPaths};
+use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvWalPaths};
 use sinomo_kv::{
-    ClusterKvRaftCommitResult, ClusterKvRaftUncommittedAppend, DurableRaftKvNode, InProcessKvStore,
-    KvCommand, KvEntry, KvLocalCache, KvOp, KvRevision, KvSnapshot, KvTxnResponse,
-    RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
+    ClusterKvRaftCommitResult, DurableRaftKvNode, InProcessKvStore, KvCommand, KvCommandRequest,
+    KvCommittedRequestRecord, KvEntry, KvLocalCache, KvLogEntry, KvOp, KvRevision, KvSnapshot,
+    KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
     RaftRequestVoteResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
@@ -484,6 +484,25 @@ pub fn open_cluster_raft_kv_node(
     paths.kv_paths().open_raft_node(node_id).map_err(kv_err)
 }
 
+pub fn read_cluster_kv_local_snapshot(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<sinomo_kv::KvLocalRead<KvSnapshot>, NetworkError> {
+    let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
+    let snapshot = node.store().try_snapshot().map_err(kv_err)?;
+    Ok(sinomo_kv::KvLocalRead {
+        revision: snapshot.revision,
+        observed_term: node.hard_state().current_term,
+        applied_index: node.applied_index(),
+        known_leader: node
+            .hard_state()
+            .leader_id
+            .clone()
+            .filter(|leader_id| state.node_is_raft_voter(leader_id)),
+        value: snapshot,
+    })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn cache_cluster_kv_snapshot_if_newer_than_raft(
     paths: &ClusterPaths,
@@ -642,18 +661,37 @@ pub fn append_cluster_raft_command_uncommitted(
         .map_err(kv_err)
 }
 
-pub(crate) async fn append_cluster_raft_command_uncommitted_or_no_effect_async(
+pub(crate) async fn replay_cluster_raft_request_if_committed_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
-    command: KvCommand,
-) -> Result<ClusterKvRaftUncommittedAppend, NetworkError> {
+    request: &KvCommandRequest,
+) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, NetworkError> {
+    let paths = paths.clone();
+    let node_id = node_id.clone();
+    let request = request.clone();
+    runtime
+        .spawn_blocking(move || {
+            LocalClusterRaftCommandStorage::new(&paths, node_id).replay_if_committed(&request)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft replay committed request".to_string(),
+            detail: format!("cluster raft replay committed request task failed: {source}"),
+        })?
+}
+
+pub(crate) async fn append_cluster_raft_request_uncommitted_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    request: KvCommandRequest,
+) -> Result<KvLogEntry, NetworkError> {
     let paths = paths.clone();
     let node_id = node_id.clone();
     runtime
         .spawn_blocking(move || {
-            LocalClusterRaftCommandStorage::new(&paths, node_id)
-                .append_uncommitted_or_no_effect(command)
+            LocalClusterRaftCommandStorage::new(&paths, node_id).append_uncommitted(request)
         })
         .await
         .map_err(|source| NetworkError::Io {
@@ -758,13 +796,36 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
         }
     }
 
-    pub(crate) fn append_uncommitted_or_no_effect(
+    pub(crate) fn replay_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<ClusterKvRaftUncommittedAppend, NetworkError> {
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, NetworkError> {
+        self.inner.replay_if_committed(request).map_err(kv_err)
+    }
+
+    pub(crate) fn append_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, NetworkError> {
+        self.inner.append_uncommitted(request).map_err(kv_err)
+    }
+
+    pub(crate) fn record_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &sinomo_kv::KvAuthorityFailure,
+    ) -> Result<(), NetworkError> {
         self.inner
-            .append_uncommitted_or_no_effect(command)
+            .record_rejected_before_commit(request, failure)
             .map_err(kv_err)
+    }
+
+    pub(crate) fn record_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), NetworkError> {
+        self.inner.record_unknown(request, detail).map_err(kv_err)
     }
 
     pub(crate) fn discard_uncommitted_tail_and_clear_leader(
@@ -799,11 +860,34 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage<'
         crate::kv_local_store::kv_err(error)
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<ClusterKvRaftUncommittedAppend, NetworkError> {
-        self.append_uncommitted_or_no_effect(command)
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, NetworkError> {
+        self.replay_if_committed(request)
+    }
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, NetworkError> {
+        self.append_uncommitted(request)
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &sinomo_kv::KvAuthorityFailure,
+    ) -> Result<(), NetworkError> {
+        self.record_rejected_before_commit(request, failure)
+    }
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), NetworkError> {
+        self.record_unknown(request, detail)
     }
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(

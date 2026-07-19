@@ -81,6 +81,26 @@ pub fn register_storage_paths(
         ObjectSchema::new("RaftSnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
     )?;
     layout.register_object_log("sinomo-kv", StorageRing::R1, "cluster/kv-raft/wal.sobjlog")?;
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-request-attempts.sobj",
+        ObjectSchema::new("KvRequestAttemptLedger", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_file(sinomo_storage::StorageFileContract::binary(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-request-attempts.lock",
+    )?)?;
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-raft-peer-progress.sobj",
+        ObjectSchema::new(
+            "ClusterKvRaftPeerProgressLedger",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        ),
+    )?;
     layout.register_escape_path(
         "sinomo-kv",
         StorageRing::R1,
@@ -105,6 +125,9 @@ pub struct ClusterKvPaths {
     pub watches_next_id: PathBuf,
     pub watch_events: PathBuf,
     pub watch_events_log: PathBuf,
+    pub request_attempts: PathBuf,
+    pub request_attempts_lock: PathBuf,
+    pub raft_peer_progress: PathBuf,
 }
 
 impl ClusterKvPaths {
@@ -118,6 +141,9 @@ impl ClusterKvPaths {
             watches_next_id: root.join("watches-next.sobj"),
             watch_events: root.join("watch-events.sobj"),
             watch_events_log: root.join("watch-events.sobjlog"),
+            request_attempts: root.join("kv-request-attempts.sobj"),
+            request_attempts_lock: root.join("kv-request-attempts.lock"),
+            raft_peer_progress: root.join("kv-raft-peer-progress.sobj"),
             root,
         }
     }

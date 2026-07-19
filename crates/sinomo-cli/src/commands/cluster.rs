@@ -782,21 +782,6 @@ pub(crate) fn cluster_daemon_required_error(action: &str) -> CliError {
     }
 }
 
-fn append_cluster_raft_command(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    command: sinomo_runtime::kv::KvCommand,
-) -> Result<KvSnapshot, network::NetworkError> {
-    paths
-        .kv_paths()
-        .append_kv_command_and_publish(
-            node_id,
-            command,
-            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
-        )
-        .map_err(sinomo_runtime::network::NetworkError::directory)
-}
-
 pub(crate) fn cluster_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -864,7 +849,7 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
         });
     }
     if let Some(daemon) = daemon
-        && local_daemon_can_serve_cluster_kv_snapshot(daemon, &state)
+        && local_daemon_can_serve_authoritative_cluster_kv_snapshot(daemon, &state)
     {
         return Ok(());
     }
@@ -881,7 +866,7 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
     }
 }
 
-pub(crate) fn local_daemon_can_serve_cluster_kv_snapshot(
+pub(crate) fn local_daemon_can_serve_authoritative_cluster_kv_snapshot(
     daemon: &DaemonStatus,
     state: &ClusterBootstrapState,
 ) -> bool {
@@ -891,7 +876,7 @@ pub(crate) fn local_daemon_can_serve_cluster_kv_snapshot(
     if cluster.cluster_id != state.cluster_id || cluster.node_id != state.local_node_id {
         return false;
     }
-    daemon_fetch_cluster_kv_snapshot(&daemon.address, DAEMON_PROBE_TIMEOUT).is_ok()
+    daemon_fetch_cluster_kv_authoritative_snapshot(&daemon.address, DAEMON_PROBE_TIMEOUT).is_ok()
 }
 
 /// `sinomo cluster init`: daemon-first — a reachable main daemon initializes
@@ -1060,8 +1045,16 @@ pub(crate) fn cluster_migration_plan_with_paths(
     paths: &ClusterPaths,
 ) -> Result<ClusterMigrationPlanReport, CliError> {
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    cluster::plan_cluster_migration(paths, &invite, options.mode, OffsetDateTime::now_utc())
-        .map_err(Into::into)
+    let mut source = read_cluster_state(paths)?;
+    cluster::plan_cluster_migration_with_host(
+        paths,
+        &mut source,
+        &invite,
+        options.mode,
+        OffsetDateTime::now_utc(),
+        &mut CliClusterMemberMutationHost,
+    )
+    .map_err(Into::into)
 }
 
 fn print_cluster_migration_plan_report(report: &ClusterMigrationPlanReport) {
@@ -1443,7 +1436,7 @@ fn cluster_join_fresh_with_paths(
 fn cluster_join_single_node_migration_with_paths(
     options: ClusterJoinOptions,
     paths: &ClusterPaths,
-    source: ClusterBootstrapState,
+    mut source: ClusterBootstrapState,
 ) -> Result<(), CliError> {
     let report = cluster_migration_plan_with_paths(
         ClusterMigrationPlanOptions {
@@ -1460,7 +1453,12 @@ fn cluster_join_single_node_migration_with_paths(
     }
 
     let mut migration = report.migration;
-    cluster::write_cluster_migration_record_to_source_kv(paths, &migration)?;
+    cluster::write_cluster_migration_record_to_source_kv_with_host(
+        paths,
+        &mut source,
+        &migration,
+        &mut CliClusterMemberMutationHost,
+    )?;
     let dfs_moves: Vec<(PathBuf, PathBuf)> = paths
         .root
         .parent()
@@ -1683,12 +1681,12 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             endpoint: &ClusterEndpointRecord,
             timeout: Duration,
         ) -> Result<KvSnapshot, network::NetworkError> {
-            daemon_fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(|source| {
-                network::NetworkError::Io {
+            daemon_fetch_cluster_kv_local_snapshot_from_endpoint(endpoint, timeout)
+                .map(|read| read.value)
+                .map_err(|source| network::NetworkError::Io {
                     operation: "cluster join snapshot fetch".to_string(),
                     detail: source.to_string(),
-                }
-            })
+                })
         }
 
         fn call_endpoint_object_rpc(
@@ -2361,21 +2359,42 @@ pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
 pub(crate) struct CliClusterMemberMutationHost;
 
 impl cluster::ClusterMemberMutationHost for CliClusterMemberMutationHost {
-    fn current_cluster_kv_store(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<InProcessKvStore, network::NetworkError> {
-        cli_current_cluster_kv_store(paths, state)
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, network::NetworkError> {
+        // `state` can already contain the proposed membership mutation. Raft
+        // authority must be established with the currently persisted voter set,
+        // never with the configuration that is still being validated.
+        let mut consensus_state = cluster::read_cluster_state_without_kv(paths)?;
+        let mut driver = cli_cluster_control_plane_driver(paths);
+        let read = cluster::read_cluster_kv_authoritative_snapshot_with_host(
+            paths,
+            &mut consensus_state,
+            cli_cluster_kv_txn_quorum_options(true),
+            &mut driver,
+        )?;
+        state.term = state.term.max(consensus_state.term);
+        state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
+        Ok(read)
     }
 
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, network::NetworkError> {
-        cli_commit_cluster_kv_txn_with_quorum(paths, state, txn)
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, network::NetworkError> {
+        let mut consensus_state = cluster::read_cluster_state_without_kv(paths)?;
+        let result = cli_commit_cluster_kv_request_with_quorum_response(
+            paths,
+            &mut consensus_state,
+            request,
+        )?;
+        state.term = state.term.max(consensus_state.term);
+        state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
+        Ok(result)
     }
 }
 
@@ -2450,9 +2469,10 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         daemon_fetch_daemon_status_from_address(&options.from, DAEMON_JOIN_TIMEOUT)?
     };
     let peer_snapshot = if let Some(endpoint) = explicit_endpoint.as_ref() {
-        daemon_fetch_cluster_kv_snapshot_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)?
+        daemon_fetch_cluster_kv_authoritative_snapshot_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)?
+            .value
     } else {
-        daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?
+        daemon_fetch_cluster_kv_authoritative_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?.value
     };
     let mut imported = Vec::new();
     let mut endpoint_updates = Vec::new();
@@ -2730,6 +2750,14 @@ pub(crate) fn cluster_leave_with_paths(
         Err(network::NetworkError::ClusterOrphan) => None,
         Err(error) => return Err(error.into()),
     };
+    if let Some(mut consensus_state) = existing.clone() {
+        cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
+            &mut CliClusterMemberMutationHost,
+            paths,
+            &mut consensus_state,
+        )?;
+    }
+    let leave_id = Id::generate();
     let previous_cluster_id = existing.as_ref().map(|state| state.cluster_id.clone());
     let local_node_id = existing
         .as_ref()
@@ -2750,8 +2778,7 @@ pub(crate) fn cluster_leave_with_paths(
 
     let quarantine = if existing.is_some() || cluster::cluster_storage_has_live_artifacts(paths) {
         Some(cluster::quarantine_cluster_storage_for_leave(
-            paths,
-            &Id::generate(),
+            paths, &leave_id,
         )?)
     } else {
         None
@@ -2805,9 +2832,9 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     let Some(status) = default_main_daemon_status()? else {
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
-    match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        Ok(snapshot) => {
-            write_imported_cluster_kv_snapshot(paths, &snapshot)?;
+    match daemon_fetch_cluster_kv_local_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
+        Ok(read) => {
+            write_imported_cluster_kv_snapshot(paths, &read.value)?;
             Ok(())
         }
         Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
@@ -2825,9 +2852,9 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon_for_data_dir(
     let Some(status) = main_daemon_status_for_data_dir(data_dir)? else {
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
-    match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        Ok(snapshot) => {
-            write_imported_cluster_kv_snapshot(paths, &snapshot)?;
+    match daemon_fetch_cluster_kv_local_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
+        Ok(read) => {
+            write_imported_cluster_kv_snapshot(paths, &read.value)?;
             Ok(())
         }
         Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
@@ -2931,7 +2958,9 @@ pub(crate) fn read_cluster_kv_store(
 }
 
 #[cfg(test)]
-pub(crate) fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
+pub(crate) fn read_cluster_kv_local_snapshot_for_test(
+    paths: &ClusterPaths,
+) -> Result<KvSnapshot, CliError> {
     match sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
         .map_err(sinomo_runtime::network::NetworkError::directory)
     {
@@ -2995,14 +3024,10 @@ pub(crate) fn expire_cluster_network_records_in_kv(
             &mut self,
             paths: &ClusterPaths,
             state: &mut ClusterBootstrapState,
-            txn: KvTxn,
-        ) -> Result<KvSnapshot, Self::Error> {
-            append_cluster_raft_command(
-                paths,
-                &state.local_node_id,
-                sinomo_runtime::kv::KvCommand::Txn(txn),
-            )
-            .map_err(Into::into)
+            request: KvTxnRequest,
+        ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
+            cli_commit_cluster_kv_request_with_quorum_response(paths, state, request)
+                .map_err(Into::into)
         }
     }
 
@@ -3019,16 +3044,30 @@ struct CliClusterInvitePublishHost;
 impl cluster::ClusterInvitePublishHost for CliClusterInvitePublishHost {
     type Error = CliError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
+            &mut CliClusterMemberMutationHost,
+            paths,
+            state,
+        )
+        .map_err(Into::into)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        append_cluster_raft_command(
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
+        cluster::ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
+            &mut CliClusterMemberMutationHost,
             paths,
-            &state.local_node_id,
-            sinomo_runtime::kv::KvCommand::Txn(txn),
+            state,
+            request,
         )
         .map_err(Into::into)
     }

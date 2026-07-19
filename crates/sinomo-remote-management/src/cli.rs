@@ -1307,6 +1307,7 @@ fn run_remote_config(
                 CONFIG_SET_ROUTE,
                 CONFIG_RPC_CATEGORY,
                 &ConfigSetRequest {
+                    request_id: Some(sinomo_core::kv::KvRequestId::generate()),
                     key,
                     value,
                     target: write_target,

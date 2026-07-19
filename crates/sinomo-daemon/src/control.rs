@@ -51,6 +51,7 @@ const DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration:
 // not make every node hold its local lane while asking a peer to enter theirs.
 const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT: Duration = Duration::from_secs(20);
 pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DAEMON_CLUSTER_KV_REACTIVE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
@@ -74,6 +75,9 @@ const DAEMON_SANDBOX_LIFECYCLE_PENDING_MARKER_CONTENT: &[u8] =
     b"sinomo-sandbox-authoritative-recovery-pending-v1\n";
 
 static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static DAEMON_CLUSTER_KV_MAINTENANCE_COORDINATOR: OnceLock<
+    sinomo_core::cluster::ClusterKvMaintenanceCoordinator,
+> = OnceLock::new();
 
 /// The main daemon owns the mandatory default DFS lifecycle. The shadow daemon
 /// is a supervisor and never owns cluster data; there is intentionally no
@@ -118,6 +122,33 @@ fn daemon_cluster_maintenance_notify() -> Arc<tokio::sync::Notify> {
 pub(crate) fn request_daemon_cluster_maintenance_refresh() {
     crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh();
     daemon_cluster_maintenance_notify().notify_one();
+}
+
+fn daemon_cluster_kv_maintenance_coordinator()
+-> &'static sinomo_core::cluster::ClusterKvMaintenanceCoordinator {
+    DAEMON_CLUSTER_KV_MAINTENANCE_COORDINATOR
+        .get_or_init(sinomo_core::cluster::ClusterKvMaintenanceCoordinator::default)
+}
+
+pub(crate) fn request_daemon_cluster_kv_maintenance(
+    source: sinomo_core::cluster::ClusterKvMaintenanceWakeSource,
+) {
+    use sinomo_core::cluster::ClusterKvMaintenanceWakeDisposition;
+
+    let disposition = queue_daemon_cluster_kv_maintenance_wake(
+        daemon_cluster_kv_maintenance_coordinator(),
+        source,
+    );
+    if disposition != ClusterKvMaintenanceWakeDisposition::RejectedShutdown {
+        daemon_cluster_maintenance_notify().notify_one();
+    }
+}
+
+fn queue_daemon_cluster_kv_maintenance_wake(
+    coordinator: &sinomo_core::cluster::ClusterKvMaintenanceCoordinator,
+    source: sinomo_core::cluster::ClusterKvMaintenanceWakeSource,
+) -> sinomo_core::cluster::ClusterKvMaintenanceWakeDisposition {
+    coordinator.request_wake(source)
 }
 
 fn daemon_network_environment_watch_enabled() -> bool {
@@ -872,6 +903,13 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     let listener = daemon_runtime.block_on(
         sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
     )?;
+    if daemon_role_owns_default_dfs(label) {
+        // The daemon lock above is the exclusive lifecycle boundary. Reopen
+        // the process-global coordinator only after that lock is held so stale
+        // scheduling hints from an earlier embedded/test generation are safe
+        // to discard.
+        daemon_cluster_kv_maintenance_coordinator().start_generation();
+    }
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_signal = shutdown_tx.clone();
     let mut runtime_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -1047,6 +1085,10 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         shutdown_rx.clone(),
     ))?;
     let _ = shutdown_signal.send(true);
+    if daemon_role_owns_default_dfs(label) {
+        let _ = daemon_cluster_kv_maintenance_coordinator().shutdown();
+        daemon_cluster_maintenance_notify().notify_waiters();
+    }
     for (task_label, task) in runtime_tasks {
         join_daemon_runtime_task(
             &daemon_runtime,
@@ -1348,6 +1390,9 @@ async fn run_daemon_background_maintenance_loop(
         .await
         .with_service_registry(service_registry);
     let maintenance_started = std::time::Instant::now();
+    let mut last_cluster_kv_reactive_maintenance = maintenance_started
+        .checked_sub(DAEMON_CLUSTER_KV_REACTIVE_MAINTENANCE_INTERVAL)
+        .unwrap_or(maintenance_started);
     let rollout_telemetry_interval = daemon_rollout_telemetry_interval(execution_profile);
     let initial_dfs_maintenance_phase = if daemon_role_owns_default_dfs(&label) {
         let phase_paths = paths.clone();
@@ -1401,6 +1446,12 @@ async fn run_daemon_background_maintenance_loop(
     let mut dfs_maintenance_task: Option<
         tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
     > = None;
+
+    if label == "daemon" {
+        request_daemon_cluster_kv_maintenance(
+            sinomo_core::cluster::ClusterKvMaintenanceWakeSource::DaemonStartup,
+        );
+    }
 
     loop {
         if daemon_shutdown_requested(&shutdown_rx) {
@@ -1656,6 +1707,20 @@ async fn run_daemon_background_maintenance_loop(
             break;
         }
 
+        if label == "daemon"
+            && last_cluster_kv_reactive_maintenance.elapsed()
+                >= DAEMON_CLUSTER_KV_REACTIVE_MAINTENANCE_INTERVAL
+        {
+            request_daemon_cluster_kv_maintenance(
+                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::PeriodicOpportunity,
+            );
+        }
+        let reactive_kv_wake = (label == "daemon")
+            .then(|| daemon_cluster_kv_maintenance_coordinator().take_pending_batch_if_due())
+            .flatten();
+        let had_reactive_kv_wake = reactive_kv_wake.is_some();
+        let mut reactive_kv_pass_outcome =
+            sinomo_core::cluster::ClusterKvMaintenancePassOutcome::Completed;
         let cluster_network_phase = async {
             let pending_work_deadline = Instant::now()
                 .checked_add(
@@ -1663,6 +1728,46 @@ async fn run_daemon_background_maintenance_loop(
                         .saturating_sub(Duration::from_millis(500)),
                 )
                 .unwrap_or_else(Instant::now);
+            if let Some(wake) = reactive_kv_wake {
+                match cluster_network
+                    .run_reactive_cluster_kv_maintenance_async(&paths, wake, runtime.clone())
+                    .await
+                {
+                    Ok(Some(report)) => {
+                        reactive_kv_pass_outcome = report.pass_outcome();
+                        for item in report.evidence {
+                            match item.disposition {
+                                sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::Failed
+                                | sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::TimedOut => {
+                                    tracing::warn!(
+                                        step = ?item.step,
+                                        code = item.code,
+                                        detail = item.detail,
+                                        "sinomo {label} reactive cluster KV maintenance step did not complete"
+                                    );
+                                }
+                                _ => {
+                                    tracing::debug!(
+                                        step = ?item.step,
+                                        disposition = ?item.disposition,
+                                        code = item.code,
+                                        detail = item.detail,
+                                        "sinomo {label} reactive cluster KV maintenance evidence"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        reactive_kv_pass_outcome =
+                            sinomo_core::cluster::ClusterKvMaintenancePassOutcome::RetryableFailure;
+                        tracing::warn!(
+                            "sinomo {label} reactive cluster KV maintenance failed: {error}"
+                        );
+                    }
+                }
+            }
             match cluster_network
                 .tick_async(&paths, &options, runtime.clone())
                 .await
@@ -1683,18 +1788,41 @@ async fn run_daemon_background_maintenance_loop(
                 }
             }
         };
-        if tokio::time::timeout(
+        let cluster_network_phase_timed_out = tokio::time::timeout(
             DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT,
             cluster_network_phase,
         )
         .await
-        .is_err()
-        {
+        .is_err();
+        if cluster_network_phase_timed_out {
             tracing::warn!(
                 "sinomo {label} cluster network maintenance timed out after {}ms",
                 DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT.as_millis()
             );
             cluster_network.request_network_environment_refresh(Instant::now());
+        }
+        if had_reactive_kv_wake {
+            if cluster_network_phase_timed_out {
+                reactive_kv_pass_outcome =
+                    sinomo_core::cluster::ClusterKvMaintenancePassOutcome::RetryableFailure;
+            }
+            if reactive_kv_pass_outcome
+                == sinomo_core::cluster::ClusterKvMaintenancePassOutcome::RetryableFailure
+            {
+                request_daemon_cluster_kv_maintenance(
+                    sinomo_core::cluster::ClusterKvMaintenanceWakeSource::PeriodicOpportunity,
+                );
+            }
+            use sinomo_core::cluster::ClusterKvMaintenanceWorkerDisposition;
+            if daemon_cluster_kv_maintenance_coordinator().finish_pass(reactive_kv_pass_outcome)
+                == ClusterKvMaintenanceWorkerDisposition::ContinueAfterYield
+                && daemon_cluster_kv_maintenance_coordinator()
+                    .retry_delay()
+                    .is_none()
+            {
+                daemon_cluster_maintenance_notify().notify_one();
+            }
+            last_cluster_kv_reactive_maintenance = Instant::now();
         }
 
         if daemon_shutdown_requested(&shutdown_rx) {
@@ -1786,7 +1914,7 @@ async fn run_daemon_background_maintenance_loop(
         } else {
             last_dfs_maintenance
         };
-        let sleep_duration = daemon_maintenance_sleep_duration(
+        let mut sleep_duration = daemon_maintenance_sleep_duration(
             sleep_started,
             cluster_network.next_due_duration(sleep_started),
             dfs_schedule_anchor,
@@ -1798,6 +1926,14 @@ async fn run_daemon_background_maintenance_loop(
             shadow_finalization_due,
             sandbox_lifecycle_maintenance_due,
         );
+        let cluster_kv_retry_delay = (label == "daemon")
+            .then(|| daemon_cluster_kv_maintenance_coordinator().retry_delay())
+            .flatten();
+        // Keep retry timing inside the daemon's shutdown-aware select.
+        // Detached delay tasks could outlive this daemon generation and
+        // spuriously wake a later embedded/test generation.
+        sleep_duration =
+            daemon_cluster_kv_retry_sleep_duration(sleep_duration, cluster_kv_retry_delay);
         let dfs_notify =
             daemon_role_owns_default_dfs(&label).then(|| Arc::clone(&dfs_maintenance_notify));
         let network_notify = network_environment_watch
@@ -1822,6 +1958,14 @@ async fn run_daemon_background_maintenance_loop(
             }
             _ = daemon_optional_notify(network_notify) => {
                 tracing::info!("sinomo {label} cluster maintenance refreshed after network environment change");
+                // Queue the KV convergence pass on the same worker that is
+                // already awake for network reconciliation. Do not emit a
+                // second notification: this loop owns the newly queued worker
+                // slot and will take the coalesced batch on its next pass.
+                let _ = queue_daemon_cluster_kv_maintenance_wake(
+                    daemon_cluster_kv_maintenance_coordinator(),
+                    sinomo_core::cluster::ClusterKvMaintenanceWakeSource::NetworkChange,
+                );
                 cluster_network.request_network_environment_refresh(Instant::now());
             }
             _ = daemon_optional_notify(cluster_notify) => {
@@ -3199,6 +3343,13 @@ fn daemon_sleep_duration_or_min(duration: Duration) -> Duration {
     } else {
         duration
     }
+}
+
+fn daemon_cluster_kv_retry_sleep_duration(
+    scheduled: Duration,
+    retry_delay: Option<Duration>,
+) -> Duration {
+    retry_delay.map_or(scheduled, |retry_delay| scheduled.min(retry_delay))
 }
 
 fn daemon_shutdown_requested(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
@@ -5350,8 +5501,8 @@ fn publish_daemon_module_rollout_status_from_data_dir(
                 && telemetry.module_id == runtime_state.plan.module_id
         });
     let record = ClusterModuleRolloutStatusRecord {
-        cluster_id: cluster_state.cluster_id,
-        node_id: cluster_state.local_node_id,
+        cluster_id: cluster_state.cluster_id.clone(),
+        node_id: cluster_state.local_node_id.clone(),
         rollout_plan_id: runtime_state.plan.rollout_plan_id.clone(),
         module_id: runtime_state.plan.module_id.clone(),
         artifact_id: runtime_state.plan.artifact_id.clone(),
@@ -5375,8 +5526,35 @@ fn publish_daemon_module_rollout_status_from_data_dir(
             .and_then(|telemetry| telemetry.last_transition_record_id.clone()),
         updated_at: OffsetDateTime::now_utc(),
     };
-    sinomo_rollout::sync_cluster_module_rollout_node_to_kv(&cluster_paths, &record)?;
+    let op = sinomo_rollout::build_cluster_module_rollout_status_put_op(&record)?;
+    commit_daemon_rollout_kv_ops(&cluster_paths, &cluster_state, vec![op])?;
     Ok(Some(record))
+}
+
+fn commit_daemon_rollout_kv_ops(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    cluster_state: &sinomo_core::ClusterBootstrapState,
+    ops: Vec<sinomo_core::kv::KvOp>,
+) -> Result<sinomo_core::kv::KvSnapshot, DaemonError> {
+    let mut commit_state = cluster_state.clone();
+    crate::cluster::commit_cluster_kv_txn_with_quorum(
+        cluster_paths,
+        &mut commit_state,
+        sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: ops,
+            failure: Vec::new(),
+        },
+    )
+}
+
+fn read_daemon_rollout_authoritative_kv_snapshot(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    cluster_state: &sinomo_core::ClusterBootstrapState,
+) -> Result<sinomo_core::kv::KvSnapshot, DaemonError> {
+    // An empty transaction is an explicit Raft read barrier. It must still
+    // quorum-commit even though it does not advance the state revision.
+    commit_daemon_rollout_kv_ops(cluster_paths, cluster_state, Vec::new())
 }
 
 pub fn run_daemon_module_rollout_desired_reconciliation_tick(
@@ -5389,8 +5567,11 @@ pub fn run_daemon_module_rollout_desired_reconciliation_tick(
     else {
         return Ok(Vec::new());
     };
-    let desired_records =
-        sinomo_rollout::read_cluster_module_rollout_desired_from_kv(&cluster_paths)?;
+    let authoritative_snapshot =
+        read_daemon_rollout_authoritative_kv_snapshot(&cluster_paths, &cluster_state)?;
+    let desired_records = sinomo_rollout::project_cluster_module_rollout_desired_from_snapshot(
+        &authoritative_snapshot,
+    )?;
     if desired_records.is_empty() {
         return Ok(Vec::new());
     }
@@ -5398,20 +5579,23 @@ pub fn run_daemon_module_rollout_desired_reconciliation_tick(
     let rollout_paths = SelfRolloutPaths::new(&data_dir);
     let runtime_state = sinomo_rollout::read_rollout_runtime_state(&rollout_paths)?;
     let existing_reconciliations: BTreeMap<String, ClusterModuleRolloutReconciliationRecord> =
-        sinomo_rollout::read_cluster_module_rollout_reconciliations_from_kv(&cluster_paths)?
-            .into_iter()
-            .map(|record| {
-                (
-                    cluster_module_rollout_reconcile_key(
-                        &record.node_id,
-                        &record.module_id,
-                        &record.rollout_plan_id,
-                    ),
-                    record,
-                )
-            })
-            .collect();
+        sinomo_rollout::project_cluster_module_rollout_reconciliations_from_snapshot(
+            &authoritative_snapshot,
+        )?
+        .into_iter()
+        .map(|record| {
+            (
+                cluster_module_rollout_reconcile_key(
+                    &record.node_id,
+                    &record.module_id,
+                    &record.rollout_plan_id,
+                ),
+                record,
+            )
+        })
+        .collect();
     let mut reconciliations = Vec::new();
+    let mut reconciliation_ops = Vec::new();
     for desired in desired_records {
         if !daemon_module_rollout_desired_targets_node(&desired, &cluster_state.local_node_id) {
             continue;
@@ -5434,11 +5618,13 @@ pub fn run_daemon_module_rollout_desired_reconciliation_tick(
             reconciliations.push(existing.clone());
             continue;
         }
-        sinomo_rollout::sync_cluster_module_rollout_reconciliation_to_kv(
-            &cluster_paths,
-            &reconciliation,
-        )?;
+        reconciliation_ops.push(
+            sinomo_rollout::build_cluster_module_rollout_reconciliation_put_op(&reconciliation)?,
+        );
         reconciliations.push(reconciliation);
+    }
+    if !reconciliation_ops.is_empty() {
+        commit_daemon_rollout_kv_ops(&cluster_paths, &cluster_state, reconciliation_ops)?;
     }
     Ok(reconciliations)
 }
@@ -5904,6 +6090,63 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn network_change_and_raft_progress_wakes_share_one_coalesced_worker() {
+        use sinomo_core::cluster::{
+            ClusterKvMaintenanceCoordinator, ClusterKvMaintenanceWakeDisposition,
+            ClusterKvMaintenanceWakeSource,
+        };
+
+        let coordinator = ClusterKvMaintenanceCoordinator::new(4);
+        assert_eq!(
+            queue_daemon_cluster_kv_maintenance_wake(
+                &coordinator,
+                ClusterKvMaintenanceWakeSource::NetworkChange,
+            ),
+            ClusterKvMaintenanceWakeDisposition::StartWorker
+        );
+        assert_eq!(
+            queue_daemon_cluster_kv_maintenance_wake(
+                &coordinator,
+                ClusterKvMaintenanceWakeSource::RaftProgress,
+            ),
+            ClusterKvMaintenanceWakeDisposition::Coalesced
+        );
+        let batch = coordinator
+            .take_pending_batch_if_due()
+            .expect("coalesced wake batch");
+        assert_eq!(batch.coalesced_wake_count, 2);
+        assert_eq!(
+            batch.sources,
+            vec![
+                ClusterKvMaintenanceWakeSource::NetworkChange,
+                ClusterKvMaintenanceWakeSource::RaftProgress,
+            ]
+        );
+    }
+
+    #[test]
+    fn cluster_kv_retry_cooldown_is_bounded_by_the_shutdown_aware_loop_sleep() {
+        assert_eq!(
+            daemon_cluster_kv_retry_sleep_duration(
+                Duration::from_secs(15),
+                Some(Duration::from_millis(250)),
+            ),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            daemon_cluster_kv_retry_sleep_duration(
+                Duration::from_millis(100),
+                Some(Duration::from_secs(30)),
+            ),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            daemon_cluster_kv_retry_sleep_duration(Duration::from_secs(15), None),
+            Duration::from_secs(15)
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_session_body_uses_standard_object_frames() {
         let expected_detail = "sandbox stream test".to_string();
@@ -6207,6 +6450,47 @@ mod tests {
                 command,
                 sinomo_core::kv::cluster_kv_key_can_defer_materialized_snapshot,
             )
+            .map_err(sinomo_core::network::NetworkError::directory)
+    }
+
+    fn authorize_local_raft_voter_for_test(state: &mut sinomo_core::ClusterBootstrapState) {
+        let capabilities =
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == state.local_node_id)
+            .expect("local cluster member");
+        member.capabilities = capabilities.clone();
+        member.allowed_capabilities = capabilities;
+    }
+
+    fn append_cluster_module_rollout_desired_for_test(
+        paths: &sinomo_core::network::ClusterPaths,
+        node_id: &NodeId,
+        desired: &ClusterModuleRolloutDesiredRecord,
+    ) -> Result<sinomo_core::kv::KvSnapshot, sinomo_core::network::NetworkError> {
+        let op = sinomo_rollout::build_cluster_module_rollout_desired_put_op(desired)
+            .map_err(sinomo_core::network::NetworkError::directory)?;
+        append_cluster_raft_command(paths, node_id, sinomo_core::kv::KvCommand::Op(op))
+    }
+
+    fn cluster_module_rollout_statuses_for_test(
+        paths: &sinomo_core::network::ClusterPaths,
+    ) -> Result<Vec<ClusterModuleRolloutStatusRecord>, sinomo_core::network::NetworkError> {
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
+        let snapshot = sinomo_core::cluster::read_cluster_kv_local_snapshot(paths, &state)?.value;
+        sinomo_rollout::project_cluster_module_rollout_statuses_from_snapshot(&snapshot)
+            .map_err(sinomo_core::network::NetworkError::directory)
+    }
+
+    fn cluster_module_rollout_reconciliations_for_test(
+        paths: &sinomo_core::network::ClusterPaths,
+    ) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, sinomo_core::network::NetworkError>
+    {
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
+        let snapshot = sinomo_core::cluster::read_cluster_kv_local_snapshot(paths, &state)?.value;
+        sinomo_rollout::project_cluster_module_rollout_reconciliations_from_snapshot(&snapshot)
             .map_err(sinomo_core::network::NetworkError::directory)
     }
 
@@ -7122,6 +7406,7 @@ mod tests {
 
         let mut origin_to_relay = LinkedDaemonObjectRpcChannel::new();
         let mut relay_to_target = LinkedDaemonObjectRpcChannel::new();
+        let tunnel_registry_lease = crate::tcp_tunnel::lease_test_tcp_tunnel_registry();
         crate::tcp_tunnel::insert_test_tcp_tunnel_object_rpc_channel_client(
             relay_node.clone(),
             origin_to_relay.client.clone(),
@@ -7195,6 +7480,7 @@ mod tests {
             .expect("relayed ping response");
         assert_eq!(decoded.responder_node_id, target_node);
 
+        drop(tunnel_registry_lease);
         crate::tcp_tunnel::remove_test_tcp_tunnel(&relay_node);
         crate::tcp_tunnel::remove_test_tcp_tunnel(&target_node);
         origin_to_relay.close("test complete");
@@ -7982,7 +8268,7 @@ mod tests {
             sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_module_rollout_status")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_module_rollout_status").expect("node id");
-        let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "daemon module rollout status",
             node.clone(),
@@ -7990,6 +8276,7 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
+        authorize_local_raft_voter_for_test(&mut cluster_state);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
@@ -7997,6 +8284,12 @@ mod tests {
             &cluster_state,
         )
         .expect("sync cluster state");
+        sinomo_core::cluster::locked_set_cluster_raft_leader(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            1,
+        )
+        .expect("set local raft leader");
 
         let rollout_paths = SelfRolloutPaths::new(&root);
         let module_id =
@@ -8043,8 +8336,8 @@ mod tests {
         let published = publish_daemon_module_rollout_status_from_data_dir(&root, &rollout_paths)
             .expect("publish module rollout status")
             .expect("published status");
-        let statuses = sinomo_rollout::read_cluster_module_rollout_statuses_from_kv(&cluster_paths)
-            .expect("cluster statuses");
+        let statuses =
+            cluster_module_rollout_statuses_for_test(&cluster_paths).expect("cluster statuses");
 
         assert_eq!(published.cluster_id, cluster_id);
         assert_eq!(published.node_id, node);
@@ -8072,7 +8365,7 @@ mod tests {
             sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_blocked")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_blocked").expect("node id");
-        let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "daemon desired blocked",
             node.clone(),
@@ -8080,6 +8373,7 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
+        authorize_local_raft_voter_for_test(&mut cluster_state);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
@@ -8087,6 +8381,12 @@ mod tests {
             &cluster_state,
         )
         .expect("sync cluster state");
+        sinomo_core::cluster::locked_set_cluster_raft_leader(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            1,
+        )
+        .expect("set local raft leader");
 
         let module_id =
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
@@ -8115,15 +8415,14 @@ mod tests {
             requested_at: Some("2026-06-01T00:00:00Z".to_string()),
             updated_at: OffsetDateTime::now_utc(),
         };
-        sinomo_rollout::sync_cluster_module_rollout_desired_to_kv(&cluster_paths, &desired)
+        append_cluster_module_rollout_desired_for_test(&cluster_paths, &node, &desired)
             .expect("sync desired");
 
         let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
         let reconciliations = run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
             .expect("reconcile desired");
-        let records =
-            sinomo_rollout::read_cluster_module_rollout_reconciliations_from_kv(&cluster_paths)
-                .expect("read reconciliations");
+        let records = cluster_module_rollout_reconciliations_for_test(&cluster_paths)
+            .expect("read reconciliations");
 
         assert_eq!(reconciliations.len(), 1);
         assert_eq!(records.len(), 1);
@@ -8143,9 +8442,8 @@ mod tests {
         let second_reconciliations =
             run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
                 .expect("second reconcile desired");
-        let second_records =
-            sinomo_rollout::read_cluster_module_rollout_reconciliations_from_kv(&cluster_paths)
-                .expect("read second reconciliations");
+        let second_records = cluster_module_rollout_reconciliations_for_test(&cluster_paths)
+            .expect("read second reconciliations");
         assert_eq!(second_reconciliations, vec![first_record.clone()]);
         assert_eq!(second_records, vec![first_record]);
     }
@@ -8161,7 +8459,7 @@ mod tests {
             sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_prepared")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_prepared").expect("node id");
-        let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "daemon desired prepared",
             node.clone(),
@@ -8169,6 +8467,7 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
+        authorize_local_raft_voter_for_test(&mut cluster_state);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
@@ -8176,6 +8475,12 @@ mod tests {
             &cluster_state,
         )
         .expect("sync cluster state");
+        sinomo_core::cluster::locked_set_cluster_raft_leader(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            1,
+        )
+        .expect("set local raft leader");
 
         let module_id =
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
@@ -8248,7 +8553,7 @@ mod tests {
             requested_at: Some("2026-06-01T00:00:00Z".to_string()),
             updated_at: OffsetDateTime::now_utc(),
         };
-        sinomo_rollout::sync_cluster_module_rollout_desired_to_kv(&cluster_paths, &desired)
+        append_cluster_module_rollout_desired_for_test(&cluster_paths, &node, &desired)
             .expect("sync desired");
 
         let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
@@ -8292,7 +8597,7 @@ mod tests {
             sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_matched")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_matched").expect("node id");
-        let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "daemon desired matched",
             node.clone(),
@@ -8300,6 +8605,7 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
+        authorize_local_raft_voter_for_test(&mut cluster_state);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
@@ -8307,6 +8613,12 @@ mod tests {
             &cluster_state,
         )
         .expect("sync cluster state");
+        sinomo_core::cluster::locked_set_cluster_raft_leader(
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            1,
+        )
+        .expect("set local raft leader");
 
         let module_id =
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
@@ -8344,15 +8656,14 @@ mod tests {
             requested_at: Some("2026-06-01T00:00:00Z".to_string()),
             updated_at: OffsetDateTime::now_utc(),
         };
-        sinomo_rollout::sync_cluster_module_rollout_desired_to_kv(&cluster_paths, &desired)
+        append_cluster_module_rollout_desired_for_test(&cluster_paths, &node, &desired)
             .expect("sync desired");
 
         let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
         let reconciliations = run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
             .expect("reconcile desired");
-        let records =
-            sinomo_rollout::read_cluster_module_rollout_reconciliations_from_kv(&cluster_paths)
-                .expect("read reconciliations");
+        let records = cluster_module_rollout_reconciliations_for_test(&cluster_paths)
+            .expect("read reconciliations");
 
         assert_eq!(reconciliations.len(), 1);
         assert_eq!(records.len(), 1);

@@ -20,6 +20,12 @@ use sinomo_node::{
 };
 use time::OffsetDateTime;
 
+/// Builds a stable request envelope for an exact cluster transaction.
+///
+/// The namespace identifies the owning operation family while the encoded
+/// transaction includes compares and desired mutations. Rebuilding an exact
+/// retry therefore reuses its committed request record; a materially different
+/// operation receives a different id.
 pub fn cluster_semantic_txn_no_effect_response(
     paths: &ClusterPaths,
     txn: &KvTxn,

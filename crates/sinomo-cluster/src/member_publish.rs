@@ -5,17 +5,20 @@ use crate::keyspace::{
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
     imported_snapshot_advances_local_kv, local_cluster_kv_snapshot_revision,
-    read_cluster_kv_current_or_cached_snapshot_arc_if_present, read_cluster_kv_current_snapshot,
-    read_cluster_kv_current_snapshot_arc, write_imported_cluster_kv_snapshot_if_changed,
+    read_cluster_kv_current_or_cached_snapshot_arc_if_present,
+    write_imported_cluster_kv_snapshot_if_changed,
 };
 use crate::local_state_store::read_cluster_state;
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::prelude::*;
+use sinomo_kv::push_bounded_txn_success_op;
 #[allow(unused_imports)]
-use sinomo_kv::{KvOp, KvSnapshot, KvTxn};
-use sinomo_kv::{KvRevision, push_bounded_txn_success_op};
+use sinomo_kv::{
+    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvCompare, KvOp, KvRevision, KvSnapshot, KvTxn,
+    KvTxnRequest,
+};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -28,16 +31,23 @@ use sinomo_node::{
     cluster_endpoint_list_stable_eq, cluster_endpoint_stable_eq, cluster_local_process_members,
     cluster_member_stable_eq,
 };
+use std::collections::BTreeSet;
 
 pub trait ClusterMemberPublishHost {
     type Error: From<NetworkError> + ToString;
+
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, Self::Error>;
 
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error>;
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error>;
 }
 
 pub struct ClusterLocalMemberPublishOptions {
@@ -58,12 +68,18 @@ pub trait ClusterLocalMemberPublishHost {
         state: &ClusterBootstrapState,
     ) -> bool;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>;
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, NetworkError>;
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError>;
 
     fn send_cluster_member_publish(
         &mut self,
@@ -80,12 +96,18 @@ pub trait ClusterLocalMemberPublishAsyncHost {
         state: &'a ClusterBootstrapState,
     ) -> ClusterMembershipRpcFuture<'a, bool>;
 
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, KvAuthoritativeRead<KvSnapshot>>;
+
     fn commit_cluster_kv_txn_with_quorum_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult>;
 
     fn send_cluster_member_publish_async<'a>(
         &'a mut self,
@@ -145,6 +167,61 @@ pub fn cluster_member_publish_matches_kv(
         }
     }
     Ok(true)
+}
+
+fn cluster_member_publish_txn_from_authoritative_snapshot(
+    snapshot: &KvSnapshot,
+    members: &[ClusterMemberRecord],
+) -> Result<KvTxn, NetworkError> {
+    let mut txn = cluster_member_publish_txn_with_snapshot(Some(snapshot), members)?;
+    let mut compared = BTreeSet::new();
+    for member in members {
+        let key = cluster_member_key(&member.node_id);
+        if !compared.insert(key.clone()) {
+            continue;
+        }
+        let entry = snapshot
+            .get(&key)
+            .ok_or_else(|| NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "member {} is absent from the authoritative cluster membership",
+                    member.node_id
+                ),
+            })?;
+        let current: ClusterMemberRecord = entry.decode().map_err(kv_err)?;
+        if current.cluster_id != member.cluster_id
+            || current.node_public_key != member.node_public_key
+            || !current.state.is_authorized()
+        {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "member {} is not authorized by the current cluster membership with the published identity",
+                    member.node_id
+                ),
+            });
+        }
+        txn.compares.push(KvCompare::ValueEquals {
+            key,
+            value: entry.value.clone(),
+        });
+    }
+    Ok(txn)
+}
+
+fn require_member_publish_commit(
+    result: ClusterKvTxnCommitResult,
+) -> Result<KvSnapshot, NetworkError> {
+    if result
+        .txn_response
+        .as_ref()
+        .is_some_and(|response| response.succeeded)
+    {
+        Ok(result.snapshot)
+    } else {
+        Err(NetworkError::ClusterReadOnly {
+            detail: "cluster membership changed while publishing member state".to_string(),
+        })
+    }
 }
 
 pub(crate) fn publish_local_members_via_voter_with_host(
@@ -309,17 +386,16 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum(paths, state)
     {
-        if already_published {
-            return Ok(None);
-        }
         let mut commit_state = state.clone();
-        return host
-            .commit_cluster_kv_txn_with_quorum(
-                paths,
-                &mut commit_state,
-                cluster_member_publish_txn_from_kv(paths, &members)?,
-            )
-            .map(Some);
+        let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut commit_state)?;
+        let txn =
+            cluster_member_publish_txn_from_authoritative_snapshot(&authoritative.value, &members)?;
+        let result = host.commit_cluster_kv_txn_with_quorum(
+            paths,
+            &mut commit_state,
+            KvTxnRequest::generated(txn),
+        )?;
+        return require_member_publish_commit(result).map(Some);
     }
     if already_published
         && !options.force_kv_snapshot_sync
@@ -356,25 +432,32 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum_async(paths, state).await?
     {
-        if already_published {
-            return Ok(None);
-        }
-        let paths_for_txn = paths.clone();
+        let mut commit_state = state.clone();
+        let authoritative = host
+            .authoritative_cluster_kv_snapshot_async(paths, &mut commit_state)
+            .await?;
         let members_for_txn = members.clone();
+        let snapshot_for_txn = authoritative.value;
         let txn = runtime
             .spawn_blocking(move || {
-                cluster_member_publish_txn_from_kv(&paths_for_txn, &members_for_txn)
+                cluster_member_publish_txn_from_authoritative_snapshot(
+                    &snapshot_for_txn,
+                    &members_for_txn,
+                )
             })
             .await
             .map_err(|source| NetworkError::Io {
                 operation: "cluster local member publish txn".to_string(),
                 detail: format!("member publish txn task failed: {source}"),
             })??;
-        let mut commit_state = state.clone();
-        return host
-            .commit_cluster_kv_txn_with_quorum_async(paths, &mut commit_state, txn)
-            .await
-            .map(Some);
+        let result = host
+            .commit_cluster_kv_txn_with_quorum_async(
+                paths,
+                &mut commit_state,
+                KvTxnRequest::generated(txn),
+            )
+            .await?;
+        return require_member_publish_commit(result).map(Some);
     }
     if already_published && !options.force_kv_snapshot_sync {
         let paths_for_targets = paths.clone();
@@ -402,15 +485,17 @@ enum PreparedClusterMemberPublish {
     Commit {
         state: ClusterBootstrapState,
         txn: KvTxn,
+        already_current: bool,
+        publisher_revision: Option<KvRevision>,
     },
 }
 
 fn prepare_cluster_member_publish_request(
-    paths: &ClusterPaths,
+    state: ClusterBootstrapState,
+    snapshot: &KvSnapshot,
     request: ClusterMemberPublishRequest,
     signer_node_id: &str,
 ) -> Result<PreparedClusterMemberPublish, NetworkError> {
-    let state = read_cluster_state(paths)?;
     if request.members.is_empty() {
         return Ok(PreparedClusterMemberPublish::Response(
             ClusterMemberPublishResponse {
@@ -448,8 +533,12 @@ fn prepare_cluster_member_publish_request(
                 },
             ));
         }
-        if !state.members.iter().any(|existing| {
-            existing.node_id == member.node_id
+        let key = cluster_member_key(&member.node_id);
+        let authoritative_member = snapshot
+            .get(&key)
+            .and_then(|entry| entry.decode::<ClusterMemberRecord>().ok());
+        if !authoritative_member.is_some_and(|existing| {
+            existing.cluster_id == member.cluster_id
                 && existing.node_public_key == member.node_public_key
                 && existing.state.is_authorized()
         }) {
@@ -466,51 +555,34 @@ fn prepare_cluster_member_publish_request(
             ));
         }
     }
-    if cluster_member_publish_matches_kv(paths, &request.members)? {
-        let kv_snapshot =
-            cluster_member_publish_response_snapshot(paths, &state, request.local_kv_revision)?;
-        return Ok(PreparedClusterMemberPublish::Response(
-            ClusterMemberPublishResponse {
-                accepted: true,
-                detail: "member endpoints already current".to_string(),
-                state,
-                kv_snapshot,
-            },
-        ));
-    }
-    let txn = cluster_member_publish_txn_from_kv(paths, &request.members)?;
-    Ok(PreparedClusterMemberPublish::Commit { state, txn })
+    let txn = cluster_member_publish_txn_from_authoritative_snapshot(snapshot, &request.members)?;
+    let already_current = txn.success.is_empty();
+    Ok(PreparedClusterMemberPublish::Commit {
+        state,
+        txn,
+        already_current,
+        publisher_revision: request.local_kv_revision,
+    })
 }
 
 fn cluster_member_publish_response_snapshot(
-    paths: &ClusterPaths,
+    snapshot: KvSnapshot,
     state: &ClusterBootstrapState,
     publisher_revision: Option<KvRevision>,
-) -> Result<Option<KvSnapshot>, NetworkError> {
-    let snapshot = read_cluster_kv_current_snapshot(paths)?;
+) -> Option<KvSnapshot> {
     let Some(publisher_revision) = publisher_revision else {
-        // No readable snapshot at the publisher (or it predates the revision
-        // hint): only a full import converges it.
-        return Ok(Some(snapshot));
+        return Some(snapshot);
     };
     if publisher_revision < snapshot.revision {
-        return Ok(Some(snapshot));
+        return Some(snapshot);
     }
-    if publisher_revision > snapshot.revision {
-        // Lag-only invariant: revisions are positions in the leader's single
-        // linear history. A publisher ahead of THIS node means this node is
-        // the stale one (normal when a fresh learner syncs through a lagging
-        // bridge) — never ship our older snapshot backwards. A publisher
-        // ahead of the LEADER is impossible and indicates replicated-state
-        // divergence worth surfacing loudly.
-        if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
-            eprintln!(
-                "warning: member publish reported KV revision {} ahead of this voter's {} — replicated KV history may have diverged",
-                publisher_revision.0, snapshot.revision.0
-            );
-        }
+    if publisher_revision > snapshot.revision && sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+        eprintln!(
+            "warning: member publish reported KV revision {} ahead of the authoritative voter's {} -- replicated KV history may have diverged",
+            publisher_revision.0, snapshot.revision.0
+        );
     }
-    Ok(None)
+    None
 }
 
 pub fn handle_cluster_member_publish_request_with_host<H>(
@@ -522,19 +594,57 @@ pub fn handle_cluster_member_publish_request_with_host<H>(
 where
     H: ClusterMemberPublishHost,
 {
-    let (state, txn) = match prepare_cluster_member_publish_request(paths, request, signer_node_id)
+    let state = read_cluster_state(paths).map_err(H::Error::from)?;
+    let mut authority_state = state.clone();
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut authority_state)?;
+    let (state, txn, already_current, publisher_revision) =
+        match prepare_cluster_member_publish_request(
+            state,
+            &authoritative.value,
+            request,
+            signer_node_id,
+        )
         .map_err(H::Error::from)?
-    {
-        PreparedClusterMemberPublish::Response(response) => return Ok(response),
-        PreparedClusterMemberPublish::Commit { state, txn } => (state, txn),
-    };
+        {
+            PreparedClusterMemberPublish::Response(response) => return Ok(response),
+            PreparedClusterMemberPublish::Commit {
+                state,
+                txn,
+                already_current,
+                publisher_revision,
+            } => (state, txn, already_current, publisher_revision),
+        };
     let mut commit_state = state.clone();
-    match host.commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, txn) {
-        Ok(snapshot) => Ok(ClusterMemberPublishResponse {
-            accepted: true,
-            detail: "member endpoints published".to_string(),
-            state: read_cluster_state(paths).unwrap_or(state),
-            kv_snapshot: Some(snapshot),
+    let request = KvTxnRequest::generated(txn);
+    match host.commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, request) {
+        Ok(result)
+            if result
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| response.succeeded) =>
+        {
+            let kv_snapshot = cluster_member_publish_response_snapshot(
+                result.snapshot,
+                &state,
+                publisher_revision,
+            );
+            Ok(ClusterMemberPublishResponse {
+                accepted: true,
+                detail: if already_current {
+                    "member endpoints already current"
+                } else {
+                    "member endpoints published"
+                }
+                .to_string(),
+                state: read_cluster_state(paths).unwrap_or(state),
+                kv_snapshot,
+            })
+        }
+        Ok(_) => Ok(ClusterMemberPublishResponse {
+            accepted: false,
+            detail: "cluster membership changed while publishing member state".to_string(),
+            state,
+            kv_snapshot: None,
         }),
         Err(error) => Ok(ClusterMemberPublishResponse {
             accepted: false,
@@ -555,27 +665,59 @@ pub async fn handle_cluster_member_publish_request_async_with_host<H>(
 where
     H: ClusterMemberMutationAsyncHost + Send,
 {
-    let paths_for_prepare = paths.clone();
+    let paths_for_state = paths.clone();
+    let state = runtime
+        .spawn_blocking(move || read_cluster_state(&paths_for_state))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster member publish state read".to_string(),
+            detail: format!("member publish state read task failed: {source}"),
+        })??;
+    let mut authority_state = state.clone();
+    let authoritative = host
+        .authoritative_cluster_kv_snapshot_async(paths, &mut authority_state)
+        .await?;
     let signer_node_id = signer_node_id.to_string();
     let prepared = runtime
         .spawn_blocking(move || {
-            prepare_cluster_member_publish_request(&paths_for_prepare, request, &signer_node_id)
+            prepare_cluster_member_publish_request(
+                state,
+                &authoritative.value,
+                request,
+                &signer_node_id,
+            )
         })
         .await
         .map_err(|source| NetworkError::Io {
             operation: "cluster member publish prepare".to_string(),
             detail: format!("member publish prepare task failed: {source}"),
         })??;
-    let (state, txn) = match prepared {
+    let (state, txn, already_current, publisher_revision) = match prepared {
         PreparedClusterMemberPublish::Response(response) => return Ok(response),
-        PreparedClusterMemberPublish::Commit { state, txn } => (state, txn),
+        PreparedClusterMemberPublish::Commit {
+            state,
+            txn,
+            already_current,
+            publisher_revision,
+        } => (state, txn, already_current, publisher_revision),
     };
     let mut commit_state = state.clone();
+    let request = KvTxnRequest::generated(txn);
     match host
-        .commit_cluster_kv_txn_with_quorum_async(paths, &mut commit_state, txn)
+        .commit_cluster_kv_txn_with_quorum_async(paths, &mut commit_state, request)
         .await
     {
-        Ok(snapshot) => {
+        Ok(result)
+            if result
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| response.succeeded) =>
+        {
+            let kv_snapshot = cluster_member_publish_response_snapshot(
+                result.snapshot,
+                &state,
+                publisher_revision,
+            );
             let paths_for_state = paths.clone();
             let fallback_state = state.clone();
             let response_state = runtime
@@ -589,11 +731,22 @@ where
                 })?;
             Ok(ClusterMemberPublishResponse {
                 accepted: true,
-                detail: "member endpoints published".to_string(),
+                detail: if already_current {
+                    "member endpoints already current"
+                } else {
+                    "member endpoints published"
+                }
+                .to_string(),
                 state: response_state,
-                kv_snapshot: Some(snapshot),
+                kv_snapshot,
             })
         }
+        Ok(_) => Ok(ClusterMemberPublishResponse {
+            accepted: false,
+            detail: "cluster membership changed while publishing member state".to_string(),
+            state,
+            kv_snapshot: None,
+        }),
         Err(error) => Ok(ClusterMemberPublishResponse {
             accepted: false,
             detail: error.to_string(),
@@ -624,14 +777,6 @@ pub fn cluster_member_publish_authorized_for_signer(
 #[cfg(any(test, feature = "test-support"))]
 pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, NetworkError> {
     cluster_member_publish_txn_with_snapshot(None, members)
-}
-
-pub(crate) fn cluster_member_publish_txn_from_kv(
-    paths: &ClusterPaths,
-    members: &[ClusterMemberRecord],
-) -> Result<KvTxn, NetworkError> {
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
-    cluster_member_publish_txn_with_snapshot(Some(snapshot.as_ref()), members)
 }
 
 #[cfg(any(test, feature = "test-support"))]

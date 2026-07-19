@@ -6,9 +6,9 @@ use sinomo_cli_registry::{
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::events::EventStore;
-use sinomo_core::kv::{
-    CLUSTER_KV_RPC_CATEGORY, CLUSTER_KV_SNAPSHOT_ROUTE, KvSnapshot, KvTxn, KvTxnResponse,
-};
+#[cfg(test)]
+use sinomo_core::kv::KvTxnResponse;
+use sinomo_core::kv::{ClusterKvTxnCommitResult, KvSnapshot, KvTxnRequest};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network;
 use sinomo_core::network::ClusterPaths;
@@ -381,18 +381,26 @@ pub trait SandboxCliHost: Send + Sync {
         })
     }
 
-    fn read_cluster_kv_snapshot(
+    /// Local-only test seam used by CLI integration tests when no daemon is
+    /// available. Production clustered policy reads use the authoritative
+    /// snapshot RPC and never fall back here after an authority failure.
+    #[doc(hidden)]
+    fn read_cluster_kv_local_snapshot_for_test(
         &self,
         _paths: &ClusterPaths,
     ) -> Option<Result<KvSnapshot, SandboxCliError>> {
         None
     }
 
-    fn commit_cluster_kv_txn(
+    /// Local-only test seam for applying an already identified request. The
+    /// request envelope is retained so test hosts exercise the same idempotency
+    /// contract as the daemon RPC path.
+    #[doc(hidden)]
+    fn commit_cluster_kv_request_for_test(
         &self,
         _data_dir: &SinomoDataDir,
-        _txn: &KvTxn,
-    ) -> Option<Result<(), SandboxCliError>> {
+        _request: &KvTxnRequest,
+    ) -> Option<Result<ClusterKvTxnCommitResult, SandboxCliError>> {
         None
     }
 
@@ -4126,7 +4134,7 @@ pub fn write_sandbox_policy_config_for_node(
     let paths = ClusterPaths::new(data_dir);
     paths.ensure()?;
     let txn = crate::sandbox_policy_config_cluster_kv_txn(config)?;
-    commit_sandbox_policy_cluster_txn(data_dir, txn)?;
+    commit_sandbox_policy_cluster_request(data_dir, KvTxnRequest::generated(txn))?;
     Ok(paths.kv_paths().snapshot)
 }
 
@@ -4196,12 +4204,10 @@ fn sandbox_policy_config_store() -> Result<sinomo_config::ConfigStore, CliError>
 
 fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     let host = current_sandbox_cli_host();
-    if let Some(address) = host.default_main_daemon_address()?
-        && let Ok(snapshot) = fetch_daemon_cluster_kv_snapshot(&address)
-    {
-        return Ok(snapshot);
+    if let Some(address) = host.default_main_daemon_address()? {
+        return fetch_daemon_cluster_kv_authoritative_snapshot(&address);
     }
-    if let Some(snapshot) = host.read_cluster_kv_snapshot(paths) {
+    if let Some(snapshot) = host.read_cluster_kv_local_snapshot_for_test(paths) {
         return snapshot;
     }
     #[cfg(test)]
@@ -4218,7 +4224,10 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
 }
 
 #[cfg(test)]
-fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
+fn commit_sandbox_policy_cluster_request(
+    data_dir: &SinomoDataDir,
+    request: KvTxnRequest,
+) -> Result<(), CliError> {
     let paths = ClusterPaths::new(data_dir);
     let snapshot = sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
         .unwrap_or_else(|_| {
@@ -4228,7 +4237,7 @@ fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
         });
     let mut store =
         sinomo_core::kv::InProcessKvStore::restore(snapshot).map_err(SandboxCliError::Kv)?;
-    let _: KvTxnResponse = store.txn(txn).map_err(SandboxCliError::Kv)?;
+    let _: KvTxnResponse = store.txn(request.txn).map_err(SandboxCliError::Kv)?;
     sinomo_core::kv::write_cluster_kv_snapshot(
         &paths.kv_paths(),
         &store.snapshot().expect("snapshot"),
@@ -4238,37 +4247,52 @@ fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
 }
 
 #[cfg(not(test))]
-fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
+fn commit_sandbox_policy_cluster_request(
+    data_dir: &SinomoDataDir,
+    request: KvTxnRequest,
+) -> Result<(), CliError> {
     let host = current_sandbox_cli_host();
-    if let Some(result) = host.commit_cluster_kv_txn(data_dir, &txn) {
-        return result;
+    if let Some(result) = host.commit_cluster_kv_request_for_test(data_dir, &request) {
+        return require_sandbox_policy_cluster_commit(result?);
     }
     let Some(address) = host.default_main_daemon_address()? else {
         return Err(CliError::DaemonNotRunning {
             detail: "clustered sandbox policy writes require the local daemon".to_string(),
         });
     };
-    let request = network::ObjectRpcRequest::encode_body(
-        sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
-        CLUSTER_KV_RPC_CATEGORY,
-        &txn,
-    )
-    .map_err(CliError::from)?;
+    let payload =
+        sinomo_core::kv::cluster_kv_txn_rpc_payload(&request).map_err(SandboxCliError::Kv)?;
+    let request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response =
         host.send_daemon_rpc(&address, &request, SANDBOX_DAEMON_CLUSTER_KV_TXN_TIMEOUT)?;
-    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    response.error_detail().map_err(CliError::from)?;
+    let commit = sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body)
+        .map_err(SandboxCliError::Kv)?;
+    require_sandbox_policy_cluster_commit(commit)
+}
+
+#[cfg(not(test))]
+fn require_sandbox_policy_cluster_commit(commit: ClusterKvTxnCommitResult) -> Result<(), CliError> {
+    if commit.txn_response.is_none() {
+        return Err(CliError::Parse {
+            detail: "cluster KV returned a barrier result for a sandbox policy transaction"
+                .to_string(),
+        });
+    }
     Ok(())
 }
 
-fn fetch_daemon_cluster_kv_snapshot(address: &str) -> Result<KvSnapshot, CliError> {
-    let request = network::ObjectRpcRequest::encode_body(
-        CLUSTER_KV_SNAPSHOT_ROUTE,
-        CLUSTER_KV_RPC_CATEGORY,
-        &(),
-    )
-    .map_err(CliError::from)?;
+fn fetch_daemon_cluster_kv_authoritative_snapshot(address: &str) -> Result<KvSnapshot, CliError> {
+    let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()
+        .map_err(SandboxCliError::Kv)?;
+    let request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = send_daemon_rpc(address, &request, SANDBOX_DAEMON_PROBE_TIMEOUT)?;
-    response.decode_body().map_err(CliError::from)
+    response.error_detail().map_err(CliError::from)?;
+    sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+        .map(|read| read.value)
+        .map_err(SandboxCliError::Kv)
 }
 
 pub fn apply_sandbox_policy_set_options(
@@ -8137,6 +8161,100 @@ fn sandbox_mount_mode_label(mode: &crate::SandboxMountMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct AuthoritativeSnapshotHost {
+        fail_authority: bool,
+    }
+
+    impl SandboxCliHost for AuthoritativeSnapshotHost {
+        fn default_main_daemon_address(&self) -> Result<Option<String>, SandboxCliError> {
+            Ok(Some("127.0.0.1:21352".to_string()))
+        }
+
+        fn send_daemon_rpc(
+            &self,
+            _address: &str,
+            request: &network::ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, SandboxCliError> {
+            assert_eq!(
+                request.route,
+                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE
+            );
+            assert_eq!(request.category, sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY);
+            sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_request_body(
+                &request.body,
+            )
+            .expect("authoritative snapshot marker request");
+            if self.fail_authority {
+                return Err(SandboxCliError::Network {
+                    address: request.route.clone(),
+                    detail: "quorum unavailable".to_string(),
+                });
+            }
+
+            let snapshot = sinomo_core::kv::InProcessKvStore::new()
+                .snapshot()
+                .expect("snapshot");
+            let response = sinomo_core::kv::KvAuthoritativeRead {
+                authority: sinomo_core::kv::KvAuthorityProof {
+                    term: 3,
+                    commit_index: 7,
+                    revision: snapshot.revision,
+                    basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 2,
+                        required_quorum: 2,
+                    },
+                },
+                value: snapshot,
+            };
+            let payload =
+                sinomo_core::kv::cluster_kv_authoritative_snapshot_response_rpc_payload(&response)
+                    .expect("authoritative snapshot response");
+            Ok(ObjectRpcResponse::from_encoded_body(
+                payload.route,
+                payload.body,
+            ))
+        }
+
+        fn read_cluster_kv_local_snapshot_for_test(
+            &self,
+            _paths: &ClusterPaths,
+        ) -> Option<Result<KvSnapshot, SandboxCliError>> {
+            panic!("an authority failure must not fall back to a local snapshot")
+        }
+    }
+
+    #[test]
+    fn sandbox_policy_reads_use_the_authoritative_snapshot_route() {
+        let host = Arc::new(AuthoritativeSnapshotHost {
+            fail_authority: false,
+        });
+        let snapshot = with_sandbox_cli_host(host, || {
+            fetch_daemon_cluster_kv_authoritative_snapshot("127.0.0.1:21352")
+        })
+        .expect("authoritative snapshot");
+
+        assert_eq!(snapshot.revision, sinomo_core::kv::KvRevision::ZERO);
+    }
+
+    #[test]
+    fn sandbox_policy_authority_failure_does_not_fall_back_to_local_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-sandbox-policy-authority-failure");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(root.path()));
+        let host = Arc::new(AuthoritativeSnapshotHost {
+            fail_authority: true,
+        });
+
+        let error = with_sandbox_cli_host(host, || sandbox_policy_cluster_snapshot(&paths))
+            .expect_err("authority failure");
+
+        assert!(matches!(
+            error,
+            SandboxCliError::Network { detail, .. } if detail == "quorum unavailable"
+        ));
+    }
 
     #[test]
     fn sandbox_help_exposes_lifecycle_and_id_requirements() {

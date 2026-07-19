@@ -178,12 +178,15 @@ pub use auth::{
 };
 pub(crate) use client::{
     DaemonSignedObjectRpcAsyncHost, cluster_paths_from_env,
-    fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
+    fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,
 };
 pub use client::{
-    RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
+    RemoteConfigClient, cancel_cluster_kv_watch_from_endpoint_on_runtime,
+    drain_cluster_kv_watch_from_endpoint_on_runtime,
+    fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime,
+    fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     fetch_daemon_status_from_endpoint_async, send_daemon_build_artifact,
     send_daemon_build_artifact_to_endpoint, send_daemon_build_artifact_to_target,
     send_daemon_build_capabilities, send_daemon_build_capabilities_to_endpoint,
@@ -208,6 +211,7 @@ pub use client::{
     send_object_rpc_session_to_target_with_options, send_object_rpc_to_target,
     send_object_rpc_to_target_async, send_object_rpc_to_target_async_with_options,
     send_object_rpc_to_target_with_options, send_object_rpc_to_target_with_timeouts,
+    start_cluster_kv_authoritative_watch_from_endpoint_on_runtime,
 };
 pub use cluster::commit_cluster_kv_txn_with_quorum;
 pub use control::{

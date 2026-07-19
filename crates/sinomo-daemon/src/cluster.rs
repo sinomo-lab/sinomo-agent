@@ -11,7 +11,7 @@ use crate::{
     current_shadow_daemon_options_on_runtime, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
     daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
-    fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
+    fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,
     fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
     read_daemon_status, send_cluster_member_publish_async, send_cluster_raft_append_on_runtime,
     send_cluster_raft_vote_on_runtime, write_daemon_status,
@@ -33,6 +33,8 @@ use sinomo_core::cluster::{
     ClusterMemberPublishRequest, ClusterMemberPublishResponse, ClusterStatusAsyncProbe,
 };
 #[cfg(test)]
+use sinomo_core::kv::InProcessKvStore;
+#[cfg(test)]
 use sinomo_core::kv::KvCommand;
 use sinomo_core::kv::{
     ClusterKvRaftAppendReplicationOutcome, ClusterKvReplicationRequest,
@@ -41,9 +43,7 @@ use sinomo_core::kv::{
     ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
     ClusterRaftVoteResponse,
 };
-use sinomo_core::kv::{InProcessKvStore, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
-#[cfg(test)]
-use sinomo_core::kv::{KvCompare, KvOpResponse};
+use sinomo_core::kv::{KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     AsyncMdnsDiscoverySocket, ClusterConnectivityRecord, ClusterConnectivityState,
@@ -1410,19 +1410,6 @@ pub(crate) fn handle_daemon_cluster_kv_snapshot(
         .map_err(Into::into)
 }
 
-pub(crate) async fn handle_daemon_cluster_kv_snapshot_async(
-    paths: &DaemonPaths,
-) -> Result<KvSnapshot, DaemonError> {
-    let paths = paths.clone();
-    let path = paths.root.display().to_string();
-    tokio::task::spawn_blocking(move || handle_daemon_cluster_kv_snapshot(&paths))
-        .await
-        .map_err(|source| DaemonError::Io {
-            path,
-            detail: format!("cluster kv snapshot task failed: {source}"),
-        })?
-}
-
 pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     paths: &DaemonPaths,
 ) -> Result<(), DaemonError> {
@@ -1437,43 +1424,104 @@ pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     Ok(())
 }
 
-pub(crate) async fn handle_daemon_cluster_kv_txn_request_async_on_runtime(
+pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime_with_timeouts(
     paths: &DaemonPaths,
-    txn: KvTxn,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    handle_daemon_cluster_kv_txn_request_async_with_forwarding(paths, txn, true, runtime).await
-}
-
-pub(crate) async fn handle_daemon_cluster_kv_txn_request_async_on_runtime_with_timeouts(
-    paths: &DaemonPaths,
-    txn: KvTxn,
+    request: sinomo_core::kv::KvTxnRequest,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
-) -> Result<KvTxnResponse, DaemonError> {
-    handle_daemon_cluster_kv_txn_request_async_with_forwarding_and_timeouts(
-        paths, txn, true, runtime, timeouts,
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
+    handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
+        paths, request, true, runtime, timeouts,
     )
     .await
 }
 
-pub(crate) async fn handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
+pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime(
     paths: &DaemonPaths,
-    txn: KvTxn,
+    request: sinomo_core::kv::KvTxnRequest,
     runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    handle_daemon_cluster_kv_txn_request_async_with_forwarding(paths, txn, false, runtime).await
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
+    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, runtime).await
 }
 
-async fn handle_daemon_cluster_kv_txn_request_async_with_forwarding(
+pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
     paths: &DaemonPaths,
-    txn: KvTxn,
+    body: &[u8],
     allow_forwarding: bool,
     runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    handle_daemon_cluster_kv_txn_request_async_with_forwarding_and_timeouts(
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let timeouts = cluster_control_plane_timeouts();
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::from_handle(runtime),
+        timeouts,
+    );
+    sinomo_core::cluster::handle_cluster_kv_authoritative_snapshot_request_async_with_host(
+        runtime,
+        &cluster_paths,
+        body,
+        timeouts.kv_txn_quorum_options(allow_forwarding),
+        &mut host,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
+    paths: &DaemonPaths,
+    body: &[u8],
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, DaemonError> {
+    let request = sinomo_core::kv::decode_cluster_kv_request_outcome_rpc_request_body(body)?;
+    let barrier = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
+    let authoritative = handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
         paths,
-        txn,
+        &barrier.body,
+        allow_forwarding,
+        runtime,
+    )
+    .await?;
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let kv_paths = cluster_paths.kv_paths();
+    let request_id = request.request_id;
+    let authoritative_snapshot = authoritative.value;
+    let outcome = runtime
+        .spawn_blocking(move || {
+            sinomo_core::kv::resolve_cluster_kv_request_outcome(
+                &kv_paths,
+                &authoritative_snapshot,
+                &request_id,
+            )
+        })
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: cluster_paths.root.display().to_string(),
+            detail: format!("cluster KV request outcome task failed: {source}"),
+        })??;
+    Ok(sinomo_core::kv::ClusterKvRequestOutcomeRead {
+        authority: authoritative.authority,
+        outcome,
+    })
+}
+
+pub(crate) async fn handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
+    paths: &DaemonPaths,
+    request: sinomo_core::kv::KvTxnRequest,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
+    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, false, runtime).await
+}
+
+async fn handle_daemon_cluster_kv_request_async_with_forwarding(
+    paths: &DaemonPaths,
+    request: sinomo_core::kv::KvTxnRequest,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
+    handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
+        paths,
+        request,
         allow_forwarding,
         runtime,
         cluster_control_plane_timeouts(),
@@ -1481,17 +1529,17 @@ async fn handle_daemon_cluster_kv_txn_request_async_with_forwarding(
     .await
 }
 
-async fn handle_daemon_cluster_kv_txn_request_async_with_forwarding_and_timeouts(
+async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
     paths: &DaemonPaths,
-    txn: KvTxn,
+    request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
-) -> Result<KvTxnResponse, DaemonError> {
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_timeouts(
+    handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
         &cluster_paths,
-        txn,
+        request,
         allow_forwarding,
         runtime,
         timeouts,
@@ -1522,23 +1570,24 @@ pub(crate) async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_ru
     allow_forwarding: bool,
     runtime: &tokio::runtime::Handle,
 ) -> Result<KvTxnResponse, DaemonError> {
-    handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_timeouts(
+    handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
         cluster_paths,
-        txn,
+        sinomo_core::kv::KvTxnRequest::generated(txn),
         allow_forwarding,
         runtime,
         cluster_control_plane_timeouts(),
     )
     .await
+    .and_then(cluster_kv_txn_response_from_commit)
 }
 
-async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_timeouts(
+async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
     cluster_paths: &ClusterPaths,
-    txn: KvTxn,
+    request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
-) -> Result<KvTxnResponse, DaemonError> {
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
         DaemonClusterRpcMode::from_handle(runtime),
         timeouts,
@@ -1546,12 +1595,20 @@ async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_
     sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
         runtime,
         cluster_paths,
-        txn,
+        request,
         timeouts.kv_txn_quorum_options(allow_forwarding),
         &mut host,
     )
     .await
     .map_err(Into::into)
+}
+
+fn cluster_kv_txn_response_from_commit(
+    result: sinomo_core::kv::ClusterKvTxnCommitResult,
+) -> Result<KvTxnResponse, DaemonError> {
+    result.txn_response.ok_or_else(|| DaemonError::Parse {
+        detail: "cluster KV transaction commit omitted its transaction response".to_string(),
+    })
 }
 
 pub(crate) struct DaemonClusterJoinRegistrationHost<'a> {
@@ -1669,15 +1726,46 @@ impl sinomo_core::cluster::ClusterJoinRegistrationHost for DaemonClusterJoinRegi
         )
     }
 
-    fn commit_join_registration_state(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
-        sinomo_core::cluster::ClusterJoinRegistrationHost::commit_join_registration_state(
+        state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>, sinomo_core::network::NetworkError>
+    {
+        sinomo_core::cluster::ClusterJoinRegistrationHost::authoritative_cluster_kv_snapshot(
             &mut self.driver,
             paths,
             state,
+        )
+    }
+
+    fn commit_join_registration_txn(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, sinomo_core::network::NetworkError> {
+        sinomo_core::cluster::ClusterJoinRegistrationHost::commit_join_registration_txn(
+            &mut self.driver,
+            paths,
+            state,
+            request,
+        )
+    }
+
+    fn admit_cluster_raft_learner(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        now: OffsetDateTime,
+    ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
+        sinomo_core::cluster::ClusterJoinRegistrationHost::admit_cluster_raft_learner(
+            &mut self.driver,
+            paths,
+            state,
+            node_id,
+            now,
         )
     }
 
@@ -1744,18 +1832,62 @@ impl sinomo_core::cluster::ClusterJoinRegistrationAsyncHost
             .local_daemon_membership_observation_async(paths, state)
     }
 
-    fn commit_join_registration_state_async<'a>(
+    fn authoritative_cluster_kv_snapshot_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
+        state: &'a mut ClusterBootstrapState,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let mut host = DaemonClusterMemberMutationHost::new_on_runtime(&runtime);
+            sinomo_core::cluster::ClusterMemberMutationAsyncHost::authoritative_cluster_kv_snapshot_async(
+                &mut host,
+                paths,
+                state,
+            )
+            .await
+        })
+    }
+
+    fn commit_join_registration_txn_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvTxnCommitResult,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let mut host = DaemonClusterMemberMutationHost::new_on_runtime(&runtime);
+            sinomo_core::cluster::ClusterMemberMutationAsyncHost::commit_cluster_kv_txn_with_quorum_async(
+                &mut host,
+                paths,
+                state,
+                request,
+            )
+            .await
+        })
+    }
+
+    fn admit_cluster_raft_learner_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        node_id: &'a NodeId,
+        now: OffsetDateTime,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            sync_cluster_state_to_kv_async_on_runtime(paths, state, &runtime)
-                .await
-                .map_err(|error| {
-                    daemon_host_network_error("cluster join registration commit", error)
-                })
+            let mut host = DaemonClusterMemberMutationHost::new_on_runtime(&runtime);
+            sinomo_core::cluster::add_cluster_raft_learner_async_with_host(
+                paths, state, node_id, now, &mut host,
+            )
+            .await
         })
     }
 
@@ -2118,6 +2250,342 @@ fn daemon_cluster_publish_interval_on_runtime(
 static DAEMON_CLUSTER_STORAGE_MUTATION_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Daemon-specific maintenance adapter for reconciliation steps that
+/// require process and network-module evidence. Consensus work remains owned by
+/// `ClusterControlPlaneMaintenanceDriver`; these hooks reuse the daemon's
+/// existing quorum-backed node-status and member-publication paths.
+struct DaemonClusterKvMaintenanceDriver<'a> {
+    inner: sinomo_core::cluster::ClusterControlPlaneMaintenanceDriver<
+        'a,
+        DaemonClusterControlPlaneTransport,
+    >,
+    daemon_paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+}
+
+impl<'a> DaemonClusterKvMaintenanceDriver<'a> {
+    fn new(
+        runtime: &tokio::runtime::Handle,
+        daemon_paths: DaemonPaths,
+        driver: &'a mut sinomo_core::cluster::ClusterControlPlaneDriver<
+            DaemonClusterControlPlaneTransport,
+        >,
+    ) -> Self {
+        Self {
+            inner: sinomo_core::cluster::ClusterControlPlaneMaintenanceDriver::new(runtime, driver),
+            daemon_paths,
+            runtime: runtime.clone(),
+        }
+    }
+}
+
+fn daemon_cluster_kv_maintenance_network_error(
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> sinomo_core::network::NetworkError {
+    sinomo_core::network::NetworkError::Io {
+        operation: operation.to_string(),
+        detail: error.to_string(),
+    }
+}
+
+fn daemon_cluster_kv_maintenance_timeouts(
+    budget: Duration,
+) -> sinomo_core::cluster::ClusterControlPlaneTimeouts {
+    let budget = budget.max(Duration::from_millis(1));
+    let mut timeouts = cluster_control_plane_timeouts();
+    timeouts.raft_append_timeout = timeouts.raft_append_timeout.min(budget);
+    timeouts.rpc_timeout = timeouts.rpc_timeout.min(budget);
+    timeouts.membership_rpc_timeout = timeouts.membership_rpc_timeout.min(budget);
+    timeouts.raft_campaign_jitter_max = timeouts.raft_campaign_jitter_max.min(budget);
+    timeouts.tcp_command_timeout = timeouts.tcp_command_timeout.min(budget);
+    timeouts.iroh_command_timeout = timeouts.iroh_command_timeout.min(budget);
+    timeouts.tcp_foreground_attempt_timeout = timeouts.tcp_foreground_attempt_timeout.min(budget);
+    timeouts.public_foreground_attempt_timeout =
+        timeouts.public_foreground_attempt_timeout.min(budget);
+    timeouts.iroh_foreground_attempt_timeout = timeouts.iroh_foreground_attempt_timeout.min(budget);
+    timeouts
+}
+
+impl sinomo_core::cluster::ClusterKvMaintenanceHost for DaemonClusterKvMaintenanceDriver<'_> {
+    fn refresh_leader_and_term_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        sinomo_core::cluster::ClusterKvMaintenanceHost::refresh_leader_and_term_async(
+            &mut self.inner,
+            paths,
+            state,
+            budget,
+        )
+    }
+
+    fn heartbeat_and_catch_up_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        sinomo_core::cluster::ClusterKvMaintenanceHost::heartbeat_and_catch_up_async(
+            &mut self.inner,
+            paths,
+            state,
+            budget,
+        )
+    }
+
+    fn refresh_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        sinomo_core::cluster::ClusterKvMaintenanceHost::refresh_snapshot_async(
+            &mut self.inner,
+            paths,
+            state,
+            budget,
+        )
+    }
+
+    fn drain_and_fan_out_watches_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        sinomo_core::cluster::ClusterKvMaintenanceHost::drain_and_fan_out_watches_async(
+            &mut self.inner,
+            paths,
+            state,
+            budget,
+        )
+    }
+
+    fn persist_peer_progress_hints_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        sinomo_core::cluster::ClusterKvMaintenanceHost::persist_peer_progress_hints_async(
+            &mut self.inner,
+            paths,
+            state,
+            budget,
+        )
+    }
+
+    fn reconcile_config_changes_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        let runtime = self.runtime.clone();
+        let worker_runtime = runtime.clone();
+        let paths = paths.clone();
+        let mut recovery_state = state.clone();
+        let operation_budget = budget
+            .checked_div(6)
+            .unwrap_or(budget)
+            .max(Duration::from_millis(1));
+        Box::pin(async move {
+            let (next_state, report) = runtime
+                .spawn_blocking(move || {
+                    let mut host = DaemonClusterMemberMutationHost::new_on_runtime_with_timeouts(
+                        &worker_runtime,
+                        daemon_cluster_kv_maintenance_timeouts(operation_budget),
+                    );
+                    let report = sinomo_core::cluster::reconcile_cluster_raft_config_changes_bounded_with_host(
+                        &paths,
+                        &mut recovery_state,
+                        OffsetDateTime::now_utc(),
+                        1,
+                        &mut host,
+                    )?;
+                    Ok::<_, sinomo_core::network::NetworkError>((recovery_state, report))
+                })
+                .await
+                .map_err(|source| sinomo_core::network::NetworkError::Io {
+                    operation: "reactive Raft config lifecycle recovery".to_string(),
+                    detail: format!("config lifecycle recovery task failed: {source}"),
+                })??;
+            *state = next_state;
+            if report.deferred_change_count > 0 {
+                return Err(sinomo_core::network::NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "reconciled one Raft config lifecycle record; {} remain for a bounded retry",
+                        report.deferred_change_count
+                    ),
+                });
+            }
+            if report.committed_change_ids.is_empty() && report.failed_change_ids.is_empty() {
+                return Ok(
+                    sinomo_core::cluster::ClusterKvMaintenanceActionResult::skipped(
+                        "config_change_recovery_idle",
+                        "no nonterminal Raft config lifecycle records required recovery",
+                    ),
+                );
+            }
+            Ok(
+                sinomo_core::cluster::ClusterKvMaintenanceActionResult::completed(
+                    "config_change_recovery_completed",
+                    format!(
+                        "resumed {}, committed {}, failed {} Raft config lifecycle record(s)",
+                        report.resumed_change_ids.len(),
+                        report.committed_change_ids.len(),
+                        report.failed_change_ids.len()
+                    ),
+                ),
+            )
+        })
+    }
+
+    fn compact_raft_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        sinomo_core::cluster::ClusterKvMaintenanceHost::compact_raft_async(
+            &mut self.inner,
+            paths,
+            state,
+            budget,
+        )
+    }
+
+    fn publish_node_status_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        let daemon_paths = self.daemon_paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let outcome = refresh_daemon_node_status_in_kv_async_with_timeouts(
+                &daemon_paths,
+                runtime,
+                daemon_cluster_kv_maintenance_timeouts(budget),
+            )
+            .await
+            .map_err(|error| {
+                daemon_cluster_kv_maintenance_network_error(
+                    "reactive node status reconciliation",
+                    error,
+                )
+            })?;
+            Ok(
+                sinomo_core::cluster::ClusterKvMaintenanceActionResult::completed(
+                    "node_status_reconciled",
+                    format!(
+                        "network info published: {}; node status published: {}",
+                        outcome.network_info_published, outcome.node_status_published
+                    ),
+                ),
+            )
+        })
+    }
+
+    fn publish_endpoint_observations_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        budget: Duration,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
+    > {
+        let daemon_paths = self.daemon_paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let observation = local_daemon_membership_observation_from_daemon_paths_async(
+                &daemon_paths,
+                state,
+                &runtime,
+            )
+            .await
+            .map_err(|error| {
+                daemon_cluster_kv_maintenance_network_error(
+                    "reactive daemon endpoint observation",
+                    error,
+                )
+            })?;
+            let refresh = sinomo_core::cluster::refresh_local_daemon_membership_from_disk_async(
+                &runtime,
+                paths,
+                state,
+                observation,
+            )
+            .await?;
+            let network_module_endpoints_changed =
+                refresh_local_network_module_endpoints(state, OffsetDateTime::now_utc()).map_err(
+                    |error| {
+                        daemon_cluster_kv_maintenance_network_error(
+                            "reactive network module endpoint observation",
+                            error,
+                        )
+                    },
+                )?;
+            let local_state_changed = refresh.changed() || network_module_endpoints_changed;
+            if local_state_changed {
+                sinomo_core::cluster::write_cluster_state_async(&runtime, paths, state).await?;
+            }
+            let publication = publish_local_members_to_quorum_if_needed_async(
+                paths,
+                state,
+                false,
+                runtime,
+                daemon_cluster_kv_maintenance_timeouts(budget),
+            )
+            .await
+            .map_err(|error| {
+                daemon_cluster_kv_maintenance_network_error(
+                    "reactive endpoint quorum publication",
+                    error,
+                )
+            })?;
+            Ok(
+                sinomo_core::cluster::ClusterKvMaintenanceActionResult::completed(
+                    "endpoint_observations_reconciled",
+                    format!(
+                        "local state changed: {local_state_changed}; quorum publication committed: {}",
+                        publication.is_some()
+                    ),
+                ),
+            )
+        })
+    }
+}
+
 impl ClusterNetworkMaintenance {
     pub async fn with_idle_stats(idle_stats: Arc<IdleStatsAtomics>) -> Self {
         let now = Instant::now();
@@ -2166,6 +2634,49 @@ impl ClusterNetworkMaintenance {
     ) -> Self {
         self.service_registry = Some(service_registry);
         self
+    }
+
+    pub(crate) async fn run_reactive_cluster_kv_maintenance_async(
+        &mut self,
+        paths: &DaemonPaths,
+        wake: sinomo_core::cluster::ClusterKvMaintenanceWakeBatch,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Option<sinomo_core::cluster::ClusterKvMaintenanceReport>, DaemonError> {
+        let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+        let state_path = cluster_paths.state.clone();
+        let state_exists = tokio::task::spawn_blocking(move || state_path.exists())
+            .await
+            .map_err(|source| DaemonError::Io {
+                path: cluster_paths.state.display().to_string(),
+                detail: format!("cluster state existence task failed: {source}"),
+            })?;
+        if !state_exists {
+            return Ok(None);
+        }
+
+        // Membership changes and leave quarantine replace these files as one
+        // unit. Reuse the daemon's existing storage mutation boundary so a
+        // reactive pass cannot reopen or commit into a generation being moved.
+        let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.lock().await;
+        let mut state =
+            sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
+                .await
+                .map_err(DaemonError::from)?;
+        let mut driver = daemon_cluster_control_plane_driver_on_runtime(&runtime);
+        let mut maintenance_host =
+            DaemonClusterKvMaintenanceDriver::new(&runtime, paths.clone(), &mut driver);
+        let report = sinomo_core::cluster::run_cluster_kv_maintenance_tick_with_host(
+            &cluster_paths,
+            &mut state,
+            wake,
+            sinomo_core::cluster::ClusterKvMaintenanceOptions {
+                total_budget: Duration::from_secs(6),
+                max_step_budget: Duration::from_millis(750),
+            },
+            &mut maintenance_host,
+        )
+        .await;
+        Ok(Some(report))
     }
 
     pub async fn tick_async(
@@ -2310,7 +2821,10 @@ impl ClusterNetworkMaintenance {
             self.kv_snapshot_pull_failure_streak = 0;
             if publish_due {
                 self.last_publish = now;
-                if let Err(error) = self.reconcile_desired_rollout(paths, &cluster_paths, &state) {
+                if let Err(error) = self
+                    .reconcile_desired_rollout(paths, &cluster_paths, &state, &runtime)
+                    .await
+                {
                     tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
                 }
             }
@@ -2419,8 +2933,9 @@ impl ClusterNetworkMaintenance {
                         use_formation_timeouts,
                     });
                 if daemon_paths_are_shadow(paths)
-                    && let Err(error) =
-                        self.reconcile_desired_rollout(paths, &cluster_paths, &state)
+                    && let Err(error) = self
+                        .reconcile_desired_rollout(paths, &cluster_paths, &state, &runtime)
+                        .await
                 {
                     tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
                 }
@@ -2676,13 +3191,24 @@ impl ClusterNetworkMaintenance {
         self.last_discovery = now.checked_sub(discovery_interval).unwrap_or(now);
     }
 
-    fn reconcile_desired_rollout(
+    async fn reconcile_desired_rollout(
         &mut self,
         paths: &DaemonPaths,
-        cluster_paths: &ClusterPaths,
+        _cluster_paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
+        runtime: &tokio::runtime::Handle,
     ) -> Result<(), DaemonError> {
-        let Some(desired) = sinomo_rollout::read_cluster_rollout_desired_from_kv(cluster_paths)?
+        let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
+        let authoritative =
+            handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
+                paths,
+                &payload.body,
+                true,
+                runtime,
+            )
+            .await?;
+        let Some(desired) =
+            sinomo_rollout::project_cluster_rollout_desired_from_snapshot(&authoritative.value)?
         else {
             return Ok(());
         };
@@ -5371,12 +5897,15 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
     daemon_paths: &DaemonPaths,
     paths: &ClusterPaths,
     invite: &sinomo_core::ClusterJoinInvite,
-    source: ClusterBootstrapState,
+    mut source: ClusterBootstrapState,
     requested_node_display_name: Option<String>,
     requested_node_role: ClusterNodeRole,
     timestamp: OffsetDateTime,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterControlJoinResponse, DaemonError> {
+    crate::control::request_daemon_cluster_kv_maintenance(
+        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MigrationOperation,
+    );
     // Serialize against the maintenance tick for the whole freeze -> join ->
     // import window, like the leave handler: the tick must not commit into
     // storage being moved aside (this handler runs on a blocking service
@@ -5386,11 +5915,14 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
         let source_name = source.local_node_display_name.trim();
         (!source_name.is_empty()).then(|| source_name.to_string())
     });
-    let report = sinomo_core::cluster::plan_cluster_migration(
+    let mut source_host = DaemonClusterMemberMutationHost::new_on_runtime(runtime);
+    let report = sinomo_core::cluster::plan_cluster_migration_with_host(
         paths,
+        &mut source,
         invite,
         sinomo_core::ClusterMigrationMode::SingleNode,
         timestamp,
+        &mut source_host,
     )?;
     if report.migration.source_cluster_id != source.cluster_id {
         return Err(DaemonError::Parse {
@@ -5400,7 +5932,12 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
     }
 
     let mut migration = report.migration;
-    sinomo_core::cluster::write_cluster_migration_record_to_source_kv(paths, &migration)?;
+    sinomo_core::cluster::write_cluster_migration_record_to_source_kv_with_host(
+        paths,
+        &mut source,
+        &migration,
+        &mut source_host,
+    )?;
     // The DFS metadata shards ride along into the import namespace; this r1
     // layout knowledge stays out of the r0 quarantine helper.
     let dfs_moves: Vec<(std::path::PathBuf, std::path::PathBuf)> = paths
@@ -5499,6 +6036,9 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
                 imported_node_local_config_keys: kv_import.imported_node_local_config_keys.len(),
                 deferred_node_local_config_keys: kv_import.deferred_node_local_config_keys.len(),
             });
+            crate::control::request_daemon_cluster_kv_maintenance(
+                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MigrationOperation,
+            );
             Ok(response)
         }
         Err(error) => {
@@ -5512,6 +6052,9 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
                 &migration,
             );
             sinomo_core::cluster::rollback_cluster_storage_quarantine(&quarantine)?;
+            crate::control::request_daemon_cluster_kv_maintenance(
+                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MigrationOperation,
+            );
             Err(error)
         }
     }
@@ -5565,27 +6108,41 @@ struct DaemonClusterInvitePublishHost {
 impl sinomo_core::cluster::ClusterInvitePublishHost for DaemonClusterInvitePublishHost {
     type Error = DaemonError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        sinomo_core::cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
+            &mut self.inner,
+            paths,
+            state,
+        )
+        .map_err(Into::into)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, Self::Error> {
         sinomo_core::cluster::ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
             &mut self.inner,
             paths,
             state,
-            txn,
+            request,
         )
         .map_err(Into::into)
     }
 }
 
 /// `/cluster/control/invite`: create, sign, and publish a join invite.
-pub(crate) fn handle_daemon_cluster_control_invite_on_runtime(
+pub(crate) fn handle_daemon_cluster_control_invite_with_authority_on_runtime(
     daemon_paths: &DaemonPaths,
     request: ClusterControlInviteRequest,
     runtime: &tokio::runtime::Handle,
+    remote_authority: Option<RemoteClusterControlAuthorityFence>,
 ) -> Result<ClusterControlInviteResponse, DaemonError> {
     let paths = cluster_paths_from_daemon_paths(daemon_paths)?;
     paths.ensure()?;
@@ -5629,7 +6186,8 @@ pub(crate) fn handle_daemon_cluster_control_invite_on_runtime(
     )?;
     let uri = sinomo_core::cluster::encode_cluster_join_invite(&invite)?;
     let mut host = DaemonClusterInvitePublishHost {
-        inner: DaemonClusterMemberMutationHost::new_on_runtime(runtime),
+        inner: DaemonClusterMemberMutationHost::new_on_runtime(runtime)
+            .with_remote_control_authority(remote_authority),
     };
     sinomo_core::cluster::publish_cluster_invitation_to_quorum_with_host(
         &paths, &state, &invite, &mut host,
@@ -5642,10 +6200,11 @@ pub(crate) fn handle_daemon_cluster_control_invite_on_runtime(
 }
 
 /// `/cluster/control/rename`: rename a member (the local node by default).
-pub(crate) fn handle_daemon_cluster_control_rename_on_runtime(
+pub(crate) fn handle_daemon_cluster_control_rename_with_authority_on_runtime(
     daemon_paths: &DaemonPaths,
     request: ClusterControlRenameRequest,
     runtime: &tokio::runtime::Handle,
+    remote_authority: Option<RemoteClusterControlAuthorityFence>,
 ) -> Result<ClusterControlRenameResponse, DaemonError> {
     // Every pre-refactor entry point (the CLI parser) required a non-empty
     // display name; keep that contract at the daemon boundary.
@@ -5659,13 +6218,15 @@ pub(crate) fn handle_daemon_cluster_control_rename_on_runtime(
     let node_id = request
         .node_id
         .unwrap_or_else(|| state.local_node_id.clone());
+    let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime)
+        .with_remote_control_authority(remote_authority);
     let update = sinomo_core::cluster::update_cluster_node_name_with_host(
         &paths,
         state,
         node_id,
         request.display_name,
         OffsetDateTime::now_utc(),
-        &mut DaemonClusterMemberMutationHost::new_on_runtime(runtime),
+        &mut host,
     )?;
     if update.changed {
         crate::control::request_daemon_cluster_maintenance_refresh();
@@ -5679,14 +6240,16 @@ pub(crate) fn handle_daemon_cluster_control_rename_on_runtime(
 }
 
 /// `/cluster/control/role`: change a member's node role.
-pub(crate) fn handle_daemon_cluster_control_role_on_runtime(
+pub(crate) fn handle_daemon_cluster_control_role_with_authority_on_runtime(
     daemon_paths: &DaemonPaths,
     request: ClusterControlRoleRequest,
     runtime: &tokio::runtime::Handle,
+    remote_authority: Option<RemoteClusterControlAuthorityFence>,
 ) -> Result<ClusterControlRoleResponse, DaemonError> {
     let paths = cluster_paths_from_daemon_paths(daemon_paths)?;
     let state = daemon_cluster_control_state(&paths)?;
-    let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime);
+    let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime)
+        .with_remote_control_authority(remote_authority);
     // Older single-node app clusters can have a valid local member in
     // state.sobj but no corresponding materialized KV row. Repair that
     // authority gap before applying the typed role update so an app upgrade
@@ -5718,18 +6281,21 @@ pub(crate) fn handle_daemon_cluster_control_role_on_runtime(
 }
 
 /// `/cluster/control/remove`: remove members by node id.
-pub(crate) fn handle_daemon_cluster_control_remove_on_runtime(
+pub(crate) fn handle_daemon_cluster_control_remove_with_authority_on_runtime(
     daemon_paths: &DaemonPaths,
     request: ClusterControlRemoveRequest,
     runtime: &tokio::runtime::Handle,
+    remote_authority: Option<RemoteClusterControlAuthorityFence>,
 ) -> Result<ClusterControlRemoveResponse, DaemonError> {
     let paths = cluster_paths_from_daemon_paths(daemon_paths)?;
     let state = daemon_cluster_control_state(&paths)?;
+    let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime)
+        .with_remote_control_authority(remote_authority);
     let removal = sinomo_core::cluster::remove_cluster_members_with_host(
         &paths,
         state,
         request.node_ids,
-        &mut DaemonClusterMemberMutationHost::new_on_runtime(runtime),
+        &mut host,
     )?;
     Ok(ClusterControlRemoveResponse {
         removed: removal
@@ -5758,6 +6324,19 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
         Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
         Err(error) => return Err(error.into()),
     };
+    // Leaving an initialized cluster is a cluster-level decision: establish a
+    // fresh current-term quorum barrier before moving any live state aside.
+    // Orphan recovery (artifacts without state.sobj) remains a local cleanup
+    // path because there is no cluster identity against which to prove quorum.
+    if let Some(mut consensus_state) = existing.clone() {
+        let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime);
+        sinomo_core::cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
+            &mut host,
+            &paths,
+            &mut consensus_state,
+        )?;
+    }
+    let leave_id = Id::generate();
     let previous_cluster_id = existing.as_ref().map(|state| state.cluster_id.clone());
     let local_node_id = existing
         .as_ref()
@@ -5793,8 +6372,7 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
     let quarantine =
         if existing.is_some() || sinomo_core::cluster::cluster_storage_has_live_artifacts(&paths) {
             Some(sinomo_core::cluster::quarantine_cluster_storage_for_leave(
-                &paths,
-                &Id::generate(),
+                &paths, &leave_id,
             )?)
         } else {
             None
@@ -5845,26 +6423,205 @@ fn update_cluster_node_role(
 
 pub(crate) struct DaemonClusterMemberMutationHost {
     runtime: tokio::runtime::Handle,
+    remote_control_authority: Option<RemoteClusterControlAuthorityFence>,
     driver: sinomo_core::cluster::ClusterMemberMutationDriver<
         DaemonClusterControlPlaneTransport,
         DaemonClusterStateSyncMembershipObserver,
     >,
 }
 
+/// Exact quorum-observed authorization evidence for one remote cluster-control
+/// request. Every downstream transaction compares both the value and modify
+/// revision of all three authority rows, closing the gap between service-level
+/// authorization and the mutation's Raft commit.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteClusterControlAuthorityFence {
+    signer_node_id: NodeId,
+    signer_public_key: String,
+    entries: [sinomo_core::kv::KvEntry; 3],
+}
+
+impl RemoteClusterControlAuthorityFence {
+    pub(crate) fn new(
+        signer_node_id: NodeId,
+        signer_public_key: String,
+        member: sinomo_core::kv::KvEntry,
+        config: sinomo_core::kv::KvEntry,
+        capability_policy: sinomo_core::kv::KvEntry,
+    ) -> Self {
+        Self {
+            signer_node_id,
+            signer_public_key,
+            entries: [member, config, capability_policy],
+        }
+    }
+
+    fn validate_entries(
+        &self,
+        entries: &[sinomo_core::kv::KvEntry; 3],
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        let member: ClusterMemberRecord = entries[0].decode().map_err(|error| {
+            sinomo_core::network::NetworkError::InvalidClusterCommand {
+                detail: format!("remote cluster-control member evidence is invalid: {error}"),
+            }
+        })?;
+        let config: sinomo_core::kv::ClusterKvRaftConfigRecord =
+            entries[1].decode().map_err(|error| {
+                sinomo_core::network::NetworkError::InvalidClusterCommand {
+                    detail: format!("remote cluster-control config evidence is invalid: {error}"),
+                }
+            })?;
+        let policy: sinomo_core::node::ClusterCapabilityPolicyRecord =
+            entries[2].decode().map_err(|error| {
+                sinomo_core::network::NetworkError::InvalidClusterCommand {
+                    detail: format!("remote cluster-control policy evidence is invalid: {error}"),
+                }
+            })?;
+        let required = sinomo_core::cluster::CLUSTER_CONTROL_ADMIN_CAPABILITY;
+        if member.node_id != self.signer_node_id
+            || member.node_public_key != self.signer_public_key
+            || !member.has_raft_vote()
+            || config.cluster_id != member.cluster_id
+            || !config.voters.contains(&self.signer_node_id)
+            || policy.cluster_id != member.cluster_id
+            || policy.node_id != self.signer_node_id
+            || !policy
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == required)
+            || !policy
+                .allowed_capabilities
+                .iter()
+                .any(|capability| capability.as_str() == required)
+        {
+            return Err(sinomo_core::network::NetworkError::InvalidClusterCommand {
+                detail: "remote cluster-control authority was revoked during the mutation"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fence_request(
+        &self,
+        mut request: sinomo_core::kv::KvTxnRequest,
+    ) -> Result<sinomo_core::kv::KvTxnRequest, sinomo_core::network::NetworkError> {
+        if !request.txn.failure.is_empty() {
+            return Err(sinomo_core::network::NetworkError::InvalidClusterCommand {
+                detail: "remote cluster-control mutations cannot contain failure-branch operations because authorization guards must fail closed"
+                    .to_string(),
+            });
+        }
+        let guard_count = self.entries.len().saturating_mul(2);
+        let compare_count = request
+            .txn
+            .compares
+            .len()
+            .checked_add(guard_count)
+            .unwrap_or(usize::MAX);
+        if compare_count > sinomo_core::kv::MAX_KV_TXN_COMPARES {
+            let error = sinomo_core::kv::KvError::TxnLimit {
+                compares: compare_count,
+                success_ops: request.txn.success.len(),
+                failure_ops: request.txn.failure.len(),
+                max_compares: sinomo_core::kv::MAX_KV_TXN_COMPARES,
+                max_ops_per_branch: sinomo_core::kv::MAX_KV_TXN_OPS_PER_BRANCH,
+            };
+            return Err(sinomo_core::network::NetworkError::InvalidClusterCommand {
+                detail: error.to_string(),
+            });
+        }
+        request.txn.compares.try_reserve(guard_count).map_err(|_| {
+            let error = sinomo_core::kv::KvError::ResourceExhausted {
+                operation: "remote cluster-control authorization guards".to_string(),
+                requested_bytes: compare_count
+                    .saturating_mul(std::mem::size_of::<sinomo_core::kv::KvCompare>().max(1)),
+            };
+            sinomo_core::network::NetworkError::InvalidClusterCommand {
+                detail: error.to_string(),
+            }
+        })?;
+        for entry in &self.entries {
+            request
+                .txn
+                .compares
+                .push(sinomo_core::kv::KvCompare::ModifyRevisionEquals {
+                    key: entry.key.clone(),
+                    revision: entry.modify_revision,
+                });
+            request
+                .txn
+                .compares
+                .push(sinomo_core::kv::KvCompare::ValueEquals {
+                    key: entry.key.clone(),
+                    value: entry.value.clone(),
+                });
+        }
+        Ok(request)
+    }
+
+    fn confirm_commit_and_advance(
+        &mut self,
+        result: &sinomo_core::kv::ClusterKvTxnCommitResult,
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        if !result
+            .txn_response
+            .as_ref()
+            .is_some_and(|response| response.succeeded)
+        {
+            return Err(sinomo_core::network::NetworkError::InvalidClusterCommand {
+                detail: "remote cluster-control authority changed before the mutation committed"
+                    .to_string(),
+            });
+        }
+        let mut next_entries = self.entries.clone();
+        for entry in &mut next_entries {
+            *entry = result.snapshot.get(&entry.key).cloned().ok_or_else(|| {
+                sinomo_core::network::NetworkError::InvalidClusterCommand {
+                    detail: format!(
+                        "remote cluster-control authority row `{}` disappeared during the mutation",
+                        entry.key
+                    ),
+                }
+            })?;
+        }
+        self.validate_entries(&next_entries)?;
+        self.entries = next_entries;
+        Ok(())
+    }
+}
+
 impl DaemonClusterMemberMutationHost {
     pub(crate) fn new_on_runtime(runtime: &tokio::runtime::Handle) -> Self {
+        Self::new_on_runtime_with_timeouts(runtime, cluster_control_plane_timeouts())
+    }
+
+    fn new_on_runtime_with_timeouts(
+        runtime: &tokio::runtime::Handle,
+        timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+    ) -> Self {
         let runtime = runtime.clone();
         Self {
             runtime: runtime.clone(),
+            remote_control_authority: None,
             driver: sinomo_core::cluster::ClusterMemberMutationDriver::new(
-                daemon_cluster_control_plane_driver_with_mode(DaemonClusterRpcMode::new(
-                    runtime.clone(),
-                )),
+                daemon_cluster_control_plane_driver_with_mode_and_timeouts(
+                    DaemonClusterRpcMode::new(runtime.clone()),
+                    timeouts,
+                ),
                 DaemonClusterStateSyncMembershipObserver {
                     runtime: runtime.clone(),
                 },
             ),
         }
+    }
+
+    pub(crate) fn with_remote_control_authority(
+        mut self,
+        authority: Option<RemoteClusterControlAuthorityFence>,
+    ) -> Self {
+        self.remote_control_authority = authority;
+        self
     }
 }
 
@@ -5985,12 +6742,13 @@ impl sinomo_core::cluster::ClusterMemberMutationHost for DaemonClusterMemberMuta
         )
     }
 
-    fn current_cluster_kv_store(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<InProcessKvStore, sinomo_core::network::NetworkError> {
-        sinomo_core::cluster::ClusterMemberMutationHost::current_cluster_kv_store(
+        state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>, sinomo_core::network::NetworkError>
+    {
+        sinomo_core::cluster::ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(
             &mut self.driver,
             paths,
             state,
@@ -6001,34 +6759,79 @@ impl sinomo_core::cluster::ClusterMemberMutationHost for DaemonClusterMemberMuta
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
-        sinomo_core::cluster::ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, sinomo_core::network::NetworkError> {
+        let request = match self.remote_control_authority.as_ref() {
+            Some(authority) => authority.fence_request(request)?,
+            None => request,
+        };
+        let result =
+            sinomo_core::cluster::ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
+                &mut self.driver,
+                paths,
+                state,
+                request,
+            )?;
+        if let Some(authority) = self.remote_control_authority.as_mut() {
+            authority.confirm_commit_and_advance(&result)?;
+        }
+        Ok(result)
+    }
+
+    fn prove_cluster_raft_member_caught_up(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        node_id: &NodeId,
+        required_log_index: u64,
+        now: OffsetDateTime,
+    ) -> Result<sinomo_core::kv::ClusterKvRaftCatchUpProof, sinomo_core::network::NetworkError>
+    {
+        sinomo_core::cluster::ClusterMemberMutationHost::prove_cluster_raft_member_caught_up(
             &mut self.driver,
             paths,
             state,
-            txn,
+            node_id,
+            required_log_index,
+            now,
         )
     }
+}
+
+async fn commit_cluster_kv_request_with_quorum_async_on_transport(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    request: sinomo_core::kv::KvTxnRequest,
+    allow_forwarding: bool,
+    transport: &mut DaemonClusterControlPlaneTransport,
+) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, sinomo_core::network::NetworkError> {
+    let runtime = transport.rpc_mode.runtime().clone();
+    let options = transport.cluster_kv_txn_quorum_options(allow_forwarding);
+    let previous_paths = transport.active_cluster_paths.replace(paths.clone());
+    let result = sinomo_core::cluster::commit_cluster_kv_txn_with_quorum_response_async_with_host(
+        &runtime, paths, state, request, options, transport,
+    )
+    .await;
+    transport.active_cluster_paths = previous_paths;
+    result
 }
 
 async fn commit_cluster_kv_txn_with_quorum_async_on_transport(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    txn: KvTxn,
+    request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
     transport: &mut DaemonClusterControlPlaneTransport,
 ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
-    let runtime = transport.rpc_mode.runtime().clone();
-    let options = transport.cluster_kv_txn_quorum_options(allow_forwarding);
-    let previous_paths = transport.active_cluster_paths.replace(paths.clone());
-    let result = sinomo_core::cluster::commit_cluster_kv_txn_with_quorum_response_async_with_host(
-        &runtime, paths, state, txn, options, transport,
+    commit_cluster_kv_request_with_quorum_async_on_transport(
+        paths,
+        state,
+        request,
+        allow_forwarding,
+        transport,
     )
     .await
-    .map(|result| result.snapshot);
-    transport.active_cluster_paths = previous_paths;
-    result
+    .map(|result| result.snapshot)
 }
 
 #[cfg(not(test))]
@@ -6205,19 +7008,33 @@ impl sinomo_core::cluster::ClusterMemberMutationAsyncHost for DaemonClusterMembe
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvTxnCommitResult,
+    > {
+        let request = match self.remote_control_authority.as_ref() {
+            Some(authority) => match authority.fence_request(request) {
+                Ok(request) => request,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            },
+            None => request,
+        };
         let runtime = self.runtime.clone();
         Box::pin(async move {
             let mut transport = DaemonClusterControlPlaneTransport::new(runtime);
-            commit_cluster_kv_txn_with_quorum_async_on_transport(
+            let result = commit_cluster_kv_request_with_quorum_async_on_transport(
                 paths,
                 state,
-                txn,
+                request,
                 true,
                 &mut transport,
             )
-            .await
+            .await?;
+            if let Some(authority) = self.remote_control_authority.as_mut() {
+                authority.confirm_commit_and_advance(&result)?;
+            }
+            Ok(result)
         })
     }
 }
@@ -6402,7 +7219,8 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
         timeout: Duration,
     ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
         let runtime = self.rpc_mode.runtime();
-        fetch_cluster_kv_snapshot_from_endpoint_on_runtime(endpoint, timeout, runtime)
+        fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime(endpoint, timeout, runtime)
+            .map(|local| local.value)
             .map_err(|error| daemon_host_network_error("cluster kv snapshot", error))
     }
 
@@ -6712,15 +7530,48 @@ impl sinomo_core::cluster::ClusterLocalMemberPublishAsyncHost
         })
     }
 
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>,
+    > {
+        Box::pin(async move {
+            let result = commit_cluster_kv_request_with_quorum_async_on_transport(
+                paths,
+                state,
+                sinomo_core::kv::KvTxnRequest::generated(sinomo_core::kv::KvTxn {
+                    compares: Vec::new(),
+                    success: Vec::new(),
+                    failure: Vec::new(),
+                }),
+                true,
+                self,
+            )
+            .await?;
+            Ok(sinomo_core::kv::KvAuthoritativeRead {
+                value: result.snapshot,
+                authority: result.authority,
+            })
+        })
+    }
+
     fn commit_cluster_kv_txn_with_quorum_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::kv::ClusterKvTxnCommitResult,
+    > {
         Box::pin(async move {
-            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, txn, true, self)
-                .await
+            commit_cluster_kv_request_with_quorum_async_on_transport(
+                paths, state, request, true, self,
+            )
+            .await
         })
     }
 
@@ -6777,10 +7628,10 @@ impl sinomo_core::cluster::ClusterConnectivityPublishAsyncHost
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: sinomo_core::kv::KvTxnRequest,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
-            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, txn, true, self)
+            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, request, true, self)
                 .await
         })
     }
@@ -6814,10 +7665,10 @@ impl sinomo_core::cluster::ClusterNetworkInfoPublishAsyncHost
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: sinomo_core::kv::KvTxnRequest,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
-            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, txn, true, self)
+            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, request, true, self)
                 .await
         })
     }
@@ -6851,10 +7702,10 @@ impl sinomo_core::cluster::ClusterNodeStatusPublishAsyncHost
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: sinomo_core::kv::KvTxnRequest,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
-            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, txn, true, self)
+            commit_cluster_kv_txn_with_quorum_async_on_transport(paths, state, request, true, self)
                 .await
         })
     }
@@ -7101,7 +7952,7 @@ async fn force_sync_cluster_node_status_to_kv_async_with_timeouts(
             &mut host,
             paths,
             &mut state,
-            txn,
+            sinomo_core::kv::KvTxnRequest::generated(txn),
         )
         .await
         .map_err(DaemonError::from)?;
@@ -7494,6 +8345,13 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
             cluster_control_plane_timeouts(),
             move || daemon_cluster_control_plane_driver_on_runtime(&host_runtime),
         );
+        // Local daemon-owned commits do not cross the RPC service boundary.
+        // Deliver their post-commit wake here so DFS, rollout, and other
+        // in-process writers receive the same reactive catch-up behavior as a
+        // client transaction.
+        crate::control::request_daemon_cluster_kv_maintenance(
+            sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RaftProgress,
+        );
     } else {
         let _ = (paths, state, events);
         tracing::warn!(
@@ -7580,7 +8438,7 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding_on_runtime(
     let result = sinomo_core::cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         state,
-        txn,
+        sinomo_core::kv::KvTxnRequest::generated(txn),
         cluster_kv_txn_quorum_options(allow_forwarding),
         &mut host,
     )?;
@@ -7637,6 +8495,128 @@ fn cluster_kv_txn_quorum_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reactive_maintenance_uses_daemon_status_and_endpoint_reconciliation_hooks() {
+        let root = unique_cluster_test_root("sinomo-daemon-reactive-publication-hooks");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = initialize_local_cluster_on_runtime(
+            &cluster_paths,
+            Some(
+                ClusterId::from_legacy_named("cluster_daemon_reactive_publication_hooks")
+                    .expect("cluster"),
+            ),
+            Some(
+                NodeId::from_legacy_named("node_daemon_reactive_publication_hooks").expect("node"),
+            ),
+            "reactive publication hooks".to_string(),
+            "reactive publication hooks".to_string(),
+            ClusterNodeRole::default(),
+            OffsetDateTime::now_utc(),
+            &tokio::runtime::Handle::current(),
+        )
+        .expect("initialize cluster");
+        let cluster = daemon_cluster_status(&state, crate::DaemonClusterProcess::Main)
+            .expect("daemon cluster status");
+        write_daemon_status(
+            &daemon_paths,
+            &crate::DaemonStatus::new(&DaemonRunOptions::default(), &daemon_paths, Some(cluster)),
+        )
+        .expect("write daemon status");
+
+        let mut maintenance =
+            ClusterNetworkMaintenance::with_idle_stats(Arc::new(IdleStatsAtomics::new())).await;
+        let report = maintenance
+            .run_reactive_cluster_kv_maintenance_async(
+                &daemon_paths,
+                sinomo_core::cluster::ClusterKvMaintenanceWakeBatch {
+                    sources: vec![
+                        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::DaemonStartup,
+                    ],
+                    coalesced_wake_count: 1,
+                    saturated_wake_count: 0,
+                },
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("reactive maintenance")
+            .expect("initialized cluster report");
+
+        for step in [
+            sinomo_core::cluster::ClusterKvMaintenanceStep::NodeStatusPublish,
+            sinomo_core::cluster::ClusterKvMaintenanceStep::EndpointObservationPublish,
+        ] {
+            let evidence = report
+                .evidence
+                .iter()
+                .find(|evidence| evidence.step == step)
+                .expect("publication evidence");
+            assert_eq!(
+                evidence.disposition,
+                sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::Completed,
+                "production daemon hook must reconcile {step:?}: {}",
+                evidence.detail
+            );
+            assert!(!evidence.code.ends_with("hook_unavailable"));
+        }
+        let config_recovery = report
+            .evidence
+            .iter()
+            .find(|evidence| {
+                evidence.step
+                    == sinomo_core::cluster::ClusterKvMaintenanceStep::ConfigChangeReconcile
+            })
+            .expect("config lifecycle recovery evidence");
+        assert_eq!(
+            config_recovery.disposition,
+            sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::Skipped
+        );
+        assert_eq!(config_recovery.code, "config_change_recovery_idle");
+    }
+
+    #[test]
+    fn request_outcome_fails_closed_without_quorum_despite_local_rejection() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-kv-outcome-no-quorum");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data dir");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let request = sinomo_core::kv::KvCommandRequest::generated(KvCommand::Barrier);
+        sinomo_core::kv::mark_cluster_kv_request_rejected_before_commit(
+            &cluster_paths.kv_paths(),
+            &request,
+            "not leader",
+        )
+        .expect("local rejected outcome");
+        let payload = sinomo_core::kv::cluster_kv_request_outcome_rpc_payload(
+            &sinomo_core::kv::ClusterKvRequestOutcomeRequest {
+                request_id: request.request_id,
+            },
+        )
+        .expect("outcome payload");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let error = runtime
+            .block_on(
+                handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
+                    &daemon_paths,
+                    &payload.body,
+                    true,
+                    runtime.handle(),
+                ),
+            )
+            .expect_err("local attempt state must not bypass authority");
+
+        assert!(matches!(error, DaemonError::ClusterReadOnly { .. }));
+    }
 
     #[test]
     fn routed_raft_requests_have_operation_specific_retry_and_budget_markers() {
@@ -8081,9 +9061,9 @@ mod tests {
             &mut self,
             _paths: &ClusterPaths,
             _state: &mut ClusterBootstrapState,
-            txn: KvTxn,
+            request: sinomo_core::kv::KvTxnRequest,
         ) -> Result<KvSnapshot, Self::Error> {
-            self.commit(txn)
+            self.commit(request.txn)
         }
     }
 
@@ -8112,9 +9092,9 @@ mod tests {
             &mut self,
             _paths: &ClusterPaths,
             _state: &mut ClusterBootstrapState,
-            txn: KvTxn,
+            request: sinomo_core::kv::KvTxnRequest,
         ) -> Result<KvSnapshot, Self::Error> {
-            self.commit(txn)
+            self.commit(request.txn)
         }
     }
 
@@ -8146,9 +9126,9 @@ mod tests {
             &'a mut self,
             _paths: &'a ClusterPaths,
             _state: &'a mut ClusterBootstrapState,
-            txn: KvTxn,
+            request: sinomo_core::kv::KvTxnRequest,
         ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
-            Box::pin(async move { self.commit(txn) })
+            Box::pin(async move { self.commit(request.txn) })
         }
     }
 
@@ -8313,7 +9293,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_async_noop_publish_warms_cold_cache() {
+    fn connectivity_async_noop_publish_commits_barrier_and_warms_cache() {
         let (_root, paths, mut state) =
             seeded_single_node_cluster_for_publish_cache_test("publish_cache_connectivity_noop");
         let now = OffsetDateTime::now_utc();
@@ -8351,6 +9331,8 @@ mod tests {
             vec![record.clone()],
         )
         .expect("seed connectivity in kv");
+        let seeded = sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths)
+            .expect("seeded connectivity snapshot");
         let source_node_id = state.local_node_id.clone();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8371,11 +9353,12 @@ mod tests {
             )
             .expect("first no-op publish");
 
-        assert!(
-            first.is_none(),
-            "matching KV must not append a raft command"
+        assert_eq!(
+            first.as_ref().map(|snapshot| snapshot.revision),
+            Some(seeded.revision),
+            "the quorum barrier must not advance the semantic KV revision"
         );
-        assert_eq!(host.commits, 0);
+        assert_eq!(host.commits, 1, "a semantic no-op still crosses quorum");
         assert_eq!(
             host.remembered_connectivity, 1,
             "verified no-op must warm the process publish cache"
@@ -8394,11 +9377,17 @@ mod tests {
             )
             .expect("cached no-op publish");
 
-        assert!(second.is_none());
-        assert_eq!(host.commits, 0);
         assert_eq!(
-            host.remembered_connectivity, 1,
-            "cache hit must avoid repeating the full KV diff"
+            second.as_ref().map(|snapshot| snapshot.revision),
+            Some(seeded.revision)
+        );
+        assert_eq!(
+            host.commits, 2,
+            "each successful publication needs fresh quorum evidence"
+        );
+        assert_eq!(
+            host.remembered_connectivity, 2,
+            "each verified no-op refreshes the process cache from committed state"
         );
     }
 
@@ -8629,14 +9618,6 @@ mod tests {
         ) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError>
         {
             panic!("forwarded acceptance recorder should not send membership node RPCs")
-        }
-
-        fn commit_join_registration_state(
-            &mut self,
-            _paths: &ClusterPaths,
-            _state: &ClusterBootstrapState,
-        ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
-            panic!("forwarded acceptance recorder should not commit join state")
         }
 
         fn remember_successful_join_endpoint(
@@ -10196,13 +11177,14 @@ mod tests {
         .expect("remove legacy-missing member row");
 
         let runtime = daemon_cluster_test_runtime();
-        let update = handle_daemon_cluster_control_role_on_runtime(
+        let update = handle_daemon_cluster_control_role_with_authority_on_runtime(
             &daemon_paths,
             ClusterControlRoleRequest {
                 node_id: local_node.clone(),
                 role: ClusterNodeRole::Mobile,
             },
             runtime.handle(),
+            None,
         )
         .expect("repair member and update role");
 
@@ -12325,8 +13307,8 @@ mod tests {
     }
 
     #[test]
-    fn no_effect_cluster_kv_txn_with_quorum_does_not_append_raft_log_entry() {
-        let root = unique_cluster_test_root("sinomo-daemon-no-effect-kv-no-append");
+    fn no_effect_cluster_kv_txn_with_quorum_commits_without_advancing_revision() {
+        let root = unique_cluster_test_root("sinomo-daemon-no-effect-kv-commit");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
         let paths = ClusterPaths::new(&data_dir);
@@ -12380,7 +13362,7 @@ mod tests {
                 failure: Vec::new(),
             },
         )
-        .expect("no-effect txn should succeed without raft append");
+        .expect("no-effect txn should commit through raft");
 
         assert_eq!(
             snapshot.revision, committed.revision,
@@ -12397,12 +13379,12 @@ mod tests {
                 }],
             })
         );
-        assert_eq!(
+        assert!(
             std::fs::metadata(&wal_path)
                 .expect("wal after no-effect")
-                .len(),
-            wal_len_before,
-            "no-effect daemon txn must not append to the raft WAL"
+                .len()
+                > wal_len_before,
+            "a fresh no-effect request must append durable quorum evidence to the raft WAL"
         );
     }
 
@@ -12444,7 +13426,7 @@ mod tests {
                     &mut host,
                     &paths,
                     &mut state,
-                    KvTxn {
+                    sinomo_core::kv::KvTxnRequest::generated(KvTxn {
                         compares: Vec::new(),
                         success: vec![KvOp::Put {
                             key: "/test/async-local-leader".to_string(),
@@ -12452,12 +13434,12 @@ mod tests {
                             lease_id: None,
                         }],
                         failure: Vec::new(),
-                    },
+                    }),
                 ),
             )
             .expect("async local leader commit");
 
-        let store = InProcessKvStore::restore(snapshot).expect("restore");
+        let store = InProcessKvStore::restore(snapshot.snapshot).expect("restore");
         assert_eq!(
             store
                 .get("/test/async-local-leader")
@@ -12468,7 +13450,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_connectivity_refresh_txn_does_not_append_raft_log_entry() {
+    fn stable_connectivity_refresh_commits_barrier_without_advancing_revision() {
         let root = unique_cluster_test_root("sinomo-daemon-connectivity-refresh-no-append");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
@@ -12562,46 +13544,30 @@ mod tests {
             ),
             "test record should differ only by non-durable connectivity observations"
         );
-        let (snapshot, response) = commit_cluster_kv_txn_with_quorum_response(
+        let snapshot = sync_cluster_connectivity_records_to_kv(
             &paths,
-            &mut state,
-            KvTxn {
-                compares: Vec::new(),
-                success: vec![
-                    KvOp::put_serde(&key, &refreshed_record, None)
-                        .expect("refresh connectivity op"),
-                ],
-                failure: Vec::new(),
-            },
+            &state.local_node_id,
+            vec![refreshed_record],
         )
-        .expect("stable connectivity refresh should succeed without append");
+        .expect("stable connectivity refresh should commit a barrier")
+        .expect("stable connectivity barrier snapshot");
 
         assert_eq!(
             snapshot.revision, seeded_snapshot.revision,
             "stable connectivity refreshes must not advance the cluster revision"
         );
-        assert_eq!(
-            response,
-            Some(KvTxnResponse {
-                succeeded: true,
-                revision: seeded_snapshot.revision,
-                responses: vec![KvOpResponse::Put {
-                    key,
-                    revision: seeded_entry.modify_revision,
-                }],
-            })
-        );
-        assert_eq!(
+        assert_eq!(snapshot.get(&key), Some(&seeded_entry));
+        assert!(
             std::fs::metadata(&wal_path)
                 .expect("wal after semantic no-effect")
-                .len(),
-            wal_len_before,
-            "stable connectivity refreshes must not append to the raft WAL"
+                .len()
+                > wal_len_before,
+            "stable connectivity refreshes must append quorum evidence to the Raft WAL"
         );
     }
 
     #[test]
-    fn source_only_member_publish_txn_does_not_append_raft_log_entry() {
+    fn source_only_member_publish_commits_barrier_without_advancing_revision() {
         let root = unique_cluster_test_root("sinomo-daemon-source-only-member-no-append");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
@@ -12623,34 +13589,19 @@ mod tests {
         let member = &mut state.members[0];
         member.capabilities = capabilities.clone();
         member.allowed_capabilities = capabilities;
-        member.endpoints = vec![
-            ClusterEndpointRecord {
-                endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
-                    "endpoint_daemon_source_only",
-                )
-                .expect("endpoint"),
-                node_id: local.clone(),
-                transport: ClusterTransportKind::LanTcp,
-                address: "172.23.0.4:21353".to_string(),
-                source: sinomo_core::ClusterEndpointSource::Mdns,
-                privacy: ClusterEndpointPrivacy::Lan,
-                priority: 20,
-                last_observed_latency_ms: None,
-            },
-            ClusterEndpointRecord {
-                endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
-                    "endpoint_daemon_source_static",
-                )
-                .expect("endpoint"),
-                node_id: local.clone(),
-                transport: ClusterTransportKind::Loopback,
-                address: "127.0.0.1:21353".to_string(),
-                source: sinomo_core::ClusterEndpointSource::Static,
-                privacy: ClusterEndpointPrivacy::LocalOnly,
-                priority: 0,
-                last_observed_latency_ms: None,
-            },
-        ];
+        member.endpoints = vec![ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_source_only",
+            )
+            .expect("endpoint"),
+            node_id: local.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "172.23.0.4:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Mdns,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 20,
+            last_observed_latency_ms: None,
+        }];
         state.members[0]
             .endpoints
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
@@ -12663,8 +13614,6 @@ mod tests {
             local.clone(),
         )
         .expect("read snapshot");
-        let config_key = sinomo_core::kv::cluster_kv_raft_config_key();
-        let config_entry = snapshot.get(&config_key).expect("config entry").clone();
         let member_key = cluster_member_key(&local);
         let member_entry = snapshot.get(&member_key).expect("member entry").clone();
         let mut observed_member = state.members[0].clone();
@@ -12685,51 +13634,41 @@ mod tests {
             .expect("wal before source no-effect")
             .len();
 
-        let (snapshot_after, response) = commit_cluster_kv_txn_with_quorum_response(
+        let runtime = daemon_cluster_test_runtime();
+        let mut host = daemon_cluster_control_plane_driver_on_runtime(runtime.handle());
+        let response = sinomo_core::cluster::handle_cluster_member_publish_request_with_host(
             &paths,
-            &mut state,
-            KvTxn {
-                compares: vec![KvCompare::ValueEquals {
-                    key: config_key,
-                    value: config_entry.value,
-                }],
-                success: vec![
-                    KvOp::put_serde(&member_key, &observed_member, None).expect("member put op"),
-                    KvOp::put_serde(&endpoint_key, &observed_endpoint, None)
-                        .expect("endpoint put op"),
-                ],
-                failure: Vec::new(),
+            ClusterMemberPublishRequest {
+                members: vec![observed_member],
+                local_kv_revision: Some(snapshot.revision),
             },
+            local.as_str(),
+            &mut host,
         )
-        .expect("source-only member publish should succeed without append");
+        .expect("source-only member publish should commit a barrier");
+        assert!(response.accepted);
+        assert_eq!(response.detail, "member endpoints already current");
+        assert!(
+            response.kv_snapshot.is_none(),
+            "a current publisher does not need the unchanged snapshot payload"
+        );
+
+        let snapshot_after =
+            sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(&paths.kv_paths(), local)
+                .expect("read snapshot after source-only publish");
 
         assert_eq!(
             snapshot_after.revision, snapshot.revision,
             "source-only member publishes must not advance the cluster revision"
         );
-        assert_eq!(
-            response,
-            Some(KvTxnResponse {
-                succeeded: true,
-                revision: snapshot.revision,
-                responses: vec![
-                    KvOpResponse::Put {
-                        key: member_key,
-                        revision: member_entry.modify_revision,
-                    },
-                    KvOpResponse::Put {
-                        key: endpoint_key,
-                        revision: endpoint_entry.modify_revision,
-                    },
-                ],
-            })
-        );
-        assert_eq!(
+        assert_eq!(snapshot_after.get(&member_key), Some(&member_entry));
+        assert_eq!(snapshot_after.get(&endpoint_key), Some(&endpoint_entry));
+        assert!(
             std::fs::metadata(&wal_path)
                 .expect("wal after source no-effect")
-                .len(),
-            wal_len_before,
-            "source-only member publishes must not append to the raft WAL"
+                .len()
+                > wal_len_before,
+            "source-only member publishes must append quorum evidence to the Raft WAL"
         );
     }
 
@@ -13216,49 +14155,36 @@ mod tests {
 
     #[test]
     fn network_info_publish_cache_hit_does_not_mask_missing_kv_snapshot() {
-        let root = unique_cluster_test_root("sinomo-daemon-network-info-cache");
-        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-        paths.ensure().expect("paths");
+        let (_root, paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("network_info_cache");
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_daemon_network_info_cache").expect("cluster");
-        let local_node =
-            NodeId::from_legacy_named("node_daemon_network_info_cache_local").expect("local");
-        let state = ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "network info cache",
-            local_node.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
         let info = sinomo_core::network::build_cluster_network_info_record(
             &state,
-            &local_node,
+            &state.local_node_id,
             now,
             CLUSTER_NETWORK_INFO_TTL_SECONDS,
         );
-        let mut store = InProcessKvStore::new();
-        store
-            .put_serde(cluster_network_info_key(&local_node), &info, None)
-            .expect("seed network info");
-        sinomo_core::kv::write_cluster_kv_snapshot(
-            &paths.kv_paths(),
-            &store.snapshot().expect("snapshot"),
-        )
-        .expect("write matching snapshot");
-
-        assert!(
-            sync_cluster_network_info_to_kv(&paths, info.clone())
-                .expect("stored match")
-                .is_none()
+        let seeded = sync_cluster_network_info_to_kv(&paths, info.clone())
+            .expect("seed network info")
+            .expect("network info commit");
+        let barrier = sync_cluster_network_info_to_kv(&paths, info.clone())
+            .expect("stored match")
+            .expect("matching publish still crosses a quorum barrier");
+        assert_eq!(
+            barrier.revision, seeded.revision,
+            "the no-op barrier must not advance the semantic revision"
         );
         std::fs::remove_file(&paths.kv_paths().snapshot).expect("remove snapshot");
-        let error = sync_cluster_network_info_to_kv(&paths, info)
-            .expect_err("cache hit must not hide a missing KV snapshot");
-        assert!(
-            error.to_string().contains("not part of a cluster"),
-            "unexpected missing-snapshot error: {error}"
+        let recovered = sync_cluster_network_info_to_kv(&paths, info.clone())
+            .expect("Raft state remains authoritative without the materialized snapshot")
+            .expect("cache hit still establishes a quorum barrier");
+        assert_eq!(recovered.revision, seeded.revision);
+        assert_eq!(
+            recovered
+                .get(&cluster_network_info_key(&state.local_node_id))
+                .and_then(|entry| entry.decode::<ClusterNetworkInfoRecord>().ok()),
+            Some(info),
+            "the response must come from reconstructed authoritative Raft state"
         );
     }
 
@@ -13282,6 +14208,9 @@ mod tests {
             now,
         );
         assign_local_node_public_keys(&paths, &mut state).expect("assign keys");
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write state");
         let current =
             sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
@@ -13319,18 +14248,18 @@ mod tests {
             returned.get(&member_key).is_some(),
             "stable sync must not return the stale materialized fallback"
         );
-        assert_eq!(
+        assert!(
             std::fs::metadata(&wal_path)
                 .expect("wal after stable sync")
-                .len(),
-            wal_len_before,
-            "stable sync should not append a raft log entry"
+                .len()
+                > wal_len_before,
+            "stable sync must append current-term quorum evidence even when state is unchanged"
         );
         let materialized = sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .expect("materialized after sync");
         assert!(
-            materialized.get(&member_key).is_none(),
-            "stable sync should not rewrite the intentionally stale materialized cache"
+            materialized.get(&member_key).is_some(),
+            "authoritative stable sync should repair the stale materialized cache"
         );
     }
 

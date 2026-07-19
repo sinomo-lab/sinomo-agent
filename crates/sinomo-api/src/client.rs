@@ -24,6 +24,9 @@ use sinomo_core::cluster::{
     ClusterControlRoleRequest, ClusterControlRoleResponse, ClusterControlRpcPayload,
     ClusterHealthRow,
 };
+use sinomo_core::kv::{
+    ClusterKvRequestOutcomeRead, ClusterKvRequestOutcomeRequest, KvRequestId, KvRequestOutcome,
+};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY, ObjectRpcRequest, ObjectRpcResponse,
@@ -136,6 +139,24 @@ impl DaemonApiClient {
         let response = send_daemon_rpc(&self.address, request, self.timeout)?;
         response.error_detail()?;
         Ok(response)
+    }
+
+    /// Resolves one cluster-KV request id after the daemon establishes a fresh
+    /// current-term quorum barrier.
+    pub fn cluster_kv_request_outcome(
+        &self,
+        request_id: &KvRequestId,
+    ) -> Result<ClusterKvRequestOutcomeRead, DaemonApiError> {
+        let payload = sinomo_core::kv::cluster_kv_request_outcome_rpc_payload(
+            &ClusterKvRequestOutcomeRequest {
+                request_id: request_id.clone(),
+            },
+        )?;
+        let request =
+            ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+                .with_response_retry_safe();
+        let response = self.call_request(&request)?;
+        decode_cluster_kv_request_outcome_response(&response, request_id)
     }
 
     /// Sends a signed request through the connected daemon to another cluster
@@ -524,6 +545,25 @@ impl DaemonApiClient {
         sinomo_core::cluster::decode_cluster_health_rpc_response(&response)
             .map_err(DaemonApiError::from)
     }
+}
+
+fn decode_cluster_kv_request_outcome_response(
+    response: &ObjectRpcResponse,
+    request_id: &KvRequestId,
+) -> Result<ClusterKvRequestOutcomeRead, DaemonApiError> {
+    response.error_detail()?;
+    let read = sinomo_core::kv::decode_cluster_kv_request_outcome_rpc_body(&response.body)?;
+    if let KvRequestOutcome::Committed(record) = &read.outcome
+        && record.request_id != *request_id
+    {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "cluster KV outcome response is for request ID {}, expected {}",
+                record.request_id, request_id
+            ),
+        });
+    }
+    Ok(read)
 }
 
 fn cluster_health_snapshot_request() -> Result<ObjectRpcRequest, DaemonApiError> {
@@ -988,6 +1028,27 @@ impl RemoteConfigClient {
             .decode_body()
             .map_err(|error| client_error(error.to_string()))
     }
+
+    /// Sets configuration with a stable cluster-KV request identity that the
+    /// caller can later reconcile through [`DaemonApiClient::cluster_kv_request_outcome`].
+    pub fn set_with_request_id(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        target: ConfigWriteTarget,
+        request_id: KvRequestId,
+    ) -> Result<ConfigWriteResult, ConfigError> {
+        let response: ConfigSetResponse = self.rpc(
+            CONFIG_SET_ROUTE,
+            &ConfigSetRequest {
+                request_id: Some(request_id),
+                key: key.to_string(),
+                value,
+                target,
+            },
+        )?;
+        Ok(response.result)
+    }
 }
 
 impl ConfigClient for RemoteConfigClient {
@@ -1017,15 +1078,7 @@ impl ConfigClient for RemoteConfigClient {
         value: serde_json::Value,
         target: ConfigWriteTarget,
     ) -> Result<ConfigWriteResult, ConfigError> {
-        let response: ConfigSetResponse = self.rpc(
-            CONFIG_SET_ROUTE,
-            &ConfigSetRequest {
-                key: key.to_string(),
-                value,
-                target,
-            },
-        )?;
-        Ok(response.result)
+        self.set_with_request_id(key, value, target, KvRequestId::generate())
     }
 }
 
@@ -1827,6 +1880,43 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn request_outcome_client_rejects_a_committed_record_for_another_request() {
+        let submitted = KvRequestId::generate();
+        let returned = KvRequestId::generate();
+        let read = ClusterKvRequestOutcomeRead {
+            authority: sinomo_core::kv::KvAuthorityProof {
+                term: 2,
+                commit_index: 7,
+                revision: sinomo_core::kv::KvRevision::ZERO,
+                basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            outcome: KvRequestOutcome::Committed(sinomo_core::kv::KvCommittedRequestRecord {
+                request_id: returned,
+                command_digest: sinomo_core::kv::KvCommandDigest([0; 32]),
+                term: 2,
+                log_index: 7,
+                revision: sinomo_core::kv::KvRevision::ZERO,
+                txn_response: None,
+            }),
+        };
+        let payload = sinomo_core::kv::cluster_kv_request_outcome_response_rpc_payload(&read)
+            .expect("outcome payload");
+        let response = ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+
+        let error = decode_cluster_kv_request_outcome_response(&response, &submitted)
+            .expect_err("request ID mismatch must fail closed");
+
+        assert!(matches!(
+            error,
+            DaemonApiError::Parse { detail }
+                if detail.contains("outcome response is for request ID")
+        ));
+    }
 
     fn test_channel_data_dir(label: &str) -> (sinomo_testdir::TestDir, SinomoDataDir) {
         let root = sinomo_testdir::TestDir::new(label);

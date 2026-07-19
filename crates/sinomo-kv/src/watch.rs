@@ -203,9 +203,7 @@ pub fn cluster_kv_events_can_defer_materialized_snapshot(
 }
 
 pub fn cluster_kv_key_can_defer_materialized_snapshot(key: &str) -> bool {
-    key.starts_with("/cluster/network/connectivity/")
-        || key.starts_with("/cluster/network/info/")
-        || key.starts_with("/cluster/node-status/")
+    cluster_kv_key_may_defer_materialized_projection(key)
 }
 
 pub fn cluster_kv_snapshot_delta_only_deferable(

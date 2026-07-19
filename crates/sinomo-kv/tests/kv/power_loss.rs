@@ -88,6 +88,7 @@ fn wal_tail_partial_and_corrupt_records_recover_safe_prefix() {
                 let lost = KvLogEntry {
                     index: 3,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: put_command("/power-loss/wal/lost-partial", b"lost"),
                     revision: KvRevision::ZERO,
                 };
@@ -219,6 +220,7 @@ fn snapshot_wal_compaction_ignores_leftover_artifacts_after_reopen() {
             &KvLogEntry {
                 index: command_count + 1,
                 term: 1,
+                request_id: KvRequestId::generate(),
                 command: put_command("/power-loss/compact/temp-only", b"ignored"),
                 revision: KvRevision::ZERO,
             },

@@ -2,6 +2,7 @@ use crate::control_plane_options::ClusterRaftLeaderElectionOptions;
 use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::locked_apply_cluster_raft_vote;
+use crate::local_state_store::project_committed_cluster_raft_config;
 use crate::prelude::*;
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
@@ -481,6 +482,9 @@ pub fn elect_cluster_raft_leader_with_host(
     options: ClusterRaftLeaderElectionOptions,
     host: &mut impl ClusterRaftVoteTransportHost,
 ) -> Result<bool, NetworkError> {
+    let mut consensus_state = state.clone();
+    project_committed_cluster_raft_config(paths, &mut consensus_state)?;
+    let state = &consensus_state;
     // A transaction that observed no usable leader may wait here behind
     // another transaction that is already campaigning or committing. Recheck
     // the durable leader while holding the same outer sequence lock used by
@@ -545,6 +549,19 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
     options: ClusterRaftLeaderElectionOptions,
     host: &mut (impl ClusterRaftVoteTransportAsyncHost + Send),
 ) -> Result<bool, NetworkError> {
+    let projection_paths = paths.clone();
+    let mut consensus_state = state.clone();
+    consensus_state = runtime
+        .spawn_blocking(move || {
+            project_committed_cluster_raft_config(&projection_paths, &mut consensus_state)?;
+            Ok::<_, NetworkError>(consensus_state)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "project committed cluster Raft config".to_string(),
+            detail: format!("Raft config projection task failed: {source}"),
+        })??;
+    let state = &consensus_state;
     let paths_for_lock = paths.clone();
     let state_for_lock = state.clone();
     let (_campaign_lock, existing_outcome) = runtime

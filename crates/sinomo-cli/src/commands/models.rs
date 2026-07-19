@@ -910,9 +910,9 @@ pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSn
     let _ = paths;
     if let Some(status) = default_main_daemon_status()?
         && let Ok(snapshot) =
-            daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
+            daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
     {
-        return Ok(snapshot);
+        return Ok(snapshot.value);
     }
     #[cfg(test)]
     {
@@ -1033,18 +1033,20 @@ fn commit_model_config_cluster_txn(_data_dir: &SinomoDataDir, txn: KvTxn) -> Res
             detail: "clustered model config writes require the local daemon".to_string(),
         });
     };
-    let request = network::ObjectRpcRequest::encode_body(
-        sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
-        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
-        &txn,
-    )
-    .map_err(CliError::from)?;
+    let txn_request = KvTxnRequest::generated(txn);
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn_request)?;
+    let request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(
         &status.address,
         &request,
         DAEMON_CLUSTER_KV_TXN_TIMEOUT,
     )?;
-    let txn_response: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    response.error_detail()?;
+    let commit = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)?;
+    let txn_response = commit.txn_response.ok_or_else(|| CliError::Parse {
+        detail: "cluster KV returned a barrier result for a model config transaction".to_string(),
+    })?;
     if !txn_response.succeeded {
         return Err(CliError::Parse {
             detail: format!(

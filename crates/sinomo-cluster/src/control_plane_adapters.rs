@@ -38,12 +38,13 @@ pub(crate) use crate::kv_local_store::{
 pub(crate) use crate::kv_read_model::{
     read_cluster_endpoints_from_kv, read_cluster_network_info_from_kv,
 };
-use crate::kv_snapshot::{
-    ClusterKvSnapshotRefreshHost, refresh_current_cluster_kv_store_with_host,
-};
-use crate::kv_txn_quorum::commit_cluster_kv_txn_with_quorum_response_with_host;
+use crate::kv_snapshot::ClusterKvSnapshotRefreshHost;
 #[cfg(test)]
 pub(crate) use crate::kv_txn_quorum::handle_cluster_kv_txn_request_with_host;
+use crate::kv_txn_quorum::{
+    commit_cluster_kv_txn_with_quorum_response_with_host,
+    read_cluster_kv_authoritative_snapshot_with_host,
+};
 #[cfg(test)]
 pub(crate) use crate::local_membership::apply_local_daemon_membership_observation;
 #[cfg(test)]
@@ -78,6 +79,7 @@ pub(crate) use crate::raft_election::elect_cluster_raft_leader_with_host;
 pub(crate) use crate::raft_election::locked_set_cluster_raft_leader;
 #[cfg(test)]
 pub(crate) use crate::raft_fanout::claim_next_cluster_raft_fanout_pass_for_test;
+use crate::raft_quorum::catch_up_cluster_raft_member_with_control_plane_driver;
 #[cfg(test)]
 pub(crate) use crate::raft_quorum::commit_cluster_raft_command_with_local_storage_and_transport;
 #[cfg(test)]
@@ -95,7 +97,7 @@ use crate::state_authority_reachability::{
 };
 use crate::status_publish::{ClusterNetworkInfoPublishHost, ClusterNodeStatusPublishHost};
 #[allow(unused_imports)]
-use sinomo_kv::{InProcessKvStore, KvSnapshot, KvTxn};
+use sinomo_kv::{InProcessKvStore, KvAuthoritativeRead, KvSnapshot, KvTxnRequest};
 use sinomo_network::ClusterConnectivityRecord;
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
@@ -166,15 +168,21 @@ where
 {
     type Error = NetworkError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
-            .map(|result| result.snapshot)
+        request: KvTxnRequest,
+    ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, Self::Error> {
+        ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(self, paths, state, request)
     }
 }
 
@@ -191,15 +199,21 @@ where
         cluster_has_local_quorum_with_host(paths, state, options, self)
     }
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, NetworkError> {
-        let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
-            .map(|result| result.snapshot)
+        request: KvTxnRequest,
+    ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, NetworkError> {
+        ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(self, paths, state, request)
     }
 
     fn send_cluster_member_publish(
@@ -225,15 +239,21 @@ where
 {
     type Error = NetworkError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
-            .map(|result| result.snapshot)
+        request: KvTxnRequest,
+    ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, Self::Error> {
+        ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(self, paths, state, request)
     }
 }
 
@@ -247,11 +267,10 @@ where
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
+        request: KvTxnRequest,
+    ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, Self::Error> {
         let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
-            .map(|result| result.snapshot)
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
     }
 }
 
@@ -281,10 +300,10 @@ where
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error> {
         let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
             .map(|result| result.snapshot)
     }
 }
@@ -315,10 +334,10 @@ where
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error> {
         let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
             .map(|result| result.snapshot)
     }
 }
@@ -353,10 +372,10 @@ where
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error> {
         let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
             .map(|result| result.snapshot)
     }
 }
@@ -365,15 +384,15 @@ impl<T> ClusterMemberMutationHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn current_cluster_kv_store(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<InProcessKvStore, NetworkError> {
-        refresh_current_cluster_kv_store_with_host(
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        read_cluster_kv_authoritative_snapshot_with_host(
             paths,
             state,
-            self.timeouts.kv_snapshot_refresh_options(),
+            self.timeouts.kv_txn_quorum_options(true),
             self,
         )
     }
@@ -382,10 +401,36 @@ where
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, NetworkError> {
+        request: KvTxnRequest,
+    ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, NetworkError> {
         let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
-            .map(|result| result.snapshot)
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
+    }
+
+    fn prove_cluster_raft_member_caught_up(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        node_id: &NodeId,
+        required_log_index: u64,
+        now: time::OffsetDateTime,
+    ) -> Result<sinomo_kv::ClusterKvRaftCatchUpProof, NetworkError> {
+        let response =
+            catch_up_cluster_raft_member_with_control_plane_driver(paths, state, node_id, self)?;
+        if !response.accepted || response.append.match_index < required_log_index {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "learner `{node_id}` caught up only to Raft index {} ({} required): {}",
+                    response.append.match_index, required_log_index, response.detail
+                ),
+            });
+        }
+        Ok(sinomo_kv::ClusterKvRaftCatchUpProof {
+            node_id: node_id.clone(),
+            term: response.append.term,
+            required_log_index,
+            observed_match_index: response.append.match_index,
+            observed_at: now,
+        })
     }
 }

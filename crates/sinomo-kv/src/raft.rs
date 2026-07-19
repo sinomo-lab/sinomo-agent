@@ -47,6 +47,7 @@ pub fn lock_cluster_kv_raft_operation_for_wal_paths(
 pub struct KvLogEntry {
     pub index: u64,
     pub term: u64,
+    pub request_id: KvRequestId,
     pub command: KvCommand,
     pub revision: KvRevision,
 }
@@ -118,9 +119,9 @@ pub struct RaftRequestVoteResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusterKvRaftUncommittedAppend {
     Appended(KvLogEntry),
-    NoEffect {
+    CommittedReplay {
         snapshot: KvSnapshot,
-        txn_response: Option<KvTxnResponse>,
+        record: KvCommittedRequestRecord,
     },
 }
 
@@ -129,6 +130,7 @@ pub struct ClusterKvRaftCommitResult {
     pub snapshot: KvSnapshot,
     pub txn_response: Option<KvTxnResponse>,
     pub events: Vec<KvEvent>,
+    pub committed_request: KvCommittedRequestRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +207,50 @@ impl RaftNodeIdSet {
         Ok(self
             .node_ids
             .insert(try_clone_kv_node_id(node_id, operation)?))
+    }
+}
+
+fn cluster_kv_authority_failure(
+    state: &ClusterBootstrapState,
+    reason: KvAuthorityFailureReason,
+    detail: String,
+    observed_term: u64,
+    revision: KvRevision,
+    reachable_voters: usize,
+    known_leader: Option<NodeId>,
+) -> KvAuthorityFailure {
+    let local_role = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .map(|member| member.role.clone())
+        .unwrap_or(ClusterMemberRole::NonVoting);
+    let suggested_recovery = match reason {
+        KvAuthorityFailureReason::HigherTermObserved | KvAuthorityFailureReason::VoterRejected => {
+            KvRecoveryAction::RefreshClusterState
+        }
+        KvAuthorityFailureReason::TransportFailure => KvRecoveryAction::ContactKnownLeader,
+        KvAuthorityFailureReason::LocalNodeNotVoter
+        | KvAuthorityFailureReason::NoQuorum
+        | KvAuthorityFailureReason::Timeout => KvRecoveryAction::RetryWhenQuorumIsReachable,
+    };
+    KvAuthorityFailure {
+        reason,
+        detail,
+        diagnostics: KvAuthorityDiagnostics {
+            local_node_id: state.local_node_id.clone(),
+            local_role,
+            known_leader,
+            observed_term,
+            reachable_voters,
+            required_quorum: cluster_kv_raft_quorum_size_for_state(state),
+            last_successful_append_at: None,
+            last_snapshot_refresh_at: None,
+            authority: KvReadAuthority::Local,
+            revision,
+            freshness: KvFreshness::Unknown,
+            suggested_recovery,
+        },
     }
 }
 
@@ -469,7 +515,8 @@ pub fn elect_cluster_kv_raft_leader_with_host<H>(
 where
     H: ClusterKvRaftLeaderElectionHost,
 {
-    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect raft election voters").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
+    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect raft election voters")
+        .map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
     if !voter_ids.contains(local_node_id) {
         return Ok(false);
     }
@@ -477,7 +524,8 @@ where
     let mut remote_vote_targets_vec = Vec::new();
     for voter_id in remote_vote_targets {
         if voter_id != *local_node_id && voter_ids.contains(&voter_id) {
-            try_reserve_kv_items(&mut remote_vote_targets_vec, 1, "collect raft vote targets").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
+            try_reserve_kv_items(&mut remote_vote_targets_vec, 1, "collect raft vote targets")
+                .map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
             remote_vote_targets_vec.push(voter_id);
         }
     }
@@ -491,23 +539,24 @@ where
             .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
         let vote_request = RaftRequestVoteRequest {
             term: election_term,
-            candidate_id: try_clone_kv_node_id(local_node_id, "build raft election vote request").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?,
+            candidate_id: try_clone_kv_node_id(local_node_id, "build raft election vote request")
+                .map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?,
             last_log_index: metadata.last_log_index,
             last_log_term: metadata.last_log_term,
         };
         let local_vote = host.apply_local_vote(RaftRequestVoteRequest {
             term: vote_request.term,
-            candidate_id: try_clone_kv_node_id(
-                &vote_request.candidate_id,
-                "apply local raft vote",
-            ).map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?,
+            candidate_id: try_clone_kv_node_id(&vote_request.candidate_id, "apply local raft vote")
+                .map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?,
             last_log_index: vote_request.last_log_index,
             last_log_term: vote_request.last_log_term,
         })?;
         let mut highest_observed_term = local_vote.term.max(election_term);
         let mut granted = RaftNodeIdSet::default();
         if local_vote.vote_granted {
-            granted.try_insert_clone(local_node_id, "record local raft vote").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
+            granted
+                .try_insert_clone(local_node_id, "record local raft vote")
+                .map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
         }
 
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
@@ -526,7 +575,9 @@ where
             };
             highest_observed_term = highest_observed_term.max(response.term);
             if response.vote_granted {
-                granted.try_insert_clone(voter_id, "record remote raft vote").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
+                granted
+                    .try_insert_clone(voter_id, "record remote raft vote")
+                    .map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
             }
         }
 
@@ -594,7 +645,8 @@ pub async fn elect_cluster_kv_raft_leader_async_with_host<H>(
 where
     H: ClusterKvRaftLeaderElectionAsyncHost,
 {
-    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect async raft election voters").map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
+    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect async raft election voters")
+        .map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
     if !voter_ids.contains(local_node_id) {
         return Ok(false);
     }
@@ -606,7 +658,8 @@ where
                 &mut remote_vote_targets_vec,
                 1,
                 "collect async raft vote targets",
-            ).map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
+            )
+            .map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
             remote_vote_targets_vec.push(voter_id);
         }
     }
@@ -623,7 +676,8 @@ where
             candidate_id: try_clone_kv_node_id(
                 local_node_id,
                 "build async raft election vote request",
-            ).map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?,
+            )
+            .map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?,
             last_log_index: metadata.last_log_index,
             last_log_term: metadata.last_log_term,
         };
@@ -633,7 +687,8 @@ where
                 candidate_id: try_clone_kv_node_id(
                     &vote_request.candidate_id,
                     "apply local async raft vote",
-                ).map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?,
+                )
+                .map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?,
                 last_log_index: vote_request.last_log_index,
                 last_log_term: vote_request.last_log_term,
             })
@@ -641,7 +696,9 @@ where
         let mut highest_observed_term = local_vote.term.max(election_term);
         let mut granted = RaftNodeIdSet::default();
         if local_vote.vote_granted {
-            granted.try_insert_clone(local_node_id, "record local async raft vote").map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
+            granted
+                .try_insert_clone(local_node_id, "record local async raft vote")
+                .map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
         }
 
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
@@ -662,7 +719,9 @@ where
             };
             highest_observed_term = highest_observed_term.max(response.term);
             if response.vote_granted {
-                granted.try_insert_clone(voter_id, "record remote async raft vote").map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
+                granted
+                    .try_insert_clone(voter_id, "record remote async raft vote")
+                    .map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
             }
         }
 
@@ -699,10 +758,27 @@ pub trait ClusterKvRaftCommandStorage {
         Ok(None)
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error>;
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, Self::Error>;
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, Self::Error>;
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &KvAuthorityFailure,
+    ) -> Result<(), Self::Error>;
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), Self::Error>;
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(&mut self)
     -> Result<(), Self::Error>;
@@ -726,16 +802,21 @@ pub struct ClusterKvRaftQuorumCommitOptions {
     pub timeout: Duration,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterKvRaftQuorumCommitResult {
     pub snapshot: KvSnapshot,
     pub txn_response: Option<KvTxnResponse>,
+    pub authority: KvAuthorityProof,
+    pub replayed_committed_request: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterKvTxnCommitResult {
+    pub request_id: KvRequestId,
     pub snapshot: KvSnapshot,
     pub txn_response: Option<KvTxnResponse>,
+    pub authority: KvAuthorityProof,
+    pub replayed_committed_request: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,6 +860,15 @@ pub trait ClusterKvRaftAppendReplicationHost {
         state: &ClusterBootstrapState,
     ) -> Result<u64, Self::Error>;
 
+    fn raft_peer_progress_next_index_hint(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target: &Self::Target,
+        _last_local_raft_log_index: u64,
+    ) -> Option<u64> {
+        None
+    }
+
     fn build_raft_append_request(
         &mut self,
         state: &ClusterBootstrapState,
@@ -817,6 +907,15 @@ pub trait ClusterKvRaftAppendReplicationAsyncHost {
         &'a mut self,
         state: &'a ClusterBootstrapState,
     ) -> ClusterKvRaftQuorumFuture<'a, u64, Self::Error>;
+
+    fn raft_peer_progress_next_index_hint_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a Self::Target,
+        _last_local_raft_log_index: u64,
+    ) -> ClusterKvRaftQuorumFuture<'a, Option<u64>, Self::Error> {
+        Box::pin(async { Ok(None) })
+    }
 
     fn build_raft_append_request_async<'a>(
         &'a mut self,
@@ -881,7 +980,12 @@ where
     H: ClusterKvRaftAppendReplicationHost,
 {
     let deadline = Instant::now() + options.timeout;
-    let mut next_index = host.last_local_raft_log_index(state)?.saturating_add(1);
+    let last_local_raft_log_index = host.last_local_raft_log_index(state)?;
+    let default_next_index = last_local_raft_log_index.saturating_add(1);
+    let mut next_index = host
+        .raft_peer_progress_next_index_hint(state, target, last_local_raft_log_index)
+        .filter(|next_index| (1..=default_next_index).contains(next_index))
+        .unwrap_or(default_next_index);
     let mut last_response = None;
     for _ in 0..options.max_attempts {
         let remaining = deadline
@@ -938,10 +1042,13 @@ where
     H: ClusterKvRaftAppendReplicationAsyncHost,
 {
     let deadline = Instant::now() + options.timeout;
+    let last_local_raft_log_index = host.last_local_raft_log_index_async(state).await?;
+    let default_next_index = last_local_raft_log_index.saturating_add(1);
     let mut next_index = host
-        .last_local_raft_log_index_async(state)
+        .raft_peer_progress_next_index_hint_async(state, target, last_local_raft_log_index)
         .await?
-        .saturating_add(1);
+        .filter(|next_index| (1..=default_next_index).contains(next_index))
+        .unwrap_or(default_next_index);
     let mut last_response = None;
     for _ in 0..options.max_attempts {
         let remaining = deadline
@@ -1000,6 +1107,14 @@ where
 pub trait ClusterKvRaftQuorumCommitHost: ClusterKvRaftCommandStorage {
     type Target: Clone;
 
+    /// Returns true only when durable local Raft state records this node as the
+    /// elected leader for the current term. Reachability or routing preference
+    /// alone is not sufficient.
+    fn local_has_verified_raft_leadership(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, Self::Error>;
+
     fn remote_voter_targets(
         &mut self,
         state: &ClusterBootstrapState,
@@ -1046,7 +1161,7 @@ pub trait ClusterKvRaftQuorumCommitHost: ClusterKvRaftCommandStorage {
         Ok(())
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+    fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error;
 }
 
 /// Async storage-side Raft quorum commit host.
@@ -1063,6 +1178,11 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost {
     fn kv_error(error: KvError) -> Self::Error;
     type Target: Clone + Send + Sync;
 
+    fn local_has_verified_raft_leadership_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error>;
+
     /// Async counterpart of
     /// [`ClusterKvRaftCommandStorage::lock_cluster_raft_commit_sequence`].
     fn lock_cluster_raft_commit_sequence_async<'a>(
@@ -1071,10 +1191,27 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost {
         Box::pin(async { Ok(None) })
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
+    fn replay_cluster_raft_request_if_committed_async<'a>(
         &'a mut self,
-        command: KvCommand,
-    ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftUncommittedAppend, Self::Error>;
+        request: &'a KvCommandRequest,
+    ) -> ClusterKvRaftQuorumFuture<'a, Option<(KvSnapshot, KvCommittedRequestRecord)>, Self::Error>;
+
+    fn append_cluster_raft_request_uncommitted_async<'a>(
+        &'a mut self,
+        request: KvCommandRequest,
+    ) -> ClusterKvRaftQuorumFuture<'a, KvLogEntry, Self::Error>;
+
+    fn record_cluster_raft_request_rejected_before_commit_async<'a>(
+        &'a mut self,
+        request: &'a KvCommandRequest,
+        failure: &'a KvAuthorityFailure,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
+
+    fn record_cluster_raft_request_unknown_async<'a>(
+        &'a mut self,
+        request: &'a KvCommandRequest,
+        detail: &'a str,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader_async<'a>(
         &'a mut self,
@@ -1139,12 +1276,12 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost {
         Box::pin(async { Ok(()) })
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+    fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error;
 }
 
 pub fn commit_cluster_kv_raft_command_with_quorum<H>(
     state: &mut ClusterBootstrapState,
-    command: KvCommand,
+    request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     host: &mut H,
 ) -> Result<ClusterKvRaftQuorumCommitResult, H::Error>
@@ -1153,24 +1290,46 @@ where
     H::Error: ToString,
 {
     let _commit_sequence_lock = host.lock_cluster_raft_commit_sequence()?;
-    let entry = match host.append_cluster_raft_command_uncommitted_or_no_effect(command)? {
-        ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
-        ClusterKvRaftUncommittedAppend::NoEffect {
+    if let Some((snapshot, record)) = host.replay_cluster_raft_request_if_committed(&request)? {
+        return Ok(ClusterKvRaftQuorumCommitResult {
             snapshot,
-            txn_response,
-        } => {
-            return Ok(ClusterKvRaftQuorumCommitResult {
-                snapshot,
-                txn_response,
-            });
-        }
-    };
+            txn_response: record.txn_response.clone(),
+            authority: KvAuthorityProof {
+                term: record.term,
+                commit_index: record.log_index,
+                revision: record.revision,
+                basis: KvAuthorityBasis::ExactCommittedRequest,
+            },
+            replayed_committed_request: true,
+        });
+    }
+    if !host.local_has_verified_raft_leadership(state)? {
+        let failure = cluster_kv_authority_failure(
+            state,
+            if cluster_kv_raft_local_is_voter(state) {
+                KvAuthorityFailureReason::VoterRejected
+            } else {
+                KvAuthorityFailureReason::LocalNodeNotVoter
+            },
+            "local node lacks verified current-term Raft leadership".to_string(),
+            0,
+            KvRevision::ZERO,
+            usize::from(cluster_kv_raft_local_is_voter(state)),
+            None,
+        );
+        host.record_cluster_raft_request_rejected_before_commit(&request, &failure)?;
+        return Err(host.cluster_authority_error(failure));
+    }
+    let request_for_outcome = request.clone();
+    let entry = host.append_cluster_raft_request_uncommitted(request)?;
 
     let mut voter_acks = RaftNodeIdSet::default();
     let mut fanout_node_ids = RaftNodeIdSet::default();
     let mut fanout_targets = Vec::new();
     if cluster_kv_raft_local_is_voter(state) {
-        voter_acks.try_insert_clone(&state.local_node_id, "record local raft commit ack").map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
+        voter_acks
+            .try_insert_clone(&state.local_node_id, "record local raft commit ack")
+            .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
     }
     let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
     let mut failures = Vec::new();
@@ -1202,20 +1361,23 @@ where
                     ClusterKvRaftTargetReplicationStatus::Accepted,
                     Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
                 )?;
-                voter_acks.try_insert_clone(
-                    host.target_node_id(target),
-                    "record remote raft commit ack",
-                ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
+                voter_acks
+                    .try_insert_clone(host.target_node_id(target), "record remote raft commit ack")
+                    .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
                 host.observe_accepted_append_state(state, target, response.state)?;
-                if fanout_node_ids.try_insert_clone(
-                    host.target_node_id(target),
-                    "record accepted raft fanout target",
-                ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)? {
+                if fanout_node_ids
+                    .try_insert_clone(
+                        host.target_node_id(target),
+                        "record accepted raft fanout target",
+                    )
+                    .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?
+                {
                     try_reserve_kv_items(
                         &mut fanout_targets,
                         1,
                         "record accepted raft fanout target",
-                    ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
+                    )
+                    .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
                     fanout_targets.push(target.clone());
                 }
             }
@@ -1253,7 +1415,7 @@ where
 
     if voter_acks.len() < quorum_size {
         let _ = host.discard_cluster_raft_uncommitted_tail_and_clear_leader();
-        return Err(host.cluster_read_only_error(format!(
+        let detail = format!(
             "raft command at index {} replicated to {} voters, {} required{}",
             entry.index,
             voter_acks.len(),
@@ -1263,17 +1425,39 @@ where
             } else {
                 format!(": {}", failures.join("; "))
             }
+        );
+        let reason = if Instant::now() >= deadline {
+            KvAuthorityFailureReason::Timeout
+        } else {
+            KvAuthorityFailureReason::NoQuorum
+        };
+        host.record_cluster_raft_request_unknown(&request_for_outcome, &detail)?;
+        return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+            state,
+            reason,
+            detail,
+            entry.term,
+            KvRevision::ZERO,
+            voter_acks.len(),
+            Some(state.local_node_id.clone()),
         )));
     }
 
     let commit = host.commit_cluster_raft_index_with_events(entry.index)?;
     for target in targets {
-        if fanout_node_ids.try_insert_clone(
-            host.target_node_id(&target),
-            "dedupe committed raft fanout target",
-        ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)? {
-            try_reserve_kv_items(&mut fanout_targets, 1, "dedupe committed raft fanout target")
-                .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
+        if fanout_node_ids
+            .try_insert_clone(
+                host.target_node_id(&target),
+                "dedupe committed raft fanout target",
+            )
+            .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?
+        {
+            try_reserve_kv_items(
+                &mut fanout_targets,
+                1,
+                "dedupe committed raft fanout target",
+            )
+            .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
             fanout_targets.push(target);
         }
     }
@@ -1288,12 +1472,22 @@ where
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
+        authority: KvAuthorityProof {
+            term: entry.term,
+            commit_index: entry.index,
+            revision: commit.committed_request.revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: voter_acks.len(),
+                required_quorum: quorum_size,
+            },
+        },
+        replayed_committed_request: false,
     })
 }
 
 pub async fn commit_cluster_kv_raft_command_with_quorum_async<H>(
     state: &mut ClusterBootstrapState,
-    command: KvCommand,
+    request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     host: &mut H,
 ) -> Result<ClusterKvRaftQuorumCommitResult, H::Error>
@@ -1301,27 +1495,52 @@ where
     H: ClusterKvRaftQuorumCommitAsyncHost,
 {
     let _commit_sequence_lock = host.lock_cluster_raft_commit_sequence_async().await?;
-    let entry = match host
-        .append_cluster_raft_command_uncommitted_or_no_effect_async(command)
+    if let Some((snapshot, record)) = host
+        .replay_cluster_raft_request_if_committed_async(&request)
         .await?
     {
-        ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
-        ClusterKvRaftUncommittedAppend::NoEffect {
+        return Ok(ClusterKvRaftQuorumCommitResult {
             snapshot,
-            txn_response,
-        } => {
-            return Ok(ClusterKvRaftQuorumCommitResult {
-                snapshot,
-                txn_response,
-            });
-        }
-    };
+            txn_response: record.txn_response.clone(),
+            authority: KvAuthorityProof {
+                term: record.term,
+                commit_index: record.log_index,
+                revision: record.revision,
+                basis: KvAuthorityBasis::ExactCommittedRequest,
+            },
+            replayed_committed_request: true,
+        });
+    }
+    if !host.local_has_verified_raft_leadership_async(state).await? {
+        let failure = cluster_kv_authority_failure(
+            state,
+            if cluster_kv_raft_local_is_voter(state) {
+                KvAuthorityFailureReason::VoterRejected
+            } else {
+                KvAuthorityFailureReason::LocalNodeNotVoter
+            },
+            "local node lacks verified current-term Raft leadership".to_string(),
+            0,
+            KvRevision::ZERO,
+            usize::from(cluster_kv_raft_local_is_voter(state)),
+            None,
+        );
+        host.record_cluster_raft_request_rejected_before_commit_async(&request, &failure)
+            .await?;
+        return Err(host.cluster_authority_error(failure));
+    }
+    let request_for_outcome = request.clone();
+    let entry = host
+        .append_cluster_raft_request_uncommitted_async(request)
+        .await?;
 
     let mut voter_acks = RaftNodeIdSet::default();
     let mut fanout_node_ids = RaftNodeIdSet::default();
     let mut fanout_targets = Vec::new();
     if cluster_kv_raft_local_is_voter(state) {
-        voter_acks.try_insert_clone(&state.local_node_id, "record local async raft commit ack").map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+        voter_acks
+            .try_insert_clone(&state.local_node_id, "record local async raft commit ack")
+            .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
     }
     let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
     let mut failures = Vec::new();
@@ -1357,21 +1576,27 @@ where
                     Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
                 )
                 .await?;
-                voter_acks.try_insert_clone(
-                    host.target_node_id(target),
-                    "record remote async raft commit ack",
-                ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+                voter_acks
+                    .try_insert_clone(
+                        host.target_node_id(target),
+                        "record remote async raft commit ack",
+                    )
+                    .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
                 host.observe_accepted_append_state_async(state, target, response.state)
                     .await?;
-                if fanout_node_ids.try_insert_clone(
-                    host.target_node_id(target),
-                    "record accepted async raft fanout target",
-                ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)? {
+                if fanout_node_ids
+                    .try_insert_clone(
+                        host.target_node_id(target),
+                        "record accepted async raft fanout target",
+                    )
+                    .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?
+                {
                     try_reserve_kv_items(
                         &mut fanout_targets,
                         1,
                         "record accepted async raft fanout target",
-                    ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+                    )
+                    .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
                     fanout_targets.push(target.clone());
                 }
             }
@@ -1414,7 +1639,7 @@ where
         let _ = host
             .discard_cluster_raft_uncommitted_tail_and_clear_leader_async()
             .await;
-        return Err(host.cluster_read_only_error(format!(
+        let detail = format!(
             "raft command at index {} replicated to {} voters, {} required{}",
             entry.index,
             voter_acks.len(),
@@ -1424,6 +1649,22 @@ where
             } else {
                 format!(": {}", failures.join("; "))
             }
+        );
+        let reason = if Instant::now() >= deadline {
+            KvAuthorityFailureReason::Timeout
+        } else {
+            KvAuthorityFailureReason::NoQuorum
+        };
+        host.record_cluster_raft_request_unknown_async(&request_for_outcome, &detail)
+            .await?;
+        return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+            state,
+            reason,
+            detail,
+            entry.term,
+            KvRevision::ZERO,
+            voter_acks.len(),
+            Some(state.local_node_id.clone()),
         )));
     }
 
@@ -1431,15 +1672,19 @@ where
         .commit_cluster_raft_index_with_events_async(entry.index)
         .await?;
     for target in targets {
-        if fanout_node_ids.try_insert_clone(
-            host.target_node_id(&target),
-            "dedupe committed async raft fanout target",
-        ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)? {
+        if fanout_node_ids
+            .try_insert_clone(
+                host.target_node_id(&target),
+                "dedupe committed async raft fanout target",
+            )
+            .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?
+        {
             try_reserve_kv_items(
                 &mut fanout_targets,
                 1,
                 "dedupe committed async raft fanout target",
-            ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+            )
+            .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
             fanout_targets.push(target);
         }
     }
@@ -1452,6 +1697,61 @@ where
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
+        authority: KvAuthorityProof {
+            term: entry.term,
+            commit_index: entry.index,
+            revision: commit.committed_request.revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: voter_acks.len(),
+                required_quorum: quorum_size,
+            },
+        },
+        replayed_committed_request: false,
+    })
+}
+
+/// Establishes a fresh current-term quorum barrier and returns the snapshot at
+/// that barrier. A new request id is intentionally generated for every call so
+/// an old committed barrier can never be mistaken for current authority.
+pub fn read_cluster_kv_authoritative_snapshot_with_host<H>(
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvRaftQuorumCommitOptions,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, H::Error>
+where
+    H: ClusterKvRaftQuorumCommitHost,
+    H::Error: ToString,
+{
+    let result = commit_cluster_kv_raft_command_with_quorum(
+        state,
+        KvCommandRequest::generated(KvCommand::Barrier),
+        options,
+        host,
+    )?;
+    Ok(KvAuthoritativeRead {
+        value: result.snapshot,
+        authority: result.authority,
+    })
+}
+
+pub async fn read_cluster_kv_authoritative_snapshot_async_with_host<H>(
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvRaftQuorumCommitOptions,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, H::Error>
+where
+    H: ClusterKvRaftQuorumCommitAsyncHost,
+{
+    let result = commit_cluster_kv_raft_command_with_quorum_async(
+        state,
+        KvCommandRequest::generated(KvCommand::Barrier),
+        options,
+        host,
+    )
+    .await?;
+    Ok(KvAuthoritativeRead {
+        value: result.snapshot,
+        authority: result.authority,
     })
 }
 
@@ -1461,6 +1761,108 @@ pub struct ClusterKvTxnQuorumDriverOptions {
 }
 
 const CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS: usize = 2;
+
+fn invalid_forwarded_cluster_kv_commit(detail: impl Into<String>) -> KvError {
+    KvError::AuthorityUnavailable {
+        detail: detail.into(),
+    }
+}
+
+fn validate_cluster_kv_txn_commit_response(
+    state: &ClusterBootstrapState,
+    request: &KvTxnRequest,
+    response: &ClusterKvTxnCommitResult,
+) -> Result<(), KvError> {
+    if response.request_id != request.request_id {
+        return Err(invalid_forwarded_cluster_kv_commit(format!(
+                "cluster KV commit response request ID {} does not match submitted request ID {}",
+                response.request_id, request.request_id
+            )));
+    }
+    response.snapshot.validate_resource_bounds()?;
+    let txn_response = response.txn_response.as_ref().ok_or_else(|| {
+        invalid_forwarded_cluster_kv_commit(
+            "cluster KV transaction commit response omitted its transaction result",
+        )
+    })?;
+    if response.authority.term == 0 || response.authority.commit_index == 0 {
+        return Err(invalid_forwarded_cluster_kv_commit(
+            "cluster KV commit response has an empty authority term or commit index",
+        ));
+    }
+    match response.authority.basis {
+        KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks,
+            required_quorum,
+        } => {
+            let voter_count = cluster_kv_raft_voter_ids(state)?.len();
+            let expected_quorum = cluster_kv_raft_quorum_size(voter_count);
+            if response.replayed_committed_request {
+                return Err(invalid_forwarded_cluster_kv_commit(
+                    "fresh-quorum commit response was marked as an exact committed replay",
+                ));
+            }
+            if response.authority.term < state.term {
+                return Err(invalid_forwarded_cluster_kv_commit(format!(
+                    "cluster KV commit response term {} is older than observed term {}",
+                    response.authority.term, state.term
+                )));
+            }
+            if required_quorum != expected_quorum
+                || voter_acks < expected_quorum
+                || voter_acks > voter_count
+            {
+                return Err(invalid_forwarded_cluster_kv_commit(format!(
+                    "cluster KV commit response reported {voter_acks} voter acknowledgements and quorum {required_quorum}, but membership has {voter_count} voters and requires {expected_quorum}"
+                )));
+            }
+            if response.authority.revision != response.snapshot.revision {
+                return Err(invalid_forwarded_cluster_kv_commit(format!(
+                    "cluster KV commit proof revision {} does not match returned snapshot revision {}",
+                    response.authority.revision.0, response.snapshot.revision.0
+                )));
+            }
+            if txn_response.revision != response.authority.revision {
+                return Err(invalid_forwarded_cluster_kv_commit(format!(
+                    "cluster KV transaction result revision {} does not match authority revision {}",
+                    txn_response.revision.0, response.authority.revision.0
+                )));
+            }
+        }
+        KvAuthorityBasis::ExactCommittedRequest => {
+            if !response.replayed_committed_request {
+                return Err(invalid_forwarded_cluster_kv_commit(
+                    "exact committed-request authority was not marked as a replay",
+                ));
+            }
+            let digest = request.clone().into_command_request().digest()?;
+            let record = response
+                .snapshot
+                .committed_requests
+                .iter()
+                .find(|record| record.request_id == request.request_id)
+                .ok_or_else(|| {
+                    invalid_forwarded_cluster_kv_commit(format!(
+                        "exact committed-request response omitted durable record {}",
+                        request.request_id
+                    ))
+                })?;
+            if record.command_digest != digest
+                || record.term != response.authority.term
+                || record.log_index != response.authority.commit_index
+                || record.revision != response.authority.revision
+                || record.txn_response != response.txn_response
+                || response.snapshot.revision < record.revision
+            {
+                return Err(invalid_forwarded_cluster_kv_commit(format!(
+                    "exact committed-request proof for {} does not match its durable snapshot record",
+                    request.request_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub trait ClusterKvTxnQuorumHost {
     type Error: ToString;
@@ -1482,7 +1884,7 @@ pub trait ClusterKvTxnQuorumHost {
     fn forward_cluster_kv_txn_to_voter(
         &mut self,
         state: &ClusterBootstrapState,
-        txn: &KvTxn,
+        request: &KvTxnRequest,
     ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error>;
 
     fn elect_cluster_raft_leader(
@@ -1495,22 +1897,17 @@ pub trait ClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
     ) -> Result<usize, Self::Error>;
 
-    fn semantic_txn_no_effect_response(
-        &mut self,
-        txn: &KvTxn,
-    ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error>;
-
     fn commit_cluster_raft_txn_with_quorum(
         &mut self,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<ClusterKvRaftQuorumCommitResult, Self::Error>;
 
     fn cluster_quorum_commit_error_allows_retry(&mut self, _error: &Self::Error) -> bool {
         false
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+    fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error;
 }
 
 pub trait ClusterKvTxnQuorumAsyncHost {
@@ -1536,7 +1933,7 @@ pub trait ClusterKvTxnQuorumAsyncHost {
     fn forward_cluster_kv_txn_to_voter_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
-        txn: &'a KvTxn,
+        request: &'a KvTxnRequest,
     ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error>;
 
     fn elect_cluster_raft_leader_async<'a>(
@@ -1549,27 +1946,22 @@ pub trait ClusterKvTxnQuorumAsyncHost {
         state: &'a ClusterBootstrapState,
     ) -> ClusterKvRaftQuorumFuture<'a, usize, Self::Error>;
 
-    fn semantic_txn_no_effect_response_async<'a>(
-        &'a mut self,
-        txn: &'a KvTxn,
-    ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error>;
-
     fn commit_cluster_raft_txn_with_quorum_async<'a>(
         &'a mut self,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftQuorumCommitResult, Self::Error>;
 
     fn cluster_quorum_commit_error_allows_retry(&mut self, _error: &Self::Error) -> bool {
         false
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+    fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error;
 }
 
 pub fn commit_cluster_kv_txn_with_quorum_with_host<H>(
     state: &mut ClusterBootstrapState,
-    txn: KvTxn,
+    request: KvTxnRequest,
     options: ClusterKvTxnQuorumDriverOptions,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, H::Error>
@@ -1579,15 +1971,26 @@ where
     let _ = host.refresh_current_cluster_kv_store(state);
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
-            && let Some(response) = host.forward_cluster_kv_txn_to_voter(state, &txn)?
+            && let Some(response) = host.forward_cluster_kv_txn_to_voter(state, &request)?
         {
+            validate_cluster_kv_txn_commit_response(state, &request, &response)
+                .map_err(H::kv_error)?;
             return Ok(response);
         }
         let reachable_voters = host.reachable_voter_count(state)?;
-        return Err(host.cluster_read_only_error(format!(
+        let detail = format!(
             "local node is not a Raft voter and could not forward to a voter ({} reachable voters, {} required)",
             reachable_voters,
             cluster_kv_raft_quorum_size_for_state(state)
+        );
+        return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+            state,
+            KvAuthorityFailureReason::LocalNodeNotVoter,
+            detail,
+            0,
+            KvRevision::ZERO,
+            reachable_voters,
+            None,
         )));
     }
 
@@ -1595,13 +1998,23 @@ where
     for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
         if !host.local_is_raft_leader(state)? {
             if !options.allow_forwarding {
-                return Err(host.cluster_read_only_error(
-                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
-                        .to_string(),
-                ));
+                let reachable_voters = host.reachable_voter_count(state)?;
+                return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+                    state,
+                    KvAuthorityFailureReason::NoQuorum,
+                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections".to_string(),
+                    0,
+                    KvRevision::ZERO,
+                    reachable_voters,
+                    None,
+                )));
             }
-            let forwarding_failure = match host.forward_cluster_kv_txn_to_voter(state, &txn) {
-                Ok(Some(response)) => return Ok(response),
+            let forwarding_failure = match host.forward_cluster_kv_txn_to_voter(state, &request) {
+                Ok(Some(response)) => {
+                    validate_cluster_kv_txn_commit_response(state, &request, &response)
+                        .map_err(H::kv_error)?;
+                    return Ok(response);
+                }
                 Ok(None) => None,
                 Err(error) => Some(error),
             };
@@ -1618,25 +2031,44 @@ where
                     detail.push_str("; previous local commit failed: ");
                     detail.push_str(&error.to_string());
                 }
-                return Err(host.cluster_read_only_error(detail));
+                let reachable_voters = host.reachable_voter_count(state)?;
+                return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+                    state,
+                    KvAuthorityFailureReason::NoQuorum,
+                    detail,
+                    0,
+                    KvRevision::ZERO,
+                    reachable_voters,
+                    None,
+                )));
             }
         }
         if !host.local_is_raft_leader(state)? {
-            let mut detail = "local node is not the Raft leader and could not win quorum".to_string();
+            let mut detail =
+                "local node is not the Raft leader and could not win quorum".to_string();
             if let Some(error) = previous_commit_failure.as_ref() {
                 detail.push_str("; previous local commit failed: ");
                 detail.push_str(&error.to_string());
             }
-            return Err(host.cluster_read_only_error(detail));
+            let reachable_voters = host.reachable_voter_count(state)?;
+            return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+                state,
+                KvAuthorityFailureReason::NoQuorum,
+                detail,
+                0,
+                KvRevision::ZERO,
+                reachable_voters,
+                None,
+            )));
         }
-        if let Some(response) = host.semantic_txn_no_effect_response(&txn)? {
-            return Ok(response);
-        }
-        match host.commit_cluster_raft_txn_with_quorum(state, txn.clone()) {
+        match host.commit_cluster_raft_txn_with_quorum(state, request.clone()) {
             Ok(commit) => {
                 return Ok(ClusterKvTxnCommitResult {
+                    request_id: request.request_id.clone(),
                     snapshot: commit.snapshot,
                     txn_response: commit.txn_response,
+                    authority: commit.authority,
+                    replayed_committed_request: commit.replayed_committed_request,
                 });
             }
             Err(error)
@@ -1657,13 +2089,24 @@ where
                 error.to_string()
             )
         })
-        .unwrap_or_else(|| "local node could not commit after retrying Raft leadership".to_string());
-    Err(host.cluster_read_only_error(detail))
+        .unwrap_or_else(|| {
+            "local node could not commit after retrying Raft leadership".to_string()
+        });
+    let reachable_voters = host.reachable_voter_count(state)?;
+    Err(host.cluster_authority_error(cluster_kv_authority_failure(
+        state,
+        KvAuthorityFailureReason::NoQuorum,
+        detail,
+        0,
+        KvRevision::ZERO,
+        reachable_voters,
+        None,
+    )))
 }
 
 pub async fn commit_cluster_kv_txn_with_quorum_async_with_host<H>(
     state: &mut ClusterBootstrapState,
-    txn: KvTxn,
+    request: KvTxnRequest,
     options: ClusterKvTxnQuorumDriverOptions,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, H::Error>
@@ -1674,16 +2117,27 @@ where
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host
-                .forward_cluster_kv_txn_to_voter_async(state, &txn)
+                .forward_cluster_kv_txn_to_voter_async(state, &request)
                 .await?
         {
+            validate_cluster_kv_txn_commit_response(state, &request, &response)
+                .map_err(H::kv_error)?;
             return Ok(response);
         }
         let reachable_voters = host.reachable_voter_count_async(state).await?;
-        return Err(host.cluster_read_only_error(format!(
+        let detail = format!(
             "local node is not a Raft voter and could not forward to a voter ({} reachable voters, {} required)",
             reachable_voters,
             cluster_kv_raft_quorum_size_for_state(state)
+        );
+        return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+            state,
+            KvAuthorityFailureReason::LocalNodeNotVoter,
+            detail,
+            0,
+            KvRevision::ZERO,
+            reachable_voters,
+            None,
         )));
     }
 
@@ -1691,16 +2145,26 @@ where
     for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
         if !host.local_is_raft_leader_async(state).await? {
             if !options.allow_forwarding {
-                return Err(host.cluster_read_only_error(
-                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections"
-                        .to_string(),
-                ));
+                let reachable_voters = host.reachable_voter_count_async(state).await?;
+                return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+                    state,
+                    KvAuthorityFailureReason::NoQuorum,
+                    "forwarded cluster KV transaction reached a non-leader voter; forwarded requests do not start elections".to_string(),
+                    0,
+                    KvRevision::ZERO,
+                    reachable_voters,
+                    None,
+                )));
             }
             let forwarding_failure = match host
-                .forward_cluster_kv_txn_to_voter_async(state, &txn)
+                .forward_cluster_kv_txn_to_voter_async(state, &request)
                 .await
             {
-                Ok(Some(response)) => return Ok(response),
+                Ok(Some(response)) => {
+                    validate_cluster_kv_txn_commit_response(state, &request, &response)
+                        .map_err(H::kv_error)?;
+                    return Ok(response);
+                }
                 Ok(None) => None,
                 Err(error) => Some(error),
             };
@@ -1717,7 +2181,16 @@ where
                     detail.push_str("; previous local commit failed: ");
                     detail.push_str(&error.to_string());
                 }
-                return Err(host.cluster_read_only_error(detail));
+                let reachable_voters = host.reachable_voter_count_async(state).await?;
+                return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+                    state,
+                    KvAuthorityFailureReason::NoQuorum,
+                    detail,
+                    0,
+                    KvRevision::ZERO,
+                    reachable_voters,
+                    None,
+                )));
             }
         }
         if !host.local_is_raft_leader_async(state).await? {
@@ -1727,19 +2200,28 @@ where
                 detail.push_str("; previous local commit failed: ");
                 detail.push_str(&error.to_string());
             }
-            return Err(host.cluster_read_only_error(detail));
-        }
-        if let Some(response) = host.semantic_txn_no_effect_response_async(&txn).await? {
-            return Ok(response);
+            let reachable_voters = host.reachable_voter_count_async(state).await?;
+            return Err(host.cluster_authority_error(cluster_kv_authority_failure(
+                state,
+                KvAuthorityFailureReason::NoQuorum,
+                detail,
+                0,
+                KvRevision::ZERO,
+                reachable_voters,
+                None,
+            )));
         }
         match host
-            .commit_cluster_raft_txn_with_quorum_async(state, txn.clone())
+            .commit_cluster_raft_txn_with_quorum_async(state, request.clone())
             .await
         {
             Ok(commit) => {
                 return Ok(ClusterKvTxnCommitResult {
+                    request_id: request.request_id.clone(),
                     snapshot: commit.snapshot,
                     txn_response: commit.txn_response,
+                    authority: commit.authority,
+                    replayed_committed_request: commit.replayed_committed_request,
                 });
             }
             Err(error)
@@ -1760,8 +2242,19 @@ where
                 error.to_string()
             )
         })
-        .unwrap_or_else(|| "local node could not commit after retrying Raft leadership".to_string());
-    Err(host.cluster_read_only_error(detail))
+        .unwrap_or_else(|| {
+            "local node could not commit after retrying Raft leadership".to_string()
+        });
+    let reachable_voters = host.reachable_voter_count_async(state).await?;
+    Err(host.cluster_authority_error(cluster_kv_authority_failure(
+        state,
+        KvAuthorityFailureReason::NoQuorum,
+        detail,
+        0,
+        KvRevision::ZERO,
+        reachable_voters,
+        None,
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2312,19 +2805,71 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         command: KvCommand,
     ) -> Result<ClusterKvRaftCommitResult, KvError> {
+        self.append_request_with_response(node_id, KvCommandRequest::generated(command))
+    }
+
+    pub fn append_request_with_response(
+        &self,
+        node_id: &NodeId,
+        request: KvCommandRequest,
+    ) -> Result<ClusterKvRaftCommitResult, KvError> {
         let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
-        if let Some((snapshot, txn_response)) = Self::command_no_effect_response(&node, &command)? {
-            return Ok(ClusterKvRaftCommitResult {
-                snapshot,
-                txn_response,
-                events: Vec::new(),
+        let digest = request.digest()?;
+        if node.store().request_id_expired(&request.request_id) {
+            return Err(KvError::RequestExpired {
+                request_id: request.request_id,
             });
         }
+        if let Some(record) = node.store().committed_request(&request.request_id) {
+            if record.command_digest != digest {
+                return Err(KvError::RequestIdConflict {
+                    request_id: request.request_id,
+                });
+            }
+            return Ok(ClusterKvRaftCommitResult {
+                snapshot: node.store().try_snapshot()?,
+                txn_response: record.txn_response.clone(),
+                events: Vec::new(),
+                committed_request: record.clone(),
+            });
+        }
+        if let Err(error) = node.store().preflight_apply_command(&request.command) {
+            let _ = mark_cluster_kv_request_rejected_before_commit(
+                &self.paths,
+                &request,
+                error.to_string(),
+            );
+            return Err(error);
+        }
+        mark_cluster_kv_request_submitted(&self.paths, &request)?;
         let before_revision = node.store().revision();
         let term = node.hard_state().current_term.max(1);
-        let entry = node.append_local_command(term, command)?;
-        node.commit_to(entry.index)?;
+        let request_for_outcome = request.clone();
+        let entry = match node.append_local_request(term, request) {
+            Ok(entry) => entry,
+            Err(error) => {
+                let _ = mark_cluster_kv_request_unknown(
+                    &self.paths,
+                    &request_for_outcome,
+                    error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = node.commit_to(entry.index) {
+            let _ = mark_cluster_kv_request_unknown(
+                &self.paths,
+                &request_for_outcome,
+                error.to_string(),
+            );
+            return Err(error);
+        }
         let txn_response = node.txn_response_at(entry.index).cloned();
+        let committed_request = node
+            .store()
+            .committed_request(&entry.request_id)
+            .cloned()
+            .ok_or(KvError::MissingCommittedEntry { index: entry.index })?;
         self.compact_node_if_needed(&mut node)?;
         let snapshot = node.store().try_snapshot()?;
         let events = Self::events_after_revision(&snapshot, before_revision)?;
@@ -2332,6 +2877,7 @@ impl ClusterKvRaftStore {
             snapshot,
             txn_response,
             events,
+            committed_request,
         })
     }
 
@@ -2482,29 +3028,111 @@ impl ClusterKvRaftStore {
         self.append_command_to_open_node(&mut node, command)
     }
 
-    pub fn append_command_uncommitted_or_no_effect(
+    pub fn replay_request_if_committed(
         &self,
         node_id: &NodeId,
-        command: KvCommand,
-    ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
-        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
-        if let Some((snapshot, txn_response)) = Self::command_no_effect_response(&node, &command)? {
-            return Ok(ClusterKvRaftUncommittedAppend::NoEffect {
-                snapshot,
-                txn_response,
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, KvError> {
+        let node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let digest = request.digest()?;
+        if node.store().request_id_expired(&request.request_id) {
+            return Err(KvError::RequestExpired {
+                request_id: request.request_id.clone(),
             });
         }
-        self.append_command_to_open_node(&mut node, command)
+        let Some(record) = node.store().committed_request(&request.request_id) else {
+            return Ok(None);
+        };
+        if record.command_digest != digest {
+            return Err(KvError::RequestIdConflict {
+                request_id: request.request_id.clone(),
+            });
+        }
+        Ok(Some((node.store().try_snapshot()?, record.clone())))
+    }
+
+    pub fn locked_replay_request_if_committed(
+        &self,
+        node_id: &NodeId,
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, KvError> {
+        let _raft_guard = self.lock_operation()?;
+        self.replay_request_if_committed(node_id, request)
+    }
+
+    pub fn append_request_uncommitted(
+        &self,
+        node_id: &NodeId,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, KvError> {
+        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let preflight = (|| {
+            let digest = request.digest()?;
+            if node.store().request_id_expired(&request.request_id) {
+                return Err(KvError::RequestExpired {
+                    request_id: request.request_id.clone(),
+                });
+            }
+            if let Some(existing) = node.store().committed_request(&request.request_id)
+                && existing.command_digest != digest
+            {
+                return Err(KvError::RequestIdConflict {
+                    request_id: request.request_id.clone(),
+                });
+            }
+            node.store().preflight_apply_command(&request.command)
+        })();
+        if let Err(error) = preflight {
+            let _ = mark_cluster_kv_request_rejected_before_commit(
+                &self.paths,
+                &request,
+                error.to_string(),
+            );
+            return Err(error);
+        }
+        mark_cluster_kv_request_submitted(&self.paths, &request)?;
+        let request_for_outcome = request.clone();
+        match self.append_request_to_open_node(&mut node, request) {
+            Ok(entry) => Ok(entry),
+            Err(error) => {
+                let _ = mark_cluster_kv_request_unknown(
+                    &self.paths,
+                    &request_for_outcome,
+                    error.to_string(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub fn locked_append_request_uncommitted(
+        &self,
+        node_id: &NodeId,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, KvError> {
+        let _raft_guard = self.lock_operation()?;
+        self.append_request_uncommitted(node_id, request)
+    }
+
+    pub fn append_request_uncommitted_or_replay(
+        &self,
+        node_id: &NodeId,
+        request: KvCommandRequest,
+    ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
+        if let Some((snapshot, record)) = self.replay_request_if_committed(node_id, &request)? {
+            return Ok(ClusterKvRaftUncommittedAppend::CommittedReplay { snapshot, record });
+        }
+        self.append_request_uncommitted(node_id, request)
             .map(ClusterKvRaftUncommittedAppend::Appended)
     }
 
-    pub fn locked_append_command_uncommitted_or_no_effect(
+    pub fn locked_append_request_uncommitted_or_replay(
         &self,
         node_id: &NodeId,
-        command: KvCommand,
+        request: KvCommandRequest,
     ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
         let _raft_guard = self.lock_operation()?;
-        self.append_command_uncommitted_or_no_effect(node_id, command)
+        self.append_request_uncommitted_or_replay(node_id, request)
     }
 
     pub fn discard_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
@@ -2554,10 +3182,18 @@ impl ClusterKvRaftStore {
         self.compact_node_if_needed(&mut node)?;
         let snapshot = node.store().try_snapshot()?;
         let events = Self::events_after_revision(&snapshot, before_revision)?;
+        let committed_request = node
+            .log_entry_at(commit_index)
+            .and_then(|entry| node.store().committed_request(&entry.request_id))
+            .cloned()
+            .ok_or(KvError::MissingCommittedEntry {
+                index: commit_index,
+            })?;
         Ok(ClusterKvRaftCommitResult {
             snapshot,
             txn_response,
             events,
+            committed_request,
         })
     }
 
@@ -2603,26 +3239,15 @@ impl ClusterKvRaftStore {
         Ok(entry)
     }
 
-    fn command_no_effect_response(
-        node: &DurableRaftKvNode,
-        command: &KvCommand,
-    ) -> Result<Option<(KvSnapshot, Option<KvTxnResponse>)>, KvError> {
-        match command {
-            KvCommand::Op(op) => {
-                if node.store().op_response_if_no_effect(op)?.is_some() {
-                    return Ok(Some((node.store().try_snapshot()?, None)));
-                }
-            }
-            KvCommand::Txn(txn) => {
-                if let Some(response) = node
-                    .store()
-                    .txn_response_if_selected_branch_no_effect(txn)?
-                {
-                    return Ok(Some((node.store().try_snapshot()?, Some(response))));
-                }
-            }
-        }
-        Ok(None)
+    fn append_request_to_open_node(
+        &self,
+        node: &mut DurableRaftKvNode,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, KvError> {
+        let term = node.hard_state().current_term.max(1);
+        let entry = node.append_local_request(term, request)?;
+        self.compact_node_if_needed(node)?;
+        Ok(entry)
     }
 
     fn events_after_revision(
@@ -2673,13 +3298,48 @@ where
         self.last_snapshot_publish_wrote.take()
     }
 
-    pub fn append_uncommitted_or_no_effect(
+    pub fn append_uncommitted_or_replay(
         &mut self,
-        command: KvCommand,
+        request: KvCommandRequest,
     ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
         self.last_snapshot_publish_wrote = None;
         self.store
-            .locked_append_command_uncommitted_or_no_effect(&self.node_id, command)
+            .locked_append_request_uncommitted_or_replay(&self.node_id, request)
+    }
+
+    pub fn replay_if_committed(
+        &mut self,
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, KvError> {
+        self.last_snapshot_publish_wrote = None;
+        self.store
+            .locked_replay_request_if_committed(&self.node_id, request)
+    }
+
+    pub fn append_uncommitted(&mut self, request: KvCommandRequest) -> Result<KvLogEntry, KvError> {
+        self.last_snapshot_publish_wrote = None;
+        self.store
+            .locked_append_request_uncommitted(&self.node_id, request)
+    }
+
+    pub fn record_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &KvAuthorityFailure,
+    ) -> Result<(), KvError> {
+        mark_cluster_kv_request_rejected_before_commit(
+            self.store.paths(),
+            request,
+            failure.detail.clone(),
+        )
+    }
+
+    pub fn record_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), KvError> {
+        mark_cluster_kv_request_unknown(self.store.paths(), request, detail.to_string())
     }
 
     pub fn discard_uncommitted_tail_and_clear_leader(&mut self) -> Result<KvSnapshot, KvError> {
@@ -2725,11 +3385,34 @@ where
         error
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error> {
-        self.append_uncommitted_or_no_effect(command)
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, Self::Error> {
+        self.replay_if_committed(request)
+    }
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, Self::Error> {
+        self.append_uncommitted(request)
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &KvAuthorityFailure,
+    ) -> Result<(), Self::Error> {
+        self.record_rejected_before_commit(request, failure)
+    }
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), Self::Error> {
+        self.record_unknown(request, detail)
     }
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
@@ -2913,12 +3596,7 @@ impl DurableRaftKvNode {
         // through replication. Corrupt durable state must likewise fail closed;
         // silently quarantining it and restarting at index zero loses the
         // consensus position needed for a safe recovery.
-        Self::open_inner(
-            node_id.clone(),
-            paths,
-            discard_uncommitted_tail,
-            lock_wait,
-        )
+        Self::open_inner(node_id.clone(), paths, discard_uncommitted_tail, lock_wait)
     }
 
     pub async fn open_async_with_materialized_cache(
@@ -2963,6 +3641,10 @@ impl DurableRaftKvNode {
 
     pub fn term_at(&self, index: u64) -> Option<u64> {
         self.node.term_at(index)
+    }
+
+    pub fn log_entry_at(&self, index: u64) -> Option<&KvLogEntry> {
+        self.node.log_entry_at(index)
     }
 
     pub fn applied_index(&self) -> u64 {
@@ -3093,9 +3775,9 @@ impl DurableRaftKvNode {
             let snapshot_repairs_same_index_divergence = snapshot.last_included_index > 0
                 && snapshot.last_included_index == applied_index
                 && snapshot.last_included_index == self.hard_state().commit_index
-                && self.term_at(snapshot.last_included_index).is_some_and(|local_term| {
-                    snapshot.last_included_term > local_term
-                })
+                && self
+                    .term_at(snapshot.last_included_index)
+                    .is_some_and(|local_term| snapshot.last_included_term > local_term)
                 && snapshot.last_included_term <= append.term
                 && append.prev_log_index == snapshot.last_included_index
                 && append.prev_log_term == snapshot.last_included_term
@@ -3203,12 +3885,21 @@ impl DurableRaftKvNode {
         term: u64,
         command: KvCommand,
     ) -> Result<KvLogEntry, KvError> {
+        self.append_local_request(term, KvCommandRequest::generated(command))
+    }
+
+    pub fn append_local_request(
+        &mut self,
+        term: u64,
+        request: KvCommandRequest,
+    ) -> Result<KvLogEntry, KvError> {
         let hard_state_before = self.node.hard_state.clone();
         let log_before = self.node.log.clone();
         let entry = KvLogEntry {
             index: self.node.last_log_index().saturating_add(1),
             term,
-            command,
+            request_id: request.request_id,
+            command: request.command,
             revision: KvRevision::ZERO,
         };
         self.node.hard_state.current_term = term;

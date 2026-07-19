@@ -1037,6 +1037,7 @@ mod tests {
     #[test]
     fn config_type_aliases_keep_the_authoritative_wire_contract() {
         let request = RemoteManagementConfigSetRequest {
+            request_id: Some(sinomo_core::kv::KvRequestId::generate()),
             key: "sandbox.policy".to_string(),
             value: serde_json::json!({ "mode": "strict" }),
             target: ConfigWriteTarget::Local,

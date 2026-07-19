@@ -1,6 +1,8 @@
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::control_plane_options::ClusterKvTxnQuorumOptions;
 use crate::kv_forward::{
+    forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host,
+    forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host,
     forward_cluster_kv_txn_to_state_authority_async_with_host,
     forward_cluster_kv_txn_to_state_authority_with_host,
 };
@@ -10,11 +12,12 @@ use crate::kv_local_store::{
     imported_snapshot_advances_local_kv, locked_kv_state_authority_id,
     write_imported_cluster_kv_snapshot_if_changed,
 };
-use crate::kv_semantics::cluster_semantic_txn_no_effect_response;
 use crate::kv_snapshot::refresh_current_cluster_kv_store_with_host;
 #[cfg(any(test, feature = "test-support"))]
 use crate::local_state_store::read_cluster_state_without_kv;
-use crate::local_state_store::read_cluster_state_without_kv_async;
+use crate::local_state_store::{
+    project_committed_cluster_raft_config, read_cluster_state_without_kv_async,
+};
 use crate::prelude::*;
 use crate::raft_election::{
     ClusterRaftVoteTransportAsyncHost, elect_cluster_raft_leader_async_with_host,
@@ -30,14 +33,14 @@ use crate::state_authority_reachability::{
     cluster_reachable_state_authority_count_with_host,
 };
 #[allow(unused_imports)]
-#[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
     ClusterKvStateAuthorityVoteRequest, ClusterKvStateAuthorityVoteResponse,
     ClusterKvTxnCommitResult,
 };
-use sinomo_kv::{KvCommand, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_kv::{KvAuthoritativeRead, KvAuthorityBasis, KvCommand};
+use sinomo_kv::{KvCommandRequest, KvSnapshot, KvTxnRequest};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::ClusterSignedObjectRpcAsyncHost;
@@ -86,7 +89,7 @@ pub trait ClusterKvTxnQuorumHost {
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        txn: &KvTxn,
+        request: &KvTxnRequest,
         options: ClusterKvTxnQuorumOptions,
     ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
     where
@@ -95,7 +98,7 @@ pub trait ClusterKvTxnQuorumHost {
         forward_cluster_kv_txn_to_state_authority_with_host(
             paths,
             state,
-            txn,
+            request,
             options.forward_options,
             self,
         )
@@ -124,7 +127,7 @@ pub trait ClusterKvTxnQuorumHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        command: KvCommand,
+        request: KvCommandRequest,
         options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>;
 }
@@ -282,10 +285,10 @@ where
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        command: KvCommand,
+        request: KvCommandRequest,
         options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
-        commit_cluster_raft_command_with_control_plane_driver(paths, state, command, options, self)
+        commit_cluster_raft_command_with_control_plane_driver(paths, state, request, options, self)
     }
 }
 
@@ -320,10 +323,14 @@ where
     fn forward_cluster_kv_txn_to_voter(
         &mut self,
         state: &ClusterBootstrapState,
-        txn: &KvTxn,
+        request: &KvTxnRequest,
     ) -> Result<Option<sinomo_kv::ClusterKvTxnCommitResult>, Self::Error> {
-        self.host
-            .forward_cluster_kv_txn_to_state_authority(self.paths, state, txn, self.options)
+        self.host.forward_cluster_kv_txn_to_state_authority(
+            self.paths,
+            state,
+            request,
+            self.options,
+        )
     }
 
     fn elect_cluster_raft_leader(
@@ -345,30 +352,15 @@ where
         ))
     }
 
-    fn semantic_txn_no_effect_response(
-        &mut self,
-        txn: &KvTxn,
-    ) -> Result<Option<sinomo_kv::ClusterKvTxnCommitResult>, Self::Error> {
-        Ok(
-            cluster_semantic_txn_no_effect_response(self.paths, txn, OffsetDateTime::now_utc())?
-                .map(
-                    |(snapshot, txn_response)| sinomo_kv::ClusterKvTxnCommitResult {
-                        snapshot,
-                        txn_response: Some(txn_response),
-                    },
-                ),
-        )
-    }
-
     fn commit_cluster_raft_txn_with_quorum(
         &mut self,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<sinomo_kv::ClusterKvRaftQuorumCommitResult, Self::Error> {
         self.host.commit_cluster_kv_command_with_quorum(
             self.paths,
             state,
-            KvCommand::Txn(txn),
+            request.into_command_request(),
             ClusterKvRaftQuorumCommitOptions {
                 timeout: self.options.raft_append_timeout,
             },
@@ -379,39 +371,190 @@ where
         matches!(error, NetworkError::ClusterReadOnly { .. })
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-        NetworkError::ClusterReadOnly { detail }
+    fn cluster_authority_error(&mut self, failure: sinomo_kv::KvAuthorityFailure) -> Self::Error {
+        NetworkError::ClusterReadOnly {
+            detail: serde_json::to_string(&failure).unwrap_or_else(|_| format!("{failure:?}")),
+        }
     }
 }
 
 pub fn commit_cluster_kv_txn_with_quorum_response_with_host(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    txn: KvTxn,
+    request: KvTxnRequest,
     options: ClusterKvTxnQuorumOptions,
     host: &mut impl ClusterKvTxnQuorumHost,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    let mut consensus_state = state.clone();
+    project_committed_cluster_raft_config(paths, &mut consensus_state)?;
     let allow_forwarding = options.allow_forwarding;
     let mut kv_host = NetworkClusterKvTxnQuorumHost {
         paths,
         options,
         host,
     };
-    sinomo_kv::commit_cluster_kv_txn_with_quorum_with_host(
-        state,
-        txn,
+    let result = sinomo_kv::commit_cluster_kv_txn_with_quorum_with_host(
+        &mut consensus_state,
+        request,
         sinomo_kv::ClusterKvTxnQuorumDriverOptions { allow_forwarding },
         &mut kv_host,
+    )?;
+    state.term = state.term.max(consensus_state.term);
+    state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
+    Ok(result)
+}
+
+fn authoritative_read_from_commit(
+    result: ClusterKvRaftQuorumCommitResult,
+    state: &ClusterBootstrapState,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    validate_forwarded_authoritative_read(
+        KvAuthoritativeRead {
+            value: result.snapshot,
+            authority: result.authority,
+        },
+        state,
     )
+}
+
+fn validate_forwarded_authoritative_read(
+    read: KvAuthoritativeRead<KvSnapshot>,
+    state: &ClusterBootstrapState,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    let voter_count = sinomo_kv::cluster_kv_raft_voter_ids(state)
+        .map_err(kv_err)?
+        .len();
+    let expected_quorum = sinomo_kv::cluster_kv_raft_quorum_size(voter_count);
+    let KvAuthorityBasis::CurrentTermQuorum {
+        voter_acks,
+        required_quorum,
+    } = read.authority.basis
+    else {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "authoritative read was not current-term quorum confirmed".to_string(),
+        });
+    };
+    if required_quorum != expected_quorum
+        || voter_acks < required_quorum
+        || voter_acks > voter_count
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative proof reported {voter_acks} voter acknowledgements and quorum {required_quorum}, but committed membership has {voter_count} voters and requires {expected_quorum}"
+            ),
+        });
+    }
+    if read.authority.revision != read.value.revision {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative proof revision {} does not match returned snapshot revision {}",
+                read.authority.revision.0, read.value.revision.0
+            ),
+        });
+    }
+    Ok(read)
+}
+
+pub fn read_cluster_kv_authoritative_snapshot_with_host(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvTxnQuorumOptions,
+    host: &mut impl ClusterKvTxnQuorumHost,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    let _ = host.refresh_current_cluster_kv_store(paths, state);
+    let mut consensus_state = state.clone();
+    project_committed_cluster_raft_config(paths, &mut consensus_state)?;
+    let read = read_cluster_kv_authoritative_snapshot_with_consensus_state(
+        paths,
+        &mut consensus_state,
+        options,
+        host,
+    )?;
+    state.term = state
+        .term
+        .max(consensus_state.term)
+        .max(read.authority.term);
+    state.kv_revision = state
+        .kv_revision
+        .max(consensus_state.kv_revision)
+        .max(read.authority.revision.0);
+    Ok(read)
+}
+
+fn read_cluster_kv_authoritative_snapshot_with_consensus_state(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvTxnQuorumOptions,
+    host: &mut impl ClusterKvTxnQuorumHost,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    if !sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+        if options.allow_forwarding
+            && let Some(read) =
+                forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+                    paths,
+                    state,
+                    options.forward_options,
+                    host,
+                )?
+        {
+            return validate_forwarded_authoritative_read(read, state);
+        }
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "local node is not a Raft voter and could not forward an authoritative read"
+                .to_string(),
+        });
+    }
+    if !host.local_is_kv_state_authority(paths, state)? {
+        let forwarding_failure = if options.allow_forwarding {
+            match forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+                paths,
+                state,
+                options.forward_options,
+                host,
+            ) {
+                Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
+                Ok(None) => None,
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if !options.allow_forwarding || !host.elect_kv_state_authority(paths, state, options)? {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: forwarding_failure.map_or_else(
+                    || "local node could not establish current-term Raft leadership".to_string(),
+                    |error| {
+                        format!(
+                            "local node could not establish current-term Raft leadership; forwarding failed: {error}"
+                        )
+                    },
+                ),
+            });
+        }
+    }
+    if !host.local_is_kv_state_authority(paths, state)? {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "local node lacks verified current-term Raft leadership".to_string(),
+        });
+    }
+    let result = host.commit_cluster_kv_command_with_quorum(
+        paths,
+        state,
+        KvCommandRequest::generated(KvCommand::Barrier),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: options.raft_append_timeout,
+        },
+    )?;
+    authoritative_read_from_commit(result, state)
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn handle_cluster_kv_txn_request_with_host(
     paths: &ClusterPaths,
-    txn: KvTxn,
+    request: KvTxnRequest,
     options: ClusterKvTxnQuorumOptions,
     host: &mut impl ClusterKvTxnQuorumHost,
-) -> Result<KvTxnResponse, NetworkError> {
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
     let mut state = read_cluster_state_without_kv(paths).map_err(|error| match error {
         NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
             detail: "local node has no cluster state".to_string(),
@@ -419,14 +562,10 @@ pub fn handle_cluster_kv_txn_request_with_host(
         other => other,
     })?;
     let result = commit_cluster_kv_txn_with_quorum_response_with_host(
-        paths, &mut state, txn, options, host,
+        paths, &mut state, request, options, host,
     )?;
     write_imported_cluster_kv_snapshot_if_changed(paths, &result.snapshot)?;
-    Ok(result.txn_response.unwrap_or(KvTxnResponse {
-        succeeded: true,
-        revision: result.snapshot.revision,
-        responses: Vec::new(),
-    }))
+    Ok(result)
 }
 
 pub(crate) fn locked_cluster_raft_local_is_leader(
@@ -452,23 +591,6 @@ async fn locked_cluster_raft_local_is_leader_async(
         .map_err(|source| NetworkError::Io {
             operation: "cluster raft local leader".to_string(),
             detail: format!("local leader task failed: {source}"),
-        })?
-}
-
-async fn cluster_semantic_txn_no_effect_response_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    txn: &KvTxn,
-    now: OffsetDateTime,
-) -> Result<Option<(KvSnapshot, KvTxnResponse)>, NetworkError> {
-    let paths = paths.clone();
-    let txn = txn.clone();
-    runtime
-        .spawn_blocking(move || cluster_semantic_txn_no_effect_response(&paths, &txn, now))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster semantic txn no-effect check".to_string(),
-            detail: format!("semantic txn no-effect task failed: {source}"),
         })?
 }
 
@@ -520,7 +642,7 @@ where
     fn forward_cluster_kv_txn_to_voter_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
-        txn: &'a KvTxn,
+        request: &'a KvTxnRequest,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
         'a,
         Option<sinomo_kv::ClusterKvTxnCommitResult>,
@@ -532,7 +654,7 @@ where
         let host = &mut *self.host;
         Box::pin(async move {
             forward_cluster_kv_txn_to_state_authority_async_with_host(
-                runtime, paths, state, txn, options, host,
+                runtime, paths, state, request, options, host,
             )
             .await
         })
@@ -564,37 +686,10 @@ where
         })
     }
 
-    fn semantic_txn_no_effect_response_async<'a>(
-        &'a mut self,
-        txn: &'a KvTxn,
-    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
-        'a,
-        Option<sinomo_kv::ClusterKvTxnCommitResult>,
-        Self::Error,
-    > {
-        let runtime = self.runtime;
-        let paths = self.paths;
-        Box::pin(async move {
-            Ok(cluster_semantic_txn_no_effect_response_async(
-                runtime,
-                paths,
-                txn,
-                OffsetDateTime::now_utc(),
-            )
-            .await?
-            .map(
-                |(snapshot, txn_response)| sinomo_kv::ClusterKvTxnCommitResult {
-                    snapshot,
-                    txn_response: Some(txn_response),
-                },
-            ))
-        })
-    }
-
     fn commit_cluster_raft_txn_with_quorum_async<'a>(
         &'a mut self,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
         'a,
         sinomo_kv::ClusterKvRaftQuorumCommitResult,
@@ -609,7 +704,7 @@ where
                 runtime,
                 paths,
                 state,
-                KvCommand::Txn(txn),
+                request.into_command_request(),
                 ClusterKvRaftQuorumCommitOptions {
                     timeout: options.raft_append_timeout,
                 },
@@ -624,8 +719,10 @@ where
         matches!(error, NetworkError::ClusterReadOnly { .. })
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-        NetworkError::ClusterReadOnly { detail }
+    fn cluster_authority_error(&mut self, failure: sinomo_kv::KvAuthorityFailure) -> Self::Error {
+        NetworkError::ClusterReadOnly {
+            detail: serde_json::to_string(&failure).unwrap_or_else(|_| format!("{failure:?}")),
+        }
     }
 }
 
@@ -633,13 +730,25 @@ pub async fn commit_cluster_kv_txn_with_quorum_response_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    txn: KvTxn,
+    request: KvTxnRequest,
     options: ClusterKvTxnQuorumOptions,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
+    let project_paths = paths.clone();
+    let mut consensus_state = state.clone();
+    consensus_state = runtime
+        .spawn_blocking(move || {
+            project_committed_cluster_raft_config(&project_paths, &mut consensus_state)?;
+            Ok::<_, NetworkError>(consensus_state)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "project committed cluster Raft config".to_string(),
+            detail: format!("Raft config projection task failed: {source}"),
+        })??;
     let allow_forwarding = options.allow_forwarding;
     let mut kv_host = NetworkClusterKvTxnQuorumAsyncHost {
         runtime,
@@ -648,12 +757,14 @@ where
         host,
     };
     let result = sinomo_kv::commit_cluster_kv_txn_with_quorum_async_with_host(
-        state,
-        txn,
+        &mut consensus_state,
+        request,
         sinomo_kv::ClusterKvTxnQuorumDriverOptions { allow_forwarding },
         &mut kv_host,
     )
     .await?;
+    state.term = state.term.max(consensus_state.term);
+    state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
     // A forwarded commit observes the voter's post-commit snapshot; import it
     // when it advances the local view so the forwarding node reads its own
     // write immediately. The committed-append fan-out runs on the voter and
@@ -678,13 +789,143 @@ where
     Ok(result)
 }
 
+pub async fn read_cluster_kv_authoritative_snapshot_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvTxnQuorumOptions,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let project_paths = paths.clone();
+    let mut consensus_state = state.clone();
+    consensus_state = runtime
+        .spawn_blocking(move || {
+            project_committed_cluster_raft_config(&project_paths, &mut consensus_state)?;
+            Ok::<_, NetworkError>(consensus_state)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "project committed cluster Raft config".to_string(),
+            detail: format!("Raft config projection task failed: {source}"),
+        })??;
+    let read = read_cluster_kv_authoritative_snapshot_async_with_consensus_state(
+        runtime,
+        paths,
+        &mut consensus_state,
+        options,
+        host,
+    )
+    .await?;
+    state.term = state
+        .term
+        .max(consensus_state.term)
+        .max(read.authority.term);
+    state.kv_revision = state
+        .kv_revision
+        .max(consensus_state.kv_revision)
+        .max(read.authority.revision.0);
+    Ok(read)
+}
+
+async fn read_cluster_kv_authoritative_snapshot_async_with_consensus_state<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvTxnQuorumOptions,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    if !sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+        if options.allow_forwarding
+            && let Some(read) =
+                forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host(
+                    runtime,
+                    paths,
+                    state,
+                    options.forward_options,
+                    host,
+                )
+                .await?
+        {
+            return validate_forwarded_authoritative_read(read, state);
+        }
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "local node is not a Raft voter and could not forward an authoritative read"
+                .to_string(),
+        });
+    }
+    if !locked_cluster_raft_local_is_leader_async(runtime, paths, state).await? {
+        let forwarding_failure = if options.allow_forwarding {
+            match forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host(
+                runtime,
+                paths,
+                state,
+                options.forward_options,
+                host,
+            )
+            .await
+            {
+                Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
+                Ok(None) => None,
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if !options.allow_forwarding
+            || !elect_cluster_raft_leader_async_with_host(
+                runtime,
+                paths,
+                state,
+                options.leader_election_options,
+                host,
+            )
+            .await?
+        {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: forwarding_failure.map_or_else(
+                    || "local node could not establish current-term Raft leadership".to_string(),
+                    |error| {
+                        format!(
+                            "local node could not establish current-term Raft leadership; forwarding failed: {error}"
+                        )
+                    },
+                ),
+            });
+        }
+    }
+    if !locked_cluster_raft_local_is_leader_async(runtime, paths, state).await? {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "local node lacks verified current-term Raft leadership".to_string(),
+        });
+    }
+    let result = commit_cluster_raft_command_with_quorum_async_with_host(
+        runtime,
+        paths,
+        state,
+        KvCommandRequest::generated(KvCommand::Barrier),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: options.raft_append_timeout,
+        },
+        options.raft_append_replication_options,
+        host,
+    )
+    .await?;
+    authoritative_read_from_commit(result, state)
+}
+
 pub async fn handle_cluster_kv_txn_request_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
-    txn: KvTxn,
+    request: KvTxnRequest,
     options: ClusterKvTxnQuorumOptions,
     host: &mut H,
-) -> Result<KvTxnResponse, NetworkError>
+) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
@@ -697,13 +938,143 @@ where
             other => other,
         })?;
     let result = commit_cluster_kv_txn_with_quorum_response_async_with_host(
-        runtime, paths, &mut state, txn, options, host,
+        runtime, paths, &mut state, request, options, host,
     )
     .await?;
     write_imported_cluster_kv_snapshot_if_changed_async(runtime, paths, &result.snapshot).await?;
-    Ok(result.txn_response.unwrap_or(KvTxnResponse {
-        succeeded: true,
-        revision: result.snapshot.revision,
-        responses: Vec::new(),
-    }))
+    Ok(result)
+}
+
+pub async fn handle_cluster_kv_authoritative_snapshot_request_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    body: &[u8],
+    options: ClusterKvTxnQuorumOptions,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_request_body(body).map_err(kv_err)?;
+    let mut state = read_cluster_state_without_kv_async(runtime, paths)
+        .await
+        .map_err(|error| match error {
+            NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
+                detail: "local node has no cluster state".to_string(),
+            },
+            other => other,
+        })?;
+    read_cluster_kv_authoritative_snapshot_async_with_host(
+        runtime, paths, &mut state, options, host,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_base::ClusterMemberRecord;
+    use sinomo_kv::{InProcessKvStore, KvAuthorityProof, KvRevision};
+    use sinomo_node::ClusterId;
+    use time::OffsetDateTime;
+
+    fn three_voter_state() -> ClusterBootstrapState {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cluster_id = ClusterId::from_legacy_named("cluster_authority_proof").expect("cluster");
+        let local = NodeId::from_legacy_named("node_authority_proof_local").expect("local");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "authority proof",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        for (node_id, name) in [
+            (state.local_node_id.clone(), "local"),
+            (
+                NodeId::from_legacy_named("node_authority_proof_second").expect("second"),
+                "second",
+            ),
+            (
+                NodeId::from_legacy_named("node_authority_proof_third").expect("third"),
+                "third",
+            ),
+        ] {
+            let mut member = ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id,
+                name,
+                format!("pk-{name}"),
+                now,
+            );
+            member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            if name == "local" {
+                state.members[0] = member;
+            } else {
+                state.members.push(member);
+            }
+        }
+        state
+    }
+
+    fn authoritative_read(
+        snapshot_revision: KvRevision,
+        proof_revision: KvRevision,
+        voter_acks: usize,
+        required_quorum: usize,
+    ) -> KvAuthoritativeRead<KvSnapshot> {
+        let mut snapshot = InProcessKvStore::new().try_snapshot().expect("snapshot");
+        snapshot.revision = snapshot_revision;
+        KvAuthoritativeRead {
+            value: snapshot,
+            authority: KvAuthorityProof {
+                term: 3,
+                commit_index: 7,
+                revision: proof_revision,
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks,
+                    required_quorum,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn authoritative_proof_requires_real_membership_quorum_and_matching_revision() {
+        let state = three_voter_state();
+        let revision = KvRevision(9);
+        assert!(
+            validate_forwarded_authoritative_read(
+                authoritative_read(revision, revision, 2, 2),
+                &state,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_forwarded_authoritative_read(
+                authoritative_read(revision, revision, 1, 2),
+                &state,
+            )
+            .is_err(),
+            "fewer acknowledgements than quorum must be rejected"
+        );
+        assert!(
+            validate_forwarded_authoritative_read(
+                authoritative_read(revision, revision, 2, 1),
+                &state,
+            )
+            .is_err(),
+            "a proof cannot claim a smaller quorum than committed membership"
+        );
+        assert!(
+            validate_forwarded_authoritative_read(
+                authoritative_read(revision, KvRevision(8), 2, 2),
+                &state,
+            )
+            .is_err(),
+            "proof and snapshot revisions must identify the same committed view"
+        );
+    }
 }

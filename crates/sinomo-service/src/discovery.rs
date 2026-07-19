@@ -10,7 +10,7 @@
 
 use crate::{ClusterAccess, ServiceError, ServiceRegistry};
 use serde::{Deserialize, Serialize};
-use sinomo_kv::{KvEntry, KvOp, KvTxn, KvTxnResponse};
+use sinomo_kv::{ClusterKvTxnCommitResult, KvEntry, KvOp, KvTxn, KvTxnRequest};
 use sinomo_network::{ClusterDirectory, NetworkError};
 use sinomo_node::NodeId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -116,25 +116,27 @@ pub fn discover_service_instances(
     cluster: &dyn ClusterAccess,
     service: &str,
 ) -> Result<Vec<ServiceInstanceRecord>, ServiceError> {
-    let entries = cluster.kv_range_prefix(&cluster_service_prefix(service))?;
-    service_instances_from_entries(&entries)
+    let read = cluster.kv_range_prefix_local(&cluster_service_prefix(service))?;
+    service_instances_from_entries(&read.value)
 }
 
-/// Publishes the local registry's instance records, skipping the commit when
-/// the stored records already match (registration is idempotent per tick).
+/// Publishes the local registry's instance records. A locally unchanged batch
+/// is still submitted as an empty stable-ID transaction so success is backed
+/// by a quorum commit rather than a stale local equality check.
 pub async fn publish_local_service_instances(
     cluster: &dyn ClusterAccess,
     registry: &ServiceRegistry,
     node_id: &NodeId,
     registry_version: u64,
     now: OffsetDateTime,
-) -> Result<Option<KvTxnResponse>, ServiceError> {
+) -> Result<ClusterKvTxnCommitResult, ServiceError> {
     let records = service_instance_records_from_registry(registry, node_id, registry_version, now);
     let mut ops = Vec::new();
     for record in records {
         let key = cluster_service_instance_key(&record.service, node_id);
         let unchanged = cluster
-            .kv_get(&key)?
+            .kv_get_local(&key)?
+            .value
             .and_then(|entry| entry.decode::<ServiceInstanceRecord>().ok())
             .is_some_and(|stored| stored.stable_eq(&record));
         if unchanged {
@@ -142,15 +144,12 @@ pub async fn publish_local_service_instances(
         }
         ops.push(KvOp::put_serde(key, &record, None)?);
     }
-    if ops.is_empty() {
-        return Ok(None);
-    }
     let txn = KvTxn {
         compares: Vec::new(),
         success: ops,
         failure: Vec::new(),
     };
-    cluster.kv_commit_async(txn).await.map(Some)
+    cluster.kv_commit_async(KvTxnRequest::generated(txn)).await
 }
 
 /// How [`ServiceTargetSelector`] orders candidate nodes for a service.

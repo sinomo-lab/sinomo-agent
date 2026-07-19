@@ -78,7 +78,7 @@ pub trait ClusterControlPlaneTransport {
         target_node_id: &NodeId,
         timeout: Duration,
     ) -> bool {
-        let Ok(payload) = sinomo_kv::cluster_kv_snapshot_rpc_payload() else {
+        let Ok(payload) = sinomo_kv::cluster_kv_local_snapshot_rpc_payload() else {
             return false;
         };
         let request = cluster_kv_object_rpc_request(payload);

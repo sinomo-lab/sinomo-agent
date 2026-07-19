@@ -29,6 +29,8 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -83,6 +85,15 @@ enum TcpTunnelStreamEvent {
 
 static TCP_TUNNELS: LazyLock<TcpTunnelRegistry> = LazyLock::new(TcpTunnelRegistry::default);
 static TCP_TUNNEL_MAINTENANCE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+#[cfg(test)]
+static TEST_TCP_TUNNEL_REGISTRY_LIFECYCLE: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
+
+#[cfg(test)]
+fn lock_test_tcp_tunnel_registry_lifecycle() -> RwLockWriteGuard<'static, ()> {
+    TEST_TCP_TUNNEL_REGISTRY_LIFECYCLE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Wakes tunnel maintenance after connectivity or network-environment changes.
 ///
@@ -270,6 +281,8 @@ impl TcpTunnelRegistry {
     }
 
     fn remove_if_same(&self, handle: &Arc<TcpTunnelHandle>) {
+        #[cfg(test)]
+        let _lifecycle = lock_test_tcp_tunnel_registry_lifecycle();
         let Ok(mut peers) = self.peers.lock() else {
             return;
         };
@@ -284,6 +297,8 @@ impl TcpTunnelRegistry {
     }
 
     fn remove(&self, node_id: &NodeId) -> Option<Arc<TcpTunnelHandle>> {
+        #[cfg(test)]
+        let _lifecycle = lock_test_tcp_tunnel_registry_lifecycle();
         let removed = self
             .peers
             .lock()
@@ -296,6 +311,8 @@ impl TcpTunnelRegistry {
     }
 
     fn close_all(&self, detail: &str) -> usize {
+        #[cfg(test)]
+        let _lifecycle = lock_test_tcp_tunnel_registry_lifecycle();
         let handles = self
             .peers
             .lock()
@@ -330,6 +347,16 @@ impl TcpTunnelRegistry {
             })
             .unwrap_or(false)
     }
+}
+
+/// Serializes the small number of unit fixtures that need stable entries in
+/// the process-global tunnel registry against unrelated simulated daemon
+/// identity transitions. Production runs one registry lifecycle per process.
+#[cfg(test)]
+pub(crate) fn lease_test_tcp_tunnel_registry() -> RwLockReadGuard<'static, ()> {
+    TEST_TCP_TUNNEL_REGISTRY_LIFECYCLE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

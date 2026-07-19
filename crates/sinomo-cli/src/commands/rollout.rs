@@ -2910,25 +2910,32 @@ fn publish_cluster_rollout_desired(
     };
     let txn = KvTxn {
         compares: Vec::new(),
-        success: vec![KvOp::put_serde(
-            sinomo_runtime::r0::cluster_rollout_desired_key(),
-            &desired,
-            None,
-        )?],
+        success: vec![sinomo_runtime::rollout::build_cluster_rollout_desired_put_op(&desired)?],
         failure: Vec::new(),
     };
-    let request = network::ObjectRpcRequest::encode_body(
-        sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
-        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
-        &txn,
-    )
-    .map_err(CliError::from)?;
+    let txn_request = KvTxnRequest::generated(txn);
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn_request)?;
+    let request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(
         &status.address,
         &request,
         DAEMON_CLUSTER_KV_TXN_TIMEOUT,
     )?;
-    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    response.error_detail()?;
+    let commit = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)?;
+    let txn_response = commit.txn_response.ok_or_else(|| CliError::Parse {
+        detail: "cluster KV returned a barrier result for a rollout desired transaction"
+            .to_string(),
+    })?;
+    if !txn_response.succeeded {
+        return Err(CliError::Parse {
+            detail: format!(
+                "rollout desired transaction compare failed at revision {:?}",
+                txn_response.revision
+            ),
+        });
+    }
     Ok(())
 }
 

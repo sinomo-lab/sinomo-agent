@@ -27,7 +27,7 @@ mod tests {
     #[test]
     fn cluster_kv_rpc_routes_group_storage_routes() {
         assert_eq!(CLUSTER_KV_RPC_CATEGORY, "cluster.kv");
-        assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_SNAPSHOT_ROUTE));
+        assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE));
         assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
         for route in CLUSTER_KV_LOCAL_READ_WATCH_ROUTES
             .iter()
@@ -55,7 +55,7 @@ mod tests {
             assert_eq!(cluster_kv_rpc_route_policy(route).copied(), Some(policy));
         }
         assert_eq!(
-            cluster_kv_rpc_route_policy(CLUSTER_KV_SNAPSHOT_ROUTE)
+            cluster_kv_rpc_route_policy(CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE)
                 .expect("snapshot policy")
                 .auth,
             ClusterKvRouteAuth::Authenticated
@@ -67,11 +67,23 @@ mod tests {
             [CLUSTER_KV_WRITE_CAPABILITY]
         );
         assert_eq!(
-            cluster_kv_rpc_route_policy(CLUSTER_KV_RANGE_PREFIX_ROUTE)
+            cluster_kv_rpc_route_policy(CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE)
                 .expect("range policy")
                 .required_capabilities,
             [CLUSTER_KV_READ_CAPABILITY]
         );
+        for route in [
+            CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+            CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+            CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        ] {
+            assert_eq!(
+                cluster_kv_rpc_route_policy(route)
+                    .expect("authoritative read policy")
+                    .auth,
+                ClusterKvRouteAuth::LocalOrClusterMember
+            );
+        }
         assert!(!CLUSTER_KV_LOCAL_READ_WATCH_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
     }
 
@@ -184,12 +196,185 @@ mod tests {
     }
 
     #[test]
+    fn raft_config_change_lifecycle_requires_catch_up_before_learner_promotion() {
+        let voter = NodeId::from_legacy_named("node_config_lifecycle_voter").expect("voter");
+        let learner = NodeId::from_legacy_named("node_config_lifecycle_learner").expect("learner");
+        let now = OffsetDateTime::now_utc();
+        let current = ClusterKvRaftConfigRecord {
+            cluster_id: Id::from_legacy_named("cluster_config_lifecycle").expect("cluster"),
+            term: 4,
+            kv_revision: 12,
+            voters: vec![voter],
+            learners: vec![learner.clone()],
+            non_voting: Vec::new(),
+            updated_at: now,
+        };
+        let mut change = begin_cluster_kv_raft_config_change(
+            &current,
+            Id::generate(),
+            ClusterKvRaftConfigChangeKind::PromoteLearner,
+            learner.clone(),
+            Some(40),
+            now,
+        )
+        .expect("plan learner promotion");
+        assert_eq!(change.phase, ClusterKvRaftConfigChangePhase::CatchingUp);
+        assert!(
+            apply_cluster_kv_raft_config_change(&current, &change, 5, KvRevision(13), now).is_err(),
+            "promotion cannot commit before catch-up evidence"
+        );
+        assert!(
+            record_cluster_kv_raft_catch_up_proof(
+                &mut change,
+                ClusterKvRaftCatchUpProof {
+                    node_id: learner.clone(),
+                    term: 5,
+                    required_log_index: 40,
+                    observed_match_index: 39,
+                    observed_at: now,
+                },
+            )
+            .is_err(),
+            "a lagging learner is not promotion-ready"
+        );
+        record_cluster_kv_raft_catch_up_proof(
+            &mut change,
+            ClusterKvRaftCatchUpProof {
+                node_id: learner.clone(),
+                term: 5,
+                required_log_index: 40,
+                observed_match_index: 40,
+                observed_at: now,
+            },
+        )
+        .expect("record sufficient catch-up proof");
+        assert_eq!(change.phase, ClusterKvRaftConfigChangePhase::ReadyToCommit);
+        let promoted =
+            apply_cluster_kv_raft_config_change(&current, &change, 5, KvRevision(13), now)
+                .expect("apply learner promotion");
+        assert!(promoted.voters.contains(&learner));
+        assert!(!promoted.learners.contains(&learner));
+
+        finish_cluster_kv_raft_config_change(
+            &mut change,
+            true,
+            ClusterKvRaftConfigChangeEvidence {
+                detail: "promotion committed by current-term quorum".to_string(),
+                term: 5,
+                log_index: 41,
+                revision: KvRevision(13),
+                observed_at: now,
+            },
+        )
+        .expect("finish config change");
+        assert_eq!(change.phase, ClusterKvRaftConfigChangePhase::Committed);
+    }
+
+    #[test]
+    fn raft_peer_progress_hints_round_trip_and_clear() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-peer-progress");
+        let paths = ClusterKvPaths::new(&root);
+        let peer = NodeId::from_legacy_named("node_peer_progress").expect("peer");
+        let progress = ClusterKvRaftPeerProgress {
+            peer_node_id: peer,
+            term: 6,
+            next_index: 18,
+            match_index: 17,
+            last_accepted_index: 17,
+            observed_at: OffsetDateTime::now_utc(),
+        };
+        record_cluster_kv_raft_peer_progress(&paths, progress.clone()).expect("record progress");
+        assert_eq!(
+            read_cluster_kv_raft_peer_progress(&paths).expect("read progress"),
+            vec![progress]
+        );
+        clear_cluster_kv_raft_peer_progress(&paths).expect("clear progress");
+        assert!(
+            read_cluster_kv_raft_peer_progress(&paths)
+                .expect("read cleared progress")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn raft_peer_progress_next_index_hint_discards_missing_stale_and_corrupt_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-peer-progress-consumption");
+        let paths = ClusterKvPaths::new(&root);
+        let peer = NodeId::from_legacy_named("node_peer_progress_consumption").expect("peer");
+        let now = OffsetDateTime::now_utc();
+
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint(&paths, &peer, 7, 12),
+            None
+        );
+
+        record_cluster_kv_raft_peer_progress(
+            &paths,
+            ClusterKvRaftPeerProgress {
+                peer_node_id: peer.clone(),
+                term: 6,
+                next_index: 9,
+                match_index: 8,
+                last_accepted_index: 8,
+                observed_at: now,
+            },
+        )
+        .expect("record stale progress");
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint(&paths, &peer, 7, 12),
+            None
+        );
+
+        record_cluster_kv_raft_peer_progress(
+            &paths,
+            ClusterKvRaftPeerProgress {
+                peer_node_id: peer.clone(),
+                term: 7,
+                next_index: 10,
+                match_index: 8,
+                last_accepted_index: 8,
+                observed_at: now,
+            },
+        )
+        .expect("record inconsistent progress");
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint(&paths, &peer, 7, 12),
+            None
+        );
+
+        record_cluster_kv_raft_peer_progress(
+            &paths,
+            ClusterKvRaftPeerProgress {
+                peer_node_id: peer.clone(),
+                term: 7,
+                next_index: 9,
+                match_index: 8,
+                last_accepted_index: 8,
+                observed_at: now,
+            },
+        )
+        .expect("record valid progress");
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint(&paths, &peer, 7, 12),
+            Some(9)
+        );
+
+        std::fs::write(&paths.raft_peer_progress, b"not a sinomo object")
+            .expect("corrupt soft progress ledger");
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint(&paths, &peer, 7, 12),
+            None
+        );
+    }
+
+    #[test]
     fn cluster_kv_rpc_payloads_encode_storage_owned_bodies() {
-        let snapshot_payload = cluster_kv_snapshot_rpc_payload().expect("snapshot rpc payload");
-        assert_eq!(snapshot_payload.route, CLUSTER_KV_SNAPSHOT_ROUTE);
+        let snapshot_payload =
+            cluster_kv_local_snapshot_rpc_payload().expect("snapshot rpc payload");
+        assert_eq!(snapshot_payload.route, CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
         assert_eq!(snapshot_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
-            decode_cluster_kv_snapshot_rpc_request_body(&snapshot_payload.body)
+            decode_cluster_kv_local_snapshot_rpc_request_body(&snapshot_payload.body)
                 .expect("snapshot request body"),
             ()
         );
@@ -203,12 +388,13 @@ mod tests {
             }],
             failure: Vec::new(),
         };
-        let txn_payload = cluster_kv_txn_rpc_payload(&txn).expect("txn rpc payload");
+        let txn_request = KvTxnRequest::new(KvRequestId::generate(), txn);
+        let txn_payload = cluster_kv_txn_rpc_payload(&txn_request).expect("txn rpc payload");
         assert_eq!(txn_payload.route, CLUSTER_KV_TXN_ROUTE);
         assert_eq!(txn_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
             decode_cluster_kv_txn_rpc_request_body(&txn_payload.body).expect("txn request body"),
-            txn
+            txn_request
         );
 
         let snapshot = KvSnapshot {
@@ -217,21 +403,48 @@ mod tests {
             entries: Vec::new(),
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        };
+        let local_snapshot = KvLocalRead {
+            value: snapshot.clone(),
+            revision: snapshot.revision,
+            observed_term: 3,
+            applied_index: 11,
+            known_leader: None,
         };
         let snapshot_response_payload =
-            cluster_kv_snapshot_response_rpc_payload(&snapshot).expect("snapshot response payload");
-        assert_eq!(snapshot_response_payload.route, CLUSTER_KV_SNAPSHOT_ROUTE);
+            cluster_kv_local_snapshot_response_rpc_payload(&local_snapshot)
+                .expect("snapshot response payload");
+        assert_eq!(
+            snapshot_response_payload.route,
+            CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE
+        );
         assert_eq!(snapshot_response_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
-            decode_cluster_kv_snapshot_rpc_body(&snapshot_response_payload.body)
+            decode_cluster_kv_local_snapshot_rpc_body(&snapshot_response_payload.body)
                 .expect("snapshot response body"),
-            snapshot
+            local_snapshot
         );
 
-        let txn_response = KvTxnResponse {
-            succeeded: true,
-            revision: KvRevision(9),
-            responses: Vec::new(),
+        let txn_response = ClusterKvTxnCommitResult {
+            request_id: KvRequestId::generate(),
+            snapshot: snapshot.clone(),
+            txn_response: Some(KvTxnResponse {
+                succeeded: true,
+                revision: KvRevision(9),
+                responses: Vec::new(),
+            }),
+            authority: KvAuthorityProof {
+                term: 3,
+                commit_index: 11,
+                revision: KvRevision(9),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            replayed_committed_request: false,
         };
         let txn_response_payload =
             cluster_kv_txn_response_rpc_payload(&txn_response).expect("txn response payload");
@@ -243,12 +456,390 @@ mod tests {
         );
 
         let range_payload =
-            cluster_kv_range_prefix_rpc_payload("/rpc/").expect("range prefix payload");
-        assert_eq!(range_payload.route, CLUSTER_KV_RANGE_PREFIX_ROUTE);
+            cluster_kv_local_range_prefix_rpc_payload("/rpc/").expect("range prefix payload");
+        assert_eq!(range_payload.route, CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE);
         assert_eq!(range_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
             decode_cluster_kv_rpc_body::<String>(&range_payload.body).expect("range prefix body"),
             "/rpc/"
+        );
+
+        let authoritative =
+            cluster_kv_authoritative_snapshot_rpc_payload().expect("authoritative payload");
+        assert_eq!(authoritative.route, CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE);
+        assert_eq!(
+            decode_cluster_kv_authoritative_snapshot_rpc_request_body(&authoritative.body)
+                .expect("authoritative request body"),
+            ClusterKvAuthoritativeSnapshotRequest
+        );
+    }
+
+    #[test]
+    fn authoritative_range_and_watch_rpc_contracts_are_barrier_bound() {
+        let snapshot = KvSnapshot {
+            revision: KvRevision(7),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![KvEntry {
+                key: "/rpc/range/value".to_string(),
+                value: b"value".to_vec(),
+                create_revision: KvRevision(7),
+                modify_revision: KvRevision(7),
+                version: KvVersion(1),
+                lease_id: None,
+            }],
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        };
+        let authority = KvAuthorityProof {
+            term: 4,
+            commit_index: 12,
+            revision: snapshot.revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2,
+            },
+        };
+        let authoritative = KvAuthoritativeRead {
+            value: snapshot,
+            authority,
+        };
+        let snapshot_response =
+            cluster_kv_authoritative_snapshot_response_rpc_payload(&authoritative)
+                .expect("authoritative snapshot response");
+        assert_eq!(
+            decode_cluster_kv_authoritative_snapshot_rpc_body(&snapshot_response.body)
+                .expect("decode authoritative snapshot"),
+            authoritative
+        );
+        let invalid_snapshot = KvAuthoritativeRead {
+            value: authoritative.value.clone(),
+            authority: KvAuthorityProof {
+                revision: authoritative.authority.revision.next(),
+                ..authoritative.authority
+            },
+        };
+        let invalid_snapshot_body =
+            encode_cluster_kv_rpc_body(&invalid_snapshot).expect("invalid snapshot body");
+        assert!(matches!(
+            decode_cluster_kv_authoritative_snapshot_rpc_body(&invalid_snapshot_body),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+
+        let range_request = cluster_kv_authoritative_range_prefix_rpc_payload("/rpc/range/")
+            .expect("authoritative range request");
+        assert_eq!(
+            range_request.route,
+            CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+        );
+        assert_eq!(
+            decode_cluster_kv_authoritative_range_prefix_rpc_request_body(&range_request.body)
+                .expect("decode range request"),
+            ClusterKvAuthoritativeRangePrefixRequest {
+                prefix: "/rpc/range/".to_string(),
+            }
+        );
+        let range = project_cluster_kv_authoritative_range_prefix(&authoritative, "/rpc/range/")
+            .expect("project exact barrier snapshot");
+        assert_eq!(range.authority, authority);
+        assert_eq!(range.value.len(), 1);
+        let range_response = cluster_kv_authoritative_range_prefix_response_rpc_payload(&range)
+            .expect("range response");
+        assert_eq!(
+            decode_cluster_kv_authoritative_range_prefix_rpc_body(&range_response.body)
+                .expect("decode range response"),
+            range
+        );
+
+        let watch_request = cluster_kv_authoritative_watch_start_rpc_payload("/rpc/range/")
+            .expect("authoritative watch request");
+        assert_eq!(
+            watch_request.route,
+            CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE
+        );
+        assert_eq!(
+            decode_cluster_kv_authoritative_watch_start_rpc_request_body(&watch_request.body)
+                .expect("decode watch request"),
+            ClusterKvAuthoritativeWatchStartRequest {
+                prefix: "/rpc/range/".to_string(),
+            }
+        );
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(9),
+            prefix: "/rpc/range/".to_string(),
+            next_revision: authority.revision.next(),
+        };
+        let watch = KvAuthoritativeRead {
+            value: registration,
+            authority,
+        };
+        let watch_response = cluster_kv_authoritative_watch_start_response_rpc_payload(&watch)
+            .expect("watch response");
+        assert_eq!(
+            decode_cluster_kv_authoritative_watch_start_rpc_body(&watch_response.body)
+                .expect("decode watch response"),
+            watch
+        );
+
+        let invalid_watch = KvAuthoritativeRead {
+            value: ClusterKvWatchRegistration {
+                next_revision: authority.revision,
+                ..watch.value.clone()
+            },
+            authority,
+        };
+        assert!(matches!(
+            cluster_kv_authoritative_watch_start_response_rpc_payload(&invalid_watch),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+
+        let drain = ClusterKvWatchDrainRequest {
+            watch_id: watch.value.watch_id,
+            wait_timeout_millis: 10,
+        };
+        let drain_payload =
+            cluster_kv_local_watch_drain_rpc_payload(&drain).expect("watch drain payload");
+        assert_eq!(drain_payload.route, CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE);
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<ClusterKvWatchDrainRequest>(&drain_payload.body)
+                .expect("decode drain request"),
+            drain
+        );
+        let cancel = ClusterKvWatchCancelRequest {
+            watch_id: watch.value.watch_id,
+        };
+        let cancel_payload =
+            cluster_kv_local_watch_cancel_rpc_payload(&cancel).expect("watch cancel payload");
+        assert_eq!(cancel_payload.route, CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE);
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<ClusterKvWatchCancelRequest>(&cancel_payload.body)
+                .expect("decode cancel request"),
+            cancel
+        );
+    }
+
+    #[test]
+    fn request_outcomes_cover_committed_rejected_unknown_conflict_and_expired() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-request-outcomes");
+        let paths = ClusterKvPaths::new(&root);
+        let empty_snapshot = InProcessKvStore::new().snapshot().expect("empty snapshot");
+        let authoritative_snapshot = KvAuthoritativeRead {
+            value: empty_snapshot.clone(),
+            authority: KvAuthorityProof {
+                term: 1,
+                commit_index: 1,
+                revision: empty_snapshot.revision,
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 1,
+                    required_quorum: 1,
+                },
+            },
+        };
+
+        let submitted = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_submitted(&paths, &submitted).expect("mark submitted");
+        assert!(matches!(
+            resolve_cluster_kv_request_outcome(&paths, &empty_snapshot, &submitted.request_id,)
+                .expect("submitted outcome"),
+            KvRequestOutcome::Unknown { .. }
+        ));
+        mark_cluster_kv_request_unknown(&paths, &submitted, "quorum response was ambiguous")
+            .expect("mark unknown");
+        assert_eq!(
+            resolve_cluster_kv_request_outcome(&paths, &empty_snapshot, &submitted.request_id,)
+                .expect("unknown outcome"),
+            KvRequestOutcome::Unknown {
+                detail: "quorum response was ambiguous".to_string(),
+            }
+        );
+        mark_cluster_kv_request_rejected_before_commit(
+            &paths,
+            &submitted,
+            "a later local retry was rejected",
+        )
+        .expect("later rejection does not erase uncertainty");
+        assert_eq!(
+            resolve_cluster_kv_request_outcome(&paths, &empty_snapshot, &submitted.request_id,)
+                .expect("uncertainty remains"),
+            KvRequestOutcome::Unknown {
+                detail: "quorum response was ambiguous".to_string(),
+            }
+        );
+
+        let rejected = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_rejected_before_commit(&paths, &rejected, "not a verified leader")
+            .expect("mark rejected");
+        let outcome_request =
+            cluster_kv_request_outcome_rpc_payload(&ClusterKvRequestOutcomeRequest {
+                request_id: rejected.request_id.clone(),
+            })
+            .expect("outcome request");
+        let outcome_response = handle_cluster_kv_request_outcome_rpc_payload(
+            &paths,
+            &authoritative_snapshot,
+            &outcome_request.body,
+        )
+        .expect("handle outcome route");
+        assert_eq!(
+            decode_cluster_kv_request_outcome_rpc_body(&outcome_response.body)
+                .expect("decode outcome"),
+            ClusterKvRequestOutcomeRead {
+                authority: authoritative_snapshot.authority,
+                outcome: KvRequestOutcome::RejectedBeforeCommit {
+                    reason: "not a verified leader".to_string(),
+                },
+            }
+        );
+        let unproven = ClusterKvRequestOutcomeRead {
+            authority: KvAuthorityProof {
+                term: 1,
+                commit_index: 1,
+                revision: KvRevision::ZERO,
+                basis: KvAuthorityBasis::ExactCommittedRequest,
+            },
+            outcome: KvRequestOutcome::Unknown {
+                detail: "not proven".to_string(),
+            },
+        };
+        let unproven_body = encode_cluster_kv_rpc_body(&unproven).expect("unproven outcome body");
+        assert!(matches!(
+            decode_cluster_kv_request_outcome_rpc_body(&unproven_body),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+
+        let invalid = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: "/invalid/lease".to_string(),
+            value: b"value".to_vec(),
+            lease_id: Some(LeaseId(999)),
+        }));
+        let invalid_node = NodeId::from_legacy_named("node_request_preflight").expect("node");
+        assert_eq!(
+            paths
+                .raft_store()
+                .append_request_uncommitted(&invalid_node, invalid.clone())
+                .expect_err("invalid request must be rejected before append"),
+            KvError::UnknownLease {
+                lease_id: LeaseId(999),
+            }
+        );
+        assert!(matches!(
+            resolve_cluster_kv_request_outcome(&paths, &empty_snapshot, &invalid.request_id)
+                .expect("preflight rejection outcome"),
+            KvRequestOutcome::RejectedBeforeCommit { .. }
+        ));
+        assert_eq!(
+            paths
+                .raft_store()
+                .open_node(&invalid_node)
+                .expect("open preflight node")
+                .last_log_index(),
+            0
+        );
+
+        let mut store = InProcessKvStore::new();
+        let committed = KvCommandRequest::generated(KvCommand::Barrier);
+        let committed_record = KvCommittedRequestRecord {
+            request_id: committed.request_id.clone(),
+            command_digest: committed.digest().expect("committed digest"),
+            term: 2,
+            log_index: 3,
+            revision: KvRevision::ZERO,
+            txn_response: None,
+        };
+        store
+            .record_committed_request(committed_record.clone())
+            .expect("record committed request");
+        let committed_snapshot = store.snapshot().expect("committed snapshot");
+        assert_eq!(
+            resolve_cluster_kv_request_outcome(&paths, &committed_snapshot, &committed.request_id,)
+                .expect("committed outcome"),
+            KvRequestOutcome::Committed(committed_record.clone())
+        );
+        let committed_request =
+            cluster_kv_request_outcome_rpc_payload(&ClusterKvRequestOutcomeRequest {
+                request_id: committed.request_id.clone(),
+            })
+            .expect("committed outcome request");
+        let authoritative_committed = KvAuthoritativeRead {
+            value: committed_snapshot,
+            authority: KvAuthorityProof {
+                term: 2,
+                commit_index: 3,
+                revision: KvRevision::ZERO,
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+        };
+        let committed_response = handle_cluster_kv_request_outcome_rpc_payload(
+            &paths,
+            &authoritative_committed,
+            &committed_request.body,
+        )
+        .expect("committed outcome response");
+        assert_eq!(
+            decode_cluster_kv_request_outcome_rpc_body(&committed_response.body)
+                .expect("decode committed outcome"),
+            ClusterKvRequestOutcomeRead {
+                authority: authoritative_committed.authority,
+                outcome: KvRequestOutcome::Committed(committed_record.clone()),
+            }
+        );
+        let conflicting_record = KvCommittedRequestRecord {
+            command_digest: kv_command_digest(&KvCommand::Op(KvOp::Delete {
+                key: "/different".to_string(),
+            }))
+            .expect("conflicting digest"),
+            ..committed_record
+        };
+        assert!(matches!(
+            store.record_committed_request(conflicting_record),
+            Err(KvError::RequestIdConflict { .. })
+        ));
+
+        let expired_id = KvRequestId::generate();
+        let oversized_record = KvCommittedRequestRecord {
+            request_id: expired_id.clone(),
+            command_digest: kv_command_digest(&KvCommand::Barrier).expect("digest"),
+            term: 3,
+            log_index: 4,
+            revision: KvRevision::ZERO,
+            txn_response: Some(KvTxnResponse {
+                succeeded: true,
+                revision: KvRevision::ZERO,
+                responses: vec![KvOpResponse::Delete {
+                    key: "x".repeat(MAX_COMMITTED_KV_REQUEST_BYTES.saturating_add(1)),
+                    deleted: false,
+                }],
+            }),
+        };
+        store
+            .record_committed_request(oversized_record)
+            .expect("oversized record is evicted into an expiry tombstone");
+        assert!(store.request_id_expired(&expired_id));
+        assert_eq!(
+            resolve_cluster_kv_request_outcome(
+                &paths,
+                &store.snapshot().expect("expired snapshot"),
+                &expired_id,
+            )
+            .expect("expired outcome"),
+            KvRequestOutcome::Expired
+        );
+
+        let oversized_attempt = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_unknown(
+            &paths,
+            &oversized_attempt,
+            "x".repeat(MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES.saturating_add(1)),
+        )
+        .expect("oversized attempt is evicted into an expiry tombstone");
+        assert_eq!(
+            read_cluster_kv_request_attempt(&paths, &oversized_attempt.request_id)
+                .expect("read oversized attempt"),
+            Some(KvRequestOutcome::Expired)
         );
     }
 
@@ -442,16 +1033,22 @@ mod tests {
             error
         }
 
-        fn range_prefix(&mut self, prefix: &str) -> Result<Vec<KvEntry>, Self::Error> {
+        fn range_prefix(&mut self, prefix: &str) -> Result<KvLocalRead<Vec<KvEntry>>, Self::Error> {
             self.seen_range_prefix = Some(prefix.to_string());
-            Ok(vec![KvEntry {
-                key: format!("{prefix}/value"),
-                value: b"value".to_vec(),
-                create_revision: KvRevision(1),
-                modify_revision: KvRevision(1),
-                version: KvVersion(1),
-                lease_id: None,
-            }])
+            Ok(KvLocalRead {
+                value: vec![KvEntry {
+                    key: format!("{prefix}/value"),
+                    value: b"value".to_vec(),
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(1),
+                    version: KvVersion(1),
+                    lease_id: None,
+                }],
+                revision: KvRevision(1),
+                observed_term: 2,
+                applied_index: 3,
+                known_leader: None,
+            })
         }
 
         fn create_watch(
@@ -497,18 +1094,19 @@ mod tests {
         let range_body =
             encode_cluster_kv_rpc_body(&"/svc".to_string()).expect("range request body");
         let range_payload = handle_cluster_kv_local_read_watch_rpc_payload(
-            CLUSTER_KV_RANGE_PREFIX_ROUTE,
+            CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
             &range_body,
             &mut host,
         )
         .expect("range dispatch")
         .expect("range route");
-        assert_eq!(range_payload.route, CLUSTER_KV_RANGE_PREFIX_ROUTE);
+        assert_eq!(range_payload.route, CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE);
         assert_eq!(range_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(host.seen_range_prefix.as_deref(), Some("/svc"));
         assert_eq!(
-            decode_cluster_kv_rpc_body::<Vec<KvEntry>>(&range_payload.body)
+            decode_cluster_kv_local_range_prefix_rpc_body(&range_payload.body)
                 .expect("range response body")
+                .value
                 .first()
                 .map(|entry| entry.key.as_str()),
             Some("/svc/value")
@@ -520,13 +1118,13 @@ mod tests {
         };
         let watch_body = encode_cluster_kv_rpc_body(&watch_request).expect("watch request body");
         let watch_payload = handle_cluster_kv_local_read_watch_rpc_payload(
-            CLUSTER_KV_WATCH_PREFIX_ROUTE,
+            CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
             &watch_body,
             &mut host,
         )
         .expect("watch dispatch")
         .expect("watch route");
-        assert_eq!(watch_payload.route, CLUSTER_KV_WATCH_PREFIX_ROUTE);
+        assert_eq!(watch_payload.route, CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE);
         assert_eq!(host.created_watch, Some(watch_request));
         assert_eq!(
             decode_cluster_kv_rpc_body::<ClusterKvWatchRegistration>(&watch_payload.body)
@@ -541,13 +1139,13 @@ mod tests {
         };
         let drain_body = encode_cluster_kv_rpc_body(&drain_request).expect("drain request body");
         let drain_payload = handle_cluster_kv_local_read_watch_rpc_payload(
-            CLUSTER_KV_WATCH_DRAIN_ROUTE,
+            CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
             &drain_body,
             &mut host,
         )
         .expect("drain dispatch")
         .expect("drain route");
-        assert_eq!(drain_payload.route, CLUSTER_KV_WATCH_DRAIN_ROUTE);
+        assert_eq!(drain_payload.route, CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE);
         assert_eq!(host.drained_watch, Some(drain_request));
         assert_eq!(
             decode_cluster_kv_rpc_body::<ClusterKvWatchDrainResponse>(&drain_payload.body)
@@ -561,13 +1159,13 @@ mod tests {
         };
         let cancel_body = encode_cluster_kv_rpc_body(&cancel_request).expect("cancel request body");
         let cancel_payload = handle_cluster_kv_local_read_watch_rpc_payload(
-            CLUSTER_KV_WATCH_CANCEL_ROUTE,
+            CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
             &cancel_body,
             &mut host,
         )
         .expect("cancel dispatch")
         .expect("cancel route");
-        assert_eq!(cancel_payload.route, CLUSTER_KV_WATCH_CANCEL_ROUTE);
+        assert_eq!(cancel_payload.route, CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE);
         assert_eq!(host.cancelled_watch, Some(cancel_request));
         assert!(
             decode_cluster_kv_rpc_body::<ClusterKvWatchCancelResponse>(&cancel_payload.body)
@@ -813,12 +1411,36 @@ mod tests {
         assert!(cluster_kv_key_can_defer_materialized_snapshot(
             "/cluster/node-status/node-a"
         ));
+        assert_eq!(
+            cluster_kv_keyspace_class("/cluster/endpoints/node-a/endpoint-a"),
+            ClusterKvKeyspaceClass::Operational
+        );
+        assert_eq!(
+            cluster_kv_default_read_authority_for_key("/cluster/policy/capabilities/node-a"),
+            KvReadAuthority::Local
+        );
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/endpoints/node-a/endpoint-a"
+        ));
+        assert_eq!(
+            cluster_kv_keyspace_class("/cluster/members/node-a"),
+            ClusterKvKeyspaceClass::Critical
+        );
+        assert_eq!(
+            cluster_kv_default_read_authority_for_key("/cluster/rollout/desired"),
+            KvReadAuthority::Authoritative
+        );
         assert!(!cluster_kv_key_can_defer_materialized_snapshot(
             "/cluster/members/node-a"
         ));
         assert!(!cluster_kv_key_can_defer_materialized_snapshot(
             "/config/models/default"
         ));
+        assert_eq!(
+            cluster_kv_keyspace_class("/future/unclassified/key"),
+            ClusterKvKeyspaceClass::Critical,
+            "unknown prefixes fail closed"
+        );
     }
 
     #[test]
@@ -837,6 +1459,8 @@ mod tests {
             entries,
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         };
         let key_can_defer = |key: &str| key.starts_with("/deferred/");
 
@@ -943,6 +1567,14 @@ mod tests {
             snapshot: snapshot.clone(),
             txn_response: None,
             events: snapshot.events.clone(),
+            committed_request: KvCommittedRequestRecord {
+                request_id: KvRequestId::generate(),
+                command_digest: kv_command_digest(&KvCommand::Barrier).expect("digest"),
+                term: 1,
+                log_index: 1,
+                revision: snapshot.revision,
+                txn_response: None,
+            },
         };
 
         let wrote = store
@@ -1095,6 +1727,8 @@ mod tests {
             }],
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         };
         assert!(cluster_kv_snapshot_compare(
             &snapshot,
@@ -2533,6 +3167,8 @@ mod tests {
             entries: Vec::new(),
             leases: Vec::new(),
             events,
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         }
     }
 
@@ -2861,6 +3497,8 @@ mod tests {
             ],
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         };
 
         assert_eq!(
@@ -2942,6 +3580,8 @@ mod tests {
             }],
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         };
 
         assert_eq!(
@@ -2999,10 +3639,17 @@ mod tests {
             .map(|index| test_kv_delete_event(index as u64 + 1, "/snapshot/rpc-event"))
             .collect::<Vec<_>>();
         let snapshot = test_kv_snapshot_with_events(events);
-        let body = encode_cluster_kv_rpc_body(&snapshot).expect("encode snapshot body");
+        let body = encode_cluster_kv_rpc_body(&KvLocalRead {
+            revision: snapshot.revision,
+            observed_term: 1,
+            applied_index: 1,
+            known_leader: None,
+            value: snapshot,
+        })
+        .expect("encode snapshot body");
 
         assert_eq!(
-            decode_cluster_kv_snapshot_rpc_body(&body).expect_err("snapshot event limit"),
+            decode_cluster_kv_local_snapshot_rpc_body(&body).expect_err("snapshot event limit"),
             KvError::SnapshotEventLimit {
                 observed_events: MAX_RETAINED_EVENTS + 1,
                 max_events: MAX_RETAINED_EVENTS,
@@ -4197,6 +4844,8 @@ mod tests {
                 granted_at: OffsetDateTime::now_utc(),
             }],
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         })
         .expect("restore");
         let revision_before = store.revision();
@@ -4698,6 +5347,8 @@ mod tests {
                 granted_at: OffsetDateTime::now_utc(),
             }],
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         })
         .expect("restore");
         let revision_before = store.revision();
@@ -4997,6 +5648,8 @@ mod tests {
                 },
             ],
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         };
         write_object_file(cache.path(), &snapshot).expect("write external snapshot");
 
@@ -5949,12 +6602,28 @@ mod tests {
     struct QuorumCommitTestHost {
         targets: Vec<NodeId>,
         accepting_targets: BTreeSet<NodeId>,
+        unverified_leader: bool,
+        replayed: Option<(KvSnapshot, KvCommittedRequestRecord)>,
         appended: Option<KvLogEntry>,
+        rejected_requests: Vec<KvRequestId>,
+        unknown_requests: Vec<KvRequestId>,
         committed_indices: Vec<u64>,
         discarded: bool,
         replicated_targets: Vec<NodeId>,
         statuses: Vec<(NodeId, ClusterKvRaftTargetReplicationStatus)>,
         fanout_targets: Vec<NodeId>,
+    }
+
+    fn test_authority(revision: KvRevision) -> KvAuthorityProof {
+        KvAuthorityProof {
+            term: 1,
+            commit_index: 7,
+            revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2,
+            },
+        }
     }
 
     impl ClusterKvRaftCommandStorage for QuorumCommitTestHost {
@@ -5964,18 +6633,44 @@ mod tests {
             QuorumCommitTestError::from(error)
         }
 
-        fn append_cluster_raft_command_uncommitted_or_no_effect(
+        fn replay_cluster_raft_request_if_committed(
             &mut self,
-            command: KvCommand,
-        ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error> {
+            _request: &KvCommandRequest,
+        ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, Self::Error> {
+            Ok(self.replayed.clone())
+        }
+
+        fn append_cluster_raft_request_uncommitted(
+            &mut self,
+            request: KvCommandRequest,
+        ) -> Result<KvLogEntry, Self::Error> {
             let entry = KvLogEntry {
                 index: 7,
                 term: 1,
-                command,
+                request_id: request.request_id,
+                command: request.command,
                 revision: KvRevision(1),
             };
             self.appended = Some(entry.clone());
-            Ok(ClusterKvRaftUncommittedAppend::Appended(entry))
+            Ok(entry)
+        }
+
+        fn record_cluster_raft_request_rejected_before_commit(
+            &mut self,
+            request: &KvCommandRequest,
+            _failure: &KvAuthorityFailure,
+        ) -> Result<(), Self::Error> {
+            self.rejected_requests.push(request.request_id.clone());
+            Ok(())
+        }
+
+        fn record_cluster_raft_request_unknown(
+            &mut self,
+            request: &KvCommandRequest,
+            _detail: &str,
+        ) -> Result<(), Self::Error> {
+            self.unknown_requests.push(request.request_id.clone());
+            Ok(())
         }
 
         fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
@@ -6007,12 +6702,29 @@ mod tests {
                 snapshot: store.snapshot().expect("snapshot"),
                 txn_response: None,
                 events: vec![test_kv_put_event(1, "/kv/quorum/fanout", b"ok")],
+                committed_request: KvCommittedRequestRecord {
+                    request_id: self.appended.as_ref().expect("appended").request_id.clone(),
+                    command_digest: kv_command_digest(
+                        &self.appended.as_ref().expect("appended").command,
+                    )?,
+                    term: 1,
+                    log_index: index,
+                    revision: store.revision(),
+                    txn_response: None,
+                },
             })
         }
     }
 
     impl ClusterKvRaftQuorumCommitHost for QuorumCommitTestHost {
         type Target = NodeId;
+
+        fn local_has_verified_raft_leadership(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<bool, Self::Error> {
+            Ok(!self.unverified_leader)
+        }
 
         fn remote_voter_targets(
             &mut self,
@@ -6065,8 +6777,8 @@ mod tests {
             Ok(())
         }
 
-        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-            QuorumCommitTestError::ReadOnly(detail)
+        fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(failure.detail)
         }
     }
 
@@ -6078,13 +6790,53 @@ mod tests {
         }
         type Target = NodeId;
 
-        fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
+        fn local_has_verified_raft_leadership_async<'a>(
             &'a mut self,
-            command: KvCommand,
-        ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftUncommittedAppend, Self::Error> {
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
+            Box::pin(async move { Ok(!self.unverified_leader) })
+        }
+
+        fn replay_cluster_raft_request_if_committed_async<'a>(
+            &'a mut self,
+            _request: &'a KvCommandRequest,
+        ) -> ClusterKvRaftQuorumFuture<
+            'a,
+            Option<(KvSnapshot, KvCommittedRequestRecord)>,
+            Self::Error,
+        > {
+            Box::pin(async move { Ok(self.replayed.clone()) })
+        }
+
+        fn append_cluster_raft_request_uncommitted_async<'a>(
+            &'a mut self,
+            request: KvCommandRequest,
+        ) -> ClusterKvRaftQuorumFuture<'a, KvLogEntry, Self::Error> {
             Box::pin(async move {
-                ClusterKvRaftCommandStorage::append_cluster_raft_command_uncommitted_or_no_effect(
-                    self, command,
+                ClusterKvRaftCommandStorage::append_cluster_raft_request_uncommitted(self, request)
+            })
+        }
+
+        fn record_cluster_raft_request_rejected_before_commit_async<'a>(
+            &'a mut self,
+            request: &'a KvCommandRequest,
+            failure: &'a KvAuthorityFailure,
+        ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                ClusterKvRaftCommandStorage::record_cluster_raft_request_rejected_before_commit(
+                    self, request, failure,
+                )
+            })
+        }
+
+        fn record_cluster_raft_request_unknown_async<'a>(
+            &'a mut self,
+            request: &'a KvCommandRequest,
+            detail: &'a str,
+        ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                ClusterKvRaftCommandStorage::record_cluster_raft_request_unknown(
+                    self, request, detail,
                 )
             })
         }
@@ -6165,8 +6917,8 @@ mod tests {
             })
         }
 
-        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-            QuorumCommitTestError::ReadOnly(detail)
+        fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(failure.detail)
         }
     }
 
@@ -6197,7 +6949,7 @@ mod tests {
         fn forward_cluster_kv_txn_to_voter(
             &mut self,
             _state: &ClusterBootstrapState,
-            _txn: &KvTxn,
+            _request: &KvTxnRequest,
         ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error> {
             Ok(self.forwarded.clone())
         }
@@ -6221,29 +6973,24 @@ mod tests {
             Ok(self.reachable_voters)
         }
 
-        fn semantic_txn_no_effect_response(
-            &mut self,
-            _txn: &KvTxn,
-        ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error> {
-            Ok(None)
-        }
-
         fn commit_cluster_raft_txn_with_quorum(
             &mut self,
             _state: &mut ClusterBootstrapState,
-            txn: KvTxn,
+            request: KvTxnRequest,
         ) -> Result<ClusterKvRaftQuorumCommitResult, Self::Error> {
             self.committed_txns = self.committed_txns.saturating_add(1);
             let mut store = InProcessKvStore::new();
-            let txn_response = store.txn(txn)?;
+            let txn_response = store.txn(request.txn)?;
             Ok(ClusterKvRaftQuorumCommitResult {
                 snapshot: store.snapshot().expect("snapshot"),
                 txn_response: Some(txn_response),
+                authority: test_authority(store.revision()),
+                replayed_committed_request: false,
             })
         }
 
-        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-            QuorumCommitTestError::ReadOnly(detail)
+        fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(failure.detail)
         }
     }
 
@@ -6264,7 +7011,7 @@ mod tests {
         fn forward_cluster_kv_txn_to_voter_async<'a>(
             &'a mut self,
             _state: &'a ClusterBootstrapState,
-            _txn: &'a KvTxn,
+            _request: &'a KvTxnRequest,
         ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
             Box::pin(async move { Ok(self.forwarded.clone()) })
         }
@@ -6290,31 +7037,26 @@ mod tests {
             Box::pin(async move { Ok(self.reachable_voters) })
         }
 
-        fn semantic_txn_no_effect_response_async<'a>(
-            &'a mut self,
-            _txn: &'a KvTxn,
-        ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
-            Box::pin(async { Ok(None) })
-        }
-
         fn commit_cluster_raft_txn_with_quorum_async<'a>(
             &'a mut self,
             _state: &'a mut ClusterBootstrapState,
-            txn: KvTxn,
+            request: KvTxnRequest,
         ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftQuorumCommitResult, Self::Error> {
             Box::pin(async move {
                 self.committed_txns = self.committed_txns.saturating_add(1);
                 let mut store = InProcessKvStore::new();
-                let txn_response = store.txn(txn)?;
+                let txn_response = store.txn(request.txn)?;
                 Ok(ClusterKvRaftQuorumCommitResult {
                     snapshot: store.snapshot().expect("snapshot"),
                     txn_response: Some(txn_response),
+                    authority: test_authority(store.revision()),
+                    replayed_committed_request: false,
                 })
             })
         }
 
-        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-            QuorumCommitTestError::ReadOnly(detail)
+        fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(failure.detail)
         }
     }
 
@@ -6342,13 +7084,45 @@ mod tests {
                 .map_err(Into::into)
         }
 
-        fn append_cluster_raft_command_uncommitted_or_no_effect(
+        fn replay_cluster_raft_request_if_committed(
             &mut self,
-            command: KvCommand,
-        ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error> {
+            request: &KvCommandRequest,
+        ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, Self::Error> {
             self.kv_paths
                 .raft_store()
-                .locked_append_command_uncommitted_or_no_effect(&self.node_id, command)
+                .locked_replay_request_if_committed(&self.node_id, request)
+                .map_err(Into::into)
+        }
+
+        fn append_cluster_raft_request_uncommitted(
+            &mut self,
+            request: KvCommandRequest,
+        ) -> Result<KvLogEntry, Self::Error> {
+            self.kv_paths
+                .raft_store()
+                .locked_append_request_uncommitted(&self.node_id, request)
+                .map_err(Into::into)
+        }
+
+        fn record_cluster_raft_request_rejected_before_commit(
+            &mut self,
+            request: &KvCommandRequest,
+            failure: &KvAuthorityFailure,
+        ) -> Result<(), Self::Error> {
+            mark_cluster_kv_request_rejected_before_commit(
+                &self.kv_paths,
+                request,
+                failure.detail.clone(),
+            )
+            .map_err(Into::into)
+        }
+
+        fn record_cluster_raft_request_unknown(
+            &mut self,
+            request: &KvCommandRequest,
+            detail: &str,
+        ) -> Result<(), Self::Error> {
+            mark_cluster_kv_request_unknown(&self.kv_paths, request, detail.to_string())
                 .map_err(Into::into)
         }
 
@@ -6375,6 +7149,13 @@ mod tests {
 
     impl ClusterKvRaftQuorumCommitHost for RacingCommitTestHost {
         type Target = NodeId;
+
+        fn local_has_verified_raft_leadership(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
 
         fn remote_voter_targets(
             &mut self,
@@ -6405,8 +7186,8 @@ mod tests {
             })
         }
 
-        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
-            QuorumCommitTestError::ReadOnly(detail)
+        fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(failure.detail)
         }
     }
 
@@ -6450,11 +7231,11 @@ mod tests {
                     for index in 0..COMMITS_PER_THREAD {
                         commit_cluster_kv_raft_command_with_quorum(
                             &mut state,
-                            KvCommand::Op(KvOp::Put {
+                            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                                 key: format!("/kv/race/{writer}/{index}"),
                                 value: b"committed".to_vec(),
                                 lease_id: None,
-                            }),
+                            })),
                             ClusterKvRaftQuorumCommitOptions {
                                 timeout: Duration::from_secs(5),
                             },
@@ -6504,7 +7285,7 @@ mod tests {
 
         let result = commit_cluster_kv_txn_with_quorum_with_host(
             &mut state,
-            KvTxn {
+            KvTxnRequest::generated(KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
                     key: "/kv/txn-driver/local".to_string(),
@@ -6512,7 +7293,7 @@ mod tests {
                     lease_id: None,
                 }],
                 failure: Vec::new(),
-            },
+            }),
             ClusterKvTxnQuorumDriverOptions {
                 allow_forwarding: false,
             },
@@ -6555,9 +7336,29 @@ mod tests {
                 failure: Vec::new(),
             })
             .expect("seed forwarded response");
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/kv/txn-driver/forwarded".to_string(),
+                value: b"forwarded".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
         let forwarded = ClusterKvTxnCommitResult {
+            request_id: request.request_id.clone(),
             snapshot: store.snapshot().expect("snapshot"),
             txn_response: Some(txn_response),
+            authority: KvAuthorityProof {
+                term: 1,
+                commit_index: 7,
+                revision: store.revision(),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 1,
+                    required_quorum: 1,
+                },
+            },
+            replayed_committed_request: false,
         };
         let mut host = TxnQuorumDriverTestHost {
             forwarded: Some(forwarded.clone()),
@@ -6567,15 +7368,7 @@ mod tests {
 
         let result = commit_cluster_kv_txn_with_quorum_with_host(
             &mut state,
-            KvTxn {
-                compares: Vec::new(),
-                success: vec![KvOp::Put {
-                    key: "/kv/txn-driver/forwarded".to_string(),
-                    value: b"forwarded".to_vec(),
-                    lease_id: None,
-                }],
-                failure: Vec::new(),
-            },
+            request,
             ClusterKvTxnQuorumDriverOptions {
                 allow_forwarding: true,
             },
@@ -6586,6 +7379,96 @@ mod tests {
         assert_eq!(result, forwarded);
         assert_eq!(host.committed_txns, 0);
         assert_eq!(host.election_calls, 0);
+    }
+
+    #[test]
+    fn kv_txn_quorum_driver_rejects_forwarded_commit_without_matching_authority_evidence() {
+        let local = NodeId::from_legacy_named("node_txn_driver_proof_learner").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_proof_voter").expect("remote");
+        let mut base_state = quorum_commit_test_state(&local, &remote);
+        base_state.members[0].role = ClusterMemberRole::Learner;
+        base_state.members[0].state = ClusterMemberState::Learner;
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/kv/txn-driver/unproven".to_string(),
+                value: b"unproven".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let mut store = InProcessKvStore::new();
+        let txn_response = store.txn(request.txn.clone()).expect("seed response");
+        let snapshot = store.snapshot().expect("snapshot");
+        let invalid = [
+            (
+                "wrong membership quorum",
+                KvAuthorityProof {
+                    term: 1,
+                    commit_index: 7,
+                    revision: snapshot.revision,
+                    basis: KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 2,
+                        required_quorum: 2,
+                    },
+                },
+                false,
+            ),
+            (
+                "mismatched snapshot revision",
+                KvAuthorityProof {
+                    term: 1,
+                    commit_index: 7,
+                    revision: KvRevision::ZERO,
+                    basis: KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 1,
+                        required_quorum: 1,
+                    },
+                },
+                false,
+            ),
+            (
+                "missing exact request record",
+                KvAuthorityProof {
+                    term: 1,
+                    commit_index: 7,
+                    revision: snapshot.revision,
+                    basis: KvAuthorityBasis::ExactCommittedRequest,
+                },
+                true,
+            ),
+        ];
+
+        for (case, authority, replayed_committed_request) in invalid {
+            let mut state = base_state.clone();
+            let mut host = TxnQuorumDriverTestHost {
+                forwarded: Some(ClusterKvTxnCommitResult {
+                    request_id: request.request_id.clone(),
+                    snapshot: snapshot.clone(),
+                    txn_response: Some(txn_response.clone()),
+                    authority,
+                    replayed_committed_request,
+                }),
+                reachable_voters: 1,
+                ..TxnQuorumDriverTestHost::default()
+            };
+            let error = commit_cluster_kv_txn_with_quorum_with_host(
+                &mut state,
+                request.clone(),
+                ClusterKvTxnQuorumDriverOptions {
+                    allow_forwarding: true,
+                },
+                &mut host,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    QuorumCommitTestError::Kv(KvError::AuthorityUnavailable { .. })
+                ),
+                "{case}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -6601,7 +7484,7 @@ mod tests {
 
         let error = commit_cluster_kv_txn_with_quorum_with_host(
             &mut state,
-            KvTxn {
+            KvTxnRequest::generated(KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
                     key: "/kv/txn-driver/forwarded-rejected".to_string(),
@@ -6609,7 +7492,7 @@ mod tests {
                     lease_id: None,
                 }],
                 failure: Vec::new(),
-            },
+            }),
             ClusterKvTxnQuorumDriverOptions {
                 allow_forwarding: false,
             },
@@ -6641,7 +7524,7 @@ mod tests {
 
         let result = commit_cluster_kv_txn_with_quorum_with_host(
             &mut state,
-            KvTxn {
+            KvTxnRequest::generated(KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
                     key: "/kv/txn-driver/origin-local-election".to_string(),
@@ -6649,7 +7532,7 @@ mod tests {
                     lease_id: None,
                 }],
                 failure: Vec::new(),
-            },
+            }),
             ClusterKvTxnQuorumDriverOptions {
                 allow_forwarding: true,
             },
@@ -6691,7 +7574,7 @@ mod tests {
         let error = runtime
             .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
                 &mut state,
-                KvTxn {
+                KvTxnRequest::generated(KvTxn {
                     compares: Vec::new(),
                     success: vec![KvOp::Put {
                         key: "/kv/txn-driver/async-forwarded-rejected".to_string(),
@@ -6699,7 +7582,7 @@ mod tests {
                         lease_id: None,
                     }],
                     failure: Vec::new(),
-                },
+                }),
                 ClusterKvTxnQuorumDriverOptions {
                     allow_forwarding: false,
                 },
@@ -6736,7 +7619,7 @@ mod tests {
         let result = runtime
             .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
                 &mut state,
-                KvTxn {
+                KvTxnRequest::generated(KvTxn {
                     compares: Vec::new(),
                     success: vec![KvOp::Put {
                         key: "/kv/txn-driver/async-origin-local-election".to_string(),
@@ -6744,7 +7627,7 @@ mod tests {
                         lease_id: None,
                     }],
                     failure: Vec::new(),
-                },
+                }),
                 ClusterKvTxnQuorumDriverOptions {
                     allow_forwarding: true,
                 },
@@ -6770,6 +7653,7 @@ mod tests {
 
     struct AppendReplicationTestHost {
         last_index: u64,
+        next_index_hint: Option<u64>,
         snapshot_only_at_catch_up_anchor: bool,
         requested_next_indices: Vec<u64>,
         responses: VecDeque<ClusterRaftAppendResponse>,
@@ -6789,6 +7673,15 @@ mod tests {
             _state: &ClusterBootstrapState,
         ) -> Result<u64, Self::Error> {
             Ok(self.last_index)
+        }
+
+        fn raft_peer_progress_next_index_hint(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target: &Self::Target,
+            _last_local_raft_log_index: u64,
+        ) -> Option<u64> {
+            self.next_index_hint
         }
 
         fn build_raft_append_request(
@@ -6940,6 +7833,7 @@ mod tests {
         let watch_event = test_kv_put_event(1, "/kv/append/watch", b"ok");
         let mut host = AppendReplicationTestHost {
             last_index: 5,
+            next_index_hint: None,
             snapshot_only_at_catch_up_anchor: false,
             requested_next_indices: Vec::new(),
             responses: VecDeque::from([
@@ -6968,12 +7862,80 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_raft_append_replication_resumes_from_peer_progress_hint() {
+        let local = NodeId::from_legacy_named("node_kv_append_resume_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_kv_append_resume_remote").expect("remote");
+        let state = quorum_commit_test_state(&local, &remote);
+        let mut host = AppendReplicationTestHost {
+            last_index: 100,
+            next_index_hint: Some(41),
+            snapshot_only_at_catch_up_anchor: false,
+            requested_next_indices: Vec::new(),
+            responses: VecDeque::from([test_cluster_raft_append_response(&state, true, 100)]),
+            sent_count: 0,
+        };
+
+        let outcome = replicate_cluster_kv_raft_to_target_with_host(
+            &state,
+            &remote,
+            &[],
+            ClusterKvRaftAppendReplicationOptions {
+                max_attempts: 2,
+                timeout: Duration::from_secs(5),
+            },
+            &mut host,
+        )
+        .expect("resume hinted append replication");
+
+        assert!(outcome.response.accepted);
+        assert_eq!(host.requested_next_indices, vec![41]);
+        assert_eq!(host.sent_count, 1);
+    }
+
+    #[test]
+    fn cluster_kv_raft_append_replication_backtracks_normally_from_stale_hint() {
+        let local =
+            NodeId::from_legacy_named("node_kv_append_hint_backtrack_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_kv_append_hint_backtrack_remote").expect("remote");
+        let state = quorum_commit_test_state(&local, &remote);
+        let mut host = AppendReplicationTestHost {
+            last_index: 10,
+            next_index_hint: Some(7),
+            snapshot_only_at_catch_up_anchor: false,
+            requested_next_indices: Vec::new(),
+            responses: VecDeque::from([
+                test_cluster_raft_append_response(&state, false, 3),
+                test_cluster_raft_append_response(&state, true, 10),
+            ]),
+            sent_count: 0,
+        };
+
+        let outcome = replicate_cluster_kv_raft_to_target_with_host(
+            &state,
+            &remote,
+            &[],
+            ClusterKvRaftAppendReplicationOptions {
+                max_attempts: 3,
+                timeout: Duration::from_secs(5),
+            },
+            &mut host,
+        )
+        .expect("backtrack from stale peer progress hint");
+
+        assert!(outcome.response.accepted);
+        assert_eq!(host.requested_next_indices, vec![7, 4]);
+        assert_eq!(host.sent_count, 2);
+    }
+
+    #[test]
     fn cluster_kv_raft_append_replication_forces_catch_up_anchor_for_committed_conflict() {
         let local = NodeId::from_legacy_named("node_kv_append_conflict_local").expect("local");
         let remote = NodeId::from_legacy_named("node_kv_append_conflict_remote").expect("remote");
         let state = quorum_commit_test_state(&local, &remote);
         let mut host = AppendReplicationTestHost {
             last_index: 5,
+            next_index_hint: None,
             snapshot_only_at_catch_up_anchor: true,
             requested_next_indices: Vec::new(),
             responses: VecDeque::from([
@@ -7142,11 +8104,11 @@ mod tests {
 
         let result = commit_cluster_kv_raft_command_with_quorum(
             &mut state,
-            KvCommand::Op(KvOp::Put {
+            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                 key: "/kv/quorum/committed".to_string(),
                 value: b"ok".to_vec(),
                 lease_id: None,
-            }),
+            })),
             ClusterKvRaftQuorumCommitOptions {
                 timeout: Duration::from_secs(1),
             },
@@ -7194,11 +8156,11 @@ mod tests {
         let result = runtime
             .block_on(commit_cluster_kv_raft_command_with_quorum_async(
                 &mut state,
-                KvCommand::Op(KvOp::Put {
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                     key: "/kv/quorum/async-committed".to_string(),
                     value: b"ok".to_vec(),
                     lease_id: None,
-                }),
+                })),
                 ClusterKvRaftQuorumCommitOptions {
                     timeout: Duration::from_secs(1),
                 },
@@ -7241,11 +8203,11 @@ mod tests {
 
         let error = commit_cluster_kv_raft_command_with_quorum(
             &mut state,
-            KvCommand::Op(KvOp::Put {
+            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                 key: "/kv/quorum/rejected".to_string(),
                 value: b"no".to_vec(),
                 lease_id: None,
-            }),
+            })),
             ClusterKvRaftQuorumCommitOptions {
                 timeout: Duration::from_secs(1),
             },
@@ -7256,6 +8218,7 @@ mod tests {
         assert!(matches!(error, QuorumCommitTestError::ReadOnly(_)));
         assert!(host.discarded);
         assert!(host.committed_indices.is_empty());
+        assert_eq!(host.unknown_requests.len(), 1);
         assert_eq!(
             host.statuses,
             vec![(remote, ClusterKvRaftTargetReplicationStatus::Rejected)]
@@ -7281,11 +8244,11 @@ mod tests {
         let error = runtime
             .block_on(commit_cluster_kv_raft_command_with_quorum_async(
                 &mut state,
-                KvCommand::Op(KvOp::Put {
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                     key: "/kv/quorum/async-rejected".to_string(),
                     value: b"no".to_vec(),
                     lease_id: None,
-                }),
+                })),
                 ClusterKvRaftQuorumCommitOptions {
                     timeout: Duration::from_secs(1),
                 },
@@ -7296,10 +8259,142 @@ mod tests {
         assert!(matches!(error, QuorumCommitTestError::ReadOnly(_)));
         assert!(host.discarded);
         assert!(host.committed_indices.is_empty());
+        assert_eq!(host.unknown_requests.len(), 1);
         assert_eq!(
             host.statuses,
             vec![(remote, ClusterKvRaftTargetReplicationStatus::Rejected)]
         );
+    }
+
+    #[test]
+    fn local_read_succeeds_without_quorum_while_authoritative_read_fails_closed() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-vs-authoritative-read");
+        let paths = ClusterKvPaths::new(&root);
+        let local = NodeId::from_legacy_named("node_kv_local_read_without_quorum").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_kv_authoritative_read_without_quorum").expect("remote");
+        paths
+            .raft_store()
+            .append_command_with_response(
+                &local,
+                KvCommand::Op(KvOp::Put {
+                    key: "/kv/read/local".to_string(),
+                    value: b"available".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("seed durable local value");
+
+        let local_read = read_cluster_kv_local_snapshot(&paths, &local)
+            .expect("local read must not require quorum");
+        assert_eq!(
+            local_read
+                .value
+                .get("/kv/read/local")
+                .expect("local value")
+                .value,
+            b"available".to_vec()
+        );
+        assert_eq!(local_read.revision, local_read.value.revision);
+        assert_eq!(local_read.applied_index, 1);
+
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = QuorumCommitTestHost {
+            unverified_leader: true,
+            ..QuorumCommitTestHost::default()
+        };
+        let error = read_cluster_kv_authoritative_snapshot_with_host(
+            &mut state,
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_millis(10),
+            },
+            &mut host,
+        )
+        .expect_err("authoritative read must fail without verified leadership/quorum");
+        assert!(matches!(error, QuorumCommitTestError::ReadOnly(_)));
+        assert!(host.appended.is_none());
+        assert_eq!(host.rejected_requests.len(), 1);
+    }
+
+    #[test]
+    fn fresh_semantic_no_op_requires_quorum_and_records_unknown_after_append() {
+        let local = NodeId::from_legacy_named("node_kv_noop_quorum_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_kv_noop_quorum_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Delete {
+            key: "/kv/noop/missing".to_string(),
+        }));
+        let request_id = request.request_id.clone();
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote],
+            ..QuorumCommitTestHost::default()
+        };
+
+        let error = commit_cluster_kv_raft_command_with_quorum(
+            &mut state,
+            request,
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_millis(10),
+            },
+            &mut host,
+        )
+        .expect_err("fresh semantic no-op must not bypass quorum");
+
+        assert!(matches!(error, QuorumCommitTestError::ReadOnly(_)));
+        assert_eq!(
+            host.appended.as_ref().map(|entry| &entry.request_id),
+            Some(&request_id)
+        );
+        assert!(host.committed_indices.is_empty());
+        assert_eq!(host.unknown_requests, vec![request_id]);
+        assert!(host.discarded);
+    }
+
+    #[test]
+    fn exact_committed_retry_replays_without_verified_leadership_or_new_log() {
+        let local = NodeId::from_legacy_named("node_kv_retry_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_kv_retry_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        let snapshot = InProcessKvStore::new().snapshot().expect("snapshot");
+        let record = KvCommittedRequestRecord {
+            request_id: request.request_id.clone(),
+            command_digest: request.digest().expect("digest"),
+            term: 9,
+            log_index: 42,
+            revision: snapshot.revision,
+            txn_response: None,
+        };
+        let mut host = QuorumCommitTestHost {
+            unverified_leader: true,
+            replayed: Some((snapshot.clone(), record.clone())),
+            ..QuorumCommitTestHost::default()
+        };
+
+        let result = commit_cluster_kv_raft_command_with_quorum(
+            &mut state,
+            request,
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_millis(10),
+            },
+            &mut host,
+        )
+        .expect("exact committed retry is an authoritative replay");
+
+        assert!(result.replayed_committed_request);
+        assert_eq!(result.snapshot, snapshot);
+        assert_eq!(
+            result.authority,
+            KvAuthorityProof {
+                term: record.term,
+                commit_index: record.log_index,
+                revision: record.revision,
+                basis: KvAuthorityBasis::ExactCommittedRequest,
+            }
+        );
+        assert!(host.appended.is_none());
+        assert!(host.rejected_requests.is_empty());
+        assert!(host.replicated_targets.is_empty());
     }
 
     #[test]
@@ -8026,6 +9121,7 @@ mod tests {
                     entries: vec![KvLogEntry {
                         index: 1,
                         term: 2,
+                        request_id: KvRequestId::generate(),
                         command: KvCommand::Op(KvOp::Put {
                             key: "/raft-store/append".to_string(),
                             value: b"value".to_vec(),
@@ -8149,7 +9245,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_kv_raft_store_appends_commits_and_detects_no_effect_commands() {
+    fn cluster_kv_raft_store_commits_semantic_no_effect_and_replays_exact_request() {
         let root = temp_raft_root("sinomo-kv-raft-store-command");
         let node_id = NodeId::from_legacy_named("node_raft_store_command").expect("node");
         let paths = ClusterKvPaths::new(root.to_path_buf());
@@ -8193,21 +9289,22 @@ mod tests {
             .expect("append no-effect command");
         assert_eq!(no_effect_commit.snapshot.revision, KvRevision(1));
         assert!(no_effect_commit.events.is_empty());
-        assert!(!no_effect_wrote_snapshot);
+        assert!(no_effect_wrote_snapshot);
 
-        let no_effect_uncommitted = store
-            .append_command_uncommitted_or_no_effect(&node_id, put)
-            .expect("uncommitted no-effect command");
-        match no_effect_uncommitted {
-            ClusterKvRaftUncommittedAppend::NoEffect {
-                snapshot,
-                txn_response,
-            } => {
+        let exact_request = KvCommandRequest::new(KvRequestId::generate(), put);
+        store
+            .append_request_with_response(&node_id, exact_request.clone())
+            .expect("commit stable no-effect request");
+        let replay = store
+            .append_request_uncommitted_or_replay(&node_id, exact_request)
+            .expect("replay exact committed request");
+        match replay {
+            ClusterKvRaftUncommittedAppend::CommittedReplay { snapshot, record } => {
                 assert_eq!(snapshot.revision, KvRevision(1));
-                assert!(txn_response.is_none());
+                assert!(record.txn_response.is_none());
             }
             ClusterKvRaftUncommittedAppend::Appended(entry) => {
-                panic!("expected no-effect append, got entry {entry:?}");
+                panic!("expected exact replay, got entry {entry:?}");
             }
         }
 
@@ -8221,7 +9318,7 @@ mod tests {
                 }),
             )
             .expect("append uncommitted command");
-        assert_eq!(append.index, 2);
+        assert_eq!(append.index, 4);
         let (committed, wrote_snapshot) = store
             .commit_index_with_events_and_publish_report(&node_id, append.index, |_| false)
             .expect("commit uncommitted command");
@@ -8254,16 +9351,16 @@ mod tests {
         let mut storage = ClusterKvRaftLocalCommandStorage::new(store, node_id, |_| false);
 
         let entry = match storage
-            .append_uncommitted_or_no_effect(KvCommand::Op(KvOp::Put {
+            .append_uncommitted_or_replay(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                 key: "/raft-local-storage/committed".to_string(),
                 value: b"committed".to_vec(),
                 lease_id: None,
-            }))
+            })))
             .expect("append command")
         {
             ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
-            ClusterKvRaftUncommittedAppend::NoEffect { .. } => {
-                panic!("fresh command should append")
+            ClusterKvRaftUncommittedAppend::CommittedReplay { .. } => {
+                panic!("fresh request should append")
             }
         };
         let commit = storage
@@ -8281,11 +9378,11 @@ mod tests {
         );
 
         let _ = storage
-            .append_uncommitted_or_no_effect(KvCommand::Op(KvOp::Put {
+            .append_uncommitted_or_replay(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                 key: "/raft-local-storage/discarded".to_string(),
                 value: b"discarded".to_vec(),
                 lease_id: None,
-            }))
+            })))
             .expect("append discarded command");
         let discarded = storage
             .discard_uncommitted_tail_and_clear_leader()
@@ -8803,6 +9900,7 @@ mod tests {
                 KvLogEntry {
                     index: 1,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/gap/one".to_string(),
                         value: b"one".to_vec(),
@@ -8813,6 +9911,7 @@ mod tests {
                 KvLogEntry {
                     index: 3,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/gap/three".to_string(),
                         value: b"three".to_vec(),
@@ -8846,6 +9945,7 @@ mod tests {
                 KvLogEntry {
                     index: 1,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/commit-plan/one".to_string(),
                         value: b"one".to_vec(),
@@ -8856,6 +9956,7 @@ mod tests {
                 KvLogEntry {
                     index: 2,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/commit-plan/two".to_string(),
                         value: b"two".to_vec(),
@@ -8894,6 +9995,7 @@ mod tests {
             log: vec![KvLogEntry {
                 index: 1,
                 term: 1,
+                request_id: KvRequestId::generate(),
                 command: KvCommand::Op(KvOp::Put {
                     key: "/conflict/original".to_string(),
                     value: b"original".to_vec(),
@@ -8912,6 +10014,7 @@ mod tests {
             .append_entries(vec![KvLogEntry {
                 index: 1,
                 term: 1,
+                request_id: KvRequestId::generate(),
                 command: KvCommand::Op(KvOp::Put {
                     key: "/conflict/replacement".to_string(),
                     value: b"replacement".to_vec(),
@@ -8931,6 +10034,56 @@ mod tests {
                 lease_id: None,
             })
         );
+    }
+
+    #[test]
+    fn replicated_node_rejects_competing_leader_in_same_term() {
+        let leader_a = NodeId::from_legacy_named("node_same_term_leader_a").expect("leader a");
+        let leader_b = NodeId::from_legacy_named("node_same_term_leader_b").expect("leader b");
+        let mut node = ReplicatedKvNode {
+            store: InProcessKvStore::new(),
+            log: Vec::new(),
+            hard_state: RaftHardState::default(),
+            applied_index: 0,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            txn_responses: KvTxnResponseIndex::default(),
+        };
+
+        let accepted = node
+            .handle_append_entries(RaftAppendEntriesRequest {
+                term: 7,
+                leader_id: leader_a.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            })
+            .expect("first leader heartbeat");
+        assert!(accepted.response.success);
+
+        let rejected = node
+            .handle_append_entries(RaftAppendEntriesRequest {
+                term: 7,
+                leader_id: leader_b,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![KvLogEntry {
+                    index: 1,
+                    term: 7,
+                    request_id: KvRequestId::generate(),
+                    command: KvCommand::Barrier,
+                    revision: KvRevision::ZERO,
+                }],
+                leader_commit: 1,
+            })
+            .expect("competing heartbeat is a protocol rejection");
+
+        assert!(!rejected.response.success);
+        assert_eq!(rejected.response.term, 7);
+        assert_eq!(node.hard_state.leader_id.as_ref(), Some(&leader_a));
+        assert_eq!(node.last_log_index(), 0);
+        assert_eq!(node.applied_index, 0);
     }
 
     #[test]
@@ -9182,6 +10335,7 @@ mod tests {
         let entry = KvLogEntry {
             index: 1,
             term: 2,
+            request_id: KvRequestId::generate(),
             command: KvCommand::Op(KvOp::Put {
                 key: "/config/heartbeat-wal".to_string(),
                 value: b"reachable".to_vec(),
@@ -9801,6 +10955,7 @@ mod tests {
                 &KvLogEntry {
                     index: 3,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/gap/three".to_string(),
                         value: b"three".to_vec(),
@@ -9867,6 +11022,7 @@ mod tests {
                 &KvLogEntry {
                     index: 1,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/conflict/replacement".to_string(),
                         value: b"replacement".to_vec(),
@@ -9913,6 +11069,7 @@ mod tests {
         let entry = KvLogEntry {
             index: 1,
             term: 1,
+            request_id: KvRequestId::generate(),
             command: KvCommand::Op(KvOp::Delete {
                 key: "/wal/temp-cleanup".to_string(),
             }),
@@ -9968,6 +11125,7 @@ mod tests {
                 &KvLogEntry {
                     index: 2,
                     term: 1,
+                    request_id: KvRequestId::generate(),
                     command: KvCommand::Op(KvOp::Put {
                         key: "/temp-only".to_string(),
                         value: b"ignored".to_vec(),

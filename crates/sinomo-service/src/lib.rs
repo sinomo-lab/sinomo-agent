@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use sinomo_kv::{KvEntry, KvError, KvTxn, KvTxnResponse};
+use sinomo_kv::{
+    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvEntry, KvError, KvLocalRead, KvTxnRequest,
+};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
     NetworkError, ObjectRpcBodyMode, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcRequest,
@@ -97,15 +99,34 @@ pub enum ServiceError {
 /// methods take `&self`; the implementation serializes writes internally. Present only
 /// when clustered — [`ServiceContext::cluster`] is `None` in local-only mode.
 pub trait ClusterAccess: Send + Sync {
-    /// Read a single cluster-KV entry.
-    fn kv_get(&self, key: &str) -> Result<Option<KvEntry>, ServiceError>;
-    /// Read all cluster-KV entries under a key prefix.
-    fn kv_range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, ServiceError>;
-    /// Commit a cluster-KV transaction through the host-owned async runtime.
+    /// Read a single entry from the best local view. The metadata is
+    /// observational and does not establish cluster freshness.
+    fn kv_get_local(&self, key: &str) -> Result<KvLocalRead<Option<KvEntry>>, ServiceError>;
+    /// Read a prefix from the best local view, with explicit local-read
+    /// metadata.
+    fn kv_range_prefix_local(
+        &self,
+        prefix: &str,
+    ) -> Result<KvLocalRead<Vec<KvEntry>>, ServiceError>;
+    /// Read one entry at or after a current-term quorum-confirmed barrier.
+    /// This must fail rather than degrade to the local view when authority
+    /// cannot be established.
+    fn kv_get_authoritative_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<KvAuthoritativeRead<Option<KvEntry>>, ServiceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    /// Commit a stable-ID cluster-KV request through the host-owned async
+    /// runtime. The ID must be preserved through forwarding and retries.
     fn kv_commit_async<'a>(
         &'a self,
-        txn: KvTxn,
-    ) -> Pin<Box<dyn Future<Output = Result<KvTxnResponse, ServiceError>> + Send + 'a>>;
+        request: KvTxnRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ClusterKvTxnCommitResult, ServiceError>> + Send + 'a>>;
 }
 
 /// Where the response to one service request goes.

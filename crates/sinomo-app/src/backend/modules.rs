@@ -455,6 +455,7 @@ impl Backend {
             node_id,
             CONFIG_SET_ROUTE,
             &ConfigSetRequest {
+                request_id: Some(sinomo_runtime::kv::KvRequestId::generate()),
                 key: MODULE_NODE_CONFIG_KEY.to_string(),
                 value,
                 target: ConfigWriteTarget::Local,

@@ -47,7 +47,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
     }
 
     #[cfg(test)]
-    fn read_cluster_kv_snapshot(
+    fn read_cluster_kv_local_snapshot_for_test(
         &self,
         paths: &sinomo_runtime::network::ClusterPaths,
     ) -> Option<Result<sinomo_runtime::kv::KvSnapshot, sinomo_runtime::sandbox::SandboxCliError>>
@@ -60,28 +60,56 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
     }
 
     #[cfg(test)]
-    fn commit_cluster_kv_txn(
+    fn commit_cluster_kv_request_for_test(
         &self,
         data_dir: &sinomo_runtime::local::SinomoDataDir,
-        txn: &sinomo_runtime::kv::KvTxn,
-    ) -> Option<Result<(), sinomo_runtime::sandbox::SandboxCliError>> {
+        request: &sinomo_runtime::kv::KvTxnRequest,
+    ) -> Option<
+        Result<
+            sinomo_runtime::kv::ClusterKvTxnCommitResult,
+            sinomo_runtime::sandbox::SandboxCliError,
+        >,
+    > {
         let paths = sinomo_runtime::network::ClusterPaths::new(data_dir);
         let result = (|| {
-            let snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            let node_id = sinomo_runtime::cluster::read_cluster_state_without_kv(&paths)
+                .map(|state| state.local_node_id)
                 .unwrap_or_else(|_| {
-                    sinomo_runtime::kv::InProcessKvStore::new()
-                        .snapshot()
-                        .expect("snapshot")
+                    sinomo_runtime::node::NodeId::from_legacy_named("sandbox_cli_test")
+                        .expect("valid sandbox CLI test node id")
                 });
-            let mut store = sinomo_runtime::kv::InProcessKvStore::restore(snapshot)?;
-            let _: sinomo_runtime::kv::KvTxnResponse = store.txn(txn.clone())?;
-            sinomo_runtime::kv::write_cluster_kv_snapshot(
-                &paths.kv_paths(),
-                &store.snapshot().expect("snapshot"),
-            )
-            .map_err(sinomo_runtime::network::NetworkError::directory)
-            .map_err(sinomo_runtime::network::NetworkError::directory)?;
-            Ok(())
+            let kv_paths = paths.kv_paths();
+            let replayed_committed_request =
+                sinomo_runtime::kv::read_cluster_kv_store_for_node(&kv_paths, node_id.clone())
+                    .ok()
+                    .and_then(|store| store.committed_request(&request.request_id).cloned())
+                    .is_some();
+            let raft_store = kv_paths.raft_store();
+            let commit = raft_store
+                .append_request_with_response(&node_id, request.clone().into_command_request())?;
+            raft_store.publish_commit_result(
+                &commit,
+                sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
+            )?;
+            Ok(sinomo_runtime::kv::ClusterKvTxnCommitResult {
+                request_id: request.request_id.clone(),
+                snapshot: commit.snapshot,
+                txn_response: commit.txn_response,
+                authority: sinomo_runtime::kv::KvAuthorityProof {
+                    term: commit.committed_request.term,
+                    commit_index: commit.committed_request.log_index,
+                    revision: commit.committed_request.revision,
+                    basis: if replayed_committed_request {
+                        sinomo_runtime::kv::KvAuthorityBasis::ExactCommittedRequest
+                    } else {
+                        sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        }
+                    },
+                },
+                replayed_committed_request,
+            })
         })();
         Some(result)
     }
@@ -444,5 +472,64 @@ fn daemon_error_from_sandbox_cli(
 ) -> sinomo_runtime::daemon::DaemonError {
     sinomo_runtime::daemon::DaemonError::Parse {
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_runtime::sandbox::SandboxCliHost;
+
+    #[test]
+    fn sandbox_kv_test_hook_preserves_request_identity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-kv-request");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = sinomo_runtime::network::ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let request = sinomo_runtime::kv::KvTxnRequest::generated(sinomo_runtime::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![sinomo_runtime::kv::KvOp::Put {
+                key: "/config/sandbox/test".to_string(),
+                value: b"one".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let host = SinomoCliSandboxHost;
+
+        let first = host
+            .commit_cluster_kv_request_for_test(&data_dir, &request)
+            .expect("test hook")
+            .expect("first commit");
+        let replay = host
+            .commit_cluster_kv_request_for_test(&data_dir, &request)
+            .expect("test hook")
+            .expect("exact retry");
+
+        assert!(!first.replayed_committed_request);
+        assert!(replay.replayed_committed_request);
+        assert_eq!(first.snapshot.revision, replay.snapshot.revision);
+        assert_eq!(
+            replay.authority.basis,
+            sinomo_runtime::kv::KvAuthorityBasis::ExactCommittedRequest
+        );
+
+        let conflicting = sinomo_runtime::kv::KvTxnRequest::new(
+            request.request_id,
+            sinomo_runtime::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![sinomo_runtime::kv::KvOp::Put {
+                    key: "/config/sandbox/test".to_string(),
+                    value: b"two".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+        );
+        assert!(
+            host.commit_cluster_kv_request_for_test(&data_dir, &conflicting)
+                .expect("test hook")
+                .is_err()
+        );
     }
 }

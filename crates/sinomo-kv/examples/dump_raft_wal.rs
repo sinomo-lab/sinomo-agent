@@ -48,6 +48,7 @@ fn main() {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            KvCommand::Barrier => "barrier".to_string(),
         };
         let summary: String = summary.chars().take(110).collect();
         println!("  {} {}", entry.index, summary);

@@ -8958,6 +8958,8 @@ mod tests {
             }],
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         };
 
         let old_runtime =

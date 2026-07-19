@@ -8,7 +8,6 @@ use sinomo_build::{
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE,
 };
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::cluster::{
     ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
@@ -497,6 +496,7 @@ fn daemon_signer_authorizes_cluster_kv_route(
 ) -> bool {
     match auth {
         ClusterKvRouteAuth::Authenticated => true,
+        ClusterKvRouteAuth::LocalOnly => matches!(signer, DaemonSignerAuthority::Local),
         ClusterKvRouteAuth::LocalOrClusterMember => matches!(
             signer,
             DaemonSignerAuthority::Local
@@ -791,38 +791,93 @@ fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), Daemon
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let options =
         ClusterControlPlaneTimeouts::default_daemon_transport().kv_snapshot_refresh_options();
-    let payload = sinomo_core::kv::cluster_kv_snapshot_rpc_payload()?;
+    let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
     let request = sinomo_core::network::ObjectRpcRequest::from_encoded_body(
         payload.route,
         payload.category,
         payload.body,
     );
-    sinomo_core::cluster::refresh_current_cluster_kv_store_with_local_storage_and_transport(
-        &cluster_paths,
-        &state,
-        options,
-        |target_node_id, timeout| {
-            let response = crate::client::send_object_rpc_to_target_with_timeouts(
-                target_node_id,
-                &request,
-                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                false,
-            )
-            .map_err(|error| sinomo_core::network::NetworkError::Io {
-                operation: "cluster auth membership refresh".to_string(),
-                detail: error.to_string(),
-            })?;
-            response.error_detail()?;
-            sinomo_core::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(|source| {
-                sinomo_core::network::NetworkError::Io {
-                    operation: "decode cluster auth membership snapshot".to_string(),
-                    detail: source.to_string(),
+    let mut authoritative_snapshot = None;
+
+    // Reuse the bounded authority-target iteration and local Raft cache repair,
+    // but require every successful fetch to carry a fresh quorum-backed proof.
+    // A local snapshot fallback is never sufficient for an authentication
+    // decision, so the captured authoritative response is checked below.
+    let refreshed =
+        sinomo_core::cluster::refresh_current_cluster_kv_store_with_local_storage_and_transport(
+            &cluster_paths,
+            &state,
+            options,
+            |target_node_id, timeout| {
+                let response = crate::client::send_object_rpc_to_target_with_timeouts(
+                    target_node_id,
+                    &request,
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                    false,
+                )
+                .map_err(|error| sinomo_core::network::NetworkError::Io {
+                    operation: "cluster auth membership refresh".to_string(),
+                    detail: error.to_string(),
+                })?;
+                response.error_detail()?;
+                let authoritative =
+                    sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
+                        &response.body,
+                    )
+                    .map_err(|source| {
+                        sinomo_core::network::NetworkError::Io {
+                            operation: "decode authoritative cluster auth membership snapshot"
+                                .to_string(),
+                            detail: source.to_string(),
+                        }
+                    })?;
+                let proof = authoritative.authority;
+                if proof.revision != authoritative.value.revision {
+                    return Err(sinomo_core::network::NetworkError::Io {
+                        operation: "validate authoritative cluster auth membership snapshot"
+                            .to_string(),
+                        detail: format!(
+                            "authority proof revision {:?} does not match snapshot revision {:?}",
+                            proof.revision, authoritative.value.revision
+                        ),
+                    });
                 }
-            })
-        },
-    )
-    .map(|_| ())
-    .map_err(DaemonError::from)
+                match proof.basis {
+                    sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks,
+                        required_quorum,
+                    } if required_quorum > 0 && voter_acks >= required_quorum => {}
+                    basis => {
+                        return Err(sinomo_core::network::NetworkError::Io {
+                            operation: "validate authoritative cluster auth membership snapshot"
+                                .to_string(),
+                            detail: format!(
+                                "authentication membership refresh requires a fresh current-term quorum proof, got {basis:?}"
+                            ),
+                        });
+                    }
+                }
+                authoritative_snapshot = Some(authoritative.value.clone());
+                Ok(authoritative.value)
+            },
+        )?;
+
+    let authoritative_snapshot = authoritative_snapshot.ok_or_else(|| {
+        DaemonError::ClusterReadOnly {
+            detail: "authentication membership refresh could not obtain an authoritative cluster KV snapshot"
+            .to_string(),
+        }
+    })?;
+    let refreshed_snapshot = refreshed.try_snapshot()?;
+    if refreshed_snapshot != authoritative_snapshot {
+        return Err(DaemonError::ClusterReadOnly {
+            detail: format!(
+                "authentication membership refresh selected local revision {:?} instead of the authoritative revision {:?}",
+                refreshed_snapshot.revision, authoritative_snapshot.revision
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn cached_daemon_auth_verifier_context(
@@ -1146,8 +1201,10 @@ fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> Vec<u8> {
 mod tests {
     use super::*;
     use sinomo_core::kv::{
-        CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_WATCH_DRAIN_ROUTE,
-        CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_KV_WATCH_PREFIX_ROUTE,
+        CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE, CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE, CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
+        CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE, CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+        CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE, CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE,
     };
 
     fn authenticated_command(
@@ -1323,6 +1380,77 @@ mod tests {
 
         authorize_authenticated_daemon_command(&authenticated)
             .expect("cluster members must be able to forward KV txns to voters");
+    }
+
+    #[test]
+    fn cluster_control_identity_changes_require_a_local_signer() {
+        for route in [
+            sinomo_core::cluster::CLUSTER_CONTROL_INIT_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE,
+            sinomo_core::cluster::CLUSTER_CONTROL_LEAVE_ROUTE,
+        ] {
+            authorize_authenticated_daemon_command(&authenticated_command(
+                route.to_string(),
+                DaemonSignerAuthority::Local,
+            ))
+            .expect("local operators may change this node's cluster identity");
+            assert!(
+                authorize_authenticated_daemon_command(&authenticated_command(
+                    route.to_string(),
+                    DaemonSignerAuthority::Voter,
+                ))
+                .is_err(),
+                "remote voters must not invoke local identity route {route}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_kv_snapshot_routes_enforce_explicit_authority_scopes() {
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+            DaemonSignerAuthority::StatusProbe,
+        ] {
+            authorize_authenticated_daemon_command(&authenticated_command(
+                CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE.to_string(),
+                signer,
+            ))
+            .expect("the explicitly local snapshot route accepts authenticated diagnostics");
+        }
+
+        for route in [
+            CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+            CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+            CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        ] {
+            for signer in [
+                DaemonSignerAuthority::Local,
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+            ] {
+                authorize_authenticated_daemon_command(&authenticated_command(
+                    route.to_string(),
+                    signer,
+                ))
+                .expect("cluster members may request barrier-backed reads");
+            }
+            for signer in [
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                assert!(
+                    authorize_authenticated_daemon_command(&authenticated_command(
+                        route.to_string(),
+                        signer,
+                    ))
+                    .is_err(),
+                    "non-members must not request authoritative cluster state"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1934,9 +2062,9 @@ mod tests {
     #[test]
     fn cluster_kv_watch_routes_authorize_cluster_members() {
         for route in [
-            CLUSTER_KV_WATCH_PREFIX_ROUTE,
-            CLUSTER_KV_WATCH_DRAIN_ROUTE,
-            CLUSTER_KV_WATCH_CANCEL_ROUTE,
+            CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
+            CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+            CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
             CLUSTER_KV_WATCH_EVENTS_ROUTE,
         ] {
             for signer in [

@@ -3,13 +3,17 @@ use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::invalidate_cluster_kv_reader_node_id_cache;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
+use crate::kv_local_store::read_cluster_kv_current_snapshot_arc;
 use crate::kv_local_store::record_current_cluster_kv_reader_node_id_cache;
 use crate::kv_read_model::read_cluster_members_from_kv;
 use crate::local_membership::{
     locally_learned_remote_route_endpoints, preserve_locally_learned_remote_route_endpoints,
 };
 use crate::member_store::merge_member_record;
-use sinomo_base::ClusterBootstrapState;
+use sinomo_base::{
+    ClusterBootstrapState, ClusterMemberRole, ClusterMemberState, DAEMON_MAIN_RUN_CAPABILITY,
+};
+use sinomo_kv::ClusterKvRaftConfigRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 #[cfg(any(test, feature = "test-support"))]
@@ -281,6 +285,106 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
     }
     cleanup_cluster_endpoint_duplicates(&mut state);
     Ok(state)
+}
+
+/// Reads the locally applied committed Raft configuration and projects it onto
+/// the routing/member view used by consensus operations.
+///
+/// `ClusterBootstrapState` remains the topology and identity carrier, but its
+/// member role fields can lag a committed `/cluster/raft/config` transition.
+/// Consensus must never silently fall back to those stale roles: once a config
+/// record exists, it is the effective voter/learner set until another config
+/// entry commits.
+pub fn read_cluster_consensus_state(
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, NetworkError> {
+    let mut state = read_cluster_state(paths)?;
+    project_committed_cluster_raft_config(paths, &mut state)?;
+    Ok(state)
+}
+
+/// Overlays the locally applied committed config on an existing topology
+/// snapshot. This is used at consensus boundaries so a caller cannot smuggle a
+/// proposed member-role mutation into the quorum calculation.
+pub fn project_committed_cluster_raft_config(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+) -> Result<bool, NetworkError> {
+    let snapshot = match read_cluster_kv_current_snapshot_arc(paths) {
+        Ok(snapshot) => snapshot,
+        Err(NetworkError::ClusterOrphan) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(entry) = snapshot.get(&sinomo_kv::cluster_kv_raft_config_key()) else {
+        return Ok(false);
+    };
+    let config: ClusterKvRaftConfigRecord = entry.decode().map_err(kv_err)?;
+    if config.cluster_id != state.cluster_id {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: format!(
+                "committed Raft config cluster `{}` does not match local cluster `{}`",
+                config.cluster_id, state.cluster_id
+            ),
+        });
+    }
+
+    for voter in &config.voters {
+        if config.learners.contains(voter) || config.non_voting.contains(voter) {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: format!(
+                    "committed Raft config assigns node `{voter}` to overlapping roles"
+                ),
+            });
+        }
+    }
+    for learner in &config.learners {
+        if config.non_voting.contains(learner) {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: format!(
+                    "committed Raft config assigns node `{learner}` to overlapping roles"
+                ),
+            });
+        }
+    }
+
+    for member in &mut state.members {
+        if config.voters.contains(&member.node_id) {
+            member.role = ClusterMemberRole::Voter;
+            member.state = ClusterMemberState::Voter;
+        } else if config.learners.contains(&member.node_id) {
+            member.role = ClusterMemberRole::Learner;
+            member.state = ClusterMemberState::Learner;
+        } else if config.non_voting.contains(&member.node_id) {
+            member.role = ClusterMemberRole::NonVoting;
+            member.state = ClusterMemberState::NonVoting;
+        } else if member.has_raft_vote() {
+            // A legacy/local member record must not add a voter that is absent
+            // from the committed configuration.
+            member.role = ClusterMemberRole::NonVoting;
+            member.state = ClusterMemberState::NonVoting;
+        }
+    }
+
+    for voter in &config.voters {
+        let Some(member) = state.members.iter().find(|member| member.node_id == *voter) else {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: format!("committed Raft voter `{voter}` has no member identity record"),
+            });
+        };
+        if !member
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
+        {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: format!(
+                    "committed Raft voter `{voter}` lacks capability `{DAEMON_MAIN_RUN_CAPABILITY}`"
+                ),
+            });
+        }
+    }
+
+    Ok(true)
 }
 
 /// Reads the merged cluster state through a short, syscall-free validation

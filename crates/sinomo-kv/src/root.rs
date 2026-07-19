@@ -32,13 +32,22 @@ pub const MAX_DELETE_PREFIX_KEYS: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
 pub const MAX_KEYS_PER_LEASE: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
 pub const MAX_KV_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_KV_COMMAND_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_COMMITTED_KV_REQUESTS: usize = 4096;
+pub const MAX_COMMITTED_KV_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_EXPIRED_KV_REQUEST_TOMBSTONES: usize = 4096;
 pub const CLUSTER_KV_RPC_CATEGORY: &str = "cluster.kv";
-pub const CLUSTER_KV_SNAPSHOT_ROUTE: &str = "/cluster/kv/snapshot";
+pub const CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE: &str = "/cluster/kv/local/snapshot";
+pub const CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE: &str = "/cluster/kv/authoritative/snapshot";
+pub const CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE: &str =
+    "/cluster/kv/authoritative/range-prefix";
+pub const CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE: &str =
+    "/cluster/kv/authoritative/watch-start";
 pub const CLUSTER_KV_TXN_ROUTE: &str = "/cluster/kv/txn";
-pub const CLUSTER_KV_RANGE_PREFIX_ROUTE: &str = "/cluster/kv/range-prefix";
-pub const CLUSTER_KV_WATCH_PREFIX_ROUTE: &str = "/cluster/kv/watch-prefix";
-pub const CLUSTER_KV_WATCH_DRAIN_ROUTE: &str = "/cluster/kv/watch-drain";
-pub const CLUSTER_KV_WATCH_CANCEL_ROUTE: &str = "/cluster/kv/watch-cancel";
+pub const CLUSTER_KV_REQUEST_OUTCOME_ROUTE: &str = "/cluster/kv/request-outcome";
+pub const CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE: &str = "/cluster/kv/local/range-prefix";
+pub const CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE: &str = "/cluster/kv/local/watch-prefix";
+pub const CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE: &str = "/cluster/kv/local/watch-drain";
+pub const CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE: &str = "/cluster/kv/local/watch-cancel";
 pub const CLUSTER_KV_WATCH_EVENTS_ROUTE: &str = "/cluster/kv/watch-events";
 pub const CLUSTER_RAFT_RPC_CATEGORY: &str = "cluster.raft";
 pub const CLUSTER_RAFT_APPEND_ROUTE: &str = "/cluster/raft/append";
@@ -48,28 +57,45 @@ pub const CLUSTER_KV_WRITE_CAPABILITY: &str = "cluster.kv.write";
 pub const CLUSTER_RAFT_APPEND_CAPABILITY: &str = "cluster.raft.append";
 pub const CLUSTER_RAFT_VOTE_CAPABILITY: &str = "cluster.raft.vote";
 pub const CLUSTER_KV_LOCAL_READ_WATCH_ROUTES: &[&str] = &[
-    CLUSTER_KV_RANGE_PREFIX_ROUTE,
-    CLUSTER_KV_WATCH_PREFIX_ROUTE,
-    CLUSTER_KV_WATCH_DRAIN_ROUTE,
-    CLUSTER_KV_WATCH_CANCEL_ROUTE,
+    CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
+    CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+    CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
 ];
 pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
-    CLUSTER_KV_SNAPSHOT_ROUTE,
+    CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
     CLUSTER_KV_TXN_ROUTE,
-    CLUSTER_KV_RANGE_PREFIX_ROUTE,
-    CLUSTER_KV_WATCH_PREFIX_ROUTE,
-    CLUSTER_KV_WATCH_DRAIN_ROUTE,
-    CLUSTER_KV_WATCH_CANCEL_ROUTE,
+    CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
+    CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
+    CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+    CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
     CLUSTER_KV_WATCH_EVENTS_ROUTE,
 ];
 pub const CLUSTER_RAFT_RPC_ROUTES: &[&str] = &[CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE];
 pub const CLUSTER_KV_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
-    (CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (
+        CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
+    ),
+    (
+        CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
+    ),
+    (
+        CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
+    ),
     (CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_RPC_CATEGORY),
-    (CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY),
-    (CLUSTER_KV_WATCH_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY),
-    (CLUSTER_KV_WATCH_DRAIN_ROUTE, CLUSTER_KV_RPC_CATEGORY),
-    (CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_REQUEST_OUTCOME_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE, CLUSTER_KV_RPC_CATEGORY),
     (CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_KV_RPC_CATEGORY),
 ];
 pub const CLUSTER_RAFT_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
@@ -80,6 +106,7 @@ pub const CLUSTER_RAFT_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClusterKvRouteAuth {
     Authenticated,
+    LocalOnly,
     LocalOrClusterMember,
     LocalOrRaftVoter,
 }
@@ -88,6 +115,7 @@ impl ClusterKvRouteAuth {
     pub fn as_scope(self) -> &'static str {
         match self {
             Self::Authenticated => "authenticated",
+            Self::LocalOnly => "local-command",
             Self::LocalOrClusterMember => "local-or-cluster-member",
             Self::LocalOrRaftVoter => "local-or-cluster-voter",
         }
@@ -104,9 +132,27 @@ pub struct ClusterKvRpcRoutePolicy {
 
 pub const CLUSTER_KV_RPC_ROUTE_POLICIES: &[ClusterKvRpcRoutePolicy] = &[
     ClusterKvRpcRoutePolicy {
-        route: CLUSTER_KV_SNAPSHOT_ROUTE,
+        route: CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::Authenticated,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
     },
     ClusterKvRpcRoutePolicy {
@@ -116,25 +162,31 @@ pub const CLUSTER_KV_RPC_ROUTE_POLICIES: &[ClusterKvRpcRoutePolicy] = &[
         required_capabilities: &[CLUSTER_KV_WRITE_CAPABILITY],
     },
     ClusterKvRpcRoutePolicy {
-        route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
+        route: CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
     },
     ClusterKvRpcRoutePolicy {
-        route: CLUSTER_KV_WATCH_PREFIX_ROUTE,
+        route: CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
     },
     ClusterKvRpcRoutePolicy {
-        route: CLUSTER_KV_WATCH_DRAIN_ROUTE,
+        route: CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
     },
     ClusterKvRpcRoutePolicy {
-        route: CLUSTER_KV_WATCH_CANCEL_ROUTE,
+        route: CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
@@ -202,10 +254,13 @@ pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 pub const CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS: usize = 3;
 pub const CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP: u64 = 64;
 
+mod config_change;
 mod in_process;
+mod keyspace;
 mod model;
 mod paths;
 mod raft;
+mod request;
 mod rpc;
 mod snapshot;
 mod wal;
@@ -215,6 +270,7 @@ mod watch_store;
 
 mod internal {
     pub(crate) use super::in_process::*;
+    pub(crate) use super::keyspace::*;
     pub(crate) use super::model::*;
     pub(crate) use super::paths::*;
     pub(crate) use super::raft::*;
@@ -225,12 +281,31 @@ mod internal {
     pub(crate) use super::*;
 }
 
+pub use config_change::{
+    ClusterKvRaftCatchUpProof, ClusterKvRaftConfigChange, ClusterKvRaftConfigChangeEvidence,
+    ClusterKvRaftConfigChangeKind, ClusterKvRaftConfigChangePhase, ClusterKvRaftPeerProgress,
+    MAX_CLUSTER_KV_RAFT_CONFIG_CHANGE_EVIDENCE, MAX_CLUSTER_KV_RAFT_PEER_PROGRESS_HINTS,
+    apply_cluster_kv_raft_config_change, begin_cluster_kv_raft_config_change,
+    clear_cluster_kv_raft_peer_progress, cluster_kv_raft_config_change_key,
+    cluster_kv_raft_peer_progress_next_index_hint,
+    cluster_kv_raft_peer_progress_next_index_hint_async, finish_cluster_kv_raft_config_change,
+    read_cluster_kv_raft_peer_progress, record_cluster_kv_raft_catch_up_proof,
+    record_cluster_kv_raft_peer_progress,
+};
 pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
+pub use keyspace::{
+    ClusterKvKeyspaceClass, cluster_kv_default_read_authority_for_key,
+    cluster_kv_key_may_defer_materialized_projection, cluster_kv_keyspace_class,
+};
 pub type InProcessKvCluster = InProcessRaftKvCluster;
 pub use model::{
-    KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvEventKind, KvLease, KvOp, KvOpResponse,
-    KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
-    decode_kv_value, encode_kv_value, push_bounded_txn_success_op,
+    ClusterKvRequestOutcomeRead, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityDiagnostics, KvAuthorityFailure,
+    KvAuthorityFailureReason, KvAuthorityProof, KvCommand, KvCommandDigest, KvCommandRequest,
+    KvCommittedRequestRecord, KvCompare, KvEntry, KvError, KvEvent, KvEventKind, KvFreshness,
+    KvLease, KvLocalRead, KvOp, KvOpResponse, KvReadAuthority, KvRecoveryAction,
+    KvRequestAttemptRecord, KvRequestAttemptState, KvRequestId, KvRequestOutcome, KvRevision,
+    KvSnapshot, KvTxn, KvTxnRequest, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
+    decode_kv_value, encode_kv_value, kv_command_digest, push_bounded_txn_success_op,
 };
 pub use paths::{
     CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, ClusterKvPaths, lock_cluster_kv_commit_sequence,
@@ -262,33 +337,64 @@ pub use raft::{
     elect_cluster_kv_raft_leader_async_with_host, elect_cluster_kv_raft_leader_with_host,
     lock_cluster_kv_raft_operation_for_paths, lock_cluster_kv_raft_operation_for_root,
     lock_cluster_kv_raft_operation_for_wal_paths,
+    read_cluster_kv_authoritative_snapshot_async_with_host,
+    read_cluster_kv_authoritative_snapshot_with_host,
     replicate_cluster_kv_raft_to_target_async_with_host,
     replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
 };
+pub use request::{
+    MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES, MAX_CLUSTER_KV_REQUEST_ATTEMPT_TOMBSTONES,
+    MAX_CLUSTER_KV_REQUEST_ATTEMPTS, mark_cluster_kv_request_rejected_before_commit,
+    mark_cluster_kv_request_submitted, mark_cluster_kv_request_unknown,
+    read_cluster_kv_request_attempt, record_cluster_kv_request_attempt,
+    resolve_cluster_kv_request_outcome,
+};
 pub use rpc::{
-    ClusterKvLocalReadWatchHost, ClusterKvReplicationRequest, ClusterKvReplicationResponse,
+    ClusterKvAuthoritativeRangePrefixRequest, ClusterKvAuthoritativeSnapshotRequest,
+    ClusterKvAuthoritativeWatchStartRequest, ClusterKvLocalReadWatchHost,
+    ClusterKvReplicationRequest, ClusterKvReplicationResponse, ClusterKvRequestOutcomeRequest,
     ClusterKvRpcPayload, ClusterKvStateAuthorityVoteRequest, ClusterKvStateAuthorityVoteResponse,
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
     ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
-    cluster_kv_range_prefix_rpc_payload, cluster_kv_snapshot_response_rpc_payload,
-    cluster_kv_snapshot_rpc_payload, cluster_kv_txn_response_rpc_payload,
-    cluster_kv_txn_rpc_payload, cluster_kv_watch_events_noop_response,
-    cluster_kv_watch_events_response_rpc_payload, cluster_kv_watch_events_rpc_payload,
-    cluster_raft_append_response_rpc_payload, cluster_raft_append_rpc_payload,
-    cluster_raft_vote_response_rpc_payload, cluster_raft_vote_rpc_payload,
-    decode_cluster_kv_snapshot_rpc_body, decode_cluster_kv_snapshot_rpc_request_body,
+    cluster_kv_authoritative_range_prefix_response_rpc_payload,
+    cluster_kv_authoritative_range_prefix_rpc_payload,
+    cluster_kv_authoritative_snapshot_response_rpc_payload,
+    cluster_kv_authoritative_snapshot_rpc_payload,
+    cluster_kv_authoritative_watch_start_response_rpc_payload,
+    cluster_kv_authoritative_watch_start_rpc_payload,
+    cluster_kv_local_range_prefix_response_rpc_payload, cluster_kv_local_range_prefix_rpc_payload,
+    cluster_kv_local_snapshot_response_rpc_payload, cluster_kv_local_snapshot_rpc_payload,
+    cluster_kv_local_watch_cancel_rpc_payload, cluster_kv_local_watch_drain_rpc_payload,
+    cluster_kv_request_outcome_response_rpc_payload, cluster_kv_request_outcome_rpc_payload,
+    cluster_kv_txn_response_rpc_payload, cluster_kv_txn_rpc_payload,
+    cluster_kv_watch_events_noop_response, cluster_kv_watch_events_response_rpc_payload,
+    cluster_kv_watch_events_rpc_payload, cluster_raft_append_response_rpc_payload,
+    cluster_raft_append_rpc_payload, cluster_raft_vote_response_rpc_payload,
+    cluster_raft_vote_rpc_payload, decode_cluster_kv_authoritative_range_prefix_rpc_body,
+    decode_cluster_kv_authoritative_range_prefix_rpc_request_body,
+    decode_cluster_kv_authoritative_snapshot_rpc_body,
+    decode_cluster_kv_authoritative_snapshot_rpc_request_body,
+    decode_cluster_kv_authoritative_watch_start_rpc_body,
+    decode_cluster_kv_authoritative_watch_start_rpc_request_body,
+    decode_cluster_kv_local_range_prefix_rpc_body, decode_cluster_kv_local_snapshot_rpc_body,
+    decode_cluster_kv_local_snapshot_rpc_request_body,
+    decode_cluster_kv_local_watch_cancel_rpc_body, decode_cluster_kv_local_watch_drain_rpc_body,
+    decode_cluster_kv_request_outcome_rpc_body, decode_cluster_kv_request_outcome_rpc_request_body,
     decode_cluster_kv_txn_rpc_body, decode_cluster_kv_txn_rpc_request_body,
     decode_cluster_kv_watch_events_rpc_request_body,
     decode_cluster_kv_watch_events_rpc_response_body, decode_cluster_raft_append_rpc_request_body,
     decode_cluster_raft_append_rpc_response_body, decode_cluster_raft_vote_rpc_request_body,
     decode_cluster_raft_vote_rpc_response_body, handle_cluster_kv_local_read_watch_rpc_payload,
-    handle_cluster_kv_watch_events, handle_cluster_raft_rpc_payload,
+    handle_cluster_kv_request_outcome_rpc_payload, handle_cluster_kv_watch_events,
+    handle_cluster_raft_rpc_payload, project_cluster_kv_authoritative_range_prefix,
+    validate_cluster_kv_current_term_authority_proof,
 };
 pub use snapshot::{
     KvLocalCache, KvMaterializedCache, compact_kv_snapshot_event_history, kv_snapshot_durable_eq,
     read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot_arc_for_node,
-    read_cluster_kv_current_snapshot_for_node, read_cluster_kv_entry,
-    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
+    read_cluster_kv_current_snapshot_for_node, read_cluster_kv_entry, read_cluster_kv_local_entry,
+    read_cluster_kv_local_prefix, read_cluster_kv_local_snapshot, read_cluster_kv_prefix_entries,
+    read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_store_for_node,
     write_cluster_kv_materialized_snapshot_if_changed, write_cluster_kv_snapshot,
     write_cluster_kv_snapshot_if_changed, write_imported_cluster_kv_snapshot_if_changed,

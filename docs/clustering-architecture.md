@@ -164,10 +164,52 @@ compare-and-swap behavior, watches resume from revisions, and snapshots bound
 recovery cost. The KV state machine owns these semantics; the cluster layer only
 drives replication and exposes authorized service operations.
 
-Reads declare their freshness requirements. Status views may use a known local
-snapshot. Membership changes, invitations, migration, authority changes, and
-rollout decisions require a fresh authoritative path or must fail with a clear
-degraded-state result.
+Public reads use one of two explicit consistency contracts:
+
+- A **local** read returns the best materialized or applied view available on
+  the node. It remains available without quorum and reports its revision and
+  term, but its freshness may be unknown.
+- An **authoritative** read first establishes a current-term quorum barrier and
+  returns a view at or after that barrier together with its revision, term, and
+  committed log index. It fails rather than degrading to a local read when the
+  barrier cannot be established.
+
+Leader preference is a routing optimization, not a third consistency level. A
+reachable leader without current quorum evidence does not prove freshness.
+Status and telemetry views normally use local reads. Membership changes,
+invitations, migration, authority changes, cluster configuration, and rollout
+decisions use authoritative reads or fail with structured quorum diagnostics.
+An authoritative watch establishes its starting revision through the same
+barrier; subsequent events remain ordered and expose the last applied revision.
+Because watch registrations are node-local, the current watch-start RPC must be
+sent to the Raft authority and executes its barrier and registration on that
+same node. A non-authority receiver fails closed. It must not forward only the
+barrier and then register locally, because that would attach the watch to a
+potentially lagging follower; any future forwarding must forward the complete
+watch-start operation as one unit.
+
+Every mutation carries a stable request ID. Success means either that the exact
+request is durably recorded as committed or that its command committed through
+the current quorum. A locally detected semantic no-op is not success by itself;
+it still requires a quorum barrier unless an exact committed-request record can
+replay its response. After an uncertain timeout, callers query the request ID
+instead of guessing whether a blind retry is safe. The request-outcome route
+establishes a fresh current-term quorum barrier first and returns its authority
+proof with the outcome. Committed history comes from that authoritative
+snapshot; node-local rejected, unknown, or expired attempt state is considered
+only after the snapshot rules out a commit. Without authority, the query fails
+closed.
+
+The config service exposes this identity at its outer write boundary:
+`ConfigSetRequest.request_id` is preserved into the cluster KV transaction, and
+typed remote clients can call `set_with_request_id` when they need to reconcile
+an uncertain config write through the request-outcome route.
+
+Authority configuration changes are explicit lifecycle operations. A node is
+added as a learner, proves catch-up through a required committed revision or log
+index, and is then promoted in a separate quorum-backed transition. Voter
+demotion or removal likewise records its transition and completion or failure
+evidence, while preserving an overlapping quorum.
 
 ## Networking and Discovery
 
@@ -238,6 +280,22 @@ claim about the initial wire implementation.
 
 See [DFS architecture](dfs-architecture.md) and
 [service responsibilities in the overview](architecture.md#distributed-foundation).
+
+## Reactive Convergence
+
+Cluster activity drives bounded maintenance; Sinomo does not require a
+conventional always-on heartbeat and election loop. Daemon startup, app or CLI
+traffic, status and health requests, rollout and migration work, peer Raft RPCs,
+network changes, and a low-frequency timer while the daemon is already running
+all coalesce into the same maintenance action.
+
+One action refreshes observed leadership and term, performs an appropriate
+append heartbeat or catch-up attempt, pulls a newer snapshot when necessary,
+applies and compacts durable state within configured bounds, drains watch work,
+and schedules status or endpoint publication. Each step is bounded and records
+completed, deferred, skipped, or failed evidence. These wake signals schedule
+existing Raft actions; they never establish authority or create a second
+consensus path.
 
 ## Failure Behavior
 

@@ -32,11 +32,12 @@ modules:
 
 The model inventory is split by subsystem:
 
-- `models/kv/raft_kv.qnt` models the compact Raft/KV committed-prefix slice:
-  leader election, node online/offline transitions, catch-up, leader proposals,
-  quorum commit, and KV-state replay. `models/kv/raft_protocol.qnt` complements
-  it with bounded per-node term, vote, log, replication, commit, and durable
-  restart state. Their invariant entrypoints live under `checks/kv/`.
+- `models/kv/raft_kv.qnt` models the compact Raft/KV committed-prefix and result
+  authority contract: leader election, node online/offline transitions, catch-up,
+  local and authoritative reads, quorum-backed writes, exact committed-request
+  replay, and KV-state replay. `models/kv/raft_protocol.qnt` complements it with
+  bounded per-node term, vote, log, replication, commit, and durable restart
+  state. Their invariant entrypoints live under `checks/kv/`.
 - `models/network/` contains the base network mechanism, endpoint selection,
   route planning, routing-table cache invalidation, delivery retry, endpoint
   attempt-budget, timed transport, and timed delivery-retry models. Matching
@@ -102,8 +103,8 @@ Every model must be read as one of three evidence classes:
   should have table- or trace-driven Rust conformance tests.
 - **Abstract contract** deliberately hides lower-layer mechanics and proves
   only the named boundary. For example, `raft_kv` is a committed-prefix/KV
-  refinement, not a proof of concrete RequestVote, AppendEntries, WAL, or
-  snapshot behavior.
+  result-authority refinement, not a proof of concrete RequestVote,
+  AppendEntries, WAL, snapshot, or daemon scheduling behavior.
 - **Target hardening** states behavior that the implementation does not yet
   enforce. The catch-up certificate required by the membership promotion model
   is currently in this class.
@@ -129,12 +130,52 @@ The `raft_kv_safety.safety` invariant combines these properties:
 - every globally committed slot is filled;
 - at most one leader is recorded for each bounded term;
 - the visible KV cell equals replay of the committed log prefix;
-- the global commit index and next log index stay inside the model bound.
+- the global commit index and next log index stay inside the model bound;
+- a local read succeeds independently of quorum and returns exactly the selected
+  node's applied committed prefix, which may be older than the canonical prefix;
+- an authoritative read succeeds only with a current-term quorum barrier and
+  returns the canonical committed prefix, while failure returns no local
+  fallback;
+- a new effect-changing write reports success only with quorum-commit evidence;
+- an exact retry may reuse success without live quorum only when its request id
+  and command match a durable committed-request record; and
+- a semantic no-effect write reports success only with a current-term quorum
+  barrier or that exact durable prior-commit evidence.
+
+The deliberately broken `brokenNoQuorumNoEffect` transition records the old
+failure mode: local equality reports success while no quorum barrier and no
+exact committed-request record exist. It is excluded from the refined `step`
+relation and reached only through `coverageStep`.
+`witnessBrokenNoQuorumNoEffectCounterexample` requires randomized coverage to
+exhibit that contract violation before the refinement is accepted; symbolic
+verification continues to check only the corrected `step` relation.
+
+This slice intentionally does not model daemon wake sources, maintenance timers,
+coalescing, retry backoff, routing, snapshot RPCs, or app/CLI wiring. Reactive
+wakes change when existing Raft actions run; they are scheduling evidence, not
+quorum or freshness evidence. Those mechanics belong in deterministic Rust and
+cluster tests rather than `raft_kv` or the deeper `raft_protocol` model.
 
 The model already caught one useful bug during drafting: an offline node was
 allowed to come online without catch-up, then accept a later committed entry
 without the earlier prefix. The Rust in-process cluster catches up a node when
 `set_node_online(..., true)` is called, so the spec now models that behavior.
+
+The focused reactive-contract evidence recorded on 2026-07-19 used Quint 0.32.0
+and Apalache 0.56.1:
+
+```bash
+QUINT_CASE_FILTER=raft-kv QUINT_COVERAGE_MAX_SAMPLES=5000 \
+  bash scripts/formal/check-quint.sh coverage
+
+QUINT_CASE_FILTER=raft-kv QUINT_VERIFY_MAX_STEPS=5 \
+  bash scripts/formal/check-quint.sh verify-fast
+```
+
+Coverage found no refined-safety violation and reached
+`witnessBrokenNoQuorumNoEffectCounterexample` in 5000 of 5000 traces. The
+five-step Apalache check of the refined `step` relation found no violation and
+completed in 175694 ms.
 
 The `raft_protocol_safety.safety` invariant checks the deeper three-voter
 protocol slice:
@@ -1761,7 +1802,7 @@ witness predicates; coverage mode raises the sample count and fails if any
 registered witness is not reached:
 
 ```bash
-QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
+QUINT_CASE_FILTER=raft-kv,raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
   QUINT_COVERAGE_MAX_SAMPLES=5000 \
   bash scripts/formal/check-quint.sh coverage
 ```
@@ -1790,14 +1831,14 @@ while IFS= read -r -d '' file; do
   timeout --foreground 300s quint typecheck "$file"
 done < <(find specs/quint -name '*.qnt' -print0 | sort -z)
 
-quint run specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --step=coverageStep --max-steps=20 --max-samples=50 --witnesses witnessBrokenNoQuorumNoEffectCounterexample --verbosity=1
 quint run specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/scenarios/network/timed_delivery_smoke.qnt --main=network_timed_delivery_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
 quint run specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/scenarios/system/smoke.qnt --main=system_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
 
-quint verify specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --max-steps=5 --verbosity=1
+quint verify specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --step=step --max-steps=5 --backend=apalache --apalache-version=0.56.1 --server-endpoint=localhost:8822 --verbosity=1
 quint verify specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=4 --verbosity=1
 quint verify specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=7 --verbosity=1
 quint verify specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=2 --verbosity=1

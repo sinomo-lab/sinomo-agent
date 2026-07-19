@@ -29,6 +29,60 @@ pub fn read_cluster_kv_store_for_node(
     read_cluster_kv_current_snapshot_for_node(paths, node_id).and_then(InProcessKvStore::restore)
 }
 
+/// Reads the best locally available KV view without contacting a quorum.
+///
+/// The returned metadata is observational only: neither the known leader nor
+/// the observed term establishes freshness.
+pub fn read_cluster_kv_local_snapshot(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+) -> Result<KvLocalRead<KvSnapshot>, KvError> {
+    let node = paths.raft_store().open_node(node_id)?;
+    // Read value and metadata from the same opened Raft view. Reopening via
+    // the materialized-cache helper here can observe a different applied
+    // index (or fall back while this node lock is held).
+    let snapshot = node.store().try_snapshot()?;
+    Ok(KvLocalRead {
+        revision: snapshot.revision,
+        observed_term: node.hard_state().current_term,
+        applied_index: node.applied_index(),
+        known_leader: node.hard_state().leader_id.clone(),
+        value: snapshot,
+    })
+}
+
+pub fn read_cluster_kv_local_entry(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    key: &str,
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    let local = read_cluster_kv_local_snapshot(paths, node_id)?;
+    let value = local.value.get(key).cloned();
+    Ok(KvLocalRead {
+        value,
+        revision: local.revision,
+        observed_term: local.observed_term,
+        applied_index: local.applied_index,
+        known_leader: local.known_leader,
+    })
+}
+
+pub fn read_cluster_kv_local_prefix(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    prefix: &str,
+) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
+    let local = read_cluster_kv_local_snapshot(paths, node_id)?;
+    let value = local.value.try_range_prefix(prefix)?;
+    Ok(KvLocalRead {
+        value,
+        revision: local.revision,
+        observed_term: local.observed_term,
+        applied_index: local.applied_index,
+        known_leader: local.known_leader,
+    })
+}
+
 pub fn write_cluster_kv_snapshot(
     paths: &ClusterKvPaths,
     snapshot: &KvSnapshot,
@@ -172,6 +226,33 @@ impl KvSnapshot {
                 max_events: MAX_RETAINED_EVENTS,
             });
         }
+        if self.committed_requests.len() > MAX_COMMITTED_KV_REQUESTS {
+            return Err(KvError::RequestRecordLimit {
+                observed_records: self.committed_requests.len(),
+                max_records: MAX_COMMITTED_KV_REQUESTS,
+            });
+        }
+        if self.expired_requests.len() > MAX_EXPIRED_KV_REQUEST_TOMBSTONES {
+            return Err(KvError::RequestRecordLimit {
+                observed_records: self.expired_requests.len(),
+                max_records: MAX_EXPIRED_KV_REQUEST_TOMBSTONES,
+            });
+        }
+        let mut committed_request_bytes = 0_usize;
+        for record in &self.committed_requests {
+            committed_request_bytes = committed_request_bytes
+                .checked_add(encode_kv_value(record)?.len())
+                .ok_or_else(|| KvError::ResourceExhausted {
+                    operation: "validate committed KV request record bytes".to_string(),
+                    requested_bytes: usize::MAX,
+                })?;
+        }
+        if committed_request_bytes > MAX_COMMITTED_KV_REQUEST_BYTES {
+            return Err(KvError::RequestRecordBytesLimit {
+                observed_bytes: committed_request_bytes,
+                max_bytes: MAX_COMMITTED_KV_REQUEST_BYTES,
+            });
+        }
 
         let mut payload_bytes = 0_usize;
         for entry in &self.entries {
@@ -211,6 +292,12 @@ impl KvSnapshot {
         self.leases
             .sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
         self.leases.reverse();
+        self.committed_requests
+            .sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        self.committed_requests.reverse();
+        self.committed_requests
+            .dedup_by(|left, right| left.request_id == right.request_id);
+        self.committed_requests.reverse();
         self.leases
             .dedup_by(|left, right| left.lease_id == right.lease_id);
         self.leases.reverse();
@@ -301,7 +388,8 @@ impl KvSnapshot {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<T>, KvError> {
-        let entries = self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?;
+        let entries =
+            self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?;
         let mut values = Vec::new();
         try_reserve_kv_items(
             &mut values,
@@ -322,6 +410,10 @@ impl KvSnapshot {
                 .leases
                 .windows(2)
                 .all(|window| window[0].lease_id < window[1].lease_id)
+            && self
+                .committed_requests
+                .windows(2)
+                .all(|window| window[0].request_id < window[1].request_id)
     }
 }
 
@@ -811,6 +903,8 @@ pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
         .iter()
         .map(|lease| (&lease.lease_id, lease.ttl_ticks, lease.remaining_ticks));
     left_leases.eq(right_leases)
+        && left.committed_requests == right.committed_requests
+        && left.expired_requests == right.expired_requests
 }
 
 pub fn compact_kv_snapshot_event_history(snapshot: &mut KvSnapshot, max_events: usize) {

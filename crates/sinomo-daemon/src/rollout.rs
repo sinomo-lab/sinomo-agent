@@ -231,6 +231,9 @@ fn rejected_cluster_rollout_response(
 }
 
 fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
+    crate::control::request_daemon_cluster_kv_maintenance(
+        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RolloutActivity,
+    );
     let daemon_paths = daemon_paths.clone();
     if let Err(error) = thread::Builder::new()
         .name("sinomo-rollout-progress-publish".to_string())

@@ -235,20 +235,41 @@ mod tests {
     fn daemon_node_helpers_are_stable() {
         let main_node = NodeId::from_legacy_named("node_test_main").expect("node");
         let shadow_node = shadow_daemon_node_id(&main_node);
+        let voter_capabilities = main_daemon_capabilities(&sinomo_base::ClusterMemberRole::Voter);
+        let learner_capabilities =
+            main_daemon_capabilities(&sinomo_base::ClusterMemberRole::Learner);
 
         assert_eq!(shadow_node, shadow_daemon_node_id(&main_node));
         assert_eq!(shadow_node.as_str().len(), 26);
         assert!(
-            main_daemon_capabilities(&sinomo_base::ClusterMemberRole::Voter)
+            voter_capabilities
                 .iter()
                 .any(|capability| capability.as_str() == "cluster.kv.vote")
         );
+        for capability in ["cluster.kv.read", "cluster.kv.write"] {
+            assert!(
+                voter_capabilities
+                    .iter()
+                    .any(|candidate| candidate.as_str() == capability)
+            );
+            assert!(
+                learner_capabilities
+                    .iter()
+                    .any(|candidate| candidate.as_str() == capability)
+            );
+        }
+        assert!(voter_capabilities.iter().any(|capability| {
+            capability.as_str() == DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY
+        }));
         assert!(
-            main_daemon_capabilities(&sinomo_base::ClusterMemberRole::Voter)
+            voter_capabilities
                 .iter()
-                .any(|capability| {
-                    capability.as_str() == DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY
-                })
+                .any(|capability| { capability.as_str() == CLUSTER_CONTROL_ADMIN_CAPABILITY })
+        );
+        assert!(
+            !learner_capabilities
+                .iter()
+                .any(|capability| { capability.as_str() == CLUSTER_CONTROL_ADMIN_CAPABILITY })
         );
         assert!(
             shadow_daemon_capabilities()
@@ -261,6 +282,33 @@ mod tests {
         let lan = daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353");
         assert_eq!(lan, daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353"));
         assert_eq!(lan.as_str().len(), 26);
+    }
+
+    #[test]
+    fn applying_raft_roles_keeps_control_admin_policy_voter_only() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let cluster_id = Id::from_legacy_named("cluster_control_policy").expect("cluster");
+        let node_id = Id::from_legacy_named("node_control_policy").expect("node");
+        let mut member =
+            ClusterMemberRecord::local_non_voting(cluster_id, node_id, "node", "pk", now);
+
+        apply_cluster_raft_role(&mut member, sinomo_base::ClusterMemberRole::Voter, now);
+        assert!(
+            member
+                .capabilities
+                .iter()
+                .any(|capability| { capability.as_str() == CLUSTER_CONTROL_ADMIN_CAPABILITY })
+        );
+        assert_eq!(member.allowed_capabilities, member.capabilities);
+
+        apply_cluster_raft_role(&mut member, sinomo_base::ClusterMemberRole::Learner, now);
+        assert!(
+            !member
+                .capabilities
+                .iter()
+                .any(|capability| { capability.as_str() == CLUSTER_CONTROL_ADMIN_CAPABILITY })
+        );
+        assert_eq!(member.allowed_capabilities, member.capabilities);
     }
 
     #[test]

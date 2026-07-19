@@ -58,11 +58,12 @@ pub use artifact::{
     stage_rollout_file_with_retry,
 };
 pub use cluster_kv::{
-    read_cluster_module_rollout_desired_from_kv,
-    read_cluster_module_rollout_reconciliations_from_kv,
-    read_cluster_module_rollout_statuses_from_kv, read_cluster_rollout_desired_from_kv,
-    sync_cluster_module_rollout_desired_to_kv, sync_cluster_module_rollout_node_to_kv,
-    sync_cluster_module_rollout_reconciliation_to_kv, sync_cluster_rollout_desired_to_kv,
+    build_cluster_module_rollout_desired_put_op,
+    build_cluster_module_rollout_reconciliation_put_op, build_cluster_module_rollout_status_put_op,
+    build_cluster_rollout_desired_put_op, project_cluster_module_rollout_desired_from_snapshot,
+    project_cluster_module_rollout_reconciliations_from_snapshot,
+    project_cluster_module_rollout_statuses_from_snapshot,
+    project_cluster_rollout_desired_from_snapshot,
 };
 pub use controller::{
     AppliedRolloutTransition, DEFAULT_SHADOW_TELEMETRY_LIMIT, RolloutAction, RolloutController,

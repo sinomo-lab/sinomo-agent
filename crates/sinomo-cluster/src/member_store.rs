@@ -122,9 +122,13 @@ pub(crate) fn cluster_state_sync_txn_from_store(
     if let Some(current_config_entry) = &current_config_entry {
         let current_config: ClusterKvRaftConfigRecord =
             current_config_entry.decode().map_err(kv_err)?;
-        if validate_config_transition {
-            sinomo_kv::validate_cluster_kv_raft_config_transition(&current_config, &new_config)
-                .map_err(kv_err)?;
+        if validate_config_transition
+            && !sinomo_kv::cluster_kv_raft_config_record_stable_eq(&current_config, &new_config)
+        {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: "established Raft membership cannot be changed by generic cluster-state sync; use the explicit config-change lifecycle"
+                    .to_string(),
+            });
         }
         compares.push(KvCompare::ValueEquals {
             key: sinomo_kv::cluster_kv_raft_config_key(),
@@ -269,45 +273,6 @@ pub(crate) fn cluster_member_update_txn_from_store(
     })
 }
 
-pub(crate) fn cluster_member_raft_update_txn_from_store(
-    store: &InProcessKvStore,
-    current_entry: KvEntry,
-    member: &ClusterMemberRecord,
-    now: OffsetDateTime,
-) -> Result<KvTxn, NetworkError> {
-    let raft_config_key = sinomo_kv::cluster_kv_raft_config_key();
-    let Some(current_config_entry) = store.get(&raft_config_key).cloned() else {
-        return Err(NetworkError::ClusterReadOnly {
-            detail: "cluster raft config is missing".to_string(),
-        });
-    };
-    let current_config: ClusterKvRaftConfigRecord =
-        current_config_entry.decode().map_err(kv_err)?;
-    let next_config = cluster_raft_config_from_store(store, member, &current_config, now)?;
-    sinomo_kv::validate_cluster_kv_raft_config_transition(&current_config, &next_config)
-        .map_err(kv_err)?;
-    let mut success = cluster_member_update_ops_from_store(store, member)?;
-    push_bounded_txn_success_op(
-        &mut success,
-        KvOp::put_serde(raft_config_key.clone(), &next_config, None).map_err(kv_err)?,
-    )
-    .map_err(kv_err)?;
-    Ok(KvTxn {
-        compares: vec![
-            KvCompare::ValueEquals {
-                key: current_entry.key,
-                value: current_entry.value,
-            },
-            KvCompare::ValueEquals {
-                key: raft_config_key,
-                value: current_config_entry.value,
-            },
-        ],
-        success,
-        failure: Vec::new(),
-    })
-}
-
 pub fn cluster_member_update_ops_from_store(
     store: &InProcessKvStore,
     member: &ClusterMemberRecord,
@@ -398,6 +363,7 @@ fn push_store_cluster_member_endpoint_diff_ops(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn cluster_raft_config_from_store(
     store: &InProcessKvStore,
     updated_member: &ClusterMemberRecord,

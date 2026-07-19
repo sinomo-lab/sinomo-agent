@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
+use crate::local_state_store::project_committed_cluster_raft_config;
 use sinomo_base::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole};
 use sinomo_network::{
     ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector, ClusterPaths, NetworkError,
@@ -83,6 +84,11 @@ pub fn cluster_reachable_state_authority_count_with_host(
     options: ClusterStateAuthorityReachabilityOptions,
     host: &mut impl ClusterStateAuthorityReachabilityHost,
 ) -> usize {
+    let mut consensus_state = state.clone();
+    if project_committed_cluster_raft_config(paths, &mut consensus_state).is_err() {
+        return 0;
+    }
+    let state = &consensus_state;
     let quorum_size = sinomo_kv::cluster_kv_raft_quorum_size_for_state(state);
     let mut voters = BTreeSet::new();
     if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
@@ -127,6 +133,9 @@ pub async fn cluster_reachable_state_authority_count_async_with_host(
     options: ClusterStateAuthorityReachabilityOptions,
     host: &mut impl ClusterStateAuthorityReachabilityAsyncHost,
 ) -> Result<usize, NetworkError> {
+    let mut consensus_state = state.clone();
+    project_committed_cluster_raft_config(paths, &mut consensus_state)?;
+    let state = &consensus_state;
     let quorum_size = sinomo_kv::cluster_kv_raft_quorum_size_for_state(state);
     let mut voters = BTreeSet::new();
     if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
@@ -181,8 +190,12 @@ pub fn cluster_has_local_quorum_with_host(
     options: ClusterStateAuthorityReachabilityOptions,
     host: &mut impl ClusterStateAuthorityReachabilityHost,
 ) -> bool {
-    cluster_reachable_state_authority_count_with_host(paths, state, options, host)
-        >= sinomo_kv::cluster_kv_raft_quorum_size_for_state(state)
+    let mut consensus_state = state.clone();
+    if project_committed_cluster_raft_config(paths, &mut consensus_state).is_err() {
+        return false;
+    }
+    cluster_reachable_state_authority_count_with_host(paths, &consensus_state, options, host)
+        >= sinomo_kv::cluster_kv_raft_quorum_size_for_state(&consensus_state)
 }
 
 pub async fn cluster_has_local_quorum_async_with_host(
@@ -191,9 +204,14 @@ pub async fn cluster_has_local_quorum_async_with_host(
     options: ClusterStateAuthorityReachabilityOptions,
     host: &mut impl ClusterStateAuthorityReachabilityAsyncHost,
 ) -> Result<bool, NetworkError> {
-    Ok(
-        cluster_reachable_state_authority_count_async_with_host(paths, state, options, host)
-            .await?
-            >= sinomo_kv::cluster_kv_raft_quorum_size_for_state(state),
+    let mut consensus_state = state.clone();
+    project_committed_cluster_raft_config(paths, &mut consensus_state)?;
+    Ok(cluster_reachable_state_authority_count_async_with_host(
+        paths,
+        &consensus_state,
+        options,
+        host,
     )
+    .await?
+        >= sinomo_kv::cluster_kv_raft_quorum_size_for_state(&consensus_state))
 }

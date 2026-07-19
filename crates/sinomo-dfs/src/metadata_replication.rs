@@ -309,7 +309,7 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
     state: &ClusterBootstrapState,
     peer_transport: &dyn DfsPeerTransport,
 ) -> Result<(), DfsError> {
-    let payload = sinomo_core::kv::cluster_kv_snapshot_rpc_payload()?;
+    let payload = sinomo_core::kv::cluster_kv_local_snapshot_rpc_payload()?;
     let request = object_rpc_request_from_kv_payload(payload);
     let options = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
         .kv_snapshot_refresh_options();
@@ -337,7 +337,8 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
             }
             let response = response.response;
             response.error_detail()?;
-            sinomo_core::kv::decode_cluster_kv_snapshot_rpc_body(&response.body)
+            sinomo_core::kv::decode_cluster_kv_local_snapshot_rpc_body(&response.body)
+                .map(|read| read.value)
                 .map_err(sinomo_core::network::NetworkError::directory)
         },
     )

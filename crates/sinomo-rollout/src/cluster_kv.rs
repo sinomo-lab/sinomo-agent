@@ -1,53 +1,49 @@
-#[allow(unused_imports)]
-use sinomo_core::cluster::ClusterKvPathsExt;
-use sinomo_core::kv::{KvCommand, KvOp, KvSnapshot};
-use sinomo_core::network::{ClusterPaths, NetworkError};
+use sinomo_core::kv::{KvError, KvOp, KvSnapshot};
 use sinomo_core::{
     ClusterModuleRolloutDesiredRecord, ClusterModuleRolloutReconciliationRecord,
-    ClusterModuleRolloutStatusRecord, ClusterRolloutDesiredRecord, Id as NodeId,
+    ClusterModuleRolloutStatusRecord, ClusterRolloutDesiredRecord,
     cluster_module_rollout_desired_key, cluster_module_rollout_desired_prefix,
     cluster_module_rollout_node_key, cluster_module_rollout_node_prefix,
     cluster_module_rollout_reconcile_key, cluster_module_rollout_reconcile_prefix,
     cluster_rollout_desired_key,
 };
 
-pub fn read_cluster_rollout_desired_from_kv(
-    paths: &ClusterPaths,
-) -> Result<Option<ClusterRolloutDesiredRecord>, NetworkError> {
-    let snapshot = read_current_cluster_kv_snapshot(paths)?;
+/// Projects cluster rollout intent from a caller-supplied KV snapshot.
+///
+/// This function does not establish freshness or authority. Control-plane
+/// callers must supply an authoritative snapshot; explicitly local status and
+/// diagnostics callers may supply a local snapshot.
+pub fn project_cluster_rollout_desired_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Option<ClusterRolloutDesiredRecord>, KvError> {
     snapshot
         .get(&cluster_rollout_desired_key())
         .map(|entry| entry.decode())
         .transpose()
-        .map_err(sinomo_core::network::NetworkError::directory)
 }
 
-pub fn sync_cluster_rollout_desired_to_kv(
-    paths: &ClusterPaths,
+/// Builds the storage operation for publishing cluster rollout intent.
+///
+/// The caller owns request identity, quorum commit, retry, and outcome lookup.
+pub fn build_cluster_rollout_desired_put_op(
     desired: &ClusterRolloutDesiredRecord,
-) -> Result<KvSnapshot, NetworkError> {
-    put_cluster_kv_value(paths, cluster_rollout_desired_key(), desired)
+) -> Result<KvOp, KvError> {
+    KvOp::put_serde(cluster_rollout_desired_key(), desired, None)
 }
 
-pub fn read_cluster_module_rollout_statuses_from_kv(
-    paths: &ClusterPaths,
-) -> Result<Vec<ClusterModuleRolloutStatusRecord>, NetworkError> {
-    let Some(snapshot) = read_cached_cluster_kv_snapshot_if_present(paths)? else {
-        return Ok(Vec::new());
-    };
+/// Projects per-node module rollout status from a caller-supplied KV snapshot.
+///
+/// This function does not establish freshness or authority. A local snapshot
+/// is appropriate only for explicitly operational status and diagnostics.
+pub fn project_cluster_module_rollout_statuses_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Vec<ClusterModuleRolloutStatusRecord>, KvError> {
     let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
-    for entry in snapshot
-        .range_prefix_limited(
-            &cluster_module_rollout_node_prefix(),
-            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-        )
-        .map_err(sinomo_core::network::NetworkError::directory)?
-    {
-        statuses.push(
-            entry
-                .decode()
-                .map_err(sinomo_core::network::NetworkError::directory)?,
-        );
+    for entry in snapshot.range_prefix_limited(
+        &cluster_module_rollout_node_prefix(),
+        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
+        statuses.push(entry.decode()?);
     }
     statuses.sort_by(|left, right| {
         left.node_id
@@ -58,36 +54,32 @@ pub fn read_cluster_module_rollout_statuses_from_kv(
     Ok(statuses)
 }
 
-pub fn sync_cluster_module_rollout_node_to_kv(
-    paths: &ClusterPaths,
+/// Builds the storage operation for publishing one node's module rollout status.
+///
+/// The caller owns request identity, quorum commit, retry, and outcome lookup.
+pub fn build_cluster_module_rollout_status_put_op(
     status: &ClusterModuleRolloutStatusRecord,
-) -> Result<KvSnapshot, NetworkError> {
-    put_cluster_kv_value(
-        paths,
+) -> Result<KvOp, KvError> {
+    KvOp::put_serde(
         cluster_module_rollout_node_key(&status.node_id, &status.module_id),
         status,
+        None,
     )
 }
 
-pub fn read_cluster_module_rollout_desired_from_kv(
-    paths: &ClusterPaths,
-) -> Result<Vec<ClusterModuleRolloutDesiredRecord>, NetworkError> {
-    let Some(snapshot) = read_cached_cluster_kv_snapshot_if_present(paths)? else {
-        return Ok(Vec::new());
-    };
+/// Projects module rollout intent from a caller-supplied KV snapshot.
+///
+/// This function does not establish freshness or authority. Control-plane
+/// callers must supply an authoritative snapshot.
+pub fn project_cluster_module_rollout_desired_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Vec<ClusterModuleRolloutDesiredRecord>, KvError> {
     let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
-    for entry in snapshot
-        .range_prefix_limited(
-            &cluster_module_rollout_desired_prefix(),
-            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-        )
-        .map_err(sinomo_core::network::NetworkError::directory)?
-    {
-        desired.push(
-            entry
-                .decode()
-                .map_err(sinomo_core::network::NetworkError::directory)?,
-        );
+    for entry in snapshot.range_prefix_limited(
+        &cluster_module_rollout_desired_prefix(),
+        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
+        desired.push(entry.decode()?);
     }
     desired.sort_by(|left, right| {
         left.rollout_plan
@@ -102,39 +94,36 @@ pub fn read_cluster_module_rollout_desired_from_kv(
     Ok(desired)
 }
 
-pub fn sync_cluster_module_rollout_desired_to_kv(
-    paths: &ClusterPaths,
+/// Builds the storage operation for publishing module rollout intent.
+///
+/// The caller owns request identity, quorum commit, retry, and outcome lookup.
+pub fn build_cluster_module_rollout_desired_put_op(
     desired: &ClusterModuleRolloutDesiredRecord,
-) -> Result<KvSnapshot, NetworkError> {
-    put_cluster_kv_value(
-        paths,
+) -> Result<KvOp, KvError> {
+    KvOp::put_serde(
         cluster_module_rollout_desired_key(
             &desired.rollout_plan.module_id,
             &desired.rollout_plan.rollout_plan_id,
         ),
         desired,
+        None,
     )
 }
 
-pub fn read_cluster_module_rollout_reconciliations_from_kv(
-    paths: &ClusterPaths,
-) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, NetworkError> {
-    let Some(snapshot) = read_cached_cluster_kv_snapshot_if_present(paths)? else {
-        return Ok(Vec::new());
-    };
+/// Projects module rollout reconciliation evidence from a caller-supplied KV snapshot.
+///
+/// This function does not establish freshness or authority. Callers using the
+/// evidence to advance or finish a rollout must supply an authoritative snapshot;
+/// explicitly operational status callers may supply a local snapshot.
+pub fn project_cluster_module_rollout_reconciliations_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, KvError> {
     let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
-    for entry in snapshot
-        .range_prefix_limited(
-            &cluster_module_rollout_reconcile_prefix(),
-            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-        )
-        .map_err(sinomo_core::network::NetworkError::directory)?
-    {
-        reconciliations.push(
-            entry
-                .decode()
-                .map_err(sinomo_core::network::NetworkError::directory)?,
-        );
+    for entry in snapshot.range_prefix_limited(
+        &cluster_module_rollout_reconcile_prefix(),
+        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
+        reconciliations.push(entry.decode()?);
     }
     reconciliations.sort_by(|left, right| {
         left.node_id
@@ -145,93 +134,44 @@ pub fn read_cluster_module_rollout_reconciliations_from_kv(
     Ok(reconciliations)
 }
 
-pub fn sync_cluster_module_rollout_reconciliation_to_kv(
-    paths: &ClusterPaths,
+/// Builds the storage operation for publishing module rollout reconciliation evidence.
+///
+/// The caller owns request identity, quorum commit, retry, and outcome lookup.
+pub fn build_cluster_module_rollout_reconciliation_put_op(
     reconciliation: &ClusterModuleRolloutReconciliationRecord,
-) -> Result<KvSnapshot, NetworkError> {
-    put_cluster_kv_value(
-        paths,
+) -> Result<KvOp, KvError> {
+    KvOp::put_serde(
         cluster_module_rollout_reconcile_key(
             &reconciliation.node_id,
             &reconciliation.module_id,
             &reconciliation.rollout_plan_id,
         ),
         reconciliation,
+        None,
     )
-}
-
-fn read_current_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
-    sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
-        &paths.kv_paths(),
-        state.local_node_id,
-    )
-    .map_err(sinomo_core::network::NetworkError::directory)
-}
-
-fn read_cached_cluster_kv_snapshot_if_present(
-    paths: &ClusterPaths,
-) -> Result<Option<KvSnapshot>, NetworkError> {
-    paths
-        .kv_paths()
-        .local_cache()
-        .cached_snapshot_arc_if_present()
-        .map(|snapshot| snapshot.map(|snapshot| (*snapshot).clone()))
-        .map_err(sinomo_core::network::NetworkError::directory)
-}
-
-fn put_cluster_kv_value<T: serde::Serialize + ?Sized>(
-    paths: &ClusterPaths,
-    key: String,
-    value: &T,
-) -> Result<KvSnapshot, NetworkError> {
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
-    let op =
-        KvOp::put_serde(key, value, None).map_err(sinomo_core::network::NetworkError::directory)?;
-    append_cluster_kv_command(paths, &state.local_node_id, KvCommand::Op(op))
-}
-
-fn append_cluster_kv_command(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    command: KvCommand,
-) -> Result<KvSnapshot, NetworkError> {
-    paths
-        .kv_paths()
-        .append_kv_command_and_publish(node_id, command, |_| false)
-        .map_err(sinomo_core::network::NetworkError::directory)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::kv::{InProcessKvStore, KvCommand};
     use sinomo_core::{RollbackPolicy, RolloutPlan, RolloutStrategy, TrustRing};
     use time::OffsetDateTime;
 
-    #[test]
-    fn rollout_cluster_kv_helpers_own_rollout_records() {
-        let root = sinomo_testdir::TestDir::new("sinomo-rollout-cluster-kv");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
+    fn apply_built_op(store: &mut InProcessKvStore, op: Result<KvOp, KvError>) {
+        store
+            .apply_command(KvCommand::Op(op.expect("build rollout KV operation")))
+            .expect("apply rollout KV operation");
+    }
 
+    #[test]
+    fn rollout_cluster_kv_builders_and_snapshot_projections_round_trip_records() {
+        let mut store = InProcessKvStore::new();
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             sinomo_core::Id::from_legacy_named("rollout_cluster_kv").expect("cluster id");
         let node_id =
             sinomo_core::Id::from_legacy_named("rollout_cluster_kv_node").expect("node id");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "rollout cluster kv",
-            node_id.clone(),
-            "rollout node",
-            "public-key",
-            now,
-        );
-        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
-            .expect("sync state");
 
         let desired = ClusterRolloutDesiredRecord {
             cluster_id: cluster_id.clone(),
@@ -248,9 +188,11 @@ mod tests {
             requested_at: Some("2026-06-04T00:00:00Z".to_string()),
             updated_at: now,
         };
-        sync_cluster_rollout_desired_to_kv(&paths, &desired).expect("sync rollout desired");
+        apply_built_op(&mut store, build_cluster_rollout_desired_put_op(&desired));
+        let snapshot = store.snapshot().expect("snapshot rollout desired");
         assert_eq!(
-            read_cluster_rollout_desired_from_kv(&paths).expect("read rollout desired"),
+            project_cluster_rollout_desired_from_snapshot(&snapshot)
+                .expect("project rollout desired"),
             Some(desired.clone())
         );
 
@@ -281,7 +223,10 @@ mod tests {
             ),
             updated_at: now,
         };
-        sync_cluster_module_rollout_node_to_kv(&paths, &module_status).expect("sync module status");
+        apply_built_op(
+            &mut store,
+            build_cluster_module_rollout_status_put_op(&module_status),
+        );
 
         let module_desired = ClusterModuleRolloutDesiredRecord {
             cluster_id: cluster_id.clone(),
@@ -304,8 +249,10 @@ mod tests {
             requested_at: Some("2026-06-04T00:00:00Z".to_string()),
             updated_at: now,
         };
-        sync_cluster_module_rollout_desired_to_kv(&paths, &module_desired)
-            .expect("sync module desired");
+        apply_built_op(
+            &mut store,
+            build_cluster_module_rollout_desired_put_op(&module_desired),
+        );
 
         let reconciliation = ClusterModuleRolloutReconciliationRecord {
             cluster_id,
@@ -320,20 +267,25 @@ mod tests {
             local_runtime_stage: Some("loaded".to_string()),
             updated_at: now,
         };
-        sync_cluster_module_rollout_reconciliation_to_kv(&paths, &reconciliation)
-            .expect("sync reconciliation");
+        apply_built_op(
+            &mut store,
+            build_cluster_module_rollout_reconciliation_put_op(&reconciliation),
+        );
 
+        let snapshot = store.snapshot().expect("snapshot rollout records");
         assert_eq!(
-            read_cluster_module_rollout_statuses_from_kv(&paths).expect("read module statuses"),
+            project_cluster_module_rollout_statuses_from_snapshot(&snapshot)
+                .expect("project module statuses"),
             vec![module_status]
         );
         assert_eq!(
-            read_cluster_module_rollout_desired_from_kv(&paths).expect("read module desired"),
+            project_cluster_module_rollout_desired_from_snapshot(&snapshot)
+                .expect("project module desired"),
             vec![module_desired]
         );
         assert_eq!(
-            read_cluster_module_rollout_reconciliations_from_kv(&paths)
-                .expect("read reconciliations"),
+            project_cluster_module_rollout_reconciliations_from_snapshot(&snapshot)
+                .expect("project reconciliations"),
             vec![reconciliation]
         );
     }

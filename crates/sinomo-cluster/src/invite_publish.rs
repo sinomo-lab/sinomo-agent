@@ -1,17 +1,20 @@
-use crate::keyspace::{cluster_invitation_key, cluster_invitation_state_key};
+use crate::keyspace::{cluster_invitation_key, cluster_invitation_state_key, cluster_member_key};
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::{
-    append_cluster_raft_command, read_cluster_kv_current_snapshot,
-    read_cluster_kv_current_snapshot_arc, read_cluster_kv_entry,
-    read_cluster_kv_latest_observed_entry,
-};
-use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
+#[cfg(any(test, feature = "test-support"))]
+use crate::kv_local_store::{append_cluster_raft_command, read_cluster_kv_current_snapshot_arc};
+use crate::kv_local_store::{read_cluster_kv_entry, read_cluster_kv_latest_observed_entry};
+use crate::local_state_store::read_cluster_state;
+#[cfg(any(test, feature = "test-support"))]
+use crate::local_state_store::read_cluster_state_without_kv;
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::membership_rpc::{ClusterInvitePublishRequest, ClusterInvitePublishResponse};
 use crate::prelude::*;
 use sinomo_kv::push_bounded_txn_success_op;
 #[allow(unused_imports)]
-use sinomo_kv::{KvCommand, KvEntry, KvOp, KvSnapshot, KvTxn};
+use sinomo_kv::{
+    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvCommand, KvCompare, KvEntry, KvOp, KvSnapshot,
+    KvTxn, KvTxnRequest,
+};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_node::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
@@ -19,12 +22,18 @@ use sinomo_node::{ClusterInvitationStateRecord, cluster_invitation_state_stable_
 pub trait ClusterInvitePublishHost {
     type Error: From<NetworkError> + ToString;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, Self::Error>;
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error>;
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error>;
 }
 
 pub fn read_cluster_invitation_from_kv(
@@ -70,6 +79,7 @@ fn decode_published_cluster_invitation(
     entry.decode().map_err(kv_err)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn cluster_invitation_publish_txn_from_kv(
     paths: &ClusterPaths,
     invite: &ClusterJoinInvite,
@@ -87,16 +97,16 @@ pub fn publish_cluster_invitation_to_quorum_with_host<H>(
 where
     H: ClusterInvitePublishHost,
 {
-    let txn = if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
-        cluster_invitation_publish_txn_from_kv(paths, invite)?
-    } else {
-        cluster_invitation_publish_txn_without_snapshot(invite)?
-    };
-    if txn.success.is_empty() {
-        return read_cluster_kv_current_snapshot(paths).map_err(Into::into);
-    }
     let mut commit_state = state.clone();
-    host.commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, txn)
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut commit_state)?;
+    let txn =
+        cluster_invitation_publish_txn_from_authoritative_snapshot(&authoritative.value, invite)?;
+    let result = host.commit_cluster_kv_txn_with_quorum(
+        paths,
+        &mut commit_state,
+        KvTxnRequest::generated(txn),
+    )?;
+    require_invite_publish_commit(result).map_err(H::Error::from)
 }
 
 enum PreparedClusterInvitePublish {
@@ -108,13 +118,13 @@ enum PreparedClusterInvitePublish {
 }
 
 fn prepare_cluster_invite_publish_request(
-    paths: &ClusterPaths,
+    state: ClusterBootstrapState,
+    snapshot: &KvSnapshot,
     request: ClusterInvitePublishRequest,
     signer_node_id: &str,
     signer_public_key: &str,
     now: OffsetDateTime,
 ) -> Result<PreparedClusterInvitePublish, NetworkError> {
-    let state = read_cluster_state(paths)?;
     if request.invite.cluster_id != state.cluster_id {
         return Ok(PreparedClusterInvitePublish::Response(
             ClusterInvitePublishResponse {
@@ -155,11 +165,16 @@ fn prepare_cluster_invite_publish_request(
             },
         ));
     }
-    if !state.members.iter().any(|member| {
-        member.node_id == request.invite.issuer_node_id
-            && member.node_public_key == request.invite.issuer_public_key
-            && member.state.is_authorized()
-    }) {
+    let issuer_key = cluster_member_key(&request.invite.issuer_node_id);
+    let authorized_issuer = snapshot
+        .get(&issuer_key)
+        .and_then(|entry| entry.decode::<ClusterMemberRecord>().ok())
+        .is_some_and(|member| {
+            member.cluster_id == request.invite.cluster_id
+                && member.node_public_key == request.invite.issuer_public_key
+                && member.state.is_authorized()
+        });
+    if !authorized_issuer {
         return Ok(PreparedClusterInvitePublish::Response(
             ClusterInvitePublishResponse {
                 accepted: false,
@@ -184,21 +199,8 @@ fn prepare_cluster_invite_publish_request(
             },
         ));
     }
-    let txn = if sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
-        cluster_invitation_publish_txn_from_kv(paths, &request.invite)?
-    } else {
-        cluster_invitation_publish_txn_without_snapshot(&request.invite)?
-    };
-    if txn.success.is_empty() {
-        return Ok(PreparedClusterInvitePublish::Response(
-            ClusterInvitePublishResponse {
-                accepted: true,
-                detail: "invite published".to_string(),
-                state,
-                kv_snapshot: Some(read_cluster_kv_current_snapshot(paths)?),
-            },
-        ));
-    }
+    let txn =
+        cluster_invitation_publish_txn_from_authoritative_snapshot(snapshot, &request.invite)?;
     Ok(PreparedClusterInvitePublish::Commit { state, txn })
 }
 
@@ -213,8 +215,12 @@ pub fn handle_cluster_invite_publish_request_with_host<H>(
 where
     H: ClusterInvitePublishHost,
 {
+    let state = read_cluster_state(paths).map_err(H::Error::from)?;
+    let mut authority_state = state.clone();
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut authority_state)?;
     let (state, txn) = match prepare_cluster_invite_publish_request(
-        paths,
+        state,
+        &authoritative.value,
         request,
         signer_node_id,
         signer_public_key,
@@ -226,12 +232,26 @@ where
         PreparedClusterInvitePublish::Commit { state, txn } => (state, txn),
     };
     let mut commit_state = state.clone();
-    match host.commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, txn) {
-        Ok(snapshot) => Ok(ClusterInvitePublishResponse {
-            accepted: true,
-            detail: "invite published".to_string(),
-            state: read_cluster_state(paths).unwrap_or(state),
-            kv_snapshot: Some(snapshot),
+    let request = KvTxnRequest::generated(txn);
+    match host.commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, request) {
+        Ok(result)
+            if result
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| response.succeeded) =>
+        {
+            Ok(ClusterInvitePublishResponse {
+                accepted: true,
+                detail: "invite published".to_string(),
+                state: read_cluster_state(paths).unwrap_or(state),
+                kv_snapshot: Some(result.snapshot),
+            })
+        }
+        Ok(_) => Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: "cluster membership changed while publishing invitation".to_string(),
+            state,
+            kv_snapshot: None,
         }),
         Err(error) => Ok(ClusterInvitePublishResponse {
             accepted: false,
@@ -254,13 +274,25 @@ pub async fn handle_cluster_invite_publish_request_async_with_host<H>(
 where
     H: ClusterMemberMutationAsyncHost + Send,
 {
-    let paths_for_prepare = paths.clone();
+    let paths_for_state = paths.clone();
+    let state = runtime
+        .spawn_blocking(move || read_cluster_state(&paths_for_state))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster invite publish state read".to_string(),
+            detail: format!("invite publish state read task failed: {source}"),
+        })??;
+    let mut authority_state = state.clone();
+    let authoritative = host
+        .authoritative_cluster_kv_snapshot_async(paths, &mut authority_state)
+        .await?;
     let signer_node_id = signer_node_id.to_string();
     let signer_public_key = signer_public_key.to_string();
     let prepared = runtime
         .spawn_blocking(move || {
             prepare_cluster_invite_publish_request(
-                &paths_for_prepare,
+                state,
+                &authoritative.value,
                 request,
                 &signer_node_id,
                 &signer_public_key,
@@ -277,11 +309,17 @@ where
         PreparedClusterInvitePublish::Commit { state, txn } => (state, txn),
     };
     let mut commit_state = state.clone();
+    let request = KvTxnRequest::generated(txn);
     match host
-        .commit_cluster_kv_txn_with_quorum_async(paths, &mut commit_state, txn)
+        .commit_cluster_kv_txn_with_quorum_async(paths, &mut commit_state, request)
         .await
     {
-        Ok(snapshot) => {
+        Ok(result)
+            if result
+                .txn_response
+                .as_ref()
+                .is_some_and(|response| response.succeeded) =>
+        {
             let paths_for_state = paths.clone();
             let fallback_state = state.clone();
             let response_state = runtime
@@ -297,9 +335,15 @@ where
                 accepted: true,
                 detail: "invite published".to_string(),
                 state: response_state,
-                kv_snapshot: Some(snapshot),
+                kv_snapshot: Some(result.snapshot),
             })
         }
+        Ok(_) => Ok(ClusterInvitePublishResponse {
+            accepted: false,
+            detail: "cluster membership changed while publishing invitation".to_string(),
+            state,
+            kv_snapshot: None,
+        }),
         Err(error) => Ok(ClusterInvitePublishResponse {
             accepted: false,
             detail: error.to_string(),
@@ -309,7 +353,12 @@ where
     }
 }
 
-pub fn sync_cluster_invitation_to_kv(
+/// Seeds invitation state in the local Raft store without proving quorum.
+///
+/// This is deliberately unavailable to production callers. Runtime invitation
+/// publication must use `publish_cluster_invitation_to_quorum_with_host`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn sync_cluster_invitation_to_local_raft_unchecked(
     paths: &ClusterPaths,
     invite: &ClusterJoinInvite,
 ) -> Result<KvSnapshot, NetworkError> {
@@ -322,10 +371,53 @@ pub fn sync_cluster_invitation_to_kv(
     append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
 }
 
-fn cluster_invitation_publish_txn_without_snapshot(
+fn cluster_invitation_publish_txn_from_authoritative_snapshot(
+    snapshot: &KvSnapshot,
     invite: &ClusterJoinInvite,
 ) -> Result<KvTxn, NetworkError> {
-    cluster_invitation_publish_txn_with_snapshot(None, invite)
+    let issuer_key = cluster_member_key(&invite.issuer_node_id);
+    let issuer_entry = snapshot
+        .get(&issuer_key)
+        .ok_or_else(|| NetworkError::ClusterReadOnly {
+            detail: format!(
+                "invitation issuer {} is absent from the authoritative cluster membership",
+                invite.issuer_node_id
+            ),
+        })?;
+    let issuer: ClusterMemberRecord = issuer_entry.decode().map_err(kv_err)?;
+    if issuer.cluster_id != invite.cluster_id
+        || issuer.node_public_key != invite.issuer_public_key
+        || !issuer.state.is_authorized()
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "invitation issuer {} is not authorized by the current cluster membership",
+                invite.issuer_node_id
+            ),
+        });
+    }
+    let mut txn = cluster_invitation_publish_txn_with_snapshot(Some(snapshot), invite)?;
+    txn.compares.push(KvCompare::ValueEquals {
+        key: issuer_key,
+        value: issuer_entry.value.clone(),
+    });
+    Ok(txn)
+}
+
+fn require_invite_publish_commit(
+    result: ClusterKvTxnCommitResult,
+) -> Result<KvSnapshot, NetworkError> {
+    if result
+        .txn_response
+        .as_ref()
+        .is_some_and(|response| response.succeeded)
+    {
+        Ok(result.snapshot)
+    } else {
+        Err(NetworkError::ClusterReadOnly {
+            detail: "cluster membership changed while publishing invitation".to_string(),
+        })
+    }
 }
 
 fn cluster_invitation_publish_txn_with_snapshot(

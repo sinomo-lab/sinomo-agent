@@ -18,48 +18,50 @@ pub(crate) fn decode_cluster_kv_rpc_body<T: DeserializeOwned>(body: &[u8]) -> Re
     sinomo_object_serde::from_bytes(body).map_err(kv_object_error)
 }
 
-pub fn cluster_kv_snapshot_rpc_payload() -> Result<ClusterKvRpcPayload, KvError> {
+pub fn cluster_kv_local_snapshot_rpc_payload() -> Result<ClusterKvRpcPayload, KvError> {
     Ok(ClusterKvRpcPayload {
-        route: CLUSTER_KV_SNAPSHOT_ROUTE,
+        route: CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         body: encode_cluster_kv_rpc_body(&())?,
     })
 }
 
-pub fn decode_cluster_kv_snapshot_rpc_request_body(body: &[u8]) -> Result<(), KvError> {
+pub fn decode_cluster_kv_local_snapshot_rpc_request_body(body: &[u8]) -> Result<(), KvError> {
     decode_cluster_kv_rpc_body(body)
 }
 
-pub fn cluster_kv_snapshot_response_rpc_payload(
-    snapshot: &KvSnapshot,
+pub fn cluster_kv_local_snapshot_response_rpc_payload(
+    snapshot: &KvLocalRead<KvSnapshot>,
 ) -> Result<ClusterKvRpcPayload, KvError> {
     Ok(ClusterKvRpcPayload {
-        route: CLUSTER_KV_SNAPSHOT_ROUTE,
+        route: CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         body: encode_cluster_kv_rpc_body(snapshot)?,
     })
 }
 
-pub fn decode_cluster_kv_snapshot_rpc_body(body: &[u8]) -> Result<KvSnapshot, KvError> {
-    let snapshot: KvSnapshot = decode_cluster_kv_rpc_body(body)?;
-    snapshot.validate_resource_bounds()?;
+pub fn decode_cluster_kv_local_snapshot_rpc_body(
+    body: &[u8],
+) -> Result<KvLocalRead<KvSnapshot>, KvError> {
+    let snapshot: KvLocalRead<KvSnapshot> = decode_cluster_kv_rpc_body(body)?;
+    snapshot.value.validate_resource_bounds()?;
     Ok(snapshot)
 }
 
-pub fn cluster_kv_txn_rpc_payload(txn: &KvTxn) -> Result<ClusterKvRpcPayload, KvError> {
+pub fn cluster_kv_txn_rpc_payload(request: &KvTxnRequest) -> Result<ClusterKvRpcPayload, KvError> {
     Ok(ClusterKvRpcPayload {
         route: CLUSTER_KV_TXN_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
-        body: encode_cluster_kv_rpc_body(txn)?,
+        body: encode_cluster_kv_rpc_body(request)?,
     })
 }
 
-pub fn decode_cluster_kv_txn_rpc_request_body(body: &[u8]) -> Result<KvTxn, KvError> {
+pub fn decode_cluster_kv_txn_rpc_request_body(body: &[u8]) -> Result<KvTxnRequest, KvError> {
     decode_cluster_kv_rpc_body(body)
 }
 
 pub fn cluster_kv_txn_response_rpc_payload(
-    response: &KvTxnResponse,
+    response: &ClusterKvTxnCommitResult,
 ) -> Result<ClusterKvRpcPayload, KvError> {
     Ok(ClusterKvRpcPayload {
         route: CLUSTER_KV_TXN_ROUTE,
@@ -68,15 +70,335 @@ pub fn cluster_kv_txn_response_rpc_payload(
     })
 }
 
-pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<KvTxnResponse, KvError> {
+pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<ClusterKvTxnCommitResult, KvError> {
     decode_cluster_kv_rpc_body(body)
 }
 
-pub fn cluster_kv_range_prefix_rpc_payload(prefix: &str) -> Result<ClusterKvRpcPayload, KvError> {
+/// Marker request for an authoritative read. The receiver must generate a
+/// fresh barrier request id for every invocation; callers cannot supply or
+/// reuse one and thereby replay stale authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvAuthoritativeSnapshotRequest;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvAuthoritativeRangePrefixRequest {
+    pub prefix: String,
+}
+
+/// Starts a watch after a server-generated authoritative barrier. Unlike the
+/// local watch request, callers cannot choose a revision that predates the
+/// barrier or reuse an old proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvAuthoritativeWatchStartRequest {
+    pub prefix: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvRequestOutcomeRequest {
+    pub request_id: KvRequestId,
+}
+
+pub fn cluster_kv_authoritative_snapshot_rpc_payload() -> Result<ClusterKvRpcPayload, KvError> {
     Ok(ClusterKvRpcPayload {
-        route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
+        route: CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&ClusterKvAuthoritativeSnapshotRequest)?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_snapshot_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvAuthoritativeSnapshotRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_authoritative_snapshot_response_rpc_payload(
+    response: &KvAuthoritativeRead<KvSnapshot>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_snapshot_rpc_body(
+    body: &[u8],
+) -> Result<KvAuthoritativeRead<KvSnapshot>, KvError> {
+    let response: KvAuthoritativeRead<KvSnapshot> = decode_cluster_kv_rpc_body(body)?;
+    response.value.validate_resource_bounds()?;
+    validate_cluster_kv_current_term_authority_proof(&response.authority)?;
+    if response.authority.revision != response.value.revision {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative proof revision {:?} does not match snapshot revision {:?}",
+                response.authority.revision, response.value.revision
+            ),
+        });
+    }
+    Ok(response)
+}
+
+pub fn cluster_kv_authoritative_range_prefix_rpc_payload(
+    prefix: impl Into<String>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&ClusterKvAuthoritativeRangePrefixRequest {
+            prefix: prefix.into(),
+        })?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_range_prefix_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvAuthoritativeRangePrefixRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_authoritative_range_prefix_response_rpc_payload(
+    response: &KvAuthoritativeRead<Vec<KvEntry>>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_range_prefix_rpc_body(
+    body: &[u8],
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, KvError> {
+    let response: KvAuthoritativeRead<Vec<KvEntry>> = decode_cluster_kv_rpc_body(body)?;
+    validate_cluster_kv_current_term_authority_proof(&response.authority)?;
+    Ok(response)
+}
+
+/// Projects a bounded prefix range from the exact snapshot justified by an
+/// authoritative proof. Filtering a separately reopened local view here would
+/// reintroduce a stale-read race after the barrier.
+pub fn project_cluster_kv_authoritative_range_prefix(
+    read: &KvAuthoritativeRead<KvSnapshot>,
+    prefix: &str,
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, KvError> {
+    validate_cluster_kv_current_term_authority_proof(&read.authority)?;
+    if read.authority.revision != read.value.revision {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative proof revision {:?} does not match snapshot revision {:?}",
+                read.authority.revision, read.value.revision
+            ),
+        });
+    }
+    Ok(KvAuthoritativeRead {
+        value: read.value.range_prefix_limited_by_payload_bytes(
+            prefix,
+            CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+            CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+        )?,
+        authority: read.authority,
+    })
+}
+
+pub fn cluster_kv_authoritative_watch_start_rpc_payload(
+    prefix: impl Into<String>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&ClusterKvAuthoritativeWatchStartRequest {
+            prefix: prefix.into(),
+        })?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_watch_start_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvAuthoritativeWatchStartRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_authoritative_watch_start_response_rpc_payload(
+    response: &KvAuthoritativeRead<ClusterKvWatchRegistration>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    validate_cluster_kv_authoritative_watch_start_response(response)?;
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_watch_start_rpc_body(
+    body: &[u8],
+) -> Result<KvAuthoritativeRead<ClusterKvWatchRegistration>, KvError> {
+    let response: KvAuthoritativeRead<ClusterKvWatchRegistration> =
+        decode_cluster_kv_rpc_body(body)?;
+    validate_cluster_kv_authoritative_watch_start_response(&response)?;
+    Ok(response)
+}
+
+fn validate_cluster_kv_authoritative_watch_start_response(
+    response: &KvAuthoritativeRead<ClusterKvWatchRegistration>,
+) -> Result<(), KvError> {
+    validate_cluster_kv_current_term_authority_proof(&response.authority)?;
+    let expected = response.authority.revision.next();
+    if response.value.next_revision != expected {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative watch starts at {:?}, expected the revision after barrier {:?}",
+                response.value.next_revision, response.authority.revision
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_cluster_kv_current_term_authority_proof(
+    proof: &KvAuthorityProof,
+) -> Result<(), KvError> {
+    match proof.basis {
+        KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks,
+            required_quorum,
+        } if proof.term > 0 && required_quorum > 0 && voter_acks >= required_quorum => Ok(()),
+        _ => Err(KvError::AuthorityUnavailable {
+            detail: "authoritative read response lacks a valid current-term quorum proof"
+                .to_string(),
+        }),
+    }
+}
+
+pub fn cluster_kv_request_outcome_rpc_payload(
+    request: &ClusterKvRequestOutcomeRequest,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(request)?,
+    })
+}
+
+pub fn decode_cluster_kv_request_outcome_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvRequestOutcomeRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_request_outcome_response_rpc_payload(
+    read: &ClusterKvRequestOutcomeRead,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    validate_cluster_kv_request_outcome_read(read)?;
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(read)?,
+    })
+}
+
+pub fn decode_cluster_kv_request_outcome_rpc_body(
+    body: &[u8],
+) -> Result<ClusterKvRequestOutcomeRead, KvError> {
+    let read = decode_cluster_kv_rpc_body(body)?;
+    validate_cluster_kv_request_outcome_read(&read)?;
+    Ok(read)
+}
+
+fn validate_cluster_kv_request_outcome_read(
+    read: &ClusterKvRequestOutcomeRead,
+) -> Result<(), KvError> {
+    validate_cluster_kv_current_term_authority_proof(&read.authority)?;
+    if let KvRequestOutcome::Committed(record) = &read.outcome
+        && (record.term > read.authority.term
+            || record.log_index > read.authority.commit_index
+            || record.revision > read.authority.revision)
+    {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "committed request at term {}, index {}, revision {:?} is newer than outcome authority at term {}, index {}, revision {:?}",
+                record.term,
+                record.log_index,
+                record.revision,
+                read.authority.term,
+                read.authority.commit_index,
+                read.authority.revision
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub fn cluster_kv_local_range_prefix_rpc_payload(
+    prefix: &str,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         body: encode_cluster_kv_rpc_body(prefix)?,
+    })
+}
+
+pub fn cluster_kv_local_range_prefix_response_rpc_payload(
+    entries: &KvLocalRead<Vec<KvEntry>>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(entries)?,
+    })
+}
+
+pub fn decode_cluster_kv_local_range_prefix_rpc_body(
+    body: &[u8],
+) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_local_watch_drain_rpc_payload(
+    request: &ClusterKvWatchDrainRequest,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(request)?,
+    })
+}
+
+pub fn decode_cluster_kv_local_watch_drain_rpc_body(
+    body: &[u8],
+) -> Result<ClusterKvWatchDrainResponse, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_local_watch_cancel_rpc_payload(
+    request: &ClusterKvWatchCancelRequest,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(request)?,
+    })
+}
+
+pub fn decode_cluster_kv_local_watch_cancel_rpc_body(
+    body: &[u8],
+) -> Result<ClusterKvWatchCancelResponse, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+/// Resolves the durable local outcome of a previously accepted request id.
+/// Committed Raft history is authoritative over the local attempt ledger.
+pub fn handle_cluster_kv_request_outcome_rpc_payload(
+    paths: &ClusterKvPaths,
+    snapshot: &KvAuthoritativeRead<KvSnapshot>,
+    body: &[u8],
+) -> Result<ClusterKvRpcPayload, KvError> {
+    let request = decode_cluster_kv_request_outcome_rpc_request_body(body)?;
+    let outcome = resolve_cluster_kv_request_outcome(paths, &snapshot.value, &request.request_id)?;
+    cluster_kv_request_outcome_response_rpc_payload(&ClusterKvRequestOutcomeRead {
+        authority: snapshot.authority,
+        outcome,
     })
 }
 
@@ -326,7 +648,7 @@ pub trait ClusterKvLocalReadWatchHost {
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
 
-    fn range_prefix(&mut self, prefix: &str) -> Result<Vec<KvEntry>, Self::Error>;
+    fn range_prefix(&mut self, prefix: &str) -> Result<KvLocalRead<Vec<KvEntry>>, Self::Error>;
 
     fn create_watch(
         &mut self,
@@ -353,41 +675,41 @@ where
     H: ClusterKvLocalReadWatchHost,
 {
     let payload = match route {
-        CLUSTER_KV_RANGE_PREFIX_ROUTE => {
+        CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE => {
             let prefix: String = decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.range_prefix(&prefix)?;
             ClusterKvRpcPayload {
-                route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
+                route: CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
                 body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
-        CLUSTER_KV_WATCH_PREFIX_ROUTE => {
+        CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE => {
             let request: ClusterKvWatchPrefixRequest =
                 decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.create_watch(request)?;
             ClusterKvRpcPayload {
-                route: CLUSTER_KV_WATCH_PREFIX_ROUTE,
+                route: CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
                 body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
-        CLUSTER_KV_WATCH_DRAIN_ROUTE => {
+        CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE => {
             let request: ClusterKvWatchDrainRequest =
                 decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.drain_watch(request)?;
             ClusterKvRpcPayload {
-                route: CLUSTER_KV_WATCH_DRAIN_ROUTE,
+                route: CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
                 body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
-        CLUSTER_KV_WATCH_CANCEL_ROUTE => {
+        CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE => {
             let request: ClusterKvWatchCancelRequest =
                 decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.cancel_watch(request)?;
             ClusterKvRpcPayload {
-                route: CLUSTER_KV_WATCH_CANCEL_ROUTE,
+                route: CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
                 body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }

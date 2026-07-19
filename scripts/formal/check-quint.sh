@@ -39,7 +39,7 @@ register_case() {
   cases+=("$id|$file|$main|$steps|$backend|$run_step|$verify_step|$tier|$witnesses")
 }
 
-register_case raft-kv specs/quint/checks/kv/raft_kv_safety.qnt raft_kv_safety "$verify_steps"
+register_case raft-kv specs/quint/checks/kv/raft_kv_safety.qnt raft_kv_safety "$verify_steps" apalache coverageStep step fast "witnessBrokenNoQuorumNoEffectCounterexample"
 register_case raft-protocol specs/quint/checks/kv/raft_protocol_safety.qnt raft_protocol_safety "${QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS:-1}" apalache step step deep "witnessVoteGranted witnessStaleCandidateRejected witnessLeaderElectedFromQuorum witnessAppendPrevMismatchRejected witnessDivergentSuffixTruncated witnessAcknowledgementQuorumCommit witnessHigherTermStepDown witnessDurableRestart witnessFollowerStateMachineReplay witnessLeaderCompletenessAfterElection"
 register_case network-base specs/quint/checks/network/network_safety.qnt network_safety "$verify_steps"
 register_case network-endpoint specs/quint/checks/network/endpoint_selection_safety.qnt network_endpoint_selection_safety "${QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS:-4}"

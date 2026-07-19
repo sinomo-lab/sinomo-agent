@@ -33,7 +33,7 @@ pub const CLUSTER_CONTROL_REMOVE_ROUTE: &str = "/cluster/control/remove";
 /// Leave the current cluster and re-initialize as a single-node cluster.
 pub const CLUSTER_CONTROL_LEAVE_ROUTE: &str = "/cluster/control/leave";
 /// Capability tag advertised for cluster-control mutations.
-pub const CLUSTER_CONTROL_ADMIN_CAPABILITY: &str = "cluster.control.admin";
+pub const CLUSTER_CONTROL_ADMIN_CAPABILITY: &str = sinomo_node::CLUSTER_CONTROL_ADMIN_CAPABILITY;
 
 /// Every cluster-control object-RPC route.
 pub const CLUSTER_CONTROL_RPC_ROUTES: &[&str] = &[
@@ -57,27 +57,41 @@ pub struct ClusterControlRoutePolicy {
     pub required_capabilities: &'static [&'static str],
 }
 
-const CLUSTER_CONTROL_MUTATION_AUTH: ClusterKvRouteAuth = ClusterKvRouteAuth::LocalOrRaftVoter;
-
-const fn cluster_control_mutation_policy(route: &'static str) -> ClusterControlRoutePolicy {
+const fn cluster_control_mutation_policy(
+    route: &'static str,
+    auth: ClusterKvRouteAuth,
+) -> ClusterControlRoutePolicy {
     ClusterControlRoutePolicy {
         route,
         category: CLUSTER_CONTROL_RPC_CATEGORY,
-        auth: CLUSTER_CONTROL_MUTATION_AUTH,
+        auth,
         required_capabilities: &[CLUSTER_CONTROL_ADMIN_CAPABILITY],
     }
 }
 
-/// Auth policy table: every cluster-control route is a mutation and requires an
-/// admin signer (the local daemon identity or a cluster raft voter).
+/// Auth policy table for cluster-control mutations. Identity-changing
+/// operations remain node-local consent decisions; replicated administration
+/// may also be requested by a freshly authorized Raft voter.
 pub const CLUSTER_CONTROL_RPC_ROUTE_POLICIES: &[ClusterControlRoutePolicy] = &[
-    cluster_control_mutation_policy(CLUSTER_CONTROL_INIT_ROUTE),
-    cluster_control_mutation_policy(CLUSTER_CONTROL_JOIN_ROUTE),
-    cluster_control_mutation_policy(CLUSTER_CONTROL_INVITE_ROUTE),
-    cluster_control_mutation_policy(CLUSTER_CONTROL_RENAME_ROUTE),
-    cluster_control_mutation_policy(CLUSTER_CONTROL_ROLE_ROUTE),
-    cluster_control_mutation_policy(CLUSTER_CONTROL_REMOVE_ROUTE),
-    cluster_control_mutation_policy(CLUSTER_CONTROL_LEAVE_ROUTE),
+    cluster_control_mutation_policy(CLUSTER_CONTROL_INIT_ROUTE, ClusterKvRouteAuth::LocalOnly),
+    cluster_control_mutation_policy(CLUSTER_CONTROL_JOIN_ROUTE, ClusterKvRouteAuth::LocalOnly),
+    cluster_control_mutation_policy(
+        CLUSTER_CONTROL_INVITE_ROUTE,
+        ClusterKvRouteAuth::LocalOrRaftVoter,
+    ),
+    cluster_control_mutation_policy(
+        CLUSTER_CONTROL_RENAME_ROUTE,
+        ClusterKvRouteAuth::LocalOrRaftVoter,
+    ),
+    cluster_control_mutation_policy(
+        CLUSTER_CONTROL_ROLE_ROUTE,
+        ClusterKvRouteAuth::LocalOrRaftVoter,
+    ),
+    cluster_control_mutation_policy(
+        CLUSTER_CONTROL_REMOVE_ROUTE,
+        ClusterKvRouteAuth::LocalOrRaftVoter,
+    ),
+    cluster_control_mutation_policy(CLUSTER_CONTROL_LEAVE_ROUTE, ClusterKvRouteAuth::LocalOnly),
 ];
 
 /// Looks up the auth policy for a cluster-control route.
@@ -419,15 +433,35 @@ mod tests {
     }
 
     #[test]
-    fn cluster_control_mutations_require_local_or_voter_admin() {
-        for policy in CLUSTER_CONTROL_RPC_ROUTE_POLICIES {
+    fn cluster_control_identity_changes_are_local_only() {
+        for route in [
+            CLUSTER_CONTROL_INIT_ROUTE,
+            CLUSTER_CONTROL_JOIN_ROUTE,
+            CLUSTER_CONTROL_LEAVE_ROUTE,
+        ] {
+            let policy = cluster_control_rpc_route_policy(route).expect("route policy");
             assert_eq!(
                 policy.auth,
-                ClusterKvRouteAuth::LocalOrRaftVoter,
-                "cluster control route {} must require a local or voter signer",
-                policy.route
+                ClusterKvRouteAuth::LocalOnly,
+                "identity-changing route {route} must remain local-only"
             );
+            assert_eq!(policy.auth.as_scope(), "local-command");
+        }
+    }
+
+    #[test]
+    fn replicated_cluster_control_mutations_require_local_or_voter_admin() {
+        for route in [
+            CLUSTER_CONTROL_INVITE_ROUTE,
+            CLUSTER_CONTROL_RENAME_ROUTE,
+            CLUSTER_CONTROL_ROLE_ROUTE,
+            CLUSTER_CONTROL_REMOVE_ROUTE,
+        ] {
+            let policy = cluster_control_rpc_route_policy(route).expect("route policy");
+            assert_eq!(policy.auth, ClusterKvRouteAuth::LocalOrRaftVoter);
             assert_eq!(policy.auth.as_scope(), "local-or-cluster-voter");
+        }
+        for policy in CLUSTER_CONTROL_RPC_ROUTE_POLICIES {
             assert_eq!(
                 policy.required_capabilities,
                 &[CLUSTER_CONTROL_ADMIN_CAPABILITY],

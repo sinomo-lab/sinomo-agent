@@ -208,7 +208,10 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{
+    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvError, KvLocalRead, KvOp, KvSnapshot, KvTxn,
+    KvTxnRequest, KvTxnResponse,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
 use sinomo_runtime::network::{self, ClusterPaths};
@@ -1310,8 +1313,9 @@ fn cli_local_cluster_quorum_if_relevant(
     let paths = cluster_paths_from_defaults()?;
     match read_cluster_state(&paths) {
         Ok(state) => Ok(Some(
-            daemon.is_some_and(|daemon| local_daemon_can_serve_cluster_kv_snapshot(daemon, &state))
-                || cluster_has_local_quorum(&paths, &state),
+            daemon.is_some_and(|daemon| {
+                local_daemon_can_serve_authoritative_cluster_kv_snapshot(daemon, &state)
+            }) || cluster_has_local_quorum(&paths, &state),
         )),
         Err(CliError::ClusterOrphan) => Ok(None),
         Err(error) => Err(error),
@@ -5651,26 +5655,44 @@ const SINOMO_JOIN_URI_PREFIX: &str = cluster::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
 
-fn daemon_fetch_cluster_kv_snapshot(
+fn daemon_fetch_cluster_kv_local_snapshot(
     address: &str,
     timeout: Duration,
-) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
-    let request = cluster_kv_snapshot_rpc_request()?;
+) -> Result<KvLocalRead<KvSnapshot>, sinomo_runtime::daemon::DaemonError> {
+    let request = cluster_kv_local_snapshot_rpc_request()?;
     let response = daemon_send_daemon_rpc(address, &request, timeout)?;
-    decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+    decode_cluster_kv_local_snapshot_rpc_response(&response).map_err(Into::into)
 }
 
-fn daemon_fetch_cluster_kv_snapshot_from_endpoint(
+fn daemon_fetch_cluster_kv_local_snapshot_from_endpoint(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
-) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
-    let request = cluster_kv_snapshot_rpc_request()?;
+) -> Result<KvLocalRead<KvSnapshot>, sinomo_runtime::daemon::DaemonError> {
+    let request = cluster_kv_local_snapshot_rpc_request()?;
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
-    decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+    decode_cluster_kv_local_snapshot_rpc_response(&response).map_err(Into::into)
 }
 
-fn cluster_kv_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvError> {
-    let payload = sinomo_runtime::kv::cluster_kv_snapshot_rpc_payload()?;
+fn daemon_fetch_cluster_kv_authoritative_snapshot(
+    address: &str,
+    timeout: Duration,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, sinomo_runtime::daemon::DaemonError> {
+    let request = cluster_kv_authoritative_snapshot_rpc_request()?;
+    let response = daemon_send_daemon_rpc(address, &request, timeout)?;
+    decode_cluster_kv_authoritative_snapshot_rpc_response(&response).map_err(Into::into)
+}
+
+fn daemon_fetch_cluster_kv_authoritative_snapshot_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, sinomo_runtime::daemon::DaemonError> {
+    let request = cluster_kv_authoritative_snapshot_rpc_request()?;
+    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
+    decode_cluster_kv_authoritative_snapshot_rpc_response(&response).map_err(Into::into)
+}
+
+fn cluster_kv_local_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvError> {
+    let payload = sinomo_runtime::kv::cluster_kv_local_snapshot_rpc_payload()?;
     Ok(network::ObjectRpcRequest::from_encoded_body(
         payload.route,
         payload.category,
@@ -5678,10 +5700,60 @@ fn cluster_kv_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvErro
     ))
 }
 
-fn decode_cluster_kv_snapshot_rpc_response(
+fn decode_cluster_kv_local_snapshot_rpc_response(
     response: &network::ObjectRpcResponse,
-) -> Result<KvSnapshot, network::NetworkError> {
+) -> Result<KvLocalRead<KvSnapshot>, network::NetworkError> {
     response.error_detail()?;
-    sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body)
-        .map_err(sinomo_runtime::network::NetworkError::directory)
+    let read = sinomo_runtime::kv::decode_cluster_kv_local_snapshot_rpc_body(&response.body)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
+    if read.revision != read.value.revision {
+        return Err(network::NetworkError::Serialization {
+            detail: format!(
+                "cluster KV local-read metadata revision {:?} does not match snapshot revision {:?}",
+                read.revision, read.value.revision
+            ),
+        });
+    }
+    Ok(read)
+}
+
+fn cluster_kv_authoritative_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvError> {
+    let payload = sinomo_runtime::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
+    Ok(network::ObjectRpcRequest::from_encoded_body(
+        payload.route,
+        payload.category,
+        payload.body,
+    ))
+}
+
+fn decode_cluster_kv_authoritative_snapshot_rpc_response(
+    response: &network::ObjectRpcResponse,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, network::NetworkError> {
+    response.error_detail()?;
+    let read =
+        sinomo_runtime::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+            .map_err(sinomo_runtime::network::NetworkError::directory)?;
+    if read.authority.term == 0
+        || !matches!(
+            read.authority.basis,
+            sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks,
+                required_quorum,
+            } if required_quorum > 0 && voter_acks >= required_quorum
+        )
+    {
+        return Err(network::NetworkError::ClusterReadOnly {
+            detail: "cluster KV authoritative snapshot lacks a fresh current-term quorum proof"
+                .to_string(),
+        });
+    }
+    if read.authority.revision != read.value.revision {
+        return Err(network::NetworkError::Serialization {
+            detail: format!(
+                "cluster KV authority revision {:?} does not match snapshot revision {:?}",
+                read.authority.revision, read.value.revision
+            ),
+        });
+    }
+    Ok(read)
 }

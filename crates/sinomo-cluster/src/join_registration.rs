@@ -1,7 +1,9 @@
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
+#[cfg(any(test, feature = "test-support"))]
 use crate::invite_publish::read_cluster_invitation_for_join_introducer;
 use crate::keyspace::{
     cluster_capability_policy_key, cluster_endpoint_prefix, cluster_identity_key,
+    cluster_invitation_key, cluster_invitation_state_key, cluster_member_key,
 };
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::write_imported_cluster_kv_snapshot_if_changed;
@@ -12,7 +14,11 @@ use crate::local_membership::{
 use crate::local_state_store::{
     read_cluster_state, read_cluster_state_without_kv, write_cluster_state,
 };
-use crate::member_mutation::sync_cluster_state_to_kv_with_host;
+use crate::member_mutation::{
+    ClusterMemberMutationHost, require_cluster_kv_txn_succeeded,
+    update_cluster_state_authority_with_host,
+};
+use crate::member_store::{apply_cluster_raft_role, cluster_member_update_ops_from_store};
 use crate::membership_forward::{
     ClusterMembershipRpcForwardHost,
     forward_cluster_membership_rpc_to_state_authority_async_with_host,
@@ -20,9 +26,12 @@ use crate::membership_forward::{
 };
 use crate::membership_rpc::{ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse};
 use crate::prelude::*;
-use sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 #[allow(unused_imports)]
 use sinomo_kv::KvSnapshot;
+use sinomo_kv::{
+    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, ClusterKvRaftConfigRecord, ClusterKvTxnCommitResult,
+    InProcessKvStore, KvAuthoritativeRead, KvCompare, KvOp, KvTxn, KvTxnRequest,
+};
 use sinomo_network::ClusterConnectivityState;
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
@@ -33,10 +42,13 @@ use sinomo_network::{
     ObjectRpcRequest, ObjectRpcResponse,
 };
 use sinomo_network::{cleanup_member_endpoint_duplicates, upsert_member_endpoint};
+#[cfg(any(test, feature = "test-support"))]
+use sinomo_node::upsert_member_record;
 use sinomo_node::{
-    ClusterCapabilityPolicyRecord, ClusterIdentityRecord, cluster_member_is_local_process,
-    upsert_member_record,
+    ClusterCapabilityPolicyRecord, ClusterIdentityRecord, ClusterInvitationStateRecord,
+    cluster_member_is_local_process, cluster_member_stable_eq, shadow_daemon_node_id,
 };
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 const JOIN_RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -56,6 +68,7 @@ pub struct ClusterJoinReconciliation {
     pub kv_snapshot: Option<KvSnapshot>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn prepare_cluster_join_registration_response(
     paths: &ClusterPaths,
     state: ClusterBootstrapState,
@@ -166,6 +179,340 @@ pub fn prepare_cluster_join_registration_response(
     })
 }
 
+struct PreparedAuthoritativeClusterJoin {
+    state: ClusterBootstrapState,
+    seed_txn: KvTxn,
+    learner_node_ids: Vec<NodeId>,
+}
+
+enum AuthoritativeClusterJoinPreparation {
+    Rejected(ClusterJoinRegistrationResponse),
+    Commit(PreparedAuthoritativeClusterJoin),
+}
+
+fn rejected_cluster_join_registration(
+    state: ClusterBootstrapState,
+    detail: impl Into<String>,
+) -> AuthoritativeClusterJoinPreparation {
+    AuthoritativeClusterJoinPreparation::Rejected(ClusterJoinRegistrationResponse {
+        accepted: false,
+        detail: detail.into(),
+        state,
+        kv_snapshot: None,
+        responder_node_id: None,
+    })
+}
+
+fn prepare_authoritative_cluster_join_registration(
+    state: ClusterBootstrapState,
+    snapshot: &KvSnapshot,
+    request: ClusterJoinRegistrationRequest,
+    now: OffsetDateTime,
+) -> Result<AuthoritativeClusterJoinPreparation, NetworkError> {
+    let invite_key = cluster_invitation_key(&request.invite.invite_id);
+    let Some(invite_entry) = snapshot.get(&invite_key).cloned() else {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "invitation is not present in the authoritative cluster KV",
+        ));
+    };
+    let persisted_invite: ClusterJoinInvite = invite_entry.decode().map_err(kv_err)?;
+    if persisted_invite != request.invite
+        || request.invitation_secret.trim().is_empty()
+        || request.invitation_secret != persisted_invite.invitation_secret
+    {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "invitation rejected",
+        ));
+    }
+    if let Err(error) = crate::verify_cluster_join_invite_signature(&persisted_invite) {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            format!("invite signature rejected: {error}"),
+        ));
+    }
+    if persisted_invite.cluster_id != state.cluster_id {
+        return Ok(rejected_cluster_join_registration(
+            state.clone(),
+            format!(
+                "invite cluster `{}` does not match introducer cluster `{}`",
+                persisted_invite.cluster_id, state.cluster_id
+            ),
+        ));
+    }
+    if persisted_invite.expires_at <= now {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            format!(
+                "invite expired at {}",
+                persisted_invite
+                    .expires_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string())
+            ),
+        ));
+    }
+
+    let invitation_state_key = cluster_invitation_state_key(&persisted_invite.invite_id);
+    let Some(invitation_state_entry) = snapshot.get(&invitation_state_key).cloned() else {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "invitation has no authoritative lifecycle state",
+        ));
+    };
+    let invitation_state: ClusterInvitationStateRecord =
+        invitation_state_entry.decode().map_err(kv_err)?;
+    if invitation_state.state != "active"
+        || invitation_state.cluster_id != persisted_invite.cluster_id
+        || invitation_state.invite_id != persisted_invite.invite_id
+        || invitation_state.issuer_node_id != persisted_invite.issuer_node_id
+        || invitation_state.expires_at != persisted_invite.expires_at
+    {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "invitation is not active in the authoritative cluster KV",
+        ));
+    }
+
+    let issuer_key = cluster_member_key(&persisted_invite.issuer_node_id);
+    let Some(issuer_entry) = snapshot.get(&issuer_key).cloned() else {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            format!(
+                "invite issuer {} is not an authorized cluster member",
+                persisted_invite.issuer_node_id
+            ),
+        ));
+    };
+    let issuer: ClusterMemberRecord = issuer_entry.decode().map_err(kv_err)?;
+    if issuer.cluster_id != persisted_invite.cluster_id
+        || issuer.node_public_key != persisted_invite.issuer_public_key
+        || !issuer.state.is_authorized()
+    {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            format!(
+                "invite issuer {} is not an authorized cluster member",
+                persisted_invite.issuer_node_id
+            ),
+        ));
+    }
+
+    if request.members.is_empty() || request.members.len() > 2 {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "join registration must contain one learner and at most one non-voting shadow",
+        ));
+    }
+    if request.members.iter().any(|member| {
+        member.role == ClusterMemberRole::Voter
+            || !persisted_invite.allowed_member_roles.contains(&member.role)
+    }) {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "join request includes an unsupported or unauthorized member role",
+        ));
+    }
+    let learner_members = request
+        .members
+        .iter()
+        .filter(|member| member.role == ClusterMemberRole::Learner)
+        .collect::<Vec<_>>();
+    let non_voting_members = request
+        .members
+        .iter()
+        .filter(|member| member.role == ClusterMemberRole::NonVoting)
+        .collect::<Vec<_>>();
+    if learner_members.len() != 1 || non_voting_members.len() > 1 {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "join registration must contain exactly one learner and at most one non-voting shadow",
+        ));
+    }
+    if let Some(shadow) = non_voting_members.first()
+        && shadow.node_id != shadow_daemon_node_id(&learner_members[0].node_id)
+    {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "the non-voting join member is not the learner's shadow daemon",
+        ));
+    }
+    let mut member_ids = BTreeSet::new();
+    let mut member_public_keys = BTreeSet::new();
+    if request.members.iter().any(|member| {
+        member.cluster_id != persisted_invite.cluster_id
+            || member.node_public_key.trim().is_empty()
+            || !member_ids.insert(member.node_id.clone())
+            || !member_public_keys.insert(member.node_public_key.clone())
+    }) {
+        return Ok(rejected_cluster_join_registration(
+            state,
+            "join request contains conflicting member identities",
+        ));
+    }
+
+    let config_key = sinomo_kv::cluster_kv_raft_config_key();
+    let config_entry =
+        snapshot
+            .get(&config_key)
+            .cloned()
+            .ok_or_else(|| NetworkError::ClusterReadOnly {
+                detail: "established cluster Raft config is missing during join admission"
+                    .to_string(),
+            })?;
+    let config: ClusterKvRaftConfigRecord = config_entry.decode().map_err(kv_err)?;
+    if config.cluster_id != persisted_invite.cluster_id {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "authoritative Raft config belongs to a different cluster".to_string(),
+        });
+    }
+
+    let store = InProcessKvStore::restore(snapshot.clone()).map_err(kv_err)?;
+    let mut compares = vec![
+        KvCompare::ValueEquals {
+            key: invite_key,
+            value: invite_entry.value,
+        },
+        KvCompare::ValueEquals {
+            key: invitation_state_key,
+            value: invitation_state_entry.value,
+        },
+        KvCompare::ValueEquals {
+            key: issuer_key,
+            value: issuer_entry.value,
+        },
+        KvCompare::ValueEquals {
+            key: config_key,
+            value: config_entry.value,
+        },
+    ];
+    let mut compared_keys = compares
+        .iter()
+        .map(|compare| match compare {
+            KvCompare::Exists { key }
+            | KvCompare::Missing { key }
+            | KvCompare::ValueEquals { key, .. }
+            | KvCompare::VersionEquals { key, .. }
+            | KvCompare::CreateRevisionEquals { key, .. }
+            | KvCompare::ModifyRevisionEquals { key, .. }
+            | KvCompare::LeaseEquals { key, .. } => key.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    let mut success = Vec::new();
+    let mut learner_node_ids = Vec::new();
+
+    for requested in request.members {
+        let desired_role = requested.role.clone();
+        let mut seeded = requested.clone();
+        seeded.cluster_id = persisted_invite.cluster_id.clone();
+        seeded.updated_at = now;
+        if desired_role == ClusterMemberRole::Learner {
+            apply_cluster_raft_role(&mut seeded, ClusterMemberRole::NonVoting, now);
+            learner_node_ids.push(seeded.node_id.clone());
+        } else {
+            seeded.state = ClusterMemberState::NonVoting;
+        }
+        let mut final_member = requested;
+        final_member.cluster_id = persisted_invite.cluster_id.clone();
+        if desired_role == ClusterMemberRole::Learner {
+            apply_cluster_raft_role(&mut final_member, ClusterMemberRole::Learner, now);
+        } else {
+            final_member.state = ClusterMemberState::NonVoting;
+            final_member.updated_at = now;
+        }
+
+        let member_key = cluster_member_key(&seeded.node_id);
+        let config_role = sinomo_kv::cluster_kv_raft_config_member_role(&config, &seeded.node_id);
+        if let Some(existing_entry) = snapshot.get(&member_key).cloned() {
+            let existing: ClusterMemberRecord = existing_entry.decode().map_err(kv_err)?;
+            let exact_seed_retry =
+                config_role.is_none() && cluster_member_stable_eq(&existing, &seeded);
+            let exact_finished_retry = desired_role == ClusterMemberRole::Learner
+                && config_role == Some(ClusterMemberRole::Learner)
+                && cluster_member_stable_eq(&existing, &final_member);
+            if !exact_seed_retry && !exact_finished_retry {
+                return Ok(rejected_cluster_join_registration(
+                    state,
+                    format!(
+                        "cluster member `{}` conflicts with an existing identity or role",
+                        seeded.node_id
+                    ),
+                ));
+            }
+            if compared_keys.insert(member_key.clone()) {
+                compares.push(KvCompare::ValueEquals {
+                    key: member_key,
+                    value: existing_entry.value,
+                });
+            }
+            continue;
+        }
+        if config_role.is_some() {
+            return Ok(rejected_cluster_join_registration(
+                state,
+                format!(
+                    "cluster member `{}` has a Raft role without a persisted member identity",
+                    seeded.node_id
+                ),
+            ));
+        }
+        for op in cluster_member_update_ops_from_store(&store, &seeded)? {
+            let key = match &op {
+                KvOp::Put { key, .. } | KvOp::Delete { key } => key.clone(),
+                KvOp::DeletePrefix { .. }
+                | KvOp::LeaseGrant { .. }
+                | KvOp::LeaseKeepAlive { .. }
+                | KvOp::LeaseRevoke { .. } => {
+                    return Err(NetworkError::InvalidClusterCommand {
+                        detail: "join member seeding produced a non-member KV operation"
+                            .to_string(),
+                    });
+                }
+            };
+            if compared_keys.insert(key.clone()) {
+                match snapshot.get(&key) {
+                    Some(entry) => compares.push(KvCompare::ValueEquals {
+                        key,
+                        value: entry.value.clone(),
+                    }),
+                    None => compares.push(KvCompare::Missing { key }),
+                }
+            }
+            success.push(op);
+        }
+    }
+
+    Ok(AuthoritativeClusterJoinPreparation::Commit(
+        PreparedAuthoritativeClusterJoin {
+            state,
+            seed_txn: KvTxn {
+                compares,
+                success,
+                failure: Vec::new(),
+            },
+            learner_node_ids,
+        },
+    ))
+}
+
+fn cluster_join_response_state_from_snapshot(
+    mut state: ClusterBootstrapState,
+    snapshot: &KvSnapshot,
+    now: OffsetDateTime,
+) -> Result<ClusterBootstrapState, NetworkError> {
+    state.members = crate::read_cluster_members_from_snapshot(snapshot)?;
+    state.kv_revision = snapshot.revision.0;
+    if let Some(config) = snapshot
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .and_then(|entry| entry.decode::<ClusterKvRaftConfigRecord>().ok())
+    {
+        state.term = config.term;
+    }
+    state.updated_at = now;
+    Ok(state)
+}
+
 pub fn handle_cluster_join_registration_request_with_host(
     paths: &ClusterPaths,
     request: ClusterJoinRegistrationRequest,
@@ -176,12 +523,6 @@ pub fn handle_cluster_join_registration_request_with_host(
     if let Some(observation) = host.local_daemon_membership_observation(paths, &state)? {
         apply_local_daemon_membership_observation(&mut state, observation);
     }
-    let mut prepared =
-        prepare_cluster_join_registration_response(paths, state.clone(), request.clone(), now)?;
-    if !prepared.accepted {
-        return Ok(prepared);
-    }
-
     if !cluster_kv_local_is_state_authority(&state) {
         let rpc_request = cluster_join_registration_rpc_request(&request)?;
         let response = forward_cluster_membership_rpc_to_state_authority_with_host(
@@ -204,13 +545,53 @@ pub fn handle_cluster_join_registration_request_with_host(
         return Ok(response);
     }
 
-    let snapshot = host.commit_join_registration_state(paths, &prepared.state)?;
-    write_cluster_state(paths, &prepared.state)?;
-    if join_registration_should_remember_successful_targets(&prepared.state, &request.invite) {
-        host.remember_successful_join_targets(paths, &prepared.state, &request.members)?;
+    let mut authority_state = state.clone();
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut authority_state)?;
+    let prepared = match prepare_authoritative_cluster_join_registration(
+        state,
+        &authoritative.value,
+        request.clone(),
+        now,
+    )? {
+        AuthoritativeClusterJoinPreparation::Rejected(response) => return Ok(response),
+        AuthoritativeClusterJoinPreparation::Commit(prepared) => prepared,
+    };
+    let mut commit_state = prepared.state.clone();
+    let seeded = host.commit_join_registration_txn(
+        paths,
+        &mut commit_state,
+        KvTxnRequest::generated(prepared.seed_txn),
+    )?;
+    let seeded = match require_cluster_kv_txn_succeeded(seeded, "seeding join members") {
+        Ok(seeded) => seeded,
+        Err(_) => {
+            return Ok(ClusterJoinRegistrationResponse {
+                accepted: false,
+                detail: "cluster invitation or membership changed during join admission"
+                    .to_string(),
+                state: prepared.state,
+                kv_snapshot: None,
+                responder_node_id: None,
+            });
+        }
+    };
+    let mut snapshot = seeded.snapshot;
+    for learner_node_id in &prepared.learner_node_ids {
+        snapshot =
+            host.admit_cluster_raft_learner(paths, &mut commit_state, learner_node_id, now)?;
     }
-    prepared.kv_snapshot = Some(snapshot);
-    Ok(prepared)
+    let response_state = cluster_join_response_state_from_snapshot(prepared.state, &snapshot, now)?;
+    write_cluster_state(paths, &response_state)?;
+    if join_registration_should_remember_successful_targets(&response_state, &request.invite) {
+        host.remember_successful_join_targets(paths, &response_state, &request.members)?;
+    }
+    Ok(ClusterJoinRegistrationResponse {
+        accepted: true,
+        detail: "join registered".to_string(),
+        state: response_state,
+        kv_snapshot: Some(snapshot),
+        responder_node_id: None,
+    })
 }
 
 pub async fn handle_cluster_join_registration_request_async_with_host(
@@ -234,27 +615,6 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
     {
         apply_local_daemon_membership_observation(&mut state, observation);
     }
-    let prepare_paths = paths.clone();
-    let prepare_state = state.clone();
-    let prepare_request = request.clone();
-    let mut prepared = runtime
-        .spawn_blocking(move || {
-            prepare_cluster_join_registration_response(
-                &prepare_paths,
-                prepare_state,
-                prepare_request,
-                now,
-            )
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster join registration prepare".to_string(),
-            detail: format!("join registration prepare task failed: {source}"),
-        })??;
-    if !prepared.accepted {
-        return Ok(prepared);
-    }
-
     if !cluster_kv_local_is_state_authority(&state) {
         let rpc_request = cluster_join_registration_rpc_request(&request)?;
         let forward_started = Instant::now();
@@ -308,11 +668,71 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         return Ok(response);
     }
 
-    let snapshot = host
-        .commit_join_registration_state_async(paths, &prepared.state)
+    let mut authority_state = state.clone();
+    let authoritative = host
+        .authoritative_cluster_kv_snapshot_async(paths, &mut authority_state)
         .await?;
+    let prepare_state = state;
+    let prepare_snapshot = authoritative.value;
+    let prepare_request = request.clone();
+    let prepared = runtime
+        .spawn_blocking(move || {
+            prepare_authoritative_cluster_join_registration(
+                prepare_state,
+                &prepare_snapshot,
+                prepare_request,
+                now,
+            )
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster join registration prepare".to_string(),
+            detail: format!("join registration prepare task failed: {source}"),
+        })??;
+    let prepared = match prepared {
+        AuthoritativeClusterJoinPreparation::Rejected(response) => return Ok(response),
+        AuthoritativeClusterJoinPreparation::Commit(prepared) => prepared,
+    };
+    let mut commit_state = prepared.state.clone();
+    let seeded = host
+        .commit_join_registration_txn_async(
+            paths,
+            &mut commit_state,
+            KvTxnRequest::generated(prepared.seed_txn),
+        )
+        .await?;
+    let seeded = match require_cluster_kv_txn_succeeded(seeded, "seeding join members") {
+        Ok(seeded) => seeded,
+        Err(_) => {
+            return Ok(ClusterJoinRegistrationResponse {
+                accepted: false,
+                detail: "cluster invitation or membership changed during join admission"
+                    .to_string(),
+                state: prepared.state,
+                kv_snapshot: None,
+                responder_node_id: None,
+            });
+        }
+    };
+    let mut snapshot = seeded.snapshot;
+    for learner_node_id in &prepared.learner_node_ids {
+        snapshot = host
+            .admit_cluster_raft_learner_async(paths, &mut commit_state, learner_node_id, now)
+            .await?;
+    }
+    let response_state_input = prepared.state;
+    let response_snapshot = snapshot.clone();
+    let response_state = runtime
+        .spawn_blocking(move || {
+            cluster_join_response_state_from_snapshot(response_state_input, &response_snapshot, now)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster join registration response projection".to_string(),
+            detail: format!("join response projection task failed: {source}"),
+        })??;
     let write_paths = paths.clone();
-    let write_state = prepared.state.clone();
+    let write_state = response_state.clone();
     runtime
         .spawn_blocking(move || write_cluster_state(&write_paths, &write_state))
         .await
@@ -320,12 +740,17 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             operation: "write cluster state".to_string(),
             detail: format!("cluster state write task failed: {source}"),
         })??;
-    if join_registration_should_remember_successful_targets(&prepared.state, &request.invite) {
-        host.remember_successful_join_targets_async(paths, &prepared.state, &request.members)
+    if join_registration_should_remember_successful_targets(&response_state, &request.invite) {
+        host.remember_successful_join_targets_async(paths, &response_state, &request.members)
             .await?;
     }
-    prepared.kv_snapshot = Some(snapshot);
-    Ok(prepared)
+    Ok(ClusterJoinRegistrationResponse {
+        accepted: true,
+        detail: "join registered".to_string(),
+        state: response_state,
+        kv_snapshot: Some(snapshot),
+        responder_node_id: None,
+    })
 }
 
 pub fn send_cluster_join_registration_over_membership_rpc<S>(
@@ -992,11 +1417,43 @@ pub trait ClusterJoinRegistrationHost {
         request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError>;
 
-    fn commit_join_registration_state(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<KvSnapshot, NetworkError>;
+        _state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "join registration host cannot prove current authority for {}",
+                paths.root.display()
+            ),
+        })
+    }
+
+    fn commit_join_registration_txn(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+        _request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+        Err(NetworkError::ClusterReadOnly {
+            detail: "join registration host cannot commit fenced membership changes".to_string(),
+        })
+    }
+
+    fn admit_cluster_raft_learner(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        _now: OffsetDateTime,
+    ) -> Result<KvSnapshot, NetworkError> {
+        Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "join registration host cannot admit `{node_id}` through the Raft config lifecycle"
+            ),
+        })
+    }
 
     fn remember_successful_join_targets(
         &mut self,
@@ -1051,11 +1508,62 @@ pub trait ClusterJoinRegistrationAsyncHost: ClusterSignedObjectRpcAsyncHost {
         Box::pin(async { Ok(None) })
     }
 
-    fn commit_join_registration_state_async<'a>(
+    fn authoritative_cluster_kv_snapshot_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
+        state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, KvAuthoritativeRead<KvSnapshot>> {
+        Box::pin(async move {
+            let result = self
+                .commit_join_registration_txn_async(
+                    paths,
+                    state,
+                    KvTxnRequest::generated(KvTxn {
+                        compares: Vec::new(),
+                        success: Vec::new(),
+                        failure: Vec::new(),
+                    }),
+                )
+                .await?;
+            if !matches!(
+                result.authority.basis,
+                sinomo_kv::KvAuthorityBasis::CurrentTermQuorum { .. }
+            ) {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail:
+                        "join registration authoritative read lacked a current-term quorum barrier"
+                            .to_string(),
+                });
+            }
+            Ok(KvAuthoritativeRead {
+                value: result.snapshot,
+                authority: result.authority,
+            })
+        })
+    }
+
+    fn commit_join_registration_txn_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult>;
+
+    fn admit_cluster_raft_learner_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+        node_id: &'a NodeId,
+        _now: OffsetDateTime,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "join registration host cannot admit `{node_id}` through the Raft config lifecycle"
+                ),
+            })
+        })
+    }
 
     fn remember_successful_join_targets_async<'a>(
         &'a mut self,
@@ -1164,12 +1672,46 @@ where
         )
     }
 
-    fn commit_join_registration_state(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        ClusterJoinRegistrationHost::authoritative_cluster_kv_snapshot(
+            &mut self.driver,
+            paths,
+            state,
+        )
+    }
+
+    fn commit_join_registration_txn(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+        ClusterJoinRegistrationHost::commit_join_registration_txn(
+            &mut self.driver,
+            paths,
+            state,
+            request,
+        )
+    }
+
+    fn admit_cluster_raft_learner(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        now: OffsetDateTime,
     ) -> Result<KvSnapshot, NetworkError> {
-        ClusterJoinRegistrationHost::commit_join_registration_state(&mut self.driver, paths, state)
+        ClusterJoinRegistrationHost::admit_cluster_raft_learner(
+            &mut self.driver,
+            paths,
+            state,
+            node_id,
+            now,
+        )
     }
 
     fn remember_successful_join_endpoint(
@@ -1234,12 +1776,40 @@ where
         )
     }
 
-    fn commit_join_registration_state(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+    }
+
+    fn commit_join_registration_txn(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+        ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(self, paths, state, request)
+    }
+
+    fn admit_cluster_raft_learner(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        now: OffsetDateTime,
     ) -> Result<KvSnapshot, NetworkError> {
-        sync_cluster_state_to_kv_with_host(paths, state, self)
+        update_cluster_state_authority_with_host(
+            paths,
+            state.clone(),
+            node_id.clone(),
+            ClusterMemberRole::Learner,
+            now,
+            self,
+        )?;
+        ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+            .map(|read| read.value)
     }
 
     fn remember_successful_join_endpoint(

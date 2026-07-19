@@ -126,11 +126,7 @@ impl KvEntryIndex {
         self.entries.remove(key)
     }
 
-    fn try_insert(
-        &mut self,
-        entry: KvEntry,
-        operation: &str,
-    ) -> Result<Option<KvEntry>, KvError> {
+    fn try_insert(&mut self, entry: KvEntry, operation: &str) -> Result<Option<KvEntry>, KvError> {
         let key = try_clone_kv_string(&entry.key, operation)?;
         Ok(self.entries.insert(key, entry))
     }
@@ -188,11 +184,7 @@ impl KvLeaseIndex {
         self.leases.insert(lease.lease_id, lease)
     }
 
-    fn try_insert(
-        &mut self,
-        lease: KvLease,
-        operation: &str,
-    ) -> Result<Option<KvLease>, KvError> {
+    fn try_insert(&mut self, lease: KvLease, operation: &str) -> Result<Option<KvLease>, KvError> {
         self.try_reserve_insert(lease.lease_id, operation)?;
         Ok(self.insert_reserved(lease))
     }
@@ -283,10 +275,7 @@ impl KvLeaseDeadlineIndex {
         lease_clock: u64,
         candidates: &mut Vec<LeaseId>,
     ) -> Result<(), KvError> {
-        for (_, lease_ids) in self
-            .deadlines
-            .range(..=lease_clock)
-        {
+        for (_, lease_ids) in self.deadlines.range(..=lease_clock) {
             for lease_id in lease_ids {
                 try_reserve_kv_items(candidates, 1, "collect expired lease candidates")?;
                 candidates.push(*lease_id);
@@ -394,12 +383,7 @@ impl KvWatchPrefixIndex {
         self.watch_ids_by_prefix.get(prefix)
     }
 
-    fn try_add(
-        &mut self,
-        watch_id: WatchId,
-        prefix: &str,
-        operation: &str,
-    ) -> Result<(), KvError> {
+    fn try_add(&mut self, watch_id: WatchId, prefix: &str, operation: &str) -> Result<(), KvError> {
         self.watch_ids_by_prefix
             .entry(try_clone_kv_string(prefix, operation)?)
             .or_default()
@@ -432,6 +416,9 @@ pub struct InProcessKvStore {
     pub(crate) watches: KvWatchIndex,
     pub(crate) watch_prefixes: KvWatchPrefixIndex,
     pub(crate) next_watch_id: u64,
+    pub(crate) committed_requests: BTreeMap<KvRequestId, KvCommittedRequestRecord>,
+    pub(crate) expired_request_ids: BTreeSet<KvRequestId>,
+    pub(crate) expired_request_order: VecDeque<KvRequestId>,
 }
 
 impl InProcessKvStore {
@@ -445,6 +432,70 @@ impl InProcessKvStore {
 
     pub fn compacted_revision(&self) -> KvRevision {
         self.compacted_revision
+    }
+
+    pub fn committed_request(&self, request_id: &KvRequestId) -> Option<&KvCommittedRequestRecord> {
+        self.committed_requests.get(request_id)
+    }
+
+    pub fn request_id_expired(&self, request_id: &KvRequestId) -> bool {
+        self.expired_request_ids.contains(request_id)
+    }
+
+    pub(crate) fn record_committed_request(
+        &mut self,
+        record: KvCommittedRequestRecord,
+    ) -> Result<(), KvError> {
+        if self.request_id_expired(&record.request_id) {
+            return Err(KvError::RequestExpired {
+                request_id: record.request_id,
+            });
+        }
+        if let Some(existing) = self.committed_requests.get(&record.request_id) {
+            if existing.command_digest != record.command_digest {
+                return Err(KvError::RequestIdConflict {
+                    request_id: record.request_id,
+                });
+            }
+            return Ok(());
+        }
+        self.committed_requests
+            .insert(record.request_id.clone(), record);
+        while self.committed_requests.len() > MAX_COMMITTED_KV_REQUESTS
+            || self.committed_request_encoded_bytes()? > MAX_COMMITTED_KV_REQUEST_BYTES
+        {
+            let Some(expired_id) = self
+                .committed_requests
+                .values()
+                .min_by_key(|record| record.log_index)
+                .map(|record| record.request_id.clone())
+            else {
+                break;
+            };
+            self.committed_requests.remove(&expired_id);
+            if self.expired_request_ids.insert(expired_id.clone()) {
+                self.expired_request_order.push_back(expired_id);
+            }
+            while self.expired_request_order.len() > MAX_EXPIRED_KV_REQUEST_TOMBSTONES {
+                if let Some(expired_id) = self.expired_request_order.pop_front() {
+                    self.expired_request_ids.remove(&expired_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn committed_request_encoded_bytes(&self) -> Result<usize, KvError> {
+        let mut total = 0_usize;
+        for record in self.committed_requests.values() {
+            total = total
+                .checked_add(encode_kv_value(record)?.len())
+                .ok_or_else(|| KvError::ResourceExhausted {
+                    operation: "measure committed KV request records".to_string(),
+                    requested_bytes: usize::MAX,
+                })?;
+        }
+        Ok(total)
     }
 
     pub fn event_history_len(&self) -> usize {
@@ -548,7 +599,8 @@ impl InProcessKvStore {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<T>, KvError> {
-        let entries = self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?;
+        let entries =
+            self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?;
         let mut values = Vec::new();
         try_reserve_kv_items(&mut values, entries.len(), "decode limited kv prefix range")?;
         for entry in entries {
@@ -678,17 +730,23 @@ impl InProcessKvStore {
         validate_kv_command_payload(&command)?;
         match command {
             KvCommand::Op(op) => {
-                self.apply_op(op)?;
+                // A fresh logical request still receives its own committed
+                // Raft record, but replaying the state-machine operation must
+                // preserve no-effect semantics: no revision bump or event.
+                if self.no_effect_response_for_op(&op).is_none() {
+                    self.apply_op(op)?;
+                }
                 Ok((self.revision, None))
             }
             KvCommand::Txn(txn) => {
                 let response = self.txn(txn)?;
                 Ok((response.revision, Some(response)))
             }
+            KvCommand::Barrier => Ok((self.revision, None)),
         }
     }
 
-    fn preflight_apply_command(&self, command: &KvCommand) -> Result<(), KvError> {
+    pub(crate) fn preflight_apply_command(&self, command: &KvCommand) -> Result<(), KvError> {
         validate_kv_command_payload(command)?;
         match command {
             KvCommand::Op(op) => self.validate_ops(std::slice::from_ref(op)),
@@ -703,6 +761,7 @@ impl InProcessKvStore {
                 };
                 self.validate_ops(ops)
             }
+            KvCommand::Barrier => Ok(()),
         }
     }
 
@@ -798,7 +857,11 @@ impl InProcessKvStore {
 
     pub fn try_snapshot(&self) -> Result<KvSnapshot, KvError> {
         let mut entries = Vec::new();
-        try_reserve_kv_items(&mut entries, self.entries.len(), "build kv snapshot entries")?;
+        try_reserve_kv_items(
+            &mut entries,
+            self.entries.len(),
+            "build kv snapshot entries",
+        )?;
         for entry in self.entries.values() {
             entries.push(try_clone_kv_entry(entry, "build kv snapshot entries")?);
         }
@@ -815,28 +878,62 @@ impl InProcessKvStore {
             entries,
             leases: self.try_current_leases_for_snapshot()?,
             events,
+            committed_requests: self.committed_requests.values().cloned().collect(),
+            expired_requests: self.expired_request_order.iter().cloned().collect(),
         })
     }
 
     pub fn restore(snapshot: KvSnapshot) -> Result<Self, KvError> {
+        snapshot.validate_resource_bounds()?;
+        let KvSnapshot {
+            revision,
+            compacted_revision,
+            entries: snapshot_entries,
+            leases: snapshot_leases,
+            events: snapshot_events,
+            committed_requests: snapshot_committed_requests,
+            expired_requests: snapshot_expired_requests,
+        } = snapshot;
         let mut entries = KvEntryIndex::default();
-        for entry in snapshot.entries {
+        for entry in snapshot_entries {
             entries.try_insert(entry, "restore kv snapshot entries")?;
         }
         let lease_keys = build_lease_key_index(entries.values())?;
         let mut leases = KvLeaseIndex::default();
-        for lease in snapshot.leases {
+        for lease in snapshot_leases {
             leases.try_insert(lease, "restore kv snapshot leases")?;
         }
         let (lease_deadline_by_id, lease_deadlines) = build_lease_deadline_index(&leases, 0)?;
         let mut events = Vec::new();
-        try_reserve_kv_items(&mut events, snapshot.events.len(), "restore kv snapshot events")?;
-        for event in snapshot.events {
+        try_reserve_kv_items(
+            &mut events,
+            snapshot_events.len(),
+            "restore kv snapshot events",
+        )?;
+        for event in snapshot_events {
             events.push(Arc::new(event));
         }
+        let mut committed_requests = BTreeMap::new();
+        for record in snapshot_committed_requests {
+            if let Some(existing) = committed_requests.get(&record.request_id)
+                && existing != &record
+            {
+                return Err(KvError::RequestIdConflict {
+                    request_id: record.request_id,
+                });
+            }
+            committed_requests.insert(record.request_id.clone(), record);
+        }
+        let mut expired_request_order = VecDeque::new();
+        let mut expired_request_ids = BTreeSet::new();
+        for request_id in snapshot_expired_requests {
+            if expired_request_ids.insert(request_id.clone()) {
+                expired_request_order.push_back(request_id);
+            }
+        }
         Ok(Self {
-            revision: snapshot.revision,
-            compacted_revision: snapshot.compacted_revision,
+            revision,
+            compacted_revision,
             entries,
             events,
             leases,
@@ -847,6 +944,9 @@ impl InProcessKvStore {
             watches: KvWatchIndex::default(),
             watch_prefixes: KvWatchPrefixIndex::default(),
             next_watch_id: 1,
+            committed_requests,
+            expired_request_ids,
+            expired_request_order,
         })
     }
 
@@ -1101,11 +1201,7 @@ impl InProcessKvStore {
                             *state = SimulatedKeyState::ABSENT;
                         }
                     }
-                    try_reserve_kv_items(
-                        &mut revoked_leases,
-                        1,
-                        "track simulated revoked lease",
-                    )?;
+                    try_reserve_kv_items(&mut revoked_leases, 1, "track simulated revoked lease")?;
                     revoked_leases.push(*lease_id);
                 }
             }
@@ -1167,9 +1263,7 @@ impl InProcessKvStore {
             false
         };
         if let Err(error) = self.entries.try_insert(entry, "insert kv entry") {
-            if added_lease_key
-                && let Some(lease_id) = lease_id
-            {
+            if added_lease_key && let Some(lease_id) = lease_id {
                 self.remove_lease_key(lease_id, &key);
             }
             return Err(error);
@@ -1252,12 +1346,7 @@ impl InProcessKvStore {
         let mut count = 0_usize;
         for entry in self.entries.prefix_entries(prefix) {
             if self
-                .simulated_key_state(
-                    &entry.key,
-                    touched_keys,
-                    deleted_prefixes,
-                    revoked_leases,
-                )
+                .simulated_key_state(&entry.key, touched_keys, deleted_prefixes, revoked_leases)
                 .present
             {
                 count = count.saturating_add(1);
@@ -1713,6 +1802,7 @@ fn try_clone_kv_log_entry(entry: &KvLogEntry, operation: &str) -> Result<KvLogEn
     Ok(KvLogEntry {
         index: entry.index,
         term: entry.term,
+        request_id: entry.request_id.clone(),
         command: try_clone_kv_command(&entry.command, operation)?,
         revision: entry.revision,
     })
@@ -1767,7 +1857,10 @@ impl KvRaftNodeIndex {
         let mut online = BTreeSet::new();
         for node_id in voters.iter() {
             let node_id = try_clone_kv_node_id(node_id, "initialize raft node id")?;
-            online.insert(try_clone_kv_node_id(&node_id, "initialize raft online node id")?);
+            online.insert(try_clone_kv_node_id(
+                &node_id,
+                "initialize raft online node id",
+            )?);
             nodes.insert(node_id, ReplicatedKvNode::empty());
         }
         Ok(Self { nodes, online })
@@ -1901,11 +1994,9 @@ impl InProcessRaftKvCluster {
 
     pub fn txn_response(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
         let outcome = self.propose_command(KvCommand::Txn(txn))?;
-        Ok(outcome.txn_response.unwrap_or_else(|| KvTxnResponse {
-            succeeded: true,
-            revision: outcome.revision,
-            responses: Vec::new(),
-        }))
+        outcome.txn_response.ok_or_else(|| KvError::Serialization {
+            detail: "committed KV transaction omitted its transaction response".to_string(),
+        })
     }
 
     fn propose_command(&mut self, command: KvCommand) -> Result<RaftCommitOutcome, KvError> {
@@ -1927,6 +2018,7 @@ impl InProcessRaftKvCluster {
         let entry = KvLogEntry {
             index,
             term: self.term,
+            request_id: KvRequestId::generate(),
             command,
             revision: KvRevision::ZERO,
         };
@@ -2115,10 +2207,14 @@ impl InProcessRaftKvCluster {
         let term = self.term;
         for node in self.nodes.values_mut() {
             node.hard_state.current_term = term;
-            node.hard_state.voted_for =
-                Some(try_clone_kv_node_id(&new_leader_id, "record transferred raft vote")?);
-            node.hard_state.leader_id =
-                Some(try_clone_kv_node_id(&new_leader_id, "record transferred raft leader")?);
+            node.hard_state.voted_for = Some(try_clone_kv_node_id(
+                &new_leader_id,
+                "record transferred raft vote",
+            )?);
+            node.hard_state.leader_id = Some(try_clone_kv_node_id(
+                &new_leader_id,
+                "record transferred raft leader",
+            )?);
         }
         Ok(())
     }
@@ -2170,8 +2266,10 @@ impl InProcessRaftKvCluster {
         for node in self.nodes.values_mut() {
             if node.hard_state.current_term <= self.term {
                 node.hard_state.current_term = self.term;
-                node.hard_state.leader_id =
-                    Some(try_clone_kv_node_id(&candidate_id, "record elected raft leader")?);
+                node.hard_state.leader_id = Some(try_clone_kv_node_id(
+                    &candidate_id,
+                    "record elected raft leader",
+                )?);
             }
         }
         Ok(true)
@@ -2494,7 +2592,9 @@ impl ReplicatedKvNode {
             validate_kv_command_payload(&entry.command)?;
             if entry.index <= self.applied_index {
                 if let Some(existing) = self.log_entry_at(entry.index)
-                    && (existing.term != entry.term || existing.command != entry.command)
+                    && (existing.term != entry.term
+                        || existing.request_id != entry.request_id
+                        || existing.command != entry.command)
                 {
                     return Err(KvError::ConflictingLogEntry { index: entry.index });
                 }
@@ -2512,7 +2612,10 @@ impl ReplicatedKvNode {
                     try_reserve_kv_items(&mut appended, 1, "record appended raft entry")?;
                     appended.push(entry);
                 }
-                Ok(existing_position) if self.log[existing_position].command != entry.command => {
+                Ok(existing_position)
+                    if self.log[existing_position].request_id != entry.request_id
+                        || self.log[existing_position].command != entry.command =>
+                {
                     return Err(KvError::ConflictingLogEntry { index: entry.index });
                 }
                 Ok(_) => {}
@@ -2569,6 +2672,23 @@ impl ReplicatedKvNode {
         }
         if term > self.hard_state.current_term {
             self.hard_state.voted_for = None;
+        }
+        if term == self.hard_state.current_term
+            && self
+                .hard_state
+                .leader_id
+                .as_ref()
+                .is_some_and(|known_leader| known_leader != &leader_id)
+        {
+            return Ok(RaftAppendEntriesPreparation {
+                response: RaftAppendEntriesResponse {
+                    term: self.hard_state.current_term,
+                    success: false,
+                    match_index: self.last_log_index(),
+                },
+                appended_entries: Vec::new(),
+                commit_index: None,
+            });
         }
         self.hard_state.current_term = term;
         self.hard_state.leader_id = Some(leader_id);
@@ -2686,7 +2806,11 @@ impl ReplicatedKvNode {
             .log
             .partition_point(|entry| entry.index <= commit_index);
         let mut entries = Vec::new();
-        try_reserve_kv_items(&mut entries, end.saturating_sub(start), "collect commit entries")?;
+        try_reserve_kv_items(
+            &mut entries,
+            end.saturating_sub(start),
+            "collect commit entries",
+        )?;
         for entry in &self.log[start..end] {
             entries.push(try_clone_kv_log_entry(entry, "collect commit entries")?);
         }
@@ -2710,15 +2834,56 @@ impl ReplicatedKvNode {
     pub(crate) fn preflight_commit_entries(&self, entries: &[KvLogEntry]) -> Result<(), KvError> {
         match entries {
             [] => Ok(()),
-            [entry] => self.store.preflight_apply_command(&entry.command),
+            [entry] => self.preflight_commit_entry(entry),
             _ => {
                 let mut store = self.store.clone();
                 for entry in entries {
-                    store.apply_command_with_response(entry.command.clone())?;
+                    if store.request_id_expired(&entry.request_id) {
+                        return Err(KvError::RequestExpired {
+                            request_id: entry.request_id.clone(),
+                        });
+                    }
+                    let digest = kv_command_digest(&entry.command)?;
+                    if let Some(existing) = store.committed_request(&entry.request_id) {
+                        if existing.command_digest != digest {
+                            return Err(KvError::RequestIdConflict {
+                                request_id: entry.request_id.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    let (revision, txn_response) =
+                        store.apply_command_with_response(entry.command.clone())?;
+                    store.record_committed_request(KvCommittedRequestRecord {
+                        request_id: entry.request_id.clone(),
+                        command_digest: digest,
+                        term: entry.term,
+                        log_index: entry.index,
+                        revision,
+                        txn_response,
+                    })?;
                 }
                 Ok(())
             }
         }
+    }
+
+    fn preflight_commit_entry(&self, entry: &KvLogEntry) -> Result<(), KvError> {
+        if self.store.request_id_expired(&entry.request_id) {
+            return Err(KvError::RequestExpired {
+                request_id: entry.request_id.clone(),
+            });
+        }
+        let digest = kv_command_digest(&entry.command)?;
+        if let Some(existing) = self.store.committed_request(&entry.request_id) {
+            if existing.command_digest != digest {
+                return Err(KvError::RequestIdConflict {
+                    request_id: entry.request_id.clone(),
+                });
+            }
+            return Ok(());
+        }
+        self.store.preflight_apply_command(&entry.command)
     }
 
     pub(crate) fn apply_preflighted_commit(
@@ -2742,7 +2907,29 @@ impl ReplicatedKvNode {
         &mut self,
         entry: KvLogEntry,
     ) -> Result<(), KvError> {
-        let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
+        let digest = kv_command_digest(&entry.command)?;
+        let (revision, txn_response) = if let Some(existing) =
+            self.store.committed_request(&entry.request_id)
+        {
+            if existing.command_digest != digest {
+                return Err(KvError::RequestIdConflict {
+                    request_id: entry.request_id,
+                });
+            }
+            (existing.revision, existing.txn_response.clone())
+        } else {
+            let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
+            self.store
+                .record_committed_request(KvCommittedRequestRecord {
+                    request_id: entry.request_id.clone(),
+                    command_digest: digest,
+                    term: entry.term,
+                    log_index: entry.index,
+                    revision,
+                    txn_response: txn_response.clone(),
+                })?;
+            (revision, txn_response)
+        };
         if let Some(log_entry) = self.log_entry_at_mut(entry.index) {
             log_entry.revision = revision;
         }

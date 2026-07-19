@@ -5,22 +5,23 @@ use crate::control_plane_options::ClusterRaftAppendReplicationOptions;
 use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
-    LocalClusterRaftCommandStorage, append_cluster_raft_command_uncommitted_or_no_effect_async,
+    LocalClusterRaftCommandStorage, append_cluster_raft_request_uncommitted_async,
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
+    replay_cluster_raft_request_if_committed_async,
 };
+use crate::local_state_store::project_committed_cluster_raft_config;
 use crate::member_store::merge_cluster_state_from_peer;
 use crate::prelude::*;
 #[cfg(any(test, feature = "test-support"))]
 use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
-#[allow(unused_imports)]
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterRaftAppendRequest,
     ClusterRaftAppendResponse,
 };
-use sinomo_kv::{KvCommand, KvEvent};
+use sinomo_kv::{KvCommandRequest, KvEvent, KvSnapshot};
 use sinomo_network::ClusterConnectivityState;
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
@@ -255,13 +256,47 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
         crate::kv_local_store::kv_err(error)
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<sinomo_kv::ClusterKvRaftUncommittedAppend, NetworkError> {
-        sinomo_kv::ClusterKvRaftCommandStorage::append_cluster_raft_command_uncommitted_or_no_effect(
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, sinomo_kv::KvCommittedRequestRecord)>, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::replay_cluster_raft_request_if_committed(
             &mut self.storage,
-            command,
+            request,
+        )
+    }
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<sinomo_kv::KvLogEntry, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::append_cluster_raft_request_uncommitted(
+            &mut self.storage,
+            request,
+        )
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &sinomo_kv::KvAuthorityFailure,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::record_cluster_raft_request_rejected_before_commit(
+            &mut self.storage,
+            request,
+            failure,
+        )
+    }
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::record_cluster_raft_request_unknown(
+            &mut self.storage,
+            request,
+            detail,
         )
     }
 
@@ -363,7 +398,7 @@ where
 pub fn commit_cluster_raft_command_with_local_storage_and_transport<S, R, F, O>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    command: KvCommand,
+    request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     control_plane_timeouts: ClusterControlPlaneTimeouts,
     send_raft_append: S,
@@ -389,7 +424,7 @@ where
         fan_out_committed_cluster_raft_command,
         on_raft_append_sent,
     };
-    commit_cluster_raft_command_with_quorum_driver(paths, state, command, options, &mut host)
+    commit_cluster_raft_command_with_quorum_driver(paths, state, request, options, &mut host)
 }
 
 struct DriverNodeRaftAppendReplicationHost<'a, T> {
@@ -417,6 +452,20 @@ where
             .kv_paths()
             .locked_last_raft_log_index(&state.local_node_id)
             .map_err(kv_err)
+    }
+
+    fn raft_peer_progress_next_index_hint(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target: &Self::Target,
+        last_local_raft_log_index: u64,
+    ) -> Option<u64> {
+        sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint(
+            &self.paths.kv_paths(),
+            target,
+            state.term,
+            last_local_raft_log_index,
+        )
     }
 
     fn build_raft_append_request(
@@ -467,13 +516,47 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
         crate::kv_local_store::kv_err(error)
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<sinomo_kv::ClusterKvRaftUncommittedAppend, NetworkError> {
-        sinomo_kv::ClusterKvRaftCommandStorage::append_cluster_raft_command_uncommitted_or_no_effect(
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, sinomo_kv::KvCommittedRequestRecord)>, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::replay_cluster_raft_request_if_committed(
             &mut self.storage,
-            command,
+            request,
+        )
+    }
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<sinomo_kv::KvLogEntry, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::append_cluster_raft_request_uncommitted(
+            &mut self.storage,
+            request,
+        )
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &sinomo_kv::KvAuthorityFailure,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::record_cluster_raft_request_rejected_before_commit(
+            &mut self.storage,
+            request,
+            failure,
+        )
+    }
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::record_cluster_raft_request_unknown(
+            &mut self.storage,
+            request,
+            detail,
         )
     }
 
@@ -578,7 +661,7 @@ where
 pub(crate) fn commit_cluster_raft_command_with_control_plane_driver<T>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    command: KvCommand,
+    request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     driver: &mut ClusterControlPlaneDriver<T>,
 ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
@@ -589,7 +672,34 @@ where
         storage: LocalClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
         driver,
     };
-    commit_cluster_raft_command_with_quorum_driver(paths, state, command, options, &mut host)
+    commit_cluster_raft_command_with_quorum_driver(paths, state, request, options, &mut host)
+}
+
+pub(crate) fn catch_up_cluster_raft_member_with_control_plane_driver<T>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    driver: &mut ClusterControlPlaneDriver<T>,
+) -> Result<ClusterRaftAppendResponse, NetworkError>
+where
+    T: ClusterControlPlaneTransport,
+{
+    let options = driver
+        .timeouts
+        .raft_append_replication_options(driver.timeouts.raft_append_timeout);
+    let mut host = DriverNodeRaftAppendReplicationHost {
+        paths,
+        options,
+        transport: &mut driver.transport,
+    };
+    sinomo_kv::replicate_cluster_kv_raft_to_target_with_host(
+        state,
+        target_node_id,
+        &[],
+        options.kv_options(),
+        &mut host,
+    )
+    .map(|outcome| outcome.response)
 }
 
 struct NetworkClusterKvRaftQuorumCommitHost<'a, H> {
@@ -649,12 +759,36 @@ where
         .map_err(kv_err)
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<sinomo_kv::ClusterKvRaftUncommittedAppend, NetworkError> {
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, sinomo_kv::KvCommittedRequestRecord)>, NetworkError> {
+        self.host.replay_cluster_raft_request_if_committed(request)
+    }
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<sinomo_kv::KvLogEntry, NetworkError> {
+        self.host.append_cluster_raft_request_uncommitted(request)
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &sinomo_kv::KvAuthorityFailure,
+    ) -> Result<(), NetworkError> {
         self.host
-            .append_cluster_raft_command_uncommitted_or_no_effect(command)
+            .record_cluster_raft_request_rejected_before_commit(request, failure)
+    }
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), NetworkError> {
+        self.host
+            .record_cluster_raft_request_unknown(request, detail)
     }
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
@@ -685,6 +819,16 @@ where
     H: ClusterRaftQuorumCommitHost,
 {
     type Target = NodeId;
+
+    fn local_has_verified_raft_leadership(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        self.paths
+            .kv_paths()
+            .locked_raft_local_is_leader(state)
+            .map_err(kv_err)
+    }
 
     fn remote_voter_targets(
         &mut self,
@@ -762,20 +906,32 @@ where
         Ok(())
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> NetworkError {
-        NetworkError::ClusterReadOnly { detail }
+    fn cluster_authority_error(&mut self, failure: sinomo_kv::KvAuthorityFailure) -> NetworkError {
+        NetworkError::ClusterReadOnly {
+            detail: serde_json::to_string(&failure).unwrap_or_else(|_| format!("{failure:?}")),
+        }
     }
 }
 
 pub fn commit_cluster_raft_command_with_quorum_driver(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    command: KvCommand,
+    request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     host: &mut impl ClusterRaftQuorumCommitHost,
 ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
+    let mut consensus_state = state.clone();
+    project_committed_cluster_raft_config(paths, &mut consensus_state)?;
     let mut kv_host = NetworkClusterKvRaftQuorumCommitHost { paths, host };
-    sinomo_kv::commit_cluster_kv_raft_command_with_quorum(state, command, options, &mut kv_host)
+    let result = sinomo_kv::commit_cluster_kv_raft_command_with_quorum(
+        &mut consensus_state,
+        request,
+        options,
+        &mut kv_host,
+    )?;
+    state.term = state.term.max(consensus_state.term);
+    state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
+    Ok(result)
 }
 
 struct AsyncNodeRaftAppendReplicationHost<'a, H> {
@@ -801,6 +957,28 @@ where
         state: &'a ClusterBootstrapState,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
         self.host.last_local_raft_log_index_async(self.paths, state)
+    }
+
+    fn raft_peer_progress_next_index_hint_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        target: &'a Self::Target,
+        last_local_raft_log_index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<u64>, Self::Error> {
+        let paths = self.paths.kv_paths();
+        let peer_node_id = target.clone();
+        let current_term = state.term;
+        Box::pin(async move {
+            Ok(
+                sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint_async(
+                    paths,
+                    peer_node_id,
+                    current_term,
+                    last_local_raft_log_index,
+                )
+                .await,
+            )
+        })
     }
 
     fn build_raft_append_request_async<'a>(
@@ -863,6 +1041,25 @@ where
     }
     type Target = NodeId;
 
+    fn local_has_verified_raft_leadership_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, bool, NetworkError> {
+        let runtime = self.runtime;
+        let kv_paths = self.paths.kv_paths();
+        let state = state.clone();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || kv_paths.locked_raft_local_is_leader(&state))
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "verify local raft leadership".to_string(),
+                    detail: format!("local raft leadership task failed: {source}"),
+                })?
+                .map_err(kv_err)
+        })
+    }
+
     fn lock_cluster_raft_commit_sequence_async<'a>(
         &'a mut self,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<std::fs::File>, NetworkError> {
@@ -886,25 +1083,81 @@ where
         })
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
+    fn replay_cluster_raft_request_if_committed_async<'a>(
         &'a mut self,
-        command: KvCommand,
+        request: &'a KvCommandRequest,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
         'a,
-        sinomo_kv::ClusterKvRaftUncommittedAppend,
+        Option<(KvSnapshot, sinomo_kv::KvCommittedRequestRecord)>,
         NetworkError,
     > {
         let runtime = self.runtime;
         let paths = self.paths;
         let local_node_id = self.local_node_id.clone();
         Box::pin(async move {
-            append_cluster_raft_command_uncommitted_or_no_effect_async(
-                runtime,
-                paths,
-                &local_node_id,
-                command,
-            )
-            .await
+            replay_cluster_raft_request_if_committed_async(runtime, paths, &local_node_id, request)
+                .await
+        })
+    }
+
+    fn append_cluster_raft_request_uncommitted_async<'a>(
+        &'a mut self,
+        request: KvCommandRequest,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, sinomo_kv::KvLogEntry, NetworkError> {
+        let runtime = self.runtime;
+        let paths = self.paths;
+        let local_node_id = self.local_node_id.clone();
+        Box::pin(async move {
+            append_cluster_raft_request_uncommitted_async(runtime, paths, &local_node_id, request)
+                .await
+        })
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit_async<'a>(
+        &'a mut self,
+        request: &'a KvCommandRequest,
+        failure: &'a sinomo_kv::KvAuthorityFailure,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
+        let runtime = self.runtime;
+        let paths = self.paths.clone();
+        let local_node_id = self.local_node_id.clone();
+        let request = request.clone();
+        let failure = failure.clone();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+                        .record_rejected_before_commit(&request, &failure)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "record rejected cluster raft request".to_string(),
+                    detail: format!("record rejected cluster raft request task failed: {source}"),
+                })?
+        })
+    }
+
+    fn record_cluster_raft_request_unknown_async<'a>(
+        &'a mut self,
+        request: &'a KvCommandRequest,
+        detail: &'a str,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
+        let runtime = self.runtime;
+        let paths = self.paths.clone();
+        let local_node_id = self.local_node_id.clone();
+        let request = request.clone();
+        let detail = detail.to_string();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+                        .record_unknown(&request, &detail)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "record unknown cluster raft request".to_string(),
+                    detail: format!("record unknown cluster raft request task failed: {source}"),
+                })?
         })
     }
 
@@ -1083,8 +1336,10 @@ where
         })
     }
 
-    fn cluster_read_only_error(&mut self, detail: String) -> NetworkError {
-        NetworkError::ClusterReadOnly { detail }
+    fn cluster_authority_error(&mut self, failure: sinomo_kv::KvAuthorityFailure) -> NetworkError {
+        NetworkError::ClusterReadOnly {
+            detail: serde_json::to_string(&failure).unwrap_or_else(|_| format!("{failure:?}")),
+        }
     }
 }
 
@@ -1092,7 +1347,7 @@ pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
-    command: KvCommand,
+    request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     append_options: ClusterRaftAppendReplicationOptions,
     host: &mut H,
@@ -1100,18 +1355,33 @@ pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
 where
     H: ClusterRaftQuorumAsyncHost + Send,
 {
+    let project_paths = paths.clone();
+    let mut consensus_state = state.clone();
+    consensus_state = runtime
+        .spawn_blocking(move || {
+            project_committed_cluster_raft_config(&project_paths, &mut consensus_state)?;
+            Ok::<_, NetworkError>(consensus_state)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "project committed cluster Raft config".to_string(),
+            detail: format!("Raft config projection task failed: {source}"),
+        })??;
     let mut kv_host = NetworkClusterKvRaftQuorumCommitAsyncHost {
         runtime,
         paths,
-        local_node_id: state.local_node_id.clone(),
+        local_node_id: consensus_state.local_node_id.clone(),
         append_options,
         host,
     };
-    sinomo_kv::commit_cluster_kv_raft_command_with_quorum_async(
-        state,
-        command,
+    let result = sinomo_kv::commit_cluster_kv_raft_command_with_quorum_async(
+        &mut consensus_state,
+        request,
         options,
         &mut kv_host,
     )
-    .await
+    .await?;
+    state.term = state.term.max(consensus_state.term);
+    state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
+    Ok(result)
 }

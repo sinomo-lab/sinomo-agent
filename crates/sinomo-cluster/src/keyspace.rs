@@ -1,10 +1,11 @@
 use crate::prelude::*;
 use sinomo_kv::KvSnapshot;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use sinomo_node::cluster_node_status_key_matches_record;
 pub(crate) use sinomo_node::{
     cluster_capability_policy_key, cluster_identity_key, cluster_invitation_key,
     cluster_invitation_state_key, cluster_member_key, cluster_node_status_key,
     cluster_node_status_key_for_process, cluster_node_status_key_for_record,
-    cluster_node_status_key_matches_record,
 };
 
 pub(crate) fn cluster_node_status_snapshot_record(

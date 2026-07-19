@@ -2576,11 +2576,10 @@ impl sinomo_runtime::dfs::DfsControlPlaneKvClient for CliDfsControlPlaneKvClient
         let result =
             cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
                 .map_err(|source| self.kv_error(source))?;
-        Ok(result.txn_response.unwrap_or(KvTxnResponse {
-            succeeded: true,
-            revision: result.snapshot.revision,
-            responses: Vec::new(),
-        }))
+        result.txn_response.ok_or_else(|| KvError::Serialization {
+            detail: "cluster KV returned a barrier result for a DFS control-plane transaction"
+                .to_string(),
+        })
     }
 }
 

@@ -22,6 +22,7 @@ mod keyspace;
 mod kv_forward;
 mod kv_local_store;
 mod kv_read_model;
+#[cfg(any(test, feature = "test-support"))]
 mod kv_semantics;
 mod kv_snapshot;
 mod kv_snapshot_observer;
@@ -40,6 +41,7 @@ mod raft_quorum;
 #[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;
+mod reactive_maintenance;
 mod state_authority_reachability;
 mod status_publish;
 
@@ -113,10 +115,12 @@ pub use invite::{
     is_remote_usable_invite_endpoint, push_unique_introducer, sign_cluster_join_invite,
     sort_default_invite_introducers, verify_cluster_join_invite_signature,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use invite_publish::sync_cluster_invitation_to_local_raft_unchecked;
 pub use invite_publish::{
     ClusterInvitePublishHost, handle_cluster_invite_publish_request_async_with_host,
     publish_cluster_invitation_to_quorum_with_host, read_cluster_invitation_for_join_introducer,
-    read_cluster_invitation_from_kv, sync_cluster_invitation_to_kv,
+    read_cluster_invitation_from_kv,
 };
 pub use join_registration::{
     ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationAsyncHost,
@@ -132,7 +136,7 @@ pub use join_registration::{
 pub use kv_local_store::{
     ClusterKvPathsExt, read_cluster_kv_latest_observed_entry,
     read_cluster_kv_latest_observed_prefix_entries, read_cluster_kv_latest_observed_snapshot,
-    read_cluster_kv_latest_observed_snapshot_arc_if_present,
+    read_cluster_kv_latest_observed_snapshot_arc_if_present, read_cluster_kv_local_snapshot,
 };
 pub use kv_read_model::KvClusterDirectory;
 pub use kv_read_model::{
@@ -152,7 +156,10 @@ pub use kv_txn_quorum::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_kv_txn_with_quorum_response_with_host,
+    handle_cluster_kv_authoritative_snapshot_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host,
+    read_cluster_kv_authoritative_snapshot_async_with_host,
+    read_cluster_kv_authoritative_snapshot_with_host,
 };
 pub use local_membership::{
     ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipRefresh,
@@ -163,16 +170,19 @@ pub use local_membership::{
     refresh_local_daemon_membership_from_disk_async,
 };
 pub use local_state_store::{
-    read_cluster_state, read_cluster_state_async, read_cluster_state_cached,
-    read_cluster_state_cached_shared, read_cluster_state_without_kv,
-    read_cluster_state_without_kv_async, read_cluster_state_without_kv_cached_shared,
-    write_cluster_state, write_cluster_state_async,
+    project_committed_cluster_raft_config, read_cluster_consensus_state, read_cluster_state,
+    read_cluster_state_async, read_cluster_state_cached, read_cluster_state_cached_shared,
+    read_cluster_state_without_kv, read_cluster_state_without_kv_async,
+    read_cluster_state_without_kv_cached_shared, write_cluster_state, write_cluster_state_async,
 };
 pub use member_mutation::{
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
     ClusterMemberRemoval, ClusterNodeNameUpdate, ClusterNodeRoleUpdate,
-    ClusterStateAuthorityUpdate, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_state_sync_txn, remove_cluster_members_with_host,
+    ClusterRaftConfigReconciliationReport, ClusterStateAuthorityUpdate,
+    MAX_CLUSTER_RAFT_CONFIG_RECONCILIATIONS_PER_PASS, add_cluster_raft_learner_async_with_host,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
+    reconcile_cluster_raft_config_changes_bounded_with_host,
+    reconcile_cluster_raft_config_changes_with_host, remove_cluster_members_with_host,
     sync_cluster_state_to_kv_async_with_host, sync_cluster_state_to_kv_with_host,
     sync_cluster_state_to_local_kv_unchecked, update_cluster_node_name_with_host,
     update_cluster_node_role_with_host, update_cluster_state_authority_with_host,
@@ -192,17 +202,28 @@ pub use membership_rpc::{
 pub use migration::{
     ClusterMigrationKvImportReport, ClusterMigrationPlanReport, ClusterMigrationQuarantine,
     cluster_migration_kv_import_report_path, cluster_storage_has_live_artifacts,
-    import_node_local_configs_from_source_kv_with_host, plan_cluster_migration,
+    import_node_local_configs_from_source_kv_with_host, plan_cluster_migration_with_host,
     quarantine_cluster_storage_for_leave, quarantine_cluster_storage_for_migration,
-    rollback_cluster_storage_quarantine, write_cluster_migration_record_to_source_kv,
+    rollback_cluster_storage_quarantine, write_cluster_migration_record_to_source_kv_with_host,
     write_local_cluster_migration_record,
 };
 pub use raft_fanout::{
     ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,
     spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
-pub use raft_quorum::ClusterKvQuorumAsyncHost;
+pub use raft_quorum::{ClusterKvQuorumAsyncHost, ClusterRaftQuorumCommitHost};
 pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
+pub use reactive_maintenance::{
+    ClusterControlPlaneMaintenanceDriver, ClusterKvMaintenanceActionResult,
+    ClusterKvMaintenanceCoordinator, ClusterKvMaintenanceHost, ClusterKvMaintenanceOptions,
+    ClusterKvMaintenancePassOutcome, ClusterKvMaintenanceRaftObservation,
+    ClusterKvMaintenanceReport, ClusterKvMaintenanceStep, ClusterKvMaintenanceStepDisposition,
+    ClusterKvMaintenanceStepEvidence, ClusterKvMaintenanceWakeBatch,
+    ClusterKvMaintenanceWakeDisposition, ClusterKvMaintenanceWakeSource,
+    ClusterKvMaintenanceWorkerDisposition, DEFAULT_CLUSTER_KV_MAINTENANCE_MAX_COALESCED_WAKES,
+    DEFAULT_CLUSTER_KV_MAINTENANCE_RETRY_BACKOFF_BASE,
+    DEFAULT_CLUSTER_KV_MAINTENANCE_RETRY_BACKOFF_MAX, run_cluster_kv_maintenance_tick_with_host,
+};
 pub use state_authority_reachability::{
     ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
     ClusterStateAuthorityReachabilityOptions, cluster_has_local_quorum_async_with_host,

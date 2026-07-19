@@ -28,9 +28,7 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::core::{EvaluationOutcome, EventEnvelope};
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, JsonlEventStore, ReplayDirection, ReplayQuery};
-#[cfg(not(test))]
-use sinomo_runtime::kv::KvTxnResponse;
-use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvSnapshot, KvTxn};
+use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvSnapshot, KvTxn, KvTxnRequest};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -780,11 +778,9 @@ fn registry_trusted_signer_cluster_entries(
 
 fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     let _ = paths;
-    if let Some(status) = default_main_daemon_status()?
-        && let Ok(snapshot) =
-            daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
-    {
-        return Ok(snapshot);
+    if let Some(status) = default_main_daemon_status()? {
+        return daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
+            .map_err(Into::into);
     }
     #[cfg(test)]
     {
@@ -832,7 +828,7 @@ fn commit_registry_trust_cluster_txn(
             detail: "clustered trusted signer registry writes require the local daemon".to_string(),
         });
     };
-    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn)
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&KvTxnRequest::generated(txn))
         .map_err(network::NetworkError::directory)?;
     let request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
@@ -842,8 +838,18 @@ fn commit_registry_trust_cluster_txn(
         DAEMON_CLUSTER_KV_TXN_TIMEOUT,
     )?;
     response.error_detail().map_err(CliError::from)?;
-    let _: KvTxnResponse = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)
+    let commit = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)
         .map_err(network::NetworkError::directory)?;
+    let txn_response = commit.txn_response.ok_or_else(|| {
+        CliError::Network(network::NetworkError::ClusterReadOnly {
+            detail: "cluster KV transaction committed without a transaction response".to_string(),
+        })
+    })?;
+    if !txn_response.succeeded {
+        return Err(CliError::Network(network::NetworkError::ClusterReadOnly {
+            detail: "cluster KV transaction compare failed".to_string(),
+        }));
+    }
     Ok(())
 }
 
@@ -886,12 +892,14 @@ fn daemon_fetch_cluster_kv_snapshot(
     address: &str,
     timeout: Duration,
 ) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
-    let payload = sinomo_runtime::kv::cluster_kv_snapshot_rpc_payload()?;
+    let payload = sinomo_runtime::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
     let request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(address, &request, timeout)?;
     response.error_detail()?;
-    sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
+    sinomo_runtime::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+        .map(|read| read.value)
+        .map_err(Into::into)
 }
 
 fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
@@ -917,11 +925,9 @@ fn load_model_config_for_node(
 
 fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     let _ = paths;
-    if let Some(status) = default_main_daemon_status()?
-        && let Ok(snapshot) =
-            daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
-    {
-        return Ok(snapshot);
+    if let Some(status) = default_main_daemon_status()? {
+        return daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
+            .map_err(Into::into);
     }
     #[cfg(test)]
     {

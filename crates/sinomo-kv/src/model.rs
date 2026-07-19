@@ -237,6 +237,7 @@ pub(crate) fn try_clone_kv_command(
     Ok(match command {
         KvCommand::Op(op) => KvCommand::Op(try_clone_kv_op(op, operation)?),
         KvCommand::Txn(txn) => KvCommand::Txn(try_clone_kv_txn(txn, operation)?),
+        KvCommand::Barrier => KvCommand::Barrier,
     })
 }
 
@@ -452,6 +453,39 @@ pub struct LeaseId(pub u64);
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct WatchId(pub u64);
 
+/// Stable identity for a client-visible KV request.
+///
+/// Callers must reuse the same id only when retrying the exact same command.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct KvRequestId(pub Id);
+
+impl KvRequestId {
+    pub fn generate() -> Self {
+        Self(Id::generate())
+    }
+
+    pub fn derived(namespace: &str, value: impl AsRef<[u8]>) -> Self {
+        Self(Id::derived(namespace, value))
+    }
+
+    pub fn as_id(&self) -> &Id {
+        &self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Display for KvRequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct KvCommandDigest(pub [u8; 32]);
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvEntry {
     pub key: String,
@@ -660,11 +694,10 @@ pub fn push_bounded_txn_success_op(ops: &mut Vec<KvOp>, op: KvOp) -> Result<(), 
         .checked_add(1)
         .and_then(|items| items.checked_mul(std::mem::size_of::<KvOp>().max(1)))
         .unwrap_or(usize::MAX);
-    ops.try_reserve(1)
-        .map_err(|_| KvError::ResourceExhausted {
-            operation: "kv transaction success ops".to_string(),
-            requested_bytes,
-        })?;
+    ops.try_reserve(1).map_err(|_| KvError::ResourceExhausted {
+        operation: "kv transaction success ops".to_string(),
+        requested_bytes,
+    })?;
     ops.push(op);
     Ok(())
 }
@@ -676,6 +709,7 @@ pub(crate) fn validate_kv_command_payload(command: &KvCommand) -> Result<(), KvE
             validate_kv_payload_total(kv_op_payload_bytes(op))
         }
         KvCommand::Txn(txn) => validate_kv_txn_payload(txn),
+        KvCommand::Barrier => Ok(()),
     }
 }
 
@@ -699,6 +733,26 @@ pub struct KvTxn {
         deserialize_with = "deserialize_fallible_vec"
     )]
     pub failure: Vec<KvOp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvTxnRequest {
+    pub request_id: KvRequestId,
+    pub txn: KvTxn,
+}
+
+impl KvTxnRequest {
+    pub fn new(request_id: KvRequestId, txn: KvTxn) -> Self {
+        Self { request_id, txn }
+    }
+
+    pub fn generated(txn: KvTxn) -> Self {
+        Self::new(KvRequestId::generate(), txn)
+    }
+
+    pub fn into_command_request(self) -> KvCommandRequest {
+        KvCommandRequest::new(self.request_id, KvCommand::Txn(self.txn))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -776,12 +830,198 @@ pub struct KvSnapshot {
         deserialize_with = "deserialize_fallible_vec"
     )]
     pub events: Vec<KvEvent>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
+    pub committed_requests: Vec<KvCommittedRequestRecord>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
+    pub expired_requests: Vec<KvRequestId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum KvCommand {
     Op(KvOp),
     Txn(KvTxn),
+    /// A current-term no-op used to establish an authoritative read barrier.
+    Barrier,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvCommandRequest {
+    pub request_id: KvRequestId,
+    pub command: KvCommand,
+}
+
+impl KvCommandRequest {
+    pub fn new(request_id: KvRequestId, command: KvCommand) -> Self {
+        Self {
+            request_id,
+            command,
+        }
+    }
+
+    pub fn generated(command: KvCommand) -> Self {
+        Self::new(KvRequestId::generate(), command)
+    }
+
+    pub fn digest(&self) -> Result<KvCommandDigest, KvError> {
+        kv_command_digest(&self.command)
+    }
+}
+
+pub fn kv_command_digest(command: &KvCommand) -> Result<KvCommandDigest, KvError> {
+    let bytes = encode_kv_value(command)?;
+    Ok(KvCommandDigest(*blake3::hash(&bytes).as_bytes()))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvCommittedRequestRecord {
+    pub request_id: KvRequestId,
+    pub command_digest: KvCommandDigest,
+    pub term: u64,
+    pub log_index: u64,
+    pub revision: KvRevision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn_response: Option<KvTxnResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvRequestAttemptState {
+    Submitted,
+    RejectedBeforeCommit { reason: String },
+    Unknown { detail: String },
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvRequestAttemptRecord {
+    pub request_id: KvRequestId,
+    pub command_digest: KvCommandDigest,
+    pub state: KvRequestAttemptState,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvRequestOutcome {
+    Committed(KvCommittedRequestRecord),
+    RejectedBeforeCommit { reason: String },
+    Unknown { detail: String },
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvAuthorityBasis {
+    CurrentTermQuorum {
+        voter_acks: usize,
+        required_quorum: usize,
+    },
+    ExactCommittedRequest,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvAuthorityProof {
+    pub term: u64,
+    pub commit_index: u64,
+    pub revision: KvRevision,
+    pub basis: KvAuthorityBasis,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvLocalRead<T> {
+    pub value: T,
+    pub revision: KvRevision,
+    pub observed_term: u64,
+    pub applied_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_leader: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvAuthoritativeRead<T> {
+    pub value: T,
+    pub authority: KvAuthorityProof,
+}
+
+/// Outcome of one request after a fresh current-term quorum barrier.
+///
+/// Committed history comes from the barrier snapshot. Rejected, unknown, and
+/// expired states may additionally reflect the querying node's durable attempt
+/// ledger, but are returned only after committed history has been ruled out by
+/// the attached authority proof.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterKvRequestOutcomeRead {
+    pub authority: KvAuthorityProof,
+    pub outcome: KvRequestOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvReadAuthority {
+    Local,
+    Authoritative,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvFreshness {
+    Unknown,
+    CurrentTermQuorumConfirmed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvAuthorityFailureReason {
+    LocalNodeNotVoter,
+    NoQuorum,
+    Timeout,
+    HigherTermObserved,
+    VoterRejected,
+    TransportFailure,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvRecoveryAction {
+    RetryWhenQuorumIsReachable,
+    ContactKnownLeader,
+    RefreshClusterState,
+    RunClusterDoctor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvAuthorityDiagnostics {
+    pub local_node_id: NodeId,
+    pub local_role: ClusterMemberRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_leader: Option<NodeId>,
+    pub observed_term: u64,
+    pub reachable_voters: usize,
+    pub required_quorum: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_append_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snapshot_refresh_at: Option<OffsetDateTime>,
+    pub authority: KvReadAuthority,
+    pub revision: KvRevision,
+    pub freshness: KvFreshness,
+    pub suggested_recovery: KvRecoveryAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KvAuthorityFailure {
+    pub reason: KvAuthorityFailureReason,
+    pub detail: String,
+    pub diagnostics: KvAuthorityDiagnostics,
 }
 
 impl Default for KvRevision {
@@ -867,6 +1107,20 @@ pub enum KvError {
         observed_events: usize,
         max_events: usize,
     },
+    #[error(
+        "kv snapshot contains {observed_records} committed request records; max is {max_records}"
+    )]
+    RequestRecordLimit {
+        observed_records: usize,
+        max_records: usize,
+    },
+    #[error(
+        "kv snapshot committed request records use {observed_bytes} encoded bytes; max is {max_bytes}"
+    )]
+    RequestRecordBytesLimit {
+        observed_bytes: usize,
+        max_bytes: usize,
+    },
     #[error("lease {lease_id:?} would have {observed_keys} attached keys; max is {max_keys}")]
     LeaseKeyLimit {
         lease_id: LeaseId,
@@ -916,4 +1170,10 @@ pub enum KvError {
     StaleLeadershipTerm { term: u64, current_term: u64 },
     #[error("invalid raft config transition: {detail}")]
     InvalidRaftConfigTransition { detail: String },
+    #[error("KV request id {request_id} was reused for a different command")]
+    RequestIdConflict { request_id: KvRequestId },
+    #[error("KV request id {request_id} expired from idempotency retention")]
+    RequestExpired { request_id: KvRequestId },
+    #[error("cluster KV authority unavailable: {detail}")]
+    AuthorityUnavailable { detail: String },
 }

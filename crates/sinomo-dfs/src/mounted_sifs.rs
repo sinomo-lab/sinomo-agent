@@ -760,10 +760,13 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
         let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
+        let request = sinomo_core::kv::KvTxnRequest::generated(txn);
         let rpc_payload =
-            sinomo_core::kv::cluster_kv_txn_rpc_payload(&txn).map_err(|source| KvError::Io {
-                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-                detail: source.to_string(),
+            sinomo_core::kv::cluster_kv_txn_rpc_payload(&request).map_err(|source| {
+                KvError::Io {
+                    path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
+                    detail: source.to_string(),
+                }
             })?;
         let request = object_rpc_request_from_kv_payload(rpc_payload);
         let response = self
@@ -784,12 +787,18 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         response
             .error_detail()
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
-        sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(|source| {
-            KvError::Io {
-                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-                detail: source.to_string(),
-            }
-        })
+        let result =
+            sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(|source| {
+                KvError::Io {
+                    path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+        result
+            .txn_response
+            .ok_or_else(|| KvError::AuthorityUnavailable {
+                detail: "cluster KV transaction response omitted its committed result".to_string(),
+            })
     }
 
     fn linearizable_compare_value(

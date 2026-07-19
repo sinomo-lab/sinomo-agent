@@ -64,7 +64,7 @@ use super::{
     daemon_handle_daemon_sandbox_toolchain_add_command,
     daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_write,
 };
-use crate::commands::{read_cluster_kv_snapshot, read_cluster_state};
+use crate::commands::{read_cluster_kv_local_snapshot_for_test, read_cluster_state};
 use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, ProviderReasoningEffort,
@@ -104,7 +104,9 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::events::{
     EventId, EventStore, InMemoryEventStore, JsonlEventStore, ReplayQuery, SessionId,
 };
-use sinomo_runtime::kv::{InProcessKvStore, KvCommand, KvCompare, KvOp, KvRevision, KvTxn};
+use sinomo_runtime::kv::{
+    InProcessKvStore, KvCommand, KvCompare, KvOp, KvRevision, KvTxn, KvTxnRequest,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::{
     MODULE_SHADOW_DECISION_EVENT_KIND, ModuleReplayCaseOutcome, ModuleReplayReport,
@@ -318,13 +320,36 @@ impl cluster::ClusterLocalMemberPublishHost for CliLocalMemberPublishHost {
         true
     }
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<
+        sinomo_runtime::kv::KvAuthoritativeRead<sinomo_runtime::kv::KvSnapshot>,
+        network::NetworkError,
+    > {
+        let result = super::cli_commit_cluster_kv_request_with_quorum_response(
+            paths,
+            state,
+            KvTxnRequest::generated(sinomo_runtime::kv::KvTxn {
+                compares: Vec::new(),
+                success: Vec::new(),
+                failure: Vec::new(),
+            }),
+        )?;
+        Ok(sinomo_runtime::kv::KvAuthoritativeRead {
+            value: result.snapshot,
+            authority: result.authority,
+        })
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<sinomo_runtime::kv::KvSnapshot, network::NetworkError> {
-        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        request: KvTxnRequest,
+    ) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
+        super::cli_commit_cluster_kv_request_with_quorum_response(paths, state, request)
     }
 
     fn send_cluster_member_publish(
@@ -7146,7 +7171,7 @@ fn cluster_peer_members_preserves_pending_local_member() {
         members.iter().any(|member| member.node_id
             == NodeId::from_legacy_named("node_peers_joined").expect("node"))
     );
-    read_cluster_kv_snapshot(&paths).expect("repaired kv snapshot");
+    read_cluster_kv_local_snapshot_for_test(&paths).expect("repaired kv snapshot");
 }
 
 #[test]
@@ -8697,13 +8722,61 @@ fn cluster_leave_reinitializes_single_node_cluster() {
         Some(report.local_node_id.clone())
     );
 
-    let snapshot = read_cluster_kv_snapshot(&paths).expect("new kv snapshot");
+    let snapshot = read_cluster_kv_local_snapshot_for_test(&paths).expect("new kv snapshot");
     assert!(
         !snapshot
             .entries
             .iter()
             .any(|entry| entry.key == "/config/source-only"),
         "leave should not import source cluster KV into the new single-node cluster"
+    );
+}
+
+#[test]
+fn cluster_leave_fails_closed_without_current_quorum() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-leave-no-quorum");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    let cluster_id = ClusterId::from_legacy_named("cluster_leave_no_quorum").expect("cluster");
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(cluster_id.clone()),
+            node_id: Some(NodeId::from_legacy_named("node_leave_no_quorum_local").expect("node")),
+            name: "leave no quorum".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let mut state = read_cluster_state(&paths).expect("cluster state");
+    let peer_id = NodeId::from_legacy_named("node_leave_no_quorum_peer").expect("peer");
+    let closed_listener = TcpListener::bind("127.0.0.1:0").expect("closed peer listener");
+    let peer_address = closed_listener
+        .local_addr()
+        .expect("peer address")
+        .to_string();
+    drop(closed_listener);
+    let mut peer = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        peer_id.clone(),
+        "offline peer",
+        "pk-offline-peer",
+        OffsetDateTime::now_utc(),
+    );
+    peer.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    peer.allowed_capabilities = peer.capabilities.clone();
+    peer.endpoints = vec![daemon_lan_endpoint(&peer_id, peer_address, 0)];
+    state.members.push(peer);
+    cluster::write_cluster_state(&paths, &state).expect("write two-voter state");
+    cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("seed two-voter raft config");
+
+    let error = cluster_leave_with_paths(&paths).expect_err("leave must require quorum");
+
+    assert!(matches!(error, CliError::ClusterReadOnly { .. }));
+    let state_after = read_cluster_state(&paths).expect("source state remains live");
+    assert_eq!(state_after.cluster_id, cluster_id);
+    assert!(
+        paths.state.exists(),
+        "failed leave must not quarantine source state"
     );
 }
 
@@ -8896,7 +8969,8 @@ fn cluster_join_on_initialized_node_rolls_back_when_target_join_fails() {
             .as_deref()
             .is_some_and(|detail| detail.contains("target join failed"))
     );
-    let restored_snapshot = read_cluster_kv_snapshot(&source_paths).expect("restored kv snapshot");
+    let restored_snapshot =
+        read_cluster_kv_local_snapshot_for_test(&source_paths).expect("restored kv snapshot");
     assert!(restored_snapshot.get(&node_local_config_key).is_some());
     assert!(restored_snapshot.get(&source_cluster_config_key).is_some());
     assert!(
@@ -9242,7 +9316,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::kv::CLUSTER_KV_SNAPSHOT_ROUTE,
+            sinomo_runtime::kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -9251,7 +9325,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_ROUTE,
+            sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -9260,7 +9334,25 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::kv::CLUSTER_KV_WATCH_PREFIX_ROUTE,
+            sinomo_runtime::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+            super::DaemonSignerAuthority::Member,
+            "node_member",
+            "pk_member"
+        ))
+        .is_ok()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            sinomo_runtime::kv::CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
+            super::DaemonSignerAuthority::Member,
+            "node_member",
+            "pk_member"
+        ))
+        .is_ok()
+    );
+    assert!(
+        super::authorize_authenticated_daemon_command(&authenticated_test_command(
+            sinomo_runtime::kv::CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -9536,6 +9628,43 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
         ))
         .is_err()
     );
+}
+
+#[test]
+fn cli_cluster_kv_snapshot_decoders_validate_consistency_metadata() {
+    let snapshot = InProcessKvStore::new().snapshot().expect("snapshot");
+    let stale = sinomo_runtime::kv::KvAuthoritativeRead {
+        value: snapshot.clone(),
+        authority: sinomo_runtime::kv::KvAuthorityProof {
+            term: 1,
+            commit_index: 1,
+            revision: snapshot.revision,
+            basis: sinomo_runtime::kv::KvAuthorityBasis::ExactCommittedRequest,
+        },
+    };
+    let payload =
+        sinomo_runtime::kv::cluster_kv_authoritative_snapshot_response_rpc_payload(&stale)
+            .expect("stale payload");
+    let response = network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+    assert!(matches!(
+        super::decode_cluster_kv_authoritative_snapshot_rpc_response(&response),
+        Err(network::NetworkError::ClusterReadOnly { .. })
+    ));
+
+    let local = sinomo_runtime::kv::KvLocalRead {
+        value: snapshot,
+        revision: KvRevision(1),
+        observed_term: 1,
+        applied_index: 1,
+        known_leader: None,
+    };
+    let payload = sinomo_runtime::kv::cluster_kv_local_snapshot_response_rpc_payload(&local)
+        .expect("local payload");
+    let response = network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+    assert!(matches!(
+        super::decode_cluster_kv_local_snapshot_rpc_response(&response),
+        Err(network::NetworkError::Serialization { .. })
+    ));
 }
 
 #[test]
@@ -9914,8 +10043,11 @@ fn introducer_records_joined_members_and_returns_peer_view() {
         super::load_or_create_main_node_identity(&host_root).expect("host identity");
     offline_invite.signature =
         sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
-    sinomo_runtime::cluster::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
-        .expect("active offline invite kv");
+    sinomo_runtime::cluster::sync_cluster_invitation_to_local_raft_unchecked(
+        &host_paths,
+        &offline_invite,
+    )
+    .expect("active offline invite kv");
     let remote_node = NodeId::from_legacy_named("node_remote").expect("node");
     let remote_main_identity =
         super::load_or_create_main_node_identity(&join_root).expect("remote identity");
@@ -11243,7 +11375,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
 
     assert!(result.is_err(), "unexpected successful txn: {result:?}");
     assert!(
-        !read_cluster_kv_snapshot(&paths)
+        !read_cluster_kv_local_snapshot_for_test(&paths)
             .expect("cluster snapshot")
             .entries
             .iter()
@@ -11271,7 +11403,7 @@ fn daemon_cluster_kv_is_read_only_without_cluster_state() {
     assert!(matches!(result, Err(CliError::ClusterReadOnly { .. })));
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     assert_eq!(
-        read_cluster_kv_snapshot(&cluster_paths)
+        read_cluster_kv_local_snapshot_for_test(&cluster_paths)
             .expect("snapshot")
             .entries,
         Vec::new()
@@ -11421,7 +11553,7 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
     let state = read_cluster_state(&paths).expect("cluster state");
     sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
-    let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
+    let stale_snapshot = read_cluster_kv_local_snapshot_for_test(&paths).expect("stale snapshot");
     append_cluster_raft_command_with_response(
         &paths,
         &state.local_node_id,
@@ -11432,7 +11564,8 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
         }),
     )
     .expect("current write");
-    let current_snapshot = read_cluster_kv_snapshot(&paths).expect("current snapshot");
+    let current_snapshot =
+        read_cluster_kv_local_snapshot_for_test(&paths).expect("current snapshot");
     assert!(
         current_snapshot
             .entries
@@ -11446,8 +11579,8 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
         .cache_snapshot_if_newer_than_raft(state.local_node_id.clone(), stale_snapshot)
         .expect("cache stale snapshot");
     assert!(!cached_ahead);
-    let snapshot_after_stale =
-        read_cluster_kv_snapshot(&paths).expect("snapshot after stale cache attempt");
+    let snapshot_after_stale = read_cluster_kv_local_snapshot_for_test(&paths)
+        .expect("snapshot after stale cache attempt");
     assert!(
         snapshot_after_stale
             .entries
@@ -11722,7 +11855,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         .expect("peer current append");
     assert!(current_response.accepted);
     assert!(
-        read_cluster_kv_snapshot(&peer_paths)
+        read_cluster_kv_local_snapshot_for_test(&peer_paths)
             .expect("peer current snapshot")
             .entries
             .iter()
@@ -11733,7 +11866,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         .expect("peer stale append");
     assert!(delayed_stale_response.accepted);
     assert!(
-        read_cluster_kv_snapshot(&peer_paths)
+        read_cluster_kv_local_snapshot_for_test(&peer_paths)
             .expect("peer after stale snapshot")
             .entries
             .iter()
@@ -11771,7 +11904,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
             .expect("peer watch append")
             .accepted
     );
-    let host_events = read_cluster_kv_snapshot(&host_paths)
+    let host_events = read_cluster_kv_local_snapshot_for_test(&host_paths)
         .expect("host watch snapshot")
         .events;
     let peer_state = read_cluster_state(&peer_paths).expect("peer state after append");

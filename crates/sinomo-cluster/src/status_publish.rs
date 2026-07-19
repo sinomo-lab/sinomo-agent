@@ -11,7 +11,7 @@ use crate::local_state_store::read_cluster_state;
 use crate::local_state_store::read_cluster_state_without_kv;
 use crate::prelude::*;
 #[allow(unused_imports)]
-use sinomo_kv::{KvCommand, KvOp, KvSnapshot, KvTxn};
+use sinomo_kv::{KvCommand, KvOp, KvSnapshot, KvTxn, KvTxnRequest};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -40,7 +40,7 @@ pub trait ClusterNetworkInfoPublishHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error>;
 }
 
@@ -67,7 +67,7 @@ pub trait ClusterNetworkInfoPublishAsyncHost {
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
@@ -93,7 +93,7 @@ pub trait ClusterNodeStatusPublishHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error>;
 }
 
@@ -120,7 +120,7 @@ pub trait ClusterNodeStatusPublishAsyncHost {
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
@@ -180,19 +180,22 @@ pub fn publish_cluster_node_status_to_quorum_with_host<H>(
 where
     H: ClusterNodeStatusPublishHost,
 {
-    if cluster_node_status_publish_matches_with_host(paths, &status, host)? {
-        return Ok(None);
-    }
+    let already_current = cluster_node_status_publish_matches_with_host(paths, &status, host)?;
     let mut state = read_cluster_state(paths)?;
     let key = cluster_node_status_key_for_record(&status);
+    let success = if already_current {
+        Vec::new()
+    } else {
+        vec![KvOp::put_serde(key, &status, None).map_err(kv_err)?]
+    };
     let snapshot = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
-        KvTxn {
+        KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
-            success: vec![KvOp::put_serde(key, &status, None).map_err(kv_err)?],
+            success,
             failure: Vec::new(),
-        },
+        }),
     )?;
     host.remember_published_node_status(paths, &status);
     Ok(Some(snapshot))
@@ -236,9 +239,8 @@ pub async fn publish_cluster_node_status_to_quorum_async_with_host<H>(
 where
     H: ClusterNodeStatusPublishAsyncHost,
 {
-    if cluster_node_status_publish_matches_async_with_host(runtime, paths, &status, host).await? {
-        return Ok(None);
-    }
+    let already_current =
+        cluster_node_status_publish_matches_async_with_host(runtime, paths, &status, host).await?;
 
     let state_paths = paths.clone();
     let mut state = runtime
@@ -252,19 +254,24 @@ where
         })?
         .map_err(H::Error::from)?;
     let key = cluster_node_status_key_for_record(&status);
+    let success = if already_current {
+        Vec::new()
+    } else {
+        vec![
+            KvOp::put_serde(key, &status, None)
+                .map_err(kv_err)
+                .map_err(H::Error::from)?,
+        ]
+    };
     let snapshot = host
         .commit_cluster_kv_txn_with_quorum_async(
             paths,
             &mut state,
-            KvTxn {
+            KvTxnRequest::generated(KvTxn {
                 compares: Vec::new(),
-                success: vec![
-                    KvOp::put_serde(key, &status, None)
-                        .map_err(kv_err)
-                        .map_err(H::Error::from)?,
-                ],
+                success,
                 failure: Vec::new(),
-            },
+            }),
         )
         .await?;
     host.remember_published_node_status_async(paths, &status)
@@ -312,21 +319,22 @@ pub fn publish_cluster_network_info_to_quorum_with_host<H>(
 where
     H: ClusterNetworkInfoPublishHost,
 {
-    if cluster_network_info_publish_matches_with_host(paths, &info, host)? {
-        return Ok(None);
-    }
+    let already_current = cluster_network_info_publish_matches_with_host(paths, &info, host)?;
     let mut state = read_cluster_state(paths)?;
     let node_id = info.node_id.clone();
+    let success = if already_current {
+        Vec::new()
+    } else {
+        vec![KvOp::put_serde(cluster_network_info_key(&node_id), &info, None).map_err(kv_err)?]
+    };
     let snapshot = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
-        KvTxn {
+        KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
-            success: vec![
-                KvOp::put_serde(cluster_network_info_key(&node_id), &info, None).map_err(kv_err)?,
-            ],
+            success,
             failure: Vec::new(),
-        },
+        }),
     )?;
     host.remember_published_network_info(paths, &info);
     Ok(Some(snapshot))
@@ -370,9 +378,8 @@ pub async fn publish_cluster_network_info_to_quorum_async_with_host<H>(
 where
     H: ClusterNetworkInfoPublishAsyncHost,
 {
-    if cluster_network_info_publish_matches_async_with_host(runtime, paths, &info, host).await? {
-        return Ok(None);
-    }
+    let already_current =
+        cluster_network_info_publish_matches_async_with_host(runtime, paths, &info, host).await?;
 
     let state_paths = paths.clone();
     let mut state = runtime
@@ -386,19 +393,24 @@ where
         })?
         .map_err(H::Error::from)?;
     let node_id = info.node_id.clone();
+    let success = if already_current {
+        Vec::new()
+    } else {
+        vec![
+            KvOp::put_serde(cluster_network_info_key(&node_id), &info, None)
+                .map_err(kv_err)
+                .map_err(H::Error::from)?,
+        ]
+    };
     let snapshot = host
         .commit_cluster_kv_txn_with_quorum_async(
             paths,
             &mut state,
-            KvTxn {
+            KvTxnRequest::generated(KvTxn {
                 compares: Vec::new(),
-                success: vec![
-                    KvOp::put_serde(cluster_network_info_key(&node_id), &info, None)
-                        .map_err(kv_err)
-                        .map_err(H::Error::from)?,
-                ],
+                success,
                 failure: Vec::new(),
-            },
+            }),
         )
         .await?;
     host.remember_published_network_info_async(paths, &info)

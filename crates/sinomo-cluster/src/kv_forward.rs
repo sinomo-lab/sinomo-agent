@@ -2,7 +2,7 @@
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::locked_kv_state_authority_id_async;
 use sinomo_base::ClusterBootstrapState;
-use sinomo_kv::{ClusterKvTxnCommitResult, KvTxn};
+use sinomo_kv::{ClusterKvTxnCommitResult, KvAuthoritativeRead, KvSnapshot, KvTxnRequest};
 use sinomo_network::ClusterPaths;
 use sinomo_network::{
     ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
@@ -61,7 +61,7 @@ pub trait ClusterKvTxnForwardHost {
 pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    txn: &KvTxn,
+    request: &KvTxnRequest,
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
@@ -106,7 +106,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
         match forward_cluster_kv_txn_to_state_authority_node_with_host(
             state,
             target,
-            txn,
+            request,
             options.routed_node_attempt_timeout(remaining, targets.len() - index),
             host,
         ) {
@@ -132,15 +132,80 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     })
 }
 
+pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvTxnForwardOptions,
+    host: &mut impl ClusterKvTxnForwardHost,
+) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError> {
+    let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
+        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+    );
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    match host
+        .known_kv_state_authority_id(paths, state)
+        .ok()
+        .flatten()
+    {
+        Some(authority_id)
+            if !cluster_node_blocks_leader_preference(paths, state, &authority_id) =>
+        {
+            if authority_id == state.local_node_id {
+                return Ok(None);
+            }
+            prefer_known_state_authority_node(&mut targets, &authority_id);
+        }
+        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
+        _ => {}
+    }
+
+    let deadline = Instant::now() + options.timeout;
+    let mut failures = Vec::new();
+    for (index, target) in targets.iter().enumerate() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
+        let request =
+            ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+                .with_response_retry_safe();
+        let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
+        match host.call_node_object_rpc(state, target, &request, timeout) {
+            Ok(response) => {
+                response.error_detail()?;
+                let read =
+                    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+                        .map_err(kv_err)?;
+                return Ok(Some(read));
+            }
+            Err(error) => failures.push(format!("node {target} failed: {error}")),
+        }
+    }
+    Err(NetworkError::ClusterReadOnly {
+        detail: format!(
+            "could not establish an authoritative cluster KV read{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    })
+}
+
 fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
-    txn: &KvTxn,
+    request: &KvTxnRequest,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
-    let started = Instant::now();
-    let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(txn).map_err(kv_err)?;
+    let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(request).map_err(kv_err)?;
     let txn_request = ObjectRpcRequest::from_encoded_body(
         txn_payload.route,
         txn_payload.category,
@@ -148,40 +213,15 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     );
     let txn_response = host.call_node_object_rpc(state, target_node_id, &txn_request, timeout)?;
     txn_response.error_detail()?;
-    let txn_response =
-        sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
-
-    let snapshot_timeout = timeout
-        .saturating_sub(started.elapsed())
-        .max(Duration::from_millis(1));
-    let snapshot_payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()
-        .map_err(kv_err)
-        .map_err(|error| cluster_kv_forward_post_commit_error("build snapshot request", error))?;
-    let snapshot_request = ObjectRpcRequest::from_encoded_body(
-        snapshot_payload.route,
-        snapshot_payload.category,
-        snapshot_payload.body,
-    );
-    let snapshot_response = host
-        .call_node_object_rpc(state, target_node_id, &snapshot_request, snapshot_timeout)
-        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
-    snapshot_response
-        .error_detail()
-        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
-    let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)
-        .map_err(kv_err)
-        .map_err(|error| cluster_kv_forward_post_commit_error("decode snapshot", error))?;
-    Ok(ClusterKvTxnCommitResult {
-        snapshot,
-        txn_response: Some(txn_response),
-    })
+    let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
+    validate_forwarded_cluster_kv_txn_response(request, response)
 }
 
 pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    txn: &KvTxn,
+    request: &KvTxnRequest,
     options: ClusterKvTxnForwardOptions,
     host: &mut H,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
@@ -241,7 +281,7 @@ where
             paths,
             state,
             target,
-            txn,
+            request,
             options.routed_node_attempt_timeout(remaining, targets.len() - index),
             host,
         )
@@ -260,6 +300,99 @@ where
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
             "could not forward cluster KV transaction to any known state authority{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    })
+}
+
+pub async fn forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvTxnForwardOptions,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError>
+where
+    H: ClusterSignedObjectRpcAsyncHost + Send,
+{
+    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
+        runtime,
+        paths,
+        state,
+        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+    )
+    .await?;
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    match locked_kv_state_authority_id_async(runtime, paths, state)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(authority_id)
+            if !cluster_node_blocks_leader_preference_async(
+                runtime,
+                paths,
+                state,
+                &authority_id,
+            )
+            .await? =>
+        {
+            if authority_id == state.local_node_id {
+                return Ok(None);
+            }
+            prefer_known_state_authority_node(&mut targets, &authority_id);
+        }
+        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
+        _ => {}
+    }
+
+    let deadline = Instant::now() + options.timeout;
+    let mut failures = Vec::new();
+    for (index, target) in targets.iter().enumerate() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
+        let request =
+            ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+                .with_response_retry_safe();
+        let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
+        let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
+        match client
+            .call_target(
+                state,
+                target,
+                ObjectRpcSessionCall::value(request),
+                ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+            )
+            .await
+        {
+            Ok(response) if response.body.is_empty() => {
+                response.response.error_detail()?;
+                let read = sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
+                    &response.response.body,
+                )
+                .map_err(kv_err)?;
+                return Ok(Some(read));
+            }
+            Ok(_) => failures.push(format!(
+                "node {target} returned an unexpected authoritative-read attachment"
+            )),
+            Err(error) => failures.push(format!("node {target} failed: {error}")),
+        }
+    }
+    Err(NetworkError::ClusterReadOnly {
+        detail: format!(
+            "could not establish an authoritative cluster KV read{}",
             if failures.is_empty() {
                 String::new()
             } else {
@@ -290,34 +423,19 @@ fn cluster_kv_forward_error_allows_next_authority(error: &NetworkError) -> bool 
     error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent)
 }
 
-fn cluster_kv_forward_post_commit_error(
-    stage: &str,
-    error: impl std::fmt::Display,
-) -> NetworkError {
-    // A valid transaction response means the authority may already have
-    // committed the mutation. Snapshot recovery must never cause the whole
-    // transaction to be sent to another authority.
-    NetworkError::delivery_failed(
-        format!("complete forwarded cluster KV transaction during {stage}"),
-        NetworkDeliveryState::PossiblyApplied,
-        error.to_string(),
-    )
-}
-
 async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
-    txn: &KvTxn,
+    request: &KvTxnRequest,
     timeout: Duration,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
     H: ClusterSignedObjectRpcAsyncHost + Send,
 {
-    let started = Instant::now();
-    let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(txn).map_err(kv_err)?;
+    let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(request).map_err(kv_err)?;
     let txn_request = ObjectRpcRequest::from_encoded_body(
         txn_payload.route,
         txn_payload.category,
@@ -339,53 +457,30 @@ where
     }
     let txn_response = txn_response.response;
     txn_response.error_detail()?;
-    let txn_response =
-        sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
+    let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
+    validate_forwarded_cluster_kv_txn_response(request, response)
+}
 
-    let snapshot_timeout = timeout
-        .saturating_sub(started.elapsed())
-        .max(Duration::from_millis(1));
-    let snapshot_payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()
-        .map_err(kv_err)
-        .map_err(|error| cluster_kv_forward_post_commit_error("build snapshot request", error))?;
-    let snapshot_request = ObjectRpcRequest::from_encoded_body(
-        snapshot_payload.route,
-        snapshot_payload.category,
-        snapshot_payload.body,
-    )
-    .with_response_retry_safe();
-    let snapshot_response = client
-        .call_target(
-            state,
-            target_node_id,
-            ObjectRpcSessionCall::value(snapshot_request),
-            ClusterObjectRpcOptions::default().with_overall_timeout(snapshot_timeout),
-        )
-        .await
-        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
-    if !snapshot_response.body.is_empty() {
-        return Err(cluster_kv_forward_post_commit_error(
-            "fetch snapshot",
-            "cluster KV snapshot returned an unexpected attachment",
-        ));
+fn validate_forwarded_cluster_kv_txn_response(
+    request: &KvTxnRequest,
+    response: ClusterKvTxnCommitResult,
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    if response.request_id != request.request_id {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "forwarded cluster KV response request ID {} does not match submitted request ID {}",
+                response.request_id, request.request_id
+            ),
+        });
     }
-    let snapshot_response = snapshot_response.response;
-    snapshot_response
-        .error_detail()
-        .map_err(|error| cluster_kv_forward_post_commit_error("fetch snapshot", error))?;
-    let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)
-        .map_err(kv_err)
-        .map_err(|error| cluster_kv_forward_post_commit_error("decode snapshot", error))?;
-    Ok(ClusterKvTxnCommitResult {
-        snapshot,
-        txn_response: Some(txn_response),
-    })
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sinomo_base::{CapabilityName, ClusterMemberRecord, ClusterMemberState};
+    use sinomo_kv::{KvAuthorityBasis, KvAuthorityProof, KvRevision, KvTxn, KvTxnResponse};
     use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
     use time::OffsetDateTime;
 
@@ -418,11 +513,12 @@ mod tests {
         ));
     }
 
-    struct SnapshotFailureAfterCommitHost {
+    struct CommittedResponseHost {
         calls: usize,
+        mismatch_request_id: bool,
     }
 
-    impl ClusterKvTxnForwardHost for SnapshotFailureAfterCommitHost {
+    impl ClusterKvTxnForwardHost for CommittedResponseHost {
         fn known_kv_state_authority_id(
             &mut self,
             _paths: &ClusterPaths,
@@ -440,11 +536,40 @@ mod tests {
         ) -> Result<ObjectRpcResponse, NetworkError> {
             self.calls = self.calls.saturating_add(1);
             if request.route == sinomo_kv::CLUSTER_KV_TXN_ROUTE {
+                let submitted = sinomo_kv::decode_cluster_kv_txn_rpc_request_body(&request.body)
+                    .expect("transaction request");
+                let snapshot = KvSnapshot {
+                    revision: KvRevision(1),
+                    compacted_revision: KvRevision(0),
+                    entries: Vec::new(),
+                    leases: Vec::new(),
+                    events: Vec::new(),
+                    committed_requests: Vec::new(),
+                    expired_requests: Vec::new(),
+                };
                 let payload =
-                    sinomo_kv::cluster_kv_txn_response_rpc_payload(&sinomo_kv::KvTxnResponse {
-                        succeeded: true,
-                        revision: sinomo_kv::KvRevision(1),
-                        responses: Vec::new(),
+                    sinomo_kv::cluster_kv_txn_response_rpc_payload(&ClusterKvTxnCommitResult {
+                        request_id: if self.mismatch_request_id {
+                            sinomo_kv::KvRequestId::generate()
+                        } else {
+                            submitted.request_id
+                        },
+                        snapshot,
+                        txn_response: Some(KvTxnResponse {
+                            succeeded: true,
+                            revision: KvRevision(1),
+                            responses: Vec::new(),
+                        }),
+                        authority: KvAuthorityProof {
+                            term: 1,
+                            commit_index: 1,
+                            revision: KvRevision(1),
+                            basis: KvAuthorityBasis::CurrentTermQuorum {
+                                voter_acks: 1,
+                                required_quorum: 1,
+                            },
+                        },
+                        replayed_committed_request: false,
                     })
                     .expect("transaction response payload");
                 return Ok(ObjectRpcResponse::from_encoded_body(
@@ -554,26 +679,61 @@ mod tests {
     }
 
     #[test]
-    fn kv_forward_snapshot_failure_after_txn_response_is_possibly_applied() {
+    fn kv_forward_returns_complete_committed_response_without_second_snapshot_rpc() {
         let (_root, state) = forward_test_state(false);
         let target = state.members[1].node_id.clone();
-        let mut host = SnapshotFailureAfterCommitHost { calls: 0 };
+        let mut host = CommittedResponseHost {
+            calls: 0,
+            mismatch_request_id: false,
+        };
+        let request = KvTxnRequest::generated(test_txn());
+
+        let result = forward_cluster_kv_txn_to_state_authority_node_with_host(
+            &state,
+            &target,
+            &request,
+            Duration::from_secs(1),
+            &mut host,
+        )
+        .expect("complete committed response");
+
+        assert_eq!(host.calls, 1);
+        assert_eq!(result.request_id, request.request_id);
+        assert_eq!(result.snapshot.revision, KvRevision(1));
+        assert_eq!(result.authority.term, 1);
+        assert!(matches!(
+            result.authority.basis,
+            KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 1,
+                required_quorum: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn kv_forward_rejects_response_for_a_different_request_id() {
+        let (_root, state) = forward_test_state(false);
+        let target = state.members[1].node_id.clone();
+        let mut host = CommittedResponseHost {
+            calls: 0,
+            mismatch_request_id: true,
+        };
+        let request = KvTxnRequest::generated(test_txn());
 
         let error = forward_cluster_kv_txn_to_state_authority_node_with_host(
             &state,
             &target,
-            &test_txn(),
+            &request,
             Duration::from_secs(1),
             &mut host,
         )
-        .expect_err("snapshot failure must not look like an uncommitted transaction");
+        .expect_err("mismatched request ID must fail closed");
 
-        assert_eq!(host.calls, 2);
-        assert_eq!(
-            error.delivery_state(),
-            Some(NetworkDeliveryState::PossiblyApplied)
-        );
-        assert!(!cluster_kv_forward_error_allows_next_authority(&error));
+        assert!(matches!(
+            error,
+            NetworkError::Serialization { detail }
+                if detail.contains("does not match submitted request ID")
+        ));
     }
 
     #[test]
@@ -590,7 +750,7 @@ mod tests {
         let forwarded = forward_cluster_kv_txn_to_state_authority_with_host(
             &paths,
             &state,
-            &test_txn(),
+            &KvTxnRequest::generated(test_txn()),
             forward_options(),
             &mut host,
         )
@@ -615,7 +775,7 @@ mod tests {
         let forwarded = forward_cluster_kv_txn_to_state_authority_with_host(
             &paths,
             &state,
-            &test_txn(),
+            &KvTxnRequest::generated(test_txn()),
             forward_options(),
             &mut host,
         );

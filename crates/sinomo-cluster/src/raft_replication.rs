@@ -5,7 +5,6 @@ use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::prelude::*;
 #[allow(unused_imports)]
-#[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::KvEvent;
 use sinomo_kv::{
@@ -158,6 +157,20 @@ where
         self.host.last_local_raft_log_index(self.paths, state)
     }
 
+    fn raft_peer_progress_next_index_hint(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target: &Self::Target,
+        last_local_raft_log_index: u64,
+    ) -> Option<u64> {
+        sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint(
+            &self.paths.kv_paths(),
+            &target.node_id,
+            state.term,
+            last_local_raft_log_index,
+        )
+    }
+
     fn build_raft_append_request(
         &mut self,
         state: &ClusterBootstrapState,
@@ -217,6 +230,28 @@ where
         state: &'a ClusterBootstrapState,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
         self.host.last_local_raft_log_index_async(self.paths, state)
+    }
+
+    fn raft_peer_progress_next_index_hint_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        target: &'a Self::Target,
+        last_local_raft_log_index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<u64>, Self::Error> {
+        let paths = self.paths.kv_paths();
+        let peer_node_id = target.node_id.clone();
+        let current_term = state.term;
+        Box::pin(async move {
+            Ok(
+                sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint_async(
+                    paths,
+                    peer_node_id,
+                    current_term,
+                    last_local_raft_log_index,
+                )
+                .await,
+            )
+        })
     }
 
     fn build_raft_append_request_async<'a>(

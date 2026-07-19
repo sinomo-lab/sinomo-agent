@@ -12,7 +12,10 @@ use crate::kv_local_store::{
 };
 use crate::local_state_store::read_cluster_state_without_kv;
 use crate::prelude::*;
-use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvCompare, KvOp, KvSnapshot, KvTxn};
+use sinomo_kv::{
+    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, ClusterKvTxnCommitResult, KvCompare, KvOp, KvSnapshot,
+    KvTxn, KvTxnRequest,
+};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
@@ -46,8 +49,8 @@ pub trait ClusterNetworkRecordExpiryHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error>;
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error>;
 }
 
 pub trait ClusterConnectivityPublishHost {
@@ -74,7 +77,7 @@ pub trait ClusterConnectivityPublishHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error>;
 }
 
@@ -103,7 +106,7 @@ pub trait ClusterConnectivityPublishAsyncHost {
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
@@ -224,17 +227,40 @@ where
             sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
         )?;
         if success.is_empty() {
-            // A zero-op diff is just as authoritative as a successful commit:
-            // the complete source set was compared with cluster KV and already
-            // matches. Warm the process cache from the stored records, rather
-            // than the incoming probe records: stable-equal observations can
-            // carry a newer TTL that was deliberately not committed yet.
+            if latest.is_some() {
+                // A previous commit in this call already crossed Raft. Warm
+                // the cache from its authoritative response and finish.
+                if let Some(published) =
+                    cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
+                {
+                    host.remember_published_connectivity_record_set(
+                        paths,
+                        source_node_id,
+                        &published,
+                    );
+                }
+                return Ok(latest);
+            }
+            if state.is_none() {
+                state = Some(read_cluster_state_without_kv(paths)?);
+            }
+            let committed = host.commit_cluster_kv_txn_with_quorum(
+                paths,
+                state
+                    .as_mut()
+                    .expect("cluster state is initialized before connectivity publish"),
+                KvTxnRequest::generated(KvTxn {
+                    compares: Vec::new(),
+                    success: Vec::new(),
+                    failure: Vec::new(),
+                }),
+            )?;
             if let Some(published) =
-                cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
+                cluster_connectivity_records_for_source_from_snapshot(&committed, source_node_id)
             {
                 host.remember_published_connectivity_record_set(paths, source_node_id, &published);
             }
-            return Ok(latest);
+            return Ok(Some(committed));
         }
         if previous_ops.as_ref() == Some(&success) {
             return Ok(latest);
@@ -249,11 +275,11 @@ where
                 state
                     .as_mut()
                     .expect("cluster state is initialized before connectivity publish"),
-                KvTxn {
+                KvTxnRequest::generated(KvTxn {
                     compares: Vec::new(),
                     success,
                     failure: Vec::new(),
-                },
+                }),
             )?,
         );
     }
@@ -316,14 +342,13 @@ where
     let write_paths = paths.clone();
     let write_source_node_id = source_node_id.clone();
     let write_records = records.clone();
-    let mut records = runtime
+    runtime
         .spawn_blocking(move || {
             write_local_cluster_connectivity_record_set(
                 &write_paths,
                 &write_source_node_id,
                 &write_records,
-            )?;
-            read_local_cluster_connectivity_records_for_source(&write_paths, &write_source_node_id)
+            )
         })
         .await
         .map_err(|source| {
@@ -334,20 +359,13 @@ where
         })?
         .map_err(H::Error::from)?;
 
-    if host
-        .published_connectivity_record_set_matches_async(paths, source_node_id, &records)
-        .await?
-    {
-        return Ok(None);
-    }
-
     let mut state = initial_state;
     let mut latest: Option<KvSnapshot> = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
     loop {
         let read_paths = paths.clone();
         let read_source_node_id = source_node_id.clone();
-        records = runtime
+        let records = runtime
             .spawn_blocking(move || {
                 read_local_cluster_connectivity_records_for_source(
                     &read_paths,
@@ -418,12 +436,50 @@ where
             }
         };
         if success.is_empty() {
-            // The initial local/KV comparison can be a no-op after daemon
-            // restart. Remember that verified complete set too; otherwise the
-            // cache remains cold until some unrelated connectivity mutation.
-            // Cache the authoritative stored values so an uncommitted incoming
-            // TTL refresh cannot extend the cache's notion of KV freshness.
-            if let Some(published) = published_on_noop {
+            if latest.is_some() {
+                // The earlier round already crossed Raft. Cache its stored
+                // values, not the incoming refresh, and finish.
+                if let Some(published) = published_on_noop {
+                    host.remember_published_connectivity_record_set_async(
+                        paths,
+                        source_node_id,
+                        &published,
+                    )
+                    .await?;
+                }
+                return Ok(latest);
+            }
+            if state.is_none() {
+                let state_paths = paths.clone();
+                state = Some(
+                    runtime
+                        .spawn_blocking(move || read_cluster_state_without_kv(&state_paths))
+                        .await
+                        .map_err(|source| {
+                            H::Error::from(NetworkError::Io {
+                                operation: "read cluster state".to_string(),
+                                detail: format!("cluster state read task failed: {source}"),
+                            })
+                        })?
+                        .map_err(H::Error::from)?,
+                );
+            }
+            let committed = host
+                .commit_cluster_kv_txn_with_quorum_async(
+                    paths,
+                    state
+                        .as_mut()
+                        .expect("cluster state is initialized before connectivity publish"),
+                    KvTxnRequest::generated(KvTxn {
+                        compares: Vec::new(),
+                        success: Vec::new(),
+                        failure: Vec::new(),
+                    }),
+                )
+                .await?;
+            if let Some(published) =
+                cluster_connectivity_records_for_source_from_snapshot(&committed, source_node_id)
+            {
                 host.remember_published_connectivity_record_set_async(
                     paths,
                     source_node_id,
@@ -431,7 +487,7 @@ where
                 )
                 .await?;
             }
-            return Ok(latest);
+            return Ok(Some(committed));
         }
         if previous_ops.as_ref() == Some(&success) {
             return Ok(latest);
@@ -458,11 +514,11 @@ where
                 state
                     .as_mut()
                     .expect("cluster state is initialized before connectivity publish"),
-                KvTxn {
+                KvTxnRequest::generated(KvTxn {
                     compares: Vec::new(),
                     success,
                     failure: Vec::new(),
-                },
+                }),
             )
             .await?,
         );
@@ -694,16 +750,25 @@ where
         return Ok(None);
     }
     let mut local_state = read_cluster_state_without_kv(paths)?;
-    host.commit_cluster_kv_txn_with_quorum(
+    let result = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut local_state,
-        KvTxn {
+        KvTxnRequest::generated(KvTxn {
             compares,
             success,
             failure: Vec::new(),
-        },
-    )
-    .map(Some)
+        }),
+    )?;
+    if !result
+        .txn_response
+        .as_ref()
+        .is_some_and(|response| response.succeeded)
+    {
+        return Err(H::Error::from(NetworkError::InvalidClusterCommand {
+            detail: "cluster network records changed while expiring stale observations".to_string(),
+        }));
+    }
+    Ok(Some(result.snapshot))
 }
 
 fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {

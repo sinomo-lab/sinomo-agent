@@ -11,7 +11,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sinomo_core::kv::{KvEntry, KvOp, KvTxn};
+use sinomo_core::kv::{KvEntry, KvOp, KvRequestId, KvTxn, KvTxnRequest};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::service::{
@@ -642,6 +642,20 @@ impl ConfigStore {
         resolve_config(data_dir, cluster, &definition)
     }
 
+    /// Resolve a key while allowing cluster-backed modes to establish an
+    /// authoritative quorum barrier. Synchronous callers remain available for
+    /// local-only resolution, but may not silently substitute a local KV view
+    /// for cluster authority.
+    pub async fn get_async(
+        &self,
+        data_dir: &SinomoDataDir,
+        cluster: Option<&dyn ClusterAccess>,
+        key: &str,
+    ) -> Result<ConfigResolution, ConfigError> {
+        let definition = self.registry.get(key)?.clone();
+        resolve_config_async(data_dir, cluster, &definition).await
+    }
+
     pub fn get_typed<T: DeserializeOwned>(
         &self,
         data_dir: &SinomoDataDir,
@@ -676,9 +690,24 @@ impl ConfigStore {
         value: Value,
         target: ConfigWriteTarget,
     ) -> Result<ConfigWriteResult, ConfigError> {
+        self.set_async_with_request_id(data_dir, cluster, key, value, target, None)
+            .await
+    }
+
+    /// Writes configuration while preserving a caller-supplied cluster KV
+    /// request identity for reconciliation after an uncertain response.
+    pub async fn set_async_with_request_id(
+        &self,
+        data_dir: &SinomoDataDir,
+        cluster: Option<&dyn ClusterAccess>,
+        key: &str,
+        value: Value,
+        target: ConfigWriteTarget,
+        request_id: Option<KvRequestId>,
+    ) -> Result<ConfigWriteResult, ConfigError> {
         let definition = self.registry.get(key)?.clone();
         definition.validate_value(&value)?;
-        write_config_async(data_dir, cluster, &definition, value, target).await
+        write_config_async(data_dir, cluster, &definition, value, target, request_id).await
     }
 
     pub fn set_typed<T: Serialize>(
@@ -829,6 +858,9 @@ pub struct ConfigGetResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigSetRequest {
+    /// Stable identity to reuse when reconciling or retrying this exact cluster
+    /// write. Local-target writes ignore it.
+    pub request_id: Option<KvRequestId>,
     pub key: String,
     pub value: Value,
     #[serde(default = "default_write_target")]
@@ -913,7 +945,9 @@ impl Service for ConfigService {
                 }
                 CONFIG_GET_ROUTE => {
                     let request: ConfigGetRequest = request.decode_body()?;
-                    let resolution = store.get(&ctx.data_dir, cluster, &request.key)?;
+                    let resolution = store
+                        .get_async(&ctx.data_dir, cluster, &request.key)
+                        .await?;
                     ObjectRpcResponse::encode_body(
                         CONFIG_GET_ROUTE,
                         &ConfigGetResponse { resolution },
@@ -922,12 +956,13 @@ impl Service for ConfigService {
                 CONFIG_SET_ROUTE => {
                     let request: ConfigSetRequest = request.decode_body()?;
                     let result = store
-                        .set_async(
+                        .set_async_with_request_id(
                             &ctx.data_dir,
                             cluster,
                             &request.key,
                             request.value,
                             request.target,
+                            request.request_id,
                         )
                         .await?;
                     ObjectRpcResponse::encode_body(CONFIG_SET_ROUTE, &ConfigSetResponse { result })?
@@ -1015,18 +1050,53 @@ fn resolve_config(
             if let Some(local) = read_or_migrate_local_config(data_dir, definition)? {
                 Some(local)
             } else {
-                read_cluster_config(cluster, definition)?
+                reject_sync_cluster_config_read(cluster, definition)?
             }
         }
         ConfigClusterMode::ClusterOverrideLocal | ConfigClusterMode::Synced => {
-            if let Some(cluster) = read_cluster_config(cluster, definition)? {
+            if let Some(cluster) = reject_sync_cluster_config_read(cluster, definition)? {
                 Some(cluster)
             } else {
                 read_or_migrate_local_config(data_dir, definition)?
             }
         }
-        ConfigClusterMode::ClusterOnly => read_cluster_config(cluster, definition)?,
+        ConfigClusterMode::ClusterOnly => reject_sync_cluster_config_read(cluster, definition)?,
     };
+    finish_config_resolution(resolved, definition)
+}
+
+async fn resolve_config_async(
+    data_dir: &SinomoDataDir,
+    cluster: Option<&dyn ClusterAccess>,
+    definition: &ConfigDefinition,
+) -> Result<ConfigResolution, ConfigError> {
+    let resolved = match definition.cluster_mode {
+        ConfigClusterMode::LocalOnly => read_or_migrate_local_config(data_dir, definition)?,
+        ConfigClusterMode::LocalOverrideCluster => {
+            if let Some(local) = read_or_migrate_local_config(data_dir, definition)? {
+                Some(local)
+            } else {
+                read_cluster_config_authoritative(cluster, definition).await?
+            }
+        }
+        ConfigClusterMode::ClusterOverrideLocal | ConfigClusterMode::Synced => {
+            if let Some(cluster) = read_cluster_config_authoritative(cluster, definition).await? {
+                Some(cluster)
+            } else {
+                read_or_migrate_local_config(data_dir, definition)?
+            }
+        }
+        ConfigClusterMode::ClusterOnly => {
+            read_cluster_config_authoritative(cluster, definition).await?
+        }
+    };
+    finish_config_resolution(resolved, definition)
+}
+
+fn finish_config_resolution(
+    resolved: Option<ConfigResolution>,
+    definition: &ConfigDefinition,
+) -> Result<ConfigResolution, ConfigError> {
     resolved
         .or_else(|| {
             definition
@@ -1042,6 +1112,19 @@ fn resolve_config(
         .ok_or_else(|| ConfigError::MissingValue {
             key: definition.key.to_string(),
         })
+}
+
+fn reject_sync_cluster_config_read(
+    cluster: Option<&dyn ClusterAccess>,
+    definition: &ConfigDefinition,
+) -> Result<Option<ConfigResolution>, ConfigError> {
+    if cluster.is_none() {
+        return Ok(None);
+    }
+    Err(ConfigError::Service(ServiceError::Service(format!(
+        "cluster-backed config `{}` requires authoritative async resolution",
+        definition.key
+    ))))
 }
 
 fn write_config(
@@ -1100,6 +1183,7 @@ async fn write_config_async(
     definition: &ConfigDefinition,
     value: Value,
     target: ConfigWriteTarget,
+    request_id: Option<KvRequestId>,
 ) -> Result<ConfigWriteResult, ConfigError> {
     let target = match target {
         ConfigWriteTarget::Auto => {
@@ -1131,7 +1215,7 @@ async fn write_config_async(
                     detail: "config is local-only".to_string(),
                 });
             }
-            write_cluster_config_async(cluster, definition, value.clone()).await?;
+            write_cluster_config_async(cluster, definition, value.clone(), request_id).await?;
             Ok(ConfigWriteResult {
                 key: definition.key.clone(),
                 value,
@@ -1210,7 +1294,7 @@ fn write_local_config(
     Ok(path)
 }
 
-fn read_cluster_config(
+async fn read_cluster_config_authoritative(
     cluster: Option<&dyn ClusterAccess>,
     definition: &ConfigDefinition,
 ) -> Result<Option<ConfigResolution>, ConfigError> {
@@ -1218,7 +1302,12 @@ fn read_cluster_config(
         return Ok(None);
     };
     let key = definition.cluster_key();
-    if let Some(entry) = cluster.kv_get(&key).map_err(ConfigError::Service)? {
+    if let Some(entry) = cluster
+        .kv_get_authoritative_async(&key)
+        .await
+        .map_err(ConfigError::Service)?
+        .value
+    {
         let value = decode_cluster_config_entry(&entry, definition)?;
         return Ok(Some(ConfigResolution {
             key: definition.key.clone(),
@@ -1228,7 +1317,12 @@ fn read_cluster_config(
         }));
     }
     for legacy in &definition.cluster_legacy_keys {
-        if let Some(entry) = cluster.kv_get(legacy).map_err(ConfigError::Service)? {
+        if let Some(entry) = cluster
+            .kv_get_authoritative_async(legacy)
+            .await
+            .map_err(ConfigError::Service)?
+            .value
+        {
             let value = decode_cluster_config_entry(&entry, definition)?;
             return Ok(Some(ConfigResolution {
                 key: definition.key.clone(),
@@ -1245,19 +1339,37 @@ async fn write_cluster_config_async(
     cluster: Option<&dyn ClusterAccess>,
     definition: &ConfigDefinition,
     value: Value,
+    request_id: Option<KvRequestId>,
 ) -> Result<(), ConfigError> {
     let cluster = cluster.ok_or_else(|| ConfigError::ClusterUnavailable {
         key: definition.key.to_string(),
     })?;
     let op = cluster_config_put_op(definition, value)?;
-    cluster
-        .kv_commit_async(KvTxn {
-            compares: Vec::new(),
-            success: vec![op],
-            failure: Vec::new(),
-        })
+    let txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![op],
+        failure: Vec::new(),
+    };
+    let request = match request_id {
+        Some(request_id) => KvTxnRequest::new(request_id, txn),
+        None => KvTxnRequest::generated(txn),
+    };
+    let committed = cluster
+        .kv_commit_async(request)
         .await
         .map_err(ConfigError::Service)?;
+    let response = committed.txn_response.ok_or_else(|| {
+        ConfigError::Service(ServiceError::Service(format!(
+            "cluster config transaction for `{}` committed without a transaction response",
+            definition.key
+        )))
+    })?;
+    if !response.succeeded {
+        return Err(ConfigError::Service(ServiceError::Service(format!(
+            "cluster config transaction for `{}` did not apply its success branch",
+            definition.key
+        ))));
+    }
     Ok(())
 }
 
@@ -2010,10 +2122,14 @@ impl From<ConfigError> for ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::kv::{KvEntry, KvRevision, KvVersion};
+    use sinomo_core::kv::{
+        ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvEntry,
+        KvLocalRead, KvRevision, KvSnapshot, KvTxnResponse, KvVersion,
+    };
     use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
     use sinomo_core::service::ResponseSink;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn bool_definition() -> ConfigDefinition {
         ConfigDefinition::new(
@@ -2672,11 +2788,16 @@ mod tests {
     #[derive(Default)]
     struct InMemoryCluster {
         entries: Mutex<BTreeMap<String, Vec<u8>>>,
+        committed_request_ids: Mutex<Vec<KvRequestId>>,
+        authoritative_failure: Mutex<Option<String>>,
+        local_get_calls: AtomicUsize,
+        authoritative_get_calls: AtomicUsize,
     }
 
     impl ClusterAccess for InMemoryCluster {
-        fn kv_get(&self, key: &str) -> Result<Option<KvEntry>, ServiceError> {
-            Ok(self
+        fn kv_get_local(&self, key: &str) -> Result<KvLocalRead<Option<KvEntry>>, ServiceError> {
+            self.local_get_calls.fetch_add(1, Ordering::Relaxed);
+            let value = self
                 .entries
                 .lock()
                 .expect("cluster lock")
@@ -2689,38 +2810,184 @@ mod tests {
                     modify_revision: KvRevision(1),
                     version: KvVersion(1),
                     lease_id: None,
-                }))
+                });
+            Ok(KvLocalRead {
+                value,
+                revision: KvRevision(1),
+                observed_term: 1,
+                applied_index: 1,
+                known_leader: None,
+            })
         }
 
-        fn kv_range_prefix(&self, _prefix: &str) -> Result<Vec<KvEntry>, ServiceError> {
-            Ok(Vec::new())
-        }
-
-        fn kv_commit_async<'a>(
+        fn kv_get_authoritative_async<'a>(
             &'a self,
-            txn: KvTxn,
+            key: &'a str,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
-                        Output = Result<sinomo_core::kv::KvTxnResponse, ServiceError>,
+                        Output = Result<KvAuthoritativeRead<Option<KvEntry>>, ServiceError>,
                     > + Send
                     + 'a,
             >,
         > {
             Box::pin(async move {
+                self.authoritative_get_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(detail) = self
+                    .authoritative_failure
+                    .lock()
+                    .expect("authoritative failure lock")
+                    .clone()
+                {
+                    return Err(ServiceError::Service(detail));
+                }
+                let value = self
+                    .entries
+                    .lock()
+                    .expect("cluster lock")
+                    .get(key)
+                    .cloned()
+                    .map(|value| KvEntry {
+                        key: key.to_string(),
+                        value,
+                        create_revision: KvRevision(1),
+                        modify_revision: KvRevision(1),
+                        version: KvVersion(1),
+                        lease_id: None,
+                    });
+                Ok(KvAuthoritativeRead {
+                    value,
+                    authority: KvAuthorityProof {
+                        term: 1,
+                        commit_index: 1,
+                        revision: KvRevision(1),
+                        basis: KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                })
+            })
+        }
+
+        fn kv_range_prefix_local(
+            &self,
+            prefix: &str,
+        ) -> Result<KvLocalRead<Vec<KvEntry>>, ServiceError> {
+            let entries = self.entries.lock().expect("cluster lock");
+            let value = entries
+                .iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .map(|(key, value)| KvEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(1),
+                    version: KvVersion(1),
+                    lease_id: None,
+                })
+                .collect();
+            Ok(KvLocalRead {
+                value,
+                revision: KvRevision(1),
+                observed_term: 1,
+                applied_index: 1,
+                known_leader: None,
+            })
+        }
+
+        fn kv_commit_async<'a>(
+            &'a self,
+            request: KvTxnRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ClusterKvTxnCommitResult, ServiceError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let request_id = request.request_id.clone();
+                self.committed_request_ids
+                    .lock()
+                    .expect("request id lock")
+                    .push(request_id.clone());
                 let mut entries = self.entries.lock().expect("cluster lock");
-                for op in txn.success {
+                for op in request.txn.success {
                     if let KvOp::Put { key, value, .. } = op {
                         entries.insert(key, value);
                     }
                 }
-                Ok(sinomo_core::kv::KvTxnResponse {
-                    succeeded: true,
-                    revision: KvRevision(1),
-                    responses: Vec::new(),
+                let snapshot_entries = entries
+                    .iter()
+                    .map(|(key, value)| KvEntry {
+                        key: key.clone(),
+                        value: value.clone(),
+                        create_revision: KvRevision(1),
+                        modify_revision: KvRevision(1),
+                        version: KvVersion(1),
+                        lease_id: None,
+                    })
+                    .collect();
+                Ok(ClusterKvTxnCommitResult {
+                    request_id,
+                    snapshot: KvSnapshot {
+                        revision: KvRevision(1),
+                        compacted_revision: KvRevision::ZERO,
+                        entries: snapshot_entries,
+                        leases: Vec::new(),
+                        events: Vec::new(),
+                        committed_requests: Vec::new(),
+                        expired_requests: Vec::new(),
+                    },
+                    txn_response: Some(KvTxnResponse {
+                        succeeded: true,
+                        revision: KvRevision(1),
+                        responses: Vec::new(),
+                    }),
+                    authority: KvAuthorityProof {
+                        term: 1,
+                        commit_index: 1,
+                        revision: KvRevision(1),
+                        basis: KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                    replayed_committed_request: false,
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn cluster_config_write_preserves_caller_supplied_request_id() {
+        let root = sinomo_testdir::TestDir::new("sinomo-config-request-id");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = ConfigStore::new(registry());
+        let cluster = InMemoryCluster::default();
+        let request_id = KvRequestId::generate();
+
+        store
+            .set_async_with_request_id(
+                &data_dir,
+                Some(&cluster),
+                "test.enabled",
+                Value::Bool(true),
+                ConfigWriteTarget::Cluster,
+                Some(request_id.clone()),
+            )
+            .await
+            .expect("cluster write");
+
+        assert_eq!(
+            cluster
+                .committed_request_ids
+                .lock()
+                .expect("request id lock")
+                .as_slice(),
+            std::slice::from_ref(&request_id)
+        );
     }
 
     #[tokio::test]
@@ -2750,10 +3017,83 @@ mod tests {
             .expect("cluster");
 
         let resolved = store
-            .get(&data_dir, Some(&cluster), "test.enabled")
+            .get_async(&data_dir, Some(&cluster), "test.enabled")
+            .await
             .expect("resolve");
         assert_eq!(resolved.value, Value::Bool(true));
         assert_eq!(resolved.source, ConfigValueSource::Cluster);
+        assert_eq!(cluster.local_get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cluster.authoritative_get_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cluster_override_local_does_not_fallback_when_authority_fails() {
+        let root = sinomo_testdir::TestDir::new("sinomo-config-authority-failure");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = ConfigStore::new(registry());
+        store
+            .set(
+                &data_dir,
+                None,
+                "test.enabled",
+                Value::Bool(false),
+                ConfigWriteTarget::Local,
+            )
+            .expect("local fallback candidate");
+        let cluster = InMemoryCluster::default();
+        *cluster
+            .authoritative_failure
+            .lock()
+            .expect("authoritative failure lock") = Some("quorum unavailable".to_string());
+
+        let error = store
+            .get_async(&data_dir, Some(&cluster), "test.enabled")
+            .await
+            .expect_err("authoritative failure must not fall back to local config");
+        assert!(error.to_string().contains("quorum unavailable"), "{error}");
+        assert_eq!(cluster.local_get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cluster.authoritative_get_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn local_only_config_does_not_request_cluster_authority() {
+        let root = sinomo_testdir::TestDir::new("sinomo-config-local-only-authority");
+        let data_dir = SinomoDataDir::new(&root);
+        let definition = ConfigDefinition::new(
+            "test.local-only",
+            "test",
+            ConfigValueType::Bool,
+            "local-only test switch",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("local-only definition");
+        let local_registry = ConfigRegistry::builder()
+            .register(definition)
+            .expect("register local-only definition")
+            .build();
+        let store = ConfigStore::new(local_registry);
+        store
+            .set(
+                &data_dir,
+                None,
+                "test.local-only",
+                Value::Bool(true),
+                ConfigWriteTarget::Local,
+            )
+            .expect("local-only value");
+        let cluster = InMemoryCluster::default();
+        *cluster
+            .authoritative_failure
+            .lock()
+            .expect("authoritative failure lock") = Some("authority must not be used".to_string());
+
+        let resolved = store
+            .get_async(&data_dir, Some(&cluster), "test.local-only")
+            .await
+            .expect("local-only resolution");
+        assert_eq!(resolved.value, Value::Bool(true));
+        assert_eq!(resolved.source, ConfigValueSource::Local);
+        assert_eq!(cluster.authoritative_get_calls.load(Ordering::Relaxed), 0);
     }
 
     #[derive(Default)]
@@ -2807,5 +3147,57 @@ mod tests {
             .expect("response frame");
         let response: ConfigSearchResponse = response.decode_body().expect("decode");
         assert_eq!(response.definitions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn config_service_get_does_not_fallback_after_authority_failure() {
+        let root = sinomo_testdir::TestDir::new("sinomo-config-service-authority-failure");
+        let data_dir = SinomoDataDir::new(&root);
+        ConfigStore::new(registry())
+            .set(
+                &data_dir,
+                None,
+                "test.enabled",
+                Value::Bool(false),
+                ConfigWriteTarget::Local,
+            )
+            .expect("local fallback candidate");
+        let cluster = Arc::new(InMemoryCluster::default());
+        *cluster
+            .authoritative_failure
+            .lock()
+            .expect("authoritative failure lock") = Some("service quorum unavailable".to_string());
+        let cluster_access: Arc<dyn ClusterAccess> = cluster.clone();
+        let sink = VecSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let ctx = ServiceContext::new(
+            Arc::new(data_dir),
+            Some(cluster_access),
+            sinomo_core::service::ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(sink),
+        );
+        let service_registry =
+            register_services(sinomo_core::service::ServiceRegistry::builder(), registry()).build();
+        let request = ObjectRpcRequest::encode_body(
+            CONFIG_GET_ROUTE,
+            CONFIG_RPC_CATEGORY,
+            &ConfigGetRequest {
+                key: "test.enabled".to_string(),
+            },
+        )
+        .expect("encode config get");
+
+        let error = service_registry
+            .dispatch(ctx, request)
+            .await
+            .expect_err("service must fail closed when config authority is unavailable");
+        assert!(
+            error.to_string().contains("service quorum unavailable"),
+            "{error}"
+        );
+        assert!(frames.lock().expect("frames").is_empty());
+        assert_eq!(cluster.local_get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cluster.authoritative_get_calls.load(Ordering::Relaxed), 1);
     }
 }

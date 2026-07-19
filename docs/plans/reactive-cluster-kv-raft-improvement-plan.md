@@ -1,6 +1,6 @@
 # Reactive Cluster KV/Raft Improvement Plan
 
-Status: proposed follow-up work. Last reviewed 2026-07-09.
+Status: proposed follow-up work. Last reviewed 2026-07-19.
 
 ## Context
 
@@ -11,11 +11,12 @@ nodes wake, operators run commands, apps connect, or peer traffic arrives. The
 goal is not to turn `sinomo-kv` into a conventional always-on Raft service.
 
 The current implementation already has useful safety machinery: persisted Raft
-hard state, WAL-backed log entries, quorum-gated writes, append conflict checks,
-vote freshness checks, snapshots, materialized local snapshots, durable watches,
-and host-provided transport. The main gaps are around explicit consistency
-contracts, passive-cluster liveness, idempotency, membership-change lifecycle,
-and operational recovery.
+hard state, WAL-backed log entries, quorum-gated mutation paths, append conflict
+checks, vote freshness checks, snapshots, materialized local snapshots, durable
+watches, and host-provided transport. The main gaps are around explicit
+consistency contracts, the local semantic-no-effect write fast path,
+passive-cluster liveness, idempotency, membership-change lifecycle, and
+operational recovery.
 
 ## Design Principles
 
@@ -24,9 +25,11 @@ and operational recovery.
    rollout activity, peer RPCs, and periodic opportunistic maintenance when a
    daemon is already alive.
 
-2. Separate correctness from freshness.
-   Writes should remain quorum-gated. Reads should be explicit about whether
-   they are local-cache reads, leader-refreshed reads, or quorum-fresh reads.
+2. Separate local availability from cluster authority.
+   Reads expose either a local view that may be stale or an authoritative view
+   backed by a current-term quorum barrier. Known-leader preference and snapshot
+   refresh are implementation mechanisms, not caller-visible consistency
+   levels. A cluster KV write reports success only after quorum-backed commit.
 
 3. Keep ownership boundaries.
    `sinomo-kv` owns KV semantics and Raft safety decisions. `sinomo-network`
@@ -42,39 +45,56 @@ and operational recovery.
 
 ## P0: Safety And Correctness
 
-### 1. Define the KV consistency contract
+### 1. Define the two-level KV consistency contract
 
-Document every KV-facing operation as one of:
+Document public KV reads as one of:
 
-- `local-cache`: reads the best local materialized or applied view and may be
-  stale.
-- `leader-refreshed`: routes to or refreshes from the known leader when
-  possible, and fails or degrades explicitly when freshness cannot be proven.
-- `quorum-fresh`: requires a quorum-backed check or commit path before
-  returning.
+- `local`: reads the best local materialized or applied view and may be stale.
+- `authoritative`: returns a view at or after a current-term quorum-confirmed
+  barrier and fails when that authority cannot be established.
+
+Do not expose `leader-refreshed` as a consistency level. Trying the known leader
+first is useful routing, but a leader response without current quorum evidence
+does not prove freshness. An authoritative read must never silently degrade to
+a local read.
 
 Apply this classification to snapshot, range-prefix, watch creation/drain,
 cluster membership, migration, rollout desired state, node status, and network
-connectivity reads.
+connectivity reads. An authoritative watch establishes its starting revision
+through a barrier; later delivery may lag but must remain ordered and report its
+last applied revision.
+
+Define the write contract at the same boundary: every successful cluster KV
+mutation, including a locally detected semantic no-op, must be backed by either
+a current-term quorum barrier or durable evidence that the exact request
+already committed. State that does not justify quorum-backed commit belongs in
+a local store, event/telemetry path, or another subsystem rather than cluster
+KV.
 
 Expected outcome: callers cannot accidentally use a stale local snapshot for a
-decision that needs cluster authority.
+decision that needs cluster authority, and write success always means committed
+cluster state.
 
-### 2. Add critical-read freshness APIs
+### 2. Add authoritative-read barrier APIs
 
 Keep cheap local reads for dashboards and status views, but add explicit helper
 APIs for critical decisions:
 
-- Read from known leader if reachable.
-- Refresh local KV from leader or quorum before returning.
-- Fail with structured diagnostics when freshness cannot be established.
+- Establish a current-term quorum barrier through a ReadIndex-style check,
+  equivalent quorum confirmation, or initially a quorum-backed no-op.
+- Return the authoritative snapshot/value plus its committed revision and term.
+- Prefer the known leader internally, but do not treat reachability alone as
+  authority.
+- Fail with structured diagnostics when the barrier cannot be established; the
+  caller must explicitly choose a separate local-read API if stale data is
+  acceptable.
 
 Initial critical callers should include cluster join/leave/migration planning,
 membership mutation, Raft config mutation, rollout desired state, invitations,
 and cluster-level config.
 
-Expected outcome: passive clusters keep cheap reads, while dangerous decisions
-get a stronger freshness path.
+Expected outcome: passive clusters keep cheap local reads, while dangerous
+decisions have one unambiguous authoritative path.
 
 ### 3. Add request IDs and idempotency records
 
@@ -84,7 +104,9 @@ unknown after timeout.
 
 This should complement, not replace, semantic no-effect checks. Semantic
 no-effect is useful for repeated state publication, but it is not a general
-duplicate-request protocol.
+duplicate-request protocol and cannot by itself prove that local state is
+current. An exact retry may reuse a stored response without a new log entry only
+when its idempotency record proves that the request previously committed.
 
 Expected outcome: retries after disconnects or mobile sleep do not depend on
 guessing whether a previous request committed.
@@ -120,6 +142,9 @@ The tick should:
 - Drain and fan out watch events.
 - Publish node status and endpoint observations.
 - Record structured evidence for any skipped step.
+
+The tick schedules existing Raft actions; it must not introduce a second
+consensus path, weaken quorum rules, or make timer/wake evidence authoritative.
 
 Trigger it from daemon startup, app/CLI connection, cluster status/health,
 rollout activity, migration operations, peer RPC handling, and low-frequency
@@ -167,26 +192,31 @@ retries.
 ### 9. Batch and coalesce noisy writes
 
 Add short-window opportunistic batching for high-churn keys such as node status,
-network connectivity, and network info. Preserve strict paths for membership,
-config, migration, invitations, and rollout desired state.
+network connectivity, and network info. Every accepted batch still follows the
+same quorum commit contract. Preserve immediate paths for membership, config,
+migration, invitations, and rollout desired state.
 
 Expected outcome: passive wakeups publish fewer redundant commits while critical
 state remains strongly handled.
 
-### 10. Split critical and telemetry KV behavior
+### 10. Split read defaults and projection behavior by keyspace
 
 Define keyspace classes:
 
 - Critical: membership, Raft config, cluster config, migrations, invitations,
   rollout desired state.
-- Operational: endpoint records, capability records, node-local config.
+- Operational: endpoint records and capability records.
 - Telemetry: node status, network connectivity, network info, health probes.
 
-Use stricter freshness/durability defaults for critical keys and allow deferred
-materialized snapshot writes or stale reads for telemetry keys.
+All cluster KV classes retain the same quorum-backed write semantics. Use
+authoritative reads by default for critical decisions, and local reads by
+default for operational and telemetry views. Operational and telemetry keys may
+use coalescing, retention limits, and deferred derived/materialized projections.
+If telemetry is not worth a quorum commit, keep it outside cluster KV. Node-local
+configuration and fail-closed permission state remain outside cluster KV.
 
-Expected outcome: the system stops treating every KV key as if it had the same
-consistency and durability requirements.
+Expected outcome: the system varies availability and projection cost without
+creating weaker meanings of cluster KV write success.
 
 ### 11. Make snapshot transfer resumable
 
@@ -199,13 +229,14 @@ interrupted links.
 
 ### 12. Improve quorum and freshness diagnostics
 
-Every read-only, stale-read, or quorum failure should include:
+Every local-read warning or authoritative/quorum failure should include:
 
 - Local node id and role.
 - Known leader and last observed term.
 - Reachable voters versus required quorum.
 - Last successful append or snapshot refresh.
-- Whether local data is stale, fresh, or unknown.
+- Whether the returned data is local or authoritative, its revision/term, and
+  whether its freshness is unknown.
 - Suggested recovery action.
 
 Expected outcome: operators can distinguish real data loss, temporary offline
@@ -221,9 +252,10 @@ cluster model.
 
 ### 14. ReadIndex everywhere
 
-Do not make quorum reads the default. Add leader/quorum freshness only for
-critical operations. Dashboards and local status views should remain cheap and
-available during partial connectivity.
+Do not make authoritative reads the default. Implement one bounded barrier path
+for critical operations; it may use ReadIndex or an equivalent quorum check.
+Dashboards and local status views should remain cheap and available during
+partial connectivity.
 
 ### 15. Autonomous Raft heartbeat/election loop
 
@@ -231,14 +263,62 @@ Avoid a conventional always-on loop as the default. It conflicts with the
 reactive cluster model. If needed later, make it an optional server-mode
 capability for deployments that intentionally run stable always-on nodes.
 
+## Verification Strategy
+
+### Quint boundary
+
+Do not model daemon wake sources, maintenance timers, backoff, routing, snapshot
+RPCs, or app/CLI wiring in Quint. The reactive refactor changes when existing
+Raft actions run, not the core consensus algorithm. Model those implementation
+mechanics with deterministic Rust and cluster tests.
+
+Keep `specs/quint/models/kv/raft_kv.qnt` as the small algorithm contract. Extend
+it only enough to express:
+
+- local-read success may observe an older committed prefix;
+- authoritative-read success requires a current-term quorum barrier and returns
+  the canonical committed prefix;
+- write success requires quorum-backed commit; and
+- a semantic no-op cannot report authoritative success without a barrier or an
+  exact durable committed-request record.
+
+Add a deliberately broken no-quorum/no-effect transition and require the model
+to find its counterexample before accepting the refinement. Do not expand
+`raft_protocol.qnt` for the reactive work. Model request-id retention and
+uncertain outcomes separately only when their algorithm is concrete enough to
+state a small independent invariant.
+
+### Runtime and cluster evidence
+
+The implementation gate should include:
+
+- focused tests proving local reads remain available without quorum while
+  authoritative reads fail;
+- tests proving ordinary writes and semantic no-op writes cannot return success
+  without quorum;
+- tests proving quorum-backed writes, authoritative reads, and exact committed
+  retries return the expected revision/result;
+- deterministic virtual-time tests for wake coalescing, retry backoff, shutdown,
+  and non-starvation of maintenance work; and
+- a three-node intermittent-cluster scenario covering offline local reads,
+  failed authoritative operations, quorum restoration, catch-up, and eventual
+  convergence.
+
 ## Recommended First Implementation Slice
 
 1. Add the consistency contract to docs and route/type names.
-2. Implement critical-read freshness helpers.
-3. Add request IDs and idempotency records for KV transactions.
-4. Add the opportunistic maintenance tick and wire it to daemon/app/CLI wake
+2. Implement the authoritative-read barrier and migrate the initial critical
+   callers.
+3. Close the semantic-no-effect fast path so write success always has quorum or
+   durable prior-commit evidence.
+4. Add request IDs and idempotency records for KV transactions.
+5. Add the opportunistic maintenance tick and wire it to daemon/app/CLI wake
    points.
-5. Convert Raft config changes into explicit lifecycle operations with evidence.
+6. Convert Raft config changes into explicit lifecycle operations with evidence.
+
+Complete the small `raft_kv` contract refinement with steps 2-3. Use the runtime
+and cluster evidence above for step 5 instead of expanding the Raft protocol
+model.
 
 This slice preserves Sinomo's passive design while addressing the most important
 correctness and recovery gaps first.

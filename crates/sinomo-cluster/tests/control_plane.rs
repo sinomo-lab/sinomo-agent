@@ -116,8 +116,6 @@ use sinomo_node::{
     main_daemon_capabilities, shadow_daemon_node_id,
 };
 #[allow(unused_imports)]
-#[allow(unused_imports)]
-#[allow(unused_imports)]
 use sinomo_node::{
     cluster_capability_policy_key, cluster_identity_key, cluster_invitation_key,
     cluster_invitation_state_key, cluster_member_key, cluster_node_status_key,
@@ -147,27 +145,26 @@ use sinomo_base::{
 };
 use sinomo_events::{InMemoryEventStore, ReplayQuery};
 use sinomo_kv::{
-    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, CLUSTER_RAFT_APPEND_ROUTE,
     CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftAppendReplicationOutcome,
     ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
-    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
-    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, ClusterKvWatchAllocatorState,
-    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
-    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest,
-    ClusterKvWatchRegistration, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare,
-    KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId,
-    MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
-    MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
-    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot, WatchId,
-    append_cluster_kv_watch_events, append_cluster_kv_watch_events_for_active_watches,
-    cached_cluster_kv_watch_events_contain_all, cached_cluster_kv_watch_events_for_test,
-    cached_cluster_kv_watch_registration_for_test, cancel_cluster_kv_watch,
-    cluster_kv_watch_allocator_trust_contains_for_test, cluster_kv_watch_dir_scans_for_test,
-    cluster_kv_watch_drain_once_calls_for_test, cluster_kv_watch_drain_read_passes_for_test,
-    cluster_kv_watch_event_cache_capacity_for_test, cluster_kv_watch_event_cache_contains_for_test,
-    cluster_kv_watch_event_log_read_bytes_for_test,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
+    ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse,
+    ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
+    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore,
+    KvCommand, KvCommandRequest, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse,
+    KvRevision, KvSnapshot, KvTxn, KvTxnRequest, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
+    MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftRequestVoteRequest, RaftSnapshot, WatchId, append_cluster_kv_watch_events,
+    append_cluster_kv_watch_events_for_active_watches, cached_cluster_kv_watch_events_contain_all,
+    cached_cluster_kv_watch_events_for_test, cached_cluster_kv_watch_registration_for_test,
+    cancel_cluster_kv_watch, cluster_kv_watch_allocator_trust_contains_for_test,
+    cluster_kv_watch_dir_scans_for_test, cluster_kv_watch_drain_once_calls_for_test,
+    cluster_kv_watch_drain_read_passes_for_test, cluster_kv_watch_event_cache_capacity_for_test,
+    cluster_kv_watch_event_cache_contains_for_test, cluster_kv_watch_event_log_read_bytes_for_test,
     cluster_kv_watch_event_log_write_bytes_for_test, cluster_kv_watch_events,
     cluster_kv_watch_generation, cluster_kv_watch_notifier_capacity_for_test,
     cluster_kv_watch_notifier_has_key_for_test, cluster_kv_watch_notifier_has_raw_key_for_test,
@@ -225,6 +222,53 @@ fn object_rpc_response_from_kv_payload(
     payload: sinomo_kv::ClusterKvRpcPayload,
 ) -> ObjectRpcResponse {
     ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
+}
+
+fn test_current_quorum_authority(snapshot: &KvSnapshot) -> sinomo_kv::KvAuthorityProof {
+    sinomo_kv::KvAuthorityProof {
+        term: 1,
+        commit_index: snapshot.revision.0.max(1),
+        revision: snapshot.revision,
+        basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks: 1,
+            required_quorum: 1,
+        },
+    }
+}
+
+fn test_cluster_kv_txn_commit_result(
+    snapshot: KvSnapshot,
+    txn_response: Option<KvTxnResponse>,
+) -> ClusterKvTxnCommitResult {
+    test_cluster_kv_txn_commit_result_for_request(
+        sinomo_kv::KvRequestId::generate(),
+        snapshot,
+        txn_response,
+    )
+}
+
+fn test_cluster_kv_txn_commit_result_for_request(
+    request_id: sinomo_kv::KvRequestId,
+    snapshot: KvSnapshot,
+    txn_response: Option<KvTxnResponse>,
+) -> ClusterKvTxnCommitResult {
+    ClusterKvTxnCommitResult {
+        request_id,
+        authority: test_current_quorum_authority(&snapshot),
+        snapshot,
+        txn_response,
+        replayed_committed_request: false,
+    }
+}
+
+fn test_authoritative_cluster_kv_snapshot(
+    paths: &ClusterPaths,
+) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    let snapshot = read_cluster_kv_current_snapshot(paths)?;
+    Ok(sinomo_kv::KvAuthoritativeRead {
+        authority: test_current_quorum_authority(&snapshot),
+        value: snapshot,
+    })
 }
 
 fn cluster_kv_watch_test_node_id() -> NodeId {
@@ -1990,8 +2034,9 @@ fn cluster_kv_txn_rpc_preserves_nested_sobj_values_as_raw_bytes() {
         success: vec![op],
         failure: Vec::new(),
     };
+    let txn_request = KvTxnRequest::generated(txn);
     let request = object_rpc_request_from_kv_payload(
-        sinomo_kv::cluster_kv_txn_rpc_payload(&txn).expect("encode txn request"),
+        sinomo_kv::cluster_kv_txn_rpc_payload(&txn_request).expect("encode txn request"),
     );
     assert!(
         request
@@ -2001,8 +2046,8 @@ fn cluster_kv_txn_rpc_preserves_nested_sobj_values_as_raw_bytes() {
         "cluster RPC encoding must embed nested KV values verbatim instead of base64 wrapping them"
     );
 
-    let decoded: KvTxn = request.decode_body().expect("decode txn request");
-    let decoded_value = match decoded.success.first().expect("put op") {
+    let decoded: KvTxnRequest = request.decode_body().expect("decode txn request");
+    let decoded_value = match decoded.txn.success.first().expect("put op") {
         KvOp::Put { value, .. } => value,
         _ => unreachable!("expected put op"),
     };
@@ -2441,7 +2486,7 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
         issuer_public_key: identity.public_key.clone(),
         signature: String::new(),
     };
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invite");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invite");
     let request = ClusterInviteChallengeRequest {
         protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
         invite_id: invite.invite_id.clone(),
@@ -7308,7 +7353,7 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
 }
 
 #[test]
-fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
+fn empty_cluster_kv_txn_commits_exact_request_without_advancing_revision() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-empty-txn-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -7349,14 +7394,14 @@ fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
             responses: Vec::new(),
         })
     );
-    assert_eq!(
-        wal_len_before, wal_len_after,
-        "empty transactions should not consume WAL writes"
+    assert!(
+        wal_len_after > wal_len_before,
+        "an accepted empty transaction must durably record its exact request"
     );
 }
 
 #[test]
-fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
+fn no_effect_cluster_kv_op_commits_exact_request_without_advancing_revision() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-no-effect-op-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -7388,14 +7433,14 @@ fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
 
     assert_eq!(no_op_snapshot.revision, snapshot.revision);
     assert_eq!(txn_response, None);
-    assert_eq!(
-        wal_len_before, wal_len_after,
-        "direct no-effect operations should not consume WAL writes"
+    assert!(
+        wal_len_after > wal_len_before,
+        "an accepted no-effect operation must durably record its exact request"
     );
 }
 
 #[test]
-fn stable_put_does_not_append_raft_log_entry() {
+fn stable_put_commits_exact_request_without_advancing_revision() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-stable-put-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -7436,9 +7481,9 @@ fn stable_put_does_not_append_raft_log_entry() {
         b"stable"
     );
     assert_eq!(txn_response, None);
-    assert_eq!(
-        wal_len_before, wal_len_after,
-        "stable puts should not consume WAL writes"
+    assert!(
+        wal_len_after > wal_len_before,
+        "an accepted stable put must durably record its exact request"
     );
 
     let changed = append_cluster_raft_command(
@@ -7460,7 +7505,7 @@ fn stable_put_does_not_append_raft_log_entry() {
 }
 
 #[test]
-fn stable_cluster_member_put_does_not_append_raft_log_entry() {
+fn stable_cluster_member_put_commits_exact_request_without_advancing_revision() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-stable-member-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -7497,9 +7542,9 @@ fn stable_cluster_member_put_does_not_append_raft_log_entry() {
 
     assert_eq!(no_op_snapshot.revision, snapshot.revision);
     assert_eq!(txn_response, None);
-    assert_eq!(
-        wal_len_before, wal_len_after,
-        "stable cluster member puts should not consume WAL writes"
+    assert!(
+        wal_len_after > wal_len_before,
+        "an accepted stable member put must durably record its exact request"
     );
     assert!(
         no_op_snapshot
@@ -7527,7 +7572,7 @@ fn stable_cluster_member_put_does_not_append_raft_log_entry() {
 }
 
 #[test]
-fn stable_lease_grant_does_not_append_raft_log_entry() {
+fn stable_lease_grant_commits_exact_request_without_advancing_revision() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-stable-lease-grant-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -7569,9 +7614,9 @@ fn stable_lease_grant_does_not_append_raft_log_entry() {
             .ttl_ticks,
         10
     );
-    assert_eq!(
-        wal_len_before, wal_len_after_noop,
-        "stable full lease grants should not consume WAL writes"
+    assert!(
+        wal_len_after_noop > wal_len_before,
+        "an accepted stable lease grant must durably record its exact request"
     );
 
     let changed = append_cluster_raft_command(
@@ -7602,7 +7647,72 @@ fn stable_lease_grant_does_not_append_raft_log_entry() {
 }
 
 #[test]
-fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
+fn committed_raft_config_is_effective_after_stale_local_state_restart() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cluster-committed-config-effective");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_committed_config_effective").expect("cluster");
+    let local = NodeId::from_legacy_named("node_committed_config_local").expect("local");
+    let second = NodeId::from_legacy_named("node_committed_config_second").expect("second");
+    let third = NodeId::from_legacy_named("node_committed_config_third").expect("third");
+    let mut stale_local_state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "committed config effective",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    mark_test_member_as_voter(&mut stale_local_state.members[0]);
+    for (node_id, name) in [(second.clone(), "second"), (third.clone(), "third")] {
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            node_id,
+            name,
+            format!("pk-{name}"),
+            now,
+        );
+        mark_test_member_as_voter(&mut member);
+        stale_local_state.members.push(member);
+    }
+    write_cluster_state(&paths, &stale_local_state).expect("write stale local state");
+    let seeded = sync_cluster_state_to_local_raft_unchecked(&paths, &stale_local_state)
+        .expect("seed three-voter config");
+    let mut config: ClusterKvRaftConfigRecord = seeded
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .expect("raft config")
+        .decode()
+        .expect("decode raft config");
+    config.voters = vec![second.clone(), third.clone()];
+    config.non_voting = vec![local.clone()];
+    config.updated_at = now + time::Duration::seconds(1);
+    append_cluster_raft_command(
+        &paths,
+        &local,
+        KvCommand::Op(
+            KvOp::put_serde(sinomo_kv::cluster_kv_raft_config_key(), &config, None)
+                .expect("config put"),
+        ),
+    )
+    .expect("commit safe overlapping local demotion");
+
+    // Simulate restart with the pre-change local projection still on disk.
+    write_cluster_state(&paths, &stale_local_state).expect("restore stale local state");
+    let effective = read_cluster_consensus_state(&paths).expect("effective consensus state");
+    assert!(!effective.node_is_raft_voter(&local));
+    assert!(effective.node_is_raft_voter(&second));
+    assert!(effective.node_is_raft_voter(&third));
+    assert_eq!(
+        sinomo_kv::cluster_kv_raft_quorum_size_for_state(&effective),
+        2
+    );
+}
+
+#[test]
+fn cluster_kv_txn_with_empty_selected_branch_commits_exact_request() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-empty-selected-branch-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -7649,9 +7759,9 @@ fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
             responses: Vec::new(),
         })
     );
-    assert_eq!(
-        wal_len_before, wal_len_after,
-        "CAS no-ops should not consume WAL writes"
+    assert!(
+        wal_len_after > wal_len_before,
+        "an accepted CAS no-op must durably record its exact request"
     );
     assert_eq!(
         no_op_snapshot
@@ -7665,7 +7775,7 @@ fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
 }
 
 #[test]
-fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry() {
+fn cluster_kv_txn_with_no_effect_selected_branch_commits_exact_request() {
     let root =
         sinomo_testdir::TestDir::new("sinomo-network-no-effect-selected-branch-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
@@ -7740,9 +7850,9 @@ fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry(
             ],
         })
     );
-    assert_eq!(
-        wal_len_before, wal_len_after,
-        "no-effect transactions should not consume WAL writes"
+    assert!(
+        wal_len_after > wal_len_before,
+        "an accepted no-effect transaction must durably record its exact request"
     );
     let changed = append_cluster_raft_command(
         &paths,
@@ -8048,6 +8158,11 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
 
     assert_eq!(report.attempted_nodes, 1);
     assert_eq!(report.replicated_nodes, vec![peer.clone()]);
+    assert_eq!(report.peer_progress_hints.len(), 1);
+    assert_eq!(report.peer_progress_hints[0].peer_node_id, peer);
+    assert_eq!(report.peer_progress_hints[0].term, 1);
+    assert_eq!(report.peer_progress_hints[0].match_index, 1);
+    assert_eq!(report.peer_progress_hints[0].next_index, 2);
     assert_eq!(report.watch_event_batches_sent, expected_batches);
     assert_eq!(host.appended_nodes, vec![peer.clone()]);
     assert_eq!(host.appended_event_counts, vec![events.len()]);
@@ -8415,23 +8530,30 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
     }
 
     impl ClusterMemberMutationHost for MemoryMutationHost {
-        fn current_cluster_kv_store(
+        fn authoritative_cluster_kv_snapshot(
             &mut self,
             _paths: &ClusterPaths,
-            _state: &ClusterBootstrapState,
-        ) -> Result<InProcessKvStore, NetworkError> {
-            Ok(self.store.clone())
+            _state: &mut ClusterBootstrapState,
+        ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+            let snapshot = self.store.try_snapshot().map_err(kv_err)?;
+            Ok(sinomo_kv::KvAuthoritativeRead {
+                authority: test_current_quorum_authority(&snapshot),
+                value: snapshot,
+            })
         }
 
         fn commit_cluster_kv_txn_with_quorum(
             &mut self,
             _paths: &ClusterPaths,
             _state: &mut ClusterBootstrapState,
-            txn: KvTxn,
-        ) -> Result<KvSnapshot, NetworkError> {
+            request: KvTxnRequest,
+        ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
             self.commits += 1;
-            self.store.txn(txn).map_err(kv_err)?;
-            Ok(self.store.snapshot().expect("snapshot"))
+            let response = self.store.txn(request.txn).map_err(kv_err)?;
+            Ok(test_cluster_kv_txn_commit_result(
+                self.store.snapshot().expect("snapshot"),
+                Some(response),
+            ))
         }
     }
 
@@ -9020,15 +9142,10 @@ fn local_cluster_raft_command_storage_appends_commits_and_discards_under_network
         value: b"committed".to_vec(),
         lease_id: None,
     });
-    let index = match storage
-        .append_cluster_raft_command_uncommitted_or_no_effect(command)
+    let index = storage
+        .append_cluster_raft_request_uncommitted(KvCommandRequest::generated(command))
         .expect("append uncommitted")
-    {
-        ClusterKvRaftUncommittedAppend::Appended(entry) => entry.index,
-        ClusterKvRaftUncommittedAppend::NoEffect { .. } => {
-            panic!("fresh command should append a raft entry")
-        }
-    };
+        .index;
 
     let commit = storage
         .commit_cluster_raft_index_with_events(index)
@@ -9048,7 +9165,7 @@ fn local_cluster_raft_command_storage_appends_commits_and_discards_under_network
         lease_id: None,
     });
     let _ = storage
-        .append_cluster_raft_command_uncommitted_or_no_effect(discarded)
+        .append_cluster_raft_request_uncommitted(KvCommandRequest::generated(discarded))
         .expect("append discarded command");
     storage
         .discard_cluster_raft_uncommitted_tail_and_clear_leader()
@@ -9145,14 +9262,46 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for RecordingQuorumCommitHost {
         sinomo_cluster::kv_err(error)
     }
 
-    fn append_cluster_raft_command_uncommitted_or_no_effect(
+    fn replay_cluster_raft_request_if_committed(
         &mut self,
-        command: KvCommand,
-    ) -> Result<sinomo_kv::ClusterKvRaftUncommittedAppend, NetworkError> {
+        request: &KvCommandRequest,
+    ) -> Result<Option<(KvSnapshot, sinomo_kv::KvCommittedRequestRecord)>, NetworkError> {
         let paths = self.paths().clone();
         let local_node_id = self.local_node_id().clone();
         LocalClusterRaftCommandStorage::new(&paths, local_node_id)
-            .append_cluster_raft_command_uncommitted_or_no_effect(command)
+            .replay_cluster_raft_request_if_committed(request)
+    }
+
+    fn append_cluster_raft_request_uncommitted(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> Result<sinomo_kv::KvLogEntry, NetworkError> {
+        let paths = self.paths().clone();
+        let local_node_id = self.local_node_id().clone();
+        LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+            .append_cluster_raft_request_uncommitted(request)
+    }
+
+    fn record_cluster_raft_request_rejected_before_commit(
+        &mut self,
+        request: &KvCommandRequest,
+        failure: &sinomo_kv::KvAuthorityFailure,
+    ) -> Result<(), NetworkError> {
+        let paths = self.paths().clone();
+        let local_node_id = self.local_node_id().clone();
+        LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+            .record_cluster_raft_request_rejected_before_commit(request, failure)
+    }
+
+    fn record_cluster_raft_request_unknown(
+        &mut self,
+        request: &KvCommandRequest,
+        detail: &str,
+    ) -> Result<(), NetworkError> {
+        let paths = self.paths().clone();
+        let local_node_id = self.local_node_id().clone();
+        LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+            .record_cluster_raft_request_unknown(request, detail)
     }
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
@@ -9444,7 +9593,7 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
 
     fn call_node_object_rpc(
         &mut self,
-        _state: &ClusterBootstrapState,
+        state: &ClusterBootstrapState,
         target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         _timeout: Duration,
@@ -9453,13 +9602,26 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
             .push((target_node_id.clone(), request.route.clone()));
         match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
-                let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
+                let submitted = sinomo_kv::decode_cluster_kv_txn_rpc_request_body(&request.body)
                     .map_err(kv_err)?;
-                Ok(object_rpc_response_from_kv_payload(payload))
-            }
-            CLUSTER_KV_SNAPSHOT_ROUTE => {
-                let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)
-                    .map_err(kv_err)?;
+                let voter_count = state
+                    .members
+                    .iter()
+                    .filter(|member| sinomo_kv::cluster_kv_member_has_raft_vote(member))
+                    .count();
+                let required_quorum = sinomo_kv::cluster_kv_raft_quorum_size(voter_count);
+                let mut result = test_cluster_kv_txn_commit_result_for_request(
+                    submitted.request_id,
+                    self.snapshot.clone(),
+                    Some(self.txn_response.clone()),
+                );
+                result.authority.term = result.authority.term.max(state.term);
+                result.authority.basis = sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: required_quorum,
+                    required_quorum,
+                };
+                let payload =
+                    sinomo_kv::cluster_kv_txn_response_rpc_payload(&result).map_err(kv_err)?;
                 Ok(object_rpc_response_from_kv_payload(payload))
             }
             route => ObjectRpcResponse::encode_error(route, "unexpected route"),
@@ -9501,7 +9663,7 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.fetches.push((target_node_id.clone(), timeout));
-        assert_eq!(request.route, CLUSTER_KV_SNAPSHOT_ROUTE);
+        assert_eq!(request.route, CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
         let snapshot =
             self.snapshots
                 .get(target_node_id)
@@ -9511,7 +9673,14 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
                     detail: format!("no snapshot for {target_node_id}"),
                 })?;
         let payload =
-            sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&snapshot).map_err(kv_err)?;
+            sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(&sinomo_kv::KvLocalRead {
+                revision: snapshot.revision,
+                observed_term: 1,
+                applied_index: snapshot.revision.0,
+                known_leader: self.known_authority.clone(),
+                value: snapshot,
+            })
+            .map_err(kv_err)?;
         Ok(object_rpc_response_from_kv_payload(payload))
     }
 }
@@ -9586,12 +9755,12 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         &mut self,
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
-        command: KvCommand,
+        request: KvCommandRequest,
         _options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         self.commit_calls += 1;
         let mut store = InProcessKvStore::new();
-        let txn_response = match command {
+        let txn_response = match request.command {
             KvCommand::Txn(txn) => Some(store.txn(txn).expect("test txn commit")),
             KvCommand::Op(op) => Some(
                 store
@@ -9602,10 +9771,14 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
                     })
                     .expect("test op commit"),
             ),
+            KvCommand::Barrier => None,
         };
+        let snapshot = store.snapshot().expect("test snapshot");
         Ok(ClusterKvRaftQuorumCommitResult {
-            snapshot: store.snapshot().expect("test snapshot"),
+            authority: test_current_quorum_authority(&snapshot),
+            snapshot,
             txn_response,
+            replayed_committed_request: false,
         })
     }
 }
@@ -9670,7 +9843,7 @@ impl ClusterKvTxnQuorumHost for RetryableCommitFailureKvTxnQuorumHost {
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _txn: &KvTxn,
+        _request: &KvTxnRequest,
         _options: ClusterKvTxnQuorumOptions,
     ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
         Ok(None)
@@ -9700,7 +9873,7 @@ impl ClusterKvTxnQuorumHost for RetryableCommitFailureKvTxnQuorumHost {
         &mut self,
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
-        _command: KvCommand,
+        _request: KvCommandRequest,
         _options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         self.commit_calls += 1;
@@ -9713,7 +9886,9 @@ impl ClusterKvTxnQuorumHost for RetryableCommitFailureKvTxnQuorumHost {
         let snapshot = forward_test_snapshot("/test/retry-after-commit-failure", b"committed");
         Ok(ClusterKvRaftQuorumCommitResult {
             txn_response: Some(forward_test_txn_response(snapshot.revision)),
+            authority: test_current_quorum_authority(&snapshot),
             snapshot,
+            replayed_committed_request: false,
         })
     }
 }
@@ -10684,7 +10859,7 @@ fn forwarded_cluster_kv_txn_driver_never_starts_election() {
     let error = commit_cluster_kv_txn_with_quorum_response_with_host(
         &paths,
         &mut state,
-        KvTxn {
+        KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: vec![KvOp::Put {
                 key: "/test/forwarded-local-election".to_string(),
@@ -10692,7 +10867,7 @@ fn forwarded_cluster_kv_txn_driver_never_starts_election() {
                 lease_id: None,
             }],
             failure: Vec::new(),
-        },
+        }),
         kv_txn_quorum_test_options(false),
         &mut host,
     )
@@ -10733,7 +10908,7 @@ fn cluster_kv_txn_driver_retries_after_retryable_local_commit_failure() {
     let result = commit_cluster_kv_txn_with_quorum_response_with_host(
         &paths,
         &mut state,
-        KvTxn {
+        KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: vec![KvOp::Put {
                 key: "/test/retry-after-commit-failure".to_string(),
@@ -10741,7 +10916,7 @@ fn cluster_kv_txn_driver_retries_after_retryable_local_commit_failure() {
                 lease_id: None,
             }],
             failure: Vec::new(),
-        },
+        }),
         kv_txn_quorum_test_options(true),
         &mut host,
     )
@@ -10772,7 +10947,7 @@ fn cluster_kv_txn_request_driver_reports_read_only_without_cluster_state() {
 
     let error = handle_cluster_kv_txn_request_with_host(
         &paths,
-        KvTxn {
+        KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: vec![KvOp::Put {
                 key: "/test/orphan".to_string(),
@@ -10780,7 +10955,7 @@ fn cluster_kv_txn_request_driver_reports_read_only_without_cluster_state() {
                 lease_id: None,
             }],
             failure: Vec::new(),
-        },
+        }),
         kv_txn_quorum_test_options(true),
         &mut host,
     )
@@ -11070,16 +11245,17 @@ fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
             10,
         ));
     write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
     let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
 
     let result = commit_cluster_raft_command_with_quorum_driver(
         &paths,
         &mut state,
-        KvCommand::Op(KvOp::Put {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
             key: "/quorum/commit".to_string(),
             value: b"committed".to_vec(),
             lease_id: None,
-        }),
+        })),
         ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
@@ -11096,7 +11272,11 @@ fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
         b"committed".to_vec()
     );
     assert_eq!(host.replicated_nodes, vec![peer_node_id.clone()]);
-    assert_eq!(host.committed_indices, vec![1]);
+    assert_eq!(
+        host.committed_indices,
+        vec![2],
+        "the fixture config occupies committed index 1"
+    );
     assert!(!host.discarded);
     assert_eq!(
         host.connectivity,
@@ -11132,16 +11312,17 @@ fn cluster_raft_quorum_commit_deduplicates_remote_voter_endpoints() {
             daemon_lan_endpoint(&peer_node_id, "10.0.0.84:21353".to_string(), 20),
         ]);
     write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
     let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
 
     commit_cluster_raft_command_with_quorum_driver(
         &paths,
         &mut state,
-        KvCommand::Op(KvOp::Put {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
             key: "/quorum/dedupe".to_string(),
             value: b"dedupe".to_vec(),
             lease_id: None,
-        }),
+        })),
         ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
@@ -11176,16 +11357,17 @@ fn cluster_raft_quorum_commit_targets_same_remote_voter_once_by_node() {
         .endpoints
         .extend([private_endpoint.clone(), public_endpoint.clone()]);
     write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
     let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
 
     commit_cluster_raft_command_with_quorum_driver(
         &paths,
         &mut state,
-        KvCommand::Op(KvOp::Put {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
             key: "/quorum/same-voter-retry".to_string(),
             value: b"retry".to_vec(),
             lease_id: None,
-        }),
+        })),
         ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
@@ -11248,17 +11430,18 @@ fn cluster_raft_quorum_commit_succeeds_with_two_of_three_voters_online() {
             10,
         ));
     write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
     let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
     host.failing_nodes.insert(offline_node_id.clone());
 
     let result = commit_cluster_raft_command_with_quorum_driver(
         &paths,
         &mut state,
-        KvCommand::Op(KvOp::Put {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
             key: "/quorum/two-of-three".to_string(),
             value: b"committed".to_vec(),
             lease_id: None,
-        }),
+        })),
         ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
@@ -11276,7 +11459,211 @@ fn cluster_raft_quorum_commit_succeeds_with_two_of_three_voters_online() {
     );
     assert!(host.replicated_nodes.contains(&peer_node_id));
     assert!(!host.discarded);
-    assert_eq!(host.committed_indices, vec![1]);
+    assert_eq!(
+        host.committed_indices,
+        vec![2],
+        "the fixture config occupies committed index 1"
+    );
+}
+
+#[test]
+fn intermittent_three_node_cluster_preserves_local_reads_and_converges_after_quorum_returns() {
+    let leader_root = sinomo_testdir::TestDir::new("cluster-intermittent-leader");
+    let peer_one_root = sinomo_testdir::TestDir::new("cluster-intermittent-peer-one");
+    let peer_two_root = sinomo_testdir::TestDir::new("cluster-intermittent-peer-two");
+    let leader_paths = ClusterPaths::new(&SinomoDataDir::new(&leader_root));
+    let peer_one_paths = ClusterPaths::new(&SinomoDataDir::new(&peer_one_root));
+    let peer_two_paths = ClusterPaths::new(&SinomoDataDir::new(&peer_two_root));
+    for paths in [&leader_paths, &peer_one_paths, &peer_two_paths] {
+        paths.ensure().expect("cluster paths");
+    }
+
+    let (mut state, leader_id, peer_one_id) = cluster_raft_handler_test_state(
+        "cluster_intermittent_three_node",
+        "node_intermittent_leader",
+        "node_intermittent_peer_one",
+    );
+    let peer_two_id = NodeId::from_legacy_named("node_intermittent_peer_two").expect("peer two id");
+    let mut peer_two = state.members[1].clone();
+    peer_two.node_id = peer_two_id.clone();
+    peer_two.display_name = "peer two".to_string();
+    peer_two.node_public_key = "peer-two-public-key".to_string();
+    peer_two.endpoints.clear();
+    mark_test_member_as_voter(&mut peer_two);
+    state.members.push(peer_two);
+    state.members[1].endpoints = vec![daemon_lan_endpoint(
+        &peer_one_id,
+        "10.91.0.2:21353".to_string(),
+        10,
+    )];
+    state.members[2].endpoints = vec![daemon_lan_endpoint(
+        &peer_two_id,
+        "10.91.0.3:21353".to_string(),
+        10,
+    )];
+    write_cluster_state(&leader_paths, &state).expect("leader state");
+    for (paths, node_id) in [
+        (&peer_one_paths, &peer_one_id),
+        (&peer_two_paths, &peer_two_id),
+    ] {
+        let mut peer_state = state.clone();
+        peer_state.local_node_id = node_id.clone();
+        peer_state.local_node_display_name = peer_state
+            .members
+            .iter()
+            .find(|member| &member.node_id == node_id)
+            .expect("peer member")
+            .display_name
+            .clone();
+        write_cluster_state(paths, &peer_state).expect("peer state");
+    }
+
+    let seeded = append_cluster_raft_command(
+        &leader_paths,
+        &leader_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/intermittent/already-committed".to_string(),
+            value: b"available-offline".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed local history");
+    locked_set_cluster_raft_leader(&leader_paths, &leader_id, 1)
+        .expect("establish initial leader term");
+    let local_read = read_cluster_kv_local_snapshot(&leader_paths, &state)
+        .expect("local read remains available without quorum");
+    assert_eq!(local_read.revision, seeded.revision);
+    assert!(
+        local_read
+            .value
+            .get("/intermittent/already-committed")
+            .is_some()
+    );
+    let mut offline_peer_two_state = state.clone();
+    offline_peer_two_state.local_node_id = peer_two_id.clone();
+    assert!(
+        read_cluster_kv_local_snapshot(&peer_two_paths, &offline_peer_two_state).is_ok(),
+        "an offline follower must still serve its local (possibly stale) view"
+    );
+
+    let unavailable = commit_cluster_raft_command_with_local_storage_and_transport(
+        &leader_paths,
+        &mut state,
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: "/intermittent/must-not-commit".to_string(),
+            value: b"no-quorum".to_vec(),
+            lease_id: None,
+        })),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_millis(100),
+        },
+        ClusterControlPlaneTimeouts::default_daemon_transport(),
+        |_endpoint, _request, _timeout| {
+            Err(NetworkError::delivery_failed(
+                "intermittent peer append",
+                NetworkDeliveryState::DefinitelyNotSent,
+                "both peers are offline",
+            ))
+        },
+        |_, _, _, _, _| {},
+        |_, _, _, _| {},
+        || {},
+    )
+    .expect_err("an authoritative write must fail while two of three voters are offline");
+    assert!(matches!(unavailable, NetworkError::ClusterReadOnly { .. }));
+    assert!(
+        read_cluster_kv_local_snapshot(&leader_paths, &state)
+            .expect("local view after failed write")
+            .value
+            .get("/intermittent/must-not-commit")
+            .is_none()
+    );
+
+    let authenticated_leader = ClusterAuthenticatedPeer {
+        node_id: leader_id.to_string(),
+        public_key: "local-public-key".to_string(),
+    };
+    locked_set_cluster_raft_leader(&leader_paths, &leader_id, 2)
+        .expect("restore leadership after the failed no-quorum attempt");
+    let peer_one_for_commit = peer_one_id.clone();
+    let committed = commit_cluster_raft_command_with_local_storage_and_transport(
+        &leader_paths,
+        &mut state,
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: "/intermittent/converged".to_string(),
+            value: b"quorum-restored".to_vec(),
+            lease_id: None,
+        })),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_secs(2),
+        },
+        ClusterControlPlaneTimeouts::default_daemon_transport(),
+        |endpoint, request, _timeout| {
+            if endpoint.node_id != peer_one_for_commit {
+                return Err(NetworkError::delivery_failed(
+                    "intermittent peer append",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "peer two remains offline",
+                ));
+            }
+            handle_cluster_raft_append_request(
+                &peer_one_paths,
+                request.clone(),
+                &authenticated_leader,
+            )
+        },
+        |_, _, _, _, _| {},
+        |_, _, _, _| {},
+        || {},
+    )
+    .expect("one restored peer establishes a two-of-three quorum");
+    assert!(committed.snapshot.get("/intermittent/converged").is_some());
+    assert!(matches!(
+        committed.authority.basis,
+        sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks: 2,
+            required_quorum: 2
+        }
+    ));
+
+    let replication_options = ClusterRaftAppendReplicationOptions {
+        max_attempts: 16,
+        timeout: Duration::from_secs(2),
+        tcp_command_timeout: Duration::from_secs(2),
+        iroh_command_timeout: Duration::from_secs(2),
+        tcp_foreground_attempt_timeout: Duration::from_secs(2),
+        public_foreground_attempt_timeout: Duration::from_secs(2),
+        iroh_foreground_attempt_timeout: Duration::from_secs(2),
+    };
+    for (endpoint, peer_paths) in [
+        (state.members[1].endpoints[0].clone(), &peer_one_paths),
+        (state.members[2].endpoints[0].clone(), &peer_two_paths),
+    ] {
+        let outcome = replicate_cluster_raft_to_endpoint_with_local_host(
+            &leader_paths,
+            &state,
+            &endpoint,
+            &[],
+            replication_options,
+            |_endpoint, request, _timeout| {
+                handle_cluster_raft_append_request(
+                    peer_paths,
+                    request.clone(),
+                    &authenticated_leader,
+                )
+            },
+            || {},
+        )
+        .expect("restored peer catch-up");
+        assert!(outcome.response.accepted);
+    }
+
+    for peer_paths in [&peer_one_paths, &peer_two_paths] {
+        let peer_snapshot = read_cluster_kv_snapshot(peer_paths).expect("caught-up peer snapshot");
+        assert_eq!(peer_snapshot.revision, committed.snapshot.revision);
+        assert_eq!(peer_snapshot.entries, committed.snapshot.entries);
+        assert!(peer_snapshot.get("/intermittent/converged").is_some());
+    }
 }
 
 #[test]
@@ -11299,17 +11686,18 @@ fn cluster_raft_quorum_commit_observes_higher_rejected_append_term() {
         .endpoints
         .push(peer_endpoint);
     write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
     let observed_term = 977;
     let response_state = state.clone();
 
     let error = commit_cluster_raft_command_with_local_storage_and_transport(
         &paths,
         &mut state,
-        KvCommand::Op(KvOp::Put {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
             key: "/quorum/rejected-term".to_string(),
             value: b"rejected".to_vec(),
             lease_id: None,
-        }),
+        })),
         ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
@@ -11361,6 +11749,7 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
             10,
         ));
     write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
 
     let append_calls = Arc::new(Mutex::new(Vec::new()));
     let connectivity = Arc::new(Mutex::new(Vec::new()));
@@ -11374,11 +11763,11 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
     let result = commit_cluster_raft_command_with_local_storage_and_transport(
         &paths,
         &mut state,
-        KvCommand::Op(KvOp::Put {
+        KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
             key: "/quorum/local-helper".to_string(),
             value: b"committed".to_vec(),
             lease_id: None,
-        }),
+        })),
         ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
@@ -11897,11 +12286,11 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_for_known_state_authority(
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
-        &KvTxn {
+        &KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: Vec::new(),
             failure: Vec::new(),
-        },
+        }),
         ClusterKvTxnForwardOptions {
             timeout: Duration::from_secs(5),
             tcp_command_timeout: Duration::from_secs(5),
@@ -11916,10 +12305,7 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_for_known_state_authority(
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
         host.rpcs,
-        vec![
-            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
-            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
-        ]
+        vec![(peer_node_id, CLUSTER_KV_TXN_ROUTE.to_string())]
     );
 }
 
@@ -11957,11 +12343,11 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
-        &KvTxn {
+        &KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: Vec::new(),
             failure: Vec::new(),
-        },
+        }),
         ClusterKvTxnForwardOptions {
             timeout: Duration::from_secs(5),
             tcp_command_timeout: Duration::from_secs(5),
@@ -11976,10 +12362,7 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
         host.rpcs,
-        vec![
-            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
-            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
-        ]
+        vec![(peer_node_id, CLUSTER_KV_TXN_ROUTE.to_string())]
     );
 }
 
@@ -12082,11 +12465,11 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_without_known_state_author
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
-        &KvTxn {
+        &KvTxnRequest::generated(KvTxn {
             compares: Vec::new(),
             success: Vec::new(),
             failure: Vec::new(),
-        },
+        }),
         ClusterKvTxnForwardOptions {
             timeout: Duration::from_secs(5),
             tcp_command_timeout: Duration::from_secs(5),
@@ -12101,10 +12484,7 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_without_known_state_author
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
         host.rpcs,
-        vec![
-            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
-            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
-        ]
+        vec![(peer_node_id, CLUSTER_KV_TXN_ROUTE.to_string())]
     );
 }
 
@@ -12131,6 +12511,18 @@ fn cluster_raft_append_replication_retries_from_rejected_match_index() {
     )
     .expect("seed raft entry");
     let endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.72:21353".to_string(), 10);
+    sinomo_kv::record_cluster_kv_raft_peer_progress(
+        &paths.kv_paths(),
+        sinomo_kv::ClusterKvRaftPeerProgress {
+            peer_node_id: peer_node_id.clone(),
+            term: state.term,
+            next_index: 1,
+            match_index: 0,
+            last_accepted_index: 0,
+            observed_at: OffsetDateTime::now_utc(),
+        },
+    )
+    .expect("record resumed peer progress");
     let mut host = RecordingRaftAppendHost {
         responses: vec![
             ClusterRaftAppendResponse {
@@ -12179,7 +12571,7 @@ fn cluster_raft_append_replication_retries_from_rejected_match_index() {
 
     assert!(outcome.response.accepted);
     assert_eq!(host.sent_count, 2);
-    assert_eq!(host.sent_prev_log_indexes, vec![1, 0]);
+    assert_eq!(host.sent_prev_log_indexes, vec![0, 0]);
     assert_eq!(host.sent_timeouts[0], Duration::from_secs(1));
 }
 
@@ -13260,7 +13652,7 @@ fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
         issuer_public_key: "issuer-pk".to_string(),
         signature: String::new(),
     };
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
     write_cluster_kv_snapshot(
         &paths,
         &InProcessKvStore::new().snapshot().expect("snapshot"),
@@ -13438,7 +13830,7 @@ fn cluster_join_registration_prepare_accepts_signed_learner_and_rejects_role_esc
         signature: String::new(),
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
     let learner_member = ClusterMemberRecord::pending_learner(
         cluster_id.clone(),
         joined_node_id.clone(),
@@ -13539,6 +13931,61 @@ struct RecordingJoinRegistrationHost {
     observation: Option<ClusterLocalDaemonMembershipObservation>,
     committed: Vec<ClusterBootstrapState>,
     remembered_targets: usize,
+    force_compare_failure: bool,
+}
+
+impl RecordingJoinRegistrationHost {
+    fn ensure_authoritative_test_state(
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<(), NetworkError> {
+        let needs_bootstrap = read_cluster_kv_current_snapshot(paths)
+            .ok()
+            .is_none_or(|snapshot| {
+                snapshot
+                    .get(&sinomo_kv::cluster_kv_raft_config_key())
+                    .is_none()
+            });
+        if needs_bootstrap {
+            sync_cluster_state_to_local_raft_unchecked(paths, state)?;
+        }
+        Ok(())
+    }
+
+    fn commit_test_join_txn(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+        Self::ensure_authoritative_test_state(paths, state)?;
+        let request_id = request.request_id;
+        if self.force_compare_failure {
+            self.force_compare_failure = false;
+            let snapshot = read_cluster_kv_current_snapshot(paths)?;
+            let revision = snapshot.revision;
+            return Ok(test_cluster_kv_txn_commit_result_for_request(
+                request_id,
+                snapshot,
+                Some(KvTxnResponse {
+                    succeeded: false,
+                    revision,
+                    responses: Vec::new(),
+                }),
+            ));
+        }
+        if self.committed.is_empty() && !request.txn.success.is_empty() {
+            self.committed.push(state.clone());
+        }
+        let (snapshot, response) = append_cluster_raft_command_with_response(
+            paths,
+            &state.local_node_id,
+            KvCommand::Txn(request.txn),
+        )?;
+        Ok(test_cluster_kv_txn_commit_result_for_request(
+            request_id, snapshot, response,
+        ))
+    }
 }
 
 impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
@@ -13560,13 +14007,41 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
         panic!("voter-local join registration should not forward membership node RPCs")
     }
 
-    fn commit_join_registration_state(
+    fn authoritative_cluster_kv_snapshot(
         &mut self,
         paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        Self::ensure_authoritative_test_state(paths, state)?;
+        test_authoritative_cluster_kv_snapshot(paths)
+    }
+
+    fn commit_join_registration_txn(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+        self.commit_test_join_txn(paths, state, request)
+    }
+
+    fn admit_cluster_raft_learner(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        now: OffsetDateTime,
     ) -> Result<KvSnapshot, NetworkError> {
-        self.committed.push(state.clone());
-        sync_cluster_state_to_local_raft_unchecked(paths, state)
+        update_cluster_state_authority_with_host(
+            paths,
+            state.clone(),
+            node_id.clone(),
+            ClusterMemberRole::Learner,
+            now,
+            self,
+        )?;
+        ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+            .map(|read| read.value)
     }
 
     fn remember_successful_join_endpoint(
@@ -13577,6 +14052,47 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     ) -> Result<(), NetworkError> {
         self.remembered_targets += 1;
         Ok(())
+    }
+}
+
+impl ClusterMemberMutationHost for RecordingJoinRegistrationHost {
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        RecordingJoinRegistrationHost::ensure_authoritative_test_state(paths, state)?;
+        test_authoritative_cluster_kv_snapshot(paths)
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+        self.commit_test_join_txn(paths, state, request)
+    }
+}
+
+impl ClusterMemberMutationAsyncHost for RecordingJoinRegistrationHost {
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::KvAuthoritativeRead<KvSnapshot>> {
+        Box::pin(async move {
+            ClusterMemberMutationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+        })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult> {
+        Box::pin(async move { self.commit_test_join_txn(paths, state, request) })
     }
 }
 
@@ -13601,14 +14117,34 @@ impl ClusterJoinRegistrationAsyncHost for RecordingJoinRegistrationHost {
         })
     }
 
-    fn commit_join_registration_state_async<'a>(
+    fn authoritative_cluster_kv_snapshot_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
+        state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::KvAuthoritativeRead<KvSnapshot>> {
+        Box::pin(async move {
+            ClusterJoinRegistrationHost::authoritative_cluster_kv_snapshot(self, paths, state)
+        })
+    }
+
+    fn commit_join_registration_txn_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult> {
+        Box::pin(async move { self.commit_test_join_txn(paths, state, request) })
+    }
+
+    fn admit_cluster_raft_learner_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        node_id: &'a NodeId,
+        now: OffsetDateTime,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
-            self.committed.push(state.clone());
-            sync_cluster_state_to_local_raft_unchecked(paths, state)
+            add_cluster_raft_learner_async_with_host(paths, state, node_id, now, self).await
         })
     }
 
@@ -13638,14 +14174,6 @@ impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
         _request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         panic!("default target remembering should not send membership node RPCs")
-    }
-
-    fn commit_join_registration_state(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Result<KvSnapshot, NetworkError> {
-        panic!("default target remembering should not commit join state")
     }
 
     fn remember_successful_join_endpoint(
@@ -13746,7 +14274,7 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
         signature: String::new(),
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
     let mut learner_member = ClusterMemberRecord::pending_learner(
         cluster_id,
         joined_node_id.clone(),
@@ -13793,7 +14321,7 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
     assert_eq!(host.observations, 1);
     assert_eq!(host.committed.len(), 1);
     assert_eq!(host.remembered_targets, 1);
-    let committed = &host.committed[0];
+    let committed = &response.state;
     assert!(committed.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
     }));
@@ -13885,7 +14413,7 @@ fn cluster_join_registration_handler_voter_skips_bridge_channel_target_connectiv
         signature: String::new(),
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
     let mut learner_member = ClusterMemberRecord::pending_learner(
         cluster_id,
         joined_node_id.clone(),
@@ -13969,7 +14497,7 @@ fn cluster_join_registration_async_handler_voter_commits_through_host() {
         signature: String::new(),
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
     let mut learner_member = ClusterMemberRecord::pending_learner(
         cluster_id,
         joined_node_id.clone(),
@@ -14022,7 +14550,7 @@ fn cluster_join_registration_async_handler_voter_commits_through_host() {
     assert_eq!(host.observations, 1);
     assert_eq!(host.committed.len(), 1);
     assert_eq!(host.remembered_targets, 1);
-    let committed = &host.committed[0];
+    let committed = &response.state;
     assert!(committed.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
     }));
@@ -14046,6 +14574,270 @@ fn cluster_join_registration_async_handler_voter_commits_through_host() {
     assert!(stored.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
     }));
+}
+
+struct JoinAuthorityFixture {
+    root: sinomo_testdir::TestDir,
+    paths: ClusterPaths,
+    now: OffsetDateTime,
+    state: ClusterBootstrapState,
+    invite: ClusterJoinInvite,
+    joined_node_id: NodeId,
+}
+
+fn join_authority_fixture(name: &str) -> JoinAuthorityFixture {
+    let root = sinomo_testdir::TestDir::new(name);
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named(format!("cluster_{name}")).expect("fixture cluster id");
+    let issuer_node_id =
+        NodeId::from_legacy_named(format!("node_{name}_issuer")).expect("fixture issuer");
+    let joined_node_id =
+        NodeId::from_legacy_named(format!("node_{name}_joined")).expect("fixture joiner");
+    let issuer_identity =
+        sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        name,
+        issuer_node_id,
+        "issuer",
+        issuer_identity.public_key.clone(),
+        now,
+    );
+    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    write_cluster_state(&paths, &state).expect("write fixture state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed fixture config");
+    let invite = build_cluster_join_invite(&state, &issuer_identity, Vec::new(), 3_600, now)
+        .expect("build fixture invite");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite)
+        .expect("publish fixture invite");
+    JoinAuthorityFixture {
+        root,
+        paths,
+        now,
+        state,
+        invite,
+        joined_node_id,
+    }
+}
+
+fn join_authority_fixture_request(
+    fixture: &JoinAuthorityFixture,
+) -> ClusterJoinRegistrationRequest {
+    ClusterJoinRegistrationRequest {
+        invite: fixture.invite.clone(),
+        invitation_secret: fixture.invite.invitation_secret.clone(),
+        members: vec![ClusterMemberRecord::pending_learner(
+            fixture.state.cluster_id.clone(),
+            fixture.joined_node_id.clone(),
+            "joined",
+            format!("pk-{}", fixture.joined_node_id),
+            fixture.now,
+        )],
+    }
+}
+
+#[test]
+fn cluster_join_registration_rejects_stale_persisted_invite() {
+    let fixture = join_authority_fixture("join_stale_invite");
+    let stale_request = join_authority_fixture_request(&fixture);
+    let issuer_identity = sinomo_node::load_or_create_main_node_identity(&fixture.root)
+        .expect("reload issuer identity");
+    let mut replacement = fixture.invite.clone();
+    replacement.invitation_secret = "replacement-secret".to_string();
+    replacement.token_id = "replacement-token".to_string();
+    replacement.signature.clear();
+    replacement.signature =
+        sign_cluster_join_invite(&replacement, &issuer_identity).expect("sign replacement");
+    sync_cluster_invitation_to_local_raft_unchecked(&fixture.paths, &replacement)
+        .expect("replace persisted invite");
+
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        stale_request,
+        fixture.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("handle stale invite");
+
+    assert!(!response.accepted);
+    assert!(response.detail.contains("invitation rejected"));
+    assert!(
+        read_cluster_kv_current_snapshot(&fixture.paths)
+            .expect("snapshot")
+            .get(&cluster_member_key(&fixture.joined_node_id))
+            .is_none()
+    );
+}
+
+#[test]
+fn cluster_join_registration_rejects_revoked_invite_and_removed_issuer() {
+    let revoked = join_authority_fixture("join_revoked_invite");
+    let state_key = sinomo_node::cluster_invitation_state_key(&revoked.invite.invite_id);
+    let mut invitation_state: sinomo_node::ClusterInvitationStateRecord =
+        read_cluster_kv_current_snapshot(&revoked.paths)
+            .expect("snapshot")
+            .get(&state_key)
+            .expect("invitation state")
+            .decode()
+            .expect("decode invitation state");
+    invitation_state.state = "revoked".to_string();
+    append_cluster_raft_command(
+        &revoked.paths,
+        &revoked.state.local_node_id,
+        KvCommand::Op(KvOp::put_serde(state_key, &invitation_state, None).expect("state op")),
+    )
+    .expect("revoke invite");
+    let response = handle_cluster_join_registration_request_with_host(
+        &revoked.paths,
+        join_authority_fixture_request(&revoked),
+        revoked.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("handle revoked invite");
+    assert!(!response.accepted);
+    assert!(response.detail.contains("not active"));
+
+    let removed = join_authority_fixture("join_removed_issuer");
+    let mut issuer = removed.state.members[0].clone();
+    issuer.state = ClusterMemberState::Removed;
+    append_cluster_raft_command(
+        &removed.paths,
+        &removed.state.local_node_id,
+        KvCommand::Op(
+            KvOp::put_serde(cluster_member_key(&issuer.node_id), &issuer, None).expect("issuer op"),
+        ),
+    )
+    .expect("remove issuer");
+    let response = handle_cluster_join_registration_request_with_host(
+        &removed.paths,
+        join_authority_fixture_request(&removed),
+        removed.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("handle removed issuer");
+    assert!(!response.accepted);
+    assert!(response.detail.contains("not an authorized cluster member"));
+}
+
+#[test]
+fn cluster_join_registration_losing_cas_writes_nothing_and_rejects() {
+    let fixture = join_authority_fixture("join_losing_cas");
+    let mut host = RecordingJoinRegistrationHost {
+        force_compare_failure: true,
+        ..Default::default()
+    };
+
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle losing CAS");
+
+    assert!(!response.accepted);
+    assert!(response.detail.contains("changed during join admission"));
+    assert!(
+        read_cluster_kv_current_snapshot(&fixture.paths)
+            .expect("snapshot")
+            .get(&cluster_member_key(&fixture.joined_node_id))
+            .is_none()
+    );
+}
+
+#[test]
+fn cluster_join_registration_rejects_direct_voter_admission() {
+    let fixture = join_authority_fixture("join_direct_voter");
+    let issuer_identity = sinomo_node::load_or_create_main_node_identity(&fixture.root)
+        .expect("reload issuer identity");
+    let mut voter_invite = fixture.invite.clone();
+    voter_invite.allowed_member_roles = vec![ClusterMemberRole::Voter];
+    voter_invite.signature.clear();
+    voter_invite.signature =
+        sign_cluster_join_invite(&voter_invite, &issuer_identity).expect("sign voter invite");
+    sync_cluster_invitation_to_local_raft_unchecked(&fixture.paths, &voter_invite)
+        .expect("publish voter invite");
+    let mut voter = ClusterMemberRecord::pending_learner(
+        fixture.state.cluster_id.clone(),
+        fixture.joined_node_id.clone(),
+        "joined",
+        format!("pk-{}", fixture.joined_node_id),
+        fixture.now,
+    );
+    voter.role = ClusterMemberRole::Voter;
+
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        ClusterJoinRegistrationRequest {
+            invitation_secret: voter_invite.invitation_secret.clone(),
+            invite: voter_invite,
+            members: vec![voter],
+        },
+        fixture.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("handle voter admission");
+
+    assert!(!response.accepted);
+    assert!(response.detail.contains("unsupported"));
+}
+
+#[test]
+fn cluster_join_registration_exact_retry_is_idempotent() {
+    let fixture = join_authority_fixture("join_exact_retry");
+    let request = join_authority_fixture_request(&fixture);
+    let first = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        request.clone(),
+        fixture.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("first join");
+    assert!(first.accepted);
+    let first_snapshot = first.kv_snapshot.expect("first snapshot");
+    let first_changes = first_snapshot
+        .range_prefix_limited("/cluster/raft/config-changes/", 8)
+        .expect("first changes");
+    assert_eq!(first_changes.len(), 1);
+
+    let retry = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        request.clone(),
+        fixture.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("retry join");
+    assert!(retry.accepted);
+    let retry_snapshot = retry.kv_snapshot.expect("retry snapshot");
+    assert_eq!(
+        retry_snapshot
+            .range_prefix_limited("/cluster/raft/config-changes/", 8)
+            .expect("retry changes")
+            .len(),
+        1,
+        "exact retry must not create a second AddLearner lifecycle"
+    );
+
+    let mut conflicting = request;
+    conflicting.members[0].node_public_key = "different-public-key".to_string();
+    let conflict = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        conflicting,
+        fixture.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("conflicting retry");
+    assert!(!conflict.accepted);
+    assert!(
+        conflict
+            .detail
+            .contains("conflicts with an existing identity or role")
+    );
 }
 
 #[test]
@@ -14966,7 +15758,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
         signature: String::new(),
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
-    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invite");
+    sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invite");
 
     let mut pending = ClusterBootstrapState::pending_join(
         cluster_id.clone(),
@@ -15314,7 +16106,8 @@ fn cluster_invitation_sync_batches_invite_and_state_in_one_revision() {
         signature: String::new(),
     };
 
-    let snapshot = sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    let snapshot =
+        sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
 
     assert_eq!(
         snapshot.revision,
@@ -15356,20 +16149,57 @@ fn cluster_invitation_sync_batches_invite_and_state_in_one_revision() {
 struct RecordingClusterInvitePublishHost {
     commits: usize,
     last_txn: Option<KvTxn>,
+    authoritative_snapshot: Option<KvSnapshot>,
+    force_compare_failure: bool,
 }
 
 impl ClusterInvitePublishHost for RecordingClusterInvitePublishHost {
     type Error = NetworkError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        if let Some(snapshot) = self.authoritative_snapshot.clone() {
+            return Ok(sinomo_kv::KvAuthoritativeRead {
+                authority: test_current_quorum_authority(&snapshot),
+                value: snapshot,
+            });
+        }
+        test_authoritative_cluster_kv_snapshot(paths)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
         self.commits += 1;
-        self.last_txn = Some(txn.clone());
-        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        self.last_txn = Some(request.txn.clone());
+        let request_id = request.request_id;
+        if self.force_compare_failure {
+            let snapshot = read_cluster_kv_current_snapshot(paths)?;
+            let revision = snapshot.revision;
+            return Ok(test_cluster_kv_txn_commit_result_for_request(
+                request_id,
+                snapshot,
+                Some(KvTxnResponse {
+                    succeeded: false,
+                    revision,
+                    responses: Vec::new(),
+                }),
+            ));
+        }
+        let (snapshot, response) = append_cluster_raft_command_with_response(
+            paths,
+            &state.local_node_id,
+            KvCommand::Txn(request.txn),
+        )?;
+        Ok(test_cluster_kv_txn_commit_result_for_request(
+            request_id, snapshot, response,
+        ))
     }
 }
 
@@ -15382,16 +16212,47 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterInvitePublishHost {
         Box::pin(async { Ok(()) })
     }
 
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::KvAuthoritativeRead<KvSnapshot>> {
+        Box::pin(async move {
+            ClusterInvitePublishHost::authoritative_cluster_kv_snapshot(self, paths, _state)
+        })
+    }
+
     fn commit_cluster_kv_txn_with_quorum_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult> {
         Box::pin(async move {
             self.commits += 1;
-            self.last_txn = Some(txn.clone());
-            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+            self.last_txn = Some(request.txn.clone());
+            let request_id = request.request_id;
+            if self.force_compare_failure {
+                let snapshot = read_cluster_kv_current_snapshot(paths)?;
+                let revision = snapshot.revision;
+                return Ok(test_cluster_kv_txn_commit_result_for_request(
+                    request_id,
+                    snapshot,
+                    Some(KvTxnResponse {
+                        succeeded: false,
+                        revision,
+                        responses: Vec::new(),
+                    }),
+                ));
+            }
+            let (snapshot, response) = append_cluster_raft_command_with_response(
+                paths,
+                &state.local_node_id,
+                KvCommand::Txn(request.txn),
+            )?;
+            Ok(test_cluster_kv_txn_commit_result_for_request(
+                request_id, snapshot, response,
+            ))
         })
     }
 }
@@ -15518,7 +16379,9 @@ fn cluster_invite_publish_request_with_host_validates_and_delegates_commit() {
     let mut unauthorized_host = RecordingClusterInvitePublishHost::default();
     let rejected = handle_cluster_invite_publish_request_with_host(
         &paths,
-        ClusterInvitePublishRequest { invite },
+        ClusterInvitePublishRequest {
+            invite: invite.clone(),
+        },
         "node_invite_publish_request_host_other",
         &issuer_identity.public_key,
         now,
@@ -15527,6 +16390,53 @@ fn cluster_invite_publish_request_with_host_validates_and_delegates_commit() {
     .expect("unauthorized invite publish response");
     assert!(!rejected.accepted);
     assert_eq!(unauthorized_host.commits, 0);
+
+    let mut stale_authorization_host = RecordingClusterInvitePublishHost {
+        authoritative_snapshot: Some(
+            InProcessKvStore::new()
+                .snapshot()
+                .expect("empty authoritative snapshot"),
+        ),
+        ..Default::default()
+    };
+    let stale_authorization = handle_cluster_invite_publish_request_with_host(
+        &paths,
+        ClusterInvitePublishRequest {
+            invite: invite.clone(),
+        },
+        issuer_node.as_str(),
+        &issuer_identity.public_key,
+        now,
+        &mut stale_authorization_host,
+    )
+    .expect("stale local issuer authorization response");
+    assert!(!stale_authorization.accepted);
+    assert!(
+        stale_authorization
+            .detail
+            .contains("not an authorized cluster member")
+    );
+    assert_eq!(stale_authorization_host.commits, 0);
+
+    let mut cas_failure_host = RecordingClusterInvitePublishHost {
+        force_compare_failure: true,
+        ..Default::default()
+    };
+    let cas_rejected = handle_cluster_invite_publish_request_with_host(
+        &paths,
+        ClusterInvitePublishRequest { invite },
+        issuer_node.as_str(),
+        &issuer_identity.public_key,
+        now,
+        &mut cas_failure_host,
+    )
+    .expect("CAS conflict response");
+    assert!(!cas_rejected.accepted);
+    assert_eq!(
+        cas_rejected.detail,
+        "cluster membership changed while publishing invitation"
+    );
+    assert_eq!(cas_failure_host.commits, 1);
 }
 
 #[test]
@@ -15564,7 +16474,8 @@ fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
         signature: String::new(),
     };
 
-    let first = sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    let first =
+        sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite).expect("sync invitation");
     let wal_path = cluster_raft_wal_paths(&paths, &state.local_node_id).wal;
     let wal_len_after_first = std::fs::metadata(&wal_path)
         .expect("wal after first invite")
@@ -15581,7 +16492,8 @@ fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
         txn.success.is_empty(),
         "stable invite publish should ignore invitation-state updated_at"
     );
-    let repeat = sync_cluster_invitation_to_kv(&paths, &invite).expect("repeat invitation");
+    let repeat = sync_cluster_invitation_to_local_raft_unchecked(&paths, &invite)
+        .expect("repeat invitation");
 
     assert_eq!(repeat.revision, first.revision);
     assert_eq!(
@@ -17036,6 +17948,11 @@ fn sync_cluster_state_to_kv_with_host_prepares_commits_and_skips_noop() {
         now,
     );
     write_cluster_state(&paths, &state).expect("write state");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("empty snapshot"),
+    )
+    .expect("seed empty snapshot");
 
     struct RecordingSyncHost {
         prepares: usize,
@@ -17053,24 +17970,34 @@ fn sync_cluster_state_to_kv_with_host_prepares_commits_and_skips_noop() {
             Ok(())
         }
 
-        fn current_cluster_kv_store(
+        fn authoritative_cluster_kv_snapshot(
             &mut self,
             paths: &ClusterPaths,
-            _state: &ClusterBootstrapState,
-        ) -> Result<InProcessKvStore, NetworkError> {
-            read_cluster_kv_snapshot(paths)
-                .map(|snapshot| InProcessKvStore::restore(snapshot).expect("restore"))
-                .map_err(Into::into)
+            _state: &mut ClusterBootstrapState,
+        ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+            let snapshot = read_cluster_kv_snapshot(paths)?;
+            Ok(sinomo_kv::KvAuthoritativeRead {
+                authority: test_current_quorum_authority(&snapshot),
+                value: snapshot,
+            })
         }
 
         fn commit_cluster_kv_txn_with_quorum(
             &mut self,
             paths: &ClusterPaths,
             state: &mut ClusterBootstrapState,
-            txn: KvTxn,
-        ) -> Result<KvSnapshot, NetworkError> {
+            request: KvTxnRequest,
+        ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
             self.commits += 1;
-            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+            let request_id = request.request_id;
+            let (snapshot, response) = append_cluster_raft_command_with_response(
+                paths,
+                &state.local_node_id,
+                KvCommand::Txn(request.txn),
+            )?;
+            Ok(test_cluster_kv_txn_commit_result_for_request(
+                request_id, snapshot, response,
+            ))
         }
     }
 
@@ -17091,7 +18018,10 @@ fn sync_cluster_state_to_kv_with_host_prepares_commits_and_skips_noop() {
     let second =
         sync_cluster_state_to_kv_with_host(&paths, &state, &mut host).expect("second sync");
     assert_eq!(host.prepares, 2);
-    assert_eq!(host.commits, 1, "matching prepared state must skip commit");
+    assert_eq!(
+        host.commits, 2,
+        "matching prepared state must commit an empty barrier request"
+    );
     assert_eq!(second.revision, first.revision);
 }
 
@@ -18014,20 +18944,57 @@ fn cluster_member_publish_ignores_stable_endpoint_order() {
 struct RecordingClusterMemberPublishHost {
     commits: usize,
     last_txn: Option<KvTxn>,
+    authoritative_snapshot: Option<KvSnapshot>,
+    force_compare_failure: bool,
 }
 
 impl ClusterMemberPublishHost for RecordingClusterMemberPublishHost {
     type Error = NetworkError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        if let Some(snapshot) = self.authoritative_snapshot.clone() {
+            return Ok(sinomo_kv::KvAuthoritativeRead {
+                authority: test_current_quorum_authority(&snapshot),
+                value: snapshot,
+            });
+        }
+        test_authoritative_cluster_kv_snapshot(paths)
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
         self.commits += 1;
-        self.last_txn = Some(txn.clone());
-        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        self.last_txn = Some(request.txn.clone());
+        let request_id = request.request_id;
+        if self.force_compare_failure {
+            let snapshot = read_cluster_kv_current_snapshot(paths)?;
+            let revision = snapshot.revision;
+            return Ok(test_cluster_kv_txn_commit_result_for_request(
+                request_id,
+                snapshot,
+                Some(KvTxnResponse {
+                    succeeded: false,
+                    revision,
+                    responses: Vec::new(),
+                }),
+            ));
+        }
+        let (snapshot, response) = append_cluster_raft_command_with_response(
+            paths,
+            &state.local_node_id,
+            KvCommand::Txn(request.txn),
+        )?;
+        Ok(test_cluster_kv_txn_commit_result_for_request(
+            request_id, snapshot, response,
+        ))
     }
 }
 
@@ -18040,16 +19007,47 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterMemberPublishHost {
         Box::pin(async { Ok(()) })
     }
 
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::KvAuthoritativeRead<KvSnapshot>> {
+        Box::pin(async move {
+            ClusterMemberPublishHost::authoritative_cluster_kv_snapshot(self, paths, _state)
+        })
+    }
+
     fn commit_cluster_kv_txn_with_quorum_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult> {
         Box::pin(async move {
             self.commits += 1;
-            self.last_txn = Some(txn.clone());
-            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+            self.last_txn = Some(request.txn.clone());
+            let request_id = request.request_id;
+            if self.force_compare_failure {
+                let snapshot = read_cluster_kv_current_snapshot(paths)?;
+                let revision = snapshot.revision;
+                return Ok(test_cluster_kv_txn_commit_result_for_request(
+                    request_id,
+                    snapshot,
+                    Some(KvTxnResponse {
+                        succeeded: false,
+                        revision,
+                        responses: Vec::new(),
+                    }),
+                ));
+            }
+            let (snapshot, response) = append_cluster_raft_command_with_response(
+                paths,
+                &state.local_node_id,
+                KvCommand::Txn(request.txn),
+            )?;
+            Ok(test_cluster_kv_txn_commit_result_for_request(
+                request_id, snapshot, response,
+            ))
         })
     }
 }
@@ -18067,16 +19065,6 @@ impl ClusterJoinRegistrationHost for UnusedClusterJoinRegistrationHost {
             detail: "unused membership forward host".to_string(),
         })
     }
-
-    fn commit_join_registration_state(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Result<KvSnapshot, NetworkError> {
-        Err(NetworkError::InvalidClusterCommand {
-            detail: "unused join registration host".to_string(),
-        })
-    }
 }
 
 struct UnusedClusterInvitePublishHost;
@@ -18084,12 +19072,22 @@ struct UnusedClusterInvitePublishHost;
 impl ClusterInvitePublishHost for UnusedClusterInvitePublishHost {
     type Error = NetworkError;
 
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, Self::Error> {
+        Err(NetworkError::InvalidClusterCommand {
+            detail: "unused invite publish host".to_string(),
+        })
+    }
+
     fn commit_cluster_kv_txn_with_quorum(
         &mut self,
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
-        _txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
+        _request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
         Err(NetworkError::InvalidClusterCommand {
             detail: "unused invite publish host".to_string(),
         })
@@ -18106,6 +19104,14 @@ struct RecordingClusterLocalMemberPublishHost {
 }
 
 impl ClusterLocalMemberPublishHost for RecordingClusterLocalMemberPublishHost {
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+    ) -> Result<sinomo_kv::KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+        test_authoritative_cluster_kv_snapshot(paths)
+    }
+
     fn cluster_has_local_quorum(
         &mut self,
         _paths: &ClusterPaths,
@@ -18118,14 +19124,19 @@ impl ClusterLocalMemberPublishHost for RecordingClusterLocalMemberPublishHost {
         &mut self,
         paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, NetworkError> {
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
         self.commits += 1;
+        let request_id = request.request_id;
         let mut store = read_cluster_kv_store(paths)?;
-        store.txn(txn).map_err(kv_err)?;
+        let response = store.txn(request.txn).map_err(kv_err)?;
         let snapshot = store.snapshot().expect("snapshot");
         write_cluster_kv_snapshot(paths, &snapshot)?;
-        Ok(snapshot)
+        Ok(test_cluster_kv_txn_commit_result_for_request(
+            request_id,
+            snapshot,
+            Some(response),
+        ))
     }
 
     fn send_cluster_member_publish(
@@ -18155,6 +19166,16 @@ impl ClusterLocalMemberPublishHost for RecordingClusterLocalMemberPublishHost {
 }
 
 impl ClusterLocalMemberPublishAsyncHost for RecordingClusterLocalMemberPublishHost {
+    fn authoritative_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::KvAuthoritativeRead<KvSnapshot>> {
+        Box::pin(async move {
+            ClusterLocalMemberPublishHost::authoritative_cluster_kv_snapshot(self, paths, state)
+        })
+    }
+
     fn cluster_has_local_quorum_async<'a>(
         &'a mut self,
         _paths: &'a ClusterPaths,
@@ -18167,11 +19188,11 @@ impl ClusterLocalMemberPublishAsyncHost for RecordingClusterLocalMemberPublishHo
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        request: KvTxnRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvTxnCommitResult> {
         Box::pin(async move {
             ClusterLocalMemberPublishHost::commit_cluster_kv_txn_with_quorum(
-                self, paths, state, txn,
+                self, paths, state, request,
             )
         })
     }
@@ -18305,6 +19326,53 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
     .expect("unauthorized member publish response");
     assert!(!rejected.accepted);
     assert_eq!(unauthorized_host.commits, 0);
+
+    let mut stale_authorization_host = RecordingClusterMemberPublishHost {
+        authoritative_snapshot: Some(
+            InProcessKvStore::new()
+                .snapshot()
+                .expect("empty authoritative snapshot"),
+        ),
+        ..Default::default()
+    };
+    let stale_authorization = handle_cluster_member_publish_request_with_host(
+        &paths,
+        ClusterMemberPublishRequest {
+            members: vec![state.members[0].clone()],
+            local_kv_revision: None,
+        },
+        local.as_str(),
+        &mut stale_authorization_host,
+    )
+    .expect("stale authorization response");
+    assert!(!stale_authorization.accepted);
+    assert!(
+        stale_authorization
+            .detail
+            .contains("not an authorized cluster member")
+    );
+    assert_eq!(stale_authorization_host.commits, 0);
+
+    let mut cas_failure_host = RecordingClusterMemberPublishHost {
+        force_compare_failure: true,
+        ..Default::default()
+    };
+    let cas_rejected = handle_cluster_member_publish_request_with_host(
+        &paths,
+        ClusterMemberPublishRequest {
+            members: vec![state.members[0].clone()],
+            local_kv_revision: None,
+        },
+        local.as_str(),
+        &mut cas_failure_host,
+    )
+    .expect("CAS conflict response");
+    assert!(!cas_rejected.accepted);
+    assert_eq!(
+        cas_rejected.detail,
+        "cluster membership changed while publishing member state"
+    );
+    assert_eq!(cas_failure_host.commits, 1);
 }
 
 #[test]
@@ -18396,11 +19464,8 @@ fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
     state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(
-        &paths,
-        &InProcessKvStore::new().snapshot().expect("snapshot"),
-    )
-    .expect("empty snapshot");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        .expect("seed authoritative membership");
 
     let mut host = RecordingClusterLocalMemberPublishHost {
         has_quorum: true,
@@ -18424,6 +19489,22 @@ fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
         snapshot.get(&cluster_member_key(&local)).is_some(),
         "local voter quorum commit should publish the local member record"
     );
+    let stable = publish_local_members_to_quorum_if_needed_with_host(
+        &paths,
+        &state,
+        ClusterLocalMemberPublishOptions {
+            member_publish_timeout: Duration::from_secs(1),
+            force_kv_snapshot_sync: false,
+        },
+        &mut host,
+    )
+    .expect("stable local member publish")
+    .expect("stable publish barrier snapshot");
+    assert_eq!(
+        host.commits, 2,
+        "stable publish must cross the host barrier"
+    );
+    assert_eq!(stable.revision, snapshot.revision);
 }
 
 #[test]
@@ -18447,11 +19528,8 @@ fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
     state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(
-        &paths,
-        &InProcessKvStore::new().snapshot().expect("snapshot"),
-    )
-    .expect("empty snapshot");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        .expect("seed authoritative membership");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -18481,6 +19559,24 @@ fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
         snapshot.get(&cluster_member_key(&local)).is_some(),
         "async local voter quorum commit should publish the local member record"
     );
+    let stable = runtime
+        .block_on(publish_local_members_to_quorum_if_needed_async_with_host(
+            runtime.handle(),
+            &paths,
+            &state,
+            ClusterLocalMemberPublishOptions {
+                member_publish_timeout: Duration::from_secs(1),
+                force_kv_snapshot_sync: false,
+            },
+            &mut host,
+        ))
+        .expect("stable async local member publish")
+        .expect("stable async publish barrier snapshot");
+    assert_eq!(
+        host.commits, 2,
+        "stable async publish must cross the host barrier"
+    );
+    assert_eq!(stable.revision, snapshot.revision);
 }
 
 #[test]
@@ -19485,11 +20581,11 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                 runtime.handle(),
                 &paths,
                 &mut state,
-                KvCommand::Op(KvOp::Put {
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
                     key: "/test/async-quorum".to_string(),
                     value: b"ok".to_vec(),
                     lease_id: None,
-                }),
+                })),
                 ClusterKvRaftQuorumCommitOptions {
                     timeout: Duration::from_secs(5),
                 },
@@ -20884,11 +21980,11 @@ impl ClusterNetworkInfoPublishHost for RecordingClusterNetworkInfoPublishHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error> {
         self.commits += 1;
-        self.last_txn = Some(txn.clone());
-        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        self.last_txn = Some(request.txn.clone());
+        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(request.txn))
     }
 }
 
@@ -20921,12 +22017,12 @@ impl ClusterNetworkInfoPublishAsyncHost for RecordingClusterNetworkInfoPublishHo
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
             self.commits += 1;
-            self.last_txn = Some(txn.clone());
-            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+            self.last_txn = Some(request.txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(request.txn))
         })
     }
 }
@@ -20964,11 +22060,11 @@ impl ClusterNodeStatusPublishHost for RecordingClusterNodeStatusPublishHost {
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error> {
         self.commits += 1;
-        self.last_txn = Some(txn.clone());
-        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        self.last_txn = Some(request.txn.clone());
+        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(request.txn))
     }
 }
 
@@ -21001,12 +22097,12 @@ impl ClusterNodeStatusPublishAsyncHost for RecordingClusterNodeStatusPublishHost
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
             self.commits += 1;
-            self.last_txn = Some(txn.clone());
-            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+            self.last_txn = Some(request.txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(request.txn))
         })
     }
 }
@@ -21075,16 +22171,24 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
         &mut stored_match_host,
     )
     .expect("stored node status match");
-    assert!(stored_match.is_none());
-    assert_eq!(stored_match_host.commits, 0);
-    assert_eq!(stored_match_host.remembers, 1);
+    assert!(stored_match.is_some());
+    assert_eq!(stored_match_host.commits, 1);
+    assert!(
+        stored_match_host
+            .last_txn
+            .as_ref()
+            .expect("empty barrier txn")
+            .success
+            .is_empty()
+    );
+    assert_eq!(stored_match_host.remembers, 2);
 
     stored_match_host.cache_matches = true;
     let cached =
         publish_cluster_node_status_to_quorum_with_host(&paths, status, &mut stored_match_host)
             .expect("cached node status");
-    assert!(cached.is_none());
-    assert_eq!(stored_match_host.commits, 0);
+    assert!(cached.is_some());
+    assert_eq!(stored_match_host.commits, 2);
 }
 
 #[test]
@@ -21220,17 +22324,25 @@ fn network_info_quorum_publish_driver_delegates_and_remembers_stored_match() {
         &mut stored_match_host,
     )
     .expect("stored network info match");
-    assert!(stored_match.is_none());
-    assert_eq!(stored_match_host.commits, 0);
-    assert_eq!(stored_match_host.remembers, 1);
+    assert!(stored_match.is_some());
+    assert_eq!(stored_match_host.commits, 1);
+    assert!(
+        stored_match_host
+            .last_txn
+            .as_ref()
+            .expect("empty barrier txn")
+            .success
+            .is_empty()
+    );
+    assert_eq!(stored_match_host.remembers, 2);
 
     host.cache_matches = true;
     host.commits = 0;
     let cached =
         publish_cluster_network_info_to_quorum_with_host(&paths, info, &mut host).expect("cached");
-    assert!(cached.is_none());
-    assert_eq!(host.commits, 0);
-    assert_eq!(host.remembers, 2, "stored match should refresh the cache");
+    assert!(cached.is_some());
+    assert_eq!(host.commits, 1);
+    assert_eq!(host.remembers, 3, "stored match should refresh the cache");
 }
 
 #[test]
@@ -21989,15 +23101,20 @@ impl ClusterNetworkRecordExpiryHost for RecordingNetworkRecordExpiryHost {
         &mut self,
         paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
+        request: KvTxnRequest,
+    ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
         self.commits += 1;
-        self.last_txn = Some(txn.clone());
+        self.last_txn = Some(request.txn.clone());
+        let request_id = request.request_id;
         let mut store = read_cluster_kv_store(paths)?;
-        store.txn(txn).map_err(kv_err)?;
+        let response = store.txn(request.txn).map_err(kv_err)?;
         let snapshot = store.snapshot().expect("snapshot");
         write_cluster_kv_snapshot(paths, &snapshot)?;
-        Ok(snapshot)
+        Ok(test_cluster_kv_txn_commit_result_for_request(
+            request_id,
+            snapshot,
+            Some(response),
+        ))
     }
 }
 
@@ -22373,11 +23490,11 @@ impl ClusterConnectivityPublishHost for RecordingClusterConnectivityPublishHost 
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> Result<KvSnapshot, Self::Error> {
-        self.commits.push(txn.success.len());
-        self.last_txn = Some(txn.clone());
-        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        self.commits.push(request.txn.success.len());
+        self.last_txn = Some(request.txn.clone());
+        append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(request.txn))
     }
 }
 
@@ -22470,10 +23587,10 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
     )
     .expect("cached connectivity quorum sync");
     assert!(
-        cached.is_none(),
-        "stored KV match should skip connectivity planning"
+        cached.is_some(),
+        "stored KV match should commit an empty barrier request"
     );
-    assert_eq!(host.commits, Vec::<usize>::new());
+    assert_eq!(host.commits, vec![0]);
     assert_eq!(
         host.remembers, 2,
         "an authoritative stored KV match should warm a cold publication cache"
@@ -22555,11 +23672,11 @@ fn connectivity_quorum_sync_does_not_cache_uncommitted_ttl_refresh() {
     .expect("connectivity quorum sync");
 
     assert!(
-        result.is_none(),
-        "fresh stable KV records should not be rewritten"
+        result.is_some(),
+        "fresh stable KV records should commit an empty barrier request"
     );
     assert_eq!(host.cache_checks, 0);
-    assert_eq!(host.commits, Vec::<usize>::new());
+    assert_eq!(host.commits, vec![0]);
     assert_eq!(
         host.remembers, 1,
         "a verified no-op should warm the cache from authoritative KV"
@@ -22693,7 +23810,7 @@ impl ClusterConnectivityPublishAsyncHost for ForwardingOnlyConnectivityPublishAs
         &'a mut self,
         paths: &'a ClusterPaths,
         _state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
+        request: KvTxnRequest,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
         Box::pin(async move {
             self.commits += 1;
@@ -22713,7 +23830,7 @@ impl ClusterConnectivityPublishAsyncHost for ForwardingOnlyConnectivityPublishAs
                 )?;
             }
             if self.apply_commits {
-                self.voter_store.txn(txn).map_err(kv_err)?;
+                self.voter_store.txn(request.txn).map_err(kv_err)?;
             }
             Ok(self.voter_store.snapshot().expect("snapshot"))
         })
@@ -33546,17 +34663,16 @@ fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
         .expect("snapshot after commit")
         .revision;
 
-    // Re-publishing identical records is a no-op commit-wise, but the response
-    // must hand the current snapshot back to publishers that are behind (or
-    // report no revision at all) — this is how learner KV snapshots converge.
-    for (publisher_revision, expects_snapshot) in [
-        (Some(current_revision), false),
-        // Lag-only invariant: a publisher AHEAD of the responder means the
-        // responder is the stale one; it must never ship its snapshot
-        // backwards.
-        (Some(KvRevision(current_revision.0 + 1)), false),
-        (Some(KvRevision(0)), true),
-        (None, true),
+    // Re-publishing identical records commits an empty exact request. It does
+    // not advance state revision, but it still establishes the write barrier.
+    // The response carries the authoritative snapshot only when the publisher
+    // is stale or did not report a revision; current and ahead publishers do
+    // not receive a redundant full snapshot.
+    for (publisher_revision, expected_snapshot_revision) in [
+        (Some(current_revision), None),
+        (Some(KvRevision(current_revision.0 + 1)), None),
+        (Some(KvRevision(0)), Some(current_revision)),
+        (None, Some(current_revision)),
     ] {
         let mut repeat_host = RecordingClusterMemberPublishHost::default();
         let response = handle_cluster_member_publish_request_with_host(
@@ -33571,16 +34687,25 @@ fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
         .expect("repeat member publish");
         assert!(response.accepted);
         assert_eq!(response.detail, "member endpoints already current");
-        assert_eq!(repeat_host.commits, 0, "no-op publish must not commit");
         assert_eq!(
-            response.kv_snapshot.is_some(),
-            expects_snapshot,
-            "publisher revision {publisher_revision:?} should{} receive a snapshot",
-            if expects_snapshot { "" } else { " not" }
+            repeat_host.commits, 1,
+            "accepted no-op publish must cross Raft"
         );
-        if let Some(snapshot) = response.kv_snapshot {
-            assert_eq!(snapshot.revision, current_revision);
-        }
+        assert_eq!(
+            response
+                .kv_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revision),
+            expected_snapshot_revision,
+            "publisher revision {publisher_revision:?} returned the wrong snapshot payload"
+        );
+        assert_eq!(
+            read_cluster_kv_current_snapshot(&paths)
+                .expect("snapshot after repeat publish")
+                .revision,
+            current_revision,
+            "publisher revision {publisher_revision:?} must not change state revision"
+        );
     }
 }
 
@@ -33894,11 +35019,17 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.node_calls += 1;
         assert!(!target_node_id.as_str().is_empty());
-        assert_eq!(request.route, sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE);
-        let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(
-            self.node_snapshot.as_ref().expect("node snapshot"),
-        )
-        .map_err(kv_err)?;
+        assert_eq!(request.route, sinomo_kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
+        let snapshot = self.node_snapshot.as_ref().expect("node snapshot");
+        let payload =
+            sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(&sinomo_kv::KvLocalRead {
+                revision: snapshot.revision,
+                observed_term: 1,
+                applied_index: snapshot.revision.0,
+                known_leader: Some(target_node_id.clone()),
+                value: snapshot.clone(),
+            })
+            .map_err(kv_err)?;
         Ok(ObjectRpcResponse::from_encoded_body(
             payload.route,
             payload.body,

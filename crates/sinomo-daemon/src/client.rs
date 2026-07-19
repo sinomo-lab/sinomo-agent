@@ -14,8 +14,10 @@ use sinomo_config::{
 use sinomo_core::ClusterEndpointRecord;
 use sinomo_core::cluster::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use sinomo_core::kv::{
-    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse, KvSnapshot,
+    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
+    ClusterKvWatchDrainResponse, ClusterKvWatchRegistration, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    KvAuthoritativeRead, KvEntry, KvLocalRead, KvRequestId, KvSnapshot,
 };
 use sinomo_core::network::{
     NetworkError, ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResult,
@@ -242,6 +244,25 @@ impl RemoteConfigClient {
             .decode_body()
             .map_err(|error| client_error(error.to_string()))
     }
+
+    pub fn set_with_request_id(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        target: ConfigWriteTarget,
+        request_id: KvRequestId,
+    ) -> Result<ConfigWriteResult, ConfigError> {
+        let response: ConfigSetResponse = self.rpc(
+            CONFIG_SET_ROUTE,
+            &ConfigSetRequest {
+                request_id: Some(request_id),
+                key: key.to_string(),
+                value,
+                target,
+            },
+        )?;
+        Ok(response.result)
+    }
 }
 
 impl ConfigClient for RemoteConfigClient {
@@ -271,15 +292,7 @@ impl ConfigClient for RemoteConfigClient {
         value: serde_json::Value,
         target: ConfigWriteTarget,
     ) -> Result<ConfigWriteResult, ConfigError> {
-        let response: ConfigSetResponse = self.rpc(
-            CONFIG_SET_ROUTE,
-            &ConfigSetRequest {
-                key: key.to_string(),
-                value,
-                target,
-            },
-        )?;
-        Ok(response.result)
+        self.set_with_request_id(key, value, target, KvRequestId::generate())
     }
 }
 
@@ -1151,6 +1164,21 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         {
             return Box::pin(async move { Ok(Some(channel)) });
         }
+        // A cold channel miss may negotiate a persistent tunnel only through
+        // an observed real LAN TCP endpoint. Loopback and module-owned
+        // transports already carry canonical object-RPC sessions directly. A
+        // static, discovered, or membership endpoint has not proved v2 tunnel
+        // support yet, so probing it here would consume a connection that the
+        // peer is entitled to interpret as a canonical session. Reactive tunnel
+        // maintenance can establish support and publish the observed route.
+        // A synthetic `tcp-tunnel://` endpoint can only reuse that established
+        // tunnel.
+        if endpoint.transport != sinomo_core::ClusterTransportKind::LanTcp
+            || endpoint.source != sinomo_core::ClusterEndpointSource::Observed
+            || daemon_endpoint_is_tcp_tunnel(endpoint)
+        {
+            return Box::pin(async { Ok(None) });
+        }
         let endpoint = endpoint.clone();
         let runtime = self.runtime.clone();
         let paths = self.paths.clone();
@@ -1925,11 +1953,52 @@ pub fn send_daemon_shutdown_request(
     )
 }
 
-fn decode_cluster_kv_snapshot_rpc_response(
+fn decode_cluster_kv_local_snapshot_rpc_response(
     response: &sinomo_core::network::ObjectRpcResponse,
-) -> Result<KvSnapshot, DaemonError> {
+) -> Result<KvLocalRead<KvSnapshot>, DaemonError> {
     response.error_detail()?;
-    sinomo_core::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
+    let read = sinomo_core::kv::decode_cluster_kv_local_snapshot_rpc_body(&response.body)?;
+    if read.revision != read.value.revision {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "local cluster KV observation revision {:?} does not match snapshot revision {:?}",
+                read.revision, read.value.revision
+            ),
+        });
+    }
+    Ok(read)
+}
+
+fn decode_cluster_kv_authoritative_range_prefix_rpc_response(
+    response: &sinomo_core::network::ObjectRpcResponse,
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, DaemonError> {
+    response.error_detail()?;
+    sinomo_core::kv::decode_cluster_kv_authoritative_range_prefix_rpc_body(&response.body)
+        .map_err(Into::into)
+}
+
+fn decode_cluster_kv_authoritative_watch_start_rpc_response(
+    response: &sinomo_core::network::ObjectRpcResponse,
+) -> Result<KvAuthoritativeRead<ClusterKvWatchRegistration>, DaemonError> {
+    response.error_detail()?;
+    sinomo_core::kv::decode_cluster_kv_authoritative_watch_start_rpc_body(&response.body)
+        .map_err(Into::into)
+}
+
+fn decode_cluster_kv_watch_drain_rpc_response(
+    response: &sinomo_core::network::ObjectRpcResponse,
+) -> Result<ClusterKvWatchDrainResponse, DaemonError> {
+    response.error_detail()?;
+    sinomo_core::kv::decode_cluster_kv_local_watch_drain_rpc_body(&response.body)
+        .map_err(Into::into)
+}
+
+fn decode_cluster_kv_watch_cancel_rpc_response(
+    response: &sinomo_core::network::ObjectRpcResponse,
+) -> Result<ClusterKvWatchCancelResponse, DaemonError> {
+    response.error_detail()?;
+    sinomo_core::kv::decode_cluster_kv_local_watch_cancel_rpc_body(&response.body)
+        .map_err(Into::into)
 }
 
 fn decode_cluster_raft_append_rpc_response(
@@ -1947,19 +2016,95 @@ fn decode_cluster_raft_vote_rpc_response(
     sinomo_core::kv::decode_cluster_raft_vote_rpc_response_body(&response.body).map_err(Into::into)
 }
 
-pub(crate) fn fetch_cluster_kv_snapshot_from_endpoint_on_runtime(
+pub(crate) fn fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
-) -> Result<KvSnapshot, DaemonError> {
-    let rpc_request =
-        object_rpc_request_from_kv_payload(sinomo_core::kv::cluster_kv_snapshot_rpc_payload()?);
+) -> Result<KvLocalRead<KvSnapshot>, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_local_snapshot_rpc_payload()?,
+    );
     send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
         endpoint,
         &rpc_request,
         timeout,
         runtime,
-        decode_cluster_kv_snapshot_rpc_response,
+        decode_cluster_kv_local_snapshot_rpc_response,
+    )
+}
+
+pub fn fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    prefix: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_authoritative_range_prefix_rpc_payload(prefix)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
+        endpoint,
+        &rpc_request,
+        timeout,
+        runtime,
+        decode_cluster_kv_authoritative_range_prefix_rpc_response,
+    )
+}
+
+/// Starts a barrier-backed watch on the addressed authority. The current
+/// server contract deliberately fails on a non-leader rather than forwarding
+/// only the barrier and registering against a potentially stale local store.
+pub fn start_cluster_kv_authoritative_watch_from_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    prefix: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvAuthoritativeRead<ClusterKvWatchRegistration>, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_authoritative_watch_start_rpc_payload(prefix)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
+        endpoint,
+        &rpc_request,
+        timeout,
+        runtime,
+        decode_cluster_kv_authoritative_watch_start_rpc_response,
+    )
+}
+
+pub fn drain_cluster_kv_watch_from_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterKvWatchDrainRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterKvWatchDrainResponse, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_local_watch_drain_rpc_payload(request)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
+        endpoint,
+        &rpc_request,
+        timeout,
+        runtime,
+        decode_cluster_kv_watch_drain_rpc_response,
+    )
+}
+
+pub fn cancel_cluster_kv_watch_from_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterKvWatchCancelRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterKvWatchCancelResponse, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_local_watch_cancel_rpc_payload(request)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
+        endpoint,
+        &rpc_request,
+        timeout,
+        runtime,
+        decode_cluster_kv_watch_cancel_rpc_response,
     )
 }
 
@@ -3023,6 +3168,117 @@ mod tests {
     use sinomo_core::network::ObjectRpcRequest;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn local_cluster_kv_snapshot_decoder_preserves_observation_metadata() {
+        let snapshot = sinomo_core::kv::InProcessKvStore::new()
+            .try_snapshot()
+            .expect("empty snapshot");
+        let read = sinomo_core::kv::KvLocalRead {
+            revision: snapshot.revision,
+            observed_term: 7,
+            applied_index: 11,
+            known_leader: Some(
+                sinomo_core::node::NodeId::from_legacy_named("node_local_snapshot_leader")
+                    .expect("leader node id"),
+            ),
+            value: snapshot,
+        };
+        let payload = sinomo_core::kv::cluster_kv_local_snapshot_response_rpc_payload(&read)
+            .expect("local snapshot payload");
+        let response =
+            sinomo_core::network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+
+        let decoded = super::decode_cluster_kv_local_snapshot_rpc_response(&response)
+            .expect("decode local snapshot");
+
+        assert_eq!(decoded, read);
+
+        let inconsistent = sinomo_core::kv::KvLocalRead {
+            revision: sinomo_core::kv::KvRevision(read.revision.0 + 1),
+            ..read
+        };
+        let payload =
+            sinomo_core::kv::cluster_kv_local_snapshot_response_rpc_payload(&inconsistent)
+                .expect("inconsistent local snapshot payload");
+        let response =
+            sinomo_core::network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+        assert!(matches!(
+            super::decode_cluster_kv_local_snapshot_rpc_response(&response),
+            Err(crate::DaemonError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn authoritative_range_and_watch_decoders_require_barrier_proof() {
+        let authority = sinomo_core::kv::KvAuthorityProof {
+            term: 5,
+            commit_index: 13,
+            revision: sinomo_core::kv::KvRevision(8),
+            basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2,
+            },
+        };
+        let range = sinomo_core::kv::KvAuthoritativeRead {
+            value: vec![sinomo_core::kv::KvEntry {
+                key: "/client/range".to_string(),
+                value: b"value".to_vec(),
+                create_revision: authority.revision,
+                modify_revision: authority.revision,
+                version: sinomo_core::kv::KvVersion(1),
+                lease_id: None,
+            }],
+            authority,
+        };
+        let payload =
+            sinomo_core::kv::cluster_kv_authoritative_range_prefix_response_rpc_payload(&range)
+                .expect("range response");
+        let response =
+            sinomo_core::network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+        assert_eq!(
+            super::decode_cluster_kv_authoritative_range_prefix_rpc_response(&response)
+                .expect("decode range"),
+            range
+        );
+
+        let watch = sinomo_core::kv::KvAuthoritativeRead {
+            value: sinomo_core::kv::ClusterKvWatchRegistration {
+                watch_id: sinomo_core::kv::WatchId(21),
+                prefix: "/client/".to_string(),
+                next_revision: authority.revision.next(),
+            },
+            authority,
+        };
+        let payload =
+            sinomo_core::kv::cluster_kv_authoritative_watch_start_response_rpc_payload(&watch)
+                .expect("watch response");
+        let response =
+            sinomo_core::network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+        assert_eq!(
+            super::decode_cluster_kv_authoritative_watch_start_rpc_response(&response)
+                .expect("decode watch"),
+            watch
+        );
+
+        let stale_proof = sinomo_core::kv::KvAuthoritativeRead {
+            value: range.value,
+            authority: sinomo_core::kv::KvAuthorityProof {
+                basis: sinomo_core::kv::KvAuthorityBasis::ExactCommittedRequest,
+                ..authority
+            },
+        };
+        let payload = sinomo_core::kv::cluster_kv_authoritative_range_prefix_response_rpc_payload(
+            &stale_proof,
+        )
+        .expect("stale range response body");
+        let response =
+            sinomo_core::network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body);
+        assert!(matches!(
+            super::decode_cluster_kv_authoritative_range_prefix_rpc_response(&response),
+            Err(crate::DaemonError::Parse { .. })
+        ));
+    }
 
     #[test]
     fn object_rpc_transfer_timeouts_use_default_no_progress_limit() {

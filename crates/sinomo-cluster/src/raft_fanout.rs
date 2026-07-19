@@ -3,6 +3,7 @@ use crate::control_plane_options::{
     ClusterControlPlaneTimeouts, ClusterRaftAppendReplicationOptions,
     ClusterRaftCommittedFanoutOptions,
 };
+use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::read_cluster_kv_snapshot;
 use crate::local_state_store::read_cluster_state;
@@ -29,6 +30,7 @@ static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 pub struct ClusterRaftCommittedFanoutReport {
     pub attempted_nodes: usize,
     pub replicated_nodes: Vec<NodeId>,
+    pub peer_progress_hints: Vec<sinomo_kv::ClusterKvRaftPeerProgress>,
     pub watch_event_batches_sent: usize,
 }
 
@@ -176,6 +178,17 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
         if !outcome.response.accepted {
             continue;
         }
+        let match_index = outcome.response.append.match_index;
+        report
+            .peer_progress_hints
+            .push(sinomo_kv::ClusterKvRaftPeerProgress {
+                peer_node_id: target_node_id.clone(),
+                term: outcome.response.append.term,
+                next_index: match_index.saturating_add(1),
+                match_index,
+                last_accepted_index: match_index,
+                observed_at: time::OffsetDateTime::now_utc(),
+            });
         replicated_nodes.insert(target_node_id.clone());
         report.replicated_nodes.push(target_node_id.clone());
         if outcome.watch_event_fanout_needed {
@@ -367,6 +380,28 @@ where
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
         self.host
             .last_local_kv_replication_index_async(self.paths, state)
+    }
+
+    fn raft_peer_progress_next_index_hint_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        target: &'a Self::Target,
+        last_local_raft_log_index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<u64>, Self::Error> {
+        let paths = self.paths.kv_paths();
+        let peer_node_id = target.clone();
+        let current_term = state.term;
+        Box::pin(async move {
+            Ok(
+                sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint_async(
+                    paths,
+                    peer_node_id,
+                    current_term,
+                    last_local_raft_log_index,
+                )
+                .await,
+            )
+        })
     }
 
     fn build_raft_append_request_async<'a>(

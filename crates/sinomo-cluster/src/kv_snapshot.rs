@@ -5,7 +5,7 @@ use crate::kv_local_store::{
     read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
 };
 use sinomo_base::ClusterBootstrapState;
-use sinomo_kv::{InProcessKvStore, KvSnapshot};
+use sinomo_kv::{InProcessKvStore, KvLocalRead, KvSnapshot};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{
@@ -104,15 +104,22 @@ where
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        if request.route != sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE {
+        if request.route != sinomo_kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE {
             return Err(NetworkError::Io {
                 operation: "cluster KV snapshot refresh".to_string(),
                 detail: format!("unsupported local snapshot RPC route {}", request.route),
             });
         }
         let snapshot = (self.fetch_cluster_kv_snapshot)(target_node_id, timeout)?;
-        let payload =
-            sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&snapshot).map_err(kv_err)?;
+        let local_read = KvLocalRead {
+            revision: snapshot.revision,
+            observed_term: 0,
+            applied_index: 0,
+            known_leader: Some(target_node_id.clone()),
+            value: snapshot,
+        };
+        let payload = sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(&local_read)
+            .map_err(kv_err)?;
         Ok(ObjectRpcResponse::from_encoded_body(
             payload.route,
             payload.body,
@@ -210,12 +217,14 @@ fn fetch_cluster_kv_snapshot_from_state_authority_node(
     timeout: Duration,
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<KvSnapshot, NetworkError> {
-    let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload().map_err(kv_err)?;
+    let payload = sinomo_kv::cluster_kv_local_snapshot_rpc_payload().map_err(kv_err)?;
     let request =
         ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = host.call_node_object_rpc(state, authority_node_id, &request, timeout)?;
     response.error_detail()?;
-    sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(kv_err)
+    sinomo_kv::decode_cluster_kv_local_snapshot_rpc_body(&response.body)
+        .map(|read| read.value)
+        .map_err(kv_err)
 }
 
 pub fn refresh_current_cluster_kv_store_with_local_storage_and_transport<F>(
@@ -276,7 +285,7 @@ mod tests {
             request: &ObjectRpcRequest,
             timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            assert_eq!(request.route, sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE);
+            assert_eq!(request.route, sinomo_kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
             self.calls.push((target_node_id.clone(), timeout));
             if self.stalled_target.as_ref() == Some(target_node_id) {
                 std::thread::sleep(timeout);
@@ -287,8 +296,16 @@ mod tests {
                     detail: format!("node {target_node_id} is unavailable"),
                 });
             };
-            let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(snapshot)
-                .expect("snapshot response payload");
+            let payload = sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(
+                &sinomo_kv::KvLocalRead {
+                    value: snapshot.clone(),
+                    revision: snapshot.revision,
+                    observed_term: 1,
+                    applied_index: snapshot.revision.0,
+                    known_leader: Some(self.known_authority.clone()),
+                },
+            )
+            .expect("snapshot response payload");
             Ok(ObjectRpcResponse::from_encoded_body(
                 payload.route,
                 payload.body,
@@ -303,6 +320,8 @@ mod tests {
             entries: Vec::new(),
             leases: Vec::new(),
             events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
         }
     }
 
