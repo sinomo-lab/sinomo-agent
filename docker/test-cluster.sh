@@ -84,6 +84,14 @@
 #   SINOMO_TEST_NETWORK_MAX_P50_US          max aggregate network ping p50 latency (default 25000)
 #   SINOMO_TEST_NETWORK_MAX_P95_US          max network ping p95 latency (default 50000)
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 250)
+#   SINOMO_TEST_NETWORK_REALTIME_REQUESTS   measured RPCs in each no-load realtime gate (default 100)
+#   SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS warmup RPCs in each no-load realtime gate (default 20)
+#   SINOMO_TEST_NETWORK_DIRECT_MAX_US       max direct small-RPC p50 and p95 (default 1000)
+#   SINOMO_TEST_NETWORK_FORWARD_MAX_US      max one-forward small-RPC p50 and p95 (default 2000)
+#   SINOMO_TEST_NETWORK_QUIET_WAIT           seconds to wait for idle containers before each realtime leg (default 60)
+#   SINOMO_TEST_NETWORK_QUIET_SAMPLES        consecutive idle CPU samples required (default 3)
+#   SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT max CPU percent allowed per cluster container (default 10)
+#   SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS   delay between idle CPU samples (default 1)
 #   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES response bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC min latency-baseline payload throughput (default 0, disabled)
@@ -184,6 +192,14 @@ NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
 NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-25000}"
 NETWORK_MAX_P95_US="${SINOMO_TEST_NETWORK_MAX_P95_US:-50000}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-250}"
+NETWORK_REALTIME_REQUESTS="${SINOMO_TEST_NETWORK_REALTIME_REQUESTS:-100}"
+NETWORK_REALTIME_WARMUP_REQUESTS="${SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS:-20}"
+NETWORK_DIRECT_MAX_US="${SINOMO_TEST_NETWORK_DIRECT_MAX_US:-1000}"
+NETWORK_FORWARD_MAX_US="${SINOMO_TEST_NETWORK_FORWARD_MAX_US:-2000}"
+NETWORK_QUIET_WAIT="${SINOMO_TEST_NETWORK_QUIET_WAIT:-60}"
+NETWORK_QUIET_SAMPLES="${SINOMO_TEST_NETWORK_QUIET_SAMPLES:-3}"
+NETWORK_QUIET_MAX_CPU_PERCENT="${SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT:-10}"
+NETWORK_QUIET_POLL_SECONDS="${SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS:-1}"
 NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
 NETWORK_RESPONSE_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES:-0}"
 NETWORK_MIN_PAYLOAD_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC:-0}"
@@ -212,6 +228,11 @@ RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$RUN_ID}"
 BINARY="${SINOMO_TEST_BINARY:-$SINOMO_ROOT/target/debug/sinomo}"
 export SINOMO_DOCKER_BINARY="${SINOMO_DOCKER_BINARY:-$BINARY}"
+# A latency acceptance run is not valid while per-packet trace logging is on.
+# Force fresh containers off and separately reject reused containers whose
+# immutable environment still has tracing enabled.
+NETWORK_PERF_TRACE_REQUESTED="${SINOMO_NETWORK_PERF_TRACE:-0}"
+export SINOMO_NETWORK_PERF_TRACE=0
 COMPOSE_FILES=(-f "$COMPOSE_FILE")
 if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
   COMPOSE_FILES+=(-f "$COMPOSE_OVERRIDE_FILE")
@@ -220,6 +241,41 @@ fi
 mkdir -p "$ARTIFACTS"
 
 log() { echo "[test-cluster] $*"; }
+
+require_bounded_uint() {
+  local name="$1" value="$2" minimum="$3" maximum="$4" numeric
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || [ "${#value}" -gt 9 ]; then
+    log "$name must be an integer in [$minimum, $maximum], got: $value"
+    return 1
+  fi
+  numeric=$((10#$value))
+  if [ "$numeric" -lt "$minimum" ] || [ "$numeric" -gt "$maximum" ]; then
+    log "$name must be in [$minimum, $maximum], got: $value"
+    return 1
+  fi
+}
+
+validate_network_realtime_gate_config() {
+  # The benchmark prepares every warmup and measured request up front. Keep
+  # operator overrides useful for longer samples without allowing an accidental
+  # enormous value to turn a latency gate into an OOM event.
+  require_bounded_uint SINOMO_TEST_NETWORK_REALTIME_REQUESTS \
+    "$NETWORK_REALTIME_REQUESTS" 1 10000 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS \
+      "$NETWORK_REALTIME_WARMUP_REQUESTS" 1 1000 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_DIRECT_MAX_US \
+      "$NETWORK_DIRECT_MAX_US" 1 1000000 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_FORWARD_MAX_US \
+      "$NETWORK_FORWARD_MAX_US" 1 1000000 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_WAIT \
+      "$NETWORK_QUIET_WAIT" 1 600 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_SAMPLES \
+      "$NETWORK_QUIET_SAMPLES" 1 10 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT \
+      "$NETWORK_QUIET_MAX_CPU_PERCENT" 1 100 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS \
+      "$NETWORK_QUIET_POLL_SECONDS" 1 10
+}
 
 compose() {
   docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" "$@"
@@ -239,6 +295,128 @@ compose_exec_timeout() {
   timeout --foreground "${host_seconds}s" \
     docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" \
     exec -T "$node" timeout --foreground "${seconds}s" "$@"
+}
+
+container_config_env_value() {
+  local node="$1" key="$2" container
+  container="$(compose ps -q "$node")"
+  [ -n "$container" ] || return 1
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+verify_network_perf_trace_disabled() {
+  local node value rc=0
+  if [ "$NETWORK_PERF_TRACE_REQUESTED" != 0 ]; then
+    log "network-realtime gate: forcing SINOMO_NETWORK_PERF_TRACE=0 (requested $NETWORK_PERF_TRACE_REQUESTED)"
+  fi
+  for node in $NODES; do
+    value="$(container_config_env_value "$node" SINOMO_NETWORK_PERF_TRACE)" || value=""
+    if [ "$value" != 0 ]; then
+      log "network-realtime gate: $node has SINOMO_NETWORK_PERF_TRACE=${value:-<unset>}; recreate it with tracing disabled"
+      rc=1
+    fi
+  done
+  return $rc
+}
+
+container_network_set() {
+  local node="$1" container
+  container="$(compose ps -q "$node")"
+  [ -n "$container" ] || return 1
+  docker inspect \
+    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
+    "$container" 2>/dev/null \
+    | sort \
+    | awk 'BEGIN { separator = "" } { printf "%s%s", separator, $0; separator = " " } END { print "" }'
+}
+
+assert_network_realtime_topology() {
+  # The ordinary ping response proves the terminal responder but deliberately
+  # carries no hop trace. Pin the container adjacency (and disable the overlay)
+  # so the forwarding leg has exactly the intended Docker path without adding
+  # benchmark-only protocol metadata.
+  local node1_networks node3_networks node4_networks iroh
+  node1_networks="$(container_network_set node1)" || return 1
+  node3_networks="$(container_network_set node3)" || return 1
+  node4_networks="$(container_network_set node4)" || return 1
+  if [ "$node1_networks" != "${PROJECT}_seg_a" ] \
+    || [ "$node3_networks" != "${PROJECT}_seg_a ${PROJECT}_seg_ab" ] \
+    || [ "$node4_networks" != "${PROJECT}_seg_ab ${PROJECT}_seg_b" ]; then
+    log "network-realtime gate: topology does not guarantee node4 -> node3 -> node1"
+    log "  node1 networks: $node1_networks"
+    log "  node3 networks: $node3_networks"
+    log "  node4 networks: $node4_networks"
+    return 1
+  fi
+  for node in node1 node3 node4; do
+    iroh="$(container_config_env_value "$node" SINOMO_DISABLE_IROH)" || iroh=""
+    if [ "$iroh" != 1 ]; then
+      log "network-realtime gate: $node must have SINOMO_DISABLE_IROH=1 to prove the Docker route"
+      return 1
+    fi
+  done
+  log "  network-realtime topology: node4 -> node3 -> node1 is the only Docker path"
+}
+
+wait_for_network_quiet() {
+  local label="$1" deadline now consecutive=0 stats busy node container
+  local -a containers=()
+  for node in $NODES; do
+    container="$(compose ps -q "$node")"
+    if [ -z "$container" ]; then
+      log "network-quiet/$label: cannot resolve container for $node"
+      return 1
+    fi
+    containers+=("$container")
+  done
+  log "network-quiet/$label: waiting for ${#containers[@]} containers at <=${NETWORK_QUIET_MAX_CPU_PERCENT}% CPU across $NETWORK_QUIET_SAMPLES samples (<=${NETWORK_QUIET_WAIT}s)"
+  deadline=$(( $(date +%s) + NETWORK_QUIET_WAIT ))
+  while :; do
+    if ! stats="$(
+      timeout --foreground "${READINESS_COMMAND_TIMEOUT}s" \
+        docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' "${containers[@]}" \
+          2>/dev/null
+    )"; then
+      busy="docker-stats-unavailable"
+    else
+      busy="$(printf '%s\n' "$stats" | awk \
+        -v expected="${#containers[@]}" \
+        -v limit="$NETWORK_QUIET_MAX_CPU_PERCENT" '
+          NF >= 2 {
+            cpu = $2
+            sub(/%$/, "", cpu)
+            seen++
+            if (cpu !~ /^[0-9]+([.][0-9]+)?$/) {
+              printf "%s=invalid(%s) ", $1, $2
+            } else if ((cpu + 0) > limit) {
+              printf "%s=%s ", $1, $2
+            }
+          }
+          END {
+            if (seen != expected) {
+              printf "sample-count=%d/%d ", seen, expected
+            }
+          }
+        ')"
+    fi
+    if [ -z "$busy" ]; then
+      consecutive=$((consecutive + 1))
+      log "  network-quiet/$label: idle sample $consecutive/$NETWORK_QUIET_SAMPLES"
+      if [ "$consecutive" -ge "$NETWORK_QUIET_SAMPLES" ]; then
+        return 0
+      fi
+    else
+      consecutive=0
+      log "  network-quiet/$label: busy ${busy% }"
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      log "network-quiet/$label: cluster did not become idle before the deadline"
+      return 1
+    fi
+    sleep "$NETWORK_QUIET_POLL_SECONDS"
+  done
 }
 
 deadline_command_timeout() {
@@ -294,6 +472,16 @@ doctor_connectivity_warnings() {
 cluster_health() {
   local seconds="${1:-$READINESS_COMMAND_TIMEOUT}"
   compose_exec_timeout "$seconds" node1 sinomo cluster health 2>/dev/null || true
+}
+
+cluster_local_node_id() {
+  local node="$1" seconds="${2:-$READINESS_COMMAND_TIMEOUT}" node_id
+  node_id="$(
+    compose_exec_timeout "$seconds" "$node" sinomo cluster status 2>/dev/null \
+      | awk '/^local node:/ { print $3; exit }'
+  )"
+  [ -n "$node_id" ] || return 1
+  printf '%s\n' "$node_id"
 }
 
 formation_failure_markers() {
@@ -754,6 +942,49 @@ network_baseline() {
   return $rc
 }
 
+# Exercise the ordinary object-RPC API at concurrency one before other test
+# traffic starts. In this topology node4 reaches node3 directly over seg_ab;
+# node1 requires exactly one application-level forward through node3.
+network_realtime_latency_gate() {
+  local rc=0 direct_target_id forward_target_id
+  assert_network_realtime_topology || return 1
+  direct_target_id="$(cluster_local_node_id node3)" || {
+    log "  FAILED: cannot resolve node3 cluster node id for realtime latency gate"
+    return 1
+  }
+  forward_target_id="$(cluster_local_node_id node1)" || {
+    log "  FAILED: cannot resolve node1 cluster node id for realtime latency gate"
+    return 1
+  }
+  wait_for_network_quiet direct || return 1
+  run_probe node4 cluster.network.ping-benchmark \
+    --param "target-node-id=$direct_target_id" \
+    --param "requests-per-target=$NETWORK_REALTIME_REQUESTS" \
+    --param "warmup-requests-per-target=$NETWORK_REALTIME_WARMUP_REQUESTS" \
+    --param concurrency=1 \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=0 \
+    --param max-p95-ms=0 \
+    --param "max-p50-us=$NETWORK_DIRECT_MAX_US" \
+    --param "max-p95-us=$NETWORK_DIRECT_MAX_US" \
+    --param min-requests-per-second=0 || rc=1
+  wait_for_network_quiet one-forward || return 1
+  run_probe node4 cluster.network.ping-benchmark \
+    --param "target-node-id=$forward_target_id" \
+    --param "requests-per-target=$NETWORK_REALTIME_REQUESTS" \
+    --param "warmup-requests-per-target=$NETWORK_REALTIME_WARMUP_REQUESTS" \
+    --param concurrency=1 \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=0 \
+    --param max-p95-ms=0 \
+    --param "max-p50-us=$NETWORK_FORWARD_MAX_US" \
+    --param "max-p95-us=$NETWORK_FORWARD_MAX_US" \
+    --param min-requests-per-second=0 || rc=1
+  return $rc
+}
+
 network_payload_baseline() {
   local rc=0 node
   for node in $NODES; do
@@ -1123,6 +1354,7 @@ teardown() {
 
 # --- bring-up -----------------------------------------------------------------
 
+validate_network_realtime_gate_config || exit 1
 require_no_other_compose_projects || exit 1
 trap teardown EXIT
 
@@ -1149,6 +1381,11 @@ else
   PROJECT_OWNED=1
 fi
 
+if ! verify_network_perf_trace_disabled; then
+  FAILED_SCENARIOS="network-trace-disabled"
+  exit 1
+fi
+
 if ! wait_for_cluster_ready "formation"; then
   cluster_health
   FAILED_SCENARIOS="formation"
@@ -1159,6 +1396,7 @@ if ! wait_for_network_ready; then
   exit 1
 fi
 
+scenario "network-realtime-latency-gate" network_realtime_latency_gate
 scenario "dfs-protocol-codec-baseline" dfs_protocol_codec_baseline
 scenario "network-latency-baseline" network_baseline
 scenario "network-payload-baseline" network_payload_baseline

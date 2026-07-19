@@ -177,7 +177,7 @@ fn daemon_object_rpc_forward_network_error(
     }
 }
 
-async fn forward_object_rpc_session_from_daemon_control(
+pub(crate) async fn forward_object_rpc_session_from_daemon_control(
     paths: &crate::DaemonPaths,
     payload: crate::DaemonObjectRpcForwardRequest,
     request_body: sinomo_core::network::ObjectRpcIncomingBody,
@@ -1339,9 +1339,13 @@ pub(crate) fn mark_cluster_identity_restart_after_response(
     if stop
         && cluster_control_service_restart_required(route)
         && let Some(paths) = paths
-        && let Err(error) = crate::rollout::request_supervised_main_restart(paths)
     {
-        tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
+        if let Err(error) = crate::rollout::request_supervised_main_restart(paths) {
+            tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
+        }
+        crate::tcp_tunnel::close_all_tcp_tunnels_for_cluster_transition(&format!(
+            "cluster identity changed after {route}; retiring authenticated tcp tunnels"
+        ));
     }
 }
 
@@ -4448,6 +4452,14 @@ impl DaemonServiceRegistryHost {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_registry_for_test(
+        registry: ServiceRegistry,
+        paths: &DaemonPaths,
+    ) -> Result<Self, DaemonError> {
+        Self::from_registry_for_paths(registry, paths)
+    }
+
     fn from_registry_for_paths_on_runtime(
         registry: ServiceRegistry,
         paths: &DaemonPaths,
@@ -4918,6 +4930,47 @@ pub(crate) fn authenticate_daemon_control_request_via_registry(
     } else {
         Err(DaemonError::AuthDenied)
     }
+}
+
+/// Applies the same live route policy to a caller whose identity was already
+/// established by a persistent physical channel. This deliberately performs
+/// no request signature or nonce work: the channel principal is fixed when
+/// the loopback connection or authenticated cluster tunnel is accepted.
+pub(crate) fn authorize_daemon_channel_request_via_registry(
+    paths: &DaemonPaths,
+    authenticated: &AuthenticatedDaemonCommand,
+    service_host: &DaemonServiceRegistryHost,
+) -> Result<(), DaemonError> {
+    authorize_daemon_channel_request_via_registry_with_permission_check(
+        paths,
+        authenticated,
+        service_host,
+        daemon_route_local_permissions_are_granted,
+    )
+}
+
+fn authorize_daemon_channel_request_via_registry_with_permission_check<F>(
+    paths: &DaemonPaths,
+    authenticated: &AuthenticatedDaemonCommand,
+    service_host: &DaemonServiceRegistryHost,
+    permission_check: F,
+) -> Result<(), DaemonError>
+where
+    F: FnOnce(&DaemonPaths, &ObjectRouteDescriptor) -> bool,
+{
+    let Some(descriptor) = service_host.object_rpc_route_descriptor(&authenticated.route) else {
+        return crate::auth::authorize_authenticated_daemon_command(authenticated);
+    };
+    if let Some(scope) = descriptor.auth_scope.as_deref() {
+        if !daemon_signer_authorizes_route_scope(&authenticated.signer, scope) {
+            return Err(DaemonError::AuthDenied);
+        }
+    } else {
+        crate::auth::authorize_authenticated_daemon_command(authenticated)?;
+    }
+    permission_check(paths, &descriptor)
+        .then_some(())
+        .ok_or(DaemonError::AuthDenied)
 }
 
 fn daemon_auth_public_key_prefix(public_key: &str) -> &str {
@@ -6088,6 +6141,23 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
     service_runtime: Option<tokio::runtime::Handle>,
 ) -> Result<Arc<ObjectRpcRouteRegistry>, NetworkError> {
     let service_registry = service_snapshot.registry_arc();
+    // The daemon's data root and clustered/unclustered identity are process-lifetime
+    // service context. Identity-changing init/join/leave operations drain and restart
+    // the daemon after their response, so rebuilding this snapshot on the replacement
+    // process preserves the old semantics without a blocking-pool round trip per RPC.
+    let service_data_dir = Arc::new(SinomoDataDir::new(
+        daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?,
+    ));
+    let service_cluster: Option<Arc<dyn ClusterAccess>> =
+        if ClusterPaths::new(service_data_dir.as_ref()).state.exists() {
+            Some(Arc::new(DaemonClusterAccess::new(
+                paths.clone(),
+                service_data_dir.as_ref(),
+                service_runtime.as_ref(),
+            )))
+        } else {
+            None
+        };
     let native_dylib_routes = Arc::new(module_snapshot.native_dylib_routes.clone());
     let active_native_dylib_operations = Arc::new(Mutex::new(BTreeMap::<
         String,
@@ -6103,12 +6173,14 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
         let native_target = native_dylib_routes.get(&descriptor.route).cloned();
         let is_native_cancel_route = descriptor.route == MODULE_NATIVE_DYLIB_CANCEL_ROUTE;
         let handler_paths = paths.clone();
-        let handler_runtime = service_runtime.clone();
+        let handler_data_dir = Arc::clone(&service_data_dir);
+        let handler_cluster = service_cluster.clone();
         let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
         builder = builder.try_register_route(descriptor, move |request| {
             let registry = Arc::clone(&registry);
             let paths = handler_paths.clone();
-            let runtime = handler_runtime.clone();
+            let context_data_dir = Arc::clone(&handler_data_dir);
+            let context_cluster = handler_cluster.clone();
             let native_target = native_target.clone();
             let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
             async move {
@@ -6143,30 +6215,8 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                     .to_string();
                 let started_at = Instant::now();
                 let signer = daemon_service_signer_from_request_metadata(&request.request)?;
-                let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
-                    let data_dir = Arc::new(SinomoDataDir::new(
-                        daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?,
-                    ));
-                    let cluster: Option<Arc<dyn ClusterAccess>> =
-                        if ClusterPaths::new(data_dir.as_ref()).state.exists() {
-                            Some(Arc::new(DaemonClusterAccess::new(
-                                paths.clone(),
-                                data_dir.as_ref(),
-                                runtime.as_ref(),
-                            )))
-                        } else {
-                            None
-                        };
-                    Ok::<_, NetworkError>((data_dir, cluster))
-                })
-                .await
-                .map_err(|source| NetworkError::Io {
-                    operation: format!(
-                        "build daemon service context for {}",
-                        request.request.route
-                    ),
-                    detail: format!("daemon service context task failed: {source}"),
-                })??;
+                let data_dir = Arc::clone(&context_data_dir);
+                let cluster = context_cluster.clone();
                 let context_us = daemon_service_rpc_elapsed_us(started_at);
                 metrics::histogram!(
                     "sinomo.daemon.service.context.us",
@@ -7841,6 +7891,40 @@ mod tests {
         }
     }
 
+    struct TestServiceContextSnapshotService {
+        observations: Arc<Mutex<Vec<(Arc<SinomoDataDir>, bool)>>>,
+    }
+
+    impl Service for TestServiceContextSnapshotService {
+        fn name(&self) -> &'static str {
+            "test-service-context-snapshot"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/test/service-context-snapshot"]
+        }
+
+        fn route_categories(&self) -> Vec<ServiceRoute> {
+            vec![ServiceRoute::new(
+                "/test/service-context-snapshot",
+                "test-service-context-snapshot",
+            )]
+        }
+
+        fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            let observations = Arc::clone(&self.observations);
+            Box::pin(async move {
+                let _: () = request.decode_body()?;
+                observations
+                    .lock()
+                    .expect("service context observations")
+                    .push((Arc::clone(&ctx.data_dir), ctx.cluster.is_some()));
+                ctx.respond(ObjectRpcResponse::encode_body(request.route, &())?)?;
+                Ok(ServiceDisposition::Continue)
+            })
+        }
+    }
+
     struct TestJoinChallengeService;
 
     impl Service for TestJoinChallengeService {
@@ -8012,6 +8096,86 @@ mod tests {
                 .get(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
                 .map(String::as_str),
             Some("continue")
+        );
+    }
+
+    #[test]
+    fn daemon_service_context_is_reused_until_identity_snapshot_rebuild() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-context-snapshot");
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let registry = ServiceRegistry::builder()
+            .register(TestServiceContextSnapshotService {
+                observations: Arc::clone(&observations),
+            })
+            .build();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry.clone());
+        let mut router = host.route_policy_layer().layer(host.active_router());
+
+        let mut call = || {
+            runtime
+                .block_on(call_value_object_rpc_service_async(&mut router, {
+                    let mut request = ObjectRpcRequest::encode_body(
+                        "/test/service-context-snapshot",
+                        "test-service-context-snapshot",
+                        &(),
+                    )
+                    .expect("request");
+                    annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                    request
+                }))
+                .expect("service context response")
+                .error_detail()
+                .expect("service context response is successful");
+        };
+        call();
+        cluster_paths.ensure().expect("cluster paths");
+        std::fs::write(&cluster_paths.state, b"identity-now-exists")
+            .expect("write cluster identity marker");
+        call();
+
+        {
+            let observations = observations.lock().expect("service context observations");
+            assert_eq!(observations.len(), 2);
+            assert!(
+                Arc::ptr_eq(&observations[0].0, &observations[1].0),
+                "one route registry must reuse its resident data-directory context"
+            );
+            assert_eq!(
+                [observations[0].1, observations[1].1],
+                [false, false],
+                "cluster identity changes take effect only after rebuilding the daemon registry"
+            );
+        }
+
+        let rebuilt_host = test_service_host(&root, registry);
+        let mut rebuilt_router = rebuilt_host
+            .route_policy_layer()
+            .layer(rebuilt_host.active_router());
+        runtime
+            .block_on(call_value_object_rpc_service_async(&mut rebuilt_router, {
+                let mut request = ObjectRpcRequest::encode_body(
+                    "/test/service-context-snapshot",
+                    "test-service-context-snapshot",
+                    &(),
+                )
+                .expect("rebuilt request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
+            .expect("rebuilt service context response")
+            .error_detail()
+            .expect("rebuilt service context response is successful");
+        let observations = observations.lock().expect("service context observations");
+        assert_eq!(observations.len(), 3);
+        assert!(
+            observations[2].1,
+            "a rebuilt route registry observes the committed cluster identity"
         );
     }
 
@@ -8463,6 +8627,70 @@ mod tests {
             authenticate_daemon_control_request_via_registry(&paths, &allowed, &host)
                 .expect("catalog auth succeeds after local grant");
         assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+    }
+
+    #[test]
+    fn channel_registry_authorization_checks_local_permission_once() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-channel-route-permission");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder().register(TestStopService).build();
+        let host = test_service_host(&root, registry);
+        let local = AuthenticatedDaemonCommand {
+            route: "/test/stop".to_string(),
+            signer: DaemonSignerAuthority::Local,
+            signer_node_id: "local-node".to_string(),
+            signer_public_key: "local-key".to_string(),
+        };
+
+        let allowed_evaluations = std::cell::Cell::new(0);
+        authorize_daemon_channel_request_via_registry_with_permission_check(
+            &paths,
+            &local,
+            &host,
+            |_, descriptor| {
+                allowed_evaluations.set(allowed_evaluations.get() + 1);
+                assert_eq!(descriptor.route, "/test/stop");
+                assert_eq!(descriptor.category, "test-stop");
+                true
+            },
+        )
+        .expect("local authority and granted permission must be accepted");
+        assert_eq!(allowed_evaluations.get(), 1);
+
+        let denied_evaluations = std::cell::Cell::new(0);
+        assert!(matches!(
+            authorize_daemon_channel_request_via_registry_with_permission_check(
+                &paths,
+                &local,
+                &host,
+                |_, _| {
+                    denied_evaluations.set(denied_evaluations.get() + 1);
+                    false
+                },
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
+        assert_eq!(denied_evaluations.get(), 1);
+
+        let member = AuthenticatedDaemonCommand {
+            signer: DaemonSignerAuthority::Member,
+            ..local
+        };
+        let out_of_scope_evaluations = std::cell::Cell::new(0);
+        assert!(matches!(
+            authorize_daemon_channel_request_via_registry_with_permission_check(
+                &paths,
+                &member,
+                &host,
+                |_, _| {
+                    out_of_scope_evaluations.set(out_of_scope_evaluations.get() + 1);
+                    true
+                },
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
+        assert_eq!(out_of_scope_evaluations.get(), 0);
     }
 
     #[test]
@@ -9909,6 +10137,11 @@ mod tests {
             let crate::DaemonObjectRpcForwardResponse::Success { response } = envelope else {
                 panic!("forward returned a network error: {envelope:?}");
             };
+            assert_eq!(
+                response.responder_node_id(),
+                Some(target_node.as_str()),
+                "the trusted outer envelope must preserve the verified final target identity"
+            );
             assert_eq!(
                 response.decode_body::<String>().expect("inner response"),
                 format!("response-{index}")

@@ -26,10 +26,14 @@ use sinomo_core::cluster::{
 };
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY, ObjectRpcRequest, ObjectRpcResponse,
+    ObjectRpcSessionCall, ObjectRpcSessionResult,
 };
 use sinomo_core::node::NodeId;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// How long daemon discovery waits for the status probe.
 pub const DAEMON_API_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -549,7 +553,21 @@ fn object_rpc_forward_request(
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         observe_connectivity,
     };
-    ObjectRpcRequest::encode_body(route, DAEMON_RPC_CATEGORY, &payload).map_err(Into::into)
+    let mut outer = ObjectRpcRequest::encode_body(route, DAEMON_RPC_CATEGORY, &payload)
+        .map_err(DaemonApiError::from)?;
+    if let Some(traceparent) = request.traceparent() {
+        outer = outer.with_traceparent(traceparent.to_string());
+    }
+    if let Some(tracestate) = request.tracestate() {
+        outer = outer.with_tracestate(tracestate.to_string());
+    }
+    if request
+        .metadata
+        .contains_key(OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY)
+    {
+        outer = outer.with_observe_sampled(request.observe_sampled());
+    }
+    Ok(outer)
 }
 
 #[cfg(test)]
@@ -693,11 +711,7 @@ async fn send_daemon_object_rpc_session_async(
 ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
     let target_is_local = match known_local_node_id {
         Some(local_node_id) => target_node_id == local_node_id,
-        None => {
-            let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-            let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-            target_node_id == &state.local_node_id
-        }
+        None => target_node_id == &cached_daemon_api_local_node_id(&data_dir)?,
     };
     if target_is_local {
         let mut local_options = sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts);
@@ -721,15 +735,15 @@ async fn send_daemon_object_rpc_session_async(
     } else {
         ObjectRpcSessionCall::new(forward_request, call.body)
     };
-    let result = call_loopback_daemon_session_async(
+    call_loopback_daemon_session_async(
         data_dir,
         address,
         outer,
         sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts),
         runtime,
     )
-    .await?;
-    decode_daemon_object_rpc_forward_session_response(result)
+    .await
+    .and_then(decode_daemon_object_rpc_forward_session_response)
 }
 
 /// DFS peer transport that deliberately terminates at the running local
@@ -1079,24 +1093,629 @@ struct DaemonApiSessionHost {
     runtime: tokio::runtime::Handle,
 }
 
+const DAEMON_API_CHANNEL_POOL_MAX_ENTRIES: usize = 64;
+const DAEMON_API_CHANNEL_UNSUPPORTED_RETRY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DaemonApiChannelPoolKey {
+    runtime_id: tokio::runtime::Id,
+    address: String,
+    data_dir_root: PathBuf,
+}
+
+enum DaemonApiChannelPoolEntry {
+    Connecting {
+        completed: tokio::sync::watch::Sender<bool>,
+        generation: u64,
+        last_used: u64,
+    },
+    Ready {
+        connection: sinomo_core::network::ConnectedLocalObjectRpcChannel,
+        last_used: u64,
+    },
+    Unsupported {
+        retry_after: Instant,
+        last_used: u64,
+    },
+}
+
+impl DaemonApiChannelPoolEntry {
+    fn last_used(&self) -> u64 {
+        match self {
+            Self::Connecting { last_used, .. }
+            | Self::Ready { last_used, .. }
+            | Self::Unsupported { last_used, .. } => *last_used,
+        }
+    }
+
+    fn close_if_ready(self, detail: &str) {
+        if let Self::Ready { connection, .. } = self {
+            connection.transport.close(detail);
+        }
+    }
+}
+
+#[derive(Default)]
+struct DaemonApiChannelPool {
+    entries: HashMap<DaemonApiChannelPoolKey, DaemonApiChannelPoolEntry>,
+    sequence: u64,
+}
+
+impl DaemonApiChannelPool {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence
+    }
+
+    fn evict_one_inactive(&mut self) -> bool {
+        let candidate = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| match entry {
+                DaemonApiChannelPoolEntry::Unsupported { .. } => true,
+                DaemonApiChannelPoolEntry::Ready { connection, .. } => {
+                    connection.client.is_closed()
+                }
+                DaemonApiChannelPoolEntry::Connecting { .. } => false,
+            })
+            .min_by_key(|(_, entry)| entry.last_used())
+            .map(|(key, _)| key.clone());
+        let Some(candidate) = candidate else {
+            return false;
+        };
+        if let Some(entry) = self.entries.remove(&candidate) {
+            entry.close_if_ready("local object RPC channel pool eviction");
+        }
+        true
+    }
+}
+
+fn daemon_api_channel_pool() -> &'static Mutex<DaemonApiChannelPool> {
+    static POOL: OnceLock<Mutex<DaemonApiChannelPool>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(DaemonApiChannelPool::default()))
+}
+
+const DAEMON_API_CANONICAL_ROOT_CACHE_MAX_ENTRIES: usize = 64;
+
+#[derive(Clone)]
+struct DaemonApiCanonicalRootCacheEntry {
+    canonical: PathBuf,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct DaemonApiCanonicalRootCache {
+    entries: HashMap<PathBuf, DaemonApiCanonicalRootCacheEntry>,
+    sequence: u64,
+}
+
+impl DaemonApiCanonicalRootCache {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence
+    }
+
+    fn get(&mut self, root: &PathBuf) -> Option<PathBuf> {
+        let sequence = self.next_sequence();
+        let entry = self.entries.get_mut(root)?;
+        entry.last_used = sequence;
+        Some(entry.canonical.clone())
+    }
+
+    fn insert(&mut self, root: PathBuf, canonical: PathBuf) {
+        let sequence = self.next_sequence();
+        if !self.entries.contains_key(&root)
+            && self.entries.len() >= DAEMON_API_CANONICAL_ROOT_CACHE_MAX_ENTRIES
+        {
+            let candidate = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(root, _)| root.clone());
+            if let Some(candidate) = candidate {
+                self.entries.remove(&candidate);
+            }
+        }
+        self.entries.insert(
+            root,
+            DaemonApiCanonicalRootCacheEntry {
+                canonical,
+                last_used: sequence,
+            },
+        );
+    }
+}
+
+fn daemon_api_canonical_root_cache() -> &'static Mutex<DaemonApiCanonicalRootCache> {
+    static ROOTS: OnceLock<Mutex<DaemonApiCanonicalRootCache>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(DaemonApiCanonicalRootCache::default()))
+}
+
+fn canonical_daemon_api_data_dir_root(data_dir: &SinomoDataDir) -> PathBuf {
+    let root = data_dir.root();
+    if let Ok(mut roots) = daemon_api_canonical_root_cache().lock()
+        && let Some(canonical) = roots.get(&root)
+    {
+        return canonical;
+    }
+    let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    if let Ok(mut roots) = daemon_api_canonical_root_cache().lock() {
+        roots.insert(root, canonical.clone());
+    }
+    canonical
+}
+
+const DAEMON_API_LOCAL_NODE_ID_CACHE_MAX_ENTRIES: usize = 64;
+const DAEMON_API_LOCAL_NODE_ID_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct DaemonApiLocalNodeIdCacheEntry {
+    state_mark: sinomo_core::network::ClusterFileMark,
+    node_id: NodeId,
+    checked_at: Instant,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct DaemonApiLocalNodeIdCache {
+    entries: HashMap<PathBuf, DaemonApiLocalNodeIdCacheEntry>,
+    sequence: u64,
+}
+
+impl DaemonApiLocalNodeIdCache {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        self.sequence
+    }
+
+    fn remove_lru(&mut self) {
+        let candidate = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(root, _)| root.clone());
+        if let Some(candidate) = candidate {
+            self.entries.remove(&candidate);
+        }
+    }
+}
+
+fn daemon_api_local_node_id_cache() -> &'static Mutex<DaemonApiLocalNodeIdCache> {
+    static CACHE: OnceLock<Mutex<DaemonApiLocalNodeIdCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DaemonApiLocalNodeIdCache::default()))
+}
+
+/// Returns the local cluster identity without reopening and decoding the
+/// bootstrap object on every forwarded RPC. Ready calls remain syscall-free;
+/// the durable file mark is sampled at the same bounded cadence as the daemon
+/// signing-identity cache. A changed mark invalidates both this value and any
+/// local authenticated carrier established for the old state.
+fn cached_daemon_api_local_node_id(
+    data_dir: &SinomoDataDir,
+) -> Result<NodeId, sinomo_core::network::NetworkError> {
+    let root = canonical_daemon_api_data_dir_root(data_dir);
+    let checked_at = Instant::now();
+    {
+        let mut cache = daemon_api_local_node_id_cache().lock().map_err(|_| {
+            sinomo_core::network::NetworkError::Io {
+                operation: "lock daemon API local node identity cache".to_string(),
+                detail: "local node identity cache lock was poisoned".to_string(),
+            }
+        })?;
+        let sequence = cache.next_sequence();
+        if let Some(entry) = cache.entries.get_mut(&root)
+            && entry.state_mark.exists
+            && checked_at.duration_since(entry.checked_at) < DAEMON_API_LOCAL_NODE_ID_CACHE_MAX_AGE
+        {
+            entry.last_used = sequence;
+            return Ok(entry.node_id.clone());
+        }
+    }
+
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(data_dir);
+    let state_mark = sinomo_core::network::cluster_file_mark(&cluster_paths.state);
+    let mut invalidated_ready_carriers = false;
+    if let Some(state_mark) = state_mark {
+        let mut cache = daemon_api_local_node_id_cache().lock().map_err(|_| {
+            sinomo_core::network::NetworkError::Io {
+                operation: "lock daemon API local node identity cache".to_string(),
+                detail: "local node identity cache lock was poisoned".to_string(),
+            }
+        })?;
+        let sequence = cache.next_sequence();
+        if let Some(entry) = cache.entries.get_mut(&root) {
+            if entry.state_mark == state_mark && state_mark.exists {
+                entry.last_used = sequence;
+                return Ok(entry.node_id.clone());
+            }
+            cache.entries.remove(&root);
+            invalidated_ready_carriers = true;
+        }
+    } else {
+        let mut cache = daemon_api_local_node_id_cache().lock().map_err(|_| {
+            sinomo_core::network::NetworkError::Io {
+                operation: "lock daemon API local node identity cache".to_string(),
+                detail: "local node identity cache lock was poisoned".to_string(),
+            }
+        })?;
+        invalidated_ready_carriers = cache.entries.remove(&root).is_some();
+    }
+    if invalidated_ready_carriers {
+        invalidate_daemon_api_channels_for_data_dir(&root);
+    }
+
+    let state = read_daemon_api_cluster_state_without_kv(data_dir, &cluster_paths)?;
+    let node_id = state.local_node_id;
+    let after_mark = sinomo_core::network::cluster_file_mark(&cluster_paths.state);
+    if let Some(stable_mark) = state_mark.filter(|mark| Some(*mark) == after_mark && mark.exists) {
+        let mut cache = daemon_api_local_node_id_cache().lock().map_err(|_| {
+            sinomo_core::network::NetworkError::Io {
+                operation: "lock daemon API local node identity cache".to_string(),
+                detail: "local node identity cache lock was poisoned".to_string(),
+            }
+        })?;
+        let sequence = cache.next_sequence();
+        while cache.entries.len() >= DAEMON_API_LOCAL_NODE_ID_CACHE_MAX_ENTRIES
+            && !cache.entries.contains_key(&root)
+        {
+            cache.remove_lru();
+        }
+        cache.entries.insert(
+            root,
+            DaemonApiLocalNodeIdCacheEntry {
+                state_mark: stable_mark,
+                node_id: node_id.clone(),
+                checked_at,
+                last_used: sequence,
+            },
+        );
+    }
+    Ok(node_id)
+}
+
+fn invalidate_daemon_api_channels_for_data_dir(data_dir_root: &PathBuf) {
+    let Ok(mut pool) = daemon_api_channel_pool().lock() else {
+        return;
+    };
+    let keys = pool
+        .entries
+        .keys()
+        .filter(|key| &key.data_dir_root == data_dir_root)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        if let Some(entry) = pool.entries.remove(&key) {
+            entry.close_if_ready("local daemon identity changed");
+        }
+    }
+}
+
+fn read_daemon_api_cluster_state_without_kv(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+) -> Result<sinomo_core::ClusterBootstrapState, sinomo_core::network::NetworkError> {
+    #[cfg(test)]
+    {
+        let root = canonical_daemon_api_data_dir_root(data_dir);
+        let mut reads = daemon_api_cluster_state_reads()
+            .lock()
+            .expect("daemon API cluster-state read counter");
+        *reads.entry(root).or_default() += 1;
+    }
+    #[cfg(not(test))]
+    let _ = data_dir;
+    sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+}
+
+#[cfg(test)]
+fn daemon_api_cluster_state_reads() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    READS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn daemon_api_cluster_state_read_count(data_dir: &SinomoDataDir) -> usize {
+    let root = canonical_daemon_api_data_dir_root(data_dir);
+    daemon_api_cluster_state_reads()
+        .lock()
+        .expect("daemon API cluster-state read counter")
+        .get(&root)
+        .copied()
+        .unwrap_or_default()
+}
+
+enum DaemonApiChannelPoolAction {
+    Return(Option<sinomo_core::network::ObjectRpcChannelClient>),
+    Wait(tokio::sync::watch::Receiver<bool>),
+    Connect {
+        completed: tokio::sync::watch::Sender<bool>,
+        generation: u64,
+    },
+}
+
+struct DaemonApiChannelConnectGuard {
+    key: DaemonApiChannelPoolKey,
+    completed: tokio::sync::watch::Sender<bool>,
+    generation: u64,
+    armed: bool,
+}
+
+impl DaemonApiChannelConnectGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DaemonApiChannelConnectGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut pool) = daemon_api_channel_pool().lock() {
+            let owns_entry = matches!(
+                pool.entries.get(&self.key),
+                Some(DaemonApiChannelPoolEntry::Connecting { generation, .. })
+                    if *generation == self.generation
+            );
+            if owns_entry {
+                pool.entries.remove(&self.key);
+            }
+        }
+        self.completed.send_replace(true);
+    }
+}
+
+async fn pooled_loopback_object_rpc_channel(
+    data_dir: &SinomoDataDir,
+    address: &str,
+    health: sinomo_core::network::NetworkHealthPolicy,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<sinomo_core::network::ObjectRpcChannelClient>, sinomo_core::network::NetworkError>
+{
+    if !sinomo_core::network::is_loopback_connect_address(address) {
+        return Ok(None);
+    }
+    let key = DaemonApiChannelPoolKey {
+        runtime_id: runtime.id(),
+        address: address.to_string(),
+        data_dir_root: canonical_daemon_api_data_dir_root(data_dir),
+    };
+    loop {
+        let action = {
+            let mut pool = daemon_api_channel_pool().lock().map_err(|_| {
+                sinomo_core::network::NetworkError::Io {
+                    operation: "lock daemon API object RPC channel pool".to_string(),
+                    detail: "channel pool lock was poisoned".to_string(),
+                }
+            })?;
+            let sequence = pool.next_sequence();
+            match pool.entries.remove(&key) {
+                Some(DaemonApiChannelPoolEntry::Ready {
+                    connection,
+                    last_used: _,
+                }) if !connection.client.is_closed() => {
+                    let client = connection.client.clone();
+                    pool.entries.insert(
+                        key.clone(),
+                        DaemonApiChannelPoolEntry::Ready {
+                            connection,
+                            last_used: sequence,
+                        },
+                    );
+                    DaemonApiChannelPoolAction::Return(Some(client))
+                }
+                Some(DaemonApiChannelPoolEntry::Ready { connection, .. }) => {
+                    connection
+                        .transport
+                        .close("discard closed local object RPC channel");
+                    let (completed, _receiver) = tokio::sync::watch::channel(false);
+                    pool.entries.insert(
+                        key.clone(),
+                        DaemonApiChannelPoolEntry::Connecting {
+                            completed: completed.clone(),
+                            generation: sequence,
+                            last_used: sequence,
+                        },
+                    );
+                    DaemonApiChannelPoolAction::Connect {
+                        completed,
+                        generation: sequence,
+                    }
+                }
+                Some(DaemonApiChannelPoolEntry::Connecting {
+                    completed,
+                    generation,
+                    last_used: _,
+                }) => {
+                    let receiver = completed.subscribe();
+                    pool.entries.insert(
+                        key.clone(),
+                        DaemonApiChannelPoolEntry::Connecting {
+                            completed,
+                            generation,
+                            last_used: sequence,
+                        },
+                    );
+                    DaemonApiChannelPoolAction::Wait(receiver)
+                }
+                Some(DaemonApiChannelPoolEntry::Unsupported {
+                    retry_after,
+                    last_used: _,
+                }) if Instant::now() < retry_after => {
+                    pool.entries.insert(
+                        key.clone(),
+                        DaemonApiChannelPoolEntry::Unsupported {
+                            retry_after,
+                            last_used: sequence,
+                        },
+                    );
+                    DaemonApiChannelPoolAction::Return(None)
+                }
+                Some(DaemonApiChannelPoolEntry::Unsupported { .. }) | None => {
+                    while pool.entries.len() >= DAEMON_API_CHANNEL_POOL_MAX_ENTRIES
+                        && pool.evict_one_inactive()
+                    {}
+                    if pool.entries.len() >= DAEMON_API_CHANNEL_POOL_MAX_ENTRIES {
+                        DaemonApiChannelPoolAction::Return(None)
+                    } else {
+                        let (completed, _receiver) = tokio::sync::watch::channel(false);
+                        pool.entries.insert(
+                            key.clone(),
+                            DaemonApiChannelPoolEntry::Connecting {
+                                completed: completed.clone(),
+                                generation: sequence,
+                                last_used: sequence,
+                            },
+                        );
+                        DaemonApiChannelPoolAction::Connect {
+                            completed,
+                            generation: sequence,
+                        }
+                    }
+                }
+            }
+        };
+
+        match action {
+            DaemonApiChannelPoolAction::Return(client) => return Ok(client),
+            DaemonApiChannelPoolAction::Wait(mut completed) => {
+                if !*completed.borrow() {
+                    let _ = completed.changed().await;
+                }
+            }
+            DaemonApiChannelPoolAction::Connect {
+                completed,
+                generation,
+            } => {
+                let mut guard = DaemonApiChannelConnectGuard {
+                    key: key.clone(),
+                    completed: completed.clone(),
+                    generation,
+                    armed: true,
+                };
+                let result = sinomo_core::network::connect_local_object_rpc_channel_async(
+                    data_dir,
+                    address,
+                    health.into(),
+                )
+                .await;
+                let mut pool = daemon_api_channel_pool().lock().map_err(|_| {
+                    sinomo_core::network::NetworkError::Io {
+                        operation: "lock daemon API object RPC channel pool".to_string(),
+                        detail: "channel pool lock was poisoned".to_string(),
+                    }
+                })?;
+                let sequence = pool.next_sequence();
+                let owns_entry = matches!(
+                    pool.entries.get(&key),
+                    Some(DaemonApiChannelPoolEntry::Connecting {
+                        generation: entry_generation,
+                        ..
+                    }) if *entry_generation == generation
+                );
+                if !owns_entry {
+                    if let Ok(Some(connection)) = &result {
+                        connection
+                            .transport
+                            .close("discard superseded daemon API channel connection");
+                    }
+                    guard.disarm();
+                    completed.send_replace(true);
+                    return Ok(None);
+                }
+                let existing = owns_entry.then(|| pool.entries.remove(&key)).flatten();
+                debug_assert!(matches!(
+                    existing,
+                    Some(DaemonApiChannelPoolEntry::Connecting { .. })
+                ));
+                let output = match result {
+                    Ok(Some(connection)) => {
+                        let client = connection.client.clone();
+                        pool.entries.insert(
+                            key.clone(),
+                            DaemonApiChannelPoolEntry::Ready {
+                                connection,
+                                last_used: sequence,
+                            },
+                        );
+                        Ok(Some(client))
+                    }
+                    Ok(None) => {
+                        pool.entries.insert(
+                            key.clone(),
+                            DaemonApiChannelPoolEntry::Unsupported {
+                                retry_after: Instant::now() + DAEMON_API_CHANNEL_UNSUPPORTED_RETRY,
+                                last_used: sequence,
+                            },
+                        );
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                };
+                guard.disarm();
+                completed.send_replace(true);
+                return output;
+            }
+        }
+    }
+}
+
 impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonApiSessionHost {
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
     ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
+        let route = request.route.clone();
+        let category = request.category.clone();
+        let body_sha256 = sinomo_core::network::daemon_rpc_body_sha256(request);
+        match sinomo_core::network::try_sign_daemon_rpc_request_digest_from_cached_data_dir(
+            &self.data_dir,
+            &route,
+            &category,
+            &body_sha256,
+        ) {
+            Ok(Some(signature)) => Box::pin(async move { Ok(signature) }),
+            Err(error) => Box::pin(async move { Err(error) }),
+            Ok(None) => {
+                let data_dir = self.data_dir.clone();
+                let runtime = self.runtime.clone();
+                Box::pin(async move {
+                    runtime
+                        .spawn_blocking(move || {
+                            sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
+                                &data_dir,
+                                &route,
+                                &category,
+                                body_sha256,
+                            )
+                        })
+                        .await
+                        .map_err(|source| sinomo_core::network::NetworkError::Io {
+                            operation: "daemon API session signing".to_string(),
+                            detail: format!("session signing task failed: {source}"),
+                        })?
+                })
+            }
+        }
+    }
+
+    fn object_rpc_channel_async<'a>(
+        &'a mut self,
+        endpoint: &'a sinomo_core::ClusterEndpointRecord,
+        health: sinomo_core::network::NetworkHealthPolicy,
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+        'a,
+        Option<sinomo_core::network::ObjectRpcChannelClient>,
+    > {
+        let address = endpoint.address.clone();
         let data_dir = self.data_dir.clone();
-        let request = request.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            runtime
-                .spawn_blocking(move || {
-                    sinomo_core::network::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
-                })
+            pooled_loopback_object_rpc_channel(&data_dir, &address, health, &runtime)
                 .await
-                .map_err(|source| sinomo_core::network::NetworkError::Io {
-                    operation: "daemon API session signing".to_string(),
-                    detail: format!("session signing task failed: {source}"),
-                })?
+                // Channel discovery is an optional fast path. A connect or
+                // negotiation failure must preserve the canonical session.
+                .or(Ok(None))
         })
     }
 }
@@ -1137,7 +1756,7 @@ where
             })
         };
     }
-    block_on_daemon_client_on_ephemeral_sync_runtime(future)
+    block_on_daemon_client_on_process_runtime(future)
 }
 
 fn block_on_daemon_client_stream<F, T>(future: F) -> Result<T, DaemonApiError>
@@ -1150,7 +1769,7 @@ where
             detail: "streaming daemon RPC sync client cannot run inside a Tokio runtime; use send_daemon_rpc_stream_async".to_string(),
         });
     }
-    block_on_daemon_client_on_ephemeral_sync_runtime(future)
+    block_on_daemon_client_on_process_runtime(future)
 }
 
 fn block_on_daemon_client_on_owner_runtime<F, T>(
@@ -1177,25 +1796,905 @@ where
     runtime.block_on(future)
 }
 
-fn block_on_daemon_client_on_ephemeral_sync_runtime<F, T>(future: F) -> Result<T, DaemonApiError>
+fn daemon_api_sync_runtime() -> Result<&'static tokio::runtime::Runtime, DaemonApiError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("sinomo-api-sync")
+            .enable_all()
+            .build()
+            .map_err(|source| source.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(detail) => Err(DaemonApiError::Network {
+            address: "daemon client runtime".to_string(),
+            detail: detail.clone(),
+        }),
+    }
+}
+
+fn block_on_daemon_client_on_process_runtime<F, T>(future: F) -> Result<T, DaemonApiError>
 where
     F: std::future::Future<Output = Result<T, DaemonApiError>>,
 {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonApiError::Network {
-            address: "daemon client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let output = runtime.block_on(future);
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    output
+    daemon_api_sync_runtime()?.block_on(future)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    fn test_channel_data_dir(label: &str) -> (sinomo_testdir::TestDir, SinomoDataDir) {
+        let root = sinomo_testdir::TestDir::new(label);
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("test data dir");
+        (root, data_dir)
+    }
+
+    #[test]
+    fn canonical_root_cache_is_bounded_and_evicts_lru() {
+        let mut cache = DaemonApiCanonicalRootCache::default();
+        for index in 0..DAEMON_API_CANONICAL_ROOT_CACHE_MAX_ENTRIES {
+            cache.insert(
+                PathBuf::from(format!("root-{index}")),
+                PathBuf::from(format!("canonical-{index}")),
+            );
+        }
+        assert_eq!(
+            cache.get(&PathBuf::from("root-0")),
+            Some(PathBuf::from("canonical-0"))
+        );
+        cache.insert(
+            PathBuf::from("root-overflow"),
+            PathBuf::from("canonical-overflow"),
+        );
+        assert_eq!(
+            cache.entries.len(),
+            DAEMON_API_CANONICAL_ROOT_CACHE_MAX_ENTRIES
+        );
+        assert!(cache.entries.contains_key(&PathBuf::from("root-0")));
+        assert!(!cache.entries.contains_key(&PathBuf::from("root-1")));
+    }
+
+    fn test_channel_pool_key(
+        data_dir: &SinomoDataDir,
+        address: &str,
+        runtime: &tokio::runtime::Handle,
+    ) -> DaemonApiChannelPoolKey {
+        DaemonApiChannelPoolKey {
+            runtime_id: runtime.id(),
+            address: address.to_string(),
+            data_dir_root: canonical_daemon_api_data_dir_root(data_dir),
+        }
+    }
+
+    fn remove_test_channel_pool_entry(
+        data_dir: &SinomoDataDir,
+        address: &str,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        let key = test_channel_pool_key(data_dir, address, runtime);
+        if let Some(entry) = daemon_api_channel_pool()
+            .lock()
+            .expect("channel pool")
+            .entries
+            .remove(&key)
+        {
+            entry.close_if_ready("test cleanup");
+        }
+    }
+
+    fn mark_test_channel_unsupported(
+        data_dir: &SinomoDataDir,
+        address: &str,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        let key = test_channel_pool_key(data_dir, address, runtime);
+        let mut pool = daemon_api_channel_pool().lock().expect("channel pool");
+        let sequence = pool.next_sequence();
+        if let Some(entry) = pool.entries.insert(
+            key,
+            DaemonApiChannelPoolEntry::Unsupported {
+                retry_after: Instant::now() + Duration::from_secs(30),
+                last_used: sequence,
+            },
+        ) {
+            entry.close_if_ready("replace test channel pool entry");
+        }
+    }
+
+    fn remove_test_local_node_id_cache(data_dir: &SinomoDataDir) {
+        let root = canonical_daemon_api_data_dir_root(data_dir);
+        daemon_api_local_node_id_cache()
+            .lock()
+            .expect("local node identity cache")
+            .entries
+            .remove(&root);
+        daemon_api_cluster_state_reads()
+            .lock()
+            .expect("cluster-state read counter")
+            .remove(&root);
+        invalidate_daemon_api_channels_for_data_dir(&root);
+    }
+
+    fn write_test_cluster_state(
+        data_dir: &SinomoDataDir,
+        label: &str,
+        local_node_id: NodeId,
+        public_key: String,
+    ) {
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(format!("cluster_{label}"))
+                .expect("cluster id"),
+            format!("API test cluster {label}"),
+            local_node_id,
+            "local",
+            public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+    }
+
+    #[test]
+    fn local_node_id_cache_refreshes_after_identity_transition() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-local-node-id-transition");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main identity");
+        let first = NodeId::from_legacy_named("node_api_local_first").expect("first node id");
+        let second = NodeId::from_legacy_named("node_api_local_second").expect("second node id");
+        write_test_cluster_state(
+            &data_dir,
+            "api_local_node_transition",
+            first.clone(),
+            identity.public_key.clone(),
+        );
+
+        assert_eq!(
+            cached_daemon_api_local_node_id(&data_dir).expect("first cached identity"),
+            first
+        );
+        let reads_after_first = daemon_api_cluster_state_read_count(&data_dir);
+        assert_eq!(reads_after_first, 1);
+        assert_eq!(
+            cached_daemon_api_local_node_id(&data_dir).expect("ready cached identity"),
+            first
+        );
+        assert_eq!(
+            daemon_api_cluster_state_read_count(&data_dir),
+            reads_after_first,
+            "an unchanged ready-path lookup must not reopen cluster state"
+        );
+
+        write_test_cluster_state(
+            &data_dir,
+            "api_local_node_transition",
+            second.clone(),
+            identity.public_key,
+        );
+        let cache_root = canonical_daemon_api_data_dir_root(&data_dir);
+        daemon_api_local_node_id_cache()
+            .lock()
+            .expect("local node identity cache")
+            .entries
+            .get_mut(&cache_root)
+            .expect("cached local node identity")
+            .checked_at = Instant::now()
+            .checked_sub(DAEMON_API_LOCAL_NODE_ID_CACHE_MAX_AGE + Duration::from_millis(1))
+            .expect("expired cache timestamp");
+        assert_eq!(
+            cached_daemon_api_local_node_id(&data_dir).expect("transitioned cached identity"),
+            second
+        );
+        assert_eq!(
+            daemon_api_cluster_state_read_count(&data_dir),
+            reads_after_first + 1,
+            "a durable identity transition must invalidate and reload the cache"
+        );
+        remove_test_local_node_id_cache(&data_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_forwarded_ready_path_calls_do_not_reopen_cluster_state() {
+        const CALLS: usize = 3;
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-forward-local-id-cache");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_forward_cache_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_api_forward_cache_remote").expect("remote node");
+        write_test_cluster_state(
+            &data_dir,
+            "api_forward_cache",
+            local_node,
+            identity.public_key,
+        );
+
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let server_data_dir = data_dir.clone();
+        let expected_target = remote_node.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept local channel");
+            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
+                stream,
+                &server_data_dir,
+            )
+            .await
+            .expect("accept authenticated local channel");
+            let sinomo_core::network::AcceptedLocalObjectRpcChannel {
+                mut server,
+                transport,
+            } = accepted;
+            for _ in 0..CALLS {
+                let inbound = server.accept().await.expect("forwarded request");
+                assert_eq!(
+                    inbound.request.request.route,
+                    DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                );
+                let forward = inbound
+                    .request
+                    .request
+                    .decode_body::<DaemonObjectRpcForwardRequest>()
+                    .expect("forward request");
+                assert_eq!(forward.target_node_id, expected_target);
+                let response = ObjectRpcResponse::encode_body(
+                    DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                    &DaemonObjectRpcForwardResponse::Success {
+                        response: ObjectRpcResponse::encode_body(
+                            forward.request.route,
+                            &"pong".to_string(),
+                        )
+                        .expect("inner response"),
+                    },
+                )
+                .expect("forward response");
+                inbound
+                    .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                        response,
+                    ))
+                    .await
+                    .expect("respond");
+            }
+            transport
+        });
+
+        let runtime = tokio::runtime::Handle::current();
+        let request =
+            ObjectRpcRequest::encode_body("/test/api-forward-cache", "test", &"ping".to_string())
+                .expect("request");
+        let timeouts =
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2));
+        let mut reads_after_first = 0;
+        for call_index in 0..CALLS {
+            let result = send_daemon_object_rpc_session_async(
+                data_dir.clone(),
+                &address,
+                &remote_node,
+                ObjectRpcSessionCall::value(request.clone()),
+                Duration::from_secs(2),
+                None,
+                Some(Duration::from_secs(2)),
+                false,
+                timeouts,
+                None,
+                &runtime,
+            )
+            .await
+            .expect("forwarded call");
+            assert_eq!(
+                result
+                    .response
+                    .decode_body::<String>()
+                    .expect("inner response body"),
+                "pong"
+            );
+            if call_index == 0 {
+                reads_after_first = daemon_api_cluster_state_read_count(&data_dir);
+                assert_eq!(reads_after_first, 1);
+            }
+        }
+        assert_eq!(
+            daemon_api_cluster_state_read_count(&data_dir),
+            reads_after_first,
+            "repeated calls over a ready local carrier must perform zero cluster-state reads"
+        );
+
+        let server_transport = server.await.expect("server task");
+        server_transport.close("test complete");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        remove_test_local_node_id_cache(&data_dir);
+    }
+
+    fn synchronous_test_channel_call(
+        data_dir: SinomoDataDir,
+        address: String,
+    ) -> Result<(tokio::runtime::Id, String, bool), DaemonApiError> {
+        block_on_daemon_client(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let client = pooled_loopback_object_rpc_channel(
+                &data_dir,
+                &address,
+                sinomo_core::network::NetworkHealthPolicy::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                ),
+                &runtime,
+            )
+            .await?
+            .ok_or_else(|| DaemonApiError::Network {
+                address: address.clone(),
+                detail: "local object RPC channel was not accepted".to_string(),
+            })?;
+            let request = ObjectRpcRequest::encode_body(
+                "/test/sync-runtime-channel",
+                "test",
+                &"ping".to_string(),
+            )?;
+            let result = client
+                .call(ObjectRpcSessionCall::value(request))
+                .await?
+                .result()
+                .await?;
+            let response = result.response.decode_body::<String>()?;
+            Ok((runtime.id(), response, client.is_closed()))
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_channel_pool_singleflights_and_replaces_closed_carriers() {
+        const CALLERS: usize = 16;
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-pool");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = Arc::clone(&accepts);
+        let server_data_dir = data_dir.clone();
+        let (transport_sender, mut transport_receiver) = tokio::sync::mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("accept");
+                let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
+                    stream,
+                    &server_data_dir,
+                )
+                .await
+                .expect("accept channel");
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                transport_sender
+                    .send(accepted.transport)
+                    .await
+                    .expect("publish transport");
+            }
+        });
+
+        let health = sinomo_core::network::NetworkHealthPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let runtime = tokio::runtime::Handle::current();
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut callers = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let address = address.clone();
+            let data_dir = data_dir.clone();
+            let runtime = runtime.clone();
+            let barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                pooled_loopback_object_rpc_channel(&data_dir, &address, health, &runtime)
+                    .await
+                    .expect("pooled lookup")
+                    .expect("channel")
+            }));
+        }
+        let mut clients = Vec::with_capacity(CALLERS);
+        for caller in callers {
+            clients.push(caller.await.expect("caller"));
+        }
+        let first_transport = transport_receiver.recv().await.expect("first transport");
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+
+        first_transport.close("force pooled reconnect");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !clients[0].is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client observes carrier close");
+        let replacement = pooled_loopback_object_rpc_channel(&data_dir, &address, health, &runtime)
+            .await
+            .expect("replacement lookup")
+            .expect("replacement channel");
+        let second_transport = transport_receiver.recv().await.expect("second transport");
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        assert!(!replacement.is_closed());
+
+        second_transport.close("test complete");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        server.abort();
+    }
+
+    #[test]
+    fn synchronous_rpc_bridge_keeps_one_channel_carrier_alive_between_calls() {
+        const EXPECTED_CALLS: usize = 4;
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-sync-channel");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let completed_calls = Arc::new(AtomicUsize::new(0));
+        let (address_sender, address_receiver) = std::sync::mpsc::channel();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+        let server_accepts = Arc::clone(&accepts);
+        let server_completed_calls = Arc::clone(&completed_calls);
+        let server_data_dir = data_dir.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            runtime.block_on(async move {
+                let listener =
+                    sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("listener");
+                address_sender
+                    .send(listener.local_addr_string().expect("address"))
+                    .expect("publish address");
+                let calls_complete = Arc::new(tokio::sync::Notify::new());
+                let accept_loop = async {
+                    let mut handlers = Vec::new();
+                    while server_completed_calls.load(Ordering::SeqCst) < EXPECTED_CALLS {
+                        tokio::select! {
+                            accepted = listener.accept() => {
+                                let stream = accepted.expect("accept");
+                                server_accepts.fetch_add(1, Ordering::SeqCst);
+                                let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
+                                    stream,
+                                    &server_data_dir,
+                                )
+                                .await
+                                .expect("accept channel");
+                                let calls_complete = Arc::clone(&calls_complete);
+                                let completed_calls = Arc::clone(&server_completed_calls);
+                                handlers.push(tokio::spawn(async move {
+                                    let sinomo_core::network::AcceptedLocalObjectRpcChannel {
+                                        mut server,
+                                        transport,
+                                    } = accepted;
+                                    while let Some(inbound) = server.accept().await {
+                                        let route = inbound.request.request.route.clone();
+                                        let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+                                            route,
+                                            &"pong".to_string(),
+                                        )
+                                        .expect("response");
+                                        inbound
+                                            .respond(sinomo_core::network::ObjectRpcSessionResponse::value(response))
+                                            .await
+                                            .expect("respond");
+                                        if completed_calls.fetch_add(1, Ordering::SeqCst) + 1 >= EXPECTED_CALLS {
+                                            calls_complete.notify_one();
+                                        }
+                                    }
+                                    transport.close("test server channel ended");
+                                }));
+                            }
+                            () = calls_complete.notified() => {}
+                        }
+                    }
+                    handlers
+                };
+                let handlers = tokio::time::timeout(Duration::from_secs(5), accept_loop)
+                    .await
+                    .expect("server received both synchronous calls");
+                let _ = tokio::time::timeout(Duration::from_secs(2), shutdown_receiver).await;
+                for handler in handlers {
+                    handler.abort();
+                }
+            });
+        });
+        let address = address_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server address");
+
+        let (first_runtime_id, first_response, first_closed) =
+            synchronous_test_channel_call(data_dir.clone(), address.clone())
+                .expect("first sync call");
+        assert_eq!(first_response, "pong");
+        assert!(!first_closed);
+        std::thread::sleep(Duration::from_millis(20));
+        let (second_runtime_id, second_response, second_closed) =
+            synchronous_test_channel_call(data_dir.clone(), address.clone())
+                .expect("second sync call");
+        assert_eq!(second_response, "pong");
+        assert!(!second_closed);
+        assert_eq!(first_runtime_id, second_runtime_id);
+
+        let concurrent = (0..2)
+            .map(|_| {
+                let address = address.clone();
+                let data_dir = data_dir.clone();
+                std::thread::spawn(move || synchronous_test_channel_call(data_dir, address))
+            })
+            .collect::<Vec<_>>();
+        for caller in concurrent {
+            let (runtime_id, response, closed) = caller
+                .join()
+                .expect("concurrent sync caller thread")
+                .expect("concurrent sync call");
+            assert_eq!(runtime_id, first_runtime_id);
+            assert_eq!(response, "pong");
+            assert!(!closed);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(completed_calls.load(Ordering::SeqCst), EXPECTED_CALLS);
+
+        let runtime = daemon_api_sync_runtime().expect("process sync runtime");
+        remove_test_channel_pool_entry(&data_dir, &address, runtime.handle());
+        let _ = shutdown_sender.send(());
+        server.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn explicit_channel_rejection_is_the_only_negative_cached_outcome() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-rejection");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept").into_inner();
+            let mut request = [0_u8; 8];
+            stream.read_exact(&mut request).await.expect("handshake");
+            assert!(
+                sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&request[..4])
+            );
+            let mut rejection = [0_u8; 8];
+            rejection[..4].copy_from_slice(b"SXS2");
+            stream
+                .write_all(&rejection)
+                .await
+                .expect("explicit rejection");
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let result = pooled_loopback_object_rpc_channel(
+            &data_dir,
+            &address,
+            sinomo_core::network::NetworkHealthPolicy::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            &runtime,
+        )
+        .await
+        .expect("rejected negotiation");
+        assert!(result.is_none());
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(matches!(
+            daemon_api_channel_pool()
+                .lock()
+                .expect("channel pool")
+                .entries
+                .get(&key),
+            Some(DaemonApiChannelPoolEntry::Unsupported { .. })
+        ));
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn dropped_channel_negotiation_is_transient_and_next_lookup_redials() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-redial");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let (transport_sender, transport_receiver) = tokio::sync::oneshot::channel();
+        let server_data_dir = data_dir.clone();
+        let server = tokio::spawn(async move {
+            let mut first = listener.accept().await.expect("first accept").into_inner();
+            let mut request = [0_u8; 8];
+            first.read_exact(&mut request).await.expect("handshake");
+            drop(first);
+
+            let second = listener.accept().await.expect("second accept");
+            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
+                second,
+                &server_data_dir,
+            )
+            .await
+            .expect("accept replacement channel");
+            transport_sender
+                .send(accepted.transport)
+                .map_err(|_| ())
+                .expect("publish replacement transport");
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let health = sinomo_core::network::NetworkHealthPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(
+            pooled_loopback_object_rpc_channel(&data_dir, &address, health, &runtime)
+                .await
+                .is_err(),
+            "legacy EOF must remain a transient negotiation error"
+        );
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(
+            !daemon_api_channel_pool()
+                .lock()
+                .expect("channel pool")
+                .entries
+                .contains_key(&key),
+            "transient EOF must remove the connecting marker"
+        );
+
+        let replacement = pooled_loopback_object_rpc_channel(&data_dir, &address, health, &runtime)
+            .await
+            .expect("replacement lookup")
+            .expect("replacement channel");
+        assert!(!replacement.is_closed());
+        let transport = transport_receiver.await.expect("replacement transport");
+        transport.close("test complete");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn timed_out_channel_negotiation_does_not_poison_pool_state() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-timeout");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept").into_inner();
+            let mut request = [0_u8; 8];
+            stream.read_exact(&mut request).await.expect("handshake");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let result = pooled_loopback_object_rpc_channel(
+            &data_dir,
+            &address,
+            sinomo_core::network::NetworkHealthPolicy::new(
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            ),
+            &runtime,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(sinomo_core::network::NetworkError::Timeout { .. })
+        ));
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(
+            !daemon_api_channel_pool()
+                .lock()
+                .expect("channel pool")
+                .entries
+                .contains_key(&key),
+            "handshake timeout must not be cached as unsupported"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn malformed_channel_response_does_not_poison_pool_state() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-malformed");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept").into_inner();
+            let mut request = [0_u8; 8];
+            stream.read_exact(&mut request).await.expect("handshake");
+            stream
+                .write_all(b"BAD!\0\0\0\0")
+                .await
+                .expect("malformed response");
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let result = pooled_loopback_object_rpc_channel(
+            &data_dir,
+            &address,
+            sinomo_core::network::NetworkHealthPolicy::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            &runtime,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(sinomo_core::network::NetworkError::Serialization { .. })
+        ));
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(
+            !daemon_api_channel_pool()
+                .lock()
+                .expect("channel pool")
+                .entries
+                .contains_key(&key),
+            "malformed response must not be cached as unsupported"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_daemon_close_falls_back_to_canonical_session_without_pool_poison() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-legacy-channel-fallback");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main node identity");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = Arc::clone(&accepts);
+        let server_data_dir = data_dir.clone();
+        let server = tokio::spawn(async move {
+            let mut negotiation = listener
+                .accept()
+                .await
+                .expect("negotiation accept")
+                .into_inner();
+            server_accepts.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 8];
+            negotiation
+                .read_exact(&mut request)
+                .await
+                .expect("channel negotiation");
+            assert!(
+                sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&request[..4])
+            );
+            drop(negotiation);
+
+            let stream = listener.accept().await.expect("canonical accept");
+            server_accepts.fetch_add(1, Ordering::SeqCst);
+            let (_request, responder) = sinomo_core::network::accept_object_rpc_server_session(
+                Box::new(stream.into_inner()),
+                server_data_dir,
+                sinomo_core::network::NetworkCallPolicy::default(),
+                |_request, _node_id, _public_key| Ok(()),
+            )
+            .await
+            .expect("canonical session");
+            responder
+                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    ObjectRpcResponse::encode_body(
+                        "/test/legacy-channel-fallback",
+                        &"canonical".to_string(),
+                    )
+                    .expect("response"),
+                ))
+                .await
+                .expect("canonical response");
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let request = ObjectRpcRequest::encode_body(
+            "/test/legacy-channel-fallback",
+            "test",
+            &"request".to_string(),
+        )
+        .expect("request");
+        let result = call_daemon_address_session_async(
+            data_dir.clone(),
+            &address,
+            ObjectRpcSessionCall::value(request),
+            sinomo_core::network::ClusterObjectRpcOptions::default(),
+            &runtime,
+        )
+        .await
+        .expect("canonical fallback");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("response body"),
+            "canonical"
+        );
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(
+            !daemon_api_channel_pool()
+                .lock()
+                .expect("channel pool")
+                .entries
+                .contains_key(&key),
+            "legacy close must not poison future channel negotiation"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_channel_singleflight_releases_waiters() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-cancelled");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address").to_string();
+        let (read_sender, read_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut handshake = [0_u8; 8];
+            stream.read_exact(&mut handshake).await.expect("handshake");
+            let _ = read_sender.send(());
+            std::future::pending::<()>().await;
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let task_address = address.clone();
+        let task_data_dir = data_dir.clone();
+        let task_runtime = runtime.clone();
+        let lookup = tokio::spawn(async move {
+            pooled_loopback_object_rpc_channel(
+                &task_data_dir,
+                &task_address,
+                sinomo_core::network::NetworkHealthPolicy::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                ),
+                &task_runtime,
+            )
+            .await
+        });
+        read_receiver.await.expect("handshake read");
+        lookup.abort();
+        let _ = lookup.await;
+        tokio::task::yield_now().await;
+
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(
+            !daemon_api_channel_pool()
+                .lock()
+                .expect("channel pool")
+                .entries
+                .contains_key(&key),
+            "cancelled dial must not leave a permanent singleflight marker"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn channel_pool_eviction_never_exceeds_the_hard_bound() {
+        let mut pool = DaemonApiChannelPool::default();
+        let runtime_id = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .handle()
+            .id();
+        for index in 0..DAEMON_API_CHANNEL_POOL_MAX_ENTRIES {
+            pool.entries.insert(
+                DaemonApiChannelPoolKey {
+                    runtime_id,
+                    address: format!("127.0.0.1:{}", 10_000 + index),
+                    data_dir_root: PathBuf::from("/test/channel-pool"),
+                },
+                DaemonApiChannelPoolEntry::Unsupported {
+                    retry_after: Instant::now() + Duration::from_secs(1),
+                    last_used: index as u64,
+                },
+            );
+        }
+        assert_eq!(pool.entries.len(), DAEMON_API_CHANNEL_POOL_MAX_ENTRIES);
+        assert!(pool.evict_one_inactive());
+        assert_eq!(pool.entries.len(), DAEMON_API_CHANNEL_POOL_MAX_ENTRIES - 1);
+    }
 
     #[test]
     fn daemon_api_client_discovery_fails_without_running_daemon() {
@@ -1338,6 +2837,8 @@ mod tests {
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
+        let runtime = tokio::runtime::Handle::current();
+        mark_test_channel_unsupported(&data_dir, &address, &runtime);
         let response_body = vec![0x5a_u8; 173_219];
         let server_body = response_body.clone();
         let server_data_dir = data_dir.clone();
@@ -1366,18 +2867,108 @@ mod tests {
             .expect("request");
 
         let result = call_daemon_address_session_async(
-            data_dir,
+            data_dir.clone(),
             &address,
             ObjectRpcSessionCall::value(request),
             sinomo_core::network::ClusterObjectRpcOptions::default(),
-            &tokio::runtime::Handle::current(),
+            &runtime,
         )
         .await
         .expect("authenticated keepalives preserve the long loopback RPC");
         let response = decode_object_rpc_value_response(result).expect("decode response value");
         server.await.expect("server task");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
 
         assert_eq!(response.body, response_body);
+    }
+
+    /// Opt-in loopback probe for TCP connect plus the ordinary canonical
+    /// object-RPC API. It intentionally has no timing assertion because CI
+    /// hosts are not stable benchmark environments.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "diagnostic microbenchmark; run explicitly with --ignored --nocapture"]
+    async fn diagnostic_loopback_small_rpc_cost() {
+        const WARMUP: usize = 100;
+        const ITERATIONS: usize = 1_000;
+        let root = sinomo_testdir::TestDir::new("sinomo-api-loopback-cost-diagnostic");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main node identity");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        // The signer cache tracks both durable identity and cluster-state
+        // file marks. This probe needs only the mark because its server-side
+        // callback deliberately omits cluster authorization.
+        std::fs::write(&cluster_paths.state, b"diagnostic-state-mark")
+            .expect("diagnostic cluster state mark");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let runtime = tokio::runtime::Handle::current();
+        mark_test_channel_unsupported(&data_dir, &address, &runtime);
+        let server_data_dir = data_dir.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..WARMUP + ITERATIONS {
+                let stream = listener.accept().await.expect("accept diagnostic loopback");
+                let (_request, responder) = sinomo_core::network::accept_object_rpc_server_session(
+                    Box::new(stream.into_inner()),
+                    server_data_dir.clone(),
+                    sinomo_core::network::NetworkCallPolicy::default(),
+                    |_request, _node_id, _public_key| Ok(()),
+                )
+                .await
+                .expect("accept diagnostic object RPC session");
+                responder
+                    .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                        ObjectRpcResponse::encode_body(
+                            "/test/loopback-cost-diagnostic",
+                            &"small response",
+                        )
+                        .expect("diagnostic response"),
+                    ))
+                    .await
+                    .expect("diagnostic response write");
+            }
+        });
+        let request = ObjectRpcRequest::encode_body(
+            "/test/loopback-cost-diagnostic",
+            "test",
+            &"small request",
+        )
+        .expect("diagnostic request");
+        let mut latency_us = Vec::with_capacity(ITERATIONS);
+        for iteration in 0..WARMUP + ITERATIONS {
+            let started = std::time::Instant::now();
+            let result = call_daemon_address_session_async(
+                data_dir.clone(),
+                &address,
+                ObjectRpcSessionCall::value(request.clone()),
+                sinomo_core::network::ClusterObjectRpcOptions::default(),
+                &runtime,
+            )
+            .await
+            .expect("diagnostic loopback RPC");
+            decode_object_rpc_value_response(result).expect("diagnostic response value");
+            if iteration >= WARMUP {
+                latency_us.push(started.elapsed().as_micros() as u64);
+            }
+        }
+        server.await.expect("diagnostic loopback server");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        latency_us.sort_unstable();
+        let percentile = |percent: usize| {
+            let rank = latency_us.len().saturating_mul(percent).saturating_add(99) / 100;
+            latency_us[rank.saturating_sub(1).min(latency_us.len() - 1)]
+        };
+        eprintln!(
+            "loopback-small-rpc us: min={} p50={} p95={} max={}",
+            latency_us[0],
+            percentile(50),
+            percentile(95),
+            latency_us[latency_us.len() - 1],
+        );
     }
 
     #[test]
@@ -1404,6 +2995,33 @@ mod tests {
         assert_eq!(payload.idle_timeout_millis, Some(9_000));
         assert_eq!(payload.overall_timeout_millis, Some(30_000));
         assert!(payload.observe_connectivity);
+    }
+
+    #[test]
+    fn forward_request_propagates_trace_context_to_the_outer_rpc() {
+        let target_node_id = NodeId::from_legacy_named("node_forward_trace").expect("node id");
+        let inner_request = ObjectRpcRequest::encode_body("/test/timeline", "test", &())
+            .expect("inner request")
+            .with_traceparent("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01")
+            .with_tracestate("sinomo=timeline")
+            .with_observe_sampled(true);
+        let request = object_rpc_forward_request(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            &target_node_id,
+            &inner_request,
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            Some(Duration::from_secs(10)),
+            false,
+        )
+        .expect("forward request");
+
+        assert_eq!(request.traceparent(), inner_request.traceparent());
+        assert_eq!(request.tracestate(), inner_request.tracestate());
+        assert!(request.observe_sampled());
+        let payload: DaemonObjectRpcForwardRequest =
+            request.decode_body().expect("forward payload");
+        assert_eq!(payload.request, inner_request);
     }
 
     #[test]
@@ -1595,6 +3213,8 @@ mod tests {
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
+        let runtime = tokio::runtime::Handle::current();
+        mark_test_channel_unsupported(&data_dir, &address, &runtime);
         let request_body = vec![0x41_u8; 512 * 1024 + 31];
         let response_body = vec![0x52_u8; 768 * 1024 + 47];
         let expected_request = request_body.clone();
@@ -1638,7 +3258,11 @@ mod tests {
                 .expect("local response");
         });
 
-        let transport = DaemonDfsPeerTransport::at_address(data_dir, address, local_node.clone());
+        let transport = DaemonDfsPeerTransport::at_address(
+            data_dir.clone(),
+            address.clone(),
+            local_node.clone(),
+        );
         let request = ObjectRpcRequest::encode_body(
             sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
             sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
@@ -1658,6 +3282,7 @@ mod tests {
         .await
         .expect("local target RPC");
         server.await.expect("server task");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
 
         assert_eq!(
             result

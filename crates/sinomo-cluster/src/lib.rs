@@ -164,8 +164,9 @@ pub use local_membership::{
 };
 pub use local_state_store::{
     read_cluster_state, read_cluster_state_async, read_cluster_state_cached,
-    read_cluster_state_without_kv, read_cluster_state_without_kv_async, write_cluster_state,
-    write_cluster_state_async,
+    read_cluster_state_cached_shared, read_cluster_state_without_kv,
+    read_cluster_state_without_kv_async, read_cluster_state_without_kv_cached_shared,
+    write_cluster_state, write_cluster_state_async,
 };
 pub use member_mutation::{
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,

@@ -12,9 +12,9 @@ use crate::daemon_auth::{
 };
 pub(crate) use crate::transfer::NetworkCallPolicy;
 use crate::transfer::{
-    DEFAULT_TRANSFER_FRAME_BYTES, TransferControl, TransferDataFrame, TransferDataHeader,
-    TransferDigest, TransferEncodedWireFrameHeader, TransferFlowWindow, TransferId, TransferOpen,
-    TransferReceiverState, TransferSenderState, TransferVerifiedData,
+    DEFAULT_TRANSFER_FRAME_BYTES, TransferAck, TransferControl, TransferDataFrame,
+    TransferDataHeader, TransferDigest, TransferEncodedWireFrameHeader, TransferFlowWindow,
+    TransferId, TransferOpen, TransferReceiverState, TransferSenderState, TransferVerifiedData,
     read_transfer_data_payload_to_vec, read_transfer_encoded_frame_header,
     write_transfer_data_frame, write_transfer_encoded_control_frame,
 };
@@ -35,6 +35,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 const BODY_READER_BUFFER_BYTES: usize = DEFAULT_TRANSFER_FRAME_BYTES as usize;
 const BODY_READER_BUFFER_DEPTH: usize = 2;
+const SESSION_WRITER_COMMAND_DEPTH: usize = 8;
+/// Keep latency-sensitive typed values in the already signed request/response
+/// head. Larger values retain the streaming transfer path and its bounded
+/// flow-control window.
+const INLINE_VALUE_MAX_BYTES: usize = 64 * 1024;
 /// Give an active body consumer enough time to absorb a transient scheduler or
 /// allocation stall before falling back to the disk spool. The healthy
 /// `try_send` path does not wait. Five milliseconds is well below the session
@@ -462,6 +467,225 @@ where
             .await
     }
 
+    fn sign_response_head(
+        &self,
+        session_id: TransferId,
+        head_digest: TransferDigest,
+    ) -> SignedResponseHeadProof {
+        self.signer.sign_response_head(ResponseHeadProofInput {
+            session_id,
+            head_digest,
+        })
+    }
+}
+
+enum SessionWriteCommand {
+    Control {
+        payload: SessionWirePayload,
+        completion: Option<tokio::sync::oneshot::Sender<Result<(), NetworkError>>>,
+    },
+    Data {
+        header: TransferDataHeader,
+        payload: Vec<u8>,
+        completion: tokio::sync::oneshot::Sender<Result<(), NetworkError>>,
+    },
+}
+
+enum SessionWriterWork {
+    Command(SessionWriteCommand),
+    Acknowledgement(TransferAck),
+}
+
+/// Ordered, bounded write-side scheduler for one canonical session.
+///
+/// The wire reader must keep draining the peer while a large local frame is in
+/// flight. Reader-generated acknowledgements therefore update one coalescing
+/// slot instead of waiting for the socket writer. All actual writes remain
+/// serialized here so transcript sequence and proof chaining stay exact.
+#[derive(Clone)]
+struct SessionWriterHandle {
+    commands: tokio::sync::mpsc::Sender<SessionWriteCommand>,
+    acknowledgements: tokio::sync::watch::Sender<Option<TransferAck>>,
+    data_dir: SinomoDataDir,
+    signer: SessionFrameSigner,
+}
+
+impl SessionWriterHandle {
+    fn spawn<W>(mut writer: SessionFrameWriter<W>) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let data_dir = writer.data_dir.clone();
+        let signer = writer.signer.clone();
+        let (commands, mut command_receiver) =
+            tokio::sync::mpsc::channel(SESSION_WRITER_COMMAND_DEPTH);
+        let (acknowledgements, mut acknowledgement_receiver) =
+            tokio::sync::watch::channel(None::<TransferAck>);
+        tokio::spawn(async move {
+            let mut acknowledgements_open = true;
+            loop {
+                let work = if acknowledgements_open {
+                    tokio::select! {
+                        changed = acknowledgement_receiver.changed() => {
+                            match changed {
+                                Ok(()) => SessionWriterWork::Acknowledgement(
+                                    acknowledgement_receiver
+                                        .borrow_and_update()
+                                        .clone()
+                                        .expect("acknowledgement updates are never empty"),
+                                ),
+                                Err(_) => {
+                                    acknowledgements_open = false;
+                                    continue;
+                                }
+                            }
+                        }
+                        command = command_receiver.recv() => {
+                            let Some(command) = command else {
+                                break;
+                            };
+                            SessionWriterWork::Command(command)
+                        }
+                    }
+                } else {
+                    let Some(command) = command_receiver.recv().await else {
+                        break;
+                    };
+                    SessionWriterWork::Command(command)
+                };
+
+                match work {
+                    SessionWriterWork::Acknowledgement(acknowledgement) => {
+                        if writer
+                            .send(SessionWirePayload::Transfer(TransferControl::Ack(
+                                acknowledgement,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    SessionWriterWork::Command(command) => {
+                        // A cumulative ACK logically precedes any control the
+                        // reader queued after consuming those bytes (most
+                        // importantly Complete). Flush the latest version at
+                        // this command boundary so a delayed ACK can never
+                        // arrive after its completion receipt.
+                        if acknowledgements_open
+                            && acknowledgement_receiver.has_changed().unwrap_or(false)
+                        {
+                            let acknowledgement = acknowledgement_receiver
+                                .borrow_and_update()
+                                .clone()
+                                .expect("acknowledgement updates are never empty");
+                            if writer
+                                .send(SessionWirePayload::Transfer(TransferControl::Ack(
+                                    acknowledgement,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        match command {
+                            SessionWriteCommand::Control {
+                                payload,
+                                completion,
+                            } => {
+                                let result = writer.send(payload).await;
+                                let failed = result.is_err();
+                                if let Some(completion) = completion {
+                                    let _ = completion.send(result);
+                                }
+                                if failed {
+                                    break;
+                                }
+                            }
+                            SessionWriteCommand::Data {
+                                header,
+                                payload,
+                                completion,
+                            } => {
+                                let result = writer
+                                    .send_data(TransferDataFrame {
+                                        header,
+                                        payload: &payload,
+                                    })
+                                    .await;
+                                let failed = result.is_err();
+                                let _ = completion.send(result);
+                                if failed {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            commands,
+            acknowledgements,
+            data_dir,
+            signer,
+        }
+    }
+
+    async fn send(&self, payload: SessionWirePayload) -> Result<(), NetworkError> {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(SessionWriteCommand::Control {
+                payload,
+                completion: Some(completion),
+            })
+            .await
+            .map_err(|_| session_writer_stopped("queue object RPC session control"))?;
+        result
+            .await
+            .map_err(|_| session_writer_stopped("write object RPC session control"))?
+    }
+
+    async fn send_from_reader(&self, payload: SessionWirePayload) -> Result<(), NetworkError> {
+        self.commands
+            .send(SessionWriteCommand::Control {
+                payload,
+                completion: None,
+            })
+            .await
+            .map_err(|_| session_writer_stopped("queue object RPC reader control"))
+    }
+
+    async fn send_data(
+        &self,
+        header: TransferDataHeader,
+        payload: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(SessionWriteCommand::Data {
+                header,
+                payload,
+                completion,
+            })
+            .await
+            .map_err(|_| session_writer_stopped("queue object RPC session data"))?;
+        result
+            .await
+            .map_err(|_| session_writer_stopped("write object RPC session data"))?
+    }
+
+    fn acknowledge(&self, acknowledgement: TransferAck) -> Result<(), NetworkError> {
+        self.acknowledgements
+            .send(Some(acknowledgement))
+            .map_err(|_| session_writer_stopped("queue object RPC transfer acknowledgement"))
+    }
+
+    fn staging_root(&self) -> PathBuf {
+        self.data_dir.root()
+    }
+
     fn sign_body_finish(
         &self,
         binding: BodyFinishProofBinding,
@@ -484,6 +708,32 @@ where
             session_id,
             head_digest,
         })
+    }
+
+    fn ensure_response_head_proof(
+        &self,
+        session_id: &TransferId,
+        response: &mut crate::ObjectRpcResponse,
+    ) -> Result<(), NetworkError> {
+        if response
+            .metadata
+            .contains_key(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+        {
+            return Ok(());
+        }
+        let proof = self.sign_response_head(session_id.clone(), response_head_digest(response)?);
+        response.metadata.insert(
+            OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY.to_string(),
+            encode_response_head_proof(&proof)?,
+        );
+        Ok(())
+    }
+}
+
+fn session_writer_stopped(operation: &'static str) -> NetworkError {
+    NetworkError::Io {
+        operation: operation.to_string(),
+        detail: "canonical session writer stopped".to_string(),
     }
 }
 
@@ -740,23 +990,17 @@ impl Drop for SessionTransferStagingFile {
     }
 }
 
-async fn send_session_payload<W>(
-    writer: &Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+async fn send_session_payload(
+    writer: &SessionWriterHandle,
     payload: SessionWirePayload,
-) -> Result<(), NetworkError>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer.lock().await.send(payload).await
+) -> Result<(), NetworkError> {
+    writer.send(payload).await
 }
 
-fn spawn_session_keepalive<W>(
-    writer: Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+fn spawn_session_keepalive(
+    writer: SessionWriterHandle,
     policy: NetworkCallPolicy,
-) -> tokio::task::JoinHandle<()>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-{
+) -> tokio::task::JoinHandle<()> {
     let interval = policy
         .health
         .no_progress_timeout
@@ -802,16 +1046,13 @@ async fn receive_sender_feedback(
         .await
 }
 
-async fn pump_outgoing_body<W>(
-    writer: Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+async fn pump_outgoing_body(
+    writer: SessionWriterHandle,
     source: ObjectRpcBodySource,
     open: TransferOpen,
     mut feedback: tokio::sync::mpsc::Receiver<TransferControl>,
     policy: NetworkCallPolicy,
-) -> Result<(), NetworkError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), NetworkError> {
     let deadline = SessionDeadline::from_policy(policy);
     let mut state = TransferSenderState::new(
         open.transfer_id.clone(),
@@ -913,7 +1154,9 @@ where
             Err(error) => return Err(session_transfer_error(error)),
         };
         hasher.update(&bytes);
-        writer.lock().await.send_data(frame).await?;
+        let header = frame.header.clone();
+        drop(frame);
+        writer.send_data(header, bytes).await?;
     }
     producer.finish().await?;
     let digest = TransferDigest::new(*hasher.finalize().as_bytes());
@@ -960,24 +1203,21 @@ where
     }
 }
 
-async fn acknowledge_incoming_completion<W>(
-    writer: Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+async fn acknowledge_incoming_completion(
+    writer: SessionWriterHandle,
     incoming_sender: Option<IncomingBodySender>,
     receipt: crate::transfer::TransferReceipt,
     proof: Option<SignedBodyFinishProof>,
     has_spool: bool,
-) -> Result<(), NetworkError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), NetworkError> {
     if let Some(sender) = incoming_sender.as_ref() {
         sender.validate_completion(receipt.completed_bytes, receipt.digest, proof)?;
     }
-    send_session_payload(
-        &writer,
-        SessionWirePayload::Transfer(TransferControl::Complete(receipt.clone())),
-    )
-    .await?;
+    writer
+        .send(SessionWirePayload::Transfer(TransferControl::Complete(
+            receipt.clone(),
+        )))
+        .await?;
     if let Some(sender) = incoming_sender.as_ref() {
         sender.publish_completion(receipt.completed_bytes, has_spool)?;
     }
@@ -994,9 +1234,9 @@ struct SharedOutgoingTransfer {
     complete: bool,
 }
 
-async fn pump_incoming_session<R, W>(
+async fn pump_incoming_session<R>(
     mut reader: SessionFrameReader<R>,
-    writer: Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+    writer: SessionWriterHandle,
     expected_incoming_open: Option<TransferOpen>,
     outgoing: Arc<Mutex<SharedOutgoingTransfer>>,
     feedback: tokio::sync::mpsc::Sender<TransferControl>,
@@ -1006,7 +1246,6 @@ async fn pump_incoming_session<R, W>(
 ) -> Result<SessionReaderOutcome, NetworkError>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     let mut expected_incoming_open = expected_incoming_open;
     let mut receiver_state = None;
@@ -1160,11 +1399,11 @@ where
                                 .as_ref()
                                 .expect("state exists for expected open")
                                 .open_ack();
-                            send_session_payload(
-                                &writer,
-                                SessionWirePayload::Transfer(TransferControl::OpenAck(ack)),
-                            )
-                            .await?;
+                            writer
+                                .send_from_reader(SessionWirePayload::Transfer(
+                                    TransferControl::OpenAck(ack),
+                                ))
+                                .await?;
                         }
                         TransferControl::Cancel { reason, .. }
                         | TransferControl::Reset { reason, .. } => {
@@ -1201,7 +1440,7 @@ where
                 let digest = TransferDigest::new(*incoming_hasher.finalize().as_bytes());
                 let receipt = state.complete(digest).map_err(session_transfer_error)?;
                 acknowledge_incoming_completion(
-                    Arc::clone(&writer),
+                    writer.clone(),
                     incoming_sender.clone(),
                     receipt,
                     Some(proof),
@@ -1234,7 +1473,7 @@ where
                         IncomingDirectDelivery::Delivered
                         | IncomingDirectDelivery::ConsumerClosed => {}
                         IncomingDirectDelivery::Spill(payload) => {
-                            let staging_root = writer.lock().await.data_dir.root();
+                            let staging_root = writer.staging_root();
                             let (mut new_staging, spool_setup) =
                                 SessionTransferStagingFile::create(
                                     staging_root,
@@ -1260,14 +1499,12 @@ where
                 {
                     sender.advance_available(available_offset)?;
                 }
-                send_session_payload(
-                    &writer,
-                    SessionWirePayload::Transfer(TransferControl::Ack(ack)),
-                )
-                .await?;
+                writer.acknowledge(ack)?;
             }
             SessionInboundFrame::Payload(SessionWirePayload::HealthPing { nonce }) => {
-                send_session_payload(&writer, SessionWirePayload::HealthAck { nonce }).await?;
+                writer
+                    .send_from_reader(SessionWirePayload::HealthAck { nonce })
+                    .await?;
             }
             SessionInboundFrame::Payload(SessionWirePayload::HealthAck { .. }) => {}
             SessionInboundFrame::Payload(SessionWirePayload::Cancel { reason }) => {
@@ -1311,8 +1548,6 @@ fn transfer_control_id(control: &TransferControl) -> Option<&TransferId> {
 
 type BoxedSessionStream = Box<dyn NetworkDuplexStream>;
 type BoxedSessionReadHalf = tokio::io::ReadHalf<BoxedSessionStream>;
-type BoxedSessionWriteHalf = tokio::io::WriteHalf<BoxedSessionStream>;
-type BoxedSessionWriter = SessionFrameWriter<BoxedSessionWriteHalf>;
 
 async fn receive_server_session_bootstrap<F>(
     mut reader: BoxedSessionReadHalf,
@@ -1417,19 +1652,22 @@ pub(crate) async fn start_object_rpc_client_session(
         });
     }
     prepared.request.auth = Some(request_auth);
+    let perf_enabled = crate::route::network_perf_trace_enabled();
+    let perf_route = perf_enabled.then(|| prepared.request.route.clone());
     let request_uses_relay = prepared.request.route == crate::CLUSTER_RELAY_ROUTE;
     let session_id = prepared.descriptor.session_id.clone();
+    let perf_session_id = perf_enabled.then(|| session_id.clone());
     let response_proof_session_id = prepared.response_proof_session_id.clone();
     let response_proof_public_key = expected_response_origin_public_key;
     let request_open = prepared.descriptor.request_body.clone();
     let (read_half, write_half) = tokio::io::split(stream);
-    let writer = Arc::new(tokio::sync::Mutex::new(SessionFrameWriter::new(
+    let writer = SessionWriterHandle::spawn(SessionFrameWriter::new(
         write_half,
         local_data_dir,
         session_id.clone(),
         SessionFrameDirection::InitiatorToResponder,
         policy,
-    )?));
+    )?);
     let reader = SessionFrameReader::new(
         read_half,
         session_id,
@@ -1447,7 +1685,7 @@ pub(crate) async fn start_object_rpc_client_session(
         ObjectRpcIncomingBody::channel(None, ObjectRpcSessionBodyRole::None);
     let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let read_body_tx = body_tx.clone();
-    let reader_writer = Arc::clone(&writer);
+    let reader_writer = writer.clone();
     let reader_outgoing = Arc::clone(&outgoing);
     let reader_task = tokio::spawn(async move {
         if let Err(error) = pump_incoming_session(
@@ -1465,19 +1703,37 @@ pub(crate) async fn start_object_rpc_client_session(
             read_body_tx.fail(error.to_string());
         }
     });
-    let keepalive_task = spawn_session_keepalive(Arc::clone(&writer), policy);
+    let keepalive_task = spawn_session_keepalive(writer.clone(), policy);
 
-    send_session_payload(
+    let send_head_started = perf_enabled.then(std::time::Instant::now);
+    let send_head_result = send_session_payload(
         &writer,
         SessionWirePayload::RequestHead {
             request: prepared.request,
             descriptor: prepared.descriptor,
         },
     )
-    .await?;
+    .await;
+    if let (Some(started), Some(route), Some(session_id)) = (
+        send_head_started,
+        perf_route.as_deref(),
+        perf_session_id.as_ref(),
+    ) {
+        tracing::info!(
+            target: "sinomo.network.perf",
+            stage = "client_send_head",
+            route,
+            session_id = %session_id,
+            relay = request_uses_relay,
+            ok = send_head_result.is_ok(),
+            elapsed_us = crate::route::network_perf_trace_elapsed_us(started),
+        );
+    }
+    send_head_result?;
 
+    let wait_response_started = perf_enabled.then(std::time::Instant::now);
     let mut outgoing_task = if let Some(open) = request_open {
-        let outgoing_writer = Arc::clone(&writer);
+        let outgoing_writer = writer.clone();
         Some(tokio::spawn(async move {
             pump_outgoing_body(outgoing_writer, prepared.body, open, feedback_rx, policy).await
         }))
@@ -1556,6 +1812,21 @@ pub(crate) async fn start_object_rpc_client_session(
             }
         }
     };
+    if let (Some(started), Some(route), Some(session_id)) = (
+        wait_response_started,
+        perf_route.as_deref(),
+        perf_session_id.as_ref(),
+    ) {
+        tracing::info!(
+            target: "sinomo.network.perf",
+            stage = "client_wait_response_head",
+            route,
+            session_id = %session_id,
+            relay = request_uses_relay,
+            ok = true,
+            elapsed_us = crate::route::network_perf_trace_elapsed_us(started),
+        );
+    }
     let SessionWirePayload::ResponseHead {
         mut response,
         body_role,
@@ -1692,7 +1963,7 @@ pub(crate) async fn start_object_rpc_client_session(
 /// starts its body producer while the background reader continues consuming
 /// and acknowledging the request body.
 pub struct ObjectRpcSessionResponder {
-    writer: Arc<tokio::sync::Mutex<BoxedSessionWriter>>,
+    writer: SessionWriterHandle,
     outgoing: Arc<Mutex<SharedOutgoingTransfer>>,
     feedback: Option<tokio::sync::mpsc::Receiver<TransferControl>>,
     reader_task: Option<tokio::task::JoinHandle<()>>,
@@ -1718,23 +1989,16 @@ impl ObjectRpcSessionResponder {
         mut response: ObjectRpcSessionResponse,
     ) -> Result<(), NetworkError> {
         if response.body.has_value_intent() && response.body.is_empty() {
-            let value = std::mem::take(&mut response.response.body);
-            response.body = if value.is_empty() {
+            response.body = if response.response.body.len() <= INLINE_VALUE_MAX_BYTES {
                 ObjectRpcBodySource::empty()
             } else {
+                let value = std::mem::take(&mut response.response.body);
                 ObjectRpcBodySource::bytes(value).with_role(ObjectRpcSessionBodyRole::Value)
             };
         }
         let body_open = {
-            // Keep the writer guard across exact signed-head sizing and the
-            // actual write. A keepalive must not advance the transcript between
-            // those two operations.
-            let mut writer = self.writer.lock().await;
-            ensure_response_head_proof_with_writer(
-                &writer,
-                &self.session_id,
-                &mut response.response,
-            )?;
+            self.writer
+                .ensure_response_head_proof(&self.session_id, &mut response.response)?;
             let body_role = response.body.role();
             let body_open = (!response.body.is_empty()).then(|| TransferOpen {
                 transfer_id: TransferId::generate(),
@@ -1768,7 +2032,7 @@ impl ObjectRpcSessionResponder {
                 body_role,
                 body: body_open.clone(),
             };
-            writer.send(payload).await?;
+            self.writer.send(payload).await?;
             body_open
         };
         if let Some(open) = body_open {
@@ -1777,7 +2041,7 @@ impl ObjectRpcSessionResponder {
                 detail: "session response feedback receiver is unavailable".to_string(),
             })?;
             pump_outgoing_body(
-                Arc::clone(&self.writer),
+                self.writer.clone(),
                 response.body,
                 open,
                 feedback,
@@ -1853,13 +2117,13 @@ where
             .await?;
         return Err(error);
     }
-    let writer = Arc::new(tokio::sync::Mutex::new(SessionFrameWriter::new(
+    let writer = SessionWriterHandle::spawn(SessionFrameWriter::new(
         write_half,
         local_data_dir,
         descriptor.session_id.clone(),
         SessionFrameDirection::ResponderToInitiator,
         policy,
-    )?));
+    )?);
     let outgoing = Arc::new(Mutex::new(SharedOutgoingTransfer::default()));
     let (feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(16);
     let (body_tx, mut incoming_body) = if descriptor.request_body.is_some() {
@@ -1883,7 +2147,7 @@ where
         incoming_body.require_finish_proof(expectation)?;
     }
     let (head_tx, head_rx) = tokio::sync::oneshot::channel();
-    let reader_writer = Arc::clone(&writer);
+    let reader_writer = writer.clone();
     let reader_outgoing = Arc::clone(&outgoing);
     let failure_body_tx = body_tx.clone();
     let expected_open = descriptor.request_body.clone();
@@ -1904,7 +2168,7 @@ where
             sender.fail(error.to_string());
         }
     });
-    let keepalive_task = spawn_session_keepalive(Arc::clone(&writer), policy);
+    let keepalive_task = spawn_session_keepalive(writer.clone(), policy);
     let delivered_head = head_rx.await.map_err(|_| NetworkError::Io {
         operation: "accept object RPC request session head".to_string(),
         detail: "session reader stopped during request bootstrap".to_string(),
@@ -2189,7 +2453,7 @@ impl ObjectRpcBodySource {
         source
     }
 
-    fn has_value_intent(&self) -> bool {
+    pub(crate) fn has_value_intent(&self) -> bool {
         self.role == ObjectRpcSessionBodyRole::Value
     }
 
@@ -2275,20 +2539,16 @@ impl ObjectRpcBodySource {
         }
     }
 
-    async fn finish_proof<W>(
+    async fn finish_proof(
         &self,
-        writer: &Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
+        writer: &SessionWriterHandle,
         total_bytes: u64,
         digest: TransferDigest,
-    ) -> Result<SignedBodyFinishProof, NetworkError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<SignedBodyFinishProof, NetworkError> {
         match &self.finish_proof {
-            BodyFinishProofSource::Local(Some(binding)) => Ok(writer
-                .lock()
-                .await
-                .sign_body_finish(binding.clone(), total_bytes, digest)),
+            BodyFinishProofSource::Local(Some(binding)) => {
+                Ok(writer.sign_body_finish(binding.clone(), total_bytes, digest))
+            }
             BodyFinishProofSource::Local(None) => Err(NetworkError::Serialization {
                 detail: "object RPC body is missing its authenticated finish binding".to_string(),
             }),
@@ -2358,7 +2618,23 @@ impl ObjectRpcBodySource {
         })?
     }
 
-    fn producer(&self, max_chunk_bytes: usize) -> Result<BodyProducer, NetworkError> {
+    pub(crate) fn producer(&self, max_chunk_bytes: usize) -> Result<BodyProducer, NetworkError> {
+        if matches!(self.kind, ObjectRpcBodySourceKind::Empty) {
+            return Ok(BodyProducer::Bytes(BytesBodyProducer {
+                bytes: Arc::from(Vec::<u8>::new()),
+                offset: 0,
+                chunk_bytes: max_chunk_bytes.max(1),
+                _lifetime_guards: Arc::clone(&self.lifetime_guards),
+            }));
+        }
+        if let ObjectRpcBodySourceKind::Bytes(source) = &self.kind {
+            return Ok(BodyProducer::Bytes(BytesBodyProducer {
+                bytes: Arc::clone(&source.bytes),
+                offset: 0,
+                chunk_bytes: max_chunk_bytes.max(1),
+                _lifetime_guards: Arc::clone(&self.lifetime_guards),
+            }));
+        }
         if let ObjectRpcBodySourceKind::AsyncReader(source) = &self.kind {
             let reader = source
                 .lock()
@@ -2441,6 +2717,97 @@ impl Read for ArcSliceReader {
 enum IncomingBodyItem {
     Bytes(Vec<u8>),
     Error(std::io::Error),
+}
+
+#[derive(Debug)]
+enum MultiplexedBodyTerminal {
+    Pending,
+    Complete,
+    Failed(String),
+}
+
+/// Narrow adapter used by the multiplexed channel. Its one-slot application
+/// queue is fed by a per-call delivery task, never by the physical channel
+/// reader, so a stalled consumer cannot block unrelated calls.
+#[derive(Debug)]
+pub(crate) struct ObjectRpcChannelBodySender {
+    sender: Option<tokio::sync::mpsc::Sender<IncomingBodyItem>>,
+    integrity: Arc<Mutex<IncomingBodyIntegrity>>,
+    terminal: Arc<Mutex<MultiplexedBodyTerminal>>,
+}
+
+impl ObjectRpcChannelBodySender {
+    pub(crate) async fn send(&self, bytes: Vec<u8>) -> Result<(), NetworkError> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(NetworkError::Io {
+                operation: "deliver multiplexed object RPC body".to_string(),
+                detail: "body receiver is already closed".to_string(),
+            });
+        };
+        sender
+            .send(IncomingBodyItem::Bytes(bytes))
+            .await
+            .map_err(|_| NetworkError::Io {
+                operation: "deliver multiplexed object RPC body".to_string(),
+                detail: "body receiver closed before delivery".to_string(),
+            })
+    }
+
+    pub(crate) fn fail(&mut self, detail: impl Into<String>) {
+        if let Ok(mut terminal) = self.terminal.lock()
+            && matches!(&*terminal, MultiplexedBodyTerminal::Pending)
+        {
+            *terminal = MultiplexedBodyTerminal::Failed(detail.into());
+        }
+        self.sender.take();
+    }
+
+    /// Records the whole ordered body already verified by the authenticated
+    /// physical channel, then exposes EOF to the application reader. This
+    /// deliberately validates only the signed length/digest contract: the
+    /// canonical session's separate finish proof is not part of this carrier.
+    pub(crate) async fn finish_verified(
+        &mut self,
+        total_bytes: u64,
+        digest: [u8; 32],
+    ) -> Result<(), NetworkError> {
+        let result = self
+            .integrity
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "verify multiplexed object RPC body contract".to_string(),
+                detail: "incoming body integrity lock poisoned".to_string(),
+            })
+            .and_then(|mut integrity| {
+                let digest = TransferDigest::new(digest);
+                integrity.actual = Some((total_bytes, digest));
+                validate_incoming_body_integrity(&integrity, total_bytes, digest)
+            });
+        if let Err(error) = result {
+            self.fail(error.to_string());
+            return Err(error);
+        }
+        let completion = self
+            .terminal
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "complete multiplexed object RPC body".to_string(),
+                detail: "multiplexed body terminal state lock poisoned".to_string(),
+            })
+            .and_then(|mut terminal| match &*terminal {
+                MultiplexedBodyTerminal::Pending => {
+                    *terminal = MultiplexedBodyTerminal::Complete;
+                    Ok(())
+                }
+                MultiplexedBodyTerminal::Complete => Ok(()),
+                MultiplexedBodyTerminal::Failed(detail) => Err(NetworkError::Io {
+                    operation: "complete multiplexed object RPC body".to_string(),
+                    detail: detail.clone(),
+                }),
+            });
+        self.sender.take();
+        completion
+    }
 }
 
 #[derive(Debug)]
@@ -2528,6 +2895,7 @@ pub struct ObjectRpcIncomingBody {
     total_bytes: Option<u64>,
     role: ObjectRpcSessionBodyRole,
     integrity: Option<Arc<Mutex<IncomingBodyIntegrity>>>,
+    multiplexed_terminal: Option<Arc<Mutex<MultiplexedBodyTerminal>>>,
 }
 
 impl Default for ObjectRpcIncomingBody {
@@ -2544,6 +2912,7 @@ impl ObjectRpcIncomingBody {
             total_bytes: Some(0),
             role: ObjectRpcSessionBodyRole::None,
             integrity: None,
+            multiplexed_terminal: None,
         }
     }
 
@@ -2558,7 +2927,36 @@ impl ObjectRpcIncomingBody {
             total_bytes,
             role: ObjectRpcSessionBodyRole::Attachment,
             integrity: None,
+            multiplexed_terminal: None,
         }
+    }
+
+    pub(crate) fn multiplexed_channel(
+        total_bytes: Option<u64>,
+    ) -> (ObjectRpcChannelBodySender, Self) {
+        // One queued chunk plus one chunk held by the isolated delivery task
+        // bounds a stalled call to two channel quanta.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let integrity = Arc::new(Mutex::new(IncomingBodyIntegrity::default()));
+        let terminal = Arc::new(Mutex::new(MultiplexedBodyTerminal::Pending));
+        (
+            ObjectRpcChannelBodySender {
+                sender: Some(sender),
+                integrity: Arc::clone(&integrity),
+                terminal: Arc::clone(&terminal),
+            },
+            Self {
+                inner: ObjectRpcIncomingBodyInner::Channel {
+                    receiver,
+                    current: None,
+                },
+                completion_tasks: Vec::new(),
+                total_bytes,
+                role: ObjectRpcSessionBodyRole::Attachment,
+                integrity: Some(integrity),
+                multiplexed_terminal: Some(terminal),
+            },
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2570,7 +2968,13 @@ impl ObjectRpcIncomingBody {
     }
 
     fn is_materialized_value_forward(&self) -> bool {
-        self.role == ObjectRpcSessionBodyRole::Value && self.is_empty() && self.integrity.is_some()
+        // Multiplexed channels verify their own frame digest but do not carry
+        // a canonical session finish proof. They therefore retain the value
+        // forwarding role with `integrity == None`. A later multiplexed hop
+        // can re-stream the value without inventing a canonical proof; a
+        // transition back to a canonical session must satisfy its target-
+        // origin proof separately.
+        self.role == ObjectRpcSessionBodyRole::Value && self.is_empty()
     }
 
     fn materialized_value_forward(
@@ -2583,6 +2987,7 @@ impl ObjectRpcIncomingBody {
             total_bytes,
             role: ObjectRpcSessionBodyRole::Value,
             integrity,
+            multiplexed_terminal: None,
         }
     }
 
@@ -2620,6 +3025,7 @@ impl ObjectRpcIncomingBody {
                 total_bytes,
                 role,
                 integrity: Some(integrity),
+                multiplexed_terminal: None,
             },
         )
     }
@@ -2884,7 +3290,33 @@ impl AsyncRead for ObjectRpcIncomingBody {
                         Poll::Ready(Some(IncomingBodyItem::Error(error))) => {
                             return Poll::Ready(Err(error));
                         }
-                        Poll::Ready(None) => return Poll::Ready(Ok(())),
+                        Poll::Ready(None) => {
+                            if let Some(terminal) = this.multiplexed_terminal.as_ref() {
+                                match terminal.lock() {
+                                    Ok(mut terminal) => match std::mem::replace(
+                                        &mut *terminal,
+                                        MultiplexedBodyTerminal::Complete,
+                                    ) {
+                                        MultiplexedBodyTerminal::Pending => {
+                                            return Poll::Ready(Err(std::io::Error::new(
+                                                std::io::ErrorKind::UnexpectedEof,
+                                                "multiplexed body ended before verified completion",
+                                            )));
+                                        }
+                                        MultiplexedBodyTerminal::Complete => {}
+                                        MultiplexedBodyTerminal::Failed(detail) => {
+                                            return Poll::Ready(Err(std::io::Error::other(detail)));
+                                        }
+                                    },
+                                    Err(_) => {
+                                        return Poll::Ready(Err(std::io::Error::other(
+                                            "multiplexed body terminal state lock poisoned",
+                                        )));
+                                    }
+                                }
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -3252,10 +3684,10 @@ impl ObjectRpcSessionCall {
             });
         }
         if self.body.has_value_intent() && self.body.is_empty() {
-            let value = std::mem::take(&mut self.request.body);
-            self.body = if value.is_empty() {
+            self.body = if self.request.body.len() <= INLINE_VALUE_MAX_BYTES {
                 ObjectRpcBodySource::empty()
             } else {
+                let value = std::mem::take(&mut self.request.body);
                 ObjectRpcBodySource::bytes(value).with_role(ObjectRpcSessionBodyRole::Value)
             };
         }
@@ -3399,8 +3831,32 @@ impl ObjectRpcSessionRequest {
     /// bodies are fully verified and restored into the typed request before
     /// this method returns.
     pub async fn bind_signed_inner_request(
+        self,
+        request: crate::ObjectRpcRequest,
+    ) -> Result<Self, NetworkError> {
+        self.bind_signed_inner_request_with_transport(request, true)
+            .await
+    }
+
+    /// Rebinds an origin-signed relay request received over a physically
+    /// authenticated multiplexed channel.
+    ///
+    /// The channel verifies ordered body length and BLAKE3 completion before
+    /// publishing successful EOF. It therefore enforces the signed descriptor
+    /// contract directly instead of requiring the canonical session's
+    /// per-body finish proof, which does not exist on this carrier.
+    pub async fn bind_signed_inner_request_on_authenticated_channel(
+        self,
+        request: crate::ObjectRpcRequest,
+    ) -> Result<Self, NetworkError> {
+        self.bind_signed_inner_request_with_transport(request, false)
+            .await
+    }
+
+    async fn bind_signed_inner_request_with_transport(
         mut self,
         mut request: crate::ObjectRpcRequest,
+        require_finish_proof: bool,
     ) -> Result<Self, NetworkError> {
         if request.auth.is_none() {
             return Err(NetworkError::AuthDenied);
@@ -3430,9 +3886,11 @@ impl ObjectRpcSessionRequest {
             }
             self.body
                 .require_signed_contract(open.total_bytes, open.expected_digest)?;
-            let expectation = signed_request_body_finish_expectation(&request)?
-                .ok_or(NetworkError::AuthDenied)?;
-            self.body.require_finish_proof(expectation)?;
+            if require_finish_proof {
+                let expectation = signed_request_body_finish_expectation(&request)?
+                    .ok_or(NetworkError::AuthDenied)?;
+                self.body.require_finish_proof(expectation)?;
+            }
         }
         self.body.set_role(descriptor.request_body_role);
         if descriptor.request_body_role == ObjectRpcSessionBodyRole::Value {
@@ -3513,6 +3971,16 @@ impl ObjectRpcSessionResult {
         Self::new(response, ObjectRpcIncomingBody::empty())
     }
 
+    pub(crate) fn materialized_channel_value(
+        response: crate::ObjectRpcResponse,
+        total_bytes: Option<u64>,
+    ) -> Self {
+        Self::new(
+            response,
+            ObjectRpcIncomingBody::materialized_value_forward(total_bytes, None),
+        )
+    }
+
     /// Splits the application-visible response head and body while keeping
     /// transport verification state private to the routing layer.
     pub fn into_parts(self) -> (crate::ObjectRpcResponse, ObjectRpcIncomingBody) {
@@ -3536,28 +4004,61 @@ impl ObjectRpcSessionResult {
     }
 }
 
-enum BodyProducer {
+pub(crate) enum BodyProducer {
+    Bytes(BytesBodyProducer),
     Sync(SyncBodyProducer),
     Async(AsyncBodyProducer),
 }
 
 impl BodyProducer {
-    async fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+    pub(crate) async fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
         match self {
+            Self::Bytes(producer) => producer.next(),
             Self::Sync(producer) => producer.next().await,
             Self::Async(producer) => producer.next().await,
         }
     }
 
-    async fn finish(self) -> Result<(), NetworkError> {
+    pub(crate) async fn finish(self) -> Result<(), NetworkError> {
         match self {
+            Self::Bytes(_) => Ok(()),
             Self::Sync(producer) => producer.finish().await,
             Self::Async(_) => Ok(()),
         }
     }
 }
 
-struct AsyncBodyProducer {
+pub(crate) struct BytesBodyProducer {
+    bytes: Arc<[u8]>,
+    offset: usize,
+    chunk_bytes: usize,
+    _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
+}
+
+impl BytesBodyProducer {
+    fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+        if self.offset >= self.bytes.len() {
+            return Ok(None);
+        }
+        let end = self
+            .offset
+            .saturating_add(self.chunk_bytes)
+            .min(self.bytes.len());
+        let source = &self.bytes[self.offset..end];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(source.len())
+            .map_err(|_| NetworkError::ResourceExhausted {
+                operation: "allocate object RPC byte body chunk".to_string(),
+                requested_bytes: source.len(),
+            })?;
+        bytes.extend_from_slice(source);
+        self.offset = end;
+        Ok(Some(bytes))
+    }
+}
+
+pub(crate) struct AsyncBodyProducer {
     reader: Pin<Box<dyn AsyncRead + Send>>,
     chunk_bytes: usize,
     _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
@@ -3582,7 +4083,7 @@ impl AsyncBodyProducer {
     }
 }
 
-struct SyncBodyProducer {
+pub(crate) struct SyncBodyProducer {
     receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, NetworkError>>,
     task: tokio::task::JoinHandle<()>,
     _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
@@ -3788,6 +4289,37 @@ mod body_tests {
         }
     }
 
+    #[tokio::test]
+    async fn byte_body_producer_uses_exact_chunks_without_a_blocking_reader() {
+        let empty = ObjectRpcBodySource::bytes(Vec::new());
+        let mut empty_producer = empty.producer(2).expect("empty byte producer");
+        assert!(matches!(&empty_producer, BodyProducer::Bytes(_)));
+        assert_eq!(empty_producer.next().await.expect("empty EOF"), None);
+
+        let source = ObjectRpcBodySource::bytes(vec![1_u8, 2, 3]);
+        let mut producer = source.producer(2).expect("byte producer");
+        assert!(matches!(&producer, BodyProducer::Bytes(_)));
+        assert_eq!(
+            producer.next().await.expect("first chunk"),
+            Some(vec![1, 2])
+        );
+        assert_eq!(producer.next().await.expect("second chunk"), Some(vec![3]));
+        assert_eq!(producer.next().await.expect("EOF"), None);
+        producer.finish().await.expect("finish byte producer");
+
+        let exact = ObjectRpcBodySource::bytes(vec![1_u8, 2, 3, 4]);
+        let mut exact_producer = exact.producer(2).expect("exact byte producer");
+        assert_eq!(
+            exact_producer.next().await.expect("first exact chunk"),
+            Some(vec![1, 2])
+        );
+        assert_eq!(
+            exact_producer.next().await.expect("second exact chunk"),
+            Some(vec![3, 4])
+        );
+        assert_eq!(exact_producer.next().await.expect("exact EOF"), None);
+    }
+
     fn proof_public_key(data_dir: &SinomoDataDir) -> Vec<u8> {
         sign_session_frame_proof_from_data_dir(
             data_dir,
@@ -3825,6 +4357,25 @@ mod body_tests {
 
     fn receiver_bridge_call(request: crate::ObjectRpcRequest) -> ObjectRpcSessionCall {
         ObjectRpcSessionCall::value(request)
+    }
+
+    fn signed_attachment_request(
+        data_dir: &SinomoDataDir,
+        route: &str,
+        signed_body: &[u8],
+    ) -> crate::ObjectRpcRequest {
+        let inner = crate::ObjectRpcRequest::encode_body(route, "test", &"signed attachment")
+            .expect("inner request");
+        let prepared =
+            ObjectRpcSessionCall::new(inner, ObjectRpcBodySource::bytes(signed_body.to_vec()))
+                .prepare_for_signing()
+                .expect("prepare signed attachment");
+        let mut signed = prepared.request;
+        signed.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(data_dir, &signed)
+                .expect("sign attachment request"),
+        );
+        signed
     }
 
     #[tokio::test]
@@ -4044,7 +4595,7 @@ mod body_tests {
         // yield before it has been written. While that receipt is blocked, an
         // eager consumer must not observe EOF and drop/abort the reader task.
         let (write_stream, read_stream) = tokio::io::duplex(1);
-        let writer = Arc::new(tokio::sync::Mutex::new(
+        let writer = SessionWriterHandle::spawn(
             SessionFrameWriter::new(
                 write_stream,
                 data_dir,
@@ -4053,7 +4604,7 @@ mod body_tests {
                 NetworkCallPolicy::default(),
             )
             .expect("completion writer"),
-        ));
+        );
         let mut reader = SessionFrameReader::new(
             read_stream,
             session_id,
@@ -4287,12 +4838,11 @@ mod body_tests {
 
     #[test]
     fn daemon_auth_digest_is_stable_after_value_materialization() {
-        let request = crate::ObjectRpcRequest::encode_body(
+        let request = crate::ObjectRpcRequest::from_encoded_body(
             "/test/session/materialized-auth-value",
             "test",
-            &"ordinary value",
-        )
-        .expect("request");
+            vec![0x41; INLINE_VALUE_MAX_BYTES + 1],
+        );
         let value = request.body.clone();
         let prepared = ObjectRpcSessionCall::value(request)
             .prepare_for_signing()
@@ -4422,6 +4972,172 @@ mod body_tests {
             .await
             .expect_err("signed inner digest must reject tampered relay bytes at EOF");
         assert!(error.to_string().contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn multiplexed_body_drains_queued_bytes_before_terminal_error() {
+        let payload = b"queued before failure".to_vec();
+        let (mut sender, mut body) =
+            ObjectRpcIncomingBody::multiplexed_channel(Some(payload.len() as u64));
+        sender
+            .send(payload.clone())
+            .await
+            .expect("fill multiplexed body queue");
+
+        sender.fail("forced multiplexed body failure");
+        sender.fail("later failure must not replace the first");
+
+        let mut delivered = vec![0_u8; payload.len()];
+        body.read_exact(&mut delivered)
+            .await
+            .expect("drain valid queued bytes");
+        assert_eq!(delivered, payload);
+        let error = body
+            .read_u8()
+            .await
+            .expect_err("terminal failure must not become clean EOF");
+        assert!(
+            error
+                .to_string()
+                .contains("forced multiplexed body failure")
+        );
+        assert_eq!(
+            body.read_u8()
+                .await
+                .expect_err("closed body after terminal error")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        let (sender, mut truncated) = ObjectRpcIncomingBody::multiplexed_channel(Some(1));
+        drop(sender);
+        let truncation = truncated
+            .read_u8()
+            .await
+            .expect_err("unverified sender drop must not become clean EOF");
+        assert_eq!(truncation.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            truncation
+                .to_string()
+                .contains("before verified completion")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_channel_binds_large_origin_signed_attachment() {
+        let origin_root =
+            sinomo_testdir::TestDir::new("sinomo-session-channel-signed-attachment-origin");
+        let origin_data_dir = SinomoDataDir::new(origin_root.path());
+        let payload = vec![0x5a_u8; 96 * 1024 + 37];
+        let signed_inner = signed_attachment_request(
+            &origin_data_dir,
+            "/test/session/channel-signed-attachment",
+            &payload,
+        );
+        let outer = crate::ObjectRpcRequest::encode_body(
+            crate::CLUSTER_RELAY_ROUTE,
+            "test",
+            &"outer relay",
+        )
+        .expect("outer request");
+        let (mut sender, body) =
+            ObjectRpcIncomingBody::multiplexed_channel(Some(payload.len() as u64));
+        let bound = ObjectRpcSessionRequest::new(outer, body)
+            .bind_signed_inner_request_on_authenticated_channel(signed_inner)
+            .await
+            .expect("bind trusted channel contract");
+        let delivered = payload.clone();
+        let delivery = tokio::spawn(async move {
+            for chunk in delivered.chunks(crate::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) {
+                sender.send(chunk.to_vec()).await.expect("deliver chunk");
+            }
+            sender
+                .finish_verified(delivered.len() as u64, *blake3::hash(&delivered).as_bytes())
+                .await
+                .expect("finish trusted channel body");
+        });
+
+        let actual = bound
+            .body
+            .collect_to_vec(2 * payload.len())
+            .await
+            .expect("collect trusted channel attachment");
+        delivery.await.expect("delivery task");
+        assert_eq!(actual, payload);
+    }
+
+    #[tokio::test]
+    async fn authenticated_channel_rejects_origin_signed_digest_substitution() {
+        let origin_root =
+            sinomo_testdir::TestDir::new("sinomo-session-channel-signed-digest-origin");
+        let origin_data_dir = SinomoDataDir::new(origin_root.path());
+        let signed_payload = vec![0x31_u8; 96 * 1024 + 19];
+        let substituted_payload = vec![0x32_u8; signed_payload.len()];
+        let signed_inner = signed_attachment_request(
+            &origin_data_dir,
+            "/test/session/channel-signed-digest",
+            &signed_payload,
+        );
+        let outer = crate::ObjectRpcRequest::encode_body(
+            crate::CLUSTER_RELAY_ROUTE,
+            "test",
+            &"outer relay",
+        )
+        .expect("outer request");
+        let (mut sender, body) =
+            ObjectRpcIncomingBody::multiplexed_channel(Some(substituted_payload.len() as u64));
+        let bound = ObjectRpcSessionRequest::new(outer, body)
+            .bind_signed_inner_request_on_authenticated_channel(signed_inner)
+            .await
+            .expect("bind signed digest contract");
+        let delivered = substituted_payload.clone();
+        let delivery = tokio::spawn(async move {
+            for chunk in delivered.chunks(crate::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) {
+                sender.send(chunk.to_vec()).await.expect("deliver chunk");
+            }
+            sender
+                .finish_verified(delivered.len() as u64, *blake3::hash(&delivered).as_bytes())
+                .await
+        });
+
+        let read_error = bound
+            .body
+            .collect_to_vec(2 * substituted_payload.len())
+            .await
+            .expect_err("substituted attachment must fail at EOF");
+        let finish_error = delivery
+            .await
+            .expect("delivery task")
+            .expect_err("signed digest must reject substituted bytes");
+        assert!(matches!(finish_error, NetworkError::AuthDenied));
+        assert!(read_error.to_string().contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_channel_rejects_origin_signed_length_mismatch() {
+        let origin_root =
+            sinomo_testdir::TestDir::new("sinomo-session-channel-signed-length-origin");
+        let origin_data_dir = SinomoDataDir::new(origin_root.path());
+        let payload = vec![0x71_u8; 96 * 1024 + 11];
+        let signed_inner = signed_attachment_request(
+            &origin_data_dir,
+            "/test/session/channel-signed-length",
+            &payload,
+        );
+        let outer = crate::ObjectRpcRequest::encode_body(
+            crate::CLUSTER_RELAY_ROUTE,
+            "test",
+            &"outer relay",
+        )
+        .expect("outer request");
+        let (_sender, body) =
+            ObjectRpcIncomingBody::multiplexed_channel(Some(payload.len() as u64 + 1));
+        let error = ObjectRpcSessionRequest::new(outer, body)
+            .bind_signed_inner_request_on_authenticated_channel(signed_inner)
+            .await
+            .expect_err("signed length must match the trusted channel descriptor");
+        assert!(matches!(error, NetworkError::Serialization { .. }));
+        assert!(error.to_string().contains("signed inner length"));
     }
 
     #[tokio::test]
@@ -4581,7 +5297,7 @@ mod body_tests {
 
         let source = ObjectRpcBodySource::from_incoming_body(bound.body);
         let (stream, _peer) = tokio::io::duplex(4096);
-        let relay_writer = Arc::new(tokio::sync::Mutex::new(
+        let relay_writer = SessionWriterHandle::spawn(
             SessionFrameWriter::new(
                 stream,
                 relay_data_dir,
@@ -4590,7 +5306,7 @@ mod body_tests {
                 NetworkCallPolicy::default(),
             )
             .expect("relay writer"),
-        ));
+        );
         let forwarded = source
             .finish_proof(&relay_writer, 4, digest)
             .await
@@ -4774,7 +5490,7 @@ mod body_tests {
         let request_auth =
             sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
                 .expect("request auth");
-        let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
         let server = tokio::spawn(async move {
             let (request, responder) = accept_object_rpc_server_session(
                 Box::new(server_stream),
@@ -4827,6 +5543,173 @@ mod body_tests {
             .expect("server task");
         assert_eq!(request_body, expected_request);
         assert_eq!(response_body, expected_response);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn small_value_request_and_response_round_trip_inline() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-inline-value-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-inline-value-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/inline-value",
+            "test",
+            &"inline request",
+        )
+        .expect("request");
+        let expected_request = request.body.clone();
+        let prepared = ObjectRpcSessionCall::value(request)
+            .prepare_for_signing()
+            .expect("prepare inline value call");
+        assert_eq!(prepared.request.body, expected_request);
+        assert!(prepared.descriptor.request_body.is_none());
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let (request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept inline session");
+            assert_eq!(request.request.body, expected_request);
+            assert!(request.body.is_empty());
+            responder
+                .respond(ObjectRpcSessionResponse::value(
+                    crate::ObjectRpcResponse::encode_body(
+                        "/test/session/inline-value",
+                        &"inline response",
+                    )
+                    .expect("response"),
+                ))
+                .await
+                .expect("send inline response");
+        });
+        let result = start_object_rpc_client_session(
+            Box::new(client_stream),
+            prepared,
+            request_auth,
+            client_data_dir,
+            server_public_key.clone(),
+            server_public_key,
+            NetworkCallPolicy::default(),
+        )
+        .await
+        .expect("inline value session");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("decode response"),
+            "inline response"
+        );
+        assert!(result.body.is_empty());
+        server.await.expect("server task");
+    }
+
+    /// Opt-in in-memory latency probe for the complete canonical small-value
+    /// session. It includes descriptor preparation, request authentication,
+    /// signed frame encoding/verification, task scheduling, and response-head
+    /// attestation, but deliberately excludes TCP and routing. There is no
+    /// timing assertion because CI hosts are not stable benchmark systems.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "diagnostic microbenchmark; run explicitly with --ignored --nocapture"]
+    async fn diagnostic_small_value_session_stage_costs() {
+        const WARMUP: usize = 100;
+        const ITERATIONS: usize = 1_000;
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-cost-diagnostic-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-cost-diagnostic-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session-cost-diagnostic",
+            "test",
+            &"small request",
+        )
+        .expect("diagnostic request");
+
+        let mut prepare_us = Vec::with_capacity(ITERATIONS);
+        let mut request_sign_us = Vec::with_capacity(ITERATIONS);
+        let mut session_us = Vec::with_capacity(ITERATIONS);
+        for iteration in 0..WARMUP + ITERATIONS {
+            let prepare_started = std::time::Instant::now();
+            let prepared = ObjectRpcSessionCall::value(request.clone())
+                .prepare_for_signing()
+                .expect("prepare diagnostic call");
+            let prepared_elapsed = prepare_started.elapsed().as_micros() as u64;
+            let sign_started = std::time::Instant::now();
+            let request_auth =
+                sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                    .expect("sign diagnostic request");
+            let sign_elapsed = sign_started.elapsed().as_micros() as u64;
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            let iteration_server_data_dir = server_data_dir.clone();
+            let server = tokio::spawn(async move {
+                let (_request, responder) = accept_object_rpc_server_session(
+                    Box::new(server_stream),
+                    iteration_server_data_dir,
+                    NetworkCallPolicy::default(),
+                    authenticate_test_request,
+                )
+                .await
+                .expect("accept diagnostic session");
+                responder
+                    .respond(ObjectRpcSessionResponse::value(
+                        crate::ObjectRpcResponse::encode_body(
+                            "/test/session-cost-diagnostic",
+                            &"small response",
+                        )
+                        .expect("diagnostic response"),
+                    ))
+                    .await
+                    .expect("respond to diagnostic session");
+            });
+            let session_started = std::time::Instant::now();
+            let result = start_object_rpc_client_session(
+                Box::new(client_stream),
+                prepared,
+                request_auth,
+                client_data_dir.clone(),
+                server_public_key.clone(),
+                server_public_key.clone(),
+                NetworkCallPolicy::default(),
+            )
+            .await
+            .expect("diagnostic session round trip");
+            result
+                .response
+                .decode_body::<String>()
+                .expect("decode diagnostic response");
+            server.await.expect("diagnostic server task");
+            let session_elapsed = session_started.elapsed().as_micros() as u64;
+            if iteration >= WARMUP {
+                prepare_us.push(prepared_elapsed);
+                request_sign_us.push(sign_elapsed);
+                session_us.push(session_elapsed);
+            }
+        }
+
+        fn percentile(values: &mut [u64], percent: usize) -> u64 {
+            values.sort_unstable();
+            let rank = values.len().saturating_mul(percent).saturating_add(99) / 100;
+            values[rank.saturating_sub(1).min(values.len() - 1)]
+        }
+
+        eprintln!(
+            "small-session us: prepare-p50={} prepare-p95={} request-sign-p50={} request-sign-p95={} session-p50={} session-p95={}",
+            percentile(&mut prepare_us.clone(), 50),
+            percentile(&mut prepare_us, 95),
+            percentile(&mut request_sign_us.clone(), 50),
+            percentile(&mut request_sign_us, 95),
+            percentile(&mut session_us.clone(), 50),
+            percentile(&mut session_us, 95),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4934,9 +5817,11 @@ mod body_tests {
             .await
             .expect("accept session");
             responder
-                .respond(ObjectRpcSessionResponse::value(
-                    crate::ObjectRpcResponse::from_encoded_body(route, vec![0x7b]),
-                ))
+                .respond(ObjectRpcSessionResponse {
+                    response: crate::ObjectRpcResponse::from_encoded_body(route, Vec::new()),
+                    body: ObjectRpcBodySource::bytes(vec![0x7b])
+                        .with_role(ObjectRpcSessionBodyRole::Value),
+                })
                 .await
         });
         let result = tokio::time::timeout(
@@ -4963,8 +5848,8 @@ mod body_tests {
     }
 
     #[test]
-    fn value_and_attachment_roles_do_not_depend_on_payload_size() {
-        for size in [1, 73_127, 237_451] {
+    fn small_values_stay_inline_while_large_values_stream() {
+        for size in [0, 1, INLINE_VALUE_MAX_BYTES] {
             let request = crate::ObjectRpcRequest::from_encoded_body(
                 "/test/session/value-role",
                 "test",
@@ -4973,6 +5858,23 @@ mod body_tests {
             let call = ObjectRpcSessionCall::value(request);
             assert_eq!(call.request.body.len(), size);
             let prepared = call.prepare_for_signing().expect("prepare value request");
+            assert_eq!(prepared.request.body.len(), size);
+            assert!(prepared.body.is_empty());
+            assert_eq!(
+                prepared.descriptor.request_body_role,
+                ObjectRpcSessionBodyRole::None
+            );
+        }
+
+        for size in [INLINE_VALUE_MAX_BYTES + 1, 237_451] {
+            let request = crate::ObjectRpcRequest::from_encoded_body(
+                "/test/session/value-role",
+                "test",
+                vec![0x5a; size],
+            );
+            let prepared = ObjectRpcSessionCall::value(request)
+                .prepare_for_signing()
+                .expect("prepare streamed value request");
             assert!(prepared.request.body.is_empty());
             assert_eq!(prepared.body.role(), ObjectRpcSessionBodyRole::Value);
             assert_eq!(prepared.body.total_bytes(), Some(size as u64));
@@ -5460,6 +6362,72 @@ mod body_tests {
     }
 
     #[tokio::test]
+    async fn writer_scheduler_flushes_latest_ack_before_completion() {
+        let root = sinomo_testdir::TestDir::new("sinomo-session-writer-ack-order");
+        let data_dir = SinomoDataDir::new(root.path());
+        let public_key = proof_public_key(&data_dir);
+        let session_id = TransferId::generate();
+        let transfer_id = TransferId::generate();
+        let digest = TransferDigest::blake3(b"complete");
+        let (wire_writer, wire_reader) = tokio::io::duplex(4096);
+        let writer = SessionWriterHandle::spawn(
+            SessionFrameWriter::new(
+                wire_writer,
+                data_dir,
+                session_id.clone(),
+                SessionFrameDirection::ResponderToInitiator,
+                NetworkCallPolicy::default(),
+            )
+            .expect("session writer"),
+        );
+        for received_contiguous_offset in [1_u64, 2, 3] {
+            writer
+                .acknowledge(TransferAck {
+                    transfer_id: transfer_id.clone(),
+                    received_contiguous_offset,
+                    receive_window: TransferFlowWindow::default(),
+                })
+                .expect("queue cumulative acknowledgement");
+        }
+        writer
+            .send_from_reader(SessionWirePayload::Transfer(TransferControl::Complete(
+                TransferReceipt {
+                    transfer_id: transfer_id.clone(),
+                    completed_bytes: 3,
+                    digest,
+                },
+            )))
+            .await
+            .expect("queue completion");
+
+        let mut reader = SessionFrameReader::new(
+            wire_reader,
+            session_id,
+            SessionFrameDirection::ResponderToInitiator,
+            public_key,
+            NetworkCallPolicy::default(),
+        );
+        assert!(matches!(
+            reader.receive().await.expect("latest acknowledgement"),
+            SessionInboundFrame::Payload(SessionWirePayload::Transfer(TransferControl::Ack(
+                TransferAck {
+                    received_contiguous_offset: 3,
+                    ..
+                }
+            )))
+        ));
+        assert!(matches!(
+            reader.receive().await.expect("completion"),
+            SessionInboundFrame::Payload(SessionWirePayload::Transfer(TransferControl::Complete(
+                TransferReceipt {
+                    completed_bytes: 3,
+                    ..
+                }
+            )))
+        ));
+    }
+
+    #[tokio::test]
     async fn outgoing_body_pipelines_multiple_frames_before_the_first_ack() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-pipelined-window");
         let data_dir = SinomoDataDir::new(root.path());
@@ -5479,7 +6447,7 @@ mod body_tests {
             requested_window: TransferFlowWindow::default(),
         };
         let (wire_writer, wire_reader) = tokio::io::duplex(4 * 1024 * 1024);
-        let writer = Arc::new(tokio::sync::Mutex::new(
+        let writer = SessionWriterHandle::spawn(
             SessionFrameWriter::new(
                 wire_writer,
                 data_dir,
@@ -5488,7 +6456,7 @@ mod body_tests {
                 NetworkCallPolicy::default(),
             )
             .expect("session writer"),
-        ));
+        );
         let (feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(16);
         feedback_tx
             .send(TransferControl::OpenAck(crate::transfer::TransferOpenAck {
@@ -5506,7 +6474,7 @@ mod body_tests {
             })
             .expect("finish proof binding");
         let send_task = tokio::spawn(pump_outgoing_body(
-            Arc::clone(&writer),
+            writer.clone(),
             source,
             open.clone(),
             feedback_rx,

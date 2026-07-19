@@ -1,11 +1,15 @@
 use crate::{
-    OBSERVE_CONTROL_ROUTE, OBSERVE_EVENTS_ROUTE, OBSERVE_LOGS_ROUTE, OBSERVE_METRICS_ROUTE,
-    OBSERVE_RPC_CATEGORY, OBSERVE_TRACES_ROUTE, ObserveControlRequest, ObserveControlResponse,
-    ObserveEventsRequest, ObserveEventsResponse, ObserveLogsRequest, ObserveLogsResponse,
-    ObserveMetricsRequest, ObserveMetricsResponse, ObserveTracesRequest, ObserveTracesResponse,
+    OBSERVE_CONTROL_ROUTE, OBSERVE_CPU_PROFILE_ROUTE, OBSERVE_EVENTS_ROUTE, OBSERVE_LOGS_ROUTE,
+    OBSERVE_METRICS_ROUTE, OBSERVE_NETWORK_TIMELINE_ROUTE, OBSERVE_RPC_CATEGORY,
+    OBSERVE_TRACES_ROUTE, ObserveControlRequest, ObserveControlResponse, ObserveCpuProfileAction,
+    ObserveCpuProfileRequest, ObserveCpuProfileResponse, ObserveEventsRequest,
+    ObserveEventsResponse, ObserveLogsRequest, ObserveLogsResponse, ObserveMetricsRequest,
+    ObserveMetricsResponse, ObserveNetworkTimelineAction, ObserveNetworkTimelineRequest,
+    ObserveNetworkTimelineResponse, ObserveTracesRequest, ObserveTracesResponse,
     OperationalEventQuery, OperationalEventRecord, OperationalLogQuery, OperationalLogRecord,
-    observe_control_snapshot, observe_module_enabled, read_observe_metrics, read_observe_traces,
-    read_operational_events, read_operational_logs, update_observe_control,
+    handle_observe_cpu_profile, handle_observe_network_timeline, observe_control_snapshot,
+    observe_module_enabled, read_observe_metrics, read_observe_traces, read_operational_events,
+    read_operational_logs, update_observe_control,
 };
 use sinomo_cli_registry::{
     CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue, CliCommand,
@@ -29,6 +33,8 @@ enum ObserveCliCommand {
     Metrics(ObserveOptions),
     Traces(ObserveOptions),
     Control(ObserveControlOptions),
+    CpuProfile(ObserveCpuProfileOptions),
+    NetworkTimeline(ObserveNetworkTimelineOptions),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -74,6 +80,20 @@ struct ObserveControlOptions {
     clear_traces: bool,
     target_node_id: Option<String>,
     target_all: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ObserveCpuProfileOptions {
+    request: ObserveCpuProfileRequest,
+    target_node_id: Option<String>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ObserveNetworkTimelineOptions {
+    request: ObserveNetworkTimelineRequest,
+    target_node_id: Option<String>,
     json: bool,
 }
 
@@ -213,6 +233,12 @@ impl CliCommand for ObserveCliCommandRunner {
                 self.target_lister.as_ref(),
                 options,
             ),
+            ObserveCliCommand::CpuProfile(options) => {
+                observe_cpu_profile(context, self.rpc.as_ref(), options)
+            }
+            ObserveCliCommand::NetworkTimeline(options) => {
+                observe_network_timeline(context, self.rpc.as_ref(), options)
+            }
         }
     }
 }
@@ -242,6 +268,14 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Read live bounded trace events.",
             "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--capture <id> | --clear-capture --expected-capture <id>] [--clear-traces] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
             "      Read or update live tracing; capture-owned filters restore on clear or after the ten-minute lease.",
+            "  sinomo observe profile cpu start [--capture <id>] [--duration-seconds <1..30>] [--frequency-hz <10..500>] [--target <node-id>] [--json]",
+            "  sinomo observe profile cpu status [--target <node-id>] [--json]",
+            "  sinomo observe profile cpu stop [--capture <id>] [--target <node-id>] [--json]",
+            "      Control one node-local, bounded CPU profile and report its pprof artifact path.",
+            "  sinomo observe timeline network start [--capture <id>] [--duration-seconds <1..120>] [--max-events <n>] [--target <node-id>] [--json]",
+            "  sinomo observe timeline network status [--target <node-id>] [--json]",
+            "  sinomo observe timeline network stop [--capture <id>] [--target <node-id>] [--json]",
+            "      Capture one node-local, fixed-memory RPC timeline; stop emits Perfetto-convertible JSON.",
         ],
     )
 }
@@ -374,7 +408,98 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                 CliAutocompleteOption::flag("--reset", "reset trace filter"),
                 CliAutocompleteOption::flag("--json", "emit JSON"),
             ]),
+            CliAutocompleteSpec::new("profile", "control bounded process profiles").with_children(
+                [
+                    CliAutocompleteSpec::new("cpu", "control a CPU profile").with_children([
+                        cpu_profile_autocomplete("start", "start a bounded CPU profile", true),
+                        cpu_profile_autocomplete("status", "read CPU profile status", false),
+                        cpu_profile_autocomplete("stop", "stop the active CPU profile", true),
+                    ]),
+                ],
+            ),
+            CliAutocompleteSpec::new("timeline", "capture bounded RPC timelines").with_children([
+                CliAutocompleteSpec::new("network", "capture the object-RPC network path")
+                    .with_children([
+                        network_timeline_autocomplete("start", "start a bounded timeline", true),
+                        network_timeline_autocomplete("status", "read timeline status", false),
+                        network_timeline_autocomplete("stop", "stop and emit the timeline", true),
+                    ]),
+            ]),
         ])
+}
+
+fn network_timeline_autocomplete(
+    action: &'static str,
+    description: &'static str,
+    allow_capture: bool,
+) -> CliAutocompleteSpec {
+    let mut options = vec![
+        CliAutocompleteOption::with_value(
+            "--target",
+            "target node id",
+            CliAutocompleteValue::new("node-id", "target node id", []),
+        ),
+        CliAutocompleteOption::flag("--json", "emit JSON"),
+    ];
+    if allow_capture {
+        options.push(CliAutocompleteOption::with_value(
+            "--capture",
+            "timeline capture id",
+            CliAutocompleteValue::new("id", "capture id", []),
+        ));
+    }
+    if action == "start" {
+        options.extend([
+            CliAutocompleteOption::with_value(
+                "--duration-seconds",
+                "bounded capture duration",
+                CliAutocompleteValue::new("seconds", "1 to 120 seconds", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--max-events",
+                "preallocated event bound",
+                CliAutocompleteValue::new("n", "event capacity", []),
+            ),
+        ]);
+    }
+    CliAutocompleteSpec::new(action, description).with_options(options)
+}
+
+fn cpu_profile_autocomplete(
+    action: &'static str,
+    description: &'static str,
+    allow_capture: bool,
+) -> CliAutocompleteSpec {
+    let mut options = vec![
+        CliAutocompleteOption::with_value(
+            "--target",
+            "target node id",
+            CliAutocompleteValue::new("node-id", "target node id", []),
+        ),
+        CliAutocompleteOption::flag("--json", "emit JSON"),
+    ];
+    if allow_capture {
+        options.push(CliAutocompleteOption::with_value(
+            "--capture",
+            "CPU profile capture id",
+            CliAutocompleteValue::new("id", "capture id", []),
+        ));
+    }
+    if action == "start" {
+        options.extend([
+            CliAutocompleteOption::with_value(
+                "--duration-seconds",
+                "bounded capture duration",
+                CliAutocompleteValue::new("seconds", "1 to 30 seconds", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--frequency-hz",
+                "sampling frequency",
+                CliAutocompleteValue::new("hz", "10 to 500 Hz", []),
+            ),
+        ]);
+    }
+    CliAutocompleteSpec::new(action, description).with_options(options)
 }
 
 fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseError> {
@@ -398,8 +523,186 @@ fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseE
         Some((command, rest)) if matches!(command.as_str(), "control" | "ctl") => Ok(
             ObserveCliCommand::Control(parse_observe_control_options(rest)?),
         ),
+        Some((command, rest)) if command == "profile" => Ok(ObserveCliCommand::CpuProfile(
+            parse_observe_cpu_profile_options(rest)?,
+        )),
+        Some((command, rest)) if command == "timeline" => Ok(ObserveCliCommand::NetworkTimeline(
+            parse_observe_network_timeline_options(rest)?,
+        )),
         _ => Err(CliParseError::Usage),
     }
+}
+
+fn parse_observe_network_timeline_options(
+    args: &[String],
+) -> Result<ObserveNetworkTimelineOptions, CliParseError> {
+    let Some((timeline_kind, rest)) = args.split_first() else {
+        return Err(CliParseError::Usage);
+    };
+    if timeline_kind != "network" {
+        return Err(CliParseError::Usage);
+    }
+    let (action, rest) = match rest.split_first() {
+        None => (ObserveNetworkTimelineAction::Status, rest),
+        Some((action, rest)) if matches!(action.as_str(), "status" | "show") => {
+            (ObserveNetworkTimelineAction::Status, rest)
+        }
+        Some((action, rest)) if action == "start" => (ObserveNetworkTimelineAction::Start, rest),
+        Some((action, rest)) if action == "stop" => (ObserveNetworkTimelineAction::Stop, rest),
+        _ => return Err(CliParseError::Usage),
+    };
+    let mut request = ObserveNetworkTimelineRequest {
+        action,
+        ..ObserveNetworkTimelineRequest::default()
+    };
+    let mut target_node_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--capture" if action != ObserveNetworkTimelineAction::Status => {
+                index += 1;
+                let Some(capture_id) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                request.capture_id = Some(non_empty_observe_value("--capture", capture_id)?);
+            }
+            "--duration-seconds" | "--duration"
+                if action == ObserveNetworkTimelineAction::Start =>
+            {
+                index += 1;
+                let Some(duration) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                request.duration_seconds =
+                    Some(
+                        duration
+                            .parse::<u64>()
+                            .map_err(|source| CliParseError::Parse {
+                                detail: format!(
+                                    "invalid network timeline duration `{duration}`: {source}"
+                                ),
+                            })?,
+                    );
+            }
+            "--max-events" if action == ObserveNetworkTimelineAction::Start => {
+                index += 1;
+                let Some(max_events) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                request.max_events =
+                    Some(
+                        max_events
+                            .parse::<usize>()
+                            .map_err(|source| CliParseError::Parse {
+                                detail: format!(
+                                    "invalid network timeline event bound `{max_events}`: {source}"
+                                ),
+                            })?,
+                    );
+            }
+            "--target" | "--node" => {
+                index += 1;
+                let Some(target) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                target_node_id = Some(non_empty_observe_value("--target", target)?);
+            }
+            "--json" => json = true,
+            _ => return Err(CliParseError::Usage),
+        }
+        index += 1;
+    }
+    Ok(ObserveNetworkTimelineOptions {
+        request,
+        target_node_id,
+        json,
+    })
+}
+
+fn parse_observe_cpu_profile_options(
+    args: &[String],
+) -> Result<ObserveCpuProfileOptions, CliParseError> {
+    let Some((profile_kind, rest)) = args.split_first() else {
+        return Err(CliParseError::Usage);
+    };
+    if profile_kind != "cpu" {
+        return Err(CliParseError::Usage);
+    }
+    let (action, rest) = match rest.split_first() {
+        None => (ObserveCpuProfileAction::Status, rest),
+        Some((action, rest)) if matches!(action.as_str(), "status" | "show") => {
+            (ObserveCpuProfileAction::Status, rest)
+        }
+        Some((action, rest)) if action == "start" => (ObserveCpuProfileAction::Start, rest),
+        Some((action, rest)) if action == "stop" => (ObserveCpuProfileAction::Stop, rest),
+        _ => return Err(CliParseError::Usage),
+    };
+    let mut request = ObserveCpuProfileRequest {
+        action,
+        ..ObserveCpuProfileRequest::default()
+    };
+    let mut target_node_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--capture" if action != ObserveCpuProfileAction::Status => {
+                index += 1;
+                let Some(capture_id) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                request.capture_id = Some(non_empty_observe_value("--capture", capture_id)?);
+            }
+            "--duration-seconds" | "--duration" if action == ObserveCpuProfileAction::Start => {
+                index += 1;
+                let Some(duration) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                request.duration_seconds =
+                    Some(
+                        duration
+                            .parse::<u64>()
+                            .map_err(|source| CliParseError::Parse {
+                                detail: format!(
+                                    "invalid CPU profile duration `{duration}`: {source}"
+                                ),
+                            })?,
+                    );
+            }
+            "--frequency-hz" | "--frequency" if action == ObserveCpuProfileAction::Start => {
+                index += 1;
+                let Some(frequency) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                request.frequency_hz =
+                    Some(
+                        frequency
+                            .parse::<u32>()
+                            .map_err(|source| CliParseError::Parse {
+                                detail: format!(
+                                    "invalid CPU profile frequency `{frequency}`: {source}"
+                                ),
+                            })?,
+                    );
+            }
+            "--target" | "--node" => {
+                index += 1;
+                let Some(target) = rest.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                target_node_id = Some(non_empty_observe_value("--target", target)?);
+            }
+            "--json" => json = true,
+            _ => return Err(CliParseError::Usage),
+        }
+        index += 1;
+    }
+    Ok(ObserveCpuProfileOptions {
+        request,
+        target_node_id,
+        json,
+    })
 }
 
 fn parse_observe_trace_options(args: &[String]) -> Result<ObserveOptions, CliParseError> {
@@ -1143,6 +1446,132 @@ fn print_observe_control_response(
     Ok(())
 }
 
+fn observe_cpu_profile(
+    context: &mut CliCommandContext<'_>,
+    rpc: Option<&ObserveCliRpc>,
+    options: ObserveCpuProfileOptions,
+) -> Result<(), CliCommandError> {
+    let response = if rpc.is_some() {
+        observe_rpc::<_, ObserveCpuProfileResponse>(
+            rpc,
+            options.target_node_id.as_deref(),
+            OBSERVE_CPU_PROFILE_ROUTE,
+            &options.request,
+        )?
+    } else {
+        let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
+        ensure_observe_module_enabled(&data_dir)?;
+        handle_observe_cpu_profile(data_dir.root(), options.request).map_err(command_error)?
+    };
+    print_observe_cpu_profile_response(context, response, options.json)
+}
+
+fn observe_network_timeline(
+    context: &mut CliCommandContext<'_>,
+    rpc: Option<&ObserveCliRpc>,
+    options: ObserveNetworkTimelineOptions,
+) -> Result<(), CliCommandError> {
+    let response = if rpc.is_some() {
+        observe_rpc::<_, ObserveNetworkTimelineResponse>(
+            rpc,
+            options.target_node_id.as_deref(),
+            OBSERVE_NETWORK_TIMELINE_ROUTE,
+            &options.request,
+        )?
+    } else {
+        let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
+        ensure_observe_module_enabled(&data_dir)?;
+        handle_observe_network_timeline(options.request).map_err(command_error)?
+    };
+    print_observe_network_timeline_response(context, response, options.json)
+}
+
+fn print_observe_network_timeline_response(
+    context: &mut CliCommandContext<'_>,
+    response: ObserveNetworkTimelineResponse,
+    json: bool,
+) -> Result<(), CliCommandError> {
+    if json {
+        let json = serde_json::to_string_pretty(&response).map_err(command_error)?;
+        context.stdout_line(format_args!("{json}"))?;
+        return Ok(());
+    }
+    context.stdout_line(format_args!(
+        "network timeline: {}",
+        if response.active { "active" } else { "stopped" }
+    ))?;
+    if let Some(capture_id) = response.capture_id.as_deref() {
+        context.stdout_line(format_args!("capture: {capture_id}"))?;
+    }
+    context.stdout_line(format_args!(
+        "events: {}/{} dropped={} overflowed={}",
+        response.event_count, response.max_events, response.dropped_events, response.overflowed
+    ))?;
+    context.stdout_line(format_args!(
+        "process: {} pid={} node={}",
+        response.process_role,
+        response.process_id,
+        response.node_id.as_deref().unwrap_or("<none>")
+    ))?;
+    if let Some(error) = response.error.as_deref() {
+        context.stdout_line(format_args!("error: {error}"))?;
+    }
+    if !response.events.is_empty() {
+        context.stdout_line(format_args!(
+            "timeline records emitted: {} (use --json for Perfetto conversion)",
+            response.events.len()
+        ))?;
+    }
+    Ok(())
+}
+
+fn print_observe_cpu_profile_response(
+    context: &mut CliCommandContext<'_>,
+    response: ObserveCpuProfileResponse,
+    json: bool,
+) -> Result<(), CliCommandError> {
+    if json {
+        let json = serde_json::to_string_pretty(&response).map_err(command_error)?;
+        context.stdout_line(format_args!("{json}"))?;
+        return Ok(());
+    }
+    context.stdout_line(format_args!(
+        "CPU profile: {} (supported={})",
+        format!("{:?}", response.state).to_ascii_lowercase(),
+        response.supported
+    ))?;
+    if let Some(capture_id) = response.capture_id.as_deref() {
+        context.stdout_line(format_args!("capture: {capture_id}"))?;
+    }
+    if let (Some(duration), Some(frequency)) = (response.duration_seconds, response.frequency_hz) {
+        context.stdout_line(format_args!("capture bounds: {duration}s at {frequency}Hz"))?;
+    }
+    if let Some(started_at) = response.started_at {
+        let started_at = started_at.format(&Rfc3339).map_err(command_error)?;
+        context.stdout_line(format_args!("started: {started_at}"))?;
+    }
+    if let Some(finished_at) = response.finished_at {
+        let finished_at = finished_at.format(&Rfc3339).map_err(command_error)?;
+        context.stdout_line(format_args!("finished: {finished_at}"))?;
+    }
+    if let Some(sample_count) = response.sample_count {
+        context.stdout_line(format_args!("samples: {sample_count}"))?;
+    }
+    if let Some(artifact_relative_path) = response.artifact_relative_path.as_deref() {
+        context.stdout_line(format_args!(
+            "artifact: {artifact_relative_path} ({} bytes)",
+            response.artifact_bytes.unwrap_or_default()
+        ))?;
+    }
+    if let Some(manifest_relative_path) = response.manifest_relative_path.as_deref() {
+        context.stdout_line(format_args!("manifest: {manifest_relative_path}"))?;
+    }
+    if let Some(error) = response.error.as_deref() {
+        context.stdout_line(format_args!("error: {error}"))?;
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct ObserveFanoutResponse<Resp> {
     targets: Vec<ObserveTargetResponse<Resp>>,
@@ -1484,6 +1913,79 @@ mod tests {
             }
             other => panic!("expected control command, got {other:?}"),
         }
+
+        let command = parse_observe_command(&[
+            "profile".to_string(),
+            "cpu".to_string(),
+            "start".to_string(),
+            "--capture".to_string(),
+            "route-latency".to_string(),
+            "--duration-seconds".to_string(),
+            "3".to_string(),
+            "--frequency-hz".to_string(),
+            "200".to_string(),
+            "--target".to_string(),
+            "node-a".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("parse CPU profile start");
+        match command {
+            ObserveCliCommand::CpuProfile(options) => {
+                assert_eq!(options.request.action, ObserveCpuProfileAction::Start);
+                assert_eq!(options.request.capture_id.as_deref(), Some("route-latency"));
+                assert_eq!(options.request.duration_seconds, Some(3));
+                assert_eq!(options.request.frequency_hz, Some(200));
+                assert_eq!(options.target_node_id.as_deref(), Some("node-a"));
+                assert!(options.json);
+            }
+            other => panic!("expected CPU profile command, got {other:?}"),
+        }
+
+        let command = parse_observe_command(&["profile".to_string(), "cpu".to_string()])
+            .expect("CPU profile defaults to status");
+        match command {
+            ObserveCliCommand::CpuProfile(options) => {
+                assert_eq!(options.request.action, ObserveCpuProfileAction::Status);
+            }
+            other => panic!("expected CPU profile status command, got {other:?}"),
+        }
+
+        let command = parse_observe_command(&[
+            "timeline".to_string(),
+            "network".to_string(),
+            "start".to_string(),
+            "--capture".to_string(),
+            "direct-rpc".to_string(),
+            "--duration-seconds".to_string(),
+            "15".to_string(),
+            "--max-events".to_string(),
+            "4096".to_string(),
+            "--target".to_string(),
+            "node-a".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("parse network timeline start");
+        match command {
+            ObserveCliCommand::NetworkTimeline(options) => {
+                assert_eq!(options.request.action, ObserveNetworkTimelineAction::Start);
+                assert_eq!(options.request.capture_id.as_deref(), Some("direct-rpc"));
+                assert_eq!(options.request.duration_seconds, Some(15));
+                assert_eq!(options.request.max_events, Some(4096));
+                assert_eq!(options.target_node_id.as_deref(), Some("node-a"));
+                assert!(options.json);
+            }
+            other => panic!("expected network timeline command, got {other:?}"),
+        }
+
+        assert_eq!(
+            parse_observe_command(&[
+                "profile".to_string(),
+                "cpu".to_string(),
+                "start".to_string(),
+                "--all".to_string(),
+            ]),
+            Err(CliParseError::Usage)
+        );
 
         let command = parse_observe_command(&[
             "metrics".to_string(),

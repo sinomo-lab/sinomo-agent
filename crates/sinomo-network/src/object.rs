@@ -1,12 +1,20 @@
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::io_observer;
 use sinomo_object::{BorrowedDocumentBuilder, DecodeLimits, DecodeOptions, LengthMode, serde_ext};
+use std::future::Future;
+use std::io::IoSlice;
 #[cfg(any(test, feature = "test-support"))]
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 #[cfg(any(test, feature = "test-support"))]
 use std::net::TcpStream;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -82,6 +90,240 @@ pub struct ObjectFrameIoOptions {
     pub idle_timeout: Option<Duration>,
 }
 
+/// Allocation-free timestamps returned only to physical carriers that are
+/// recording a sampled frame write.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObjectFrameWriteTiming {
+    pub encode_started_monotonic_ns: u64,
+    pub encode_completed_monotonic_ns: u64,
+    pub socket_write_completed_monotonic_ns: u64,
+    pub wire_bytes: u32,
+}
+
+/// Allocation-free timestamps for one persistent-carrier frame read. `None`
+/// is returned while timeline capture is disabled, so the ordinary path pays
+/// only a relaxed capture-state check at each first-read poll.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObjectFrameReadTiming {
+    pub capture_generation: u64,
+    pub ready_monotonic_ns: u64,
+    pub read_poll_monotonic_ns: u64,
+    pub first_read_monotonic_ns: u64,
+    pub body_read_completed_monotonic_ns: u64,
+    pub decode_started_monotonic_ns: u64,
+    pub decoded_monotonic_ns: u64,
+    pub wire_bytes: u32,
+    pub first_read_bytes: u32,
+}
+
+/// Reusable receiver-local readiness observer for a persistent carrier.
+///
+/// The proxy Waker is allocated once with the carrier. Capture-disabled reads
+/// continue to register Tokio's original Waker directly; an active bounded
+/// capture registers the proxy only for the first physical read of a frame.
+pub struct ObjectFrameReadinessProbe {
+    shared: Arc<ObjectFrameReadinessProbeShared>,
+    waker: Waker,
+}
+
+#[derive(Default)]
+struct ObjectFrameReadinessProbeState {
+    parent: Option<Waker>,
+    capture_generation: u64,
+    ready_monotonic_ns: u64,
+    armed: bool,
+}
+
+#[derive(Default)]
+struct ObjectFrameReadinessProbeShared {
+    state: Mutex<ObjectFrameReadinessProbeState>,
+}
+
+impl ObjectFrameReadinessProbeShared {
+    fn state(&self) -> std::sync::MutexGuard<'_, ObjectFrameReadinessProbeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Wake for ObjectFrameReadinessProbeShared {
+    fn wake(self: Arc<Self>) {
+        Wake::wake_by_ref(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let parent = {
+            let mut state = self.state();
+            let active_generation = crate::timeline::network_timeline_capture_generation();
+            if state.armed
+                && active_generation != 0
+                && active_generation == state.capture_generation
+                && state.ready_monotonic_ns == 0
+            {
+                state.ready_monotonic_ns = crate::network_timeline_monotonic_ns();
+            }
+            // Keep the parent registered until the read completes. Tokio may
+            // issue duplicate readiness notifications before the task is
+            // polled; each must retain a path to the original task Waker.
+            state.parent.clone()
+        };
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+    }
+}
+
+impl ObjectFrameReadinessProbe {
+    pub fn new() -> Self {
+        let shared = Arc::new(ObjectFrameReadinessProbeShared::default());
+        let waker = Waker::from(Arc::clone(&shared));
+        Self { shared, waker }
+    }
+
+    fn prepare_poll(&self, capture_generation: u64, parent: &Waker) -> Option<u64> {
+        let mut state = self.shared.state();
+        if !state.armed || state.capture_generation != capture_generation {
+            state.capture_generation = capture_generation;
+            state.ready_monotonic_ns = 0;
+            state.armed = true;
+        }
+        if !state
+            .parent
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(parent))
+        {
+            state.parent = Some(parent.clone());
+        }
+        let ready_monotonic_ns = state.ready_monotonic_ns;
+        state.ready_monotonic_ns = 0;
+        (ready_monotonic_ns != 0).then_some(ready_monotonic_ns)
+    }
+
+    fn disarm(&self) {
+        let mut state = self.shared.state();
+        state.parent = None;
+        state.capture_generation = 0;
+        state.ready_monotonic_ns = 0;
+        state.armed = false;
+    }
+}
+
+impl Default for ObjectFrameReadinessProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ObjectFrameFirstRead {
+    bytes: usize,
+    capture_generation: u64,
+    ready_monotonic_ns: u64,
+    read_poll_monotonic_ns: u64,
+    first_read_monotonic_ns: u64,
+}
+
+struct ObjectFrameFirstReadFuture<'a, R> {
+    reader: &'a mut R,
+    buffer: &'a mut [u8],
+    probe: &'a ObjectFrameReadinessProbe,
+    armed: bool,
+}
+
+impl<'a, R> ObjectFrameFirstReadFuture<'a, R> {
+    fn new(reader: &'a mut R, buffer: &'a mut [u8], probe: &'a ObjectFrameReadinessProbe) -> Self {
+        Self {
+            reader,
+            buffer,
+            probe,
+            armed: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> Future for ObjectFrameFirstReadFuture<'_, R> {
+    type Output = std::io::Result<ObjectFrameFirstRead>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let capture_generation = crate::timeline::network_timeline_capture_generation();
+        if capture_generation == 0 {
+            if this.armed {
+                this.probe.disarm();
+                this.armed = false;
+            }
+            let mut read_buffer = tokio::io::ReadBuf::new(this.buffer);
+            return match Pin::new(&mut *this.reader).poll_read(cx, &mut read_buffer) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(ObjectFrameFirstRead {
+                    bytes: read_buffer.filled().len(),
+                    ..ObjectFrameFirstRead::default()
+                })),
+                Poll::Ready(Err(source)) => Poll::Ready(Err(source)),
+            };
+        }
+
+        let ready_monotonic_ns = this.probe.prepare_poll(capture_generation, cx.waker());
+        this.armed = true;
+        let read_poll_monotonic_ns = ready_monotonic_ns
+            .is_some()
+            .then(crate::network_timeline_monotonic_ns);
+        let mut readiness_context = Context::from_waker(&this.probe.waker);
+        let mut read_buffer = tokio::io::ReadBuf::new(this.buffer);
+        match Pin::new(&mut *this.reader).poll_read(&mut readiness_context, &mut read_buffer) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                this.probe.disarm();
+                this.armed = false;
+                match result {
+                    Ok(()) => {
+                        let bytes = read_buffer.filled().len();
+                        let generation_still_active =
+                            crate::timeline::network_timeline_capture_generation()
+                                == capture_generation;
+                        let first_read_monotonic_ns = (bytes > 0 && generation_still_active)
+                            .then(crate::network_timeline_monotonic_ns)
+                            .unwrap_or(0);
+                        let ready_monotonic_ns = ready_monotonic_ns
+                            .filter(|ready| {
+                                generation_still_active
+                                    && *ready <= read_poll_monotonic_ns.unwrap_or(0)
+                            })
+                            .unwrap_or(0);
+                        Poll::Ready(Ok(ObjectFrameFirstRead {
+                            bytes,
+                            capture_generation: generation_still_active
+                                .then_some(capture_generation)
+                                .unwrap_or(0),
+                            ready_monotonic_ns,
+                            read_poll_monotonic_ns: (ready_monotonic_ns != 0)
+                                .then_some(read_poll_monotonic_ns.unwrap_or(0))
+                                .unwrap_or(0),
+                            first_read_monotonic_ns,
+                        }))
+                    }
+                    Err(source) => Poll::Ready(Err(source)),
+                }
+            }
+        }
+    }
+}
+
+impl<R> Drop for ObjectFrameFirstReadFuture<'_, R> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.probe.disarm();
+        }
+    }
+}
+
+/// Maximum encoded SOF2 body accepted by persistent object-RPC channel
+/// carriers. Logical control heads are capped at 256 KiB and data quanta at
+/// 32 KiB; the remaining space covers the SOBJ document and tunnel envelope
+/// without letting a corrupt length prefix reserve arbitrary host memory.
+pub const MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES: usize = 512 * 1024;
+
 impl Default for ObjectFrameIoOptions {
     fn default() -> Self {
         Self::idle_timeout(DEFAULT_NETWORK_TIMEOUT)
@@ -109,24 +351,20 @@ pub type DaemonControlRequest = crate::ObjectRpcRequest;
 pub type DaemonControlResponse = crate::ObjectRpcResponse;
 
 static OBJECT_FRAME_BYTE_BUDGET: LazyLock<ObjectFrameByteBudget> =
-    LazyLock::new(ObjectFrameByteBudget::available_memory);
+    LazyLock::new(|| ObjectFrameByteBudget::fixed(MAX_IN_FLIGHT_OBJECT_FRAME_BYTES));
+
+/// Strict process-wide bound for encoded object-frame bodies awaiting decode.
+///
+/// This admits 128 maximum-sized persistent-carrier frames, or 2,048 normal
+/// 32 KiB data quanta, while keeping admission entirely in memory. In
+/// particular, frame receipt must never read procfs or serialize unrelated
+/// channels on a process-global mutex.
+const MAX_IN_FLIGHT_OBJECT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectFrameByteBudget {
-    inner: Arc<Mutex<ObjectFrameByteBudgetState>>,
-    limit: ObjectFrameByteBudgetLimit,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ObjectFrameByteBudgetLimit {
-    AvailableMemory,
-    #[cfg(test)]
-    Fixed(usize),
-}
-
-#[derive(Debug, Default)]
-struct ObjectFrameByteBudgetState {
-    in_flight_bytes: usize,
+    in_flight_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -136,18 +374,10 @@ pub(crate) struct ObjectFrameByteBudgetPermit {
 }
 
 impl ObjectFrameByteBudget {
-    fn available_memory() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ObjectFrameByteBudgetState::default())),
-            limit: ObjectFrameByteBudgetLimit::AvailableMemory,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn fixed(max_bytes: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ObjectFrameByteBudgetState::default())),
-            limit: ObjectFrameByteBudgetLimit::Fixed(max_bytes),
+            in_flight_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
         }
     }
 
@@ -155,89 +385,45 @@ impl ObjectFrameByteBudget {
         &self,
         frame_bytes: usize,
     ) -> Result<ObjectFrameByteBudgetPermit, NetworkError> {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let available_memory_bytes = match self.limit {
-            ObjectFrameByteBudgetLimit::AvailableMemory => current_available_memory_bytes(),
-            #[cfg(test)]
-            ObjectFrameByteBudgetLimit::Fixed(max_bytes) => {
-                Some(max_bytes.saturating_sub(state.in_flight_bytes))
-            }
-        };
-        let would_use = state.in_flight_bytes.checked_add(frame_bytes).ok_or(
-            NetworkError::ObjectFrameMemoryUnavailable {
-                frame_bytes,
-                in_flight_bytes: state.in_flight_bytes,
-                available_memory_bytes,
+        match self.in_flight_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |in_flight_bytes| {
+                in_flight_bytes
+                    .checked_add(frame_bytes)
+                    .filter(|would_use| *would_use <= self.max_bytes)
             },
-        )?;
-        if let Some(available) = available_memory_bytes {
-            let max_in_flight = state
-                .in_flight_bytes
-                .checked_add(available)
-                .unwrap_or(usize::MAX);
-            if frame_bytes > available || would_use > max_in_flight {
-                return Err(NetworkError::ObjectFrameMemoryUnavailable {
-                    frame_bytes,
-                    in_flight_bytes: state.in_flight_bytes,
-                    available_memory_bytes: Some(available),
-                });
-            }
+        ) {
+            Ok(_) => Ok(ObjectFrameByteBudgetPermit {
+                budget: self.clone(),
+                bytes: frame_bytes,
+            }),
+            Err(in_flight_bytes) => Err(NetworkError::ObjectFrameMemoryUnavailable {
+                frame_bytes,
+                in_flight_bytes,
+                available_memory_bytes: Some(self.max_bytes.saturating_sub(in_flight_bytes)),
+            }),
         }
-        state.in_flight_bytes = would_use;
-        Ok(ObjectFrameByteBudgetPermit {
-            budget: self.clone(),
-            bytes: frame_bytes,
-        })
     }
 
     #[cfg(test)]
     pub(crate) fn in_flight_bytes(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .in_flight_bytes
+        self.in_flight_bytes.load(Ordering::Acquire)
     }
 }
 
 impl Drop for ObjectFrameByteBudgetPermit {
     fn drop(&mut self) {
-        let mut state = self
+        let previous = self
             .budget
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.in_flight_bytes = state.in_flight_bytes.saturating_sub(self.bytes);
+            .in_flight_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes, "object-frame byte budget underflow");
     }
 }
 
 fn object_frame_byte_budget() -> &'static ObjectFrameByteBudget {
     &OBJECT_FRAME_BYTE_BUDGET
-}
-
-#[cfg(target_os = "linux")]
-fn current_available_memory_bytes() -> Option<usize> {
-    use std::io::Read as _;
-
-    let mut file = std::fs::File::open("/proc/meminfo").ok()?;
-    let mut buf = [0_u8; 4096];
-    let len = file.read(&mut buf).ok()?;
-    let text = std::str::from_utf8(&buf[..len]).ok()?;
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("MemAvailable:") else {
-            continue;
-        };
-        let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
-        return kb.checked_mul(1024);
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn current_available_memory_bytes() -> Option<usize> {
-    None
 }
 
 #[derive(Debug)]
@@ -848,26 +1034,67 @@ where
 {
     let bytes = SinomoObjectCodec::network_frame().encode(value)?;
     let len_prefix = object_frame_len_prefix(bytes.len())?;
-    write_all_async_frame(
+    write_all_vectored_async_frame(
         writer,
         &len_prefix,
-        options.idle_timeout,
-        "write async object frame",
-        "length",
-    )
-    .await?;
-    write_all_async_frame(
-        writer,
         &bytes,
         options.idle_timeout,
         "write async object frame",
-        "body",
     )
     .await?;
     if let Some(observer) = io_observer() {
         observer.on_net_sent(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
     }
     Ok(())
+}
+
+/// Writes one object frame and returns separate SOBJ encode/allocation and
+/// physical write/flush timestamps. Physical carriers call this only when a
+/// sampled frame already has timeline correlation; ordinary writes retain the
+/// allocation-free [`write_object_frame_async`] API and path.
+pub async fn write_object_frame_async_timed<W, T>(
+    writer: &mut W,
+    value: &T,
+    options: ObjectFrameIoOptions,
+) -> (Result<(), NetworkError>, Option<ObjectFrameWriteTiming>)
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize + ?Sized,
+{
+    let encode_started_monotonic_ns = crate::network_timeline_monotonic_ns();
+    let bytes = match SinomoObjectCodec::network_frame().encode(value) {
+        Ok(bytes) => bytes,
+        Err(error) => return (Err(error), None),
+    };
+    let len_prefix = match object_frame_len_prefix(bytes.len()) {
+        Ok(prefix) => prefix,
+        Err(error) => return (Err(error), None),
+    };
+    let encode_completed_monotonic_ns = crate::network_timeline_monotonic_ns();
+    let result = write_all_vectored_async_frame(
+        writer,
+        &len_prefix,
+        &bytes,
+        options.idle_timeout,
+        "write async object frame",
+    )
+    .await;
+    let socket_write_completed_monotonic_ns = crate::network_timeline_monotonic_ns();
+    if result.is_ok()
+        && let Some(observer) = io_observer()
+    {
+        observer.on_net_sent(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
+    }
+    let wire_bytes = OBJECT_FRAME_WIRE_PREFIX_BYTES.saturating_add(bytes.len());
+    (
+        result,
+        Some(ObjectFrameWriteTiming {
+            encode_started_monotonic_ns,
+            encode_completed_monotonic_ns,
+            socket_write_completed_monotonic_ns,
+            wire_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
+        }),
+    )
 }
 
 pub async fn write_borrowed_object_frame_async<W>(
@@ -922,6 +1149,176 @@ where
     read_object_frame_async_with_budget(reader, options, object_frame_byte_budget()).await
 }
 
+/// Reads one object frame while rejecting an encoded body above `max_bytes`
+/// immediately after its length prefix, before reserving or allocating the
+/// declared body. Canonical object-frame readers deliberately remain
+/// unrestricted; persistent bounded carriers opt into this limit.
+pub async fn read_object_frame_async_with_max_bytes<R, T>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    max_bytes: usize,
+) -> Result<T, NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let len = read_object_frame_len_async(reader, options.idle_timeout).await?;
+    if len > max_bytes {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: len,
+            max_bytes,
+        });
+    }
+    read_object_frame_body_async(reader, options, object_frame_byte_budget(), len).await
+}
+
+/// Reads one bounded object frame while allowing a persistent carrier to stay
+/// idle indefinitely between frames.
+///
+/// The first byte of the next frame is awaited without a timeout. Once that
+/// byte arrives, `options.idle_timeout` applies to every remaining prefix and
+/// body read, resetting after each successful read. This lets long-lived
+/// carriers remain idle without allowing a peer to strand one with a partial
+/// frame.
+pub async fn read_object_frame_async_with_max_bytes_after_first_byte<R, T>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    max_bytes: usize,
+) -> Result<T, NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    read_object_frame_async_with_max_bytes_after_first_byte_inner(
+        reader,
+        options,
+        max_bytes,
+        || false,
+        None,
+    )
+    .await
+    .map(|(value, _timing)| value)
+}
+
+/// Persistent-carrier variant that returns first-read and decode-completion
+/// timestamps only when the bounded network timeline is active at the first
+/// successful socket read. The decoded value and wire behavior are identical
+/// to [`read_object_frame_async_with_max_bytes_after_first_byte`].
+pub async fn read_object_frame_async_with_max_bytes_after_first_byte_timed<R, T>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    max_bytes: usize,
+    readiness_probe: &ObjectFrameReadinessProbe,
+) -> Result<(T, Option<ObjectFrameReadTiming>), NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    read_object_frame_async_with_max_bytes_after_first_byte_inner(
+        reader,
+        options,
+        max_bytes,
+        crate::network_timeline_capture_is_active,
+        Some(readiness_probe),
+    )
+    .await
+}
+
+async fn read_object_frame_async_with_max_bytes_after_first_byte_inner<R, T, F>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    max_bytes: usize,
+    timing_enabled: F,
+    readiness_probe: Option<&ObjectFrameReadinessProbe>,
+) -> Result<(T, Option<ObjectFrameReadTiming>), NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+    F: FnOnce() -> bool,
+{
+    // Read up to the complete prefix in one ordinary socket read. Besides
+    // avoiding a one-byte syscall on the hot path, this is the exact point at
+    // which an idle carrier becomes an in-progress frame subject to the
+    // no-progress policy below.
+    let mut prefix_start = [0_u8; OBJECT_FRAME_WIRE_PREFIX_BYTES];
+    let first_read = loop {
+        let result = match readiness_probe {
+            Some(readiness_probe) => {
+                ObjectFrameFirstReadFuture::new(reader, &mut prefix_start, readiness_probe).await
+            }
+            None => reader
+                .read(&mut prefix_start)
+                .await
+                .map(|bytes| ObjectFrameFirstRead {
+                    bytes,
+                    ..ObjectFrameFirstRead::default()
+                }),
+        };
+        match result {
+            Ok(ObjectFrameFirstRead { bytes: 0, .. }) => {
+                return Err(NetworkError::Io {
+                    operation: "read async object frame prefix".to_string(),
+                    detail: object_frame_eof_detail("prefix", 0, OBJECT_FRAME_WIRE_PREFIX_BYTES),
+                });
+            }
+            Ok(read) => break read,
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation: "read async object frame prefix".to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    };
+    let prefix_start_len = first_read.bytes;
+    let timing_enabled = timing_enabled();
+    let first_read_monotonic_ns = timing_enabled.then(|| {
+        (first_read.first_read_monotonic_ns != 0)
+            .then_some(first_read.first_read_monotonic_ns)
+            .unwrap_or_else(crate::network_timeline_monotonic_ns)
+    });
+    let prefix_start = std::io::Cursor::new(&prefix_start[..prefix_start_len]);
+    let mut reader = tokio::io::AsyncReadExt::chain(prefix_start, reader);
+    let len = read_object_frame_len_async(&mut reader, options.idle_timeout).await?;
+    if len > max_bytes {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: len,
+            max_bytes,
+        });
+    }
+    let (
+        value,
+        body_read_completed_monotonic_ns,
+        decode_started_monotonic_ns,
+        decoded_monotonic_ns,
+    ) = if first_read_monotonic_ns.is_some() {
+        read_object_frame_body_async_timed(&mut reader, options, object_frame_byte_budget(), len)
+            .await?
+    } else {
+        (
+            read_object_frame_body_async(&mut reader, options, object_frame_byte_budget(), len)
+                .await?,
+            0,
+            0,
+            0,
+        )
+    };
+    let timing = first_read_monotonic_ns.map(|first_read_monotonic_ns| ObjectFrameReadTiming {
+        capture_generation: first_read.capture_generation,
+        ready_monotonic_ns: first_read.ready_monotonic_ns,
+        read_poll_monotonic_ns: first_read.read_poll_monotonic_ns,
+        first_read_monotonic_ns,
+        body_read_completed_monotonic_ns,
+        decode_started_monotonic_ns,
+        decoded_monotonic_ns,
+        wire_bytes: u32::try_from(OBJECT_FRAME_WIRE_PREFIX_BYTES.saturating_add(len))
+            .unwrap_or(u32::MAX),
+        first_read_bytes: u32::try_from(prefix_start_len).unwrap_or(u32::MAX),
+    });
+    Ok((value, timing))
+}
+
 async fn read_object_frame_async_with_budget<R, T>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
@@ -932,6 +1329,19 @@ where
     T: serde::de::DeserializeOwned,
 {
     let len = read_object_frame_len_async(reader, options.idle_timeout).await?;
+    read_object_frame_body_async(reader, options, budget, len).await
+}
+
+async fn read_object_frame_body_async<R, T>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    budget: &ObjectFrameByteBudget,
+    len: usize,
+) -> Result<T, NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
     let _permit = budget.try_acquire(len)?;
     let mut bytes = try_zeroed_vec(len, "read async object frame body")?;
     read_exact_async_frame(
@@ -946,6 +1356,41 @@ where
         observer.on_net_recv(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
     }
     SinomoObjectCodec::network_frame().decode(&bytes)
+}
+
+async fn read_object_frame_body_async_timed<R, T>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    budget: &ObjectFrameByteBudget,
+    len: usize,
+) -> Result<(T, u64, u64, u64), NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let _permit = budget.try_acquire(len)?;
+    let mut bytes = try_zeroed_vec(len, "read async object frame body")?;
+    read_exact_async_frame(
+        reader,
+        &mut bytes,
+        options.idle_timeout,
+        "read async object frame body",
+        "body",
+    )
+    .await?;
+    let body_read_completed_monotonic_ns = crate::network_timeline_monotonic_ns();
+    if let Some(observer) = io_observer() {
+        observer.on_net_recv(OBJECT_FRAME_WIRE_PREFIX_BYTES as u64 + bytes.len() as u64);
+    }
+    let decode_started_monotonic_ns = crate::network_timeline_monotonic_ns();
+    let value = SinomoObjectCodec::network_frame().decode(&bytes)?;
+    let decoded_monotonic_ns = crate::network_timeline_monotonic_ns();
+    Ok((
+        value,
+        body_read_completed_monotonic_ns,
+        decode_started_monotonic_ns,
+        decoded_monotonic_ns,
+    ))
 }
 
 async fn read_object_frame_len_async<R: AsyncRead + Unpin>(
@@ -975,6 +1420,101 @@ pub(crate) async fn write_all_async_frame<W: AsyncWrite + Unpin>(
 ) -> Result<(), NetworkError> {
     write_all_async_frame_unflushed(writer, buf, idle_timeout, operation, part).await?;
     flush_async_frame(writer, idle_timeout, operation).await?;
+    Ok(())
+}
+
+async fn write_all_vectored_async_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    prefix: &[u8],
+    body: &[u8],
+    idle_timeout: Option<Duration>,
+    operation: &str,
+) -> Result<(), NetworkError> {
+    write_all_vectored_async_frame_unflushed(writer, prefix, body, idle_timeout, operation).await?;
+    flush_async_frame(writer, idle_timeout, operation).await?;
+    Ok(())
+}
+
+async fn write_all_vectored_async_frame_unflushed<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    prefix: &[u8],
+    body: &[u8],
+    idle_timeout: Option<Duration>,
+    operation: &str,
+) -> Result<(), NetworkError> {
+    let expected = prefix
+        .len()
+        .checked_add(body.len())
+        .ok_or(NetworkError::FrameTooLarge {
+            actual_bytes: usize::MAX,
+            max_bytes: usize::MAX,
+        })?;
+    let mut written = 0_usize;
+    while written < expected {
+        let part = if written < prefix.len() {
+            "length"
+        } else {
+            "body"
+        };
+        let (part_written, part_expected) = if written < prefix.len() {
+            (written, prefix.len())
+        } else {
+            (written.saturating_sub(prefix.len()), body.len())
+        };
+        let slices = if written < prefix.len() {
+            [IoSlice::new(&prefix[written..]), IoSlice::new(body)]
+        } else {
+            [
+                IoSlice::new(&body[written - prefix.len()..]),
+                IoSlice::new(&[]),
+            ]
+        };
+        let write_result = if let Some(timeout) = idle_timeout {
+            match tokio::time::timeout(timeout, writer.write_vectored(&slices)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(NetworkError::Io {
+                        operation: operation.to_string(),
+                        detail: format!(
+                            "timed out after {}ms without {part} write progress",
+                            timeout.as_millis()
+                        ),
+                    });
+                }
+            }
+        } else {
+            writer.write_vectored(&slices).await
+        };
+        match write_result {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: format!(
+                        "peer stopped accepting object frame {part}: wrote {part_written} of {part_expected} bytes"
+                    ),
+                });
+            }
+            Ok(bytes) if bytes <= expected - written => {
+                written = written.saturating_add(bytes);
+            }
+            Ok(bytes) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: format!(
+                        "object frame vectored writer reported {bytes} bytes for {} bytes remaining",
+                        expected - written
+                    ),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1112,18 +1652,22 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 mod serde_bytes_tests {
     use super::{
         AsyncDaemonControlListener, AsyncDaemonControlStream, DaemonRpcTimeouts,
-        ObjectFrameIoOptions, SINOMO_NETWORK_OBJECT_VERSION, SinomoObjectCodec,
-        decode_single_object_frame_from_slice, encode_borrowed_object_frame_to_vec,
-        encode_object_frame_to_vec, read_object_frame_async, read_object_frame_blocking,
-        write_all_async_frame, write_borrowed_object_frame_async, write_object_frame_async,
-        write_object_frame_blocking,
+        ObjectFrameIoOptions, ObjectFrameReadinessProbe, SINOMO_NETWORK_OBJECT_VERSION,
+        SinomoObjectCodec, decode_single_object_frame_from_slice,
+        encode_borrowed_object_frame_to_vec, encode_object_frame_to_vec, read_object_frame_async,
+        read_object_frame_blocking, write_all_async_frame, write_borrowed_object_frame_async,
+        write_object_frame_async, write_object_frame_async_timed, write_object_frame_blocking,
     };
     use crate::error::{NetworkDeliveryState, NetworkError};
     use serde::{Deserialize, Serialize};
     use sinomo_object::{BorrowedDocumentBuilder, DocumentView, LengthMode};
     use std::io::Cursor;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct BundleRecord {
@@ -1412,6 +1956,245 @@ mod serde_bytes_tests {
         );
     }
 
+    #[tokio::test]
+    async fn timed_object_frame_io_splits_encode_first_read_and_decode() {
+        let record = BundleRecord {
+            name: "timed-frame".to_string(),
+            payload: Some(vec![3, 1, 4, 1, 5, 9]),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        let write = write_object_frame_async_timed(
+            &mut writer,
+            &record,
+            ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+        );
+        let read = super::read_object_frame_async_with_max_bytes_after_first_byte_inner::<
+            _,
+            BundleRecord,
+            _,
+        >(
+            &mut reader,
+            ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+            super::MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
+            || true,
+            None,
+        );
+        let ((write_result, write_timing), read_result) = tokio::join!(write, read);
+
+        write_result.expect("timed frame write");
+        let write_timing = write_timing.expect("write timing");
+        let (decoded, read_timing) = read_result.expect("timed frame read");
+        let read_timing = read_timing.expect("read timing");
+        assert_eq!(decoded, record);
+        assert_eq!(read_timing.wire_bytes, write_timing.wire_bytes);
+        assert!(read_timing.first_read_bytes > 0);
+        assert!(read_timing.first_read_bytes as usize <= super::OBJECT_FRAME_WIRE_PREFIX_BYTES);
+        assert!(
+            write_timing.encode_completed_monotonic_ns >= write_timing.encode_started_monotonic_ns
+        );
+        assert!(
+            write_timing.socket_write_completed_monotonic_ns
+                >= write_timing.encode_completed_monotonic_ns
+        );
+        assert!(
+            read_timing.body_read_completed_monotonic_ns >= read_timing.first_read_monotonic_ns
+        );
+        assert!(
+            read_timing.decode_started_monotonic_ns >= read_timing.body_read_completed_monotonic_ns
+        );
+        assert!(read_timing.decoded_monotonic_ns >= read_timing.decode_started_monotonic_ns);
+    }
+
+    #[test]
+    fn readiness_probe_duplicate_wakes_retain_the_parent_waker() {
+        #[derive(Default)]
+        struct CountingWake(AtomicUsize);
+
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let probe = ObjectFrameReadinessProbe::new();
+        let count = Arc::new(CountingWake::default());
+        let parent = Waker::from(Arc::clone(&count));
+        assert_eq!(probe.prepare_poll(1, &parent), None);
+
+        Wake::wake_by_ref(&probe.shared);
+        Wake::wake_by_ref(&probe.shared);
+
+        assert_eq!(count.0.load(Ordering::Relaxed), 2);
+        probe.disarm();
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_records_async_wake_to_first_read() {
+        struct AnnouncedReader {
+            inner: tokio::io::DuplexStream,
+            first_poll: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+
+        impl AsyncRead for AnnouncedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let this = self.get_mut();
+                if let Some(first_poll) = this.first_poll.take() {
+                    let _ = first_poll.send(());
+                }
+                Pin::new(&mut this.inner).poll_read(cx, buffer)
+            }
+        }
+
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(32).expect("start readiness capture");
+
+        let record = BundleRecord {
+            name: "readiness-frame".to_string(),
+            payload: Some(vec![2, 7, 1, 8, 2, 8]),
+        };
+        let (writer, reader) = tokio::io::duplex(256);
+        let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
+        let mut reader = AnnouncedReader {
+            inner: reader,
+            first_poll: Some(first_poll_tx),
+        };
+        let writer_record = BundleRecord {
+            name: record.name.clone(),
+            payload: record.payload.clone(),
+        };
+        let writer = tokio::spawn(async move {
+            first_poll_rx.await.expect("reader first poll");
+            let mut writer = writer;
+            write_object_frame_async(
+                &mut writer,
+                &writer_record,
+                ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let readiness_probe = ObjectFrameReadinessProbe::new();
+        let read_result = super::read_object_frame_async_with_max_bytes_after_first_byte_timed::<
+            _,
+            BundleRecord,
+        >(
+            &mut reader,
+            ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+            super::MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
+            &readiness_probe,
+        )
+        .await;
+        let write_result = writer.await.expect("writer task");
+        let _snapshot = crate::stop_network_timeline_capture().expect("stop readiness capture");
+
+        write_result.expect("write readiness frame");
+        let (decoded, timing) = read_result.expect("read readiness frame");
+        let timing = timing.expect("readiness timing");
+        assert_eq!(decoded, record);
+        assert_ne!(timing.capture_generation, 0);
+        assert_ne!(timing.ready_monotonic_ns, 0);
+        assert!(timing.read_poll_monotonic_ns >= timing.ready_monotonic_ns);
+        assert!(timing.first_read_monotonic_ns >= timing.read_poll_monotonic_ns);
+    }
+
+    #[tokio::test]
+    async fn async_object_frame_writer_handles_partial_vectored_writes_and_flushes_once() {
+        struct PartialVectoredWriter {
+            bytes: Vec<u8>,
+            max_write_bytes: usize,
+            scalar_writes: usize,
+            vectored_writes: usize,
+            flushes: usize,
+            bytes_at_flush: Option<usize>,
+        }
+
+        impl tokio::io::AsyncWrite for PartialVectoredWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.scalar_writes += 1;
+                let accepted = self.max_write_bytes.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..accepted]);
+                std::task::Poll::Ready(Ok(accepted))
+            }
+
+            fn poll_write_vectored(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bufs: &[std::io::IoSlice<'_>],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.vectored_writes += 1;
+                let mut accepted = 0_usize;
+                for buf in bufs {
+                    let remaining = self.max_write_bytes.saturating_sub(accepted);
+                    if remaining == 0 {
+                        break;
+                    }
+                    let chunk_bytes = remaining.min(buf.len());
+                    self.bytes.extend_from_slice(&buf[..chunk_bytes]);
+                    accepted += chunk_bytes;
+                }
+                std::task::Poll::Ready(Ok(accepted))
+            }
+
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                self.flushes += 1;
+                self.bytes_at_flush = Some(self.bytes.len());
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let record = BundleRecord {
+            name: "partial-vectored-frame".to_string(),
+            payload: Some((0..=255_u8).cycle().take(1024).collect()),
+        };
+        let expected = encode_object_frame_to_vec(&record).expect("expected frame");
+        let mut writer = PartialVectoredWriter {
+            bytes: Vec::new(),
+            max_write_bytes: 7,
+            scalar_writes: 0,
+            vectored_writes: 0,
+            flushes: 0,
+            bytes_at_flush: None,
+        };
+
+        write_object_frame_async(
+            &mut writer,
+            &record,
+            ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .expect("write partial vectored frame");
+
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(writer.scalar_writes, 0);
+        assert!(writer.vectored_writes > 1);
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(writer.bytes_at_flush, Some(writer.bytes.len()));
+    }
+
     #[test]
     fn memory_object_frame_rejects_trailing_bytes() {
         let record = BundleRecord {
@@ -1574,6 +2357,36 @@ mod serde_bytes_tests {
             "budget rejection should happen before reading the frame body"
         );
         assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_async_object_frame_rejects_length_before_body_read() {
+        let mut frame = super::object_frame_len_prefix(8)
+            .expect("frame prefix")
+            .to_vec();
+        frame.extend_from_slice(b"abcdefgh");
+        let mut cursor = Cursor::new(frame);
+
+        let error = super::read_object_frame_async_with_max_bytes::<_, BundleRecord>(
+            &mut cursor,
+            ObjectFrameIoOptions::none(),
+            4,
+        )
+        .await
+        .expect_err("frame exceeds carrier limit");
+
+        assert_eq!(
+            error,
+            NetworkError::FrameTooLarge {
+                actual_bytes: 8,
+                max_bytes: 4,
+            }
+        );
+        assert_eq!(
+            cursor.position(),
+            12,
+            "carrier limit must reject immediately after the SOF2 length prefix"
+        );
     }
 
     #[cfg(target_pointer_width = "64")]

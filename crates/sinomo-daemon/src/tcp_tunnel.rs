@@ -1,13 +1,22 @@
 use crate::{AuthenticatedDaemonCommand, DaemonError, DaemonPaths, daemon_rpc_body_sha256};
-use sinomo_core::cluster::read_cluster_state_without_kv;
+use sinomo_core::cluster::{read_cluster_state_cached_shared, read_cluster_state_without_kv};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    AsyncDaemonControlStream, CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
-    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterEndpointSelectionPurpose, ClusterTcpTunnelFrame,
-    ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse, DaemonRpcTimeouts,
-    NetworkDeliveryState, NetworkDuplexStream, NetworkError, NetworkHealthPolicy,
-    NetworkTimeoutPhase, ObjectFrameIoOptions, ObjectRpcRequest, ObjectRpcResponse,
-    read_object_frame_async, write_object_frame_async,
+    AsyncDaemonControlStream, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+    CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY,
+    ClusterEndpointSelectionPurpose, ClusterTcpTunnelFrame, ClusterTcpTunnelHandshakeProof,
+    ClusterTcpTunnelHandshakeTranscript, ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
+    DaemonRpcTimeouts, MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, NetworkDeliveryState,
+    NetworkDuplexStream, NetworkError, NetworkHealthPolicy, NetworkTimeoutPhase,
+    ObjectFrameIoOptions, ObjectFrameReadTiming, ObjectFrameReadinessProbe, ObjectRpcChannelClient,
+    ObjectRpcChannelConfig, ObjectRpcChannelEgress, ObjectRpcChannelEndpoint,
+    ObjectRpcChannelIngress, ObjectRpcChannelRole, ObjectRpcChannelServer, ObjectRpcRequest,
+    ObjectRpcResponse, SinomoObjectCodec, cached_daemon_signing_public_key,
+    cluster_tcp_tunnel_protocol_supports_object_rpc_channel, daemon_auth_encode_public_key,
+    negotiate_cluster_tcp_tunnel_protocol, network_timeline_flag, read_object_frame_async,
+    read_object_frame_async_with_max_bytes_after_first_byte_timed,
+    sign_cluster_tcp_tunnel_handshake_from_data_dir, verify_cluster_tcp_tunnel_handshake,
+    write_object_frame_async, write_object_frame_async_timed,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{
@@ -19,15 +28,16 @@ use std::io;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 128;
 const TCP_TUNNEL_STREAM_OUTBOUND_CAPACITY: usize = 8;
+const TCP_TUNNEL_PRIORITY_BURST: usize = 8;
 const TCP_TUNNEL_STREAM_CHANNEL_CAPACITY: usize = 256;
 const TCP_TUNNEL_STREAM_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_TUNNEL_STREAM_FRAME_BYTES: usize = 32 * 1024;
@@ -37,10 +47,14 @@ const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 // Tunnel setup is an opportunistic fast path. Fail quickly so the route layer
 // can use the ordinary direct endpoint within its five-second network budget.
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+const TCP_TUNNEL_FRAME_NO_PROGRESS_TIMEOUT: Duration =
+    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
 // Real endpoints reserve most of their attempt for direct fallback when a
 // cached tunnel is stale; synthetic tunnel-only endpoints do not use this cap.
 const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str =
     sinomo_core::network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX;
+const TCP_TUNNEL_V2_HANDSHAKE_UNAVAILABLE_DETAIL: &str =
+    "peer did not provide an authenticated tcp tunnel v2 handshake";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TcpTunnelDirection {
@@ -50,13 +64,12 @@ enum TcpTunnelDirection {
 
 type PendingTcpTunnelStreamOpenMap =
     Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), NetworkError>>>>>;
-type ActiveTcpTunnelStreamMap = Arc<Mutex<HashMap<u64, ActiveTcpTunnelStream>>>;
+type ActiveTcpTunnelStreamMap = Arc<Mutex<HashMap<u64, Arc<ActiveTcpTunnelStream>>>>;
 
-#[derive(Clone)]
 struct ActiveTcpTunnelStream {
     tx: mpsc::Sender<TcpTunnelStreamEvent>,
     reset: watch::Sender<bool>,
-    remote_finished: Arc<AtomicBool>,
+    remote_finished: AtomicBool,
 }
 
 enum TcpTunnelStreamEvent {
@@ -79,18 +92,79 @@ pub(crate) fn request_tcp_tunnel_maintenance_refresh() {
     TCP_TUNNEL_MAINTENANCE_NOTIFY.notify_one();
 }
 
+fn tcp_tunnel_close_signal() -> watch::Sender<Option<String>> {
+    let (close, _) = watch::channel(None);
+    close
+}
+
+pub(crate) fn network_perf_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SINOMO_NETWORK_PERF_TRACE").as_deref() == Ok("1"))
+}
+
+pub(crate) fn network_perf_trace_elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Default)]
 struct TcpTunnelRegistry {
     peers: Mutex<BTreeMap<NodeId, Arc<TcpTunnelHandle>>>,
     connect_locks: Mutex<BTreeMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+struct TcpTunnelConnectLockLease<'a> {
+    registry: &'a TcpTunnelRegistry,
+    node_id: NodeId,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for TcpTunnelConnectLockLease<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .remove_connect_lock_if_unused(&self.node_id, &self.lock);
+    }
+}
+
 impl TcpTunnelRegistry {
     fn get(&self, node_id: &NodeId) -> Option<Arc<TcpTunnelHandle>> {
-        self.peers
-            .lock()
-            .ok()
-            .and_then(|peers| peers.get(node_id).cloned())
+        let mut peers = self.peers.lock().ok()?;
+        let handle = peers.get(node_id).cloned()?;
+        if handle.closing.load(Ordering::Acquire) {
+            if peers
+                .get(node_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                peers.remove(node_id);
+            }
+            return None;
+        }
+        let closed_channel_detail = handle
+            .object_rpc_channel_client
+            .as_ref()
+            .filter(|_| {
+                cluster_tcp_tunnel_protocol_supports_object_rpc_channel(handle.protocol_version)
+            })
+            .and_then(|client| {
+                client.is_closed().then(|| {
+                    client
+                        .close_detail()
+                        .unwrap_or_else(|| "logical object RPC channel closed".to_string())
+                })
+            });
+        if let Some(channel_detail) = closed_channel_detail {
+            if peers
+                .get(node_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                peers.remove(node_id);
+            }
+            drop(peers);
+            let detail = format!("retiring v2 tcp tunnel after {channel_detail}");
+            tracing::info!(peer_node_id = %node_id, %detail, "sinomo tcp tunnel logical channel retired");
+            handle.request_close(detail);
+            return None;
+        }
+        Some(handle)
     }
 
     fn contains(&self, node_id: &NodeId) -> bool {
@@ -108,6 +182,30 @@ impl TcpTunnelRegistry {
             .entry(node_id.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn connect_lock_lease(&self, node_id: &NodeId) -> TcpTunnelConnectLockLease<'_> {
+        TcpTunnelConnectLockLease {
+            registry: self,
+            node_id: node_id.clone(),
+            lock: self.connect_lock(node_id),
+        }
+    }
+
+    fn remove_connect_lock_if_unused(&self, node_id: &NodeId, lock: &Arc<tokio::sync::Mutex<()>>) {
+        let Ok(mut connect_locks) = self.connect_locks.lock() else {
+            return;
+        };
+        let removable = connect_locks.get(node_id).is_some_and(|current| {
+            Arc::ptr_eq(current, lock)
+                // One reference is retained by the map and one by this lease.
+                // Any holder or waiter owns another lease and keeps the
+                // singleflight lock registered until it has finished.
+                && Arc::strong_count(current) == 2
+        });
+        if removable {
+            connect_locks.remove(node_id);
+        }
     }
 
     fn insert_or_existing(&self, handle: Arc<TcpTunnelHandle>) -> Result<(), Arc<TcpTunnelHandle>> {
@@ -133,7 +231,22 @@ impl TcpTunnelRegistry {
             if !claimed_close && !existing.clean_shutdown.load(Ordering::Acquire) {
                 return Err(existing);
             }
-            if existing.active_streams.load(Ordering::Acquire) > 0 {
+            // A canonical v2 connection must win even while the reverse v2
+            // carrier has logical or fallback-stream activity. The peer may
+            // already have replaced its half of that reverse connection;
+            // rejecting the canonical socket here would then close both
+            // retained halves and make maintenance repeat the same
+            // unavailable/reconnect cycle. Work on the retired carrier can
+            // fail through the normal route semantics, while installing the
+            // canonical carrier makes later calls stable. A protocol-v1
+            // legacy stream is still protected because it has no multiplexed
+            // carrier to converge onto.
+            let both_v2 =
+                cluster_tcp_tunnel_protocol_supports_object_rpc_channel(existing.protocol_version)
+                    && cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
+                        handle.protocol_version,
+                    );
+            if existing.active_streams.load(Ordering::Acquire) > 0 && !both_v2 {
                 if claimed_close {
                     existing.closing.store(false, Ordering::Release);
                 }
@@ -182,6 +295,24 @@ impl TcpTunnelRegistry {
         removed
     }
 
+    fn close_all(&self, detail: &str) -> usize {
+        let handles = self
+            .peers
+            .lock()
+            .map(|mut peers| {
+                std::mem::take(&mut *peers)
+                    .into_values()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let closed = handles.len();
+        for handle in handles {
+            handle.request_close(detail.to_string());
+            handle.fail_streams(detail);
+        }
+        closed
+    }
+
     fn peer_ids(&self) -> Vec<NodeId> {
         self.peers
             .lock()
@@ -216,7 +347,79 @@ pub(crate) fn insert_test_tcp_tunnel(node_id: NodeId, tx: mpsc::Sender<ClusterTc
         active_streams: AtomicUsize::new(0),
         closing: AtomicBool::new(false),
         clean_shutdown: AtomicBool::new(false),
+        close_signal: tcp_tunnel_close_signal(),
         canonical_direction: true,
+        protocol_version: 1,
+        object_rpc_channel_client: None,
+        object_rpc_channel_ingress: None,
+        object_rpc_channel_server: Mutex::new(None),
+    });
+    TCP_TUNNELS.insert(handle);
+}
+
+#[cfg(test)]
+pub(crate) fn insert_test_tcp_tunnel_object_rpc_channel(node_id: NodeId) -> ObjectRpcChannelClient {
+    let endpoint = ObjectRpcChannelEndpoint::new(
+        ObjectRpcChannelRole::Dialer,
+        ObjectRpcChannelConfig::default(),
+    )
+    .expect("test tcp tunnel object RPC channel");
+    let ObjectRpcChannelEndpoint {
+        client,
+        server,
+        ingress,
+        egress: _egress,
+    } = endpoint;
+    let (tx, _rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
+    let (stream_tx, _stream_rx) = mpsc::channel(TCP_TUNNEL_STREAM_OUTBOUND_CAPACITY);
+    let handle = Arc::new(TcpTunnelHandle {
+        peer_node_id: node_id,
+        tx,
+        stream_tx,
+        pending_stream_opens: Arc::new(Mutex::new(HashMap::new())),
+        streams: Arc::new(Mutex::new(HashMap::new())),
+        stream_queued_bytes: Arc::new(Semaphore::new(TCP_TUNNEL_STREAM_QUEUED_BYTES)),
+        next_stream_id: AtomicU64::new(2),
+        local_stream_id_parity: 0,
+        active_streams: AtomicUsize::new(0),
+        closing: AtomicBool::new(false),
+        clean_shutdown: AtomicBool::new(false),
+        close_signal: tcp_tunnel_close_signal(),
+        canonical_direction: true,
+        protocol_version: CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+        object_rpc_channel_client: Some(client.clone()),
+        object_rpc_channel_ingress: Some(ingress),
+        object_rpc_channel_server: Mutex::new(Some(server)),
+    });
+    TCP_TUNNELS.insert(handle);
+    client
+}
+
+#[cfg(test)]
+pub(crate) fn insert_test_tcp_tunnel_object_rpc_channel_client(
+    node_id: NodeId,
+    client: ObjectRpcChannelClient,
+) {
+    let (tx, _rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
+    let (stream_tx, _stream_rx) = mpsc::channel(TCP_TUNNEL_STREAM_OUTBOUND_CAPACITY);
+    let handle = Arc::new(TcpTunnelHandle {
+        peer_node_id: node_id,
+        tx,
+        stream_tx,
+        pending_stream_opens: Arc::new(Mutex::new(HashMap::new())),
+        streams: Arc::new(Mutex::new(HashMap::new())),
+        stream_queued_bytes: Arc::new(Semaphore::new(TCP_TUNNEL_STREAM_QUEUED_BYTES)),
+        next_stream_id: AtomicU64::new(2),
+        local_stream_id_parity: 0,
+        active_streams: AtomicUsize::new(0),
+        closing: AtomicBool::new(false),
+        clean_shutdown: AtomicBool::new(false),
+        close_signal: tcp_tunnel_close_signal(),
+        canonical_direction: true,
+        protocol_version: CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+        object_rpc_channel_client: Some(client),
+        object_rpc_channel_ingress: None,
+        object_rpc_channel_server: Mutex::new(None),
     });
     TCP_TUNNELS.insert(handle);
 }
@@ -226,6 +429,53 @@ pub(crate) fn remove_test_tcp_tunnel(node_id: &NodeId) {
     if let Some(handle) = TCP_TUNNELS.remove(node_id) {
         handle.request_close("test cleanup".to_string());
     }
+}
+
+/// Returns the cloneable logical channel carried by the peer's negotiated v2
+/// tunnel. A v1 fallback tunnel deliberately exposes only legacy streams.
+pub(crate) fn tcp_tunnel_object_rpc_channel_client(
+    peer_node_id: &NodeId,
+) -> Option<ObjectRpcChannelClient> {
+    TCP_TUNNELS.get(peer_node_id).and_then(|handle| {
+        (!handle.closing.load(Ordering::Acquire))
+            .then(|| handle.object_rpc_channel_client.clone())
+            .flatten()
+            .filter(|client| !client.is_closed())
+    })
+}
+
+/// Returns the peer's healthy logical object-RPC channel, rebuilding the
+/// authenticated physical tunnel on a cold lookup miss. The registry's
+/// singleflight lock bounds concurrent reconnects; steady-state calls still
+/// complete through the memory-only lookup above.
+pub(crate) async fn ensure_tcp_tunnel_object_rpc_channel_client(
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+    health: NetworkHealthPolicy,
+) -> Result<Option<ObjectRpcChannelClient>, NetworkError> {
+    if let Some(client) = tcp_tunnel_object_rpc_channel_client(&endpoint.node_id) {
+        return Ok(Some(client));
+    }
+    let handle = connect_tcp_tunnel_to_endpoint_with_timeout(
+        endpoint,
+        runtime,
+        paths,
+        health.connect_timeout.min(TCP_TUNNEL_CONNECT_TIMEOUT),
+    )
+    .await?;
+    Ok(handle
+        .object_rpc_channel_client
+        .clone()
+        .filter(|client| !client.is_closed()))
+}
+
+/// Retires every physical tunnel authenticated under the current cluster
+/// identity. Callers invoke this only from a cluster identity transition or
+/// after observing an unsettled/orphaned cluster state; ordinary per-RPC
+/// lookups remain memory-only.
+pub(crate) fn close_all_tcp_tunnels_for_cluster_transition(detail: &str) -> usize {
+    TCP_TUNNELS.close_all(detail)
 }
 
 struct TcpTunnelHandle {
@@ -240,7 +490,12 @@ struct TcpTunnelHandle {
     active_streams: AtomicUsize,
     closing: AtomicBool,
     clean_shutdown: AtomicBool,
+    close_signal: watch::Sender<Option<String>>,
     canonical_direction: bool,
+    protocol_version: u16,
+    object_rpc_channel_client: Option<ObjectRpcChannelClient>,
+    object_rpc_channel_ingress: Option<ObjectRpcChannelIngress>,
+    object_rpc_channel_server: Mutex<Option<ObjectRpcChannelServer>>,
 }
 
 struct TcpTunnelDuplexStream {
@@ -285,10 +540,25 @@ impl Drop for TcpTunnelDuplexStream {
 }
 
 impl TcpTunnelHandle {
-    fn request_close(&self, detail: String) {
+    fn signal_physical_close(&self, detail: String) {
         self.closing.store(true, Ordering::Release);
+        self.close_signal.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(detail.clone());
+                true
+            }
+        });
+    }
+
+    fn request_close(self: &Arc<Self>, detail: String) {
         self.clean_shutdown.store(true, Ordering::Relaxed);
-        let _ = self.tx.try_send(ClusterTcpTunnelFrame::Close { detail });
+        // Registry reads reject the closing handle immediately, while the
+        // writer observes this signal independently of the bounded control
+        // lane. Do not lock the registry here: canonical replacement calls
+        // this method while holding its registry lock.
+        self.signal_physical_close(detail);
     }
 
     fn allocate_stream_id(&self) -> Result<u64, NetworkError> {
@@ -356,27 +626,52 @@ impl TcpTunnelHandle {
             })?
             .insert(id, accepted_tx);
         let deadline = tokio::time::Instant::now() + health.connect_timeout;
+        let open_started = network_perf_trace_enabled().then(Instant::now);
         let send_result = tokio::time::timeout_at(
             deadline,
             self.tx.send(ClusterTcpTunnelFrame::StreamOpen { id }),
         )
         .await;
+        if let Some(started) = open_started {
+            tracing::info!(
+                target: "sinomo.network.perf",
+                stage = "tcp_tunnel_stream_open",
+                target_node_id = %self.peer_node_id,
+                stream_id = id,
+                ok = matches!(&send_result, Ok(Ok(()))),
+                elapsed_us = network_perf_trace_elapsed_us(started),
+            );
+        }
         let error = match send_result {
-            Ok(Ok(())) => match tokio::time::timeout_at(deadline, accepted_rx).await {
-                Ok(Ok(Ok(()))) => return Ok(Box::new(stream)),
-                Ok(Ok(Err(error))) => error,
-                Ok(Err(_)) => NetworkError::delivery_failed(
-                    "open tcp tunnel stream",
-                    NetworkDeliveryState::DefinitelyNotSent,
-                    "tunnel reader stopped before stream acceptance",
-                ),
-                Err(_) => tcp_tunnel_timeout_error(
-                    "accept tcp tunnel stream",
-                    health.connect_timeout,
-                    NetworkTimeoutPhase::Connect,
-                    NetworkDeliveryState::DefinitelyNotSent,
-                ),
-            },
+            Ok(Ok(())) => {
+                let accept_started = network_perf_trace_enabled().then(Instant::now);
+                let accept_result = tokio::time::timeout_at(deadline, accepted_rx).await;
+                if let Some(started) = accept_started {
+                    tracing::info!(
+                        target: "sinomo.network.perf",
+                        stage = "tcp_tunnel_stream_accept",
+                        target_node_id = %self.peer_node_id,
+                        stream_id = id,
+                        ok = matches!(&accept_result, Ok(Ok(Ok(())))),
+                        elapsed_us = network_perf_trace_elapsed_us(started),
+                    );
+                }
+                match accept_result {
+                    Ok(Ok(Ok(()))) => return Ok(Box::new(stream)),
+                    Ok(Ok(Err(error))) => error,
+                    Ok(Err(_)) => NetworkError::delivery_failed(
+                        "open tcp tunnel stream",
+                        NetworkDeliveryState::DefinitelyNotSent,
+                        "tunnel reader stopped before stream acceptance",
+                    ),
+                    Err(_) => tcp_tunnel_timeout_error(
+                        "accept tcp tunnel stream",
+                        health.connect_timeout,
+                        NetworkTimeoutPhase::Connect,
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ),
+                }
+            }
             Ok(Err(_)) => NetworkError::delivery_failed(
                 "open tcp tunnel stream",
                 NetworkDeliveryState::DefinitelyNotSent,
@@ -417,12 +712,11 @@ impl TcpTunnelHandle {
         let (stream_tx, mut stream_rx) =
             mpsc::channel::<TcpTunnelStreamEvent>(TCP_TUNNEL_STREAM_CHANNEL_CAPACITY);
         let (reset, _) = watch::channel(false);
-        let remote_finished = Arc::new(AtomicBool::new(false));
-        let active = ActiveTcpTunnelStream {
+        let active = Arc::new(ActiveTcpTunnelStream {
             tx: stream_tx,
             reset: reset.clone(),
-            remote_finished: Arc::clone(&remote_finished),
-        };
+            remote_finished: AtomicBool::new(false),
+        });
         let inserted = self
             .streams
             .lock()
@@ -447,11 +741,16 @@ impl TcpTunnelHandle {
             let outbound_handle = Arc::clone(&handle);
             let mut outbound_reset = stream_reset.subscribe();
             let outbound_pump = async move {
-                let mut bytes = vec![0_u8; TCP_TUNNEL_STREAM_FRAME_BYTES];
                 loop {
                     if *outbound_reset.borrow() {
                         break;
                     }
+                    // Read directly into the Vec transferred to the physical
+                    // writer. The previous fixed scratch buffer required a
+                    // second allocation and copy for every 32 KiB fragment.
+                    let mut bytes = Vec::with_capacity(TCP_TUNNEL_STREAM_FRAME_BYTES);
+                    let mut bounded_outbound =
+                        (&mut outbound).take(TCP_TUNNEL_STREAM_FRAME_BYTES as u64);
                     let read_result = tokio::select! {
                         changed = outbound_reset.changed() => {
                             if changed.is_err() || *outbound_reset.borrow() {
@@ -459,7 +758,7 @@ impl TcpTunnelHandle {
                             }
                             continue;
                         }
-                        result = outbound.read(&mut bytes) => result,
+                        result = bounded_outbound.read_buf(&mut bytes) => result,
                     };
                     let read = match read_result {
                         Ok(read) => read,
@@ -481,12 +780,10 @@ impl TcpTunnelHandle {
                         }
                         break;
                     }
+                    debug_assert!(bytes.len() <= TCP_TUNNEL_STREAM_FRAME_BYTES);
                     let send = outbound_handle
                         .stream_tx
-                        .send(ClusterTcpTunnelFrame::StreamData {
-                            id,
-                            bytes: bytes[..read].to_vec(),
-                        });
+                        .send(ClusterTcpTunnelFrame::StreamData { id, bytes });
                     tokio::select! {
                         changed = outbound_reset.changed() => {
                             if changed.is_err() || *outbound_reset.borrow() {
@@ -574,7 +871,7 @@ impl TcpTunnelHandle {
         }
     }
 
-    async fn deliver_stream_data(&self, id: u64, bytes: Vec<u8>) {
+    fn deliver_stream_data(&self, id: u64, bytes: Vec<u8>) {
         if bytes.is_empty() || bytes.len() > TCP_TUNNEL_STREAM_FRAME_BYTES {
             self.abort_stream(
                 id,
@@ -603,28 +900,19 @@ impl TcpTunnelHandle {
             return;
         }
         let permit_count = bytes.len() as u32;
-        let queued_bytes =
-            match Arc::clone(&self.stream_queued_bytes).try_acquire_many_owned(permit_count) {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let wait_started = std::time::Instant::now();
-                    let Ok(permit) = Arc::clone(&self.stream_queued_bytes)
-                        .acquire_many_owned(permit_count)
-                        .await
-                    else {
-                        self.abort_stream(id, "tcp tunnel aggregate stream receive window closed");
-                        return;
-                    };
-                    tracing::debug!(
-                        target: "sinomo.network.tcp_tunnel",
-                        stream_id = id,
-                        frame_bytes = permit_count,
-                        wait_us = wait_started.elapsed().as_micros() as u64,
-                        "tcp tunnel stream data waited for aggregate receive capacity"
+        let queued_bytes = match Arc::clone(&self.stream_queued_bytes)
+            .try_acquire_many_owned(permit_count)
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.reset_stream_after_receive_overflow(
+                        id,
+                        &active,
+                        "tcp tunnel aggregate stream receive capacity exhausted; current frame was not delivered",
                     );
-                    permit
-                }
-            };
+                return;
+            }
+        };
         if *active.reset.borrow() {
             return;
         }
@@ -638,21 +926,50 @@ impl TcpTunnelHandle {
         };
         match active.tx.try_send(event) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(event)) => {
-                let wait_started = std::time::Instant::now();
-                if active.tx.send(event).await.is_err() {
-                    self.abort_stream(id, "tcp tunnel stream receiver closed during admission");
-                    return;
-                }
-                tracing::debug!(
-                    target: "sinomo.network.tcp_tunnel",
-                    stream_id = id,
-                    wait_us = wait_started.elapsed().as_micros() as u64,
-                    "tcp tunnel stream data waited for per-stream receive capacity"
+            Err(mpsc::error::TrySendError::Full(_event)) => {
+                self.reset_stream_after_receive_overflow(
+                    id,
+                    &active,
+                    "tcp tunnel stream receive queue saturated; current frame was not delivered",
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.abort_stream(id, "tcp tunnel stream receiver closed during admission");
+            }
+        }
+    }
+
+    fn reset_stream_after_receive_overflow(
+        &self,
+        id: u64,
+        active: &ActiveTcpTunnelStream,
+        detail: &'static str,
+    ) {
+        // The physical tunnel reader must never await one logical stream's
+        // application backpressure: doing so prevents it from decoding reset,
+        // control, and object-RPC frames for every other stream. Once a byte
+        // frame cannot enter either bounded receive window, continuing the byte
+        // stream would create a gap. Reset only that stream and report that the
+        // rejected frame was not delivered.
+        if active.reset.send_replace(true) {
+            return;
+        }
+        let _ = active.tx.try_send(TcpTunnelStreamEvent::Reset);
+        let reset = ClusterTcpTunnelFrame::StreamReset {
+            id,
+            detail: detail.to_string(),
+        };
+        match self.tx.try_send(reset) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(reset)) => {
+                // At most one task is created for each stream: send_replace
+                // above atomically suppresses repeated overflow resets. This
+                // keeps reset delivery independent of the physical reader while
+                // bounding both tasks and retained frames by the 64-stream cap.
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(reset).await;
+                });
             }
         }
     }
@@ -734,6 +1051,9 @@ impl TcpTunnelHandle {
     }
 
     fn fail_streams(&self, detail: &str) {
+        if let Some(ingress) = self.object_rpc_channel_ingress.as_ref() {
+            ingress.close(detail.to_string());
+        }
         let pending = self
             .pending_stream_opens
             .lock()
@@ -881,6 +1201,54 @@ fn tcp_tunnel_maintenance_interval(
         .min(idle_interval)
 }
 
+async fn sign_tcp_tunnel_handshake_proof_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &DaemonPaths,
+    authenticated: &AuthenticatedDaemonCommand,
+    request: &ObjectRpcRequest,
+    requested_protocol_version: u16,
+    negotiated_protocol_version: u16,
+    cluster_state: &sinomo_core::ClusterBootstrapState,
+) -> Result<ClusterTcpTunnelHandshakeProof, NetworkError> {
+    let auth = request.auth.as_deref().ok_or(NetworkError::AuthDenied)?;
+    let signed_open: crate::SignedDaemonCommand = SinomoObjectCodec::default().decode(auth)?;
+    let requester_public_key = daemon_auth_encode_public_key(&signed_open.public_key);
+    if signed_open.node_id != authenticated.signer_node_id
+        || requester_public_key != authenticated.signer_public_key
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let data_dir = tcp_tunnel_signing_data_dir(Some(paths))?;
+    let requester_node_id = signed_open.node_id;
+    let dialer_nonce = signed_open.nonce;
+    let responder_node_id = cluster_state.local_node_id.to_string();
+    let cluster_context = Some(cluster_state.cluster_id.to_string());
+    runtime
+        .spawn_blocking(move || {
+            let responder_public_key =
+                daemon_auth_encode_public_key(&cached_daemon_signing_public_key(&data_dir)?);
+            sign_cluster_tcp_tunnel_handshake_from_data_dir(
+                &data_dir,
+                ClusterTcpTunnelHandshakeTranscript {
+                    protocol: CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL.to_string(),
+                    requester_node_id,
+                    requester_public_key,
+                    responder_node_id,
+                    responder_public_key,
+                    requested_protocol_version,
+                    negotiated_protocol_version,
+                    dialer_nonce,
+                    cluster_context,
+                },
+            )
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "sign tcp tunnel handshake".to_string(),
+            detail: format!("signing task failed: {source}"),
+        })?
+}
+
 pub(crate) async fn accept_tcp_tunnel_connection_async(
     mut stream: tokio::net::TcpStream,
     paths: DaemonPaths,
@@ -889,7 +1257,8 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
     request: ObjectRpcRequest,
 ) -> Result<(), DaemonError> {
     let open: ClusterTcpTunnelOpenRequest = request.decode_body().map_err(DaemonError::from)?;
-    if open.protocol_version != CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION {
+    let Some(protocol_version) = negotiate_cluster_tcp_tunnel_protocol(open.protocol_version)
+    else {
         let response = ObjectRpcResponse::encode_error(
             CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
             format!("unsupported tcp tunnel protocol {}", open.protocol_version),
@@ -899,22 +1268,58 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
             .await
             .map_err(DaemonError::from)?;
         return Ok(());
-    }
+    };
     let peer_node_id =
         NodeId::from_str(&authenticated.signer_node_id).map_err(|source| DaemonError::Network {
             address: authenticated.signer_node_id.clone(),
             detail: format!("invalid tcp tunnel peer node id: {source}"),
         })?;
-    let mut response = ObjectRpcResponse::encode_body(
-        CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
-        &ClusterTcpTunnelOpenResponse::accepted(),
-    )
-    .map_err(DaemonError::from)?;
+    let connectivity_endpoint = tcp_tunnel_connectivity_context(&paths, &peer_node_id);
+    let handshake_proof = if cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
+        protocol_version,
+    ) {
+        let Some((_, cluster_state, _)) = connectivity_endpoint.as_ref() else {
+            let response = ObjectRpcResponse::encode_error(
+                CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+                format!(
+                    "unsupported tcp tunnel protocol {protocol_version}: cluster identity unavailable for authenticated v2 handshake"
+                ),
+            )
+            .map_err(DaemonError::from)?;
+            write_object_frame_async(&mut stream, &response, ObjectFrameIoOptions::default())
+                .await
+                .map_err(DaemonError::from)?;
+            return Ok(());
+        };
+        Some(
+            sign_tcp_tunnel_handshake_proof_async(
+                &service_runtime,
+                &paths,
+                &authenticated,
+                &request,
+                open.protocol_version,
+                protocol_version,
+                cluster_state,
+            )
+            .await
+            .map_err(DaemonError::from)?,
+        )
+    } else {
+        None
+    };
+    let open_response = match handshake_proof {
+        Some(proof) => {
+            ClusterTcpTunnelOpenResponse::accepted_version_with_handshake(protocol_version, proof)
+        }
+        None => ClusterTcpTunnelOpenResponse::accepted_version(protocol_version),
+    };
+    let mut response =
+        ObjectRpcResponse::encode_body(CLUSTER_TCP_TUNNEL_OPEN_ROUTE, &open_response)
+            .map_err(DaemonError::from)?;
     crate::service_adapter::mark_daemon_rpc_response_responder(&paths, &mut response);
     write_object_frame_async(&mut stream, &response, ObjectFrameIoOptions::default())
         .await
         .map_err(DaemonError::from)?;
-    let connectivity_endpoint = tcp_tunnel_connectivity_context(&paths, &peer_node_id);
     let tunnel_record_endpoint = connectivity_endpoint
         .as_ref()
         .map(|(_, _, endpoint)| endpoint.clone());
@@ -925,7 +1330,8 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
         service_runtime.clone(),
         tunnel_record_endpoint,
         TcpTunnelDirection::Inbound,
-    );
+        protocol_version,
+    )?;
     if let Some((cluster_paths, cluster_state, endpoint)) = connectivity_endpoint.as_ref() {
         crate::cluster::remember_cluster_tunnel_connectivity(
             cluster_paths,
@@ -1052,7 +1458,7 @@ async fn ping_tcp_tunnel_peer(
                 detail: source.to_string(),
             }
         })?;
-    let state = read_cluster_state_without_kv(&cluster_paths)?;
+    let state = read_cluster_state_cached_shared(&cluster_paths)?;
     let mut host =
         crate::client::DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_paths(paths);
     let result =
@@ -1118,12 +1524,66 @@ fn tcp_tunnel_direction_is_canonical_for_paths(
         })
 }
 
+fn tcp_tunnel_cluster_state_is_settled(state: &sinomo_core::ClusterBootstrapState) -> bool {
+    state.cluster_id.as_str() != sinomo_core::cluster::PENDING_INVITE_CLUSTER_ID
+        && !sinomo_core::network::cluster_state_needs_join_registration(state)
+}
+
+fn tcp_tunnel_registry_accepts_cluster_state(
+    registry: &TcpTunnelRegistry,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> bool {
+    if tcp_tunnel_cluster_state_is_settled(state) {
+        return true;
+    }
+    registry.close_all("local cluster state became pending; retiring authenticated tcp tunnels");
+    false
+}
+
+fn tcp_tunnel_peer_is_authorized(
+    state: &sinomo_core::ClusterBootstrapState,
+    peer_node_id: &NodeId,
+) -> bool {
+    state.members.iter().any(|member| {
+        member.cluster_id == state.cluster_id
+            && member.node_id == *peer_node_id
+            && member.state.is_authorized()
+    })
+}
+
 async fn maintain_tcp_tunnels_once(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<TcpTunnelMaintenanceOutcome, DaemonError> {
     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths)?;
-    let state = read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
+    match read_cluster_state_without_kv(&cluster_paths) {
+        Ok(state) if tcp_tunnel_registry_accepts_cluster_state(&TCP_TUNNELS, &state) => {}
+        Ok(state) => {
+            return Ok(TcpTunnelMaintenanceOutcome {
+                local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+                state: TcpTunnelMaintenanceState::Quiescent,
+            });
+        }
+        Err(NetworkError::ClusterOrphan) => {
+            close_all_tcp_tunnels_for_cluster_transition(
+                "local cluster state became uninitialized; retiring authenticated tcp tunnels",
+            );
+            return Ok(TcpTunnelMaintenanceOutcome {
+                local_node_role: ClusterNodeRole::default(),
+                state: TcpTunnelMaintenanceState::Quiescent,
+            });
+        }
+        Err(error) => {
+            close_all_tcp_tunnels_for_cluster_transition(
+                "local cluster state became unreadable; retiring authenticated tcp tunnels",
+            );
+            return Err(DaemonError::from(error));
+        }
+    }
+    // Membership authority is committed in cluster KV and can intentionally
+    // diverge from the bootstrap state file. Use the merged resident snapshot
+    // for every peer authorization and route choice in this maintenance pass.
+    let state = read_cluster_state_cached_shared(&cluster_paths).map_err(DaemonError::from)?;
     let local_node_role = sinomo_core::network::cluster_local_node_role(&state);
     prune_stale_tcp_tunnel_connectivity(paths, runtime).await?;
     let selector = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state);
@@ -1139,6 +1599,14 @@ async fn maintain_tcp_tunnels_once(
     let mut live_peers = BTreeSet::new();
     for peer_node_id in TCP_TUNNELS.peer_ids() {
         if peer_node_id == state.local_node_id {
+            continue;
+        }
+        if !tcp_tunnel_peer_is_authorized(&state, &peer_node_id) {
+            evict_tcp_tunnel_peer(
+                &peer_node_id,
+                "peer is no longer an authorized cluster member".to_string(),
+            )
+            .await;
             continue;
         }
         if TCP_TUNNELS
@@ -1287,8 +1755,8 @@ async fn connect_tcp_tunnel_to_endpoint_with_timeout(
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
-    let connect_lock = TCP_TUNNELS.connect_lock(&endpoint.node_id);
-    let _connect_guard = connect_lock.lock().await;
+    let connect_lock = TCP_TUNNELS.connect_lock_lease(&endpoint.node_id);
+    let _connect_guard = connect_lock.lock.lock().await;
     connect_tcp_tunnel_to_endpoint_after_lock(endpoint, runtime, paths, connect_timeout).await
 }
 
@@ -1301,24 +1769,22 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
-    let mut stream = AsyncDaemonControlStream::connect_with_options(
-        &endpoint.address,
-        DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+    let (stream, protocol_version) = match open_tcp_tunnel_physical_connection(
+        endpoint,
+        runtime,
+        paths,
+        connect_timeout,
+        CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
     )
-    .await?
-    .into_inner();
-    let request = signed_tcp_tunnel_open_request(runtime, paths).await?;
-    write_object_frame_async(&mut stream, &request, ObjectFrameIoOptions::default()).await?;
-    let response: ObjectRpcResponse =
-        read_object_frame_async(&mut stream, ObjectFrameIoOptions::default()).await?;
-    response.error_detail()?;
-    let open: ClusterTcpTunnelOpenResponse = response.decode_body()?;
-    if !open.accepted || open.protocol_version != CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION {
-        return Err(NetworkError::Io {
-            operation: "open tcp tunnel".to_string(),
-            detail: "peer rejected tcp tunnel protocol".to_string(),
-        });
-    }
+    .await
+    {
+        Ok(negotiated) => negotiated,
+        Err(error) if tcp_tunnel_protocol_rejected(&error) => {
+            open_tcp_tunnel_physical_connection(endpoint, runtime, paths, connect_timeout, 1)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
     let paths = paths
         .cloned()
         .or_else(daemon_paths_from_env)
@@ -1333,7 +1799,8 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
         runtime.clone(),
         Some(endpoint.clone()),
         TcpTunnelDirection::Outbound,
-    );
+        protocol_version,
+    )?;
     remember_tcp_tunnel_connectivity(
         &paths,
         endpoint,
@@ -1355,14 +1822,128 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
     Ok(handle)
 }
 
+async fn open_tcp_tunnel_physical_connection(
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+    connect_timeout: Duration,
+    requested_protocol_version: u16,
+) -> Result<(tokio::net::TcpStream, u16), NetworkError> {
+    let mut stream = AsyncDaemonControlStream::connect_with_options(
+        &endpoint.address,
+        DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+    )
+    .await?
+    .into_inner();
+    let request =
+        signed_tcp_tunnel_open_request(runtime, paths, requested_protocol_version).await?;
+    let signed_open: crate::SignedDaemonCommand = SinomoObjectCodec::default()
+        .decode(request.auth.as_deref().ok_or(NetworkError::AuthDenied)?)?;
+    write_object_frame_async(&mut stream, &request, ObjectFrameIoOptions::default()).await?;
+    let response: ObjectRpcResponse =
+        read_object_frame_async(&mut stream, ObjectFrameIoOptions::default()).await?;
+    response.error_detail()?;
+    let open: ClusterTcpTunnelOpenResponse = response.decode_body()?;
+    if !open.accepted
+        || open.protocol_version > requested_protocol_version
+        || negotiate_cluster_tcp_tunnel_protocol(open.protocol_version)
+            != Some(open.protocol_version)
+    {
+        return Err(NetworkError::Io {
+            operation: "open tcp tunnel".to_string(),
+            detail: format!(
+                "peer returned invalid tcp tunnel protocol {} for requested maximum {}",
+                open.protocol_version, requested_protocol_version
+            ),
+        });
+    }
+    if cluster_tcp_tunnel_protocol_supports_object_rpc_channel(open.protocol_version) {
+        let proof = open
+            .handshake_proof
+            .as_ref()
+            .ok_or_else(|| NetworkError::Io {
+                operation: "authenticate tcp tunnel".to_string(),
+                detail: TCP_TUNNEL_V2_HANDSHAKE_UNAVAILABLE_DETAIL.to_string(),
+            })?;
+        let expected = expected_tcp_tunnel_handshake_transcript(
+            endpoint,
+            paths,
+            &signed_open,
+            requested_protocol_version,
+            open.protocol_version,
+        )?;
+        verify_cluster_tcp_tunnel_handshake(proof, &expected)?;
+    }
+    Ok((stream, open.protocol_version))
+}
+
+fn expected_tcp_tunnel_handshake_transcript(
+    endpoint: &ClusterEndpointRecord,
+    paths: Option<&DaemonPaths>,
+    signed_open: &crate::SignedDaemonCommand,
+    requested_protocol_version: u16,
+    negotiated_protocol_version: u16,
+) -> Result<ClusterTcpTunnelHandshakeTranscript, NetworkError> {
+    let data_dir = tcp_tunnel_signing_data_dir(paths)?;
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let state = read_cluster_state_cached_shared(&cluster_paths)?;
+    let requester_public_key = daemon_auth_encode_public_key(&signed_open.public_key);
+    let requester_is_current_local_member = state.members.iter().any(|member| {
+        member.node_id == state.local_node_id
+            && member.cluster_id == state.cluster_id
+            && member.state.is_authorized()
+            && member.node_public_key == requester_public_key
+    });
+    if signed_open.node_id != state.local_node_id.to_string() || !requester_is_current_local_member
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let responder = state
+        .members
+        .iter()
+        .find(|member| {
+            member.node_id == endpoint.node_id
+                && member.cluster_id == state.cluster_id
+                && member.state.is_authorized()
+                && !member.node_public_key.trim().is_empty()
+        })
+        .ok_or(NetworkError::AuthDenied)?;
+    Ok(ClusterTcpTunnelHandshakeTranscript {
+        protocol: CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL.to_string(),
+        requester_node_id: signed_open.node_id.clone(),
+        requester_public_key,
+        responder_node_id: endpoint.node_id.to_string(),
+        responder_public_key: responder.node_public_key.clone(),
+        requested_protocol_version,
+        negotiated_protocol_version,
+        dialer_nonce: signed_open.nonce.clone(),
+        cluster_context: Some(state.cluster_id.to_string()),
+    })
+}
+
+fn tcp_tunnel_protocol_rejected(error: &NetworkError) -> bool {
+    matches!(
+        error,
+        NetworkError::ObjectRpc { route, detail }
+            if route == CLUSTER_TCP_TUNNEL_OPEN_ROUTE
+                && detail.starts_with("unsupported tcp tunnel protocol")
+    ) || matches!(
+        error,
+        NetworkError::Io { operation, detail }
+            if operation == "authenticate tcp tunnel"
+                && detail == TCP_TUNNEL_V2_HANDSHAKE_UNAVAILABLE_DETAIL
+    )
+}
+
 async fn signed_tcp_tunnel_open_request(
     runtime: &tokio::runtime::Handle,
     paths: Option<&DaemonPaths>,
+    protocol_version: u16,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request = ObjectRpcRequest::encode_body(
         CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
         CLUSTER_TCP_TUNNEL_RPC_CATEGORY,
-        &ClusterTcpTunnelOpenRequest::default(),
+        &ClusterTcpTunnelOpenRequest { protocol_version },
     )?;
     request.auth = Some(sign_object_rpc_request_for_local_node(&request, runtime, paths).await?);
     Ok(request)
@@ -1423,7 +2004,8 @@ fn spawn_tcp_tunnel(
     service_runtime: tokio::runtime::Handle,
     connectivity_endpoint: Option<ClusterEndpointRecord>,
     direction: TcpTunnelDirection,
-) -> Arc<TcpTunnelHandle> {
+    protocol_version: u16,
+) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
     let canonical_direction =
         tcp_tunnel_direction_is_canonical_for_paths(&paths, &peer_node_id, direction);
     let local_stream_id_parity = match direction {
@@ -1431,6 +2013,29 @@ fn spawn_tcp_tunnel(
         TcpTunnelDirection::Inbound => 1,
     };
     let first_stream_id = if local_stream_id_parity == 0 { 2 } else { 1 };
+    let channel_role = match direction {
+        TcpTunnelDirection::Outbound => ObjectRpcChannelRole::Dialer,
+        TcpTunnelDirection::Inbound => ObjectRpcChannelRole::Acceptor,
+    };
+    let object_rpc_channel =
+        if cluster_tcp_tunnel_protocol_supports_object_rpc_channel(protocol_version) {
+            Some(ObjectRpcChannelEndpoint::new(
+                channel_role,
+                ObjectRpcChannelConfig::default(),
+            )?)
+        } else {
+            None
+        };
+    let (object_rpc_channel_client, object_rpc_channel_server, object_rpc_channel_ingress, egress) =
+        match object_rpc_channel {
+            Some(ObjectRpcChannelEndpoint {
+                client,
+                server,
+                ingress,
+                egress,
+            }) => (Some(client), Some(server), Some(ingress), Some(egress)),
+            None => (None, None, None, None),
+        };
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
     let (stream_tx, stream_rx) = mpsc::channel(TCP_TUNNEL_STREAM_OUTBOUND_CAPACITY);
@@ -1446,7 +2051,12 @@ fn spawn_tcp_tunnel(
         active_streams: AtomicUsize::new(0),
         closing: AtomicBool::new(false),
         clean_shutdown: AtomicBool::new(false),
+        close_signal: tcp_tunnel_close_signal(),
         canonical_direction,
+        protocol_version,
+        object_rpc_channel_client,
+        object_rpc_channel_ingress,
+        object_rpc_channel_server: Mutex::new(object_rpc_channel_server),
     });
     if let Err(existing) = TCP_TUNNELS.insert_or_existing(handle.clone()) {
         drop(read_half);
@@ -1461,12 +2071,13 @@ fn spawn_tcp_tunnel(
             )
             .await;
         });
-        return existing;
+        return Ok(existing);
     }
     tokio::spawn(tcp_tunnel_writer_loop(
         handle.clone(),
         write_half,
         rx,
+        egress,
         stream_rx,
     ));
     tokio::spawn(tcp_tunnel_reader_loop(
@@ -1476,46 +2087,130 @@ fn spawn_tcp_tunnel(
         service_runtime,
         connectivity_endpoint,
     ));
-    handle
+    Ok(handle)
 }
 
 async fn tcp_tunnel_writer_loop<W>(
     handle: Arc<TcpTunnelHandle>,
     mut write_half: W,
     mut rx: mpsc::Receiver<ClusterTcpTunnelFrame>,
+    mut object_rpc_egress: Option<ObjectRpcChannelEgress>,
     mut stream_rx: mpsc::Receiver<ClusterTcpTunnelFrame>,
 ) where
     W: AsyncWrite + Unpin,
 {
-    let mut control_turn = true;
+    #[derive(Clone, Copy)]
+    enum OutboundLane {
+        Control,
+        ObjectRpc,
+        Stream,
+    }
+
+    let mut close_signal = handle.close_signal.subscribe();
+    let close_requested = async move {
+        loop {
+            if let Some(detail) = close_signal.borrow_and_update().clone() {
+                return detail;
+            }
+            if close_signal.changed().await.is_err() {
+                return "tcp tunnel close signal stopped".to_string();
+            }
+        }
+    };
+    tokio::pin!(close_requested);
+    let mut prefer_control = true;
+    let mut priority_burst = 0_usize;
     loop {
-        // Session data has a separate shallow, byte-bounded queue, so a ping,
-        // open acknowledgement or reset never sits behind a
-        // bulk backlog. Alternate priority while both queues are ready so
-        // sustained control traffic cannot starve a progressing body stream;
-        // data/finish ordering remains FIFO inside the stream queue.
-        let frame = if control_turn {
+        // Keep tunnel control and the ordered object-RPC channel lane ahead of
+        // legacy bulk streams. The channel egress already applies its own
+        // control/data fairness, and keeping all of its frames in one lane
+        // preserves per-call wire order. A fixed burst bound guarantees that
+        // a continuously ready priority lane cannot starve legacy streams.
+        let (frame, lane) = if priority_burst >= TCP_TUNNEL_PRIORITY_BURST {
+            if prefer_control {
+                tokio::select! {
+                    biased;
+                    detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
+                    frame = stream_rx.recv() => (frame, OutboundLane::Stream),
+                    frame = rx.recv() => (frame, OutboundLane::Control),
+                    frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
+                    frame = stream_rx.recv() => (frame, OutboundLane::Stream),
+                    frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
+                    frame = rx.recv() => (frame, OutboundLane::Control),
+                }
+            }
+        } else if prefer_control {
             tokio::select! {
                 biased;
-                frame = rx.recv() => frame,
-                frame = stream_rx.recv() => frame,
+                detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
+                frame = rx.recv() => (frame, OutboundLane::Control),
+                frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
+                frame = stream_rx.recv() => (frame, OutboundLane::Stream),
             }
         } else {
             tokio::select! {
                 biased;
-                frame = stream_rx.recv() => frame,
-                frame = rx.recv() => frame,
+                detail = &mut close_requested => (Some(ClusterTcpTunnelFrame::Close { detail }), OutboundLane::Control),
+                frame = next_tcp_tunnel_object_rpc_frame(&mut object_rpc_egress) => (frame, OutboundLane::ObjectRpc),
+                frame = rx.recv() => (frame, OutboundLane::Control),
+                frame = stream_rx.recv() => (frame, OutboundLane::Stream),
             }
         };
-        control_turn = !control_turn;
+        if frame.is_none() && matches!(lane, OutboundLane::ObjectRpc) {
+            object_rpc_egress = None;
+            if let Some(ingress) = handle.object_rpc_channel_ingress.as_ref() {
+                ingress.close(format!(
+                    "tcp tunnel object RPC channel to {} stopped",
+                    handle.peer_node_id
+                ));
+            }
+            continue;
+        }
         let Some(frame) = frame else {
             break;
         };
+        match lane {
+            OutboundLane::Stream => priority_burst = 0,
+            OutboundLane::Control | OutboundLane::ObjectRpc => {
+                priority_burst = priority_burst.saturating_add(1);
+                prefer_control = !prefer_control;
+            }
+        }
         let close = matches!(frame, ClusterTcpTunnelFrame::Close { .. });
-        if write_object_frame_async(&mut write_half, &frame, ObjectFrameIoOptions::default())
-            .await
-            .is_err()
+        let mut object_rpc_timeline = matches!(lane, OutboundLane::ObjectRpc)
+            .then(|| {
+                object_rpc_egress
+                    .as_ref()
+                    .and_then(ObjectRpcChannelEgress::pending_write_timeline)
+            })
+            .flatten();
+        if let Some(timeline) = object_rpc_timeline.as_mut() {
+            timeline.flags |= network_timeline_flag::TUNNEL_CARRIER;
+        }
+        let (write_result, write_timing) = if object_rpc_timeline.is_some() {
+            write_object_frame_async_timed(&mut write_half, &frame, ObjectFrameIoOptions::default())
+                .await
+        } else {
+            (
+                write_object_frame_async(&mut write_half, &frame, ObjectFrameIoOptions::default())
+                    .await,
+                None,
+            )
+        };
+        if let Some(timeline) = object_rpc_timeline {
+            timeline.record_frame_write_timing(write_timing, write_result.is_ok());
+        }
+        if matches!(lane, OutboundLane::ObjectRpc)
+            && let Some(egress) = object_rpc_egress.as_mut()
         {
+            egress.complete_frame_write(write_result.is_ok());
+        }
+        if write_result.is_err() {
             break;
         }
         if close {
@@ -1524,7 +2219,58 @@ async fn tcp_tunnel_writer_loop<W>(
     }
     handle.closing.store(true, Ordering::Release);
     TCP_TUNNELS.remove_if_same(&handle);
+    if let Some(ingress) = handle.object_rpc_channel_ingress.as_ref() {
+        ingress.close(format!(
+            "tcp tunnel writer to {} stopped",
+            handle.peer_node_id
+        ));
+    }
     handle.fail_streams("tcp tunnel writer stopped");
+}
+
+async fn next_tcp_tunnel_object_rpc_frame(
+    egress: &mut Option<ObjectRpcChannelEgress>,
+) -> Option<ClusterTcpTunnelFrame> {
+    match egress.as_mut() {
+        Some(egress) => egress
+            .next_frame_for_transport()
+            .await
+            .map(|frame| ClusterTcpTunnelFrame::ObjectRpcChannel { frame }),
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+async fn read_tcp_tunnel_frame<R>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+) -> Result<ClusterTcpTunnelFrame, NetworkError>
+where
+    R: AsyncRead + Unpin,
+{
+    sinomo_core::network::read_object_frame_async_with_max_bytes_after_first_byte(
+        reader,
+        options,
+        MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
+    )
+    .await
+}
+
+async fn read_tcp_tunnel_frame_timed<R>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    readiness_probe: &ObjectFrameReadinessProbe,
+) -> Result<(ClusterTcpTunnelFrame, Option<ObjectFrameReadTiming>), NetworkError>
+where
+    R: AsyncRead + Unpin,
+{
+    read_object_frame_async_with_max_bytes_after_first_byte_timed(
+        reader,
+        options,
+        MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
+        readiness_probe,
+    )
+    .await
 }
 
 async fn tcp_tunnel_reader_loop(
@@ -1534,26 +2280,145 @@ async fn tcp_tunnel_reader_loop(
     service_runtime: tokio::runtime::Handle,
     connectivity_endpoint: Option<ClusterEndpointRecord>,
 ) {
+    // Resolve the cloneable registry host once for the physical tunnel. A
+    // logical StreamOpen must not repeat registry discovery (or wait for its
+    // blocking initialization) before its StreamAccept can be sent.
+    let service_host = match crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+        paths.clone(),
+        service_runtime.clone(),
+    )
+    .await
+    {
+        Ok(service_host) => service_host,
+        Err(error) => {
+            let detail = format!("tcp tunnel service registry unavailable: {error}");
+            tracing::warn!("{detail}");
+            handle.signal_physical_close(detail.clone());
+            handle.fail_streams(&detail);
+            TCP_TUNNELS.remove_if_same(&handle);
+            if let Some(endpoint) = connectivity_endpoint.as_ref() {
+                remember_tcp_tunnel_connectivity(
+                    &paths,
+                    endpoint,
+                    sinomo_core::network::ClusterConnectivityState::Unreachable,
+                    Some(&service_runtime),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+    let channel_server = handle
+        .object_rpc_channel_server
+        .lock()
+        .ok()
+        .and_then(|mut server| server.take());
+    if let Some(server) = channel_server {
+        let channel_paths = paths.clone();
+        let channel_service_host = service_host.clone();
+        let channel_runtime = service_runtime.clone();
+        let channel_peer = handle.peer_node_id.clone();
+        let channel_ingress = handle.object_rpc_channel_ingress.clone();
+        let channel_handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            let result = crate::control::handle_daemon_object_rpc_channel_async(
+                server,
+                channel_paths,
+                channel_service_host,
+                channel_runtime,
+                crate::control::DaemonObjectRpcChannelPeer::ClusterNode(channel_peer.clone()),
+            )
+            .await;
+            match result {
+                Ok(false) => {
+                    let detail =
+                        format!("tcp tunnel object RPC channel server for {channel_peer} retired");
+                    if let Some(ingress) = channel_ingress.as_ref() {
+                        ingress.close(detail.clone());
+                    }
+                    // The channel principal is authenticated once per
+                    // physical tunnel. Retiring only the logical endpoint
+                    // would leave this registry entry permanently unable to
+                    // capture an updated membership role or public key.
+                    channel_handle.request_close(detail);
+                }
+                Ok(true) => {
+                    let detail =
+                        format!("tcp tunnel object RPC channel server for {channel_peer} stopped");
+                    if let Some(ingress) = channel_ingress.as_ref() {
+                        ingress.close(detail.clone());
+                    }
+                    channel_handle.request_close(detail);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "sinomo tcp tunnel object RPC channel for {channel_peer} stopped: {error}"
+                    );
+                    if let Some(ingress) = channel_ingress.as_ref() {
+                        ingress.close(error.to_string());
+                    }
+                    channel_handle.request_close(error.to_string());
+                }
+            }
+        });
+    }
     let mut mark_unreachable_on_exit = false;
+    let readiness_probe = ObjectFrameReadinessProbe::new();
     loop {
         // This reader waits between independent multiplexed requests, so an
         // idle connection is healthy. Each active request carries its own
         // 5-second connect/no-progress policy and operation deadline.
-        let frame = read_object_frame_async::<_, ClusterTcpTunnelFrame>(
+        let frame = read_tcp_tunnel_frame_timed(
             &mut read_half,
-            ObjectFrameIoOptions::none(),
+            ObjectFrameIoOptions::idle_timeout(TCP_TUNNEL_FRAME_NO_PROGRESS_TIMEOUT),
+            &readiness_probe,
         )
         .await;
-        let frame = match frame {
+        let (frame, read_timing) = match frame {
             Ok(frame) => frame,
             Err(error) => {
+                // Capture the physical fault before fail_streams closes the
+                // logical channel. Its dispatcher may concurrently request a
+                // clean carrier retirement; that must not reclassify this
+                // read timeout/EOF as an intentional shutdown.
+                mark_unreachable_on_exit = !handle.clean_shutdown.load(Ordering::Acquire);
                 handle.closing.store(true, Ordering::Release);
                 handle.fail_streams(&error.to_string());
-                mark_unreachable_on_exit = !handle.clean_shutdown.load(Ordering::Relaxed);
                 break;
             }
         };
         match frame {
+            ClusterTcpTunnelFrame::ObjectRpcChannel { frame } => {
+                if let Some(ingress) = handle.object_rpc_channel_ingress.as_ref() {
+                    ingress.record_frame_read_timeline(
+                        &frame,
+                        read_timing,
+                        network_timeline_flag::TUNNEL_CARRIER,
+                    );
+                }
+                let receive = handle
+                    .object_rpc_channel_ingress
+                    .as_ref()
+                    .filter(|_| {
+                        cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
+                            handle.protocol_version,
+                        )
+                    })
+                    .ok_or_else(|| NetworkError::Serialization {
+                        detail: format!(
+                            "peer sent an object RPC channel frame on tcp tunnel protocol {}",
+                            handle.protocol_version
+                        ),
+                    })
+                    .and_then(|ingress| ingress.receive(frame));
+                if let Err(error) = receive {
+                    let detail = format!("invalid tcp tunnel object RPC channel frame: {error}");
+                    mark_unreachable_on_exit = !handle.clean_shutdown.load(Ordering::Acquire);
+                    handle.signal_physical_close(detail.clone());
+                    handle.fail_streams(&detail);
+                    break;
+                }
+            }
             ClusterTcpTunnelFrame::StreamOpen { id } => {
                 let stream = match handle.accept_stream(id) {
                     Ok(stream) => stream,
@@ -1570,23 +2435,9 @@ async fn tcp_tunnel_reader_loop(
                 };
                 let paths = paths.clone();
                 let service_runtime = service_runtime.clone();
+                let service_host = service_host.clone();
                 let tx = handle.tx.clone();
                 tokio::spawn(async move {
-                    let service_host =
-                        match crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
-                            paths.clone(),
-                            service_runtime.clone(),
-                        )
-                        .await
-                        {
-                            Ok(service_host) => service_host,
-                            Err(error) => {
-                                tracing::warn!(
-                                    "sinomo tcp tunnel stream {id} service registry failed: {error}"
-                                );
-                                return;
-                            }
-                        };
                     if tx
                         .send(ClusterTcpTunnelFrame::StreamAccept { id })
                         .await
@@ -1612,7 +2463,7 @@ async fn tcp_tunnel_reader_loop(
                 handle.accept_stream_open(id);
             }
             ClusterTcpTunnelFrame::StreamData { id, bytes } => {
-                handle.deliver_stream_data(id, bytes).await;
+                handle.deliver_stream_data(id, bytes);
             }
             ClusterTcpTunnelFrame::StreamFinish { id } => {
                 handle.deliver_stream_finish(id);
@@ -1629,7 +2480,7 @@ async fn tcp_tunnel_reader_loop(
             }
         }
     }
-    handle.closing.store(true, Ordering::Release);
+    handle.signal_physical_close("tcp tunnel reader stopped".to_string());
     handle.fail_streams("tcp tunnel reader stopped");
     TCP_TUNNELS.remove_if_same(&handle);
     if mark_unreachable_on_exit && let Some(endpoint) = connectivity_endpoint.as_ref() {
@@ -1723,6 +2574,20 @@ mod tests {
         tx: mpsc::Sender<ClusterTcpTunnelFrame>,
         canonical_direction: bool,
     ) -> Arc<TcpTunnelHandle> {
+        test_tunnel_handle_with_direction_and_channel(node_name, tx, canonical_direction, None)
+    }
+
+    fn test_tunnel_handle_with_direction_and_channel(
+        node_name: &str,
+        tx: mpsc::Sender<ClusterTcpTunnelFrame>,
+        canonical_direction: bool,
+        object_rpc_channel_client: Option<ObjectRpcChannelClient>,
+    ) -> Arc<TcpTunnelHandle> {
+        let protocol_version = if object_rpc_channel_client.is_some() {
+            CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION
+        } else {
+            1
+        };
         let (stream_tx, _stream_rx) = mpsc::channel(TCP_TUNNEL_STREAM_OUTBOUND_CAPACITY);
         Arc::new(TcpTunnelHandle {
             peer_node_id: NodeId::from_legacy_named(node_name).expect("test node id"),
@@ -1736,7 +2601,12 @@ mod tests {
             active_streams: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             clean_shutdown: AtomicBool::new(false),
+            close_signal: tcp_tunnel_close_signal(),
             canonical_direction,
+            protocol_version,
+            object_rpc_channel_client,
+            object_rpc_channel_ingress: None,
+            object_rpc_channel_server: Mutex::new(None),
         })
     }
 
@@ -1764,11 +2634,47 @@ mod tests {
                 active_streams: AtomicUsize::new(0),
                 closing: AtomicBool::new(false),
                 clean_shutdown: AtomicBool::new(false),
+                close_signal: tcp_tunnel_close_signal(),
                 canonical_direction: true,
+                protocol_version: 1,
+                object_rpc_channel_client: None,
+                object_rpc_channel_ingress: None,
+                object_rpc_channel_server: Mutex::new(None),
             }),
             rx,
             stream_rx,
         )
+    }
+
+    #[test]
+    fn registry_retires_v2_tunnel_when_its_logical_rpc_channel_closes() {
+        let peer = NodeId::from_legacy_named("tcp_tunnel_closed_logical_channel_peer")
+            .expect("peer node id");
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _server,
+            ingress,
+            egress: _egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("object RPC channel");
+        let (tx, _rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
+        let handle = test_tunnel_handle_with_direction_and_channel(
+            "tcp_tunnel_closed_logical_channel_peer",
+            tx,
+            true,
+            Some(client.clone()),
+        );
+        TCP_TUNNELS.insert(handle.clone());
+
+        ingress.close("injected logical channel failure");
+        assert!(client.is_closed());
+        assert!(TCP_TUNNELS.get(&peer).is_none());
+        assert!(!TCP_TUNNELS.contains(&peer));
+        assert!(handle.closing.load(Ordering::Acquire));
+        assert!(handle.clean_shutdown.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1783,6 +2689,52 @@ mod tests {
         assert_eq!(first.node_id, peer);
         assert_eq!(first.transport, ClusterTransportKind::LanTcp);
         assert!(tcp_tunnel_is_synthetic_endpoint(&first));
+    }
+
+    #[test]
+    fn pending_cluster_state_retires_authenticated_channel_handles() {
+        let registry = TcpTunnelRegistry::default();
+        let peer_name = "tcp_tunnel_pending_transition_peer";
+        let peer = NodeId::from_legacy_named(peer_name).expect("peer node id");
+        let endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("object RPC channel");
+        let (tx, _rx) = mpsc::channel(1);
+        let handle = test_tunnel_handle_with_direction_and_channel(
+            peer_name,
+            tx,
+            true,
+            Some(endpoint.client),
+        );
+        registry.insert(handle.clone());
+        let pending_cluster_id = sinomo_core::node::ClusterId::new(
+            sinomo_core::cluster::PENDING_INVITE_CLUSTER_ID.to_string(),
+        )
+        .expect("pending cluster id");
+        let local_node =
+            NodeId::from_legacy_named("tcp_tunnel_pending_transition_local").expect("local node");
+        let pending = sinomo_core::ClusterBootstrapState::initialized_locally(
+            pending_cluster_id,
+            "pending transition",
+            local_node,
+            "local",
+            "pk-local",
+            time::OffsetDateTime::now_utc(),
+        );
+
+        assert!(registry.get(&peer).is_some(), "precondition: live handle");
+        assert!(!tcp_tunnel_registry_accepts_cluster_state(
+            &registry, &pending
+        ));
+
+        assert!(
+            registry.get(&peer).is_none(),
+            "pending state must remove the old authenticated handle"
+        );
+        assert!(handle.closing.load(Ordering::Acquire));
+        assert!(handle.clean_shutdown.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1809,16 +2761,519 @@ mod tests {
         );
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
 
-        let request =
-            signed_tcp_tunnel_open_request(&tokio::runtime::Handle::current(), Some(&daemon_paths))
-                .await
-                .expect("signed request");
+        let request = signed_tcp_tunnel_open_request(
+            &tokio::runtime::Handle::current(),
+            Some(&daemon_paths),
+            CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+        )
+        .await
+        .expect("signed request");
         let envelope: crate::SignedDaemonCommand =
             sinomo_core::network::SinomoObjectCodec::default()
                 .decode(request.auth.as_deref().expect("auth envelope"))
                 .expect("decode signed envelope");
 
         assert_eq!(envelope.node_id, local.to_string());
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_dialer_retries_v1_once_after_v2_protocol_rejection() {
+        let root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v2-downgrade-client");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("client data dir");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("client daemon paths");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("client identity");
+        let local =
+            NodeId::from_legacy_named("node_tcp_tunnel_v2_downgrade_client").expect("client node");
+        let peer =
+            NodeId::from_legacy_named("node_tcp_tunnel_v1_only_server").expect("server node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_v2_downgrade")
+                .expect("cluster id"),
+            "tcp tunnel v2 downgrade",
+            local,
+            "client",
+            identity.public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&data_dir),
+            &state,
+        )
+        .expect("client cluster state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("v1-only listener");
+        let address = listener.local_addr().expect("listener address");
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requested_versions = Vec::new();
+            let mut release_rx = Some(release_rx);
+            for expected_version in [CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1] {
+                let (mut stream, _) = listener.accept().await.expect("tunnel attempt");
+                let request: ObjectRpcRequest =
+                    read_object_frame_async(&mut stream, ObjectFrameIoOptions::default())
+                        .await
+                        .expect("tunnel open request");
+                let open: ClusterTcpTunnelOpenRequest =
+                    request.decode_body().expect("decode tunnel open request");
+                requested_versions.push(open.protocol_version);
+                assert_eq!(open.protocol_version, expected_version);
+
+                if expected_version == CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION {
+                    let response = ObjectRpcResponse::encode_error(
+                        CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+                        format!("unsupported tcp tunnel protocol {}", open.protocol_version),
+                    )
+                    .expect("protocol rejection");
+                    write_object_frame_async(
+                        &mut stream,
+                        &response,
+                        ObjectFrameIoOptions::default(),
+                    )
+                    .await
+                    .expect("write protocol rejection");
+                    continue;
+                }
+
+                let response = ObjectRpcResponse::encode_body(
+                    CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+                    &ClusterTcpTunnelOpenResponse::accepted_version(1),
+                )
+                .expect("v1 acceptance");
+                write_object_frame_async(&mut stream, &response, ObjectFrameIoOptions::default())
+                    .await
+                    .expect("write v1 acceptance");
+                let frame: ClusterTcpTunnelFrame =
+                    read_object_frame_async(&mut stream, ObjectFrameIoOptions::default())
+                        .await
+                        .expect("legacy stream open");
+                let id = match frame {
+                    ClusterTcpTunnelFrame::StreamOpen { id } => id,
+                    other => panic!("expected legacy stream open, got {other:?}"),
+                };
+                write_object_frame_async(
+                    &mut stream,
+                    &ClusterTcpTunnelFrame::StreamAccept { id },
+                    ObjectFrameIoOptions::default(),
+                )
+                .await
+                .expect("accept legacy stream");
+                let _ = release_rx.take().expect("one accepted tunnel").await;
+            }
+            requested_versions
+        });
+        let endpoint = test_endpoint(
+            "tcp_tunnel_v1_only_server_endpoint",
+            &peer,
+            &address.to_string(),
+            ClusterTransportKind::LanTcp,
+        );
+
+        let handle = connect_tcp_tunnel_to_endpoint_with_timeout(
+            &endpoint,
+            &tokio::runtime::Handle::current(),
+            Some(&paths),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("downgraded tunnel");
+        assert_eq!(handle.protocol_version, 1);
+        assert!(handle.object_rpc_channel_client.is_none());
+        assert!(handle.object_rpc_channel_ingress.is_none());
+        assert!(
+            handle
+                .object_rpc_channel_server
+                .lock()
+                .expect("channel server lock")
+                .is_none()
+        );
+        assert!(tcp_tunnel_object_rpc_channel_client(&peer).is_none());
+        let legacy_stream = handle
+            .open_stream(NetworkHealthPolicy::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ))
+            .await
+            .expect("v1 legacy stream");
+        drop(legacy_stream);
+        handle.request_close("test complete".to_string());
+        let _ = release_tx.send(());
+
+        let requested_versions = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("v1-only server stops")
+            .expect("v1-only server task");
+        assert_eq!(
+            requested_versions,
+            vec![CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1],
+            "downgrade must make exactly one v2 attempt and one v1 retry"
+        );
+        TCP_TUNNELS.remove(&peer);
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_dialer_exposes_v2_channel_only_after_valid_target_proof() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v2-proof-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v2-proof-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        client_data_dir
+            .ensure_root_layout()
+            .expect("client data dir");
+        server_data_dir
+            .ensure_root_layout()
+            .expect("server data dir");
+        let client_paths = DaemonPaths::new(&client_data_dir);
+        client_paths.ensure().expect("client daemon paths");
+        let client_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&client_data_dir.root())
+                .expect("client identity");
+        let server_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&server_data_dir.root())
+                .expect("server identity");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_v2_proof")
+                .expect("cluster id");
+        let client_node =
+            NodeId::from_legacy_named("node_tcp_tunnel_v2_proof_client").expect("client node");
+        let server_node =
+            NodeId::from_legacy_named("node_tcp_tunnel_v2_proof_server").expect("server node");
+        let now = time::OffsetDateTime::now_utc();
+        let mut client_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "tcp tunnel v2 proof",
+            client_node,
+            "client",
+            client_identity.public_key,
+            now,
+        );
+        client_state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                server_node.clone(),
+                "server",
+                server_identity.public_key.clone(),
+                now,
+            ));
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&client_data_dir),
+            &client_state,
+        )
+        .expect("client cluster state");
+        let server_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "tcp tunnel v2 proof",
+            server_node.clone(),
+            "server",
+            server_identity.public_key.clone(),
+            now,
+        );
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&server_data_dir),
+            &server_state,
+        )
+        .expect("server cluster state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("v2 proof listener");
+        let address = listener.local_addr().expect("listener address");
+        let (release_tx, release_rx) = oneshot::channel();
+        let responder_node_id = server_node.to_string();
+        let responder_public_key = server_identity.public_key;
+        let cluster_context = cluster_id.to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("tunnel attempt");
+            let request: ObjectRpcRequest =
+                read_object_frame_async(&mut stream, ObjectFrameIoOptions::default())
+                    .await
+                    .expect("tunnel open request");
+            let open: ClusterTcpTunnelOpenRequest =
+                request.decode_body().expect("decode tunnel open request");
+            assert_eq!(open.protocol_version, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION);
+            let signed_open: crate::SignedDaemonCommand = SinomoObjectCodec::default()
+                .decode(request.auth.as_deref().expect("signed open"))
+                .expect("decode signed open");
+            let proof = sign_cluster_tcp_tunnel_handshake_from_data_dir(
+                &server_data_dir,
+                ClusterTcpTunnelHandshakeTranscript {
+                    protocol: CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL.to_string(),
+                    requester_node_id: signed_open.node_id,
+                    requester_public_key: daemon_auth_encode_public_key(&signed_open.public_key),
+                    responder_node_id,
+                    responder_public_key,
+                    requested_protocol_version: open.protocol_version,
+                    negotiated_protocol_version: CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+                    dialer_nonce: signed_open.nonce,
+                    cluster_context: Some(cluster_context),
+                },
+            )
+            .expect("sign target handshake proof");
+            let response = ObjectRpcResponse::encode_body(
+                CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+                &ClusterTcpTunnelOpenResponse::accepted_version_with_handshake(
+                    CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+                    proof,
+                ),
+            )
+            .expect("v2 proof acceptance");
+            write_object_frame_async(&mut stream, &response, ObjectFrameIoOptions::default())
+                .await
+                .expect("write v2 proof acceptance");
+            let _ = release_rx.await;
+        });
+        let endpoint = test_endpoint(
+            "tcp_tunnel_v2_proof_server_endpoint",
+            &server_node,
+            &address.to_string(),
+            ClusterTransportKind::LanTcp,
+        );
+
+        let handle = connect_tcp_tunnel_to_endpoint_with_timeout(
+            &endpoint,
+            &tokio::runtime::Handle::current(),
+            Some(&client_paths),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("valid target proof opens v2 tunnel");
+        assert_eq!(handle.protocol_version, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION);
+        assert!(handle.object_rpc_channel_client.is_some());
+        assert!(handle.object_rpc_channel_ingress.is_some());
+        assert!(
+            handle
+                .object_rpc_channel_server
+                .lock()
+                .expect("channel server lock")
+                .is_some()
+        );
+        assert!(tcp_tunnel_object_rpc_channel_client(&server_node).is_some());
+        handle.request_close("test complete".to_string());
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("v2 proof server stops")
+            .expect("v2 proof server task");
+        TCP_TUNNELS.remove(&server_node);
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_dialer_falls_back_to_v1_when_legacy_v2_response_has_no_proof() {
+        let root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v2-no-proof-client");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("client data dir");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("client daemon paths");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("client identity");
+        let local =
+            NodeId::from_legacy_named("node_tcp_tunnel_v2_no_proof_client").expect("client node");
+        let peer =
+            NodeId::from_legacy_named("node_tcp_tunnel_legacy_v2_server").expect("server node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_v2_no_proof")
+                .expect("cluster id"),
+            "tcp tunnel v2 no proof",
+            local,
+            "client",
+            identity.public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&data_dir),
+            &state,
+        )
+        .expect("client cluster state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("legacy v2 listener");
+        let address = listener.local_addr().expect("listener address");
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requested_versions = Vec::new();
+            let mut release_rx = Some(release_rx);
+            for expected_version in [CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1] {
+                let (mut stream, _) = listener.accept().await.expect("tunnel attempt");
+                let request: ObjectRpcRequest =
+                    read_object_frame_async(&mut stream, ObjectFrameIoOptions::default())
+                        .await
+                        .expect("tunnel open request");
+                let open: ClusterTcpTunnelOpenRequest =
+                    request.decode_body().expect("decode tunnel open request");
+                requested_versions.push(open.protocol_version);
+                assert_eq!(open.protocol_version, expected_version);
+                let response = ObjectRpcResponse::encode_body(
+                    CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+                    &ClusterTcpTunnelOpenResponse::accepted_version(expected_version),
+                )
+                .expect("legacy tunnel acceptance");
+                write_object_frame_async(&mut stream, &response, ObjectFrameIoOptions::default())
+                    .await
+                    .expect("write legacy acceptance");
+                if expected_version == 1 {
+                    let _ = release_rx.take().expect("one accepted tunnel").await;
+                }
+            }
+            requested_versions
+        });
+        let endpoint = test_endpoint(
+            "tcp_tunnel_legacy_v2_server_endpoint",
+            &peer,
+            &address.to_string(),
+            ClusterTransportKind::LanTcp,
+        );
+
+        let handle = connect_tcp_tunnel_to_endpoint_with_timeout(
+            &endpoint,
+            &tokio::runtime::Handle::current(),
+            Some(&paths),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("legacy v2 response must downgrade to authenticated v1 sessions");
+        assert_eq!(handle.protocol_version, 1);
+        assert!(handle.object_rpc_channel_client.is_none());
+        assert!(tcp_tunnel_object_rpc_channel_client(&peer).is_none());
+        handle.request_close("test complete".to_string());
+        let _ = release_tx.send(());
+
+        let requested_versions = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("legacy v2 server stops")
+            .expect("legacy v2 server task");
+        assert_eq!(
+            requested_versions,
+            vec![CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, 1],
+            "an unsigned v2 acceptance must make exactly one safe v1 retry"
+        );
+        TCP_TUNNELS.remove(&peer);
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_server_accepts_v1_with_legacy_streams_and_no_object_channel() {
+        let root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-v1-server");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("server data dir");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("server daemon paths");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("server identity");
+        let local = NodeId::from_legacy_named("node_tcp_tunnel_v1_server").expect("server node");
+        let peer = NodeId::from_legacy_named("node_tcp_tunnel_v1_client").expect("client node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_v1_server")
+                .expect("cluster id"),
+            "tcp tunnel v1 server",
+            local,
+            "server",
+            identity.public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&data_dir),
+            &state,
+        )
+        .expect("server cluster state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("v1 client listener");
+        let address = listener.local_addr().expect("listener address");
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("v1 client connect");
+        let (server, _) = listener.accept().await.expect("v1 server accept");
+        let request = ObjectRpcRequest::encode_body(
+            CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+            CLUSTER_TCP_TUNNEL_RPC_CATEGORY,
+            &ClusterTcpTunnelOpenRequest {
+                protocol_version: 1,
+            },
+        )
+        .expect("v1 tunnel open request");
+        accept_tcp_tunnel_connection_async(
+            server,
+            paths.clone(),
+            tokio::runtime::Handle::current(),
+            AuthenticatedDaemonCommand {
+                route: CLUSTER_TCP_TUNNEL_OPEN_ROUTE.to_string(),
+                signer: crate::DaemonSignerAuthority::Member,
+                signer_node_id: peer.to_string(),
+                signer_public_key: "test-public-key".to_string(),
+            },
+            request,
+        )
+        .await
+        .expect("new server accepts v1 client");
+
+        let response: ObjectRpcResponse =
+            read_object_frame_async(&mut client, ObjectFrameIoOptions::default())
+                .await
+                .expect("v1 tunnel acceptance");
+        response.error_detail().expect("successful v1 acceptance");
+        let open: ClusterTcpTunnelOpenResponse =
+            response.decode_body().expect("decode v1 acceptance");
+        assert!(open.accepted);
+        assert_eq!(open.protocol_version, 1);
+
+        let handle = TCP_TUNNELS.get(&peer).expect("registered v1 tunnel");
+        assert_eq!(handle.protocol_version, 1);
+        assert!(handle.object_rpc_channel_client.is_none());
+        assert!(handle.object_rpc_channel_ingress.is_none());
+        assert!(
+            handle
+                .object_rpc_channel_server
+                .lock()
+                .expect("channel server lock")
+                .is_none()
+        );
+        assert!(tcp_tunnel_object_rpc_channel_client(&peer).is_none());
+
+        write_object_frame_async(
+            &mut client,
+            &ClusterTcpTunnelFrame::StreamOpen { id: 2 },
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect("open legacy v1 stream");
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_object_frame_async::<_, ClusterTcpTunnelFrame>(
+                &mut client,
+                ObjectFrameIoOptions::default(),
+            ),
+        )
+        .await
+        .expect("legacy stream acceptance timeout")
+        .expect("legacy stream acceptance");
+        assert_eq!(frame, ClusterTcpTunnelFrame::StreamAccept { id: 2 });
+
+        write_object_frame_async(
+            &mut client,
+            &ClusterTcpTunnelFrame::StreamReset {
+                id: 2,
+                detail: "test complete".to_string(),
+            },
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect("reset legacy stream");
+        write_object_frame_async(
+            &mut client,
+            &ClusterTcpTunnelFrame::Close {
+                detail: "test complete".to_string(),
+            },
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect("close v1 tunnel");
+        remove_test_tcp_tunnel(&peer);
     }
 
     #[tokio::test]
@@ -1937,6 +3392,62 @@ mod tests {
         ));
         assert!(existing.clean_shutdown.load(Ordering::Relaxed));
         assert!(!duplicate.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn closing_tunnel_terminates_writer_even_when_close_lane_is_saturated() {
+        let (handle, rx, stream_rx) = test_stream_tunnel_handle("tcp_tunnel_saturated_close", 0);
+        for id in 0..TCP_TUNNEL_CHANNEL_CAPACITY {
+            handle
+                .tx
+                .try_send(ClusterTcpTunnelFrame::StreamReset {
+                    id: id as u64 + 1,
+                    detail: "occupy control lane".to_string(),
+                })
+                .expect("fill control lane");
+        }
+        let registry = TcpTunnelRegistry::default();
+        registry.insert(handle.clone());
+        handle.request_close("retire saturated tunnel".to_string());
+
+        assert!(
+            registry.get(&handle.peer_node_id).is_none(),
+            "a closing handle must not remain discoverable when Close cannot queue"
+        );
+        let (writer, mut peer) = tokio::io::duplex(64 * 1024);
+        let writer_handle = handle.clone();
+        let writer_task = tokio::spawn(tcp_tunnel_writer_loop(
+            writer_handle,
+            writer,
+            rx,
+            None,
+            stream_rx,
+        ));
+        let frame = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_tcp_tunnel_frame(&mut peer, ObjectFrameIoOptions::none()),
+        )
+        .await
+        .expect("peer close timeout")
+        .expect("peer close frame");
+        assert!(matches!(
+            frame,
+            ClusterTcpTunnelFrame::Close { detail } if detail == "retire saturated tunnel"
+        ));
+        tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("writer termination timeout")
+            .expect("writer task");
+
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        let replacement = test_tunnel_handle("tcp_tunnel_saturated_close", replacement_tx);
+        assert!(registry.insert_or_existing(replacement.clone()).is_ok());
+        assert!(Arc::ptr_eq(
+            &registry
+                .get(&replacement.peer_node_id)
+                .expect("replacement handle"),
+            &replacement
+        ));
     }
 
     #[test]
@@ -2062,6 +3573,66 @@ mod tests {
             tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::RetryNeeded, 20),
             idle_interval
         );
+    }
+
+    #[test]
+    fn tcp_tunnel_maintenance_retires_removed_members() {
+        let root = sinomo_testdir::TestDir::new("sinomo-tcp-tunnel-member-prune");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("tcp_tunnel_member_prune_cluster")
+                .expect("cluster id");
+        let local = NodeId::from_legacy_named("tcp_tunnel_member_prune_local").expect("local node");
+        let peer = NodeId::from_legacy_named("tcp_tunnel_member_prune_peer").expect("peer node");
+        let now = time::OffsetDateTime::now_utc();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "tcp tunnel member prune",
+            local,
+            "local",
+            "local-public-key",
+            now,
+        );
+        let peer_member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            peer.clone(),
+            "peer",
+            "peer-public-key",
+            now,
+        );
+        let peer_key = match sinomo_core::cluster::cluster_member_put_command(&peer_member)
+            .expect("peer KV command")
+        {
+            sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put { key, .. }) => key,
+            other => panic!("unexpected peer KV command: {other:?}"),
+        };
+        state.members.push(peer_member);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write bootstrap state");
+        let kv_state = state.clone();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &kv_state)
+            .expect("sync initial KV membership");
+        let merged = read_cluster_state_cached_shared(&cluster_paths).expect("merged membership");
+        assert!(tcp_tunnel_peer_is_authorized(&merged, &peer));
+
+        sinomo_core::cluster::append_cluster_raft_command(
+            &cluster_paths,
+            &kv_state.local_node_id,
+            sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Delete { key: peer_key }),
+        )
+        .expect("commit removed KV membership");
+        let stale_bootstrap = read_cluster_state_without_kv(&cluster_paths)
+            .expect("stale bootstrap membership remains readable");
+        assert!(
+            tcp_tunnel_peer_is_authorized(&stale_bootstrap, &peer),
+            "the regression requires bootstrap state to remain stale"
+        );
+        let merged = read_cluster_state_cached_shared(&cluster_paths)
+            .expect("refreshed authoritative membership");
+        assert!(!tcp_tunnel_peer_is_authorized(&merged, &peer));
     }
 
     #[test]
@@ -2307,6 +3878,27 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
     }
 
+    #[tokio::test]
+    async fn tcp_tunnel_connect_lock_leases_do_not_retain_peer_churn() {
+        let registry = TcpTunnelRegistry::default();
+        for index in 0..512 {
+            let peer = NodeId::from_legacy_named(format!("tcp_tunnel_connect_lock_churn_{index}"))
+                .expect("test node id");
+            let lease = registry.connect_lock_lease(&peer);
+            let guard = lease.lock.lock().await;
+            drop(guard);
+            drop(lease);
+        }
+        assert!(
+            registry
+                .connect_locks
+                .lock()
+                .expect("connect locks")
+                .is_empty(),
+            "completed or cancelled connection attempts must not retain historical peer ids"
+        );
+    }
+
     #[test]
     fn tcp_tunnel_duplicate_insert_keeps_streaming_existing_handle() {
         let registry = TcpTunnelRegistry::default();
@@ -2350,6 +3942,99 @@ mod tests {
         ));
         assert!(first.clean_shutdown.load(Ordering::Relaxed));
         assert!(!second.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_canonical_v2_replacement_converges_during_active_reverse_call() {
+        let registry = TcpTunnelRegistry::default();
+        let peer_name = "tcp_tunnel_duplicate_active_channel_peer";
+        let peer = NodeId::from_legacy_named(peer_name).expect("test node id");
+        let endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("object RPC channel");
+        let request =
+            ObjectRpcRequest::encode_body("/test/tunnel-active-channel", "test", &"request")
+                .expect("request");
+        let pending = endpoint
+            .client
+            .call(sinomo_core::network::ObjectRpcSessionCall::value(request))
+            .await
+            .expect("pending channel call");
+        assert_eq!(endpoint.client.queue_snapshot().active_calls, 1);
+
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let first = test_tunnel_handle_with_direction_and_channel(
+            peer_name,
+            first_tx,
+            false,
+            Some(endpoint.client.clone()),
+        );
+        let replacement_endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("replacement object RPC channel");
+        let second = test_tunnel_handle_with_direction_and_channel(
+            peer_name,
+            second_tx,
+            true,
+            Some(replacement_endpoint.client.clone()),
+        );
+
+        assert!(registry.insert_or_existing(first.clone()).is_ok());
+        first.active_streams.fetch_add(1, Ordering::Release);
+        assert_eq!(first.active_streams.load(Ordering::Acquire), 1);
+        assert!(cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
+            first.protocol_version
+        ));
+        assert!(cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
+            second.protocol_version
+        ));
+        assert!(registry.insert_or_existing(second.clone()).is_ok());
+
+        assert!(Arc::ptr_eq(
+            &registry.get(&peer).expect("registered"),
+            &second
+        ));
+        assert!(first.closing.load(Ordering::Acquire));
+        assert!(first.clean_shutdown.load(Ordering::Acquire));
+        assert!(!second.closing.load(Ordering::Acquire));
+        first.active_streams.fetch_sub(1, Ordering::Release);
+
+        // Repeated reverse-direction maintenance opens must not dislodge the
+        // canonical v2 carrier, including while that carrier has a call in
+        // flight.
+        let replacement_request = ObjectRpcRequest::encode_body(
+            "/test/tunnel-stable-canonical-channel",
+            "test",
+            &"request",
+        )
+        .expect("replacement request");
+        let replacement_pending = replacement_endpoint
+            .client
+            .call(sinomo_core::network::ObjectRpcSessionCall::value(
+                replacement_request,
+            ))
+            .await
+            .expect("pending replacement channel call");
+        for _ in 0..8 {
+            let (duplicate_tx, _duplicate_rx) = mpsc::channel(1);
+            let duplicate = test_tunnel_handle_with_direction(peer_name, duplicate_tx, false);
+            assert!(registry.insert_or_existing(duplicate).is_err());
+            assert!(Arc::ptr_eq(
+                &registry
+                    .get(&peer)
+                    .expect("stable canonical registry entry"),
+                &second
+            ));
+            assert!(!second.closing.load(Ordering::Acquire));
+            assert!(!replacement_endpoint.client.is_closed());
+        }
+        drop(replacement_pending);
+        drop(pending);
     }
 
     #[test]
@@ -2417,6 +4102,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_tunnel_reader_rejects_oversized_frame_from_length_prefix() {
+        let declared_bytes = MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES + 1;
+        let mut encoded = b"SOF2".to_vec();
+        encoded.extend_from_slice(&(declared_bytes as u64).to_be_bytes());
+        let mut reader = std::io::Cursor::new(encoded);
+
+        let error = read_tcp_tunnel_frame(&mut reader, ObjectFrameIoOptions::none())
+            .await
+            .expect_err("oversized tunnel frame");
+
+        assert_eq!(
+            error,
+            NetworkError::FrameTooLarge {
+                actual_bytes: declared_bytes,
+                max_bytes: MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
+            }
+        );
+        assert_eq!(
+            reader.position(),
+            12,
+            "tunnel limit must reject immediately after the SOF2 length prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_reader_bounds_partial_frame_stalls_but_not_inter_frame_idle() {
+        const NO_PROGRESS_TIMEOUT: Duration = Duration::from_millis(20);
+        let mut partial_body = b"SOF2".to_vec();
+        partial_body.extend_from_slice(&64_u64.to_be_bytes());
+        partial_body.extend_from_slice(b"partial");
+
+        for (index, (label, stalled_bytes)) in [
+            ("partial prefix", b"S".as_slice()),
+            ("partial body", partial_body.as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut writer, mut reader) = tokio::io::duplex(128);
+            let read = tokio::spawn(async move {
+                read_tcp_tunnel_frame(
+                    &mut reader,
+                    ObjectFrameIoOptions::idle_timeout(NO_PROGRESS_TIMEOUT),
+                )
+                .await
+            });
+            if index == 0 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                assert!(
+                    !read.is_finished(),
+                    "an idle tunnel must wait indefinitely before the next frame starts"
+                );
+            }
+            writer
+                .write_all(stalled_bytes)
+                .await
+                .unwrap_or_else(|error| panic!("write {label}: {error}"));
+            let error = tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .unwrap_or_else(|_| panic!("{label} reader did not retire"))
+                .expect("reader task")
+                .expect_err("partial frame must time out");
+            assert!(
+                error.to_string().contains("timed out"),
+                "unexpected {label} error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn tcp_tunnel_stream_ids_are_direction_disjoint_and_open_waits_for_accept() {
         let (handle, mut control_rx, _stream_rx) =
             test_stream_tunnel_handle("tcp_tunnel_stream_open_peer", 0);
@@ -2478,6 +4233,7 @@ mod tests {
         let request = vec![0x31; TCP_TUNNEL_STREAM_FRAME_BYTES + 137];
         client.write_all(&request).await.expect("write request");
         client.shutdown().await.expect("finish request direction");
+        let mut request_fragment_lengths = Vec::new();
         loop {
             match client_stream_rx.recv().await.expect("client stream frame") {
                 ClusterTcpTunnelFrame::StreamData {
@@ -2485,7 +4241,8 @@ mod tests {
                     bytes,
                 } => {
                     assert_eq!(frame_id, id);
-                    server_handle.deliver_stream_data(id, bytes).await;
+                    request_fragment_lengths.push(bytes.len());
+                    server_handle.deliver_stream_data(id, bytes);
                 }
                 ClusterTcpTunnelFrame::StreamFinish { id: frame_id } => {
                     assert_eq!(frame_id, id);
@@ -2495,6 +4252,17 @@ mod tests {
                 other => panic!("unexpected client stream frame {other:?}"),
             }
         }
+        assert!(
+            request_fragment_lengths
+                .iter()
+                .all(|length| (1..=TCP_TUNNEL_STREAM_FRAME_BYTES).contains(length)),
+            "outbound pump must emit only non-empty bounded fragments"
+        );
+        assert_eq!(
+            request_fragment_lengths.iter().sum::<usize>(),
+            request.len(),
+            "outbound pump must transfer every byte exactly once"
+        );
         let mut received = Vec::new();
         server
             .read_to_end(&mut received)
@@ -2505,6 +4273,7 @@ mod tests {
         let response = vec![0x73; TCP_TUNNEL_STREAM_FRAME_BYTES * 3 + 211];
         server.write_all(&response).await.expect("write response");
         drop(server);
+        let mut response_fragment_lengths = Vec::new();
         loop {
             match server_stream_rx.recv().await.expect("server stream frame") {
                 ClusterTcpTunnelFrame::StreamData {
@@ -2512,7 +4281,8 @@ mod tests {
                     bytes,
                 } => {
                     assert_eq!(frame_id, id);
-                    client_handle.deliver_stream_data(id, bytes).await;
+                    response_fragment_lengths.push(bytes.len());
+                    client_handle.deliver_stream_data(id, bytes);
                 }
                 ClusterTcpTunnelFrame::StreamFinish { id: frame_id } => {
                     assert_eq!(frame_id, id);
@@ -2525,6 +4295,17 @@ mod tests {
                 other => panic!("unexpected server stream frame {other:?}"),
             }
         }
+        assert!(
+            response_fragment_lengths
+                .iter()
+                .all(|length| (1..=TCP_TUNNEL_STREAM_FRAME_BYTES).contains(length)),
+            "full-duplex response pump must retain the same fragment bound"
+        );
+        assert_eq!(
+            response_fragment_lengths.iter().sum::<usize>(),
+            response.len(),
+            "full-duplex response pump must transfer every byte exactly once"
+        );
         let mut actual = Vec::new();
         client
             .read_to_end(&mut actual)
@@ -2619,12 +4400,14 @@ mod tests {
             client_handle.clone(),
             client_write,
             client_control_rx,
+            None,
             client_stream_rx,
         ));
         let server_writer = tokio::spawn(tcp_tunnel_writer_loop(
             server_handle.clone(),
             server_write,
             server_control_rx,
+            None,
             server_stream_rx,
         ));
 
@@ -2727,7 +4510,7 @@ mod tests {
                             .expect("send stream accept");
                     }
                     ClusterTcpTunnelFrame::StreamData { id, bytes } => {
-                        client_to_server_handle.deliver_stream_data(id, bytes).await;
+                        client_to_server_handle.deliver_stream_data(id, bytes);
                     }
                     ClusterTcpTunnelFrame::StreamFinish { id } => {
                         client_to_server_handle.deliver_stream_finish(id);
@@ -2755,7 +4538,7 @@ mod tests {
                         server_to_client_handle.accept_stream_open(id);
                     }
                     ClusterTcpTunnelFrame::StreamData { id, bytes } => {
-                        server_to_client_handle.deliver_stream_data(id, bytes).await;
+                        server_to_client_handle.deliver_stream_data(id, bytes);
                     }
                     ClusterTcpTunnelFrame::StreamFinish { id } => {
                         server_to_client_handle.deliver_stream_finish(id);
@@ -2843,14 +4626,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_tunnel_writer_alternates_control_and_stream_backlogs() {
+    async fn tcp_tunnel_writer_prioritizes_control_with_bounded_bulk_fairness() {
         let (handle, control_rx, stream_rx) =
             test_stream_tunnel_handle("tcp_tunnel_writer_fair_peer", 0);
-        for id in [2, 4, 6] {
+        let channel = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("priority test object RPC channel");
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _server,
+            ingress,
+            egress,
+        } = channel;
+        for id in (2..=16).step_by(2) {
             handle
                 .tx
                 .try_send(ClusterTcpTunnelFrame::StreamAccept { id })
                 .expect("queue control frame");
+        }
+        let request =
+            ObjectRpcRequest::encode_body("/test/tunnel-writer-priority", "test", &"object-rpc")
+                .expect("priority request");
+        let pending = client
+            .call(sinomo_core::network::ObjectRpcSessionCall::value(request))
+            .await
+            .expect("queue object RPC control frame");
+        for id in [2, 4] {
             handle
                 .stream_tx
                 .try_send(ClusterTcpTunnelFrame::StreamData {
@@ -2864,22 +4667,40 @@ mod tests {
             Arc::clone(&handle),
             writer,
             control_rx,
+            Some(egress),
             stream_rx,
         ));
 
-        for expected_control in [true, false, true, false] {
+        let mut saw_object_rpc = false;
+        for _ in 0..TCP_TUNNEL_PRIORITY_BURST {
             let frame = read_object_frame_async::<_, ClusterTcpTunnelFrame>(
                 &mut reader,
                 ObjectFrameIoOptions::none(),
             )
             .await
             .expect("read scheduled frame");
-            assert_eq!(
-                matches!(frame, ClusterTcpTunnelFrame::StreamAccept { .. }),
-                expected_control,
-                "writer must alternate ready control and body queues"
+            assert!(
+                !matches!(frame, ClusterTcpTunnelFrame::StreamData { .. }),
+                "priority frame must not sit behind a ready legacy bulk stream"
             );
+            saw_object_rpc |= matches!(frame, ClusterTcpTunnelFrame::ObjectRpcChannel { .. });
         }
+        assert!(
+            saw_object_rpc,
+            "object RPC control must share the priority lane fairly"
+        );
+        let frame = read_object_frame_async::<_, ClusterTcpTunnelFrame>(
+            &mut reader,
+            ObjectFrameIoOptions::none(),
+        )
+        .await
+        .expect("read bounded-fairness stream frame");
+        assert!(
+            matches!(frame, ClusterTcpTunnelFrame::StreamData { .. }),
+            "legacy bulk stream must progress after the fixed priority burst"
+        );
+        ingress.close("test complete");
+        drop(pending);
         handle.request_close("test complete".to_string());
         tokio::time::timeout(Duration::from_secs(1), writer_task)
             .await
@@ -2888,17 +4709,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_tunnel_channel_carrier_runs_full_duplex_calls() {
+        let left = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("left channel");
+        let right = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("right channel");
+        let ObjectRpcChannelEndpoint {
+            client: left_client,
+            server: mut left_server,
+            ingress: left_ingress,
+            egress: left_egress,
+        } = left;
+        let ObjectRpcChannelEndpoint {
+            client: right_client,
+            server: mut right_server,
+            ingress: right_ingress,
+            egress: right_egress,
+        } = right;
+        let (left_handle, left_control_rx, left_stream_rx) =
+            test_stream_tunnel_handle("tunnel_channel_right", 0);
+        let (right_handle, right_control_rx, right_stream_rx) =
+            test_stream_tunnel_handle("tunnel_channel_left", 1);
+        let (left_wire, right_wire) = tokio::io::duplex(128 * 1024);
+        let (left_read, left_write) = tokio::io::split(left_wire);
+        let (right_read, right_write) = tokio::io::split(right_wire);
+        let left_writer = tokio::spawn(tcp_tunnel_writer_loop(
+            Arc::clone(&left_handle),
+            left_write,
+            left_control_rx,
+            Some(left_egress),
+            left_stream_rx,
+        ));
+        let right_writer = tokio::spawn(tcp_tunnel_writer_loop(
+            Arc::clone(&right_handle),
+            right_write,
+            right_control_rx,
+            Some(right_egress),
+            right_stream_rx,
+        ));
+        let right_wire_ingress = right_ingress.clone();
+        let left_to_right = tokio::spawn(async move {
+            let mut reader = right_read;
+            loop {
+                match read_object_frame_async::<_, ClusterTcpTunnelFrame>(
+                    &mut reader,
+                    ObjectFrameIoOptions::none(),
+                )
+                .await
+                .expect("left-to-right tunnel frame")
+                {
+                    ClusterTcpTunnelFrame::ObjectRpcChannel { frame } => right_wire_ingress
+                        .receive(frame)
+                        .expect("right channel ingress"),
+                    ClusterTcpTunnelFrame::Close { .. } => break,
+                    other => panic!("channel writer emitted a legacy tunnel frame: {other:?}"),
+                }
+            }
+        });
+        let left_wire_ingress = left_ingress.clone();
+        let right_to_left = tokio::spawn(async move {
+            let mut reader = left_read;
+            loop {
+                match read_object_frame_async::<_, ClusterTcpTunnelFrame>(
+                    &mut reader,
+                    ObjectFrameIoOptions::none(),
+                )
+                .await
+                .expect("right-to-left tunnel frame")
+                {
+                    ClusterTcpTunnelFrame::ObjectRpcChannel { frame } => left_wire_ingress
+                        .receive(frame)
+                        .expect("left channel ingress"),
+                    ClusterTcpTunnelFrame::Close { .. } => break,
+                    other => panic!("channel writer emitted a legacy tunnel frame: {other:?}"),
+                }
+            }
+        });
+
+        let left_request =
+            ObjectRpcRequest::encode_body("/test/tunnel-channel/left", "test", &"from-left")
+                .expect("left request");
+        let right_request =
+            ObjectRpcRequest::encode_body("/test/tunnel-channel/right", "test", &"from-right")
+                .expect("right request");
+        let left_pending = left_client
+            .call(sinomo_core::network::ObjectRpcSessionCall::value(
+                left_request,
+            ))
+            .await
+            .expect("left call");
+        let right_pending = right_client
+            .call(sinomo_core::network::ObjectRpcSessionCall::value(
+                right_request,
+            ))
+            .await
+            .expect("right call");
+        let (from_left, from_right) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(right_server.accept(), left_server.accept())
+        })
+        .await
+        .expect("duplex request timeout");
+        let from_left = from_left.expect("right accepted left call");
+        let from_right = from_right.expect("left accepted right call");
+        assert_eq!(
+            from_left
+                .request
+                .request
+                .decode_body::<String>()
+                .expect("left body"),
+            "from-left"
+        );
+        assert_eq!(
+            from_right
+                .request
+                .request
+                .decode_body::<String>()
+                .expect("right body"),
+            "from-right"
+        );
+        let left_response =
+            ObjectRpcResponse::encode_body("/test/tunnel-channel/left", &"from-right-server")
+                .expect("left response");
+        let right_response =
+            ObjectRpcResponse::encode_body("/test/tunnel-channel/right", &"from-left-server")
+                .expect("right response");
+        let (left_responded, right_responded) = tokio::join!(
+            from_left.respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                left_response,
+            )),
+            from_right.respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                right_response,
+            )),
+        );
+        left_responded.expect("respond to left");
+        right_responded.expect("respond to right");
+        let (left_result, right_result) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(left_pending.result(), right_pending.result())
+        })
+        .await
+        .expect("duplex response timeout");
+        assert_eq!(
+            left_result
+                .expect("left result")
+                .response
+                .decode_body::<String>()
+                .expect("left response body"),
+            "from-right-server"
+        );
+        assert_eq!(
+            right_result
+                .expect("right result")
+                .response
+                .decode_body::<String>()
+                .expect("right response body"),
+            "from-left-server"
+        );
+
+        left_ingress.close("test complete");
+        right_ingress.close("test complete");
+        left_handle.request_close("test complete".to_string());
+        right_handle.request_close("test complete".to_string());
+        for task in [left_writer, right_writer, left_to_right, right_to_left] {
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("carrier task stops")
+                .expect("carrier task");
+        }
+    }
+
+    #[tokio::test]
     async fn tcp_tunnel_saturated_stream_reset_isolated_and_releases_lifetime() {
-        let (handle, _control_rx, _stream_rx) =
+        let (handle, mut control_rx, _stream_rx) =
             test_stream_tunnel_handle("tcp_tunnel_backpressure_peer", 0);
-        let (stalled_tx, mut stalled_rx) =
+        let (stalled_tx, stalled_rx) =
             mpsc::channel::<TcpTunnelStreamEvent>(TCP_TUNNEL_STREAM_CHANNEL_CAPACITY);
         let (stalled_reset, _) = watch::channel(false);
-        let active = ActiveTcpTunnelStream {
+        let active = Arc::new(ActiveTcpTunnelStream {
             tx: stalled_tx,
             reset: stalled_reset,
-            remote_finished: Arc::new(AtomicBool::new(false)),
-        };
+            remote_finished: AtomicBool::new(false),
+        });
         handle
             .streams
             .lock()
@@ -2906,12 +4902,12 @@ mod tests {
             .insert(2, active.clone());
         for _ in 0..TCP_TUNNEL_STREAM_CHANNEL_CAPACITY {
             let permit = Arc::clone(&handle.stream_queued_bytes)
-                .try_acquire_many_owned(TCP_TUNNEL_STREAM_FRAME_BYTES as u32)
+                .try_acquire_many_owned(1)
                 .expect("aggregate test window");
             active
                 .tx
                 .try_send(TcpTunnelStreamEvent::Data {
-                    bytes: vec![0x44; TCP_TUNNEL_STREAM_FRAME_BYTES],
+                    bytes: vec![0x44],
                     _queued_bytes: permit,
                 })
                 .expect("fill stalled stream queue");
@@ -2922,43 +4918,27 @@ mod tests {
             "the bounded window itself must not reset a stream"
         );
 
-        let waiting_handle = Arc::clone(&handle);
-        let mut waiting_delivery = tokio::spawn(async move {
-            waiting_handle
-                .deliver_stream_data(2, vec![0x55; TCP_TUNNEL_STREAM_FRAME_BYTES])
-                .await;
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut waiting_delivery)
-                .await
-                .is_err(),
-            "saturated data admission must wait instead of resetting the stream"
-        );
-        assert!(
-            !*active.reset.borrow(),
-            "waiting for bounded capacity must keep the stream healthy"
-        );
-        drop(stalled_rx.recv().await.expect("release one receive slot"));
-        tokio::time::timeout(Duration::from_secs(1), waiting_delivery)
-            .await
-            .expect("waiting frame enters after capacity release")
-            .expect("waiting delivery task");
-        assert_eq!(active.tx.capacity(), 0, "waiting frame refills the queue");
-        assert!(
-            !*active.reset.borrow(),
-            "capacity release and admission must not reset the stream"
-        );
-
-        handle.deliver_stream_reset(2, "peer reset saturated stream".to_string());
+        handle.deliver_stream_data(2, vec![0x55; TCP_TUNNEL_STREAM_FRAME_BYTES]);
         assert!(
             *active.reset.borrow(),
-            "remote reset must bypass a saturated data queue"
+            "saturated data admission must reset only the stalled stream"
         );
+        let reset = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("stalled stream reset is queued")
+            .expect("stalled stream reset frame");
+        match reset {
+            ClusterTcpTunnelFrame::StreamReset { id, detail } => {
+                assert_eq!(id, 2);
+                assert!(detail.contains("current frame was not delivered"));
+            }
+            other => panic!("expected stalled stream reset, got {other:?}"),
+        }
         drop(stalled_rx);
         handle.streams.lock().expect("stream registry").remove(&2);
 
         let mut healthy = handle.create_stream(4).expect("create healthy stream");
-        handle.deliver_stream_data(4, b"healthy".to_vec()).await;
+        handle.deliver_stream_data(4, b"healthy".to_vec());
         handle.deliver_stream_finish(4);
         let mut healthy_bytes = Vec::new();
         healthy
@@ -2976,6 +4956,221 @@ mod tests {
         })
         .await
         .expect("stream lifetime releases");
+        assert_eq!(
+            handle.stream_queued_bytes.available_permits(),
+            TCP_TUNNEL_STREAM_QUEUED_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_aggregate_receive_exhaustion_resets_only_affected_stream() {
+        let (handle, mut control_rx, _stream_rx) =
+            test_stream_tunnel_handle("tcp_tunnel_aggregate_backpressure_peer", 0);
+        let (stream_tx, stream_rx) = mpsc::channel::<TcpTunnelStreamEvent>(1);
+        let (reset, _) = watch::channel(false);
+        let active = Arc::new(ActiveTcpTunnelStream {
+            tx: stream_tx,
+            reset,
+            remote_finished: AtomicBool::new(false),
+        });
+        handle
+            .streams
+            .lock()
+            .expect("stream registry")
+            .insert(2, active.clone());
+        let aggregate_window = Arc::clone(&handle.stream_queued_bytes)
+            .try_acquire_many_owned(TCP_TUNNEL_STREAM_QUEUED_BYTES as u32)
+            .expect("reserve complete aggregate receive window");
+
+        handle.deliver_stream_data(2, b"cannot-enter-window".to_vec());
+
+        assert!(*active.reset.borrow(), "affected stream must reset");
+        let reset = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("aggregate overflow reset is queued")
+            .expect("aggregate overflow reset frame");
+        match reset {
+            ClusterTcpTunnelFrame::StreamReset { id, detail } => {
+                assert_eq!(id, 2);
+                assert!(detail.contains("aggregate stream receive capacity exhausted"));
+                assert!(detail.contains("current frame was not delivered"));
+            }
+            other => panic!("expected aggregate overflow reset, got {other:?}"),
+        }
+
+        drop(aggregate_window);
+        drop(stream_rx);
+        handle.streams.lock().expect("stream registry").remove(&2);
+        assert_eq!(
+            handle.stream_queued_bytes.available_permits(),
+            TCP_TUNNEL_STREAM_QUEUED_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_legacy_stream_cannot_block_bodyless_object_rpc_channel_call() {
+        let (handle, mut control_rx, _stream_rx) =
+            test_stream_tunnel_handle("tcp_tunnel_channel_isolation_peer", 0);
+        let (stalled_tx, stalled_rx) =
+            mpsc::channel::<TcpTunnelStreamEvent>(TCP_TUNNEL_STREAM_CHANNEL_CAPACITY);
+        let (stalled_reset, _) = watch::channel(false);
+        let stalled = Arc::new(ActiveTcpTunnelStream {
+            tx: stalled_tx,
+            reset: stalled_reset,
+            remote_finished: AtomicBool::new(false),
+        });
+        handle
+            .streams
+            .lock()
+            .expect("stream registry")
+            .insert(2, stalled.clone());
+        for _ in 0..TCP_TUNNEL_STREAM_CHANNEL_CAPACITY {
+            let permit = Arc::clone(&handle.stream_queued_bytes)
+                .try_acquire_many_owned(1)
+                .expect("aggregate test window");
+            stalled
+                .tx
+                .try_send(TcpTunnelStreamEvent::Data {
+                    bytes: vec![0x41],
+                    _queued_bytes: permit,
+                })
+                .expect("fill stalled stream queue");
+        }
+
+        let sender = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("sender object RPC channel");
+        let receiver = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("receiver object RPC channel");
+        let ObjectRpcChannelEndpoint {
+            client: sender_client,
+            server: _sender_server,
+            ingress: sender_ingress,
+            egress: mut sender_egress,
+        } = sender;
+        let ObjectRpcChannelEndpoint {
+            client: _receiver_client,
+            server: mut receiver_server,
+            ingress: receiver_ingress,
+            egress: mut receiver_egress,
+        } = receiver;
+        let request = ObjectRpcRequest::encode_body(
+            "/test/tunnel-channel/backpressure-isolation",
+            "test",
+            &"bodyless-request",
+        )
+        .expect("bodyless request");
+        let pending = sender_client
+            .call(sinomo_core::network::ObjectRpcSessionCall::value(request))
+            .await
+            .expect("queue bodyless call");
+        let request_frame = sender_egress
+            .next_frame()
+            .await
+            .expect("bodyless request frame");
+        assert!(matches!(
+            &request_frame,
+            sinomo_core::network::ObjectRpcChannelWireFrame::Request { body: None, .. }
+        ));
+
+        // Feed a rejected legacy data frame and then the ordinary channel frame
+        // through one physical byte stream. This is the same ordering and the
+        // same admission calls used by tcp_tunnel_reader_loop.
+        let (mut physical_writer, mut physical_reader) = tokio::io::duplex(128 * 1024);
+        let reader_handle = Arc::clone(&handle);
+        let reader_ingress = receiver_ingress.clone();
+        let physical_reader_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                match read_tcp_tunnel_frame(&mut physical_reader, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("physical tunnel frame")
+                {
+                    ClusterTcpTunnelFrame::StreamData { id, bytes } => {
+                        reader_handle.deliver_stream_data(id, bytes);
+                    }
+                    ClusterTcpTunnelFrame::ObjectRpcChannel { frame } => reader_ingress
+                        .receive(frame)
+                        .expect("receive object RPC frame after saturated stream"),
+                    other => panic!("unexpected physical tunnel frame {other:?}"),
+                }
+            }
+        });
+        write_object_frame_async(
+            &mut physical_writer,
+            &ClusterTcpTunnelFrame::StreamData {
+                id: 2,
+                bytes: vec![0x55; TCP_TUNNEL_STREAM_FRAME_BYTES],
+            },
+            ObjectFrameIoOptions::none(),
+        )
+        .await
+        .expect("write rejected legacy stream frame");
+        write_object_frame_async(
+            &mut physical_writer,
+            &ClusterTcpTunnelFrame::ObjectRpcChannel {
+                frame: request_frame,
+            },
+            ObjectFrameIoOptions::none(),
+        )
+        .await
+        .expect("write following object RPC frame");
+        tokio::time::timeout(Duration::from_secs(1), physical_reader_task)
+            .await
+            .expect("physical reader remains live")
+            .expect("physical reader task");
+
+        let inbound = tokio::time::timeout(Duration::from_secs(1), receiver_server.accept())
+            .await
+            .expect("bodyless call is not blocked")
+            .expect("receiver accepts bodyless call");
+        let response = ObjectRpcResponse::encode_body(
+            "/test/tunnel-channel/backpressure-isolation",
+            &"bodyless-response",
+        )
+        .expect("bodyless response");
+        inbound
+            .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                response,
+            ))
+            .await
+            .expect("respond after saturated stream");
+        let response_frame = receiver_egress
+            .next_frame()
+            .await
+            .expect("bodyless response frame");
+        sender_ingress
+            .receive(response_frame)
+            .expect("receive bodyless response");
+        let result = tokio::time::timeout(Duration::from_secs(1), pending.result())
+            .await
+            .expect("bodyless result is not blocked")
+            .expect("bodyless call result");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("decode bodyless response"),
+            "bodyless-response"
+        );
+        assert!(*stalled.reset.borrow(), "only stalled stream resets");
+        let reset = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("stalled stream reset is queued")
+            .expect("stalled stream reset frame");
+        assert!(matches!(
+            reset,
+            ClusterTcpTunnelFrame::StreamReset { id: 2, .. }
+        ));
+
+        sender_ingress.close("test complete");
+        receiver_ingress.close("test complete");
+        drop(stalled_rx);
+        handle.streams.lock().expect("stream registry").remove(&2);
         assert_eq!(
             handle.stream_queued_bytes.available_permits(),
             TCP_TUNNEL_STREAM_QUEUED_BYTES

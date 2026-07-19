@@ -5,13 +5,14 @@ use ring::digest;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_local::SinomoDataDir;
-use sinomo_node::load_or_create_main_node_identity;
+use sinomo_node::{NodeIdentityPaths, load_or_create_main_node_identity};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -21,6 +22,8 @@ pub(crate) const BODY_FINISH_PROOF_PROTOCOL: &str = "sinomo.rpc-body-finish.v1";
 pub(crate) const RESPONSE_HEAD_PROOF_PROTOCOL: &str = "sinomo.rpc-response-head.v1";
 
 const DAEMON_RPC_REQUEST_DIGEST_DOMAIN: &[u8] = b"sinomo.daemon-rpc-request\0";
+const LOCAL_CHANNEL_AUTH_PROTOCOL: &[u8] = b"sinomo.local-object-rpc-channel.v2\0";
+const DAEMON_SIGNING_IDENTITY_MAX_AGE: Duration = Duration::from_secs(1);
 
 static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
     OnceLock::new();
@@ -31,6 +34,113 @@ struct CachedDaemonSigningIdentity {
     node_id: String,
     public_key: Vec<u8>,
     key_pair: Arc<ring::signature::Ed25519KeyPair>,
+    identity_mark: Option<crate::file_mark::ClusterFileMark>,
+    cluster_state_mark: Option<crate::file_mark::ClusterFileMark>,
+    checked_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalChannelProofRole {
+    Server,
+    Client,
+}
+
+impl LocalChannelProofRole {
+    fn domain_byte(self) -> u8 {
+        match self {
+            Self::Server => 1,
+            Self::Client => 2,
+        }
+    }
+}
+
+/// Process-cached daemon principal captured once for a physical local channel.
+///
+/// Keeping the key pair private to this module prevents the transport from
+/// accidentally growing per-call signing. The channel uses this handle only
+/// during its nonce-bound connection handshake.
+#[derive(Clone)]
+pub(crate) struct LocalChannelAuthIdentity {
+    identity: CachedDaemonSigningIdentity,
+}
+
+impl LocalChannelAuthIdentity {
+    pub(crate) fn from_data_dir(data_dir: &SinomoDataDir) -> Result<Self, NetworkError> {
+        Ok(Self {
+            identity: cached_daemon_signing_identity(data_dir)?,
+        })
+    }
+
+    pub(crate) fn binding(&self) -> [u8; 32] {
+        let mut payload = Vec::with_capacity(
+            LOCAL_CHANNEL_AUTH_PROTOCOL.len()
+                + self.identity.node_id.len()
+                + self.identity.public_key.len()
+                + 32,
+        );
+        payload.extend_from_slice(LOCAL_CHANNEL_AUTH_PROTOCOL);
+        payload.extend_from_slice(b"identity\0");
+        local_channel_append_bytes(&mut payload, self.identity.node_id.as_bytes());
+        local_channel_append_bytes(&mut payload, &self.identity.public_key);
+        let digest = digest::digest(&digest::SHA256, &payload);
+        digest
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 daemon identity binding")
+    }
+
+    pub(crate) fn sign(&self, role: LocalChannelProofRole, transcript: &[u8]) -> Vec<u8> {
+        let payload = local_channel_proof_payload(
+            role,
+            &self.identity.node_id,
+            &self.identity.public_key,
+            transcript,
+        );
+        self.identity.key_pair.sign(&payload).as_ref().to_vec()
+    }
+
+    pub(crate) fn verify(
+        &self,
+        role: LocalChannelProofRole,
+        transcript: &[u8],
+        signature: &[u8],
+    ) -> Result<(), NetworkError> {
+        let payload = local_channel_proof_payload(
+            role,
+            &self.identity.node_id,
+            &self.identity.public_key,
+            transcript,
+        );
+        UnparsedPublicKey::new(&ED25519, &self.identity.public_key)
+            .verify(&payload, signature)
+            .map_err(|_| NetworkError::AuthDenied)
+    }
+}
+
+fn local_channel_proof_payload(
+    role: LocalChannelProofRole,
+    node_id: &str,
+    public_key: &[u8],
+    transcript: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        LOCAL_CHANNEL_AUTH_PROTOCOL.len()
+            + node_id.len()
+            + public_key.len()
+            + transcript.len()
+            + 32,
+    );
+    payload.extend_from_slice(LOCAL_CHANNEL_AUTH_PROTOCOL);
+    payload.push(role.domain_byte());
+    local_channel_append_bytes(&mut payload, node_id.as_bytes());
+    local_channel_append_bytes(&mut payload, public_key);
+    local_channel_append_bytes(&mut payload, transcript);
+    payload
+}
+
+fn local_channel_append_bytes(payload: &mut Vec<u8>, bytes: &[u8]) {
+    payload.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    payload.extend_from_slice(bytes);
 }
 
 /// Session-local signer loaded once when a duplex stream is established.
@@ -465,6 +575,24 @@ pub fn sign_daemon_rpc_request_digest_from_data_dir(
     )
 }
 
+/// Signs from the process cache without touching the filesystem.
+///
+/// Callers on latency-sensitive async workers can use this first and move the
+/// ordinary signing path to a blocking worker only when the cache is absent or
+/// due for its bounded refresh.
+pub fn try_sign_daemon_rpc_request_digest_from_cached_data_dir(
+    data_dir: &SinomoDataDir,
+    route: &str,
+    category: &str,
+    rpc_body_sha256: &[u8],
+) -> Result<Option<Vec<u8>>, NetworkError> {
+    let Some(identity) = fresh_cached_daemon_signing_identity(data_dir)? else {
+        return Ok(None);
+    };
+    sign_daemon_rpc_request_with_identity(identity, route, category, Some(rpc_body_sha256.to_vec()))
+        .map(Some)
+}
+
 /// Digests the RPC body and its sender-controlled metadata for daemon authentication.
 ///
 /// The historical name remains part of the public API, but the digest deliberately
@@ -502,6 +630,15 @@ fn sign_daemon_rpc_request_from_data_dir_with_body_sha256(
     rpc_body_sha256: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, NetworkError> {
     let identity = cached_daemon_signing_identity(data_dir)?;
+    sign_daemon_rpc_request_with_identity(identity, route, category, rpc_body_sha256)
+}
+
+fn sign_daemon_rpc_request_with_identity(
+    identity: CachedDaemonSigningIdentity,
+    route: &str,
+    category: &str,
+    rpc_body_sha256: Option<Vec<u8>>,
+) -> Result<Vec<u8>, NetworkError> {
     let timestamp = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -528,10 +665,33 @@ fn sign_daemon_rpc_request_from_data_dir_with_body_sha256(
     SinomoObjectCodec::default().encode(&envelope)
 }
 
+fn fresh_cached_daemon_signing_identity(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<CachedDaemonSigningIdentity>, NetworkError> {
+    let root = data_dir.root();
+    let checked_at = Instant::now();
+    let guard = DAEMON_SIGNING_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|source| NetworkError::Io {
+            operation: "daemon RPC auth identity cache".to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(guard
+        .get(&root)
+        .filter(|cached| {
+            cached.identity_mark.is_some_and(|mark| mark.exists)
+                && cached.cluster_state_mark.is_some_and(|mark| mark.exists)
+                && checked_at.duration_since(cached.checked_at) < DAEMON_SIGNING_IDENTITY_MAX_AGE
+        })
+        .cloned())
+}
+
 fn cached_daemon_signing_identity(
     data_dir: &SinomoDataDir,
 ) -> Result<CachedDaemonSigningIdentity, NetworkError> {
     let root = data_dir.root();
+    let checked_at = Instant::now();
     let cached = DAEMON_SIGNING_IDENTITIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -541,12 +701,28 @@ fn cached_daemon_signing_identity(
         })?
         .get(&root)
         .cloned();
+    if let Some(cached) = cached.as_ref()
+        && cached.identity_mark.is_some_and(|mark| mark.exists)
+        && cached.cluster_state_mark.is_some_and(|mark| mark.exists)
+        && checked_at.duration_since(cached.checked_at) < DAEMON_SIGNING_IDENTITY_MAX_AGE
+    {
+        return Ok(cached.clone());
+    }
+
+    let identity_path = NodeIdentityPaths::new(&root).main;
+    let cluster_state_path = ClusterPaths::new(data_dir).state;
+    let identity_mark = crate::file_mark::cluster_file_mark(&identity_path);
+    let cluster_state_mark = crate::file_mark::cluster_file_mark(&cluster_state_path);
     if let Some(cached) = cached {
-        let Some(node_id) = local_cluster_node_id(data_dir) else {
-            return Ok(cached);
-        };
-        if node_id != cached.node_id {
-            let refreshed = CachedDaemonSigningIdentity { node_id, ..cached };
+        if identity_mark.is_some()
+            && identity_mark == cached.identity_mark
+            && cluster_state_mark.is_some()
+            && cluster_state_mark == cached.cluster_state_mark
+        {
+            let refreshed = CachedDaemonSigningIdentity {
+                checked_at,
+                ..cached
+            };
             DAEMON_SIGNING_IDENTITIES
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
@@ -557,7 +733,6 @@ fn cached_daemon_signing_identity(
                 .insert(root, refreshed.clone());
             return Ok(refreshed);
         }
-        return Ok(cached);
     }
 
     data_dir
@@ -580,6 +755,12 @@ fn cached_daemon_signing_identity(
         node_id,
         public_key,
         key_pair,
+        // Retain the marks sampled before the reads. If either file was
+        // replaced concurrently, the next lookup observes the new mark and
+        // refreshes instead of pairing stale contents with a post-read mark.
+        identity_mark,
+        cluster_state_mark,
+        checked_at,
     };
 
     let mut guard = DAEMON_SIGNING_IDENTITIES
@@ -589,7 +770,15 @@ fn cached_daemon_signing_identity(
             operation: "daemon RPC auth identity cache".to_string(),
             detail: source.to_string(),
         })?;
-    Ok(guard.entry(root).or_insert_with(|| loaded).clone())
+    guard.insert(root, loaded.clone());
+    Ok(loaded)
+}
+
+/// Returns the process-cached main-daemon public key, refreshing identity
+/// state only when its file marks change. Persistent transports use this once
+/// while establishing their connection principal.
+pub fn cached_daemon_signing_public_key(data_dir: &SinomoDataDir) -> Result<Vec<u8>, NetworkError> {
+    Ok(cached_daemon_signing_identity(data_dir)?.public_key)
 }
 
 fn local_cluster_node_id(data_dir: &SinomoDataDir) -> Option<String> {
@@ -656,7 +845,103 @@ mod tests {
     use super::*;
     use crate::ObjectRpcRequest;
     use std::collections::BTreeSet;
+    use std::hint::black_box;
     use time::OffsetDateTime;
+
+    fn diagnostic_ns_per_iteration(iterations: usize, mut operation: impl FnMut()) -> u128 {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            operation();
+        }
+        started.elapsed().as_nanos() / iterations.max(1) as u128
+    }
+
+    /// Opt-in microbenchmark for separating cryptographic work from transport
+    /// and scheduler latency. This deliberately has no timing assertion: CI
+    /// hosts are not stable benchmark environments.
+    #[test]
+    #[ignore = "diagnostic microbenchmark; run explicitly with --ignored --nocapture"]
+    fn diagnostic_daemon_and_session_crypto_costs() {
+        const ITERATIONS: usize = 20_000;
+        let root = sinomo_testdir::TestDir::new("sinomo-network-auth-cost-diagnostic");
+        let data_dir = SinomoDataDir::new(root.path());
+        let request =
+            ObjectRpcRequest::encode_body("/test/auth-cost-diagnostic", "test", &"small request")
+                .expect("diagnostic request");
+        let body_sha256 = daemon_rpc_body_sha256(&request);
+        let identity = cached_daemon_signing_identity(&data_dir).expect("cached identity");
+        let signer = SessionFrameSigner::from_data_dir(&data_dir).expect("session signer");
+        let frame_input = session_proof_input();
+        let frame_proof = signer.sign(frame_input.clone());
+        let auth = sign_daemon_rpc_request_with_identity(
+            identity.clone(),
+            &request.route,
+            &request.category,
+            Some(body_sha256.clone()),
+        )
+        .expect("request signature");
+        let envelope: SignedDaemonCommand = SinomoObjectCodec::default()
+            .decode(&auth)
+            .expect("decode request signature");
+        let auth_payload = daemon_auth_signing_payload(
+            &envelope.node_id,
+            &envelope.public_key,
+            &envelope.timestamp,
+            &envelope.nonce,
+            &request.route,
+            &request.category,
+            envelope.rpc_body_sha256.as_deref(),
+        );
+
+        // Warm code and allocator paths before reporting steady-state costs.
+        for _ in 0..1_000 {
+            black_box(daemon_rpc_body_sha256(black_box(&request)));
+            black_box(signer.sign(black_box(frame_input.clone())));
+            verify_session_frame_proof(
+                black_box(&frame_proof),
+                black_box(&frame_proof.public_key),
+                black_box(&frame_input),
+            )
+            .expect("warm frame verification");
+        }
+
+        let digest_ns = diagnostic_ns_per_iteration(ITERATIONS, || {
+            black_box(daemon_rpc_body_sha256(black_box(&request)));
+        });
+        let request_sign_ns = diagnostic_ns_per_iteration(ITERATIONS, || {
+            black_box(
+                sign_daemon_rpc_request_with_identity(
+                    identity.clone(),
+                    black_box(&request.route),
+                    black_box(&request.category),
+                    Some(body_sha256.clone()),
+                )
+                .expect("diagnostic request sign"),
+            );
+        });
+        let request_verify_ns = diagnostic_ns_per_iteration(ITERATIONS, || {
+            UnparsedPublicKey::new(&ED25519, black_box(&envelope.public_key))
+                .verify(black_box(&auth_payload), black_box(&envelope.signature))
+                .expect("diagnostic request verify");
+        });
+        let frame_sign_ns = diagnostic_ns_per_iteration(ITERATIONS, || {
+            black_box(signer.sign(black_box(frame_input.clone())));
+        });
+        let frame_verify_ns = diagnostic_ns_per_iteration(ITERATIONS, || {
+            black_box(
+                verify_session_frame_proof(
+                    black_box(&frame_proof),
+                    black_box(&frame_proof.public_key),
+                    black_box(&frame_input),
+                )
+                .expect("diagnostic frame verify"),
+            );
+        });
+
+        eprintln!(
+            "auth-cost ns/op: digest={digest_ns} request-sign={request_sign_ns} request-verify={request_verify_ns} frame-sign={frame_sign_ns} frame-verify={frame_verify_ns}"
+        );
+    }
 
     #[test]
     fn daemon_auth_nonce_suffix_is_unique_under_concurrent_signing() {
@@ -814,6 +1099,15 @@ mod tests {
         state.members[0].display_name = "second".to_string();
         crate::object_file_store::write_object_file(&cluster_paths.state, &state)
             .expect("write second state");
+        DAEMON_SIGNING_IDENTITIES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("identity cache")
+            .get_mut(&data_dir.root())
+            .expect("cached identity")
+            .checked_at = Instant::now()
+            .checked_sub(DAEMON_SIGNING_IDENTITY_MAX_AGE + Duration::from_millis(1))
+            .expect("expired cache timestamp");
 
         let second_auth =
             sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("second auth");

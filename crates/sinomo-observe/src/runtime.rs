@@ -639,6 +639,18 @@ pub fn observe_control_snapshot() -> ObserveControlResponse {
         .unwrap_or_else(|| ObserveFilterState::default().to_control_response(None, false, 0))
 }
 
+pub(crate) fn observe_runtime_process_identity() -> (String, Option<String>) {
+    OBSERVE_RUNTIME
+        .get()
+        .map(|runtime| {
+            (
+                runtime.config.process_role.clone(),
+                runtime.config.node_id.clone(),
+            )
+        })
+        .unwrap_or_else(|| ("uninitialized".to_string(), None))
+}
+
 pub fn read_observe_metrics(request: &ObserveMetricsRequest) -> ObserveMetricsResponse {
     finish_observe_metrics(observe_runtime_metrics(), request)
 }

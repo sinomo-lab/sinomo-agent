@@ -1,7 +1,9 @@
 //! Operational events, logs, and object-RPC observation service.
 
 mod cli;
+mod profile;
 mod runtime;
+mod timeline;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,14 @@ pub use cli::{
     ObserveCliCommandHandler, observe_cli_command_handler,
     observe_cli_command_handler_with_cluster_rpc, observe_cli_command_handler_with_rpc,
 };
+pub use profile::{
+    OBSERVE_CPU_PROFILE_ARTIFACT_ROOT, OBSERVE_CPU_PROFILE_DEFAULT_DURATION_SECONDS,
+    OBSERVE_CPU_PROFILE_DEFAULT_FREQUENCY_HZ, OBSERVE_CPU_PROFILE_MAX_ARTIFACT_BYTES,
+    OBSERVE_CPU_PROFILE_MAX_DURATION_SECONDS, OBSERVE_CPU_PROFILE_MAX_FREQUENCY_HZ,
+    OBSERVE_CPU_PROFILE_MIN_DURATION_SECONDS, OBSERVE_CPU_PROFILE_MIN_FREQUENCY_HZ,
+    ObserveCpuProfileAction, ObserveCpuProfileRequest, ObserveCpuProfileResponse,
+    ObserveCpuProfileState, handle_observe_cpu_profile, observe_cpu_profile_snapshot,
+};
 pub use runtime::{
     OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES, OBSERVE_DEFAULT_BASE_FILTER, OBSERVE_DEFAULT_FILTER,
     OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES, ObserveControlRequest, ObserveControlResponse,
@@ -33,6 +43,13 @@ pub use runtime::{
     observe_filter_with_builtin_quiet_directives, observe_filter_with_quiet_directives,
     read_observe_metrics, read_observe_metrics_for_data_dir, read_observe_traces,
     register_observe_metric_exporter, update_observe_control,
+};
+pub use timeline::{
+    OBSERVE_NETWORK_TIMELINE_DEFAULT_DURATION_SECONDS, OBSERVE_NETWORK_TIMELINE_DEFAULT_MAX_EVENTS,
+    OBSERVE_NETWORK_TIMELINE_MAX_DURATION_SECONDS, OBSERVE_NETWORK_TIMELINE_MAX_EVENTS,
+    OBSERVE_NETWORK_TIMELINE_MIN_DURATION_SECONDS, ObserveNetworkTimelineAction,
+    ObserveNetworkTimelineEvent, ObserveNetworkTimelineRequest, ObserveNetworkTimelineResponse,
+    handle_observe_network_timeline, observe_network_timeline_response_from_snapshot,
 };
 
 pub const OBSERVE_PROTOCOL: &str = "sinomo.observe.v1";
@@ -45,12 +62,16 @@ pub const OBSERVE_LOGS_ROUTE: &str = "/observe/logs";
 pub const OBSERVE_METRICS_ROUTE: &str = "/observe/metrics";
 pub const OBSERVE_TRACES_ROUTE: &str = "/observe/traces";
 pub const OBSERVE_CONTROL_ROUTE: &str = "/observe/control";
+pub const OBSERVE_CPU_PROFILE_ROUTE: &str = "/observe/profile/cpu";
+pub const OBSERVE_NETWORK_TIMELINE_ROUTE: &str = "/observe/timeline/network";
 pub const OBSERVE_OBJECT_RPC_ROUTES: &[&str] = &[
     OBSERVE_EVENTS_ROUTE,
     OBSERVE_LOGS_ROUTE,
     OBSERVE_METRICS_ROUTE,
     OBSERVE_TRACES_ROUTE,
     OBSERVE_CONTROL_ROUTE,
+    OBSERVE_CPU_PROFILE_ROUTE,
+    OBSERVE_NETWORK_TIMELINE_ROUTE,
 ];
 
 pub const OPERATIONAL_EVENTS_RELATIVE_PATH: &str = "events/ops/operational-events.jsonl";
@@ -750,6 +771,18 @@ pub fn observe_module_surfaces() -> sinomo_module::ModuleSurfaces {
             "observe.control.write",
             ModuleRouteAuth::Admin,
         ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            OBSERVE_CPU_PROFILE_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.profile.cpu.write",
+            ModuleRouteAuth::Admin,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            OBSERVE_NETWORK_TIMELINE_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.timeline.network.write",
+            ModuleRouteAuth::Admin,
+        ))
         .with_event_kind_name("daemon.lifecycle.started")
         .with_event_kind_name("daemon.lifecycle.shutdown_requested")
         .with_event_kind_name("daemon.lifecycle.stopped")
@@ -775,6 +808,8 @@ pub fn observe_module_capabilities() -> sinomo_core::ModuleCapabilities {
             observe_capability("observe.metrics.read"),
             observe_capability("observe.traces.read"),
             observe_capability("observe.control.write"),
+            observe_capability("observe.profile.cpu.write"),
+            observe_capability("observe.timeline.network.write"),
             observe_capability("observe.events.write"),
             observe_capability("observe.logs.write"),
         ],
@@ -834,6 +869,12 @@ pub fn register_storage_paths(
     ] {
         layout.register_binary(SINOMO_OBSERVE_MODULE_OWNER, StorageRing::R1, relative_path)?;
     }
+    layout.register_escape_path(
+        SINOMO_OBSERVE_MODULE_OWNER,
+        StorageRing::R1,
+        OBSERVE_CPU_PROFILE_ARTIFACT_ROOT,
+        "bounded node-local CPU profile artifacts and manifests",
+    )?;
     Ok(())
 }
 
@@ -913,6 +954,21 @@ impl Service for ObserveService {
                         &update_observe_control(request).map_err(service_error)?,
                     )?
                 }
+                OBSERVE_CPU_PROFILE_ROUTE => {
+                    let request: ObserveCpuProfileRequest = request.decode_body()?;
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
+                        OBSERVE_CPU_PROFILE_ROUTE,
+                        &handle_observe_cpu_profile(ctx.data_dir.root(), request)
+                            .map_err(service_error)?,
+                    )?
+                }
+                OBSERVE_NETWORK_TIMELINE_ROUTE => {
+                    let request: ObserveNetworkTimelineRequest = request.decode_body()?;
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
+                        OBSERVE_NETWORK_TIMELINE_ROUTE,
+                        &handle_observe_network_timeline(request).map_err(service_error)?,
+                    )?
+                }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
@@ -946,6 +1002,25 @@ fn service_error(error: ObserveError) -> ServiceError {
 mod tests {
     use super::*;
     use sinomo_core::service::ServiceRegistry;
+
+    #[test]
+    fn cpu_profile_artifacts_are_registered_in_the_storage_contract() {
+        let mut layout = sinomo_core::storage::StorageLayout::new();
+        register_storage_paths(&mut layout).expect("register observe storage paths");
+
+        for relative_path in [
+            "observe/profiles/capture/cpu.pprof.pb",
+            "observe/profiles/capture/manifest.json",
+        ] {
+            let owner = layout
+                .owner_for(relative_path)
+                .unwrap_or_else(|| panic!("missing storage owner for {relative_path}"));
+            assert!(matches!(
+                owner,
+                sinomo_core::storage::StoragePathOwner::Escape(_)
+            ));
+        }
+    }
 
     #[test]
     fn observe_service_route_metadata_matches_module_surfaces() {
