@@ -325,7 +325,11 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == sinomo_observe::OBSERVE_CONTROL_ROUTE => {
+        route
+            if route == sinomo_observe::OBSERVE_CONTROL_ROUTE
+                || route == sinomo_observe::OBSERVE_CPU_PROFILE_ROUTE
+                || route == sinomo_observe::OBSERVE_NETWORK_TIMELINE_ROUTE =>
+        {
             authenticated.signer.can_run_admin_command()
         }
         route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
@@ -1368,20 +1372,24 @@ mod tests {
             }
         }
 
-        for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
-            let authenticated =
-                authenticated_command(sinomo_observe::OBSERVE_CONTROL_ROUTE.to_string(), signer);
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("observe control requires an admin signer");
-        }
-        for signer in [
-            DaemonSignerAuthority::Member,
-            DaemonSignerAuthority::JoinCandidate,
-            DaemonSignerAuthority::StatusProbe,
+        for route in [
+            sinomo_observe::OBSERVE_CONTROL_ROUTE,
+            sinomo_observe::OBSERVE_CPU_PROFILE_ROUTE,
+            sinomo_observe::OBSERVE_NETWORK_TIMELINE_ROUTE,
         ] {
-            let authenticated =
-                authenticated_command(sinomo_observe::OBSERVE_CONTROL_ROUTE.to_string(), signer);
-            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("observe control requires an admin signer");
+            }
+            for signer in [
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
         }
     }
 

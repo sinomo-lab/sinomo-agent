@@ -228,6 +228,7 @@ pub(crate) fn observe_cluster_kv_snapshot_write(
     snapshot: Option<&KvSnapshot>,
 ) {
     if wrote {
+        crate::local_state_store::invalidate_cluster_state_cache(paths);
         sinomo_network::invalidate_cluster_delivery_routing_table_cache(paths);
         sinomo_network::invalidate_cluster_route_graph_cache(paths);
     }

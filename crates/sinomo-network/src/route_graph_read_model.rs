@@ -15,9 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 const MAX_CLUSTER_ROUTE_GRAPH_CACHE_ENTRIES: usize = 128;
+const CLUSTER_ROUTE_GRAPH_VALIDATION_LEASE: Duration = Duration::from_millis(250);
 
 static CLUSTER_ROUTE_GRAPH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_ROUTE_GRAPHS: LazyLock<Mutex<HashMap<PathBuf, ClusterRouteGraphCacheEntry>>> =
@@ -28,6 +30,7 @@ struct ClusterRouteGraphCacheEntry {
     mark: ClusterRouteGraphCacheMark,
     graph: ClusterConnectivityGraph,
     earliest_expires_at: Option<OffsetDateTime>,
+    validated_at: Instant,
     last_used: u64,
 }
 
@@ -176,6 +179,9 @@ impl ClusterConnectivityGraph {
         state: &ClusterBootstrapState,
     ) -> Result<Self, NetworkError> {
         let now = OffsetDateTime::now_utc();
+        if let Some(graph) = read_cluster_route_graph_from_fresh_cache(paths, state, now) {
+            return Ok(graph);
+        }
         let before_mark = cluster_route_graph_cache_mark(paths);
         if let Some(graph) = read_cluster_route_graph_from_cache(paths, state, before_mark, now) {
             return Ok(graph);
@@ -194,6 +200,9 @@ impl ClusterConnectivityGraph {
 
     pub fn read_for_local(paths: &ClusterPaths, state: &ClusterBootstrapState) -> Self {
         let now = OffsetDateTime::now_utc();
+        if let Some(graph) = read_cluster_route_graph_from_fresh_cache(paths, state, now) {
+            return graph;
+        }
         let before_mark = cluster_route_graph_cache_mark(paths);
         if let Some(graph) = read_cluster_route_graph_from_cache(paths, state, before_mark, now) {
             return graph;
@@ -295,6 +304,37 @@ fn read_cluster_route_graph_from_cache(
         return None;
     }
     let entry = cache.get_mut(&paths.root)?;
+    entry.validated_at = Instant::now();
+    entry.last_used = cluster_route_graph_cache_tick();
+    Some(entry.graph.clone())
+}
+
+fn read_cluster_route_graph_from_fresh_cache(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    now: OffsetDateTime,
+) -> Option<ClusterConnectivityGraph> {
+    let checked_at = Instant::now();
+    let local_generation = local_cluster_connectivity_content_generation(paths);
+    let mut cache = CLUSTER_ROUTE_GRAPHS.lock().ok()?;
+    let stale = {
+        let entry = cache.get(&paths.root)?;
+        entry.mark.local_connectivity_generation != local_generation
+            || entry.graph.source_node_id() != &state.local_node_id
+            || entry
+                .earliest_expires_at
+                .is_some_and(|expires_at| expires_at <= now)
+    };
+    if stale {
+        cache.remove(&paths.root);
+        return None;
+    }
+    let entry = cache.get_mut(&paths.root)?;
+    if checked_at.saturating_duration_since(entry.validated_at)
+        >= CLUSTER_ROUTE_GRAPH_VALIDATION_LEASE
+    {
+        return None;
+    }
     entry.last_used = cluster_route_graph_cache_tick();
     Some(entry.graph.clone())
 }
@@ -321,6 +361,7 @@ fn store_cluster_route_graph_cache_entry(
             mark,
             earliest_expires_at: graph.earliest_expires_at(),
             graph,
+            validated_at: Instant::now(),
             last_used: cluster_route_graph_cache_tick(),
         },
     );

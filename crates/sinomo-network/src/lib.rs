@@ -12,6 +12,8 @@
 //! host filesystem and transport adapters while cluster-aware validation remains
 //! here.
 
+mod channel;
+mod channel_transport;
 mod connectivity;
 mod connectivity_store;
 mod daemon_auth;
@@ -39,10 +41,28 @@ mod rpc;
 mod rpc_future;
 mod session;
 mod tcp_tunnel;
+mod timeline;
 // Framing and transfer state stay private beneath the canonical session API so
 // higher-level crates cannot assemble protocol frames themselves.
 mod transfer;
 
+pub use channel::{
+    OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES, OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES,
+    OBJECT_RPC_CHANNEL_MAX_CALLS, OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES,
+    OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES, OBJECT_RPC_CHANNEL_MAX_QUEUED_DATA_BYTES,
+    ObjectRpcChannelBodyDescriptor, ObjectRpcChannelBodyDirection, ObjectRpcChannelBodyKind,
+    ObjectRpcChannelCallId, ObjectRpcChannelClient, ObjectRpcChannelConfig, ObjectRpcChannelEgress,
+    ObjectRpcChannelEndpoint, ObjectRpcChannelInboundRequest, ObjectRpcChannelIngress,
+    ObjectRpcChannelPendingCall, ObjectRpcChannelQueueSnapshot, ObjectRpcChannelResponder,
+    ObjectRpcChannelRole, ObjectRpcChannelServer, ObjectRpcChannelWireFrame,
+    ObjectRpcChannelWriteTimeline,
+};
+pub use channel_transport::{
+    AcceptedLocalObjectRpcChannel, ConnectedLocalObjectRpcChannel,
+    LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION, LocalObjectRpcChannelTransport,
+    accept_local_object_rpc_channel_async, connect_local_object_rpc_channel_async,
+    local_object_rpc_channel_wire_prefix_matches,
+};
 pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
@@ -78,10 +98,11 @@ pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
 };
 pub use daemon_auth::{
-    DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, daemon_auth_decode_public_key,
-    daemon_auth_encode_public_key, daemon_auth_signing_payload, daemon_rpc_body_sha256,
-    sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_digest_from_data_dir,
-    sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
+    DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,
+    daemon_auth_decode_public_key, daemon_auth_encode_public_key, daemon_auth_signing_payload,
+    daemon_rpc_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
+    sign_daemon_rpc_request_digest_from_data_dir, sign_daemon_rpc_request_for_local_node,
+    sign_daemon_rpc_request_from_data_dir, try_sign_daemon_rpc_request_digest_from_cached_data_dir,
 };
 pub use directory::{
     ClusterDirectory, ClusterDirectoryFactory, DirectoryVersion, EmptyClusterDirectory,
@@ -191,13 +212,19 @@ pub use rpc::{
 pub use transfer::{NetworkCallPolicy, NetworkHealthPolicy};
 // Unconditional since stage C: dylib network modules reuse the object frame
 // codec through the sinomo-core facade.
-pub use object::read_object_frame_async;
-pub use object::write_object_frame_async;
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DEFAULT_NETWORK_TIMEOUT,
-    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, ObjectFrameIoOptions,
-    SinomoObjectCodec, write_borrowed_object_frame_async,
+    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
+    MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, ObjectFrameIoOptions, ObjectFrameReadTiming,
+    ObjectFrameReadinessProbe, ObjectFrameWriteTiming, SinomoObjectCodec,
+    write_borrowed_object_frame_async,
 };
+pub use object::{
+    read_object_frame_async, read_object_frame_async_with_max_bytes,
+    read_object_frame_async_with_max_bytes_after_first_byte,
+    read_object_frame_async_with_max_bytes_after_first_byte_timed,
+};
+pub use object::{write_object_frame_async, write_object_frame_async_timed};
 // Unconditional since stage C: see read_object_frame_async above.
 pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
 pub use paths::ClusterPaths;
@@ -207,11 +234,12 @@ pub use peer::{
 };
 pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
-    CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelaySessionRequestAction,
-    ClusterSignedObjectRpcAsyncHost, ClusterSignedObjectRpcFuture,
-    ClusterSignedObjectRpcObservation, RelayEnvelope, cluster_relay_session_request_action,
-    relay_request_inner_route, relay_response_is_routing_error,
+    CLUSTER_RELAY_ORIGIN_NODE_ID_METADATA_KEY, CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY,
+    CLUSTER_ROUTING_RPC_ROUTE_METADATA, ClusterObjectRpcClient, ClusterObjectRpcOptions,
+    ClusterRelaySessionRequestAction, ClusterSignedObjectRpcAsyncHost,
+    ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation, RelayEnvelope,
+    cluster_relay_session_request_action, relay_request_inner_route,
+    relay_response_is_routing_error,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
@@ -237,9 +265,25 @@ pub use session::{
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
 pub use tcp_tunnel::{
-    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL,
+    CLUSTER_TCP_TUNNEL_MIN_PROTOCOL_VERSION,
+    CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
     CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame,
+    ClusterTcpTunnelHandshakeProof, ClusterTcpTunnelHandshakeTranscript,
     ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
+    cluster_tcp_tunnel_protocol_supports_object_rpc_channel, negotiate_cluster_tcp_tunnel_protocol,
+    sign_cluster_tcp_tunnel_handshake_from_data_dir, verify_cluster_tcp_tunnel_handshake,
+};
+pub use timeline::{
+    NETWORK_TIMELINE_DEFAULT_MAX_EVENTS, NETWORK_TIMELINE_EVENT_BYTES,
+    NETWORK_TIMELINE_MAX_CAPTURE_BYTES, NetworkTimelineCaptureError, NetworkTimelineEvent,
+    NetworkTimelineSnapshot, NetworkTimelineTraceContext, NetworkTimelineTraceparentError,
+    network_timeline_capture_is_active, network_timeline_channel_lookup_outcome,
+    network_timeline_flag, network_timeline_monotonic_ns, network_timeline_stage,
+    network_timeline_stage_name, network_timeline_trace_context_for_request,
+    parse_network_timeline_traceparent, record_network_timeline_event,
+    record_network_timeline_event_now, snapshot_network_timeline_capture,
+    start_network_timeline_capture, stop_network_timeline_capture,
 };
 
 pub type ClusterEndpointId = sinomo_base::Id;

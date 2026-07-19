@@ -11,6 +11,10 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "r1"
 
+[features]
+default = []
+cpu-profiler = ["dep:pprof"]
+
 [dependencies]
 fs2.workspace = true
 metrics.workspace = true
@@ -23,6 +27,9 @@ thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+pprof = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

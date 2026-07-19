@@ -13,6 +13,7 @@ use sinomo_runtime::core::{
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
+use sinomo_runtime::observe::observe_network_timeline_response_from_snapshot;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
@@ -48,6 +49,18 @@ const DEFAULT_MAX_P50_US: u64 = 0;
 const DEFAULT_MAX_P95_US: u64 = 0;
 const DEFAULT_MIN_REQUESTS_PER_SECOND: f64 = 50.0;
 const DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND: f64 = 0.0;
+// Keep diagnostic sampling small enough that the ordinary fixed-memory
+// timeline captures on the caller and target cannot be flooded by one test.
+const MAX_TIMELINE_SAMPLES: usize = 128;
+const MAX_CLIENT_TIMELINE_EVENTS: usize = 4 * 1024;
+// A sampled bodyless call currently emits 13 client-side events. Leave room
+// for lifecycle/error events as the recorder evolves.
+const CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE: usize = 32;
+// One streamed payload quantum produces a data frame and its flow-control
+// frame. Each physical frame can emit four client-side phase events; reserve
+// twice that current cost so diagnostic additions do not immediately make the
+// benchmark capture lossy again.
+const CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM: usize = 16;
 // Exercise the ordinary RPC interface with a substantial request and response.
 // This is a test fixture size, not a protocol boundary.
 const ARBITRARY_MESSAGE_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -488,6 +501,40 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark())
 }
 
+fn should_sample_network_timeline(
+    job_index: usize,
+    total_jobs: usize,
+    requested_samples: usize,
+) -> bool {
+    let sample_count = requested_samples.min(total_jobs);
+    if sample_count == 0 || job_index >= total_jobs {
+        return false;
+    }
+    if job_index == 0 {
+        return true;
+    }
+    job_index.saturating_mul(sample_count) / total_jobs
+        != job_index.saturating_sub(1).saturating_mul(sample_count) / total_jobs
+}
+
+fn benchmark_client_timeline_capacity(
+    timeline_sample_count: usize,
+    request_payload_bytes: usize,
+    response_payload_bytes: usize,
+) -> usize {
+    let payload_quanta = request_payload_bytes
+        .div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
+        .saturating_add(
+            response_payload_bytes.div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES),
+        );
+    let events_per_sample = payload_quanta
+        .saturating_mul(CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM)
+        .saturating_add(CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE);
+    timeline_sample_count
+        .saturating_mul(events_per_sample)
+        .clamp(1, MAX_CLIENT_TIMELINE_EVENTS)
+}
+
 fn run_network_arbitrary_message(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::arbitrary_message())
 }
@@ -509,6 +556,7 @@ fn run_network_ping_with_defaults(
     let payload_bytes_name = defaults.parameter_name("payload-bytes");
     let response_payload_bytes_name = defaults.parameter_name("response-payload-bytes");
     let min_payload_bytes_per_second_name = defaults.parameter_name("min-payload-bytes-per-second");
+    let timeline_samples_name = defaults.parameter_name("timeline-samples");
     let requests_per_target =
         optional_usize_parameter(ctx, &requests_per_target_name, defaults.requests_per_target)?;
     let warmup_requests_per_target = optional_usize_parameter(
@@ -543,6 +591,13 @@ fn run_network_ping_with_defaults(
         &min_payload_bytes_per_second_name,
         defaults.min_payload_bytes_per_second,
     )?;
+    let timeline_samples = optional_usize_parameter(ctx, &timeline_samples_name, 0)?;
+    if timeline_samples > MAX_TIMELINE_SAMPLES {
+        return Err(SinomoTestError::InvalidParameter {
+            name: timeline_samples_name,
+            detail: format!("must be at most {MAX_TIMELINE_SAMPLES}"),
+        });
+    }
     require_positive(&requests_per_target_name, requests_per_target)?;
     require_positive(&concurrency_name, concurrency)?;
     require_positive(&timeout_name, timeout_ms as usize)?;
@@ -599,39 +654,53 @@ fn run_network_ping_with_defaults(
         .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
     let daemon_address = daemon_client.address().to_string();
     let control_timeout = Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1));
-    let build_jobs =
-        |phase: &str, requests_per_target: usize| -> Result<Vec<NetworkPingJob>, SinomoTestError> {
-            let mut jobs = Vec::with_capacity(target_count.saturating_mul(requests_per_target));
-            for attempt in 0..requests_per_target {
-                for target_node_id in &targets {
-                    let nonce = format!("ping-{phase}-{nonce_prefix}-{target_node_id}-{attempt}");
-                    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(
-                        &nonce,
-                        payload_bytes,
-                        response_payload_bytes,
-                    )
-                    .map_err(|source| {
-                        SinomoTestError::failed(format!(
-                            "cannot prepare network ping request for {}: {source}",
-                            target_node_id
-                        ))
-                    })?;
-                    jobs.push(NetworkPingJob {
-                        target_node_id: target_node_id.clone(),
-                        timeout: Duration::from_millis(timeout_ms),
-                        control_timeout,
-                        request_payload_bytes: payload_bytes,
-                        response_payload_bytes,
-                        nonce,
-                        request,
-                        daemon_address: daemon_address.clone(),
-                    });
+    let build_jobs = |phase: &str,
+                      requests_per_target: usize|
+     -> Result<Vec<NetworkPingJob>, SinomoTestError> {
+        let total_jobs = target_count.saturating_mul(requests_per_target);
+        let mut jobs = Vec::with_capacity(total_jobs);
+        for attempt in 0..requests_per_target {
+            for target_node_id in &targets {
+                let nonce = format!("ping-{phase}-{nonce_prefix}-{target_node_id}-{attempt}");
+                let mut request = cluster::cluster_network_ping_rpc_request_with_response_payload(
+                    &nonce,
+                    payload_bytes,
+                    response_payload_bytes,
+                )
+                .map_err(|source| {
+                    SinomoTestError::failed(format!(
+                        "cannot prepare network ping request for {}: {source}",
+                        target_node_id
+                    ))
+                })?;
+                if phase == "measure"
+                    && should_sample_network_timeline(jobs.len(), total_jobs, timeline_samples)
+                {
+                    request = request
+                        .with_trace_context_if_missing()
+                        .with_observe_sampled(true);
                 }
+                jobs.push(NetworkPingJob {
+                    target_node_id: target_node_id.clone(),
+                    timeout: Duration::from_millis(timeout_ms),
+                    control_timeout,
+                    request_payload_bytes: payload_bytes,
+                    response_payload_bytes,
+                    nonce,
+                    request,
+                    daemon_address: daemon_address.clone(),
+                });
             }
-            Ok(jobs)
-        };
+        }
+        Ok(jobs)
+    };
     let warmup_jobs = build_jobs("warmup", warmup_requests_per_target)?;
     let jobs = build_jobs("measure", requests_per_target)?;
+    let timeline_sample_count = jobs
+        .iter()
+        .filter(|job| job.request.observe_sampled())
+        .count();
+    let timeline_first_sample = jobs.iter().find(|job| job.request.observe_sampled());
     let prepare_elapsed = prepare_started.elapsed();
     let total_requests = jobs.len();
     ctx.record("requests_per_target", requests_per_target);
@@ -648,6 +717,14 @@ fn run_network_ping_with_defaults(
     ctx.record("max_p95_ms", max_p95_ms);
     ctx.record("max_p50_us", max_p50_us);
     ctx.record("max_p95_us", max_p95_us);
+    ctx.record("timeline_sample_count", timeline_sample_count);
+    if let Some(job) = timeline_first_sample {
+        ctx.record(
+            "timeline_first_traceparent",
+            job.request.traceparent().unwrap_or_default(),
+        );
+        ctx.record("timeline_first_target", job.target_node_id.to_string());
+    }
     ctx.record("min_requests_per_second", min_requests_per_second);
     ctx.record("min_payload_bytes_per_second", min_payload_bytes_per_second);
     ctx.record(
@@ -696,10 +773,43 @@ fn run_network_ping_with_defaults(
         )));
     }
 
+    let client_timeline_capacity = benchmark_client_timeline_capacity(
+        timeline_sample_count,
+        payload_bytes,
+        response_payload_bytes,
+    );
+    if timeline_sample_count > 0 {
+        network::start_network_timeline_capture(client_timeline_capacity).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot start benchmark client network timeline: {error}"
+            ))
+        })?;
+    }
     let started = Instant::now();
-    let mut results = runtime.block_on(run_network_ping_jobs_async(jobs, concurrency_limit))?;
+    let measured_result = runtime.block_on(run_network_ping_jobs_async(jobs, concurrency_limit));
     let elapsed = started.elapsed();
+    let client_timeline = if timeline_sample_count > 0 {
+        Some(network::stop_network_timeline_capture().map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot stop benchmark client network timeline: {error}"
+            ))
+        })?)
+    } else {
+        None
+    };
+    let mut results = measured_result?;
     let total_elapsed = benchmark_started.elapsed();
+    if let Some(snapshot) = client_timeline {
+        ctx.record(
+            "timeline_client_capture",
+            observe_network_timeline_response_from_snapshot(
+                Some("network-ping-client".to_string()),
+                "test-client",
+                Some(cluster_state.local_node_id.to_string()),
+                snapshot,
+            ),
+        );
+    }
     results.sort_by_key(|result| (result.target_node_id.clone(), result.latency_ms));
 
     let mut latencies_ms = Vec::new();
@@ -2407,6 +2517,42 @@ mod tests {
         assert_eq!(defaults.warmup_requests_per_target, Some(20));
         assert_eq!(defaults.concurrency, 8);
         assert_eq!(defaults.min_requests_per_second, 50.0);
+    }
+
+    #[test]
+    fn timeline_samples_are_bounded_and_spread_across_the_measurement() {
+        let selected = (0..5_000)
+            .filter(|index| should_sample_network_timeline(*index, 5_000, 128))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected.len(), 128);
+        assert_eq!(selected.first(), Some(&0));
+        assert!(selected.last().is_some_and(|index| *index > 4_900));
+        assert_eq!(
+            (0..8)
+                .filter(|index| should_sample_network_timeline(*index, 8, 128))
+                .count(),
+            8
+        );
+        assert!(!should_sample_network_timeline(0, 5_000, 0));
+    }
+
+    #[test]
+    fn client_timeline_capacity_conservatively_covers_small_payloads() {
+        assert_eq!(benchmark_client_timeline_capacity(1, 256, 64), 64);
+        assert_eq!(benchmark_client_timeline_capacity(128, 256, 64), 4096);
+    }
+
+    #[test]
+    fn client_timeline_capacity_covers_one_mib_full_duplex_payloads() {
+        assert_eq!(
+            benchmark_client_timeline_capacity(
+                1,
+                ARBITRARY_MESSAGE_PAYLOAD_BYTES,
+                ARBITRARY_MESSAGE_PAYLOAD_BYTES,
+            ),
+            1056
+        );
     }
 
     #[test]
