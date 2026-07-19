@@ -5,16 +5,19 @@
 //! private to `sinomo-network`.
 
 use crate::daemon_auth::{
-    BodyFinishProofBinding, BodyFinishProofInput, ResponseHeadProofInput, SessionFrameDirection,
-    SessionFrameProofInput, SessionFrameSigner, SignedBodyFinishProof, SignedDaemonCommand,
-    SignedResponseHeadProof, SignedSessionFrameProof, verify_body_finish_proof,
-    verify_response_head_proof, verify_session_frame_proof,
+    ResponseIdentityProofInput, SessionIdentitySigner, SignedDaemonCommand,
+    SignedResponseIdentityProof, verify_response_identity_proof,
+};
+use crate::path_metrics::{
+    NetworkPathEstimator, NetworkPathKey, NetworkPeerReceiveCreditLease,
+    reserve_shared_network_peer_receive_credit, shared_network_path_estimator,
 };
 pub(crate) use crate::transfer::NetworkCallPolicy;
 use crate::transfer::{
-    DEFAULT_TRANSFER_FRAME_BYTES, TransferAck, TransferControl, TransferDataFrame,
-    TransferDataHeader, TransferDigest, TransferEncodedWireFrameHeader, TransferFlowWindow,
-    TransferId, TransferOpen, TransferReceiverState, TransferSenderState, TransferVerifiedData,
+    DEFAULT_TRANSFER_FRAME_BYTES, MAX_TRANSFER_FRAME_BYTES, MAX_TRANSFER_WINDOW_BYTES,
+    MIN_TRANSFER_FRAME_BYTES, MIN_TRANSFER_WINDOW_BYTES, TransferAck, TransferControl,
+    TransferDataFrame, TransferDataHeader, TransferEncodedWireFrameHeader, TransferFlowWindow,
+    TransferId, TransferOpen, TransferReceiverState, TransferSenderState,
     read_transfer_data_payload_to_vec, read_transfer_encoded_frame_header,
     write_transfer_data_frame, write_transfer_encoded_control_frame,
 };
@@ -23,6 +26,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sinomo_local::SinomoDataDir;
 use std::any::Any;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -45,15 +49,23 @@ const INLINE_VALUE_MAX_BYTES: usize = 64 * 1024;
 /// `try_send` path does not wait. Five milliseconds is well below the session
 /// no-progress timeout while spanning several ordinary scheduler quanta.
 const BODY_READER_DIRECT_DELIVERY_GRACE: std::time::Duration = std::time::Duration::from_millis(5);
+const DEFAULT_BDP_ROUND_TRIP_TIME: std::time::Duration = std::time::Duration::from_millis(1);
+const MIN_TRANSFER_CREDIT_UPDATE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TRANSFER_CREDIT_UPDATE_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_TRANSFER_CREDIT_UPDATE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(2);
+const MIN_TRANSFER_CREDIT_UPDATE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1);
+const MAX_TRANSFER_CREDIT_UPDATE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
 static BODY_READER_DIRECT_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_SPILL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_CLOSED_TOTAL: AtomicU64 = AtomicU64::new(0);
-const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v2";
+const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v4";
 const OBJECT_RPC_SESSION_METADATA_KEY: &str = "sinomo.rpc-session";
-pub(crate) const OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY: &str =
-    "sinomo.rpc-response-head-proof";
-const SESSION_ZERO_DIGEST: TransferDigest = TransferDigest::new([0_u8; 32]);
+pub(crate) const OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY: &str =
+    "sinomo.rpc-response-identity-proof";
 
 /// Returns whether a non-consuming transport peek identifies the canonical
 /// session wire.
@@ -114,9 +126,8 @@ impl ObjectRpcSessionDescriptor {
             route: call.request.route.clone(),
             operation_id: call.request.operation_id().map(ToOwned::to_owned),
             total_bytes: call.body.total_bytes(),
-            expected_digest: call.body.known_digest(),
             replayable: call.body.is_replayable(),
-            requested_window: TransferFlowWindow::default(),
+            requested_window: TransferFlowWindow::maximum_supported(),
         });
         Self {
             protocol: OBJECT_RPC_SESSION_PROTOCOL.to_string(),
@@ -154,54 +165,19 @@ impl ObjectRpcSessionDescriptor {
     }
 }
 
-fn request_body_finish_binding(
-    request: &crate::ObjectRpcRequest,
-    descriptor: &ObjectRpcSessionDescriptor,
-) -> Result<BodyFinishProofBinding, NetworkError> {
-    let mut normalized = request.clone();
-    normalized.auth = None;
-    let encoded = crate::SinomoObjectCodec::network_frame().encode(&normalized)?;
-    Ok(BodyFinishProofBinding {
-        session_id: descriptor.session_id.clone(),
-        direction: SessionFrameDirection::InitiatorToResponder,
-        head_digest: TransferDigest::blake3(&encoded),
-    })
-}
-
-fn response_body_finish_binding(
-    session_id: &TransferId,
-    response: &crate::ObjectRpcResponse,
-) -> Result<BodyFinishProofBinding, NetworkError> {
-    let encoded = crate::SinomoObjectCodec::network_frame().encode(response)?;
-    Ok(BodyFinishProofBinding {
-        session_id: session_id.clone(),
-        direction: SessionFrameDirection::ResponderToInitiator,
-        head_digest: TransferDigest::blake3(&encoded),
-    })
-}
-
-fn response_head_digest(
-    response: &crate::ObjectRpcResponse,
-) -> Result<TransferDigest, NetworkError> {
-    let mut normalized = response.clone();
-    normalized
-        .metadata
-        .remove(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY);
-    let encoded = crate::SinomoObjectCodec::network_frame().encode(&normalized)?;
-    Ok(TransferDigest::blake3(&encoded))
-}
-
-fn encode_response_head_proof(proof: &SignedResponseHeadProof) -> Result<String, NetworkError> {
+fn encode_response_identity_proof(
+    proof: &SignedResponseIdentityProof,
+) -> Result<String, NetworkError> {
     let encoded = crate::SinomoObjectCodec::network_frame().encode(proof)?;
     Ok(URL_SAFE_NO_PAD.encode(encoded))
 }
 
-fn decode_response_head_proof(
+fn decode_response_identity_proof(
     response: &crate::ObjectRpcResponse,
-) -> Result<SignedResponseHeadProof, NetworkError> {
+) -> Result<SignedResponseIdentityProof, NetworkError> {
     let encoded = response
         .metadata
-        .get(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+        .get(OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY)
         .ok_or(NetworkError::AuthDenied)?;
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded.as_bytes())
@@ -210,7 +186,7 @@ fn decode_response_head_proof(
 }
 
 #[cfg(test)]
-async fn ensure_response_head_proof<W>(
+async fn ensure_response_identity_proof<W>(
     writer: &Arc<tokio::sync::Mutex<SessionFrameWriter<W>>>,
     session_id: &TransferId,
     response: &mut crate::ObjectRpcResponse,
@@ -219,10 +195,10 @@ where
     W: AsyncWrite + Unpin,
 {
     let writer = writer.lock().await;
-    ensure_response_head_proof_with_writer(&writer, session_id, response)
+    ensure_response_identity_proof_with_writer(&writer, session_id, response)
 }
 
-fn ensure_response_head_proof_with_writer<W>(
+fn ensure_response_identity_proof_with_writer<W>(
     writer: &SessionFrameWriter<W>,
     session_id: &TransferId,
     response: &mut crate::ObjectRpcResponse,
@@ -232,56 +208,26 @@ where
 {
     if response
         .metadata
-        .contains_key(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+        .contains_key(OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY)
     {
         return Ok(());
     }
-    let proof = writer.sign_response_head(session_id.clone(), response_head_digest(response)?);
+    let proof = writer.sign_response_identity(session_id.clone());
     response.metadata.insert(
-        OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY.to_string(),
-        encode_response_head_proof(&proof)?,
+        OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY.to_string(),
+        encode_response_identity_proof(&proof)?,
     );
     Ok(())
 }
 
-fn response_head_origin_is_verified(
+fn response_origin_is_verified(
     response: &crate::ObjectRpcResponse,
     expected_public_key: &[u8],
     expected_session_id: &TransferId,
 ) -> bool {
-    decode_response_head_proof(response).is_ok_and(|proof| {
-        response_head_digest(response).is_ok_and(|digest| {
-            verify_response_head_proof(&proof, expected_public_key, expected_session_id, digest)
-                .is_ok()
-        })
+    decode_response_identity_proof(response).is_ok_and(|proof| {
+        verify_response_identity_proof(&proof, expected_public_key, expected_session_id).is_ok()
     })
-}
-
-fn signed_request_body_finish_expectation(
-    request: &crate::ObjectRpcRequest,
-) -> Result<Option<BodyFinishProofExpectation>, NetworkError> {
-    let origin_request = if request.route == crate::CLUSTER_RELAY_ROUTE {
-        crate::RelayEnvelope::from_request(request)?.inner().clone()
-    } else {
-        request.clone()
-    };
-    let descriptor = session_descriptor_from_request(&origin_request)?;
-    if descriptor.request_body.is_none() {
-        return Ok(None);
-    }
-    let auth = origin_request
-        .auth
-        .as_ref()
-        .ok_or(NetworkError::AuthDenied)?;
-    let signer: SignedDaemonCommand = crate::SinomoObjectCodec::default().decode(auth)?;
-    if signer.protocol != crate::DAEMON_AUTH_PROTOCOL || signer.public_key.is_empty() {
-        return Err(NetworkError::AuthDenied);
-    }
-    Ok(Some(BodyFinishProofExpectation {
-        binding: request_body_finish_binding(&origin_request, &descriptor)?,
-        signer_node_id: Some(signer.node_id),
-        public_key: signer.public_key,
-    }))
 }
 
 fn response_proof_session_id(
@@ -307,10 +253,7 @@ enum SessionWirePayload {
         body: Option<TransferOpen>,
     },
     Transfer(TransferControl),
-    FinishAttestation {
-        finish: crate::transfer::TransferFinish,
-        proof: SignedBodyFinishProof,
-    },
+    Finish(crate::transfer::TransferFinish),
     Data(TransferDataHeader),
     HealthPing {
         nonce: u64,
@@ -323,12 +266,6 @@ enum SessionWirePayload {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SignedSessionWireControl {
-    payload: SessionWirePayload,
-    proof: SignedSessionFrameProof,
-}
-
 #[derive(Debug)]
 enum SessionInboundFrame {
     Payload(SessionWirePayload),
@@ -336,6 +273,168 @@ enum SessionInboundFrame {
         header: TransferDataHeader,
         payload: Vec<u8>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransferPathTuning {
+    flow_window: TransferFlowWindow,
+    credit_update_bytes: u64,
+    credit_update_interval: std::time::Duration,
+}
+
+fn transfer_path_tuning(estimator: &NetworkPathEstimator) -> TransferPathTuning {
+    let estimate = estimator.snapshot();
+    let max_in_flight_bytes = estimate.recommended_window_bytes_with_default_rtt(
+        2,
+        MIN_TRANSFER_WINDOW_BYTES,
+        MAX_TRANSFER_WINDOW_BYTES,
+        Some(DEFAULT_BDP_ROUND_TRIP_TIME),
+    );
+    let max_frame_bytes = if max_in_flight_bytes >= 48 * 1024 * 1024 {
+        MAX_TRANSFER_FRAME_BYTES
+    } else if max_in_flight_bytes >= 24 * 1024 * 1024 {
+        2 * 1024 * 1024
+    } else {
+        MIN_TRANSFER_FRAME_BYTES
+    };
+    let half_window = max_in_flight_bytes / 2;
+    let credit_update_bytes = (max_in_flight_bytes / 4)
+        .clamp(
+            MIN_TRANSFER_CREDIT_UPDATE_BYTES,
+            MAX_TRANSFER_CREDIT_UPDATE_BYTES,
+        )
+        .max(2 * u64::from(max_frame_bytes))
+        .min(half_window);
+    let credit_update_interval = estimate
+        .round_trip_time
+        .and_then(|rtt| rtt.checked_div(4))
+        .unwrap_or(DEFAULT_TRANSFER_CREDIT_UPDATE_INTERVAL)
+        .clamp(
+            MIN_TRANSFER_CREDIT_UPDATE_INTERVAL,
+            MAX_TRANSFER_CREDIT_UPDATE_INTERVAL,
+        );
+    TransferPathTuning {
+        flow_window: TransferFlowWindow {
+            max_in_flight_bytes,
+            max_frame_bytes,
+        },
+        credit_update_bytes,
+        credit_update_interval,
+    }
+}
+
+#[derive(Debug)]
+struct OutgoingTransferMeasurement {
+    estimator: NetworkPathEstimator,
+    delivery_sample: Option<(u64, std::time::Instant)>,
+    sent_offsets: VecDeque<(u64, std::time::Instant)>,
+}
+
+impl OutgoingTransferMeasurement {
+    fn new(estimator: NetworkPathEstimator) -> Self {
+        Self {
+            estimator,
+            delivery_sample: None,
+            sent_offsets: VecDeque::new(),
+        }
+    }
+
+    fn record_open_round_trip(&self, elapsed: std::time::Duration) {
+        self.estimator.record_round_trip_time(elapsed);
+    }
+
+    fn record_sent(&mut self, end_offset: u64) {
+        let now = std::time::Instant::now();
+        self.delivery_sample.get_or_insert((0, now));
+        self.sent_offsets.push_back((end_offset, now));
+    }
+
+    fn record_acknowledgement(&mut self, acknowledged_offset: u64) {
+        let now = std::time::Instant::now();
+        if let Some((previous_offset, previous_at)) = self.delivery_sample
+            && acknowledged_offset > previous_offset
+        {
+            self.estimator.record_delivery(
+                acknowledged_offset - previous_offset,
+                now.saturating_duration_since(previous_at),
+            );
+            self.delivery_sample = Some((acknowledged_offset, now));
+        }
+        let mut latest_sent_at = None;
+        while self
+            .sent_offsets
+            .front()
+            .is_some_and(|(offset, _)| *offset <= acknowledged_offset)
+        {
+            latest_sent_at = self.sent_offsets.pop_front().map(|(_, sent_at)| sent_at);
+        }
+        if let Some(sent_at) = latest_sent_at {
+            self.estimator
+                .record_round_trip_time(now.saturating_duration_since(sent_at));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IncomingTransferMeasurement {
+    sample_offset: u64,
+    sample_started: std::time::Instant,
+}
+
+impl IncomingTransferMeasurement {
+    fn new() -> Self {
+        Self {
+            sample_offset: 0,
+            sample_started: std::time::Instant::now(),
+        }
+    }
+
+    fn record_until(&mut self, estimator: &NetworkPathEstimator, offset: u64) {
+        let now = std::time::Instant::now();
+        if offset > self.sample_offset {
+            estimator.record_delivery(
+                offset - self.sample_offset,
+                now.saturating_duration_since(self.sample_started),
+            );
+            self.sample_offset = offset;
+            self.sample_started = now;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TransferCreditUpdateSchedule {
+    acknowledged_offset: u64,
+    acknowledged_at: std::time::Instant,
+    update_bytes: u64,
+    update_interval: std::time::Duration,
+}
+
+impl TransferCreditUpdateSchedule {
+    fn new(tuning: TransferPathTuning) -> Self {
+        Self {
+            acknowledged_offset: 0,
+            acknowledged_at: std::time::Instant::now(),
+            update_bytes: tuning.credit_update_bytes,
+            update_interval: tuning.credit_update_interval,
+        }
+    }
+
+    fn update_tuning(&mut self, tuning: TransferPathTuning) {
+        self.update_bytes = tuning.credit_update_bytes;
+        self.update_interval = tuning.credit_update_interval;
+    }
+
+    fn due(&self, received_offset: u64) -> bool {
+        let unacknowledged = received_offset.saturating_sub(self.acknowledged_offset);
+        unacknowledged >= self.update_bytes
+            || (unacknowledged > 0 && self.acknowledged_at.elapsed() >= self.update_interval)
+    }
+
+    fn mark(&mut self, acknowledged_offset: u64) {
+        self.acknowledged_offset = acknowledged_offset;
+        self.acknowledged_at = std::time::Instant::now();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -376,11 +475,7 @@ impl SessionDeadline {
 struct SessionFrameWriter<W> {
     writer: W,
     data_dir: SinomoDataDir,
-    signer: SessionFrameSigner,
-    session_id: TransferId,
-    direction: SessionFrameDirection,
-    sequence: u64,
-    previous_digest: TransferDigest,
+    signer: SessionIdentitySigner,
     policy: NetworkCallPolicy,
     deadline: SessionDeadline,
 }
@@ -392,50 +487,24 @@ where
     fn new(
         writer: W,
         data_dir: SinomoDataDir,
-        session_id: TransferId,
-        direction: SessionFrameDirection,
         policy: NetworkCallPolicy,
     ) -> Result<Self, NetworkError> {
-        let signer = SessionFrameSigner::from_data_dir(&data_dir)?;
+        let signer = SessionIdentitySigner::from_data_dir(&data_dir)?;
         Ok(Self {
             writer,
             data_dir,
             signer,
-            session_id,
-            direction,
-            sequence: 0,
-            previous_digest: SESSION_ZERO_DIGEST,
             policy,
             deadline: SessionDeadline::from_policy(policy),
         })
     }
 
-    fn encode_control(
-        &self,
-        payload: SessionWirePayload,
-    ) -> Result<(Vec<u8>, TransferDigest), NetworkError> {
-        let encoded_payload = crate::SinomoObjectCodec::network_frame().encode(&payload)?;
-        let payload_digest = match &payload {
-            SessionWirePayload::Data(header) => Some(header.payload_digest),
-            _ => None,
-        };
-        let input = SessionFrameProofInput {
-            session_id: self.session_id.clone(),
-            direction: self.direction,
-            sequence: self.sequence,
-            previous_digest: self.previous_digest,
-            frame_header_digest: TransferDigest::blake3(&encoded_payload),
-            payload_digest,
-        };
-        let proof = self.signer.sign(input);
-        let next_digest = proof.transcript_digest;
-        let encoded = crate::SinomoObjectCodec::network_frame()
-            .encode(&SignedSessionWireControl { payload, proof })?;
-        Ok((encoded, next_digest))
+    fn encode_control(&self, payload: SessionWirePayload) -> Result<Vec<u8>, NetworkError> {
+        crate::SinomoObjectCodec::network_frame().encode(&payload)
     }
 
     async fn send(&mut self, payload: SessionWirePayload) -> Result<(), NetworkError> {
-        let (encoded, next_digest) = self.encode_control(payload)?;
+        let encoded = self.encode_control(payload)?;
         self.deadline
             .run(
                 "write object RPC session control",
@@ -446,13 +515,6 @@ where
                 ),
             )
             .await?;
-        self.sequence =
-            self.sequence
-                .checked_add(1)
-                .ok_or_else(|| NetworkError::Serialization {
-                    detail: "object RPC session frame sequence overflowed".to_string(),
-                })?;
-        self.previous_digest = next_digest;
         Ok(())
     }
 
@@ -467,15 +529,9 @@ where
             .await
     }
 
-    fn sign_response_head(
-        &self,
-        session_id: TransferId,
-        head_digest: TransferDigest,
-    ) -> SignedResponseHeadProof {
-        self.signer.sign_response_head(ResponseHeadProofInput {
-            session_id,
-            head_digest,
-        })
+    fn sign_response_identity(&self, session_id: TransferId) -> SignedResponseIdentityProof {
+        self.signer
+            .sign_response_identity(ResponseIdentityProofInput { session_id })
     }
 }
 
@@ -501,13 +557,13 @@ enum SessionWriterWork {
 /// The wire reader must keep draining the peer while a large local frame is in
 /// flight. Reader-generated acknowledgements therefore update one coalescing
 /// slot instead of waiting for the socket writer. All actual writes remain
-/// serialized here so transcript sequence and proof chaining stay exact.
+/// serialized here so stream order stays exact.
 #[derive(Clone)]
 struct SessionWriterHandle {
     commands: tokio::sync::mpsc::Sender<SessionWriteCommand>,
     acknowledgements: tokio::sync::watch::Sender<Option<TransferAck>>,
     data_dir: SinomoDataDir,
-    signer: SessionFrameSigner,
+    signer: SessionIdentitySigner,
 }
 
 impl SessionWriterHandle {
@@ -686,45 +742,26 @@ impl SessionWriterHandle {
         self.data_dir.root()
     }
 
-    fn sign_body_finish(
-        &self,
-        binding: BodyFinishProofBinding,
-        total_bytes: u64,
-        digest: TransferDigest,
-    ) -> SignedBodyFinishProof {
-        self.signer.sign_body_finish(BodyFinishProofInput {
-            binding,
-            total_bytes,
-            digest,
-        })
+    fn sign_response_identity(&self, session_id: TransferId) -> SignedResponseIdentityProof {
+        self.signer
+            .sign_response_identity(ResponseIdentityProofInput { session_id })
     }
 
-    fn sign_response_head(
-        &self,
-        session_id: TransferId,
-        head_digest: TransferDigest,
-    ) -> SignedResponseHeadProof {
-        self.signer.sign_response_head(ResponseHeadProofInput {
-            session_id,
-            head_digest,
-        })
-    }
-
-    fn ensure_response_head_proof(
+    fn ensure_response_identity_proof(
         &self,
         session_id: &TransferId,
         response: &mut crate::ObjectRpcResponse,
     ) -> Result<(), NetworkError> {
         if response
             .metadata
-            .contains_key(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+            .contains_key(OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY)
         {
             return Ok(());
         }
-        let proof = self.sign_response_head(session_id.clone(), response_head_digest(response)?);
+        let proof = self.sign_response_identity(session_id.clone());
         response.metadata.insert(
-            OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY.to_string(),
-            encode_response_head_proof(&proof)?,
+            OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY.to_string(),
+            encode_response_identity_proof(&proof)?,
         );
         Ok(())
     }
@@ -739,11 +776,6 @@ fn session_writer_stopped(operation: &'static str) -> NetworkError {
 
 struct SessionFrameReader<R> {
     reader: R,
-    session_id: TransferId,
-    direction: SessionFrameDirection,
-    expected_public_key: Vec<u8>,
-    sequence: u64,
-    previous_digest: TransferDigest,
     header_buffer: Vec<u8>,
     policy: NetworkCallPolicy,
     deadline: SessionDeadline,
@@ -753,43 +785,18 @@ impl<R> SessionFrameReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    fn new(
-        reader: R,
-        session_id: TransferId,
-        direction: SessionFrameDirection,
-        expected_public_key: Vec<u8>,
-        policy: NetworkCallPolicy,
-    ) -> Self {
+    fn new(reader: R, policy: NetworkCallPolicy) -> Self {
         Self {
             reader,
-            session_id,
-            direction,
-            expected_public_key,
-            sequence: 0,
-            previous_digest: SESSION_ZERO_DIGEST,
             header_buffer: Vec::new(),
             policy,
             deadline: SessionDeadline::from_policy(policy),
         }
     }
 
-    fn after_verified_bootstrap(
-        reader: R,
-        session_id: TransferId,
-        direction: SessionFrameDirection,
-        expected_public_key: Vec<u8>,
-        policy: NetworkCallPolicy,
-        sequence: u64,
-        previous_digest: TransferDigest,
-        header_buffer: Vec<u8>,
-    ) -> Self {
+    fn after_bootstrap(reader: R, policy: NetworkCallPolicy, header_buffer: Vec<u8>) -> Self {
         Self {
             reader,
-            session_id,
-            direction,
-            expected_public_key,
-            sequence,
-            previous_digest,
             header_buffer,
             policy,
             deadline: SessionDeadline::from_policy(policy),
@@ -811,33 +818,10 @@ where
         let TransferEncodedWireFrameHeader::Control(encoded) = header else {
             return Err(NetworkError::AuthDenied);
         };
-        let signed: SignedSessionWireControl =
+        let control: SessionWirePayload =
             crate::SinomoObjectCodec::network_frame().decode(&encoded)?;
-        let encoded_payload = crate::SinomoObjectCodec::network_frame().encode(&signed.payload)?;
-        let payload_digest = match &signed.payload {
-            SessionWirePayload::Data(header) => Some(header.payload_digest),
-            _ => None,
-        };
-        let expected_input = SessionFrameProofInput {
-            session_id: self.session_id.clone(),
-            direction: self.direction,
-            sequence: self.sequence,
-            previous_digest: self.previous_digest,
-            frame_header_digest: TransferDigest::blake3(&encoded_payload),
-            payload_digest,
-        };
-        let next_digest =
-            verify_session_frame_proof(&signed.proof, &self.expected_public_key, &expected_input)?;
-        self.sequence =
-            self.sequence
-                .checked_add(1)
-                .ok_or_else(|| NetworkError::Serialization {
-                    detail: "object RPC session frame sequence overflowed".to_string(),
-                })?;
-        self.previous_digest = next_digest;
-
-        let SessionWirePayload::Data(expected_header) = signed.payload else {
-            return Ok(SessionInboundFrame::Payload(signed.payload));
+        let SessionWirePayload::Data(expected_header) = control else {
+            return Ok(SessionInboundFrame::Payload(control));
         };
         let data_header = self
             .deadline
@@ -1046,12 +1030,31 @@ async fn receive_sender_feedback(
         .await
 }
 
+fn apply_measured_transfer_ack(
+    state: &mut TransferSenderState,
+    measurement: &mut OutgoingTransferMeasurement,
+    acknowledgement: &TransferAck,
+) -> Result<(), NetworkError> {
+    measurement.record_acknowledgement(acknowledgement.received_contiguous_offset);
+    state
+        .accept_ack(acknowledgement)
+        .map_err(session_transfer_error)?;
+    state
+        .set_active_window_bytes(
+            transfer_path_tuning(&measurement.estimator)
+                .flow_window
+                .max_in_flight_bytes,
+        )
+        .map_err(session_transfer_error)
+}
+
 async fn pump_outgoing_body(
     writer: SessionWriterHandle,
     source: ObjectRpcBodySource,
     open: TransferOpen,
     mut feedback: tokio::sync::mpsc::Receiver<TransferControl>,
     policy: NetworkCallPolicy,
+    path_estimator: NetworkPathEstimator,
 ) -> Result<(), NetworkError> {
     let deadline = SessionDeadline::from_policy(policy);
     let mut state = TransferSenderState::new(
@@ -1061,6 +1064,7 @@ async fn pump_outgoing_body(
     )
     .map_err(session_transfer_error)?;
     state.mark_opening().map_err(session_transfer_error)?;
+    let open_started = std::time::Instant::now();
     send_session_payload(
         &writer,
         SessionWirePayload::Transfer(TransferControl::Open(open.clone())),
@@ -1089,15 +1093,23 @@ async fn pump_outgoing_body(
     state
         .accept_open_ack(&open_ack)
         .map_err(session_transfer_error)?;
+    let mut measurement = OutgoingTransferMeasurement::new(path_estimator);
+    measurement.record_open_round_trip(open_started.elapsed());
+    state
+        .set_active_window_bytes(
+            transfer_path_tuning(&measurement.estimator)
+                .flow_window
+                .max_in_flight_bytes,
+        )
+        .map_err(session_transfer_error)?;
     let mut producer = source.producer(open_ack.receive_window.max_frame_bytes as usize)?;
-    let mut hasher = blake3::Hasher::new();
     let mut pending = None;
     let mut source_finished = false;
     while !source_finished || pending.is_some() {
         while let Ok(control) = feedback.try_recv() {
             match control {
                 TransferControl::Ack(ack) if ack.transfer_id == open.transfer_id => {
-                    state.accept_ack(&ack).map_err(session_transfer_error)?;
+                    apply_measured_transfer_ack(&mut state, &mut measurement, &ack)?;
                 }
                 TransferControl::Cancel {
                     transfer_id,
@@ -1131,7 +1143,7 @@ async fn pump_outgoing_body(
                 pending = Some(bytes);
                 match receive_sender_feedback(&mut feedback, policy, deadline).await? {
                     TransferControl::Ack(ack) if ack.transfer_id == open.transfer_id => {
-                        state.accept_ack(&ack).map_err(session_transfer_error)?;
+                        apply_measured_transfer_ack(&mut state, &mut measurement, &ack)?;
                     }
                     TransferControl::Cancel {
                         transfer_id,
@@ -1153,28 +1165,17 @@ async fn pump_outgoing_body(
             }
             Err(error) => return Err(session_transfer_error(error)),
         };
-        hasher.update(&bytes);
         let header = frame.header.clone();
+        let end_offset = header
+            .offset
+            .saturating_add(u64::from(header.payload_bytes));
         drop(frame);
         writer.send_data(header, bytes).await?;
+        measurement.record_sent(end_offset);
     }
     producer.finish().await?;
-    let digest = TransferDigest::new(*hasher.finalize().as_bytes());
-    if open
-        .expected_digest
-        .is_some_and(|expected| expected != digest)
-    {
-        return Err(NetworkError::AuthDenied);
-    }
-    let finish = state.finish(digest).map_err(session_transfer_error)?;
-    let proof = source
-        .finish_proof(&writer, finish.total_bytes, finish.digest)
-        .await?;
-    send_session_payload(
-        &writer,
-        SessionWirePayload::FinishAttestation { finish, proof },
-    )
-    .await?;
+    let finish = state.finish().map_err(session_transfer_error)?;
+    send_session_payload(&writer, SessionWirePayload::Finish(finish)).await?;
     state.mark_finish_sent().map_err(session_transfer_error)?;
     loop {
         match receive_sender_feedback(&mut feedback, policy, deadline).await? {
@@ -1207,12 +1208,8 @@ async fn acknowledge_incoming_completion(
     writer: SessionWriterHandle,
     incoming_sender: Option<IncomingBodySender>,
     receipt: crate::transfer::TransferReceipt,
-    proof: Option<SignedBodyFinishProof>,
     has_spool: bool,
 ) -> Result<(), NetworkError> {
-    if let Some(sender) = incoming_sender.as_ref() {
-        sender.validate_completion(receipt.completed_bytes, receipt.digest, proof)?;
-    }
     writer
         .send(SessionWirePayload::Transfer(TransferControl::Complete(
             receipt.clone(),
@@ -1243,6 +1240,8 @@ async fn pump_incoming_session<R>(
     incoming: Option<IncomingBodySender>,
     head_sender: tokio::sync::oneshot::Sender<SessionWirePayload>,
     initial_head: Option<SessionWirePayload>,
+    path_key: NetworkPathKey,
+    path_estimator: NetworkPathEstimator,
 ) -> Result<SessionReaderOutcome, NetworkError>
 where
     R: AsyncRead + Unpin,
@@ -1250,11 +1249,13 @@ where
     let mut expected_incoming_open = expected_incoming_open;
     let mut receiver_state = None;
     let mut incoming_sender = incoming;
-    let mut incoming_hasher = blake3::Hasher::new();
     let mut incoming_opened = false;
     let mut incoming_complete = false;
     let mut head_sender = Some(head_sender);
     let mut staging: Option<SessionTransferStagingFile> = None;
+    let mut receive_credit: Option<NetworkPeerReceiveCreditLease> = None;
+    let mut incoming_measurement: Option<IncomingTransferMeasurement> = None;
+    let mut credit_schedule: Option<TransferCreditUpdateSchedule> = None;
 
     if let Some(payload) = initial_head {
         let declared_open = match &payload {
@@ -1278,11 +1279,6 @@ where
             return Err(NetworkError::AuthDenied);
         }
         expected_incoming_open = declared_open;
-        receiver_state = expected_incoming_open
-            .as_ref()
-            .map(|open| TransferReceiverState::from_open(open, TransferFlowWindow::default()))
-            .transpose()
-            .map_err(session_transfer_error)?;
         if expected_incoming_open.is_none() {
             incoming_opened = true;
             incoming_complete = true;
@@ -1326,13 +1322,6 @@ where
                     return Err(NetworkError::AuthDenied);
                 }
                 expected_incoming_open = declared_open;
-                receiver_state = expected_incoming_open
-                    .as_ref()
-                    .map(|open| {
-                        TransferReceiverState::from_open(open, TransferFlowWindow::default())
-                    })
-                    .transpose()
-                    .map_err(session_transfer_error)?;
                 if expected_incoming_open.is_none() {
                     incoming_opened = true;
                     incoming_complete = true;
@@ -1395,10 +1384,19 @@ where
                             // zero; bytes/files can replay, while one-pass
                             // sources fail explicitly rather than silently
                             // losing data.
-                            let ack = receiver_state
-                                .as_ref()
-                                .expect("state exists for expected open")
-                                .open_ack();
+                            let tuning = transfer_path_tuning(&path_estimator);
+                            let state = TransferReceiverState::from_open(&open, tuning.flow_window)
+                                .map_err(session_transfer_error)?;
+                            let lease = reserve_shared_network_peer_receive_credit(
+                                &path_key,
+                                state.receive_window().max_in_flight_bytes,
+                            )
+                            .await?;
+                            let ack = state.open_ack();
+                            receiver_state = Some(state);
+                            receive_credit = Some(lease);
+                            incoming_measurement = Some(IncomingTransferMeasurement::new());
+                            credit_schedule = Some(TransferCreditUpdateSchedule::new(tuning));
                             writer
                                 .send_from_reader(SessionWirePayload::Transfer(
                                     TransferControl::OpenAck(ack),
@@ -1425,10 +1423,7 @@ where
                     }
                 }
             }
-            SessionInboundFrame::Payload(SessionWirePayload::FinishAttestation {
-                finish,
-                proof,
-            }) => {
+            SessionInboundFrame::Payload(SessionWirePayload::Finish(finish)) => {
                 let state = receiver_state
                     .as_mut()
                     .ok_or_else(|| NetworkError::Serialization {
@@ -1437,18 +1432,20 @@ where
                 state
                     .accept_finish(&finish)
                     .map_err(session_transfer_error)?;
-                let digest = TransferDigest::new(*incoming_hasher.finalize().as_bytes());
-                let receipt = state.complete(digest).map_err(session_transfer_error)?;
+                if let Some(measurement) = incoming_measurement.as_mut() {
+                    measurement.record_until(&path_estimator, state.received_offset());
+                }
+                let receipt = state.complete().map_err(session_transfer_error)?;
                 acknowledge_incoming_completion(
                     writer.clone(),
                     incoming_sender.clone(),
                     receipt,
-                    Some(proof),
                     staging.is_some(),
                 )
                 .await?;
                 incoming_sender.take();
                 drop(staging.take());
+                drop(receive_credit.take());
                 incoming_complete = true;
             }
             SessionInboundFrame::Data { header, payload } => {
@@ -1463,9 +1460,6 @@ where
                         detail: "peer sent an unexpected object RPC body".to_string(),
                     })?;
                 let pending = state.begin_data(&header).map_err(session_transfer_error)?;
-                let verified = TransferVerifiedData::from_payload(pending, &payload)
-                    .map_err(session_transfer_error)?;
-                incoming_hasher.update(&payload);
                 if let Some(staging) = staging.as_mut() {
                     staging.append(payload).await?;
                 } else if let Some(sender) = incoming_sender.as_ref() {
@@ -1487,19 +1481,40 @@ where
                         }
                     }
                 }
-                state
-                    .commit_data(verified)
-                    .map_err(session_transfer_error)?;
+                state.commit_data(pending).map_err(session_transfer_error)?;
                 let available_offset = state.received_offset();
-                let ack = state
-                    .acknowledge_received(available_offset)
-                    .map_err(session_transfer_error)?;
                 if staging.is_some()
                     && let Some(sender) = incoming_sender.as_ref()
                 {
                     sender.advance_available(available_offset)?;
                 }
-                writer.acknowledge(ack)?;
+                let schedule = credit_schedule
+                    .as_mut()
+                    .expect("credit schedule exists after transfer Open");
+                if schedule.due(available_offset) {
+                    if let Some(measurement) = incoming_measurement.as_mut() {
+                        measurement.record_until(&path_estimator, available_offset);
+                    }
+                    let tuning = transfer_path_tuning(&path_estimator);
+                    let reserved_bytes = receive_credit
+                        .as_mut()
+                        .expect("receive credit exists after transfer Open")
+                        .try_grow_to(tuning.flow_window.max_in_flight_bytes);
+                    let desired_bytes = state
+                        .receive_window()
+                        .max_in_flight_bytes
+                        .max(tuning.flow_window.max_in_flight_bytes)
+                        .min(reserved_bytes);
+                    state
+                        .set_receive_window_bytes(desired_bytes)
+                        .map_err(session_transfer_error)?;
+                    let ack = state
+                        .acknowledge_received(available_offset)
+                        .map_err(session_transfer_error)?;
+                    schedule.update_tuning(tuning);
+                    schedule.mark(available_offset);
+                    writer.acknowledge(ack)?;
+                }
             }
             SessionInboundFrame::Payload(SessionWirePayload::HealthPing { nonce }) => {
                 writer
@@ -1559,6 +1574,7 @@ async fn receive_server_session_bootstrap<F>(
         ObjectRpcSessionDescriptor,
         SessionFrameReader<BoxedSessionReadHalf>,
         Result<(), NetworkError>,
+        NetworkPathKey,
     ),
     NetworkError,
 >
@@ -1576,12 +1592,11 @@ where
     let TransferEncodedWireFrameHeader::Control(encoded) = frame else {
         return Err(NetworkError::AuthDenied);
     };
-    let signed: SignedSessionWireControl =
-        crate::SinomoObjectCodec::network_frame().decode(&encoded)?;
+    let payload: SessionWirePayload = crate::SinomoObjectCodec::network_frame().decode(&encoded)?;
     let SessionWirePayload::RequestHead {
         request,
         descriptor,
-    } = &signed.payload
+    } = &payload
     else {
         return Err(NetworkError::AuthDenied);
     };
@@ -1589,37 +1604,16 @@ where
     if &signed_descriptor != descriptor {
         return Err(NetworkError::AuthDenied);
     }
-    let expected_public_key = signed.proof.public_key.clone();
-    let encoded_payload = crate::SinomoObjectCodec::network_frame().encode(&signed.payload)?;
-    let expected_input = SessionFrameProofInput {
-        session_id: descriptor.session_id.clone(),
-        direction: SessionFrameDirection::InitiatorToResponder,
-        sequence: 0,
-        previous_digest: SESSION_ZERO_DIGEST,
-        frame_header_digest: TransferDigest::blake3(&encoded_payload),
-        payload_digest: None,
-    };
-    let previous_digest =
-        verify_session_frame_proof(&signed.proof, &expected_public_key, &expected_input)?;
-    // Membership, freshness, nonce replay, route authority, and the signature
-    // over the descriptor-bearing request remain the daemon authenticator's
-    // responsibility. Verify the claimed link proof first so an invalid frame
-    // cannot consume a valid request nonce. Body bytes are not read before
-    // both checks succeed. The request may remain origin-signed across relays
-    // while this link's frames are signed by the immediate authorized relay.
-    let authentication = authenticate(request, &signed.proof.signer_node_id, &expected_public_key);
+    let auth = request.auth.as_ref().ok_or(NetworkError::AuthDenied)?;
+    let claimed: SignedDaemonCommand = crate::SinomoObjectCodec::default().decode(auth)?;
+    let path_key = NetworkPathKey::for_peer_public_key(&claimed.public_key);
+    // The daemon request signature establishes the caller identity. The
+    // transport is trusted, so session frames do not carry a second proof or
+    // content digest. Body bytes are still not read before authentication.
+    let authentication = authenticate(request, &claimed.node_id, &claimed.public_key);
     let descriptor = descriptor.clone();
-    let frame_reader = SessionFrameReader::after_verified_bootstrap(
-        reader,
-        descriptor.session_id.clone(),
-        SessionFrameDirection::InitiatorToResponder,
-        expected_public_key,
-        policy,
-        1,
-        previous_digest,
-        header_buffer,
-    );
-    Ok((signed.payload, descriptor, frame_reader, authentication))
+    let frame_reader = SessionFrameReader::after_bootstrap(reader, policy, header_buffer);
+    Ok((payload, descriptor, frame_reader, authentication, path_key))
 }
 
 fn outgoing_body_failure_can_race_response_head(error: &NetworkError) -> bool {
@@ -1660,21 +1654,12 @@ pub(crate) async fn start_object_rpc_client_session(
     let response_proof_session_id = prepared.response_proof_session_id.clone();
     let response_proof_public_key = expected_response_origin_public_key;
     let request_open = prepared.descriptor.request_body.clone();
+    let path_key = NetworkPathKey::for_peer_public_key(&expected_responder_public_key);
+    let path_estimator = shared_network_path_estimator(&path_key);
     let (read_half, write_half) = tokio::io::split(stream);
-    let writer = SessionWriterHandle::spawn(SessionFrameWriter::new(
-        write_half,
-        local_data_dir,
-        session_id.clone(),
-        SessionFrameDirection::InitiatorToResponder,
-        policy,
-    )?);
-    let reader = SessionFrameReader::new(
-        read_half,
-        session_id,
-        SessionFrameDirection::ResponderToInitiator,
-        expected_responder_public_key,
-        policy,
-    );
+    let writer =
+        SessionWriterHandle::spawn(SessionFrameWriter::new(write_half, local_data_dir, policy)?);
+    let reader = SessionFrameReader::new(read_half, policy);
     let outgoing = Arc::new(Mutex::new(SharedOutgoingTransfer {
         initialized: true,
         transfer_id: request_open.as_ref().map(|open| open.transfer_id.clone()),
@@ -1687,6 +1672,8 @@ pub(crate) async fn start_object_rpc_client_session(
     let read_body_tx = body_tx.clone();
     let reader_writer = writer.clone();
     let reader_outgoing = Arc::clone(&outgoing);
+    let reader_path_key = path_key.clone();
+    let reader_path_estimator = path_estimator.clone();
     let reader_task = tokio::spawn(async move {
         if let Err(error) = pump_incoming_session(
             reader,
@@ -1697,6 +1684,8 @@ pub(crate) async fn start_object_rpc_client_session(
             Some(read_body_tx.clone()),
             head_tx,
             None,
+            reader_path_key,
+            reader_path_estimator,
         )
         .await
         {
@@ -1734,8 +1723,17 @@ pub(crate) async fn start_object_rpc_client_session(
     let wait_response_started = perf_enabled.then(std::time::Instant::now);
     let mut outgoing_task = if let Some(open) = request_open {
         let outgoing_writer = writer.clone();
+        let outgoing_path_estimator = path_estimator.clone();
         Some(tokio::spawn(async move {
-            pump_outgoing_body(outgoing_writer, prepared.body, open, feedback_rx, policy).await
+            pump_outgoing_body(
+                outgoing_writer,
+                prepared.body,
+                open,
+                feedback_rx,
+                policy,
+                outgoing_path_estimator,
+            )
+            .await
         }))
     } else {
         drop(feedback_rx);
@@ -1844,7 +1842,7 @@ pub(crate) async fn start_object_rpc_client_session(
                 .to_string(),
         });
     }
-    let response_origin_verified = response_head_origin_is_verified(
+    let response_origin_verified = response_origin_is_verified(
         &response,
         &response_proof_public_key,
         &response_proof_session_id,
@@ -1902,11 +1900,6 @@ pub(crate) async fn start_object_rpc_client_session(
     } else {
         incoming_body.total_bytes = body.as_ref().and_then(|open| open.total_bytes);
         incoming_body.set_role(body_role);
-        incoming_body.require_finish_proof(BodyFinishProofExpectation {
-            binding: response_body_finish_binding(&response_proof_session_id, &response)?,
-            signer_node_id: None,
-            public_key: response_proof_public_key,
-        })?;
     }
     if body_role == ObjectRpcSessionBodyRole::Value
         && let Some(task) = outgoing_task.take()
@@ -1971,6 +1964,7 @@ pub struct ObjectRpcSessionResponder {
     operation_id: Option<String>,
     policy: NetworkCallPolicy,
     keepalive_task: Option<tokio::task::JoinHandle<()>>,
+    path_estimator: NetworkPathEstimator,
 }
 
 impl fmt::Debug for ObjectRpcSessionResponder {
@@ -1998,26 +1992,17 @@ impl ObjectRpcSessionResponder {
         }
         let body_open = {
             self.writer
-                .ensure_response_head_proof(&self.session_id, &mut response.response)?;
+                .ensure_response_identity_proof(&self.session_id, &mut response.response)?;
             let body_role = response.body.role();
             let body_open = (!response.body.is_empty()).then(|| TransferOpen {
                 transfer_id: TransferId::generate(),
                 route: response.response.route.clone(),
                 operation_id: self.operation_id.clone(),
                 total_bytes: response.body.total_bytes(),
-                expected_digest: response.body.known_digest(),
                 replayable: response.body.is_replayable(),
-                requested_window: TransferFlowWindow::default(),
+                requested_window: TransferFlowWindow::maximum_supported(),
             });
             body_role.validate(body_open.as_ref())?;
-            if body_open.is_some() {
-                response
-                    .body
-                    .ensure_local_finish_binding(response_body_finish_binding(
-                        &self.session_id,
-                        &response.response,
-                    )?)?;
-            }
             {
                 let mut outgoing = self.outgoing.lock().map_err(|_| NetworkError::Io {
                     operation: "initialize object RPC response transfer".to_string(),
@@ -2046,6 +2031,7 @@ impl ObjectRpcSessionResponder {
                 open,
                 feedback,
                 self.policy,
+                self.path_estimator.clone(),
             )
             .await?;
         }
@@ -2074,7 +2060,7 @@ impl Drop for ObjectRpcSessionResponder {
 /// Accepts and authenticates a server-side canonical session. The callback
 /// must perform normal daemon request authentication and independently
 /// authorize the claimed immediate-link node/key pair. No attachment bytes
-/// are consumed before that callback and frame-zero proof both succeed.
+/// are consumed before that callback succeeds.
 pub async fn accept_object_rpc_server_session<F>(
     stream: BoxedSessionStream,
     local_data_dir: SinomoDataDir,
@@ -2085,7 +2071,7 @@ where
     F: FnOnce(&crate::ObjectRpcRequest, &str, &[u8]) -> Result<(), NetworkError>,
 {
     let (read_half, write_half) = tokio::io::split(stream);
-    let (initial_head, descriptor, reader, authentication) =
+    let (initial_head, descriptor, reader, authentication, path_key) =
         receive_server_session_bootstrap(read_half, policy, authenticate).await?;
     let SessionWirePayload::RequestHead { .. } = &initial_head else {
         unreachable!("bootstrap validates request head");
@@ -2100,14 +2086,8 @@ where
         // keeping this head body-free lets the client stop its request body
         // without starting a response transfer.
         response.body.clear();
-        let mut writer = SessionFrameWriter::new(
-            write_half,
-            local_data_dir,
-            descriptor.session_id.clone(),
-            SessionFrameDirection::ResponderToInitiator,
-            policy,
-        )?;
-        ensure_response_head_proof_with_writer(&writer, &descriptor.session_id, &mut response)?;
+        let mut writer = SessionFrameWriter::new(write_half, local_data_dir, policy)?;
+        ensure_response_identity_proof_with_writer(&writer, &descriptor.session_id, &mut response)?;
         writer
             .send(SessionWirePayload::ResponseHead {
                 response,
@@ -2117,13 +2097,8 @@ where
             .await?;
         return Err(error);
     }
-    let writer = SessionWriterHandle::spawn(SessionFrameWriter::new(
-        write_half,
-        local_data_dir,
-        descriptor.session_id.clone(),
-        SessionFrameDirection::ResponderToInitiator,
-        policy,
-    )?);
+    let writer =
+        SessionWriterHandle::spawn(SessionFrameWriter::new(write_half, local_data_dir, policy)?);
     let outgoing = Arc::new(Mutex::new(SharedOutgoingTransfer::default()));
     let (feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(16);
     let (body_tx, mut incoming_body) = if descriptor.request_body.is_some() {
@@ -2138,19 +2113,14 @@ where
     } else {
         (None, ObjectRpcIncomingBody::empty())
     };
-    if descriptor.request_body.is_some() {
-        let SessionWirePayload::RequestHead { request, .. } = &initial_head else {
-            unreachable!("bootstrap validates request head");
-        };
-        let expectation =
-            signed_request_body_finish_expectation(request)?.ok_or(NetworkError::AuthDenied)?;
-        incoming_body.require_finish_proof(expectation)?;
-    }
     let (head_tx, head_rx) = tokio::sync::oneshot::channel();
     let reader_writer = writer.clone();
     let reader_outgoing = Arc::clone(&outgoing);
     let failure_body_tx = body_tx.clone();
     let expected_open = descriptor.request_body.clone();
+    let path_estimator = shared_network_path_estimator(&path_key);
+    let reader_path_estimator = path_estimator.clone();
+    let reader_path_key = path_key;
     let reader_task = tokio::spawn(async move {
         if let Err(error) = pump_incoming_session(
             reader,
@@ -2161,6 +2131,8 @@ where
             body_tx,
             head_tx,
             Some(initial_head),
+            reader_path_key,
+            reader_path_estimator,
         )
         .await
             && let Some(sender) = failure_body_tx
@@ -2197,6 +2169,7 @@ where
         operation_id: request.operation_id().map(ToOwned::to_owned),
         policy,
         keepalive_task: Some(keepalive_task),
+        path_estimator,
     };
     Ok((
         ObjectRpcSessionRequest::new(request, incoming_body),
@@ -2254,12 +2227,6 @@ enum ObjectRpcBodySourceKind {
     AsyncReader(Mutex<OnePassAsyncReader>),
 }
 
-#[derive(Debug)]
-enum BodyFinishProofSource {
-    Local(Option<BodyFinishProofBinding>),
-    Forwarded(Arc<Mutex<IncomingBodyIntegrity>>),
-}
-
 /// A whole RPC attachment source.
 ///
 /// `Bytes` and `File` sources can be replayed after a reconnect. This session
@@ -2272,7 +2239,6 @@ pub struct ObjectRpcBodySource {
     role: ObjectRpcSessionBodyRole,
     materialized_value_forward: bool,
     lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
-    finish_proof: BodyFinishProofSource,
 }
 
 impl fmt::Debug for ObjectRpcBodySource {
@@ -2310,7 +2276,6 @@ impl ObjectRpcBodySource {
             role: ObjectRpcSessionBodyRole::None,
             materialized_value_forward: false,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
-            finish_proof: BodyFinishProofSource::Local(None),
         }
     }
 
@@ -2326,7 +2291,6 @@ impl ObjectRpcBodySource {
             role: ObjectRpcSessionBodyRole::Attachment,
             materialized_value_forward: false,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
-            finish_proof: BodyFinishProofSource::Local(None),
         }
     }
 
@@ -2354,7 +2318,6 @@ impl ObjectRpcBodySource {
             },
             materialized_value_forward: false,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
-            finish_proof: BodyFinishProofSource::Local(None),
         })
     }
 
@@ -2371,7 +2334,6 @@ impl ObjectRpcBodySource {
             },
             materialized_value_forward: false,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
-            finish_proof: BodyFinishProofSource::Local(None),
         }
     }
 
@@ -2398,7 +2360,6 @@ impl ObjectRpcBodySource {
             },
             materialized_value_forward: false,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
-            finish_proof: BodyFinishProofSource::Local(None),
         }
     }
 
@@ -2413,11 +2374,6 @@ impl ObjectRpcBodySource {
     ) -> Self {
         let role = body.role;
         let materialized_value_forward = body.is_materialized_value_forward();
-        let finish_proof = body
-            .integrity
-            .as_ref()
-            .map(|integrity| BodyFinishProofSource::Forwarded(Arc::clone(integrity)))
-            .unwrap_or(BodyFinishProofSource::Local(None));
         Self {
             kind: ObjectRpcBodySourceKind::AsyncReader(Mutex::new(OnePassAsyncReader {
                 reader: Some(Box::pin(body)),
@@ -2426,7 +2382,6 @@ impl ObjectRpcBodySource {
             role,
             materialized_value_forward,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
-            finish_proof,
         }
     }
 
@@ -2510,58 +2465,6 @@ impl ObjectRpcBodySource {
             self.kind,
             ObjectRpcBodySourceKind::Reader(_) | ObjectRpcBodySourceKind::AsyncReader(_)
         )
-    }
-
-    pub(crate) fn known_digest(&self) -> Option<TransferDigest> {
-        match &self.kind {
-            ObjectRpcBodySourceKind::Empty => Some(TransferDigest::blake3(&[])),
-            ObjectRpcBodySourceKind::Bytes(source) => {
-                Some(TransferDigest::blake3(source.bytes.as_ref()))
-            }
-            ObjectRpcBodySourceKind::File(_)
-            | ObjectRpcBodySourceKind::Reader(_)
-            | ObjectRpcBodySourceKind::AsyncReader(_) => None,
-        }
-    }
-
-    fn ensure_local_finish_binding(
-        &mut self,
-        binding: BodyFinishProofBinding,
-    ) -> Result<(), NetworkError> {
-        match &mut self.finish_proof {
-            BodyFinishProofSource::Local(slot) => {
-                if slot.is_none() {
-                    *slot = Some(binding);
-                }
-                Ok(())
-            }
-            BodyFinishProofSource::Forwarded(_) => Ok(()),
-        }
-    }
-
-    async fn finish_proof(
-        &self,
-        writer: &SessionWriterHandle,
-        total_bytes: u64,
-        digest: TransferDigest,
-    ) -> Result<SignedBodyFinishProof, NetworkError> {
-        match &self.finish_proof {
-            BodyFinishProofSource::Local(Some(binding)) => {
-                Ok(writer.sign_body_finish(binding.clone(), total_bytes, digest))
-            }
-            BodyFinishProofSource::Local(None) => Err(NetworkError::Serialization {
-                detail: "object RPC body is missing its authenticated finish binding".to_string(),
-            }),
-            BodyFinishProofSource::Forwarded(integrity) => integrity
-                .lock()
-                .map_err(|_| NetworkError::Io {
-                    operation: "forward object RPC body finish proof".to_string(),
-                    detail: "incoming body integrity lock poisoned".to_string(),
-                })?
-                .finish_proof
-                .clone()
-                .ok_or_else(|| NetworkError::AuthDenied),
-        }
     }
 
     fn open(&self) -> Result<Box<dyn Read + Send>, NetworkError> {
@@ -2667,18 +2570,11 @@ impl ObjectRpcBodySource {
                 return None;
             }
         };
-        let finish_proof = match &self.finish_proof {
-            BodyFinishProofSource::Local(binding) => BodyFinishProofSource::Local(binding.clone()),
-            BodyFinishProofSource::Forwarded(integrity) => {
-                BodyFinishProofSource::Forwarded(Arc::clone(integrity))
-            }
-        };
         Some(Self {
             kind,
             role: self.role,
             materialized_value_forward: self.materialized_value_forward,
             lifetime_guards: Arc::clone(&self.lifetime_guards),
-            finish_proof,
         })
     }
 }
@@ -2732,7 +2628,6 @@ enum MultiplexedBodyTerminal {
 #[derive(Debug)]
 pub(crate) struct ObjectRpcChannelBodySender {
     sender: Option<tokio::sync::mpsc::Sender<IncomingBodyItem>>,
-    integrity: Arc<Mutex<IncomingBodyIntegrity>>,
     terminal: Arc<Mutex<MultiplexedBodyTerminal>>,
 }
 
@@ -2762,31 +2657,9 @@ impl ObjectRpcChannelBodySender {
         self.sender.take();
     }
 
-    /// Records the whole ordered body already verified by the authenticated
-    /// physical channel, then exposes EOF to the application reader. This
-    /// deliberately validates only the signed length/digest contract: the
-    /// canonical session's separate finish proof is not part of this carrier.
-    pub(crate) async fn finish_verified(
-        &mut self,
-        total_bytes: u64,
-        digest: [u8; 32],
-    ) -> Result<(), NetworkError> {
-        let result = self
-            .integrity
-            .lock()
-            .map_err(|_| NetworkError::Io {
-                operation: "verify multiplexed object RPC body contract".to_string(),
-                detail: "incoming body integrity lock poisoned".to_string(),
-            })
-            .and_then(|mut integrity| {
-                let digest = TransferDigest::new(digest);
-                integrity.actual = Some((total_bytes, digest));
-                validate_incoming_body_integrity(&integrity, total_bytes, digest)
-            });
-        if let Err(error) = result {
-            self.fail(error.to_string());
-            return Err(error);
-        }
+    /// Marks the ordered body complete after its framing and declared length
+    /// have been validated by the channel state machine.
+    pub(crate) async fn finish(&mut self, _total_bytes: u64) -> Result<(), NetworkError> {
         let completion = self
             .terminal
             .lock()
@@ -2820,71 +2693,8 @@ enum ObjectRpcIncomingBodyInner {
     },
 }
 
-#[derive(Debug, Default)]
-struct IncomingBodyIntegrity {
-    expected_total_bytes: Option<u64>,
-    expected_digest: Option<TransferDigest>,
-    actual: Option<(u64, TransferDigest)>,
-    expected_finish_proof: Option<BodyFinishProofExpectation>,
-    finish_proof: Option<SignedBodyFinishProof>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BodyFinishProofExpectation {
-    binding: BodyFinishProofBinding,
-    signer_node_id: Option<String>,
-    public_key: Vec<u8>,
-}
-
-fn validate_incoming_body_integrity(
-    integrity: &IncomingBodyIntegrity,
-    actual_total_bytes: u64,
-    actual_digest: TransferDigest,
-) -> Result<(), NetworkError> {
-    if integrity
-        .expected_total_bytes
-        .is_some_and(|expected| expected != actual_total_bytes)
-    {
-        return Err(NetworkError::Serialization {
-            detail: format!(
-                "signed object RPC body length {} does not match received length {actual_total_bytes}",
-                integrity.expected_total_bytes.unwrap_or_default()
-            ),
-        });
-    }
-    if integrity
-        .expected_digest
-        .is_some_and(|expected| expected != actual_digest)
-    {
-        return Err(NetworkError::AuthDenied);
-    }
-    Ok(())
-}
-
-fn validate_incoming_body_finish_proof(
-    integrity: &IncomingBodyIntegrity,
-    actual_total_bytes: u64,
-    actual_digest: TransferDigest,
-) -> Result<(), NetworkError> {
-    let Some(expected) = integrity.expected_finish_proof.as_ref() else {
-        return Ok(());
-    };
-    let proof = integrity
-        .finish_proof
-        .as_ref()
-        .ok_or(NetworkError::AuthDenied)?;
-    verify_body_finish_proof(
-        proof,
-        expected.signer_node_id.as_deref(),
-        &expected.public_key,
-        &expected.binding,
-        actual_total_bytes,
-        actual_digest,
-    )
-}
-
 /// A received RPC attachment. It exposes ordinary asynchronous byte reads;
-/// transport frames and chunk sizes remain private. Verified frames move
+/// transport frames and chunk sizes remain private. Ordered frames move
 /// through a bounded in-memory channel first. If the application falls behind,
 /// the wire reader lazily spills the remaining suffix to a temporary file so
 /// application backpressure cannot block full-duplex control traffic.
@@ -2894,7 +2704,6 @@ pub struct ObjectRpcIncomingBody {
     completion_tasks: Vec<tokio::task::JoinHandle<()>>,
     total_bytes: Option<u64>,
     role: ObjectRpcSessionBodyRole,
-    integrity: Option<Arc<Mutex<IncomingBodyIntegrity>>>,
     multiplexed_terminal: Option<Arc<Mutex<MultiplexedBodyTerminal>>>,
 }
 
@@ -2911,7 +2720,6 @@ impl ObjectRpcIncomingBody {
             completion_tasks: Vec::new(),
             total_bytes: Some(0),
             role: ObjectRpcSessionBodyRole::None,
-            integrity: None,
             multiplexed_terminal: None,
         }
     }
@@ -2926,7 +2734,6 @@ impl ObjectRpcIncomingBody {
             completion_tasks: Vec::new(),
             total_bytes,
             role: ObjectRpcSessionBodyRole::Attachment,
-            integrity: None,
             multiplexed_terminal: None,
         }
     }
@@ -2937,12 +2744,10 @@ impl ObjectRpcIncomingBody {
         // One queued chunk plus one chunk held by the isolated delivery task
         // bounds a stalled call to two channel quanta.
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let integrity = Arc::new(Mutex::new(IncomingBodyIntegrity::default()));
         let terminal = Arc::new(Mutex::new(MultiplexedBodyTerminal::Pending));
         (
             ObjectRpcChannelBodySender {
                 sender: Some(sender),
-                integrity: Arc::clone(&integrity),
                 terminal: Arc::clone(&terminal),
             },
             Self {
@@ -2953,7 +2758,6 @@ impl ObjectRpcIncomingBody {
                 completion_tasks: Vec::new(),
                 total_bytes,
                 role: ObjectRpcSessionBodyRole::Attachment,
-                integrity: Some(integrity),
                 multiplexed_terminal: Some(terminal),
             },
         )
@@ -2968,25 +2772,17 @@ impl ObjectRpcIncomingBody {
     }
 
     fn is_materialized_value_forward(&self) -> bool {
-        // Multiplexed channels verify their own frame digest but do not carry
-        // a canonical session finish proof. They therefore retain the value
-        // forwarding role with `integrity == None`. A later multiplexed hop
-        // can re-stream the value without inventing a canonical proof; a
-        // transition back to a canonical session must satisfy its target-
-        // origin proof separately.
+        // A materialized channel value keeps its forwarding role even though
+        // the byte stream has already been collected into the response head.
         self.role == ObjectRpcSessionBodyRole::Value && self.is_empty()
     }
 
-    fn materialized_value_forward(
-        total_bytes: Option<u64>,
-        integrity: Option<Arc<Mutex<IncomingBodyIntegrity>>>,
-    ) -> Self {
+    fn materialized_value_forward(total_bytes: Option<u64>) -> Self {
         Self {
             inner: ObjectRpcIncomingBodyInner::Empty,
             completion_tasks: Vec::new(),
             total_bytes,
             role: ObjectRpcSessionBodyRole::Value,
-            integrity,
             multiplexed_terminal: None,
         }
     }
@@ -2999,11 +2795,11 @@ impl ObjectRpcIncomingBody {
         let (setup_sender, setup_receiver) = tokio::sync::oneshot::channel();
         let (progress_sender, progress_receiver) =
             tokio::sync::watch::channel(IncomingSpoolProgress::default());
-        let integrity = Arc::new(Mutex::new(IncomingBodyIntegrity::default()));
         // The spool tailer is deliberately detached from the application
         // reader's abort-on-drop session tasks. If the application ignores a
         // request body, closing the channel makes this task discard its tail
-        // while the transport reader continues hashing and acknowledging it.
+        // while the transport reader continues receiving it under bounded
+        // peer credit.
         drop(tokio::spawn(deliver_incoming_spool(
             setup_receiver,
             progress_receiver,
@@ -3014,7 +2810,6 @@ impl ObjectRpcIncomingBody {
                 setup: Arc::new(Mutex::new(Some(setup_sender))),
                 progress: progress_sender,
                 direct: Arc::new(Mutex::new(Some(body_sender))),
-                integrity: Arc::clone(&integrity),
             },
             Self {
                 inner: ObjectRpcIncomingBodyInner::Channel {
@@ -3024,7 +2819,6 @@ impl ObjectRpcIncomingBody {
                 completion_tasks: Vec::new(),
                 total_bytes,
                 role,
-                integrity: Some(integrity),
                 multiplexed_terminal: None,
             },
         )
@@ -3040,85 +2834,6 @@ impl ObjectRpcIncomingBody {
 
     fn hold_completion_task(&mut self, task: tokio::task::JoinHandle<()>) {
         self.completion_tasks.push(task);
-    }
-
-    fn require_signed_contract(
-        &mut self,
-        expected_total_bytes: Option<u64>,
-        expected_digest: Option<TransferDigest>,
-    ) -> Result<(), NetworkError> {
-        if let Some(integrity) = self.integrity.as_ref() {
-            let mut integrity = integrity.lock().map_err(|_| NetworkError::Io {
-                operation: "bind signed object RPC body contract".to_string(),
-                detail: "incoming body integrity lock poisoned".to_string(),
-            })?;
-            if integrity
-                .expected_total_bytes
-                .is_some_and(|existing| Some(existing) != expected_total_bytes)
-                || integrity
-                    .expected_digest
-                    .is_some_and(|existing| Some(existing) != expected_digest)
-            {
-                return Err(NetworkError::AuthDenied);
-            }
-            integrity.expected_total_bytes = expected_total_bytes;
-            integrity.expected_digest = expected_digest;
-            if let Some((actual_total_bytes, actual_digest)) = integrity.actual {
-                validate_incoming_body_integrity(&integrity, actual_total_bytes, actual_digest)?;
-            }
-            return Ok(());
-        }
-
-        let bytes: &[u8] = match &self.inner {
-            ObjectRpcIncomingBodyInner::Empty => &[],
-            ObjectRpcIncomingBodyInner::Bytes(bytes) => bytes.get_ref(),
-            ObjectRpcIncomingBodyInner::Channel { .. } => {
-                return Err(NetworkError::Io {
-                    operation: "bind signed object RPC body contract".to_string(),
-                    detail: "channel body is missing its integrity state".to_string(),
-                });
-            }
-        };
-        let integrity = IncomingBodyIntegrity {
-            expected_total_bytes,
-            expected_digest,
-            actual: None,
-            ..IncomingBodyIntegrity::default()
-        };
-        validate_incoming_body_integrity(
-            &integrity,
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            TransferDigest::blake3(bytes),
-        )
-    }
-
-    fn require_finish_proof(
-        &mut self,
-        expectation: BodyFinishProofExpectation,
-    ) -> Result<(), NetworkError> {
-        let Some(integrity) = self.integrity.as_ref() else {
-            return if self.is_empty() {
-                Ok(())
-            } else {
-                Err(NetworkError::AuthDenied)
-            };
-        };
-        let mut integrity = integrity.lock().map_err(|_| NetworkError::Io {
-            operation: "bind object RPC body finish proof".to_string(),
-            detail: "incoming body integrity lock poisoned".to_string(),
-        })?;
-        if integrity
-            .expected_finish_proof
-            .as_ref()
-            .is_some_and(|existing| existing != &expectation)
-        {
-            return Err(NetworkError::AuthDenied);
-        }
-        integrity.expected_finish_proof = Some(expectation);
-        if let Some((actual_total_bytes, actual_digest)) = integrity.actual {
-            validate_incoming_body_finish_proof(&integrity, actual_total_bytes, actual_digest)?;
-        }
-        Ok(())
     }
 
     pub async fn collect_to_vec(mut self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
@@ -3176,8 +2891,7 @@ impl ObjectRpcIncomingBody {
     /// Materializes a protocol-native value body without imposing a transport
     /// size policy. The value has already crossed the authenticated streaming
     /// path; failure here is limited to the host being unable to represent or
-    /// allocate the resulting in-process `Vec` (plus ordinary I/O/integrity
-    /// failures from the stream itself).
+    /// allocate the resulting in-process `Vec` plus ordinary stream I/O.
     async fn collect_value_to_vec(
         mut self,
         operation: &'static str,
@@ -3231,12 +2945,8 @@ impl ObjectRpcIncomingBody {
         operation: &'static str,
     ) -> Result<(Vec<u8>, Self), NetworkError> {
         let total_bytes = self.total_bytes;
-        let integrity = self.integrity.as_ref().map(Arc::clone);
         let value = self.collect_value_to_vec(operation).await?;
-        Ok((
-            value,
-            Self::materialized_value_forward(total_bytes, integrity),
-        ))
+        Ok((value, Self::materialized_value_forward(total_bytes)))
     }
 }
 
@@ -3300,7 +3010,7 @@ impl AsyncRead for ObjectRpcIncomingBody {
                                         MultiplexedBodyTerminal::Pending => {
                                             return Poll::Ready(Err(std::io::Error::new(
                                                 std::io::ErrorKind::UnexpectedEof,
-                                                "multiplexed body ended before verified completion",
+                                                "multiplexed body ended before declared completion",
                                             )));
                                         }
                                         MultiplexedBodyTerminal::Complete => {}
@@ -3332,7 +3042,6 @@ struct IncomingBodySender {
     >,
     progress: tokio::sync::watch::Sender<IncomingSpoolProgress>,
     direct: Arc<Mutex<Option<tokio::sync::mpsc::Sender<IncomingBodyItem>>>>,
-    integrity: Arc<Mutex<IncomingBodyIntegrity>>,
 }
 
 #[derive(Debug)]
@@ -3480,43 +3189,7 @@ impl IncomingBodySender {
         Ok(())
     }
 
-    /// Validates and records the authenticated end-of-body state without
-    /// publishing EOF to the application reader. The wire receipt must be
-    /// written before [`Self::publish_completion`] wakes that reader: received
-    /// bodies own the session reader task, so exposing EOF first lets an eager
-    /// consumer drop the body and abort the task before it sends the receipt.
-    fn validate_completion(
-        &self,
-        available_bytes: u64,
-        actual_digest: TransferDigest,
-        finish_proof: Option<SignedBodyFinishProof>,
-    ) -> Result<(), NetworkError> {
-        {
-            let mut integrity = self.integrity.lock().map_err(|_| NetworkError::Io {
-                operation: "verify signed object RPC body contract".to_string(),
-                detail: "incoming body integrity lock poisoned".to_string(),
-            })?;
-            integrity.actual = Some((available_bytes, actual_digest));
-            integrity.finish_proof = finish_proof;
-            if let Err(error) =
-                validate_incoming_body_integrity(&integrity, available_bytes, actual_digest)
-                    .and_then(|()| {
-                        validate_incoming_body_finish_proof(
-                            &integrity,
-                            available_bytes,
-                            actual_digest,
-                        )
-                    })
-            {
-                drop(integrity);
-                self.fail(error.to_string());
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    /// Publishes a previously validated completion to the application body.
+    /// Publishes completion to the application body.
     /// Callers must first write the transfer receipt to the peer.
     fn publish_completion(
         &self,
@@ -3553,14 +3226,7 @@ impl IncomingBodySender {
     }
 
     #[cfg(test)]
-    fn complete(
-        &self,
-        available_bytes: u64,
-        actual_digest: TransferDigest,
-        has_spool: bool,
-        finish_proof: Option<SignedBodyFinishProof>,
-    ) -> Result<(), NetworkError> {
-        self.validate_completion(available_bytes, actual_digest, finish_proof)?;
+    fn complete(&self, available_bytes: u64, has_spool: bool) -> Result<(), NetworkError> {
         self.publish_completion(available_bytes, has_spool)
     }
 
@@ -3696,13 +3362,6 @@ impl ObjectRpcSessionCall {
             OBJECT_RPC_SESSION_METADATA_KEY.to_string(),
             descriptor.encode_metadata()?,
         );
-        if descriptor.request_body.is_some() {
-            self.body
-                .ensure_local_finish_binding(request_body_finish_binding(
-                    &self.request,
-                    &descriptor,
-                )?)?;
-        }
         let response_proof_session_id = response_proof_session_id(&self.request, &descriptor)?;
         Ok(PreparedSessionCall {
             request: self.request,
@@ -3750,11 +3409,6 @@ impl ObjectRpcSessionCall {
                     ),
                 });
             }
-            if let (Some(declared), Some(actual)) = (open.expected_digest, self.body.known_digest())
-                && declared != actual
-            {
-                return Err(NetworkError::AuthDenied);
-            }
         }
         let response_proof_session_id = response_proof_session_id(&self.request, &descriptor)?;
         Ok((
@@ -3792,8 +3446,8 @@ fn session_descriptor_from_request(
 /// Returns the request-head bytes covered by daemon authentication.
 ///
 /// Ordinary RPC values are moved out of the signed head and carried by the
-/// canonical transfer. The signed descriptor binds that transfer's length and
-/// digest, while the server restores the value into `request.body` before
+/// canonical transfer. The signed descriptor records that transfer's length,
+/// while the server restores the value into `request.body` before
 /// dispatch. Authentication therefore hashes an empty head body in both
 /// states. Attachment calls retain their typed head body unchanged.
 pub(crate) fn daemon_auth_request_head_body(request: &crate::ObjectRpcRequest) -> &[u8] {
@@ -3827,36 +3481,31 @@ impl ObjectRpcSessionRequest {
 
     /// Rebinds a received relay body to an already-signed inner request. The
     /// signed descriptor must agree with body presence, role, route, operation,
-    /// declared length, and digest. Attachment bodies remain streaming; value
-    /// bodies are fully verified and restored into the typed request before
+    /// declared length. Attachment bodies remain streaming; value bodies are
+    /// restored into the typed request before
     /// this method returns.
     pub async fn bind_signed_inner_request(
         self,
         request: crate::ObjectRpcRequest,
     ) -> Result<Self, NetworkError> {
-        self.bind_signed_inner_request_with_transport(request, true)
-            .await
+        self.bind_signed_inner_request_common(request).await
     }
 
     /// Rebinds an origin-signed relay request received over a physically
     /// authenticated multiplexed channel.
     ///
-    /// The channel verifies ordered body length and BLAKE3 completion before
-    /// publishing successful EOF. It therefore enforces the signed descriptor
-    /// contract directly instead of requiring the canonical session's
-    /// per-body finish proof, which does not exist on this carrier.
+    /// The channel validates ordered offsets and declared length before
+    /// publishing successful EOF.
     pub async fn bind_signed_inner_request_on_authenticated_channel(
         self,
         request: crate::ObjectRpcRequest,
     ) -> Result<Self, NetworkError> {
-        self.bind_signed_inner_request_with_transport(request, false)
-            .await
+        self.bind_signed_inner_request_common(request).await
     }
 
-    async fn bind_signed_inner_request_with_transport(
+    async fn bind_signed_inner_request_common(
         mut self,
         mut request: crate::ObjectRpcRequest,
-        require_finish_proof: bool,
     ) -> Result<Self, NetworkError> {
         if request.auth.is_none() {
             return Err(NetworkError::AuthDenied);
@@ -3883,13 +3532,6 @@ impl ObjectRpcSessionRequest {
                         "relayed object RPC body length {outer_declared} does not match signed inner length {declared}"
                     ),
                 });
-            }
-            self.body
-                .require_signed_contract(open.total_bytes, open.expected_digest)?;
-            if require_finish_proof {
-                let expectation = signed_request_body_finish_expectation(&request)?
-                    .ok_or(NetworkError::AuthDenied)?;
-                self.body.require_finish_proof(expectation)?;
             }
         }
         self.body.set_role(descriptor.request_body_role);
@@ -3977,12 +3619,12 @@ impl ObjectRpcSessionResult {
     ) -> Self {
         Self::new(
             response,
-            ObjectRpcIncomingBody::materialized_value_forward(total_bytes, None),
+            ObjectRpcIncomingBody::materialized_value_forward(total_bytes),
         )
     }
 
     /// Splits the application-visible response head and body while keeping
-    /// transport verification state private to the routing layer.
+    /// target-identity verification state private to the routing layer.
     pub fn into_parts(self) -> (crate::ObjectRpcResponse, ObjectRpcIncomingBody) {
         (self.response, self.body)
     }
@@ -4248,8 +3890,8 @@ async fn read_async_body_bounded(
 mod body_tests {
     use super::*;
     use crate::daemon_auth::{
-        SignedDaemonCommand, daemon_rpc_body_sha256, sign_daemon_rpc_request_from_data_dir,
-        sign_session_frame_proof_from_data_dir,
+        SignedDaemonCommand, cached_daemon_signing_public_key, daemon_rpc_body_sha256,
+        sign_daemon_rpc_request_from_data_dir,
     };
     use crate::transfer::TransferReceipt;
     use std::io::Cursor;
@@ -4321,19 +3963,7 @@ mod body_tests {
     }
 
     fn proof_public_key(data_dir: &SinomoDataDir) -> Vec<u8> {
-        sign_session_frame_proof_from_data_dir(
-            data_dir,
-            SessionFrameProofInput {
-                session_id: TransferId::generate(),
-                direction: SessionFrameDirection::InitiatorToResponder,
-                sequence: 0,
-                previous_digest: SESSION_ZERO_DIGEST,
-                frame_header_digest: TransferDigest::blake3(b"public-key-probe"),
-                payload_digest: None,
-            },
-        )
-        .expect("session proof identity")
-        .public_key
+        cached_daemon_signing_public_key(data_dir).expect("session identity")
     }
 
     fn authenticate_test_request(
@@ -4425,7 +4055,6 @@ mod body_tests {
     async fn incoming_body_delivers_directly_without_creating_a_spool() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-body-direct");
         let bytes = b"hello world".to_vec();
-        let digest = TransferDigest::blake3(&bytes);
         let (sender, body) = ObjectRpcIncomingBody::channel(
             Some(bytes.len() as u64),
             ObjectRpcSessionBodyRole::Attachment,
@@ -4439,7 +4068,7 @@ mod body_tests {
             IncomingDirectDelivery::Delivered
         ));
         sender
-            .complete(bytes.len() as u64, digest, false, None)
+            .complete(bytes.len() as u64, false)
             .expect("complete direct body");
         drop(sender);
         assert_eq!(
@@ -4458,7 +4087,6 @@ mod body_tests {
     async fn incoming_body_waits_for_consumer_progress_before_spilling() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-body-wait-direct");
         let bytes = b"abcdef".to_vec();
-        let digest = TransferDigest::blake3(&bytes);
         let (sender, mut body) = ObjectRpcIncomingBody::channel(
             Some(bytes.len() as u64),
             ObjectRpcSessionBodyRole::Attachment,
@@ -4500,7 +4128,7 @@ mod body_tests {
         assert!(BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL.load(Ordering::Relaxed) > delivered_before);
 
         sender
-            .complete(bytes.len() as u64, digest, false, None)
+            .complete(bytes.len() as u64, false)
             .expect("complete direct body after wait");
         drop(sender);
         let mut received = first.to_vec();
@@ -4569,15 +4197,11 @@ mod body_tests {
     async fn incoming_body_eof_is_published_only_after_the_wire_receipt_is_written() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-completion-receipt-order");
         let data_dir = SinomoDataDir::new(root.path());
-        let public_key = proof_public_key(&data_dir);
-        let session_id = TransferId::generate();
         let transfer_id = TransferId::generate();
         let bytes = b"body".to_vec();
-        let digest = TransferDigest::blake3(&bytes);
         let receipt = TransferReceipt {
             transfer_id,
             completed_bytes: bytes.len() as u64,
-            digest,
         };
         let (sender, mut body) = ObjectRpcIncomingBody::channel(
             Some(bytes.len() as u64),
@@ -4591,32 +4215,19 @@ mod body_tests {
         body.read_exact(&mut received).await.expect("body payload");
         assert_eq!(received, bytes);
 
-        // A one-byte wire buffer forces the signed Complete control frame to
+        // A one-byte wire buffer forces the Complete control frame to
         // yield before it has been written. While that receipt is blocked, an
         // eager consumer must not observe EOF and drop/abort the reader task.
         let (write_stream, read_stream) = tokio::io::duplex(1);
         let writer = SessionWriterHandle::spawn(
-            SessionFrameWriter::new(
-                write_stream,
-                data_dir,
-                session_id.clone(),
-                SessionFrameDirection::ResponderToInitiator,
-                NetworkCallPolicy::default(),
-            )
-            .expect("completion writer"),
+            SessionFrameWriter::new(write_stream, data_dir, NetworkCallPolicy::default())
+                .expect("completion writer"),
         );
-        let mut reader = SessionFrameReader::new(
-            read_stream,
-            session_id,
-            SessionFrameDirection::ResponderToInitiator,
-            public_key,
-            NetworkCallPolicy::default(),
-        );
+        let mut reader = SessionFrameReader::new(read_stream, NetworkCallPolicy::default());
         let completion = tokio::spawn(acknowledge_incoming_completion(
             writer,
             Some(sender.clone()),
             receipt.clone(),
-            None,
             false,
         ));
         let mut eof_probe = [0_u8; 1];
@@ -4664,7 +4275,6 @@ mod body_tests {
     async fn incoming_body_lazily_spills_after_the_bounded_channel_fills() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-body-spill");
         let bytes = b"abcdef".to_vec();
-        let digest = TransferDigest::blake3(&bytes);
         let (sender, body) = ObjectRpcIncomingBody::channel(
             Some(bytes.len() as u64),
             ObjectRpcSessionBodyRole::Attachment,
@@ -4691,7 +4301,7 @@ mod body_tests {
         staging.append(spill).await.expect("append spilled suffix");
         sender.advance_available(6).expect("publish spilled suffix");
         sender
-            .complete(bytes.len() as u64, digest, true, None)
+            .complete(bytes.len() as u64, true)
             .expect("complete spilled body");
         drop(sender);
         drop(staging);
@@ -4922,7 +4532,7 @@ mod body_tests {
     }
 
     #[tokio::test]
-    async fn signed_inner_body_contract_is_checked_without_prebuffering() {
+    async fn signed_inner_body_contract_checks_shape_without_prebuffering() {
         let client_root = sinomo_testdir::TestDir::new("sinomo-session-inner-contract-client");
         let spool_root = sinomo_testdir::TestDir::new("sinomo-session-inner-contract-spool");
         let client_data_dir = SinomoDataDir::new(client_root.path());
@@ -4960,18 +4570,16 @@ mod body_tests {
             .await
             .expect("append tampered bytes");
         sender.advance_available(4).expect("publish bytes");
-        sender
-            .complete(4, TransferDigest::blake3(b"evil"), true, None)
-            .expect_err("signed digest must reject tampered bytes");
+        sender.complete(4, true).expect("complete trusted body");
         drop(sender);
         drop(staging);
 
-        let error = bound
+        let actual = bound
             .body
             .collect_to_vec(16)
             .await
-            .expect_err("signed inner digest must reject tampered relay bytes at EOF");
-        assert!(error.to_string().contains("authorization"));
+            .expect("trusted transport bytes are not rehashed");
+        assert_eq!(actual, b"evil");
     }
 
     #[tokio::test]
@@ -5014,12 +4622,12 @@ mod body_tests {
         let truncation = truncated
             .read_u8()
             .await
-            .expect_err("unverified sender drop must not become clean EOF");
+            .expect_err("sender drop before completion must not become clean EOF");
         assert_eq!(truncation.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(
             truncation
                 .to_string()
-                .contains("before verified completion")
+                .contains("before declared completion")
         );
     }
 
@@ -5052,7 +4660,7 @@ mod body_tests {
                 sender.send(chunk.to_vec()).await.expect("deliver chunk");
             }
             sender
-                .finish_verified(delivered.len() as u64, *blake3::hash(&delivered).as_bytes())
+                .finish(delivered.len() as u64)
                 .await
                 .expect("finish trusted channel body");
         });
@@ -5064,53 +4672,6 @@ mod body_tests {
             .expect("collect trusted channel attachment");
         delivery.await.expect("delivery task");
         assert_eq!(actual, payload);
-    }
-
-    #[tokio::test]
-    async fn authenticated_channel_rejects_origin_signed_digest_substitution() {
-        let origin_root =
-            sinomo_testdir::TestDir::new("sinomo-session-channel-signed-digest-origin");
-        let origin_data_dir = SinomoDataDir::new(origin_root.path());
-        let signed_payload = vec![0x31_u8; 96 * 1024 + 19];
-        let substituted_payload = vec![0x32_u8; signed_payload.len()];
-        let signed_inner = signed_attachment_request(
-            &origin_data_dir,
-            "/test/session/channel-signed-digest",
-            &signed_payload,
-        );
-        let outer = crate::ObjectRpcRequest::encode_body(
-            crate::CLUSTER_RELAY_ROUTE,
-            "test",
-            &"outer relay",
-        )
-        .expect("outer request");
-        let (mut sender, body) =
-            ObjectRpcIncomingBody::multiplexed_channel(Some(substituted_payload.len() as u64));
-        let bound = ObjectRpcSessionRequest::new(outer, body)
-            .bind_signed_inner_request_on_authenticated_channel(signed_inner)
-            .await
-            .expect("bind signed digest contract");
-        let delivered = substituted_payload.clone();
-        let delivery = tokio::spawn(async move {
-            for chunk in delivered.chunks(crate::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) {
-                sender.send(chunk.to_vec()).await.expect("deliver chunk");
-            }
-            sender
-                .finish_verified(delivered.len() as u64, *blake3::hash(&delivered).as_bytes())
-                .await
-        });
-
-        let read_error = bound
-            .body
-            .collect_to_vec(2 * substituted_payload.len())
-            .await
-            .expect_err("substituted attachment must fail at EOF");
-        let finish_error = delivery
-            .await
-            .expect("delivery task")
-            .expect_err("signed digest must reject substituted bytes");
-        assert!(matches!(finish_error, NetworkError::AuthDenied));
-        assert!(read_error.to_string().contains("authorization"));
     }
 
     #[tokio::test]
@@ -5154,16 +4715,6 @@ mod body_tests {
         let prepared = receiver_bridge_call(inner)
             .prepare_for_signing()
             .expect("prepare value origin request");
-        let binding = request_body_finish_binding(&prepared.request, &prepared.descriptor)
-            .expect("origin body binding");
-        let digest = TransferDigest::blake3(&payload);
-        let proof = SessionFrameSigner::from_data_dir(&origin_data_dir)
-            .expect("origin proof signer")
-            .sign_body_finish(BodyFinishProofInput {
-                binding,
-                total_bytes: payload.len() as u64,
-                digest,
-            });
         let mut signed_inner = prepared.request;
         signed_inner.auth = Some(
             sign_daemon_rpc_request_from_data_dir(&origin_data_dir, &signed_inner)
@@ -5183,8 +4734,8 @@ mod body_tests {
             IncomingDirectDelivery::Delivered
         ));
         sender
-            .complete(payload.len() as u64, digest, false, Some(proof))
-            .expect("complete origin-authenticated body");
+            .complete(payload.len() as u64, false)
+            .expect("complete trusted body");
         drop(sender);
         let bound = ObjectRpcSessionRequest::new(outer, body)
             .bind_signed_inner_request(signed_inner)
@@ -5196,198 +4747,7 @@ mod body_tests {
     }
 
     #[tokio::test]
-    async fn relay_finish_proof_rejects_same_length_body_substitution() {
-        let origin_root = sinomo_testdir::TestDir::new("sinomo-session-relay-proof-origin");
-        let origin_data_dir = SinomoDataDir::new(origin_root.path());
-        let inner =
-            crate::ObjectRpcRequest::encode_body("/test/session/relay-proof", "test", &"head")
-                .expect("inner request");
-        let prepared = ObjectRpcSessionCall::new(
-            inner,
-            ObjectRpcBodySource::from_reader(Cursor::new(b"good".to_vec()), Some(4)),
-        )
-        .prepare_for_signing()
-        .expect("prepare origin request");
-        let binding = request_body_finish_binding(&prepared.request, &prepared.descriptor)
-            .expect("origin body binding");
-        let good_digest = TransferDigest::blake3(b"good");
-        let proof = SessionFrameSigner::from_data_dir(&origin_data_dir)
-            .expect("origin proof signer")
-            .sign_body_finish(BodyFinishProofInput {
-                binding,
-                total_bytes: 4,
-                digest: good_digest,
-            });
-        let mut signed_inner = prepared.request;
-        signed_inner.auth = Some(
-            sign_daemon_rpc_request_from_data_dir(&origin_data_dir, &signed_inner)
-                .expect("sign inner request"),
-        );
-        let outer =
-            crate::ObjectRpcRequest::encode_body(crate::CLUSTER_RELAY_ROUTE, "test", &"outer")
-                .expect("outer request");
-        let (sender, body) =
-            ObjectRpcIncomingBody::channel(Some(4), ObjectRpcSessionBodyRole::Attachment);
-        let bound = ObjectRpcSessionRequest::new(outer, body)
-            .bind_signed_inner_request(signed_inner)
-            .await
-            .expect("bind origin proof contract");
-        assert!(matches!(
-            sender.try_deliver(b"evil".to_vec()),
-            IncomingDirectDelivery::Delivered
-        ));
-        let error = sender
-            .complete(4, TransferDigest::blake3(b"evil"), false, Some(proof))
-            .expect_err("same-length relay substitution must fail origin proof");
-        assert!(matches!(error, NetworkError::AuthDenied));
-        drop(sender);
-        assert!(
-            bound.body.collect_to_vec(16).await.is_err(),
-            "the application reader must observe the rejected finish proof"
-        );
-    }
-
-    #[tokio::test]
-    async fn relay_body_source_preserves_the_origin_finish_proof() {
-        let origin_root = sinomo_testdir::TestDir::new("sinomo-session-forward-proof-origin");
-        let relay_root = sinomo_testdir::TestDir::new("sinomo-session-forward-proof-relay");
-        let origin_data_dir = SinomoDataDir::new(origin_root.path());
-        let relay_data_dir = SinomoDataDir::new(relay_root.path());
-        let inner =
-            crate::ObjectRpcRequest::encode_body("/test/session/forward-proof", "test", &"head")
-                .expect("inner request");
-        let prepared = ObjectRpcSessionCall::new(
-            inner,
-            ObjectRpcBodySource::from_reader(Cursor::new(b"body".to_vec()), Some(4)),
-        )
-        .prepare_for_signing()
-        .expect("prepare origin request");
-        let binding = request_body_finish_binding(&prepared.request, &prepared.descriptor)
-            .expect("origin body binding");
-        let digest = TransferDigest::blake3(b"body");
-        let origin_proof = SessionFrameSigner::from_data_dir(&origin_data_dir)
-            .expect("origin proof signer")
-            .sign_body_finish(BodyFinishProofInput {
-                binding,
-                total_bytes: 4,
-                digest,
-            });
-        let mut signed_inner = prepared.request;
-        signed_inner.auth = Some(
-            sign_daemon_rpc_request_from_data_dir(&origin_data_dir, &signed_inner)
-                .expect("sign inner request"),
-        );
-        let outer =
-            crate::ObjectRpcRequest::encode_body(crate::CLUSTER_RELAY_ROUTE, "test", &"outer")
-                .expect("outer request");
-        let (sender, body) =
-            ObjectRpcIncomingBody::channel(Some(4), ObjectRpcSessionBodyRole::Attachment);
-        let bound = ObjectRpcSessionRequest::new(outer, body)
-            .bind_signed_inner_request(signed_inner)
-            .await
-            .expect("bind origin proof contract");
-        assert!(matches!(
-            sender.try_deliver(b"body".to_vec()),
-            IncomingDirectDelivery::Delivered
-        ));
-        sender
-            .complete(4, digest, false, Some(origin_proof.clone()))
-            .expect("complete authenticated origin body");
-        drop(sender);
-
-        let source = ObjectRpcBodySource::from_incoming_body(bound.body);
-        let (stream, _peer) = tokio::io::duplex(4096);
-        let relay_writer = SessionWriterHandle::spawn(
-            SessionFrameWriter::new(
-                stream,
-                relay_data_dir,
-                TransferId::generate(),
-                SessionFrameDirection::InitiatorToResponder,
-                NetworkCallPolicy::default(),
-            )
-            .expect("relay writer"),
-        );
-        let forwarded = source
-            .finish_proof(&relay_writer, 4, digest)
-            .await
-            .expect("forward origin proof");
-        assert_eq!(forwarded, origin_proof);
-    }
-
-    #[tokio::test]
-    async fn response_finish_proof_rejects_wrong_target_and_head_binding() {
-        let target_root = sinomo_testdir::TestDir::new("sinomo-session-response-proof-target");
-        let attacker_root = sinomo_testdir::TestDir::new("sinomo-session-response-proof-attacker");
-        let target_data_dir = SinomoDataDir::new(target_root.path());
-        let attacker_data_dir = SinomoDataDir::new(attacker_root.path());
-        let session_id = TransferId::generate();
-        let response =
-            crate::ObjectRpcResponse::encode_body("/test/session/response-proof", &"response-head")
-                .expect("response head");
-        let binding =
-            response_body_finish_binding(&session_id, &response).expect("response binding");
-        let digest = TransferDigest::blake3(b"body");
-        let target_proof = SessionFrameSigner::from_data_dir(&target_data_dir)
-            .expect("target proof signer")
-            .sign_body_finish(BodyFinishProofInput {
-                binding: binding.clone(),
-                total_bytes: 4,
-                digest,
-            });
-        let attacker_proof = SessionFrameSigner::from_data_dir(&attacker_data_dir)
-            .expect("attacker proof signer")
-            .sign_body_finish(BodyFinishProofInput {
-                binding: binding.clone(),
-                total_bytes: 4,
-                digest,
-            });
-
-        let (wrong_signer_sender, mut wrong_signer_body) =
-            ObjectRpcIncomingBody::channel(Some(4), ObjectRpcSessionBodyRole::Attachment);
-        wrong_signer_body
-            .require_finish_proof(BodyFinishProofExpectation {
-                binding: binding.clone(),
-                signer_node_id: None,
-                public_key: proof_public_key(&target_data_dir),
-            })
-            .expect("target response expectation");
-        assert!(matches!(
-            wrong_signer_sender.try_deliver(b"body".to_vec()),
-            IncomingDirectDelivery::Delivered
-        ));
-        assert!(matches!(
-            wrong_signer_sender.complete(4, digest, false, Some(attacker_proof)),
-            Err(NetworkError::AuthDenied)
-        ));
-        drop(wrong_signer_sender);
-        drop(wrong_signer_body);
-
-        let changed_response =
-            crate::ObjectRpcResponse::encode_body("/test/session/response-proof", &"changed-head")
-                .expect("changed response head");
-        let wrong_binding = response_body_finish_binding(&session_id, &changed_response)
-            .expect("changed response binding");
-        let (wrong_head_sender, mut wrong_head_body) =
-            ObjectRpcIncomingBody::channel(Some(4), ObjectRpcSessionBodyRole::Attachment);
-        wrong_head_body
-            .require_finish_proof(BodyFinishProofExpectation {
-                binding: wrong_binding,
-                signer_node_id: None,
-                public_key: proof_public_key(&target_data_dir),
-            })
-            .expect("changed response expectation");
-        assert!(matches!(
-            wrong_head_sender.try_deliver(b"body".to_vec()),
-            IncomingDirectDelivery::Delivered
-        ));
-        assert!(matches!(
-            wrong_head_sender.complete(4, digest, false, Some(target_proof)),
-            Err(NetworkError::AuthDenied)
-        ));
-    }
-
-    #[tokio::test]
-    async fn empty_response_head_proof_survives_relay_and_rejects_tamper() {
+    async fn response_identity_proof_survives_relay_without_attesting_content() {
         let target_root = sinomo_testdir::TestDir::new("sinomo-session-head-proof-target");
         let relay_root = sinomo_testdir::TestDir::new("sinomo-session-head-proof-relay");
         let target_data_dir = SinomoDataDir::new(target_root.path());
@@ -5401,47 +4761,35 @@ mod body_tests {
         );
         let (target_stream, _target_peer) = tokio::io::duplex(4096);
         let target_writer = Arc::new(tokio::sync::Mutex::new(
-            SessionFrameWriter::new(
-                target_stream,
-                target_data_dir,
-                logical_session_id.clone(),
-                SessionFrameDirection::ResponderToInitiator,
-                NetworkCallPolicy::default(),
-            )
-            .expect("target writer"),
+            SessionFrameWriter::new(target_stream, target_data_dir, NetworkCallPolicy::default())
+                .expect("target writer"),
         ));
-        ensure_response_head_proof(&target_writer, &logical_session_id, &mut response)
+        ensure_response_identity_proof(&target_writer, &logical_session_id, &mut response)
             .await
-            .expect("target response proof");
-        assert!(response_head_origin_is_verified(
+            .expect("target identity proof");
+        assert!(response_origin_is_verified(
             &response,
             &target_public_key,
             &logical_session_id,
         ));
         let original_attestation = response
             .metadata
-            .get(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+            .get(OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY)
             .cloned()
             .expect("response attestation");
 
         let (relay_stream, _relay_peer) = tokio::io::duplex(4096);
         let relay_writer = Arc::new(tokio::sync::Mutex::new(
-            SessionFrameWriter::new(
-                relay_stream,
-                relay_data_dir,
-                TransferId::generate(),
-                SessionFrameDirection::ResponderToInitiator,
-                NetworkCallPolicy::default(),
-            )
-            .expect("relay writer"),
+            SessionFrameWriter::new(relay_stream, relay_data_dir, NetworkCallPolicy::default())
+                .expect("relay writer"),
         ));
-        ensure_response_head_proof(&relay_writer, &TransferId::generate(), &mut response)
+        ensure_response_identity_proof(&relay_writer, &TransferId::generate(), &mut response)
             .await
-            .expect("relay preserves target proof");
+            .expect("relay preserves target identity proof");
         assert_eq!(
             response
                 .metadata
-                .get(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY),
+                .get(OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY),
             Some(&original_attestation),
             "a relay must not replace the target attestation with its hop proof"
         );
@@ -5449,17 +4797,17 @@ mod body_tests {
         let mut tampered = response.clone();
         tampered.body = b"other-sizehead".to_vec();
         assert_eq!(tampered.body.len(), response.body.len());
-        assert!(!response_head_origin_is_verified(
+        assert!(response_origin_is_verified(
             &tampered,
             &target_public_key,
             &logical_session_id,
         ));
-        assert!(!response_head_origin_is_verified(
+        assert!(!response_origin_is_verified(
             &response,
             &relay_public_key,
             &logical_session_id,
         ));
-        assert!(!response_head_origin_is_verified(
+        assert!(!response_origin_is_verified(
             &response,
             &target_public_key,
             &TransferId::generate(),
@@ -5614,8 +4962,8 @@ mod body_tests {
 
     /// Opt-in in-memory latency probe for the complete canonical small-value
     /// session. It includes descriptor preparation, request authentication,
-    /// signed frame encoding/verification, task scheduling, and response-head
-    /// attestation, but deliberately excludes TCP and routing. There is no
+    /// plain frame encoding, task scheduling, and response identity
+    /// authentication, but deliberately excludes TCP and routing. There is no
     /// timing assertion because CI hosts are not stable benchmark systems.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "diagnostic microbenchmark; run explicitly with --ignored --nocapture"]
@@ -5953,7 +5301,7 @@ mod body_tests {
             result
                 .response
                 .metadata
-                .contains_key(OBJECT_RPC_RESPONSE_HEAD_PROOF_METADATA_KEY)
+                .contains_key(OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY)
         );
         let forwarded = ObjectRpcSessionResponse::new(
             result.response,
@@ -6365,20 +5713,11 @@ mod body_tests {
     async fn writer_scheduler_flushes_latest_ack_before_completion() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-writer-ack-order");
         let data_dir = SinomoDataDir::new(root.path());
-        let public_key = proof_public_key(&data_dir);
-        let session_id = TransferId::generate();
         let transfer_id = TransferId::generate();
-        let digest = TransferDigest::blake3(b"complete");
         let (wire_writer, wire_reader) = tokio::io::duplex(4096);
         let writer = SessionWriterHandle::spawn(
-            SessionFrameWriter::new(
-                wire_writer,
-                data_dir,
-                session_id.clone(),
-                SessionFrameDirection::ResponderToInitiator,
-                NetworkCallPolicy::default(),
-            )
-            .expect("session writer"),
+            SessionFrameWriter::new(wire_writer, data_dir, NetworkCallPolicy::default())
+                .expect("session writer"),
         );
         for received_contiguous_offset in [1_u64, 2, 3] {
             writer
@@ -6394,19 +5733,12 @@ mod body_tests {
                 TransferReceipt {
                     transfer_id: transfer_id.clone(),
                     completed_bytes: 3,
-                    digest,
                 },
             )))
             .await
             .expect("queue completion");
 
-        let mut reader = SessionFrameReader::new(
-            wire_reader,
-            session_id,
-            SessionFrameDirection::ResponderToInitiator,
-            public_key,
-            NetworkCallPolicy::default(),
-        );
+        let mut reader = SessionFrameReader::new(wire_reader, NetworkCallPolicy::default());
         assert!(matches!(
             reader.receive().await.expect("latest acknowledgement"),
             SessionInboundFrame::Payload(SessionWirePayload::Transfer(TransferControl::Ack(
@@ -6431,31 +5763,21 @@ mod body_tests {
     async fn outgoing_body_pipelines_multiple_frames_before_the_first_ack() {
         let root = sinomo_testdir::TestDir::new("sinomo-session-pipelined-window");
         let data_dir = SinomoDataDir::new(root.path());
-        let public_key = proof_public_key(&data_dir);
-        let session_id = TransferId::generate();
         let transfer_id = TransferId::generate();
         let frame_bytes = u64::from(crate::transfer::DEFAULT_TRANSFER_FRAME_BYTES);
         let body = vec![0x4a_u8; usize::try_from(frame_bytes * 3).expect("test body size")];
-        let digest = TransferDigest::blake3(&body);
         let open = TransferOpen {
             transfer_id: transfer_id.clone(),
             route: "/test/session/pipelined-window".to_string(),
             operation_id: Some("pipeline-test".to_string()),
             total_bytes: Some(frame_bytes * 3),
-            expected_digest: Some(digest),
             replayable: true,
             requested_window: TransferFlowWindow::default(),
         };
         let (wire_writer, wire_reader) = tokio::io::duplex(4 * 1024 * 1024);
         let writer = SessionWriterHandle::spawn(
-            SessionFrameWriter::new(
-                wire_writer,
-                data_dir,
-                session_id.clone(),
-                SessionFrameDirection::InitiatorToResponder,
-                NetworkCallPolicy::default(),
-            )
-            .expect("session writer"),
+            SessionFrameWriter::new(wire_writer, data_dir, NetworkCallPolicy::default())
+                .expect("session writer"),
         );
         let (feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(16);
         feedback_tx
@@ -6465,28 +5787,16 @@ mod body_tests {
             }))
             .await
             .expect("open acknowledgement");
-        let mut source = ObjectRpcBodySource::bytes(body);
-        source
-            .ensure_local_finish_binding(BodyFinishProofBinding {
-                session_id: session_id.clone(),
-                direction: SessionFrameDirection::InitiatorToResponder,
-                head_digest: TransferDigest::blake3(b"pipeline-test-head"),
-            })
-            .expect("finish proof binding");
+        let source = ObjectRpcBodySource::bytes(body);
         let send_task = tokio::spawn(pump_outgoing_body(
             writer.clone(),
             source,
             open.clone(),
             feedback_rx,
             NetworkCallPolicy::default(),
+            NetworkPathEstimator::new(),
         ));
-        let mut reader = SessionFrameReader::new(
-            wire_reader,
-            session_id,
-            SessionFrameDirection::InitiatorToResponder,
-            public_key,
-            NetworkCallPolicy::default(),
-        );
+        let mut reader = SessionFrameReader::new(wire_reader, NetworkCallPolicy::default());
         assert!(matches!(
             reader.receive().await.expect("Open"),
             SessionInboundFrame::Payload(SessionWirePayload::Transfer(TransferControl::Open(
@@ -6518,14 +5828,13 @@ mod body_tests {
         ));
         assert!(matches!(
             reader.receive().await.expect("Finish"),
-            SessionInboundFrame::Payload(SessionWirePayload::FinishAttestation { finish, .. })
-                if finish.total_bytes == frame_bytes * 3 && finish.digest == digest
+            SessionInboundFrame::Payload(SessionWirePayload::Finish(finish))
+                if finish.total_bytes == frame_bytes * 3
         ));
         feedback_tx
             .send(TransferControl::Complete(TransferReceipt {
                 transfer_id,
                 completed_bytes: frame_bytes * 3,
-                digest,
             }))
             .await
             .expect("completion receipt");
@@ -6536,55 +5845,57 @@ mod body_tests {
     }
 
     #[tokio::test]
-    async fn authenticated_data_frame_rejects_payload_tampering() {
-        let root = sinomo_testdir::TestDir::new("sinomo-session-tampered-payload");
+    async fn session_transport_does_not_hash_data_frame_payloads() {
+        let root = sinomo_testdir::TestDir::new("sinomo-session-trusted-payload");
         let data_dir = SinomoDataDir::new(root.path());
-        let public_key = proof_public_key(&data_dir);
-        let session_id = TransferId::generate();
         let transfer_id = TransferId::generate();
         let valid = TransferDataFrame::new(transfer_id, 0, b"good", TransferFlowWindow::default())
             .expect("valid frame");
-        let corrupt = TransferDataFrame {
+        let trusted = TransferDataFrame {
             header: valid.header,
             payload: b"evil",
         };
         let (sender, receiver) = tokio::io::duplex(4096);
-        let mut writer = SessionFrameWriter::new(
-            sender,
-            data_dir,
-            session_id.clone(),
-            SessionFrameDirection::InitiatorToResponder,
-            NetworkCallPolicy::default(),
-        )
-        .expect("session writer");
-        let send = tokio::spawn(async move { writer.send_data(corrupt).await });
-        let mut reader = SessionFrameReader::new(
-            receiver,
-            session_id,
-            SessionFrameDirection::InitiatorToResponder,
-            public_key,
-            NetworkCallPolicy::default(),
-        );
-        let error = reader
-            .receive()
-            .await
-            .expect_err("tampered payload must fail");
-        assert!(error.to_string().contains("digest mismatch"));
+        let mut writer = SessionFrameWriter::new(sender, data_dir, NetworkCallPolicy::default())
+            .expect("session writer");
+        let send = tokio::spawn(async move { writer.send_data(trusted).await });
+        let mut reader = SessionFrameReader::new(receiver, NetworkCallPolicy::default());
+        let received = reader.receive().await.expect("trusted transport payload");
+        assert!(matches!(
+            received,
+            SessionInboundFrame::Data { payload, .. } if payload == b"evil"
+        ));
         send.await
             .expect("sender task")
-            .expect("send corrupt bytes");
+            .expect("send trusted bytes");
+    }
+
+    #[test]
+    fn transfer_tuning_uses_bdp_for_window_chunk_and_credit_batching() {
+        let estimator = NetworkPathEstimator::new();
+        let initial = transfer_path_tuning(&estimator);
+        assert_eq!(initial.flow_window.max_in_flight_bytes, 16 * 1024 * 1024);
+        assert_eq!(initial.flow_window.max_frame_bytes, 1024 * 1024);
+        assert_eq!(initial.credit_update_bytes, 8 * 1024 * 1024);
+
+        estimator.record_round_trip_time(std::time::Duration::from_millis(1));
+        estimator.record_bandwidth_bytes_per_second(50 * 1024 * 1024 * 1024);
+        let measured = transfer_path_tuning(&estimator);
+        assert_eq!(measured.flow_window.max_in_flight_bytes, 64 * 1024 * 1024);
+        assert_eq!(measured.flow_window.max_frame_bytes, 4 * 1024 * 1024);
+        assert_eq!(measured.credit_update_bytes, 16 * 1024 * 1024);
+
+        let mut schedule = TransferCreditUpdateSchedule::new(initial);
+        assert!(!schedule.due(7 * 1024 * 1024));
+        assert!(schedule.due(8 * 1024 * 1024));
+        schedule.mark(8 * 1024 * 1024);
+        assert!(!schedule.due(12 * 1024 * 1024));
     }
 
     #[tokio::test(start_paused = true)]
     async fn session_reader_no_progress_is_a_typed_idle_timeout() {
         let (_sender, receiver) = tokio::io::duplex(64);
-        let mut reader = SessionFrameReader::new(
-            receiver,
-            TransferId::generate(),
-            SessionFrameDirection::InitiatorToResponder,
-            vec![0_u8; 32],
-            NetworkCallPolicy::default(),
-        );
+        let mut reader = SessionFrameReader::new(receiver, NetworkCallPolicy::default());
         let error = reader
             .receive()
             .await
@@ -6603,13 +5914,7 @@ mod body_tests {
         let (_sender, receiver) = tokio::io::duplex(64);
         let policy = NetworkCallPolicy::default()
             .with_overall_timeout(std::time::Duration::from_millis(100));
-        let mut reader = SessionFrameReader::new(
-            receiver,
-            TransferId::generate(),
-            SessionFrameDirection::InitiatorToResponder,
-            vec![0_u8; 32],
-            policy,
-        );
+        let mut reader = SessionFrameReader::new(receiver, policy);
         let error = reader
             .receive()
             .await

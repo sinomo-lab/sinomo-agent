@@ -35,25 +35,44 @@ payload size. The network incrementally carries each encoded value over the
 underlying duplex stream; object encoding, framing, flow control, retries, and
 transfer state remain inside the network boundary.
 
-Transfer frames, chunks, flow-control windows, and in-memory queues may have
-fixed implementation sizes. Those sizes control incremental I/O and resource
-use; they are not aggregate message limits and are not visible as protocol
-choices. The network does not select a different API or wire protocol when a
-value crosses a byte threshold, and it has no payload-size enablement toggle.
-Object-frame heads use one `SOF2` prefix with an unsigned 64-bit length for
-every frame; there is no compact form, extended-length sentinel, or legacy
-prefix negotiation.
+Transfer chunk size and receive credit are independent negotiated values. A
+canonical bulk session negotiates 1--4 MiB chunks and starts with 16--64 MiB of
+receive credit. The starting credit is twice the measured bandwidth-delay
+product (BDP), clamped to that range; a path without enough observations starts
+at 16 MiB. These sizes control incremental I/O and resource use; they are not
+aggregate message limits and are not visible as protocol choices. The network
+does not select a different API or wire protocol when a value crosses a byte
+threshold, and it has no payload-size enablement toggle. Object-frame heads use
+one `SOF2` prefix with an unsigned 64-bit length for every frame; there is no
+compact form, extended-length sentinel, or legacy prefix negotiation.
+
+`sinomo-network` exposes a transport-neutral path estimator for reuse by other
+crates. Callers supply RTT samples and delivered-byte intervals, keyed by a
+stable path identity, and consume the smoothed RTT, delivery bandwidth, BDP,
+or a resource-bounded recommended window. Object RPC samples handshake RTT and
+cumulative transfer delivery through this same interface. Its process-shared
+registry is bounded; object RPC currently keys observations and receive-credit
+accounting by the authenticated immediate peer.
+
+Receivers return cumulative credit after 8--16 MiB of progress, or when the
+1--10 ms path-derived progress timer becomes due, rather than acknowledging
+every chunk. Completion always flushes the final progress. Active receive
+credit is bounded to 64 MiB per transfer and 256 MiB in aggregate per immediate
+peer. Credit is an admission bound, not a preallocated buffer: the existing
+bounded reader queue and spill path continue to control resident body memory.
+The pooled channel remains the small-message latency path; bulk and
+unknown-length attachments enter the canonical BDP-tuned session.
 
 Files, readers, generated data, and typed encoded values all use the same
 session machinery and are framed incrementally in both directions. Domain
-protocols may attach operation identities and expected content digests, but do
-not define transport chunk sizes, per-chunk RPC routes, or separate small- and
-large-message calls.
+protocols may attach operation identities or domain-specific content
+identifiers, but do not define transport chunk sizes, per-chunk RPC routes, or
+separate small- and large-message calls.
 
-Verified body frames first move through a bounded in-memory reader channel. If
+Ordered body frames first move through a bounded in-memory reader channel. If
 the application falls behind, the session lazily spills only the remaining
 suffix to a temporary file; a reader that deliberately drops a request body
-switches the session to verified discard so transport acknowledgements and an
+switches the session to bounded discard so transport acknowledgements and an
 early response can still complete. Normal completion and cancellation remove
 spill files. Crash-orphan collection is not treated as transfer resume state
 and must use process-ownership proof rather than deleting files by age.
@@ -103,30 +122,27 @@ A routed packet carries:
 
 - source and target node identity;
 - a hop limit and visited-node history;
-- the authenticated protocol payload;
+- an authenticated caller identity and request context;
+- the protocol payload;
 - a cap for one downstream hop attempt.
 
 Within one relay attempt, forwarding preserves the origin-signed inner head and
-session descriptor. Each hop separately authenticates its immediate peer's
-frame transcript, while the final target authenticates the original request.
-A relay cannot alter the signed inner route, metadata, or body descriptor
-without invalidating the original request signature. Intermediate hops create
-fresh outer relay sessions and body-transfer descriptors.
+session descriptor. The final target authenticates the original caller, while
+each transport session authenticates the peer identity used for that route.
+Intermediate hops create fresh outer relay sessions and body-transfer
+descriptors.
 
-Every response head carries an Ed25519 attestation binding its normalized head
-digest to the logical origin session. Direct responses must verify against the
-expected target key. Relays preserve that target attestation unchanged for a
-delivered response; relay-generated routing feedback remains hop-authenticated
-and is classified before it can be treated as target delivery. This covers
-empty responses as well as responses with an attachment.
+Every response carries an Ed25519 identity proof bound to the logical origin
+session. Direct responses verify it against the expected target key. Relays
+preserve that proof unchanged for a delivered response; relay-generated routing
+feedback is classified before it can be treated as target delivery. The proof
+answers who produced the response, not whether the response bytes were altered.
 
-Every non-empty body ends with an origin-authenticated Ed25519 finish
-attestation binding the original session ID, request or response head digest,
-direction, final byte count, and content digest. Relays may re-frame bytes for
-each transport hop, but they forward this attestation unchanged. Request bodies
-are therefore bound to the authenticated caller, and relayed response bodies
-are bound to the expected target key; same-length substitution or a modified
-head fails before the receiver acknowledges completion.
+Body framing enforces only protocol shape: transfer identity, ordered offsets,
+declared lengths, flow-control windows, and completion byte counts. It does not
+hash, sign, checksum, encrypt, or otherwise attest body bytes. Relays may
+re-frame trusted bytes for each transport hop without retaining end-to-end
+content proofs.
 
 Retries may race, and transport behavior may duplicate delivery. Generic object
 RPC does not provide a universal response replay cache. Exact authentication
@@ -186,14 +202,13 @@ five-second health timeout. A progressing call may therefore run for an
 unbounded wall-clock duration. Callers that require strict end-to-end expiry
 provide an explicit operation deadline.
 
-Canonical calls use hop-authenticated progress frames plus an end-to-end origin
-finish attestation and the canonical health policy for every non-empty value,
-regardless of aggregate size.
+Canonical calls use framed progress and the canonical health policy for every
+non-empty value, regardless of aggregate size.
 
 Route discovery remains finite through its attempt count, hop limit, and
 per-attempt health limits. Relay envelopes carry a maximum per-hop timeout, not
-an implicit absolute end-to-end expiry. Validated progress includes advancing
-body offsets, cumulative acknowledgements, or authenticated control progress;
+an implicit absolute end-to-end expiry. Progress includes advancing body
+offsets, cumulative acknowledgements, or control progress;
 merely waiting longer does not extend an explicit operation deadline.
 
 Replayable byte and file sources can retry on a fresh connection; the current
@@ -244,12 +259,20 @@ the Iroh SDK.
 
 ## Security
 
-Object RPC routing and request authentication are separate from transport
-security. Built-in LAN TCP uses plain framing and relies on signed daemon
-requests for identity, integrity, freshness, and nonce replay protection; it
-does not provide channel confidentiality. Secure transports may additionally
-authenticate and encrypt the channel. The target service still applies its own
-domain authorization.
+`sinomo-network` assumes every selected transport medium is fully trusted. It
+does not provide confidentiality or defend against transport-layer attacks, and
+it does not add payload checksums, content digests, per-frame signatures, finish
+attestations, or encryption. Built-in LAN TCP accepts the transport's own error
+detection and delivers its payload as received. A transport module may have its
+own implementation properties, but object RPC neither requires nor duplicates
+them.
+
+Identity authentication remains in scope. Signed daemon requests establish the
+caller identity and request context, retain freshness and nonce replay checks,
+and response identity proofs establish which target answered the logical
+session. These proofs are authentication contracts, not content-integrity or
+channel-security guarantees. The target service still applies its own domain
+authorization.
 
 Relays see only the authority required to forward a packet. They cannot convert
 reachability into membership or impersonate the original requester. Local
@@ -262,13 +285,15 @@ loopback control uses the same authentication boundary for sensitive commands.
 2. Frame, chunk, window, and buffer sizes are never aggregate message limits.
    Canonical requests and responses have no payload-size threshold or
    enablement toggle and retain the same interface at every size.
+   Chunk size is negotiated independently from receive credit, while measured
+   BDP may tune both within their bounded ranges.
 3. Network and KV have no production dependency on one another;
    `sinomo-cluster` is their only R0 bridge.
 4. Directory membership and connectivity are inputs to routing, not outputs of
    successful delivery.
-5. A relay cannot modify the signed inner route or substitute request/response
-   body bytes: the original head and final content digest are authenticated end
-   to end, while target-node forwarding is authorized hop by hop.
+5. Caller and response-target identities are authenticated, while payload bytes
+   are trusted to the selected transport and are not authenticated, checksummed,
+   or encrypted by `sinomo-network`.
 6. Origin calls have no implicit whole-call deadline; explicit operation
    deadlines are distinct from per-connect and per-progress health limits.
 7. Side-effecting routes that permit retry must provide operation-level

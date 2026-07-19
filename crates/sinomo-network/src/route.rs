@@ -39,6 +39,21 @@ pub(crate) fn network_perf_trace_elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn object_rpc_call_is_channel_compatible(call: &ObjectRpcSessionCall) -> bool {
+    if call.body.has_value_intent() {
+        return call.request.body.len() <= OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES;
+    }
+    if call.body.is_empty() {
+        return true;
+    }
+    // The pooled channel remains the bounded latency path. Bulk or unknown-size
+    // attachments use the canonical session, whose independently negotiated
+    // chunks and BDP-sized receive window can fill a high-bandwidth path.
+    call.body.total_bytes().is_some_and(|bytes| {
+        bytes <= u64::try_from(OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES).unwrap_or(u64::MAX)
+    })
+}
+
 fn record_route_timeline_stage(
     trace: Option<crate::NetworkTimelineTraceContext>,
     stage: u16,
@@ -2538,11 +2553,7 @@ where
         let perf_route = perf_enabled.then(|| call.request.route.clone());
         let policy = options.session_call_policy();
         let deadline = ClusterEndpointRpcDeadline::new(policy.overall_timeout);
-        // Values above the channel's bounded materialization ceiling retain
-        // the canonical streaming session. Attachments are size independent
-        // and remain eligible for the multiplexed path.
-        let channel_compatible = !(call.body.has_value_intent()
-            && call.request.body.len() > OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES);
+        let channel_compatible = object_rpc_call_is_channel_compatible(&call);
         let channel_lookup_started = perf_enabled.then(Instant::now);
         let timeline_channel_lookup_started = timeline
             .map(|_| crate::network_timeline_monotonic_ns())
@@ -3274,8 +3285,7 @@ where
         let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
         let request_retry_safe = call.request.is_response_retry_safe();
         let operation_id = call.request.operation_id().map(str::to_string);
-        let channel_compatible = !(call.body.has_value_intent()
-            && call.request.body.len() > OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES);
+        let channel_compatible = object_rpc_call_is_channel_compatible(&call);
         let replayable_call = call.try_clone_replayable();
         let mut one_pass_call = Some(call);
         let data_dir = cluster_paths_data_dir(Some(paths))?;
@@ -4737,6 +4747,30 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn bulk_and_unknown_attachments_use_the_bdp_tuned_session() {
+        let request = || {
+            ObjectRpcRequest::from_encoded_body("/test/channel-compatibility", "test", Vec::new())
+        };
+        let small =
+            ObjectRpcSessionCall::new(request(), ObjectRpcBodySource::bytes(vec![0_u8; 1024]));
+        let bulk = ObjectRpcSessionCall::new(
+            request(),
+            ObjectRpcBodySource::bytes(vec![
+                0_u8;
+                OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES + 1
+            ]),
+        );
+        let unknown = ObjectRpcSessionCall::new(
+            request(),
+            ObjectRpcBodySource::from_reader(Cursor::new(Vec::<u8>::new()), None),
+        );
+
+        assert!(object_rpc_call_is_channel_compatible(&small));
+        assert!(!object_rpc_call_is_channel_compatible(&bulk));
+        assert!(!object_rpc_call_is_channel_compatible(&unknown));
+    }
 
     enum RecordingChannelAction {
         Respond { responder_node_id: Option<NodeId> },

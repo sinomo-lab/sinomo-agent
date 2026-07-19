@@ -21,12 +21,12 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current loopback object-RPC channel handshake version.
-pub const LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 2;
+pub const LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 3;
 
-const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_MAGIC: [u8; 4] = *b"SXC2";
-const LOCAL_OBJECT_RPC_CHANNEL_SERVER_MAGIC: [u8; 4] = *b"SXS2";
-const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_PROOF_MAGIC: [u8; 4] = *b"SXP2";
-const LOCAL_OBJECT_RPC_CHANNEL_SERVER_ACK_MAGIC: [u8; 4] = *b"SXA2";
+const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_MAGIC: [u8; 4] = *b"SXC3";
+const LOCAL_OBJECT_RPC_CHANNEL_SERVER_MAGIC: [u8; 4] = *b"SXS3";
+const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_PROOF_MAGIC: [u8; 4] = *b"SXP3";
+const LOCAL_OBJECT_RPC_CHANNEL_SERVER_ACK_MAGIC: [u8; 4] = *b"SXA3";
 const LOCAL_OBJECT_RPC_CHANNEL_NEGOTIATION_BYTES: usize = 8;
 // Retained as an internal alias while raw old-daemon compatibility tests
 // construct only the fixed negotiation prefix.
@@ -114,7 +114,7 @@ pub struct AcceptedLocalObjectRpcChannel {
 
 /// Negotiates one persistent object-RPC channel to a local daemon.
 ///
-/// `Ok(None)` means that the peer returned a valid `SXS2` protocol rejection.
+/// `Ok(None)` means that the peer returned a valid `SXS3` protocol rejection.
 /// TCP, timeout, EOF, and malformed-handshake failures remain errors so callers
 /// can fall back for the current call without negative-caching a transient
 /// failure as protocol incompatibility.

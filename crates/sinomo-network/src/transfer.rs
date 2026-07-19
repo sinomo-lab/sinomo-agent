@@ -1,8 +1,8 @@
 //! Private transfer-session foundation.
 //!
 //! Raw frame helpers are not an independent transport. The canonical
-//! object-RPC session owns them and binds Open, data digests, Finish, and the
-//! completion receipt to one authenticated transcript. Higher-level crates use
+//! object-RPC session owns them and binds Open, ordered data, Finish, and the
+//! completion receipt to one flow-controlled stream. Higher-level crates use
 //! body/session intent and never assemble these frames themselves.
 
 use crate::object::{DEFAULT_NETWORK_TIMEOUT, DaemonRpcTimeouts};
@@ -15,10 +15,12 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const DEFAULT_TRANSFER_FRAME_BYTES: u32 = 1024 * 1024;
-pub const MAX_TRANSFER_FRAME_BYTES: u32 = 16 * 1024 * 1024;
-pub const DEFAULT_TRANSFER_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
-pub const MAX_TRANSFER_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+pub const MIN_TRANSFER_FRAME_BYTES: u32 = 1024 * 1024;
+pub const DEFAULT_TRANSFER_FRAME_BYTES: u32 = MIN_TRANSFER_FRAME_BYTES;
+pub const MAX_TRANSFER_FRAME_BYTES: u32 = 4 * 1024 * 1024;
+pub const MIN_TRANSFER_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_TRANSFER_WINDOW_BYTES: u64 = MIN_TRANSFER_WINDOW_BYTES;
+pub const MAX_TRANSFER_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 const TRANSFER_WIRE_MAGIC: [u8; 4] = *b"SXF2";
 const TRANSFER_WIRE_PREFIX_BYTES: usize = 13;
 const TRANSFER_WIRE_CONTROL_KIND: u8 = 1;
@@ -102,23 +104,6 @@ impl FromStr for TransferId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub(crate) struct TransferDigest([u8; 32]);
-
-impl TransferDigest {
-    pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn blake3(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransferFlowWindow {
     pub max_in_flight_bytes: u64,
@@ -140,13 +125,15 @@ impl TransferFlowWindow {
     }
 
     pub fn validate(self) -> Result<(), TransferError> {
-        if self.max_frame_bytes == 0 || self.max_frame_bytes > MAX_TRANSFER_FRAME_BYTES {
+        if self.max_frame_bytes < MIN_TRANSFER_FRAME_BYTES
+            || self.max_frame_bytes > MAX_TRANSFER_FRAME_BYTES
+        {
             return Err(TransferError::InvalidFlowWindow {
                 max_in_flight_bytes: self.max_in_flight_bytes,
                 max_frame_bytes: self.max_frame_bytes,
             });
         }
-        if self.max_in_flight_bytes < u64::from(self.max_frame_bytes)
+        if self.max_in_flight_bytes < MIN_TRANSFER_WINDOW_BYTES
             || self.max_in_flight_bytes > MAX_TRANSFER_WINDOW_BYTES
         {
             return Err(TransferError::InvalidFlowWindow {
@@ -155,6 +142,24 @@ impl TransferFlowWindow {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn maximum_supported() -> Self {
+        Self {
+            max_in_flight_bytes: MAX_TRANSFER_WINDOW_BYTES,
+            max_frame_bytes: MAX_TRANSFER_FRAME_BYTES,
+        }
+    }
+
+    pub(crate) fn negotiate(self, supported: Self) -> Result<Self, TransferError> {
+        self.validate()?;
+        supported.validate()?;
+        let window = Self {
+            max_in_flight_bytes: self.max_in_flight_bytes.min(supported.max_in_flight_bytes),
+            max_frame_bytes: self.max_frame_bytes.min(supported.max_frame_bytes),
+        };
+        window.validate()?;
+        Ok(window)
     }
 
     pub fn available(
@@ -188,7 +193,6 @@ pub struct TransferOpen {
     pub route: String,
     pub operation_id: Option<String>,
     pub total_bytes: Option<u64>,
-    pub expected_digest: Option<TransferDigest>,
     pub replayable: bool,
     pub requested_window: TransferFlowWindow,
 }
@@ -207,7 +211,6 @@ pub struct TransferDataHeader {
     pub transfer_id: TransferId,
     pub offset: u64,
     pub payload_bytes: u32,
-    pub payload_digest: TransferDigest,
 }
 
 #[derive(Debug)]
@@ -240,7 +243,6 @@ impl<'a> TransferDataFrame<'a> {
                 transfer_id,
                 offset,
                 payload_bytes,
-                payload_digest: TransferDigest::blake3(payload),
             },
             payload,
         })
@@ -258,14 +260,12 @@ pub struct TransferAck {
 pub struct TransferFinish {
     pub transfer_id: TransferId,
     pub total_bytes: u64,
-    pub digest: TransferDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TransferReceipt {
     pub transfer_id: TransferId,
     pub completed_bytes: u64,
-    pub digest: TransferDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -403,11 +403,6 @@ where
         })?;
     payload.resize(len, 0);
     transfer_read_exact(reader, &mut payload, health, "read transfer data payload").await?;
-    if TransferDigest::blake3(&payload) != header.payload_digest {
-        return Err(NetworkError::Serialization {
-            detail: TransferError::DigestMismatch.to_string(),
-        });
-    }
     Ok(payload)
 }
 
@@ -582,10 +577,10 @@ pub struct TransferSenderState {
     transfer_id: TransferId,
     phase: TransferSenderPhase,
     window: TransferFlowWindow,
+    peer_max_in_flight_bytes: u64,
     total_bytes: Option<u64>,
     next_offset: u64,
     acknowledged_offset: u64,
-    final_digest: Option<TransferDigest>,
 }
 
 impl TransferSenderState {
@@ -599,10 +594,10 @@ impl TransferSenderState {
             transfer_id,
             phase: TransferSenderPhase::New,
             window,
+            peer_max_in_flight_bytes: window.max_in_flight_bytes,
             total_bytes,
             next_offset: 0,
             acknowledged_offset: 0,
-            final_digest: None,
         })
     }
 
@@ -622,6 +617,7 @@ impl TransferSenderState {
         self.require_id(&ack.transfer_id)?;
         ack.receive_window.validate()?;
         self.window = ack.receive_window;
+        self.peer_max_in_flight_bytes = ack.receive_window.max_in_flight_bytes;
         self.next_offset = 0;
         self.acknowledged_offset = 0;
         self.phase = TransferSenderPhase::Sending;
@@ -685,11 +681,35 @@ impl TransferSenderState {
             });
         }
         self.acknowledged_offset = ack.received_contiguous_offset;
-        self.window = ack.receive_window;
+        self.peer_max_in_flight_bytes = ack.receive_window.max_in_flight_bytes;
+        self.window.max_frame_bytes = ack.receive_window.max_frame_bytes;
+        self.window.max_in_flight_bytes = self
+            .window
+            .max_in_flight_bytes
+            .min(self.peer_max_in_flight_bytes)
+            .max(u64::from(self.window.max_frame_bytes));
         Ok(())
     }
 
-    pub fn finish(&mut self, digest: TransferDigest) -> Result<TransferFinish, TransferError> {
+    pub fn set_active_window_bytes(&mut self, desired_bytes: u64) -> Result<(), TransferError> {
+        self.require_phase(&[
+            TransferSenderPhase::Sending,
+            TransferSenderPhase::Finishing,
+            TransferSenderPhase::AwaitingReceipt,
+        ])?;
+        self.window.max_in_flight_bytes = desired_bytes.clamp(
+            u64::from(self.window.max_frame_bytes),
+            self.peer_max_in_flight_bytes,
+        );
+        self.window.validate()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn active_window(&self) -> TransferFlowWindow {
+        self.window
+    }
+
+    pub fn finish(&mut self) -> Result<TransferFinish, TransferError> {
         self.require_phase(&[TransferSenderPhase::Sending])?;
         if let Some(total_bytes) = self.total_bytes
             && self.next_offset != total_bytes
@@ -700,11 +720,9 @@ impl TransferSenderState {
             });
         }
         self.phase = TransferSenderPhase::Finishing;
-        self.final_digest = Some(digest);
         Ok(TransferFinish {
             transfer_id: self.transfer_id.clone(),
             total_bytes: self.next_offset,
-            digest,
         })
     }
 
@@ -722,9 +740,6 @@ impl TransferSenderState {
                 expected_bytes: self.next_offset,
                 actual_bytes: receipt.completed_bytes,
             });
-        }
-        if self.final_digest != Some(receipt.digest) {
-            return Err(TransferError::DigestMismatch);
         }
         self.acknowledged_offset = receipt.completed_bytes;
         self.phase = TransferSenderPhase::Complete;
@@ -749,7 +764,7 @@ impl TransferSenderState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferReceiverPhase {
     Receiving,
-    Verifying,
+    Finishing,
     Complete,
 }
 
@@ -759,42 +774,15 @@ pub struct TransferPendingData {
     next_offset: u64,
 }
 
-/// Proof that the payload for a pending data frame was read completely and its
-/// digest matched the frame header. Receiver state cannot advance from a header
-/// alone.
-#[derive(Debug, Eq, PartialEq)]
-pub struct TransferVerifiedData {
-    pending: TransferPendingData,
-}
-
-impl TransferVerifiedData {
-    pub(crate) fn from_payload(
-        pending: TransferPendingData,
-        payload: &[u8],
-    ) -> Result<Self, TransferError> {
-        if payload.len() != pending.header.payload_bytes as usize {
-            return Err(TransferError::PayloadLengthMismatch {
-                declared_bytes: pending.header.payload_bytes,
-                actual_bytes: payload.len(),
-            });
-        }
-        if TransferDigest::blake3(payload) != pending.header.payload_digest {
-            return Err(TransferError::DigestMismatch);
-        }
-        Ok(Self { pending })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct TransferReceiverState {
     transfer_id: TransferId,
     phase: TransferReceiverPhase,
     window: TransferFlowWindow,
+    window_cap: TransferFlowWindow,
     total_bytes: Option<u64>,
-    expected_digest: Option<TransferDigest>,
     received_offset: u64,
     acknowledged_offset: u64,
-    finish_digest: Option<TransferDigest>,
 }
 
 impl TransferReceiverState {
@@ -802,17 +790,18 @@ impl TransferReceiverState {
         open: &TransferOpen,
         window: TransferFlowWindow,
     ) -> Result<Self, TransferError> {
-        open.requested_window.validate()?;
-        window.validate()?;
+        let window_cap = open
+            .requested_window
+            .negotiate(TransferFlowWindow::maximum_supported())?;
+        let window = window_cap.negotiate(window)?;
         Ok(Self {
             transfer_id: open.transfer_id.clone(),
             phase: TransferReceiverPhase::Receiving,
             window,
+            window_cap,
             total_bytes: open.total_bytes,
-            expected_digest: open.expected_digest,
             received_offset: 0,
             acknowledged_offset: 0,
-            finish_digest: None,
         })
     }
 
@@ -832,8 +821,23 @@ impl TransferReceiverState {
         }
     }
 
+    pub fn set_receive_window_bytes(&mut self, desired_bytes: u64) -> Result<(), TransferError> {
+        if self.phase != TransferReceiverPhase::Receiving {
+            return Err(TransferError::InvalidReceiverState { actual: self.phase });
+        }
+        self.window.max_in_flight_bytes = desired_bytes.clamp(
+            u64::from(self.window.max_frame_bytes),
+            self.window_cap.max_in_flight_bytes,
+        );
+        self.window.validate()
+    }
+
+    pub const fn receive_window(&self) -> TransferFlowWindow {
+        self.window
+    }
+
     /// Validates a data header without advancing receive state. The caller must
-    /// stage and verify the payload before passing the returned ticket to
+    /// read the complete payload before passing the returned ticket to
     /// [`Self::commit_data`].
     pub fn begin_data(
         &self,
@@ -884,8 +888,7 @@ impl TransferReceiverState {
         })
     }
 
-    pub fn commit_data(&mut self, verified: TransferVerifiedData) -> Result<(), TransferError> {
-        let pending = verified.pending;
+    pub fn commit_data(&mut self, pending: TransferPendingData) -> Result<(), TransferError> {
         if self.phase != TransferReceiverPhase::Receiving {
             return Err(TransferError::InvalidReceiverState { actual: self.phase });
         }
@@ -938,33 +941,19 @@ impl TransferReceiverState {
                 actual_bytes: finish.total_bytes,
             });
         }
-        if self
-            .expected_digest
-            .is_some_and(|expected| expected != finish.digest)
-        {
-            return Err(TransferError::DigestMismatch);
-        }
-        self.finish_digest = Some(finish.digest);
-        self.phase = TransferReceiverPhase::Verifying;
+        self.phase = TransferReceiverPhase::Finishing;
         Ok(())
     }
 
-    pub fn complete(
-        &mut self,
-        computed_digest: TransferDigest,
-    ) -> Result<TransferReceipt, TransferError> {
-        if self.phase != TransferReceiverPhase::Verifying {
+    pub fn complete(&mut self) -> Result<TransferReceipt, TransferError> {
+        if self.phase != TransferReceiverPhase::Finishing {
             return Err(TransferError::InvalidReceiverState { actual: self.phase });
-        }
-        if self.finish_digest != Some(computed_digest) {
-            return Err(TransferError::DigestMismatch);
         }
         self.acknowledged_offset = self.received_offset;
         self.phase = TransferReceiverPhase::Complete;
         Ok(TransferReceipt {
             transfer_id: self.transfer_id.clone(),
             completed_bytes: self.received_offset,
-            digest: computed_digest,
         })
     }
 }
@@ -985,8 +974,6 @@ pub enum TransferError {
         declared_bytes: u32,
         actual_bytes: usize,
     },
-    #[error("transfer digest mismatch")]
-    DigestMismatch,
     #[error("transfer id mismatch")]
     TransferIdMismatch,
     #[error("unexpected transfer offset: expected {expected}, actual {actual}")]
@@ -1022,13 +1009,12 @@ pub enum TransferError {
 mod tests {
     use super::*;
 
-    fn open(transfer_id: TransferId, total_bytes: u64, digest: TransferDigest) -> TransferOpen {
+    fn open(transfer_id: TransferId, total_bytes: u64) -> TransferOpen {
         TransferOpen {
             transfer_id,
             route: "/test/transfer".to_string(),
             operation_id: Some("operation-1".to_string()),
             total_bytes: Some(total_bytes),
-            expected_digest: Some(digest),
             replayable: true,
             requested_window: TransferFlowWindow::default(),
         }
@@ -1045,8 +1031,7 @@ mod tests {
     #[test]
     fn transfer_controls_round_trip_as_sobj_documents() {
         let transfer_id = TransferId::generate();
-        let control =
-            TransferControl::Open(open(transfer_id, 42, TransferDigest::blake3(b"payload")));
+        let control = TransferControl::Open(open(transfer_id, 42));
         let bytes = SinomoObjectCodec::network_frame()
             .encode(&control)
             .expect("encode transfer control");
@@ -1187,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_data_frame_borrows_and_hashes_the_payload() {
+    fn raw_data_frame_borrows_the_payload_without_hashing() {
         let payload = b"borrowed transfer payload";
         let frame = TransferDataFrame::new(
             TransferId::generate(),
@@ -1197,15 +1182,21 @@ mod tests {
         )
         .expect("data frame");
         assert_eq!(frame.payload.as_ptr(), payload.as_ptr());
-        assert_eq!(frame.header.payload_digest, TransferDigest::blake3(payload));
+        assert_eq!(frame.header.payload_bytes, payload.len() as u32);
     }
 
     #[test]
     fn sender_window_requires_cumulative_ack_progress() {
-        let window = TransferFlowWindow::new(8, 4).expect("small window");
+        let window = TransferFlowWindow::default();
+        let frame_bytes = usize::try_from(window.max_frame_bytes).expect("frame size");
+        let chunk = vec![0_u8; frame_bytes];
+        let frames_in_window =
+            usize::try_from(window.max_in_flight_bytes / u64::from(window.max_frame_bytes))
+                .expect("frames in window");
+        let total_bytes = window.max_in_flight_bytes + u64::from(window.max_frame_bytes);
         let transfer_id = TransferId::generate();
-        let mut sender =
-            TransferSenderState::new(transfer_id.clone(), Some(12), window).expect("sender");
+        let mut sender = TransferSenderState::new(transfer_id.clone(), Some(total_bytes), window)
+            .expect("sender");
         sender.mark_opening().expect("open");
         sender
             .accept_open_ack(&TransferOpenAck {
@@ -1213,84 +1204,81 @@ mod tests {
                 receive_window: window,
             })
             .expect("open ack");
-        sender.reserve_data(b"abcd").expect("first frame");
-        sender.reserve_data(b"efgh").expect("second frame");
+        assert_eq!(sender.active_window(), window);
+        for _ in 0..frames_in_window {
+            sender.reserve_data(&chunk).expect("window frame");
+        }
         assert_eq!(
-            sender.reserve_data(b"ijkl").expect_err("window full"),
+            sender.reserve_data(&chunk).expect_err("window full"),
             TransferError::FlowControlBlocked {
-                requested_bytes: 4,
+                requested_bytes: u64::from(window.max_frame_bytes),
                 available_bytes: 0,
             }
         );
         sender
             .accept_ack(&TransferAck {
                 transfer_id: transfer_id.clone(),
-                received_contiguous_offset: 4,
+                received_contiguous_offset: u64::from(window.max_frame_bytes),
                 receive_window: window,
             })
             .expect("cumulative ack");
-        sender.reserve_data(b"ijkl").expect("window reopened");
-        let digest = TransferDigest::blake3(b"abcdefghijkl");
-        let finish = sender.finish(digest).expect("finish transfer");
-        assert_eq!(finish.total_bytes, 12);
+        sender.reserve_data(&chunk).expect("window reopened");
+        let finish = sender.finish().expect("finish transfer");
+        assert_eq!(finish.total_bytes, total_bytes);
         assert_eq!(sender.phase(), TransferSenderPhase::Finishing);
         sender.mark_finish_sent().expect("finish sent");
         sender
             .accept_receipt(&TransferReceipt {
                 transfer_id,
-                completed_bytes: 12,
-                digest,
+                completed_bytes: total_bytes,
             })
             .expect("completion receipt");
         assert_eq!(sender.phase(), TransferSenderPhase::Complete);
     }
 
     #[test]
-    fn receiver_rejects_out_of_order_and_commits_only_after_digest_verification() {
-        let bytes = b"abcdefgh";
-        let digest = TransferDigest::blake3(bytes);
+    fn receiver_rejects_out_of_order_and_commits_after_complete_payload_read() {
         let transfer_id = TransferId::generate();
-        let window = TransferFlowWindow::new(8, 4).expect("small window");
+        let window = TransferFlowWindow::default();
+        let frame_bytes = usize::try_from(window.max_frame_bytes).expect("frame size");
+        let chunk = vec![0_u8; frame_bytes];
+        let total_bytes = 2 * u64::from(window.max_frame_bytes);
         let mut receiver =
-            TransferReceiverState::from_open(&open(transfer_id.clone(), 8, digest), window)
+            TransferReceiverState::from_open(&open(transfer_id.clone(), total_bytes), window)
                 .expect("receiver");
 
-        let second =
-            TransferDataFrame::new(transfer_id.clone(), 4, b"efgh", window).expect("second frame");
+        let second = TransferDataFrame::new(
+            transfer_id.clone(),
+            u64::from(window.max_frame_bytes),
+            &chunk,
+            window,
+        )
+        .expect("second frame");
         assert_eq!(
             receiver.begin_data(&second.header),
             Err(TransferError::UnexpectedOffset {
                 expected: 0,
-                actual: 4,
+                actual: u64::from(window.max_frame_bytes),
             })
         );
 
         let first =
-            TransferDataFrame::new(transfer_id.clone(), 0, b"abcd", window).expect("first frame");
+            TransferDataFrame::new(transfer_id.clone(), 0, &chunk, window).expect("first frame");
         let first = receiver.begin_data(&first.header).expect("first data");
+        receiver.commit_data(first).expect("commit first data");
         receiver
-            .commit_data(TransferVerifiedData { pending: first })
-            .expect("commit first data");
-        receiver
-            .acknowledge_received(4)
+            .acknowledge_received(u64::from(window.max_frame_bytes))
             .expect("acknowledge first frame");
         let second = receiver.begin_data(&second.header).expect("second data");
-        receiver
-            .commit_data(TransferVerifiedData { pending: second })
-            .expect("commit second data");
+        receiver.commit_data(second).expect("commit second data");
         receiver
             .accept_finish(&TransferFinish {
                 transfer_id,
-                total_bytes: 8,
-                digest,
+                total_bytes,
             })
             .expect("finish");
-        assert_eq!(
-            receiver.complete(TransferDigest::blake3(b"wrong")),
-            Err(TransferError::DigestMismatch)
-        );
-        let receipt = receiver.complete(digest).expect("complete");
-        assert_eq!(receipt.completed_bytes, 8);
+        let receipt = receiver.complete().expect("complete");
+        assert_eq!(receipt.completed_bytes, total_bytes);
         assert_eq!(receiver.phase(), TransferReceiverPhase::Complete);
     }
 
@@ -1302,5 +1290,16 @@ mod tests {
             TransferFlowWindow::new(MAX_TRANSFER_WINDOW_BYTES + 1, DEFAULT_TRANSFER_FRAME_BYTES,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn flow_window_negotiates_chunk_and_credit_independently() {
+        let requested = TransferFlowWindow::maximum_supported();
+        let supported = TransferFlowWindow::new(24 * 1024 * 1024, MIN_TRANSFER_FRAME_BYTES)
+            .expect("supported window");
+
+        assert_eq!(requested.negotiate(supported), Ok(supported));
+        assert_eq!(supported.max_frame_bytes, 1024 * 1024);
+        assert_eq!(supported.max_in_flight_bytes, 24 * 1024 * 1024);
     }
 }
