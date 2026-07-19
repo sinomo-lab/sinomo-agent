@@ -1110,15 +1110,25 @@ fn canonical_plan_terms(terms: impl IntoIterator<Item = String>) -> Vec<String> 
 pub struct MemoryQueryContinuation {
     pub router_manifest_id: RouterManifestId,
     pub query_fingerprint: Id,
-    /// The first partition that has not been completely consumed. New
-    /// continuations use this stable key instead of requiring the caller to
-    /// retain an ever-growing prefix of routed partitions.
+    /// Start of the bounded routing window containing `next_partition_id`.
+    /// Evidence continuations retain this so later windows can be rebuilt and
+    /// ranked without returning to the first partition window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start_partition_id: Option<IndexPartitionId>,
+    #[serde(default)]
+    pub window_start_exclusive: bool,
+    /// Distinguishes an evidence-rank cursor from a router traversal cursor.
+    #[serde(default)]
+    pub ranked_evidence: bool,
+    /// The partition containing the next ranked evidence anchor, or the first
+    /// router posting in the next bounded partition window.
     pub next_partition_id: IndexPartitionId,
     pub next_generation_id: IndexGenerationId,
-    /// `false` resumes at this partition (for an unfinished evidence anchor);
-    /// `true` resumes strictly after a router posting already inspected under
-    /// the prior page's bounded work budget.
+    /// For router traversal cursors, `false` resumes at this posting and `true`
+    /// resumes strictly after it. Ranked evidence cursors always use `false`.
     pub resume_after_partition: bool,
+    /// Anchor index for a ranked evidence continuation. Router continuations
+    /// always use zero.
     pub next_anchor: usize,
     /// Store-local keyed authenticator over every continuation field. Callers
     /// may carry this value but cannot forge a different resume position.

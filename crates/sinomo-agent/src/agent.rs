@@ -16641,6 +16641,9 @@ mod tests {
         let continuation = sinomo_memory::MemoryQueryContinuation {
             router_manifest_id: TaskId::generate(),
             query_fingerprint: TaskId::generate(),
+            window_start_partition_id: None,
+            window_start_exclusive: false,
+            ranked_evidence: false,
             next_partition_id: TaskId::generate(),
             next_generation_id: TaskId::generate(),
             resume_after_partition: false,

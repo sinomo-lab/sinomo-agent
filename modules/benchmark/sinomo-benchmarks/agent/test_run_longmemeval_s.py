@@ -153,6 +153,20 @@ class LongMemEvalDataTests(unittest.TestCase):
 
         self.assertEqual([case.question_id for case in selected], ["question-2"])
 
+    def test_development_subset_has_two_fixed_questions_per_category(self) -> None:
+        selected = RUNNER.BENCHMARK_SUBSETS["development"]
+
+        self.assertEqual(set(RUNNER.DEVELOPMENT_SUBSET_BY_TYPE), RUNNER.QUESTION_TYPES)
+        self.assertTrue(
+            all(
+                len(question_ids) == 2
+                for question_ids in RUNNER.DEVELOPMENT_SUBSET_BY_TYPE.values()
+            )
+        )
+        self.assertEqual(len(selected), len(RUNNER.QUESTION_TYPES) * 2)
+        self.assertEqual(len(selected), len(set(selected)))
+        self.assertTrue(all(not question_id.endswith("_abs") for question_id in selected))
+
     def test_session_gold_and_turn_gold_are_independent_official_labels(self) -> None:
         payload = case_payload()
         payload["answer_session_ids"] = [

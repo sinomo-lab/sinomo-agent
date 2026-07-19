@@ -454,6 +454,103 @@ fn evidence_continuation_resumes_at_the_first_unreturned_anchor() {
 }
 
 #[test]
+fn evidence_is_ranked_before_record_limit_is_applied() {
+    let dirs = TestDirectories::new("rank-before-limit");
+    fs::write(dirs.source.join("weak.md"), "alpha weak evidence\n").expect("write weak");
+    fs::write(
+        dirs.source.join("strong.md"),
+        "alpha beta strong evidence\n",
+    )
+    .expect("write strong");
+    let store = IndexedFileMemoryStore::new(&dirs.memory);
+    let root = store
+        .register_local_root(LocalIndexRootConfig::new(
+            &dirs.source,
+            IndexRootPolicy::cluster_local(),
+        ))
+        .expect("register root");
+    store.index_root(&root.root_id).expect("index sources");
+    let query = MemoryQuery {
+        task_hint: Some("alpha beta".to_string()),
+        max_records: 1,
+        max_bytes: 128 * 1024,
+        ..MemoryQuery::default()
+    };
+
+    let first = store
+        .retrieve(&MemoryAccessContext::cluster_local(), &query)
+        .expect("first ranked page");
+    assert_eq!(first.trace.searched_partitions, 2);
+    assert_eq!(first.evidence.len(), 1);
+    assert_eq!(first.evidence[0].score, 200);
+    assert_eq!(first.evidence[0].content, "alpha beta strong evidence");
+    assert!(matches!(
+        first.coverage,
+        EvidenceCoverage::BudgetTruncated { .. }
+    ));
+
+    let second = store
+        .retrieve(
+            &MemoryAccessContext::cluster_local(),
+            &MemoryQuery {
+                continuation: first.continuation,
+                ..query
+            },
+        )
+        .expect("second ranked page");
+    assert_eq!(second.evidence.len(), 1);
+    assert_eq!(second.evidence[0].score, 100);
+    assert_eq!(second.evidence[0].content, "alpha weak evidence");
+    assert_eq!(second.coverage, EvidenceCoverage::Complete);
+}
+
+#[test]
+fn ranked_evidence_continuations_preserve_later_partition_windows() {
+    let dirs = TestDirectories::new("ranked-window-continuation");
+    for index in 0..4 {
+        fs::write(
+            dirs.source.join(format!("note-{index}.md")),
+            format!("shared evidence {index}\n"),
+        )
+        .expect("write source");
+    }
+    let store = IndexedFileMemoryStore::new(&dirs.memory);
+    let root = store
+        .register_local_root(LocalIndexRootConfig::new(
+            &dirs.source,
+            IndexRootPolicy::cluster_local(),
+        ))
+        .expect("register root");
+    store.index_root(&root.root_id).expect("index sources");
+    let mut query = MemoryQuery {
+        task_hint: Some("shared".to_string()),
+        max_partitions: 2,
+        max_records: 1,
+        max_bytes: 128 * 1024,
+        ..MemoryQuery::default()
+    };
+    let mut returned = Vec::new();
+
+    for _ in 0..8 {
+        let page = store
+            .retrieve(&MemoryAccessContext::cluster_local(), &query)
+            .expect("ranked evidence page");
+        returned.extend(
+            page.evidence
+                .iter()
+                .map(|evidence| evidence.anchor.source_version.file_ref.object_id.clone()),
+        );
+        match page.continuation {
+            Some(continuation) => query.continuation = Some(continuation),
+            None => break,
+        }
+    }
+
+    assert_eq!(returned.len(), 4);
+    assert_eq!(returned.iter().cloned().collect::<BTreeSet<_>>().len(), 4);
+}
+
+#[test]
 fn evidence_continuation_position_is_authenticated() {
     let dirs = TestDirectories::new("continuation-authenticator");
     fs::write(

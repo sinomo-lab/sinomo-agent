@@ -75,6 +75,28 @@ QUESTION_TYPES = {
     "knowledge-update",
     "multi-session",
 }
+DEVELOPMENT_SUBSET_BY_TYPE = {
+    "single-session-user": ("e47becba", "118b2229"),
+    "single-session-assistant": ("7161e7e2", "c4f10528"),
+    "single-session-preference": ("8a2466db", "06878be2"),
+    "temporal-reasoning": ("gpt4_59149c77", "gpt4_f49edff3"),
+    "knowledge-update": ("6a1eabeb", "6aeb4375"),
+    "multi-session": ("0a995998", "6d550036"),
+}
+BENCHMARK_SUBSETS = {
+    "development": tuple(
+        question_id
+        for question_type in (
+            "single-session-user",
+            "single-session-assistant",
+            "single-session-preference",
+            "temporal-reasoning",
+            "knowledge-update",
+            "multi-session",
+        )
+        for question_id in DEVELOPMENT_SUBSET_BY_TYPE[question_type]
+    )
+}
 SESSION_CUTOFFS = (1, 3, 5, 10, 30, 50)
 TURN_CUTOFFS = (1, 3, 5, 10, 30, 50)
 
@@ -353,6 +375,14 @@ def iter_selected_cases(
         raise LongMemEvalDataError(f"requested question ids were not found: {missing}")
     if selected_count == 0:
         raise LongMemEvalDataError("dataset filters selected no LongMemEval cases")
+
+
+def resolved_question_ids(
+    question_ids: Sequence[str], subset: str | None
+) -> tuple[str, ...]:
+    if subset is None:
+        return tuple(question_ids)
+    return BENCHMARK_SUBSETS[subset]
 
 
 def file_sha256(path: Path) -> str:
@@ -864,7 +894,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         "model": args.model if args.reader == "sinomo" else None,
         "account": args.account if args.reader == "sinomo" else None,
         "selection": {
-            "question_ids": list(args.question_id),
+            "subset": args.subset,
+            "question_ids": list(resolved_question_ids(args.question_id, args.subset)),
             "question_types": list(args.question_type),
             "limit": args.limit,
         },
@@ -911,7 +942,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
                 "--mode run",
                 "--dataset benchmark-results/datasets/longmemeval_s_cleaned.json",
                 "--reader none",
-                "--limit 50",
+                "--subset development",
             ]
         ),
     }
@@ -929,6 +960,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-unpinned-dataset", action="store_true")
     parser.add_argument("--question-id", action="append", default=[])
     parser.add_argument("--question-type", action="append", choices=sorted(QUESTION_TYPES), default=[])
+    parser.add_argument("--subset", choices=sorted(BENCHMARK_SUBSETS))
     parser.add_argument("--limit", type=int)
     parser.add_argument("--reader", choices=["none", "sinomo"], default="none")
     parser.add_argument("--provider", default="codex")
@@ -953,6 +985,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
+    if args.subset and (args.question_id or args.question_type or args.limit is not None):
+        parser.error(
+            "--subset cannot be combined with --question-id, --question-type, or --limit"
+        )
     if args.max_records <= 0 or args.max_bytes <= 0:
         parser.error("retrieval record and byte limits must be positive")
     if args.command_timeout_seconds <= 0 or args.model_timeout_seconds <= 0:
@@ -1041,7 +1077,7 @@ def main() -> int:
     try:
         selected = iter_selected_cases(
             dataset,
-            question_ids=args.question_id,
+            question_ids=resolved_question_ids(args.question_id, args.subset),
             question_types=args.question_type,
             limit=args.limit,
         )

@@ -55,7 +55,8 @@ pinned LongMemEval-S baseline.
 
 ### Retrieval-only baseline
 
-Build the CLI used by the benchmark, then start with a bounded run:
+Build the CLI used by the benchmark, then start with the fixed development
+subset:
 
 ```bash
 cargo build -p sinomo
@@ -63,12 +64,30 @@ python3 modules/benchmark/sinomo-benchmarks/agent/run_longmemeval_s.py \
   --mode run \
   --dataset benchmark-results/datasets/longmemeval_s_cleaned.json \
   --reader none \
-  --limit 50
+  --subset development
 ```
 
-Remove `--limit` for all 500 questions. Selection is deterministic and can
-also be narrowed with repeatable `--question-id ID` and `--question-type TYPE`
-arguments. The supported question types are printed by `--help`.
+The development subset contains two fixed, non-abstention questions from each
+official question category, so repeated debugging runs cover a stable mix
+without paying for all 500 cases:
+
+| Category | Question IDs |
+|---|---|
+| `single-session-user` | `e47becba`, `118b2229` |
+| `single-session-assistant` | `7161e7e2`, `c4f10528` |
+| `single-session-preference` | `8a2466db`, `06878be2` |
+| `temporal-reasoning` | `gpt4_59149c77`, `gpt4_f49edff3` |
+| `knowledge-update` | `6a1eabeb`, `6aeb4375` |
+| `multi-session` | `0a995998`, `6d550036` |
+
+The preset is intentionally fixed and cannot be combined with explicit IDs,
+type filters, or `--limit`. Use those existing selectors for ad hoc runs;
+`--limit` continues to select a deterministic dataset prefix.
+
+Omit `--subset development` for all 500 questions. Selection is deterministic
+and can also be narrowed with repeatable `--question-id ID` and
+`--question-type TYPE` arguments. The supported question types are printed by
+`--help`.
 
 The canonical retrieval-only baseline is therefore:
 

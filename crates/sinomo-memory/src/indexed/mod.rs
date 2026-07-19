@@ -19,6 +19,7 @@ use sinomo_runtime::storage::durable_file::{
     DurableAtomicFileOptions, create_private_staged_file, install_staged_file, sync_directory,
     write_file_atomic, write_file_create_new_atomic,
 };
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -39,6 +40,22 @@ struct RoutedPartitionsPage {
     items: Vec<(IndexPartitionId, IndexGenerationId)>,
     has_more_routed: bool,
     scan_resume: Option<RouterScanWatermark>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RankedEvidenceCandidate {
+    partition_id: IndexPartitionId,
+    generation_id: IndexGenerationId,
+    anchor_index: usize,
+    score: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RankedEvidenceCursor {
+    partition_id: IndexPartitionId,
+    generation_id: IndexGenerationId,
+    anchor_index: usize,
+    score: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -800,7 +817,7 @@ impl IndexedFileMemoryStore {
         let (terms, query_terms_truncated) =
             tokenize_query(query.task_hint.as_deref().unwrap_or_default());
         let query_fingerprint = query_fingerprint(access, query)?;
-        let (start_partition_id, start_exclusive, start_anchor) = match &query.continuation {
+        let (start_partition_id, start_exclusive) = match &query.continuation {
             Some(continuation) => {
                 if continuation.router_manifest_id != router.manifest_id
                     || continuation.query_fingerprint != query_fingerprint
@@ -810,13 +827,22 @@ impl IndexedFileMemoryStore {
                             .to_string(),
                     });
                 }
-                (
-                    Some(&continuation.next_partition_id),
-                    continuation.resume_after_partition,
-                    continuation.next_anchor,
-                )
+                if continuation.ranked_evidence {
+                    // Evidence continuations identify the next item in the
+                    // ranked page. Rebuild the same bounded routing window so
+                    // relevance ordering remains global within that window.
+                    (
+                        continuation.window_start_partition_id.clone(),
+                        continuation.window_start_exclusive,
+                    )
+                } else {
+                    (
+                        Some(continuation.next_partition_id.clone()),
+                        continuation.resume_after_partition,
+                    )
+                }
             }
-            None => (None, false, 0),
+            None => (None, false),
         };
 
         let query_snapshot = MemoryQuerySnapshot {
@@ -837,12 +863,37 @@ impl IndexedFileMemoryStore {
             }
             MemoryRetrievalOperator::LexicalExact { terms } => (terms.clone(), terms.clone()),
         };
+        let ranked_resume = match &query.continuation {
+            Some(continuation) if continuation.ranked_evidence => {
+                let generation: LexicalPartitionGeneration = self.read_required(
+                    &self.partition_generation_path(
+                        &continuation.next_partition_id,
+                        &continuation.next_generation_id,
+                    ),
+                    "ranked evidence continuation generation",
+                )?;
+                let lexical_anchor = generation
+                    .anchors
+                    .get(continuation.next_anchor)
+                    .ok_or_else(|| MemoryError::InvalidMemoryContinuation {
+                        detail: "ranked evidence continuation anchor is outside its pinned generation"
+                            .to_string(),
+                    })?;
+                Some(RankedEvidenceCursor {
+                    partition_id: continuation.next_partition_id.clone(),
+                    generation_id: continuation.next_generation_id.clone(),
+                    anchor_index: continuation.next_anchor,
+                    score: lexical_score(&lexical_anchor.terms, &planned_terms),
+                })
+            }
+            _ => None,
+        };
         let effective_partition_limit = plan.limits.max_partitions;
         let routed_page = self.route_partitions(
             &router,
             access,
             &routed_terms,
-            start_partition_id,
+            start_partition_id.as_ref(),
             start_exclusive,
             effective_partition_limit,
         )?;
@@ -873,8 +924,8 @@ impl IndexedFileMemoryStore {
             };
         }
         let partition_end = effective_partition_limit.min(routed.len());
-        let mut stopped_for_budget = false;
-        'partitions: for (partition_id, generation_id) in routed.iter().take(partition_end) {
+        let mut ranked_candidates = Vec::new();
+        for (partition_id, generation_id) in routed.iter().take(partition_end) {
             let generation: LexicalPartitionGeneration = self.read_required(
                 &self.partition_generation_path(partition_id, generation_id),
                 "partition generation",
@@ -888,74 +939,128 @@ impl IndexedFileMemoryStore {
                     .partition_generations
                     .insert(partition_id.clone(), generation_id.clone());
             }
-            let text = match self.materialize_generation_text(&generation) {
-                Ok(Some(text)) => text,
+            match self.materialize_generation_text(&generation) {
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     bundle.trace.stale_partitions += 1;
                     continue;
                 }
                 Err(error) => return Err(error),
+            }
+            if !self.current_root_authorizes_generation(access, &generation)? {
+                bundle.trace.stale_partitions += 1;
+                continue;
+            }
+            for (anchor_index, lexical_anchor) in generation.anchors.iter().enumerate() {
+                let score = lexical_score(&lexical_anchor.terms, &planned_terms);
+                if !planned_terms.is_empty() && score == 0 {
+                    continue;
+                }
+                let candidate = RankedEvidenceCandidate {
+                    partition_id: partition_id.clone(),
+                    generation_id: generation_id.clone(),
+                    anchor_index,
+                    score,
+                };
+                if ranked_resume.as_ref().is_some_and(|cursor| {
+                    compare_ranked_evidence_to_cursor(&candidate, cursor) == Ordering::Less
+                }) {
+                    continue;
+                }
+                retain_ranked_evidence_candidate(&mut ranked_candidates, candidate);
+            }
+        }
+
+        let mut stopped_for_budget = false;
+        for candidate in ranked_candidates {
+            if bundle.evidence.len() >= plan.limits.max_evidence {
+                bundle.coverage = EvidenceCoverage::BudgetTruncated {
+                    reason: combine_coverage_reasons(
+                        "evidence record limit reached".to_string(),
+                        query_approximation_reason.as_deref(),
+                    ),
+                };
+                bundle.continuation = Some(self.sign_query_continuation(
+                    router.manifest_id.clone(),
+                    query_fingerprint.clone(),
+                    start_partition_id.clone(),
+                    start_exclusive,
+                    true,
+                    candidate.partition_id,
+                    candidate.generation_id,
+                    false,
+                    candidate.anchor_index,
+                )?);
+                stopped_for_budget = true;
+                break;
+            }
+            let generation: LexicalPartitionGeneration = self.read_required(
+                &self.partition_generation_path(
+                    &candidate.partition_id,
+                    &candidate.generation_id,
+                ),
+                "ranked evidence generation",
+            )?;
+            if !self.current_root_authorizes_generation(access, &generation)? {
+                continue;
+            }
+            let text = match self.materialize_generation_text(&generation)? {
+                Some(text) => text,
+                None => {
+                    bundle.trace.stale_partitions += 1;
+                    continue;
+                }
             };
             if !self.current_root_authorizes_generation(access, &generation)? {
                 bundle.trace.stale_partitions += 1;
                 continue;
             }
-            let anchor_start = if start_partition_id == Some(partition_id) {
-                start_anchor
-            } else {
-                0
+            let lexical_anchor = generation
+                .anchors
+                .get(candidate.anchor_index)
+                .ok_or_else(|| MemoryError::InvalidMemoryContinuation {
+                    detail: "ranked evidence anchor is outside its pinned generation".to_string(),
+                })?;
+            let Some(content) = materialize_text_anchor(&text, &lexical_anchor.anchor.selector)
+            else {
+                bundle.trace.stale_partitions += 1;
+                continue;
             };
-            for (anchor_index, lexical_anchor) in
-                generation.anchors.iter().enumerate().skip(anchor_start)
-            {
-                let score = lexical_score(&lexical_anchor.terms, &planned_terms);
-                if !planned_terms.is_empty() && score == 0 {
-                    continue;
-                }
-                let Some(content) = materialize_text_anchor(&text, &lexical_anchor.anchor.selector)
-                else {
-                    bundle.trace.stale_partitions += 1;
-                    continue;
+            let evidence = MemoryEvidence {
+                anchor: lexical_anchor.anchor.clone(),
+                content: content.to_string(),
+                score: candidate.score,
+                reason: if planned_terms.is_empty() {
+                    "bounded source enumeration".to_string()
+                } else {
+                    "exact lexical anchor match".to_string()
+                },
+            };
+            if !try_push_evidence(
+                &mut bundle,
+                &generation.source,
+                evidence,
+                plan.limits.max_evidence_bytes,
+            ) {
+                bundle.coverage = EvidenceCoverage::BudgetTruncated {
+                    reason: combine_coverage_reasons(
+                        "serialized evidence byte limit reached".to_string(),
+                        query_approximation_reason.as_deref(),
+                    ),
                 };
-                let evidence = MemoryEvidence {
-                    anchor: lexical_anchor.anchor.clone(),
-                    content: content.to_string(),
-                    score,
-                    reason: if planned_terms.is_empty() {
-                        "bounded source enumeration".to_string()
-                    } else {
-                        "exact lexical anchor match".to_string()
-                    },
-                };
-                if bundle.evidence.len() >= plan.limits.max_evidence
-                    || !try_push_evidence(
-                        &mut bundle,
-                        &generation.source,
-                        evidence,
-                        plan.limits.max_evidence_bytes,
-                    )
-                {
-                    bundle.coverage = EvidenceCoverage::BudgetTruncated {
-                        reason: combine_coverage_reasons(
-                            if bundle.evidence.len() >= plan.limits.max_evidence {
-                                "evidence record limit reached".to_string()
-                            } else {
-                                "serialized evidence byte limit reached".to_string()
-                            },
-                            query_approximation_reason.as_deref(),
-                        ),
-                    };
-                    bundle.continuation = Some(self.sign_query_continuation(
-                        router.manifest_id.clone(),
-                        query_fingerprint.clone(),
-                        partition_id.clone(),
-                        generation_id.clone(),
-                        false,
-                        anchor_index,
-                    )?);
-                    stopped_for_budget = true;
-                    break 'partitions;
-                }
+                bundle.continuation = Some(self.sign_query_continuation(
+                    router.manifest_id.clone(),
+                    query_fingerprint.clone(),
+                    start_partition_id.clone(),
+                    start_exclusive,
+                    true,
+                    candidate.partition_id,
+                    candidate.generation_id,
+                    false,
+                    candidate.anchor_index,
+                )?);
+                stopped_for_budget = true;
+                break;
             }
         }
 
@@ -975,6 +1080,9 @@ impl IndexedFileMemoryStore {
             bundle.continuation = Some(self.sign_query_continuation(
                 router.manifest_id.clone(),
                 query_fingerprint.clone(),
+                None,
+                false,
+                false,
                 next_partition_id,
                 next_generation_id,
                 false,
@@ -990,6 +1098,9 @@ impl IndexedFileMemoryStore {
             bundle.continuation = Some(self.sign_query_continuation(
                 router.manifest_id.clone(),
                 query_fingerprint.clone(),
+                None,
+                false,
+                false,
                 scan_resume.partition_id,
                 scan_resume.generation_id,
                 true,
@@ -1292,6 +1403,9 @@ impl IndexedFileMemoryStore {
         &self,
         router_manifest_id: RouterManifestId,
         query_fingerprint: Id,
+        window_start_partition_id: Option<IndexPartitionId>,
+        window_start_exclusive: bool,
+        ranked_evidence: bool,
         next_partition_id: IndexPartitionId,
         next_generation_id: IndexGenerationId,
         resume_after_partition: bool,
@@ -1302,6 +1416,9 @@ impl IndexedFileMemoryStore {
             &key,
             &router_manifest_id,
             &query_fingerprint,
+            window_start_partition_id.as_ref(),
+            window_start_exclusive,
+            ranked_evidence,
             &next_partition_id,
             &next_generation_id,
             resume_after_partition,
@@ -1310,6 +1427,9 @@ impl IndexedFileMemoryStore {
         Ok(MemoryQueryContinuation {
             router_manifest_id,
             query_fingerprint,
+            window_start_partition_id,
+            window_start_exclusive,
+            ranked_evidence,
             next_partition_id,
             next_generation_id,
             resume_after_partition,
@@ -1327,6 +1447,9 @@ impl IndexedFileMemoryStore {
             &key,
             &continuation.router_manifest_id,
             &continuation.query_fingerprint,
+            continuation.window_start_partition_id.as_ref(),
+            continuation.window_start_exclusive,
+            continuation.ranked_evidence,
             &continuation.next_partition_id,
             &continuation.next_generation_id,
             continuation.resume_after_partition,
@@ -1346,8 +1469,15 @@ impl IndexedFileMemoryStore {
         )?;
         if generation.manifest.partition_id != continuation.next_partition_id
             || generation.manifest.generation_id != continuation.next_generation_id
-            || continuation.next_anchor > generation.anchors.len()
-            || (continuation.resume_after_partition && continuation.next_anchor != 0)
+            || (!continuation.ranked_evidence && continuation.next_anchor != 0)
+            || (continuation.ranked_evidence && continuation.resume_after_partition)
+            || (!continuation.ranked_evidence
+                && (continuation.window_start_partition_id.is_some()
+                    || continuation.window_start_exclusive))
+            || (continuation.window_start_exclusive
+                && continuation.window_start_partition_id.is_none())
+            || (continuation.ranked_evidence
+                && continuation.next_anchor >= generation.anchors.len())
         {
             return Err(MemoryError::InvalidMemoryContinuation {
                 detail: "continuation position is outside its pinned partition generation"
@@ -1957,6 +2087,9 @@ fn continuation_authenticator(
     key: &[u8; CONTINUATION_KEY_BYTES],
     router_manifest_id: &RouterManifestId,
     query_fingerprint: &Id,
+    window_start_partition_id: Option<&IndexPartitionId>,
+    window_start_exclusive: bool,
+    ranked_evidence: bool,
     next_partition_id: &IndexPartitionId,
     next_generation_id: &IndexGenerationId,
     resume_after_partition: bool,
@@ -1967,6 +2100,9 @@ fn continuation_authenticator(
         "memory-query-continuation",
         router_manifest_id,
         query_fingerprint,
+        window_start_partition_id,
+        window_start_exclusive,
+        ranked_evidence,
         next_partition_id,
         next_generation_id,
         resume_after_partition,
@@ -2012,6 +2148,43 @@ fn lexical_score(anchor_terms: &[String], query_terms: &[String]) -> i32 {
         .filter(|term| anchor_terms.binary_search(term).is_ok())
         .count()
         .saturating_mul(100) as i32
+}
+
+fn compare_ranked_evidence(
+    left: &RankedEvidenceCandidate,
+    right: &RankedEvidenceCandidate,
+) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.partition_id.cmp(&right.partition_id))
+        .then_with(|| left.generation_id.cmp(&right.generation_id))
+        .then_with(|| left.anchor_index.cmp(&right.anchor_index))
+}
+
+fn compare_ranked_evidence_to_cursor(
+    candidate: &RankedEvidenceCandidate,
+    cursor: &RankedEvidenceCursor,
+) -> Ordering {
+    cursor
+        .score
+        .cmp(&candidate.score)
+        .then_with(|| candidate.partition_id.cmp(&cursor.partition_id))
+        .then_with(|| candidate.generation_id.cmp(&cursor.generation_id))
+        .then_with(|| candidate.anchor_index.cmp(&cursor.anchor_index))
+}
+
+fn retain_ranked_evidence_candidate(
+    candidates: &mut Vec<RankedEvidenceCandidate>,
+    candidate: RankedEvidenceCandidate,
+) {
+    let index = candidates
+        .binary_search_by(|current| compare_ranked_evidence(current, &candidate))
+        .unwrap_or_else(|index| index);
+    candidates.insert(index, candidate);
+    if candidates.len() > MAX_MEMORY_RETRIEVAL_EVIDENCE.saturating_add(1) {
+        candidates.pop();
+    }
 }
 
 fn materialize_text_anchor<'a>(text: &'a str, selector: &MemoryAnchorSelector) -> Option<&'a str> {
