@@ -3,8 +3,8 @@
 //! This module deliberately stops below authentication and physical framing.
 //! A tunnel, local daemon transport, or direct authenticated connection carries
 //! [`ObjectRpcChannelWireFrame`] values and authenticates the physical channel
-//! once. Logical calls then use call ids, whole-body digests, and bounded flow
-//! control without signing every data quantum.
+//! once. Logical calls then use call ids, ordered offsets, declared lengths,
+//! and bounded flow control without signing or hashing data quanta.
 
 use crate::session::{BodyProducer, ObjectRpcChannelBodySender};
 use crate::{
@@ -327,7 +327,6 @@ pub enum ObjectRpcChannelWireFrame {
         call_id: ObjectRpcChannelCallId,
         direction: ObjectRpcChannelBodyDirection,
         total_bytes: u64,
-        digest: [u8; 32],
     },
     Cancel {
         call_id: ObjectRpcChannelCallId,
@@ -1442,10 +1441,9 @@ impl ChannelShared {
                 call_id,
                 direction,
                 total_bytes,
-                digest,
             } => self
                 .body_ingress(call_id, direction)?
-                .accept_end(total_bytes, digest),
+                .accept_end(total_bytes),
             ObjectRpcChannelWireFrame::Cancel { call_id, reason } => {
                 if self.role.owns_call_id(call_id)
                     || !self.try_reset_inbound(call_id, reason, false)
@@ -2295,7 +2293,7 @@ impl SendWindow {
 
 enum BodyIngressEvent {
     Data(Vec<u8>),
-    End { total_bytes: u64, digest: [u8; 32] },
+    End { total_bytes: u64 },
     Cancel,
 }
 
@@ -2350,7 +2348,7 @@ impl BodyIngress {
         Ok(())
     }
 
-    fn accept_end(&self, total_bytes: u64, digest: [u8; 32]) -> Result<(), NetworkError> {
+    fn accept_end(&self, total_bytes: u64) -> Result<(), NetworkError> {
         let mut state = self.state.lock().map_err(|_| channel_lock_error())?;
         if state.ended
             || total_bytes != state.next_offset
@@ -2364,10 +2362,7 @@ impl BodyIngress {
             });
         }
         self.sender
-            .try_send(BodyIngressEvent::End {
-                total_bytes,
-                digest,
-            })
+            .try_send(BodyIngressEvent::End { total_bytes })
             .map_err(|_| channel_resource_error("queue multiplexed body completion", 1))?;
         state.ended = true;
         advance_progress(&self.progress);
@@ -2431,7 +2426,6 @@ async fn run_body_ingress(
     mut body_sender: ObjectRpcChannelBodySender,
     lifetime: Arc<ChannelCallLifetime>,
 ) {
-    let mut hasher = blake3::Hasher::new();
     let mut total_bytes = 0_u64;
     let mut consumer_open = true;
     loop {
@@ -2451,7 +2445,6 @@ async fn run_body_ingress(
         };
         match event {
             BodyIngressEvent::Data(bytes) => {
-                hasher.update(&bytes);
                 total_bytes = total_bytes.saturating_add(bytes.len() as u64);
                 let credit_bytes = bytes.len();
                 if consumer_open {
@@ -2495,15 +2488,14 @@ async fn run_body_ingress(
             }
             BodyIngressEvent::End {
                 total_bytes: declared,
-                digest,
             } => {
-                if declared != total_bytes || digest != *hasher.finalize().as_bytes() {
-                    let reason = "multiplexed object RPC body digest mismatch".to_string();
+                if declared != total_bytes {
+                    let reason = "multiplexed object RPC body length mismatch".to_string();
                     body_sender.fail(reason.clone());
                     fail_incoming_body_call(&shared, call_id, direction, reason, true);
                     return;
                 }
-                if let Err(error) = body_sender.finish_verified(total_bytes, digest).await {
+                if let Err(error) = body_sender.finish(total_bytes).await {
                     fail_incoming_body_call(&shared, call_id, direction, error.to_string(), true);
                     return;
                 }
@@ -2732,7 +2724,6 @@ async fn run_outgoing_body(
     let mut producer: BodyProducer = source.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?;
     drop(source);
     let mut offset = 0_u64;
-    let mut hasher = blake3::Hasher::new();
     let mut last_data_emitted: Option<oneshot::Receiver<()>> = None;
     let mut pending_bytes: Option<Vec<u8>> = None;
     loop {
@@ -2780,7 +2771,6 @@ async fn run_outgoing_body(
                     call_id,
                     direction,
                     total_bytes: offset,
-                    digest: *hasher.finalize().as_bytes(),
                 },
                 lifetime.timeline,
             )?;
@@ -2810,7 +2800,6 @@ async fn run_outgoing_body(
             pending_bytes = Some(bytes.split_off(available));
         }
         window.consume(bytes.len())?;
-        hasher.update(&bytes);
         let next_offset =
             offset
                 .checked_add(bytes.len() as u64)
@@ -3471,7 +3460,6 @@ mod tests {
             call_id,
             direction: ObjectRpcChannelBodyDirection::Request,
             total_bytes: 4128,
-            digest: [9; 32],
         };
         let body_end_frame_id = channel_frame_timeline_id(&body_end);
         let acknowledged = endpoint
@@ -4228,59 +4216,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_body_queue_digest_mismatch_releases_call_and_surfaces_error() {
-        let ObjectRpcChannelEndpoint {
-            client,
-            mut server,
-            ingress,
-            mut egress,
-        } = ObjectRpcChannelEndpoint::new(
-            ObjectRpcChannelRole::Dialer,
-            ObjectRpcChannelConfig::default(),
-        )
-        .expect("endpoint");
-        let call_id = ObjectRpcChannelCallId(2);
-        let payload = b"queued".to_vec();
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Request {
-                call_id,
-                request: request("/channel/full-queue/digest", Vec::new()),
-                body: Some(ObjectRpcChannelBodyDescriptor {
-                    kind: ObjectRpcChannelBodyKind::Attachment,
-                    total_bytes: Some(payload.len() as u64),
-                }),
-            })
-            .expect("request ingress");
-        let _ = egress.next_frame().await.expect("request accepted");
-        let mut incoming = server.accept().await.expect("inbound request");
-        let mut body = std::mem::take(&mut incoming.request.body);
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Data {
-                call_id,
-                direction: ObjectRpcChannelBodyDirection::Request,
-                offset: 0,
-                bytes: payload.clone(),
-            })
-            .expect("request data");
-        let _ = egress.next_frame().await.expect("request window update");
-
-        ingress
-            .receive(ObjectRpcChannelWireFrame::BodyEnd {
-                call_id,
-                direction: ObjectRpcChannelBodyDirection::Request,
-                total_bytes: payload.len() as u64,
-                digest: [0x5a; 32],
-            })
-            .expect("mismatched body end ingress");
-        wait_for_active_calls(&client, 0).await;
-        assert!(matches!(
-            egress.next_frame().await.expect("digest mismatch reset"),
-            ObjectRpcChannelWireFrame::Reset { call_id: reset, .. } if reset == call_id
-        ));
-        assert_body_bytes_then_error(&mut body, &payload, "digest mismatch").await;
-    }
-
-    #[tokio::test]
     async fn response_window_update_queue_failure_aborts_client_call_only() {
         let config = ObjectRpcChannelConfig {
             control_queue_depth: 1,
@@ -4587,7 +4522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_response_discards_and_verifies_unread_request_tail() {
+    async fn early_response_discards_unread_request_tail() {
         let mut endpoints = linked_endpoints(ObjectRpcChannelConfig::default());
         let request_bytes = 3 * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES + 17;
         let pending = endpoints
@@ -4823,7 +4758,6 @@ mod tests {
                 call_id: cancelled_id,
                 direction: ObjectRpcChannelBodyDirection::Response,
                 total_bytes: 0,
-                digest: *blake3::hash(&[]).as_bytes(),
             },
             ObjectRpcChannelWireFrame::Reset {
                 call_id: cancelled_id,

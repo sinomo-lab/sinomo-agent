@@ -32,6 +32,7 @@ mod network_module;
 pub mod network_module_abi;
 mod object;
 mod object_file_store;
+mod path_metrics;
 mod paths;
 mod peer;
 mod roaming;
@@ -197,6 +198,9 @@ pub use object_file_store::remove_optional_file;
 pub use object_file_store::{
     read_object_file, read_optional_object_file, write_object_file,
     write_object_file_with_semantic_skip,
+};
+pub use path_metrics::{
+    NetworkPathEstimate, NetworkPathEstimator, NetworkPathKey, shared_network_path_estimator,
 };
 pub use route::cluster_healthy_route_next_hop;
 pub use route::cluster_route_next_hop;

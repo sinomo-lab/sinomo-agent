@@ -11111,7 +11111,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn daemon_generic_and_dfs_alias_forward_stream_bodies_across_two_authenticated_hops() {
+    async fn daemon_generic_dfs_and_membership_forward_across_two_authenticated_hops() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-session-forward-bodies");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -11179,17 +11179,27 @@ mod tests {
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
 
         // Case zero exercises bodies in both directions. Case one proves that
-        // a head-only request still receives a streamed response.
-        let request_bodies = [vec![0x31_u8; 2 * 1024 * 1024 + 113], Vec::new()];
+        // a head-only DFS request still receives a streamed response. Case two
+        // carries the membership challenge route used when a bridge relays a
+        // downstream join to a state authority.
+        let inner_routes = [
+            "/test/session-forward/0".to_string(),
+            "/dfs/test/session-forward/1".to_string(),
+            sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE.to_string(),
+        ];
+        let request_bodies = [vec![0x31_u8; 2 * 1024 * 1024 + 113], Vec::new(), Vec::new()];
         let response_bodies = [
             vec![0x72_u8; 3 * 1024 * 1024 + 211],
             vec![0x54_u8; 1024 * 1024 + 79],
+            Vec::new(),
         ];
+        let target_routes = inner_routes.clone();
         let target_expected_requests = request_bodies.clone();
         let target_responses = response_bodies.clone();
         let target_server = tokio::spawn(async move {
-            for (index, (expected_request, response_body)) in target_expected_requests
+            for (index, ((expected_route, expected_request), response_body)) in target_routes
                 .into_iter()
+                .zip(target_expected_requests)
                 .zip(target_responses)
                 .enumerate()
             {
@@ -11203,10 +11213,7 @@ mod tests {
                     )
                     .await
                     .expect("target session");
-                assert_eq!(
-                    incoming.request.route,
-                    format!("/dfs/test/session-forward/{index}")
-                );
+                assert_eq!(incoming.request.route, expected_route);
                 let mut actual_request = Vec::new();
                 incoming
                     .body
@@ -11240,6 +11247,7 @@ mod tests {
         let forward_routes = [
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
         ];
         let outer_server = tokio::spawn(async move {
             for forward_route in forward_routes {
@@ -11278,13 +11286,22 @@ mod tests {
         let mut host =
             crate::client::DaemonSignedObjectRpcAsyncHost::new(&runtime, false).with_paths(&paths);
         let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
-        for (index, (request_body, expected_response)) in
-            request_bodies.into_iter().zip(response_bodies).enumerate()
+        for (index, ((request_body, expected_response), inner_route)) in request_bodies
+            .into_iter()
+            .zip(response_bodies)
+            .zip(inner_routes)
+            .enumerate()
         {
             let forward_route = forward_routes[index];
             let inner_request = ObjectRpcRequest::encode_body(
-                format!("/dfs/test/session-forward/{index}"),
-                sinomo_dfs::DFS_RPC_CATEGORY,
+                inner_route,
+                if index == 2 {
+                    sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+                } else if index == 1 {
+                    sinomo_dfs::DFS_RPC_CATEGORY
+                } else {
+                    "test"
+                },
                 &format!("request-{index}"),
             )
             .expect("inner request head");
