@@ -35,6 +35,14 @@ payload size. The network incrementally carries each encoded value over the
 underlying duplex stream; object encoding, framing, flow control, retries, and
 transfer state remain inside the network boundary.
 
+The application-visible semantic model remains a SOBJ request head and SOBJ
+response head, with an optional streaming attachment in either direction.
+Ordinary RPC values are still presented as one SOBJ value even when the network
+temporarily carries a large encoded body out of line and restores it before
+dispatch. Attachments remain explicitly attached to that same call. The private
+carrier distinction between control and Data frames does not add a second RPC
+API, expose frame boundaries, or require callers to choose a transport shape.
+
 Transfer chunk size and receive credit are independent negotiated values. A
 canonical bulk session negotiates 1--4 MiB chunks and starts with 16--64 MiB of
 receive credit. The starting credit is twice the measured bandwidth-delay
@@ -68,6 +76,52 @@ session machinery and are framed incrementally in both directions. Domain
 protocols may attach operation identities or domain-specific content
 identifiers, but do not define transport chunk sizes, per-chunk RPC routes, or
 separate small- and large-message calls.
+
+### Persistent Channel Data Path
+
+The persistent multiplexed channel keeps request and response heads, body
+descriptors, completion, cancellation, and flow-control messages as ordinary
+SOBJ control documents. Only attachment and out-of-line value payload bytes use
+the private fixed Data representation. `SCDF` version 1 places a 32-byte header
+in front of the existing payload allocation. The header contains its magic and
+version, request/response direction, flags, call ID, ordered body offset,
+payload length, and reserved bytes. A carrier validates the complete header,
+including the direction, nonzero call ID, offset range, reserved fields, and
+256 KiB payload bound, before acquiring a receive buffer. Sending uses one
+partial-write-safe vectored loop over the header and payload.
+
+The channel frame quantum and per-call flow window are independent. The
+current starting point is a 256 KiB maximum Data frame and an 8 MiB per-call
+window. A receiver advertises the cumulative received offset after at least
+1 MiB of additional progress or after 2 ms with unreported progress; it does
+not send one credit message per frame. Queue admission can reserve a completed
+batch of up to four frames and 1 MiB with one exact byte-and-frame reservation,
+while the egress scheduler still writes at most one frame from a call lane
+before rotating to another ready lane.
+
+Each physical carrier owns an 8 MiB bounded pool of reusable 256 KiB
+`BytesMut` receive slabs. A received ownership-bearing `Bytes` keeps both its
+slab and the pool permit alive through clones and zero-copy slices, so a slab
+cannot be reused while any downstream consumer still references it. File,
+reader, and other non-contiguous producers also read through bounded reusable
+buffers. Contiguous producers retain their data as `Bytes` and emit slices
+without allocating a `Vec` for each frame.
+
+Applications continue to consume incoming attachments through the public
+asynchronous-reader adapter. A crate-private relay adapter instead moves the
+received `Bytes` directly into the next-hop producer, splitting only with
+zero-copy slices when carrier frame sizes differ. Transport chunk boundaries
+therefore remain private while relays avoid an incoming-read/outgoing-write
+copy cycle.
+
+Local persistent channels negotiate protocol version 4 for the mixed
+SOBJ-control/SCDF-Data dialect. Cluster TCP tunnel version 4 uses the same
+mixed representation. A tunnel peer that rejects version 4 is retried with
+version 3 and then version 1, both of which retain the legacy authenticated
+one-session-per-stream path rather than attempting to interpret cumulative
+channel credit with an older Data dialect. An incompatible local channel
+similarly falls back to the canonical session path. These compatibility
+choices are carrier details and do not change the object-RPC call interface.
 
 Ordered body frames first move through a bounded in-memory reader channel. If
 the application falls behind, the session lazily spills only the remaining

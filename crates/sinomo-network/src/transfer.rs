@@ -7,10 +7,12 @@
 
 use crate::object::{DEFAULT_NETWORK_TIMEOUT, DaemonRpcTimeouts};
 use crate::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase, SinomoObjectCodec};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use sinomo_base::{Id, IdError};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -25,6 +27,94 @@ const TRANSFER_WIRE_MAGIC: [u8; 4] = *b"SXF2";
 const TRANSFER_WIRE_PREFIX_BYTES: usize = 13;
 const TRANSFER_WIRE_CONTROL_KIND: u8 = 1;
 const TRANSFER_WIRE_DATA_KIND: u8 = 2;
+const TRANSFER_BUFFER_POOL_MAX_CACHED_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct TransferBufferPoolState {
+    buffers: Vec<BytesMut>,
+    cached_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TransferBufferPool {
+    state: Mutex<TransferBufferPoolState>,
+}
+
+impl TransferBufferPool {
+    pub(crate) fn acquire(&self, len: usize) -> BytesMut {
+        let buffer = self.state.lock().ok().and_then(|mut state| {
+            let index = state
+                .buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| buffer.capacity() >= len)
+                .min_by_key(|(_, buffer)| buffer.capacity())
+                .map(|(index, _)| index)
+                .or_else(|| (!state.buffers.is_empty()).then(|| state.buffers.len() - 1))?;
+            let buffer = state.buffers.swap_remove(index);
+            state.cached_bytes = state.cached_bytes.saturating_sub(buffer.capacity());
+            Some(buffer)
+        });
+        let mut buffer = buffer.unwrap_or_default();
+        buffer.clear();
+        if buffer.capacity() < len {
+            buffer.reserve(len);
+        }
+        buffer.resize(len, 0);
+        buffer
+    }
+
+    pub(crate) fn into_bytes(self: &Arc<Self>, buffer: BytesMut) -> Bytes {
+        Bytes::from_owner(PooledTransferBytes {
+            buffer: Some(buffer),
+            pool: Arc::clone(self),
+        })
+    }
+
+    fn release(&self, mut buffer: BytesMut) {
+        buffer.clear();
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > MAX_TRANSFER_FRAME_BYTES as usize {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(cached_bytes) = state.cached_bytes.checked_add(capacity) else {
+            return;
+        };
+        if cached_bytes > TRANSFER_BUFFER_POOL_MAX_CACHED_BYTES {
+            return;
+        }
+        state.cached_bytes = cached_bytes;
+        state.buffers.push(buffer);
+    }
+}
+
+#[derive(Debug)]
+struct PooledTransferBytes {
+    buffer: Option<BytesMut>,
+    pool: Arc<TransferBufferPool>,
+}
+
+impl AsRef<[u8]> for PooledTransferBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_deref().unwrap_or_default()
+    }
+}
+
+impl Drop for PooledTransferBytes {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.release(buffer);
+        }
+    }
+}
+
+pub(crate) fn shared_transfer_buffer_pool() -> Arc<TransferBufferPool> {
+    static POOL: OnceLock<Arc<TransferBufferPool>> = OnceLock::new();
+    Arc::clone(POOL.get_or_init(|| Arc::new(TransferBufferPool::default())))
+}
 
 /// Health limits for one network path. These limits restart after validated
 /// progress and never act as an implicit whole-call deadline.
@@ -379,11 +469,11 @@ where
     }
 }
 
-pub(crate) async fn read_transfer_data_payload_to_vec<R>(
+pub(crate) async fn read_transfer_data_payload<R>(
     reader: &mut R,
     header: &TransferDataHeader,
     health: NetworkHealthPolicy,
-) -> Result<Vec<u8>, NetworkError>
+) -> Result<Bytes, NetworkError>
 where
     R: AsyncRead + Unpin,
 {
@@ -394,16 +484,15 @@ where
         });
     }
     let len = header.payload_bytes as usize;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(len)
-        .map_err(|_| NetworkError::ResourceExhausted {
-            operation: "allocate transfer data payload".to_string(),
-            requested_bytes: len,
-        })?;
-    payload.resize(len, 0);
-    transfer_read_exact(reader, &mut payload, health, "read transfer data payload").await?;
-    Ok(payload)
+    let pool = shared_transfer_buffer_pool();
+    let mut payload = pool.acquire(len);
+    if let Err(error) =
+        transfer_read_exact(reader, &mut payload, health, "read transfer data payload").await
+    {
+        drop(pool.into_bytes(payload));
+        return Err(error);
+    }
+    Ok(pool.into_bytes(payload))
 }
 
 async fn write_transfer_header<W>(
@@ -1065,6 +1154,40 @@ mod tests {
                 u64::from(u32::MAX) + 1
             );
         }
+    }
+
+    #[test]
+    fn transfer_buffer_pool_reuses_only_released_bytes_and_stays_bounded() {
+        let pool = Arc::new(TransferBufferPool::default());
+        let first = pool.acquire(4096);
+        let first_pointer = first.as_ptr();
+        let first = pool.into_bytes(first);
+        let retained_slice = first.slice(1..);
+        drop(first);
+
+        let second = pool.acquire(4096);
+        assert_ne!(
+            second.as_ptr(),
+            first_pointer,
+            "a Bytes slice must retain ownership of its backing buffer"
+        );
+        drop(retained_slice);
+
+        let reused = pool.acquire(4096);
+        assert_eq!(reused.as_ptr(), first_pointer);
+        drop(second);
+        drop(reused);
+
+        let oversized = pool.acquire(MAX_TRANSFER_FRAME_BYTES as usize + 1);
+        drop(pool.into_bytes(oversized));
+        let state = pool.state.lock().expect("buffer pool state");
+        assert!(state.cached_bytes <= TRANSFER_BUFFER_POOL_MAX_CACHED_BYTES);
+        assert!(
+            state
+                .buffers
+                .iter()
+                .all(|buffer| buffer.capacity() <= MAX_TRANSFER_FRAME_BYTES as usize)
+        );
     }
 
     #[tokio::test]

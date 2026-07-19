@@ -20,6 +20,7 @@ default = []
 arc-swap.workspace = true
 base64.workspace = true
 blake3.workspace = true
+bytes.workspace = true
 fs2.workspace = true
 ring = "0.17.14"
 serde.workspace = true

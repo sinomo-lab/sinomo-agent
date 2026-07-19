@@ -12,8 +12,11 @@ use sinomo_local::SinomoDataDir;
 pub const CLUSTER_TCP_TUNNEL_OPEN_ROUTE: &str = "/cluster/tcp-tunnel/open";
 pub const CLUSTER_TCP_TUNNEL_RPC_CATEGORY: &str = "cluster.tcp-tunnel";
 pub const CLUSTER_TCP_TUNNEL_MIN_PROTOCOL_VERSION: u16 = 1;
-pub const CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION: u16 = 3;
-pub const CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 3;
+pub const CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION: u16 = 4;
+pub const CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 4;
+/// First tunnel protocol that carries channel Data as a fixed SCDF header and
+/// raw payload instead of nesting it in the SOBJ tunnel envelope.
+pub const CLUSTER_TCP_TUNNEL_FIXED_CHANNEL_DATA_PROTOCOL_VERSION: u16 = 4;
 pub const CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
 pub const CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL: &str = "sinomo.cluster-tcp-tunnel-handshake.v3";
 const CLUSTER_TCP_TUNNEL_HANDSHAKE_PROOF_ROUTE: &str = "/cluster/tcp-tunnel/handshake-proof";
@@ -24,7 +27,7 @@ pub struct ClusterTcpTunnelOpenRequest {
     pub protocol_version: u16,
 }
 
-/// The one-time connection transcript authenticated before a v3 tunnel can
+/// The one-time connection transcript authenticated before a v4 tunnel can
 /// expose its unsigned object-RPC channel. The dialer's already-signed open
 /// nonce is the challenge, so replaying a prior response cannot authenticate a
 /// new physical connection.
@@ -122,7 +125,7 @@ pub fn sign_cluster_tcp_tunnel_handshake_from_data_dir(
 }
 
 /// Verifies both the exact dialer challenge transcript and the endpoint's
-/// authorized node identity before a v3 no-per-packet-auth channel is exposed.
+/// authorized node identity before a v4 no-per-packet-auth channel is exposed.
 pub fn verify_cluster_tcp_tunnel_handshake(
     proof: &ClusterTcpTunnelHandshakeProof,
     expected_transcript: &ClusterTcpTunnelHandshakeTranscript,
@@ -174,6 +177,13 @@ pub const fn cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
     protocol_version: u16,
 ) -> bool {
     protocol_version >= CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION
+        && protocol_version <= CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION
+}
+
+pub const fn cluster_tcp_tunnel_protocol_supports_fixed_channel_data(
+    protocol_version: u16,
+) -> bool {
+    protocol_version >= CLUSTER_TCP_TUNNEL_FIXED_CHANNEL_DATA_PROTOCOL_VERSION
         && protocol_version <= CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION
 }
 
@@ -267,18 +277,23 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_protocol_negotiates_v1_fallback_and_v3_channel() {
+    fn tunnel_protocol_negotiates_v3_stream_fallback_and_v4_fixed_data_channel() {
         assert_eq!(negotiate_cluster_tcp_tunnel_protocol(0), None);
         assert_eq!(negotiate_cluster_tcp_tunnel_protocol(1), Some(1));
         assert_eq!(negotiate_cluster_tcp_tunnel_protocol(2), Some(2));
         assert_eq!(negotiate_cluster_tcp_tunnel_protocol(3), Some(3));
+        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(4), Some(4));
+        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(5), Some(4));
         assert!(!cluster_tcp_tunnel_protocol_supports_object_rpc_channel(1));
         assert!(!cluster_tcp_tunnel_protocol_supports_object_rpc_channel(2));
-        assert!(cluster_tcp_tunnel_protocol_supports_object_rpc_channel(3));
+        assert!(!cluster_tcp_tunnel_protocol_supports_object_rpc_channel(3));
+        assert!(cluster_tcp_tunnel_protocol_supports_object_rpc_channel(4));
+        assert!(!cluster_tcp_tunnel_protocol_supports_fixed_channel_data(3));
+        assert!(cluster_tcp_tunnel_protocol_supports_fixed_channel_data(4));
     }
 
     #[test]
-    fn tunnel_frame_round_trips_legacy_stream_and_v3_channel_variants() {
+    fn tunnel_frame_round_trips_stream_and_legacy_sobj_channel_variants() {
         let codec = SinomoObjectCodec::network_frame();
         let frames = [
             ClusterTcpTunnelFrame::StreamOpen { id: 7 },

@@ -1,18 +1,20 @@
 //! Physical TCP carrier for a local multiplexed object-RPC channel.
 //!
 //! The fixed handshake only selects this protocol on the daemon control
-//! listener. Every logical channel frame after negotiation uses the ordinary
-//! Sinomo object-frame codec.
+//! listener. Control frames use the ordinary Sinomo object-frame codec; Data
+//! frames use the fixed private SCDF header and an ownership-bearing payload.
 
+use crate::channel_wire::{
+    ObjectRpcChannelReceiveBufferPool, ObjectRpcChannelTransportFrame,
+    read_object_rpc_channel_transport_frame_async, write_object_rpc_channel_transport_frame_async,
+    write_object_rpc_channel_transport_frame_async_timed,
+};
 use crate::daemon_auth::{LocalChannelAuthIdentity, LocalChannelProofRole};
 use crate::{
-    AsyncDaemonControlStream, DEFAULT_NETWORK_TIMEOUT, DaemonRpcTimeouts,
-    MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, NetworkDeliveryState, NetworkError,
-    NetworkTimeoutPhase, ObjectFrameIoOptions, ObjectFrameReadinessProbe, ObjectRpcChannelClient,
+    AsyncDaemonControlStream, DEFAULT_NETWORK_TIMEOUT, DaemonRpcTimeouts, NetworkDeliveryState,
+    NetworkError, NetworkTimeoutPhase, ObjectFrameIoOptions, ObjectRpcChannelClient,
     ObjectRpcChannelConfig, ObjectRpcChannelEndpoint, ObjectRpcChannelIngress,
-    ObjectRpcChannelRole, ObjectRpcChannelServer, ObjectRpcChannelWireFrame, network_timeline_flag,
-    read_object_frame_async_with_max_bytes_after_first_byte_timed, write_object_frame_async,
-    write_object_frame_async_timed,
+    ObjectRpcChannelRole, ObjectRpcChannelServer, network_timeline_flag,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use sinomo_local::SinomoDataDir;
@@ -21,12 +23,12 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current loopback object-RPC channel handshake version.
-pub const LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 3;
+pub const LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 4;
 
-const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_MAGIC: [u8; 4] = *b"SXC3";
-const LOCAL_OBJECT_RPC_CHANNEL_SERVER_MAGIC: [u8; 4] = *b"SXS3";
-const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_PROOF_MAGIC: [u8; 4] = *b"SXP3";
-const LOCAL_OBJECT_RPC_CHANNEL_SERVER_ACK_MAGIC: [u8; 4] = *b"SXA3";
+const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_MAGIC: [u8; 4] = *b"SXC4";
+const LOCAL_OBJECT_RPC_CHANNEL_SERVER_MAGIC: [u8; 4] = *b"SXS4";
+const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_PROOF_MAGIC: [u8; 4] = *b"SXP4";
+const LOCAL_OBJECT_RPC_CHANNEL_SERVER_ACK_MAGIC: [u8; 4] = *b"SXA4";
 const LOCAL_OBJECT_RPC_CHANNEL_NEGOTIATION_BYTES: usize = 8;
 // Retained as an internal alias while raw old-daemon compatibility tests
 // construct only the fixed negotiation prefix.
@@ -114,7 +116,7 @@ pub struct AcceptedLocalObjectRpcChannel {
 
 /// Negotiates one persistent object-RPC channel to a local daemon.
 ///
-/// `Ok(None)` means that the peer returned a valid `SXS3` protocol rejection.
+/// `Ok(None)` means that the peer returned a valid `SXS4` protocol rejection.
 /// TCP, timeout, EOF, and malformed-handshake failures remain errors so callers
 /// can fall back for the current call without negative-caching a transient
 /// failure as protocol incompatibility.
@@ -560,36 +562,42 @@ where
         let _close_on_drop = close_on_drop;
         let read_ingress = ingress.clone();
         let read = async move {
-            let readiness_probe = ObjectFrameReadinessProbe::new();
+            let receive_pool = ObjectRpcChannelReceiveBufferPool::default_for_carrier();
             loop {
-                let (frame, timing): (ObjectRpcChannelWireFrame, _) =
-                    read_object_frame_async_with_max_bytes_after_first_byte_timed(
-                        &mut reader,
-                        ObjectFrameIoOptions::idle_timeout(no_progress_timeout),
-                        MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
-                        &readiness_probe,
-                    )
-                    .await?;
-                read_ingress.record_frame_read_timeline(
-                    &frame,
-                    timing,
-                    network_timeline_flag::LOCAL_CARRIER,
-                );
+                let frame = read_object_rpc_channel_transport_frame_async(
+                    &mut reader,
+                    ObjectFrameIoOptions::idle_timeout(no_progress_timeout),
+                    &receive_pool,
+                    |header| read_ingress.validate_data_header(header),
+                )
+                .await?;
                 // This synchronous ingress boundary is load-bearing: a stalled
                 // application call must never park the physical socket reader.
-                read_ingress.receive(frame)?;
+                match frame {
+                    ObjectRpcChannelTransportFrame::Control(frame) => {
+                        read_ingress.record_frame_read_timeline(
+                            &frame,
+                            None,
+                            network_timeline_flag::LOCAL_CARRIER,
+                        );
+                        read_ingress.receive_control(frame)?;
+                    }
+                    ObjectRpcChannelTransportFrame::Data(frame) => {
+                        read_ingress.receive_data(frame)?;
+                    }
+                }
             }
             #[allow(unreachable_code)]
             Ok::<(), NetworkError>(())
         };
         let write = async move {
-            while let Some(frame) = egress.next_frame_for_transport().await {
+            while let Some(frame) = egress.next_transport_frame().await {
                 let mut timeline = egress.pending_write_timeline();
                 if let Some(timeline) = timeline.as_mut() {
                     timeline.flags |= network_timeline_flag::LOCAL_CARRIER;
                 }
                 let (result, timing) = if timeline.is_some() {
-                    write_object_frame_async_timed(
+                    write_object_rpc_channel_transport_frame_async_timed(
                         &mut writer,
                         &frame,
                         ObjectFrameIoOptions::idle_timeout(no_progress_timeout),
@@ -597,7 +605,7 @@ where
                     .await
                 } else {
                     (
-                        write_object_frame_async(
+                        write_object_rpc_channel_transport_frame_async(
                             &mut writer,
                             &frame,
                             ObjectFrameIoOptions::idle_timeout(no_progress_timeout),
@@ -633,7 +641,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResponse};
+    use crate::{
+        MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, ObjectRpcBodySource, ObjectRpcRequest,
+        ObjectRpcSessionCall, ObjectRpcSessionResponse,
+    };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn test_data_dir(label: &str) -> (sinomo_testdir::TestDir, SinomoDataDir) {
@@ -880,6 +891,86 @@ mod tests {
             result.response.decode_body::<String>().expect("response"),
             "pong"
         );
+        left_transport.close("test complete");
+        right_transport.close("test complete");
+    }
+
+    #[tokio::test]
+    async fn local_carrier_streams_raw_scdf_data_in_both_directions() {
+        let left = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("dialer");
+        let right = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("acceptor");
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _,
+            ingress: left_ingress,
+            egress: left_egress,
+        } = left;
+        let ObjectRpcChannelEndpoint {
+            client: _,
+            mut server,
+            ingress: right_ingress,
+            egress: right_egress,
+        } = right;
+        let (left_wire, right_wire) = tokio::io::duplex(64 * 1024);
+        let (left_reader, left_writer) = tokio::io::split(left_wire);
+        let (right_reader, right_writer) = tokio::io::split(right_wire);
+        let left_transport = start_carrier_halves(
+            left_reader,
+            left_writer,
+            left_ingress,
+            left_egress,
+            Duration::from_secs(1),
+        );
+        let right_transport = start_carrier_halves(
+            right_reader,
+            right_writer,
+            right_ingress,
+            right_egress,
+            Duration::from_secs(1),
+        );
+
+        let request_bytes = vec![0x35; 1024 * 1024 + 17];
+        let response_bytes = vec![0xa7; 1024 * 1024 + 31];
+        let pending = client
+            .call(ObjectRpcSessionCall::new(
+                ObjectRpcRequest::from_encoded_body("/test/scdf", "test", Vec::new()),
+                ObjectRpcBodySource::bytes(request_bytes.clone()),
+            ))
+            .await
+            .expect("call");
+        let mut incoming = server.accept().await.expect("incoming request");
+        let mut received_request = Vec::new();
+        incoming
+            .request
+            .body
+            .read_to_end(&mut received_request)
+            .await
+            .expect("request body");
+        assert_eq!(received_request, request_bytes);
+        incoming
+            .respond(ObjectRpcSessionResponse::new(
+                crate::ObjectRpcResponse::from_encoded_body("/test/scdf", Vec::new()),
+                ObjectRpcBodySource::bytes(response_bytes.clone()),
+            ))
+            .await
+            .expect("respond");
+        let mut result = pending.result().await.expect("result");
+        let mut received_response = Vec::new();
+        result
+            .body
+            .read_to_end(&mut received_response)
+            .await
+            .expect("response body");
+        assert_eq!(received_response, response_bytes);
+
         left_transport.close("test complete");
         right_transport.close("test complete");
     }

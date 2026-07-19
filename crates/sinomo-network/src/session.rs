@@ -18,11 +18,12 @@ use crate::transfer::{
     MIN_TRANSFER_FRAME_BYTES, MIN_TRANSFER_WINDOW_BYTES, TransferAck, TransferControl,
     TransferDataFrame, TransferDataHeader, TransferEncodedWireFrameHeader, TransferFlowWindow,
     TransferId, TransferOpen, TransferReceiverState, TransferSenderState,
-    read_transfer_data_payload_to_vec, read_transfer_encoded_frame_header,
+    read_transfer_data_payload, read_transfer_encoded_frame_header, shared_transfer_buffer_pool,
     write_transfer_data_frame, write_transfer_encoded_control_frame,
 };
 use crate::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use sinomo_local::SinomoDataDir;
 use std::any::Any;
@@ -271,7 +272,7 @@ enum SessionInboundFrame {
     Payload(SessionWirePayload),
     Data {
         header: TransferDataHeader,
-        payload: Vec<u8>,
+        payload: Bytes,
     },
 }
 
@@ -542,7 +543,7 @@ enum SessionWriteCommand {
     },
     Data {
         header: TransferDataHeader,
-        payload: Vec<u8>,
+        payload: Bytes,
         completion: tokio::sync::oneshot::Sender<Result<(), NetworkError>>,
     },
 }
@@ -612,13 +613,12 @@ impl SessionWriterHandle {
 
                 match work {
                     SessionWriterWork::Acknowledgement(acknowledgement) => {
-                        if writer
+                        let result = writer
                             .send(SessionWirePayload::Transfer(TransferControl::Ack(
                                 acknowledgement,
                             )))
-                            .await
-                            .is_err()
-                        {
+                            .await;
+                        if result.is_err() {
                             break;
                         }
                     }
@@ -635,13 +635,12 @@ impl SessionWriterHandle {
                                 .borrow_and_update()
                                 .clone()
                                 .expect("acknowledgement updates are never empty");
-                            if writer
+                            let result = writer
                                 .send(SessionWirePayload::Transfer(TransferControl::Ack(
                                     acknowledgement,
                                 )))
-                                .await
-                                .is_err()
-                            {
+                                .await;
+                            if result.is_err() {
                                 break;
                             }
                         }
@@ -716,7 +715,7 @@ impl SessionWriterHandle {
     async fn send_data(
         &self,
         header: TransferDataHeader,
-        payload: Vec<u8>,
+        payload: Bytes,
     ) -> Result<(), NetworkError> {
         let (completion, result) = tokio::sync::oneshot::channel();
         self.commands
@@ -844,7 +843,7 @@ where
             .deadline
             .run(
                 "read object RPC session data payload",
-                read_transfer_data_payload_to_vec(&mut self.reader, &header, self.policy.health),
+                read_transfer_data_payload(&mut self.reader, &header, self.policy.health),
             )
             .await?;
         Ok(SessionInboundFrame::Data { header, payload })
@@ -945,7 +944,8 @@ impl SessionTransferStagingFile {
         })?
     }
 
-    async fn append(&mut self, bytes: Vec<u8>) -> Result<(), NetworkError> {
+    async fn append(&mut self, bytes: impl Into<Bytes>) -> Result<(), NetworkError> {
+        let bytes = bytes.into();
         let mut file = self.file.take().ok_or_else(|| NetworkError::Io {
             operation: "append session transfer staging file".to_string(),
             detail: "staging file is closed".to_string(),
@@ -2179,7 +2179,7 @@ where
 
 #[derive(Clone, Debug)]
 struct ReplayableBytes {
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
 }
 
 #[derive(Clone, Debug)]
@@ -2195,6 +2195,12 @@ struct OnePassReader {
 
 struct OnePassAsyncReader {
     reader: Option<Pin<Box<dyn AsyncRead + Send>>>,
+    total_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+struct OnePassIncomingChunkStream {
+    stream: Option<ObjectRpcIncomingBodyChunkStream>,
     total_bytes: Option<u64>,
 }
 
@@ -2225,6 +2231,7 @@ enum ObjectRpcBodySourceKind {
     File(ReplayableFile),
     Reader(Mutex<OnePassReader>),
     AsyncReader(Mutex<OnePassAsyncReader>),
+    IncomingChunkStream(Mutex<OnePassIncomingChunkStream>),
 }
 
 /// A whole RPC attachment source.
@@ -2286,7 +2293,7 @@ impl ObjectRpcBodySource {
         }
         Self {
             kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
-                bytes: Arc::from(bytes),
+                bytes: Bytes::from(bytes),
             }),
             role: ObjectRpcSessionBodyRole::Attachment,
             materialized_value_forward: false,
@@ -2385,6 +2392,29 @@ impl ObjectRpcBodySource {
         }
     }
 
+    /// Opens the private ownership-moving adapter used by relay forwarding.
+    ///
+    /// Unlike [`Self::from_incoming_body`], this path does not expose the
+    /// incoming body through `AsyncRead`: received `Bytes` chunks move into the
+    /// outgoing producer and are only split into zero-copy slices when the two
+    /// carrier frame sizes differ.
+    pub(crate) fn from_incoming_chunk_stream(body: ObjectRpcIncomingBody) -> Self {
+        let total_bytes = body.total_bytes();
+        let role = body.role;
+        let materialized_value_forward = body.is_materialized_value_forward();
+        Self {
+            kind: ObjectRpcBodySourceKind::IncomingChunkStream(Mutex::new(
+                OnePassIncomingChunkStream {
+                    stream: Some(body.into_chunk_stream()),
+                    total_bytes,
+                },
+            )),
+            role,
+            materialized_value_forward,
+            lifetime_guards: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     fn role(&self) -> ObjectRpcSessionBodyRole {
         if self.is_empty() {
             ObjectRpcSessionBodyRole::None
@@ -2420,6 +2450,8 @@ impl ObjectRpcBodySource {
                 if source.lock().ok().and_then(|source| source.total_bytes) == Some(0))
             || matches!(&self.kind, ObjectRpcBodySourceKind::AsyncReader(source)
                 if source.lock().ok().and_then(|source| source.total_bytes) == Some(0))
+            || matches!(&self.kind, ObjectRpcBodySourceKind::IncomingChunkStream(source)
+                if source.lock().ok().and_then(|source| source.total_bytes) == Some(0))
     }
 
     pub fn total_bytes(&self) -> Option<u64> {
@@ -2431,6 +2463,9 @@ impl ObjectRpcBodySource {
                 source.lock().ok().and_then(|source| source.total_bytes)
             }
             ObjectRpcBodySourceKind::AsyncReader(source) => {
+                source.lock().ok().and_then(|source| source.total_bytes)
+            }
+            ObjectRpcBodySourceKind::IncomingChunkStream(source) => {
                 source.lock().ok().and_then(|source| source.total_bytes)
             }
         }
@@ -2463,7 +2498,9 @@ impl ObjectRpcBodySource {
     pub(crate) fn is_replayable(&self) -> bool {
         !matches!(
             self.kind,
-            ObjectRpcBodySourceKind::Reader(_) | ObjectRpcBodySourceKind::AsyncReader(_)
+            ObjectRpcBodySourceKind::Reader(_)
+                | ObjectRpcBodySourceKind::AsyncReader(_)
+                | ObjectRpcBodySourceKind::IncomingChunkStream(_)
         )
     }
 
@@ -2471,7 +2508,7 @@ impl ObjectRpcBodySource {
         match &self.kind {
             ObjectRpcBodySourceKind::Empty => Ok(Box::new(std::io::empty())),
             ObjectRpcBodySourceKind::Bytes(source) => {
-                Ok(Box::new(ArcSliceReader::new(Arc::clone(&source.bytes))))
+                Ok(Box::new(BytesReader::new(source.bytes.clone())))
             }
             ObjectRpcBodySourceKind::File(source) => {
                 let file = File::open(&source.path).map_err(|error| NetworkError::Io {
@@ -2492,12 +2529,27 @@ impl ObjectRpcBodySource {
             ObjectRpcBodySourceKind::AsyncReader(_) => Err(body_replay_error(
                 "asynchronous reader requires the async producer path",
             )),
+            ObjectRpcBodySourceKind::IncomingChunkStream(_) => Err(body_replay_error(
+                "incoming chunk stream requires the ownership-moving producer path",
+            )),
         }
     }
 
     /// Materializes this source under an explicit caller-owned resource bound.
     /// This does not change the network protocol or select a transfer path.
     pub async fn collect_to_vec(self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
+        if let ObjectRpcBodySourceKind::IncomingChunkStream(source) = &self.kind {
+            let mut stream = source
+                .lock()
+                .map_err(|_| NetworkError::Io {
+                    operation: "open incoming object RPC chunk stream".to_string(),
+                    detail: "incoming chunk stream lock poisoned".to_string(),
+                })?
+                .stream
+                .take()
+                .ok_or_else(|| body_replay_error("incoming chunk stream was already consumed"))?;
+            return collect_incoming_chunks_bounded(&mut stream, max_bytes).await;
+        }
         if let ObjectRpcBodySourceKind::AsyncReader(source) = &self.kind {
             let mut reader = source
                 .lock()
@@ -2524,7 +2576,7 @@ impl ObjectRpcBodySource {
     pub(crate) fn producer(&self, max_chunk_bytes: usize) -> Result<BodyProducer, NetworkError> {
         if matches!(self.kind, ObjectRpcBodySourceKind::Empty) {
             return Ok(BodyProducer::Bytes(BytesBodyProducer {
-                bytes: Arc::from(Vec::<u8>::new()),
+                bytes: Bytes::new(),
                 offset: 0,
                 chunk_bytes: max_chunk_bytes.max(1),
                 _lifetime_guards: Arc::clone(&self.lifetime_guards),
@@ -2532,7 +2584,7 @@ impl ObjectRpcBodySource {
         }
         if let ObjectRpcBodySourceKind::Bytes(source) = &self.kind {
             return Ok(BodyProducer::Bytes(BytesBodyProducer {
-                bytes: Arc::clone(&source.bytes),
+                bytes: source.bytes.clone(),
                 offset: 0,
                 chunk_bytes: max_chunk_bytes.max(1),
                 _lifetime_guards: Arc::clone(&self.lifetime_guards),
@@ -2554,6 +2606,22 @@ impl ObjectRpcBodySource {
                 _lifetime_guards: Arc::clone(&self.lifetime_guards),
             }));
         }
+        if let ObjectRpcBodySourceKind::IncomingChunkStream(source) = &self.kind {
+            let stream = source
+                .lock()
+                .map_err(|_| NetworkError::Io {
+                    operation: "open incoming object RPC chunk stream".to_string(),
+                    detail: "incoming chunk stream lock poisoned".to_string(),
+                })?
+                .stream
+                .take()
+                .ok_or_else(|| body_replay_error("incoming chunk stream was already consumed"))?;
+            return Ok(BodyProducer::Incoming(IncomingBodyProducer {
+                stream,
+                chunk_bytes: max_chunk_bytes.max(1),
+                _lifetime_guards: Arc::clone(&self.lifetime_guards),
+            }));
+        }
         let reader = self.open()?;
         SyncBodyProducer::spawn(reader, max_chunk_bytes, Arc::clone(&self.lifetime_guards))
             .map(BodyProducer::Sync)
@@ -2566,7 +2634,9 @@ impl ObjectRpcBodySource {
                 ObjectRpcBodySourceKind::Bytes(source.clone())
             }
             ObjectRpcBodySourceKind::File(source) => ObjectRpcBodySourceKind::File(source.clone()),
-            ObjectRpcBodySourceKind::Reader(_) | ObjectRpcBodySourceKind::AsyncReader(_) => {
+            ObjectRpcBodySourceKind::Reader(_)
+            | ObjectRpcBodySourceKind::AsyncReader(_)
+            | ObjectRpcBodySourceKind::IncomingChunkStream(_) => {
                 return None;
             }
         };
@@ -2588,18 +2658,18 @@ fn body_replay_error(detail: &str) -> NetworkError {
 }
 
 #[derive(Debug)]
-struct ArcSliceReader {
-    bytes: Arc<[u8]>,
+struct BytesReader {
+    bytes: Bytes,
     offset: usize,
 }
 
-impl ArcSliceReader {
-    fn new(bytes: Arc<[u8]>) -> Self {
+impl BytesReader {
+    fn new(bytes: Bytes) -> Self {
         Self { bytes, offset: 0 }
     }
 }
 
-impl Read for ArcSliceReader {
+impl Read for BytesReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         let remaining = &self.bytes[self.offset..];
         let read = remaining.len().min(output.len());
@@ -2611,7 +2681,7 @@ impl Read for ArcSliceReader {
 
 #[derive(Debug)]
 enum IncomingBodyItem {
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
     Error(std::io::Error),
 }
 
@@ -2632,7 +2702,7 @@ pub(crate) struct ObjectRpcChannelBodySender {
 }
 
 impl ObjectRpcChannelBodySender {
-    pub(crate) async fn send(&self, bytes: Vec<u8>) -> Result<(), NetworkError> {
+    pub(crate) async fn send(&self, bytes: impl Into<Bytes>) -> Result<(), NetworkError> {
         let Some(sender) = self.sender.as_ref() else {
             return Err(NetworkError::Io {
                 operation: "deliver multiplexed object RPC body".to_string(),
@@ -2640,7 +2710,7 @@ impl ObjectRpcChannelBodySender {
             });
         };
         sender
-            .send(IncomingBodyItem::Bytes(bytes))
+            .send(IncomingBodyItem::Bytes(bytes.into()))
             .await
             .map_err(|_| NetworkError::Io {
                 operation: "deliver multiplexed object RPC body".to_string(),
@@ -2686,10 +2756,10 @@ impl ObjectRpcChannelBodySender {
 #[derive(Debug)]
 enum ObjectRpcIncomingBodyInner {
     Empty,
-    Bytes(std::io::Cursor<Vec<u8>>),
+    Bytes(std::io::Cursor<Bytes>),
     Channel {
         receiver: tokio::sync::mpsc::Receiver<IncomingBodyItem>,
-        current: Option<std::io::Cursor<Vec<u8>>>,
+        current: Option<std::io::Cursor<Bytes>>,
     },
 }
 
@@ -2701,6 +2771,8 @@ enum ObjectRpcIncomingBodyInner {
 #[derive(Debug)]
 pub struct ObjectRpcIncomingBody {
     inner: ObjectRpcIncomingBodyInner,
+    // Natural EOF clears these handles, detaching still-needed session work;
+    // an early application drop leaves them here so Drop cancels the session.
     completion_tasks: Vec<tokio::task::JoinHandle<()>>,
     total_bytes: Option<u64>,
     role: ObjectRpcSessionBodyRole,
@@ -2730,7 +2802,7 @@ impl ObjectRpcIncomingBody {
         }
         let total_bytes = u64::try_from(bytes.len()).ok();
         Self {
-            inner: ObjectRpcIncomingBodyInner::Bytes(std::io::Cursor::new(bytes)),
+            inner: ObjectRpcIncomingBodyInner::Bytes(std::io::Cursor::new(Bytes::from(bytes))),
             completion_tasks: Vec::new(),
             total_bytes,
             role: ObjectRpcSessionBodyRole::Attachment,
@@ -2948,6 +3020,158 @@ impl ObjectRpcIncomingBody {
         let value = self.collect_value_to_vec(operation).await?;
         Ok((value, Self::materialized_value_forward(total_bytes)))
     }
+
+    /// Consumes the application adapter and exposes the received transport
+    /// chunks to crate-internal relays without copying them through
+    /// `AsyncRead` buffers.
+    pub(crate) fn into_chunk_stream(self) -> ObjectRpcIncomingBodyChunkStream {
+        ObjectRpcIncomingBodyChunkStream { body: self }
+    }
+}
+
+/// Crate-private ownership-moving view of an incoming body.
+///
+/// This deliberately does not implement a public stream trait: transport
+/// chunk boundaries stay private, while relay producers can forward the
+/// underlying `Bytes` allocation directly.
+#[derive(Debug)]
+pub(crate) struct ObjectRpcIncomingBodyChunkStream {
+    body: ObjectRpcIncomingBody,
+}
+
+impl ObjectRpcIncomingBodyChunkStream {
+    async fn next_chunk(&mut self, max_chunk_bytes: usize) -> std::io::Result<Option<Bytes>> {
+        let max_chunk_bytes = max_chunk_bytes.max(1);
+        loop {
+            match &mut self.body.inner {
+                ObjectRpcIncomingBodyInner::Empty => {
+                    self.body.completion_tasks.clear();
+                    return Ok(None);
+                }
+                ObjectRpcIncomingBodyInner::Bytes(bytes) => {
+                    let chunk = take_owned_cursor_chunk(bytes, max_chunk_bytes);
+                    if chunk.is_none() {
+                        self.body.completion_tasks.clear();
+                    }
+                    return Ok(chunk);
+                }
+                ObjectRpcIncomingBodyInner::Channel { receiver, current } => {
+                    if let Some(bytes) = take_owned_current_chunk(current, max_chunk_bytes) {
+                        return Ok(Some(bytes));
+                    }
+                    match receiver.recv().await {
+                        Some(IncomingBodyItem::Bytes(bytes)) if bytes.is_empty() => continue,
+                        Some(IncomingBodyItem::Bytes(bytes)) if bytes.len() <= max_chunk_bytes => {
+                            return Ok(Some(bytes));
+                        }
+                        Some(IncomingBodyItem::Bytes(bytes)) => {
+                            *current = Some(std::io::Cursor::new(bytes));
+                        }
+                        Some(IncomingBodyItem::Error(error)) => return Err(error),
+                        None => {
+                            validate_multiplexed_body_eof(self.body.multiplexed_terminal.as_ref())?;
+                            self.body.completion_tasks.clear();
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn take_owned_current_chunk(
+    current: &mut Option<std::io::Cursor<Bytes>>,
+    max_chunk_bytes: usize,
+) -> Option<Bytes> {
+    let mut cursor = current.take()?;
+    let chunk = take_owned_cursor_chunk(&mut cursor, max_chunk_bytes);
+    if !cursor.get_ref().is_empty() {
+        *current = Some(cursor);
+    }
+    chunk
+}
+
+fn take_owned_cursor_chunk(
+    cursor: &mut std::io::Cursor<Bytes>,
+    max_chunk_bytes: usize,
+) -> Option<Bytes> {
+    let owned = std::mem::replace(cursor, std::io::Cursor::new(Bytes::new()));
+    let position = usize::try_from(owned.position()).unwrap_or(usize::MAX);
+    let mut remaining = owned.into_inner();
+    let consumed = position.min(remaining.len());
+    if consumed != 0 {
+        drop(remaining.split_to(consumed));
+    }
+    if remaining.is_empty() {
+        return None;
+    }
+    let take = remaining.len().min(max_chunk_bytes.max(1));
+    let chunk = remaining.split_to(take);
+    *cursor = std::io::Cursor::new(remaining);
+    Some(chunk)
+}
+
+fn validate_multiplexed_body_eof(
+    terminal: Option<&Arc<Mutex<MultiplexedBodyTerminal>>>,
+) -> std::io::Result<()> {
+    let Some(terminal) = terminal else {
+        return Ok(());
+    };
+    match terminal.lock() {
+        Ok(mut terminal) => {
+            match std::mem::replace(&mut *terminal, MultiplexedBodyTerminal::Complete) {
+                MultiplexedBodyTerminal::Pending => Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "multiplexed body ended before declared completion",
+                )),
+                MultiplexedBodyTerminal::Complete => Ok(()),
+                MultiplexedBodyTerminal::Failed(detail) => Err(std::io::Error::other(detail)),
+            }
+        }
+        Err(_) => Err(std::io::Error::other(
+            "multiplexed body terminal state lock poisoned",
+        )),
+    }
+}
+
+async fn collect_incoming_chunks_bounded(
+    stream: &mut ObjectRpcIncomingBodyChunkStream,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NetworkError> {
+    let mut output = Vec::new();
+    loop {
+        let Some(bytes) = stream
+            .next_chunk(BODY_READER_BUFFER_BYTES)
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "read incoming object RPC chunk stream".to_string(),
+                detail: source.to_string(),
+            })?
+        else {
+            return Ok(output);
+        };
+        let next = output
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(NetworkError::FrameTooLarge {
+                actual_bytes: usize::MAX,
+                max_bytes,
+            })?;
+        if next > max_bytes {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: next,
+                max_bytes,
+            });
+        }
+        output
+            .try_reserve(bytes.len())
+            .map_err(|_| NetworkError::ResourceExhausted {
+                operation: "collect incoming object RPC chunk stream".to_string(),
+                requested_bytes: next,
+            })?;
+        output.extend_from_slice(&bytes);
+    }
 }
 
 impl Drop for ObjectRpcIncomingBody {
@@ -2967,10 +3191,14 @@ impl AsyncRead for ObjectRpcIncomingBody {
         let this = self.get_mut();
         loop {
             match &mut this.inner {
-                ObjectRpcIncomingBodyInner::Empty => return Poll::Ready(Ok(())),
+                ObjectRpcIncomingBodyInner::Empty => {
+                    this.completion_tasks.clear();
+                    return Poll::Ready(Ok(()));
+                }
                 ObjectRpcIncomingBodyInner::Bytes(bytes) => {
                     let position = usize::try_from(bytes.position()).unwrap_or(usize::MAX);
                     if position >= bytes.get_ref().len() {
+                        this.completion_tasks.clear();
                         return Poll::Ready(Ok(()));
                     }
                     let read = output.remaining().min(bytes.get_ref().len() - position);
@@ -3001,30 +3229,12 @@ impl AsyncRead for ObjectRpcIncomingBody {
                             return Poll::Ready(Err(error));
                         }
                         Poll::Ready(None) => {
-                            if let Some(terminal) = this.multiplexed_terminal.as_ref() {
-                                match terminal.lock() {
-                                    Ok(mut terminal) => match std::mem::replace(
-                                        &mut *terminal,
-                                        MultiplexedBodyTerminal::Complete,
-                                    ) {
-                                        MultiplexedBodyTerminal::Pending => {
-                                            return Poll::Ready(Err(std::io::Error::new(
-                                                std::io::ErrorKind::UnexpectedEof,
-                                                "multiplexed body ended before declared completion",
-                                            )));
-                                        }
-                                        MultiplexedBodyTerminal::Complete => {}
-                                        MultiplexedBodyTerminal::Failed(detail) => {
-                                            return Poll::Ready(Err(std::io::Error::other(detail)));
-                                        }
-                                    },
-                                    Err(_) => {
-                                        return Poll::Ready(Err(std::io::Error::other(
-                                            "multiplexed body terminal state lock poisoned",
-                                        )));
-                                    }
-                                }
+                            if let Err(error) =
+                                validate_multiplexed_body_eof(this.multiplexed_terminal.as_ref())
+                            {
+                                return Poll::Ready(Err(error));
                             }
+                            this.completion_tasks.clear();
                             return Poll::Ready(Ok(()));
                         }
                         Poll::Pending => return Poll::Pending,
@@ -3047,12 +3257,13 @@ struct IncomingBodySender {
 #[derive(Debug)]
 enum IncomingDirectDelivery {
     Delivered,
-    Spill(Vec<u8>),
+    Spill(Bytes),
     ConsumerClosed,
 }
 
 impl IncomingBodySender {
-    fn try_deliver(&self, bytes: Vec<u8>) -> IncomingDirectDelivery {
+    fn try_deliver(&self, bytes: impl Into<Bytes>) -> IncomingDirectDelivery {
+        let bytes = bytes.into();
         let direct = match self.direct.lock() {
             Ok(direct) => direct.clone(),
             Err(_) => return IncomingDirectDelivery::ConsumerClosed,
@@ -3079,16 +3290,17 @@ impl IncomingBodySender {
     /// the wait finite: ignored consumers and simultaneous full-duplex bodies
     /// retain the existing spill escape hatch instead of deadlocking the wire
     /// reader behind application backpressure.
-    async fn deliver_with_grace(&self, bytes: Vec<u8>) -> IncomingDirectDelivery {
+    async fn deliver_with_grace(&self, bytes: impl Into<Bytes>) -> IncomingDirectDelivery {
         self.deliver_with_grace_for(bytes, BODY_READER_DIRECT_DELIVERY_GRACE)
             .await
     }
 
     async fn deliver_with_grace_for(
         &self,
-        bytes: Vec<u8>,
+        bytes: impl Into<Bytes>,
         grace: std::time::Duration,
     ) -> IncomingDirectDelivery {
+        let bytes = bytes.into();
         let bytes = match self.try_deliver(bytes) {
             IncomingDirectDelivery::Delivered => return IncomingDirectDelivery::Delivered,
             IncomingDirectDelivery::ConsumerClosed => {
@@ -3276,18 +3488,9 @@ async fn deliver_incoming_spool(
             let chunk_bytes = usize::try_from(remaining)
                 .unwrap_or(usize::MAX)
                 .min(BODY_READER_BUFFER_BYTES);
-            let mut bytes = match try_zeroed_body_buffer(chunk_bytes) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let _ = sender
-                        .send(IncomingBodyItem::Error(std::io::Error::other(
-                            error.to_string(),
-                        )))
-                        .await;
-                    return;
-                }
-            };
+            let mut bytes = pooled_body_buffer(chunk_bytes);
             if let Err(source) = spool.file.read_exact(&mut bytes).await {
+                drop(pooled_body_bytes(bytes));
                 let _ = sender
                     .send(IncomingBodyItem::Error(std::io::Error::new(
                         source.kind(),
@@ -3297,7 +3500,11 @@ async fn deliver_incoming_spool(
                 return;
             }
             delivered_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if sender.send(IncomingBodyItem::Bytes(bytes)).await.is_err() {
+            if sender
+                .send(IncomingBodyItem::Bytes(pooled_body_bytes(bytes)))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -3570,7 +3777,7 @@ impl ObjectRpcSessionResponse {
                 body.role = ObjectRpcSessionBodyRole::None;
             } else {
                 body.kind = ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
-                    bytes: Arc::from(value),
+                    bytes: Bytes::from(value),
                 });
                 body.role = ObjectRpcSessionBodyRole::Value;
             }
@@ -3650,14 +3857,16 @@ pub(crate) enum BodyProducer {
     Bytes(BytesBodyProducer),
     Sync(SyncBodyProducer),
     Async(AsyncBodyProducer),
+    Incoming(IncomingBodyProducer),
 }
 
 impl BodyProducer {
-    pub(crate) async fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+    pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
         match self {
             Self::Bytes(producer) => producer.next(),
             Self::Sync(producer) => producer.next().await,
             Self::Async(producer) => producer.next().await,
+            Self::Incoming(producer) => producer.next().await,
         }
     }
 
@@ -3666,19 +3875,20 @@ impl BodyProducer {
             Self::Bytes(_) => Ok(()),
             Self::Sync(producer) => producer.finish().await,
             Self::Async(_) => Ok(()),
+            Self::Incoming(_) => Ok(()),
         }
     }
 }
 
 pub(crate) struct BytesBodyProducer {
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     offset: usize,
     chunk_bytes: usize,
     _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
 }
 
 impl BytesBodyProducer {
-    fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+    fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
         if self.offset >= self.bytes.len() {
             return Ok(None);
         }
@@ -3686,15 +3896,7 @@ impl BytesBodyProducer {
             .offset
             .saturating_add(self.chunk_bytes)
             .min(self.bytes.len());
-        let source = &self.bytes[self.offset..end];
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(source.len())
-            .map_err(|_| NetworkError::ResourceExhausted {
-                operation: "allocate object RPC byte body chunk".to_string(),
-                requested_bytes: source.len(),
-            })?;
-        bytes.extend_from_slice(source);
+        let bytes = self.bytes.slice(self.offset..end);
         self.offset = end;
         Ok(Some(bytes))
     }
@@ -3707,26 +3909,47 @@ pub(crate) struct AsyncBodyProducer {
 }
 
 impl AsyncBodyProducer {
-    async fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
-        let mut bytes = try_zeroed_body_buffer(self.chunk_bytes)?;
-        let read = self
-            .reader
-            .read(&mut bytes)
-            .await
-            .map_err(|source| NetworkError::Io {
-                operation: "read asynchronous object RPC body source".to_string(),
-                detail: source.to_string(),
-            })?;
+    async fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
+        let mut bytes = pooled_body_buffer(self.chunk_bytes);
+        let read = match self.reader.read(&mut bytes).await {
+            Ok(read) => read,
+            Err(source) => {
+                drop(pooled_body_bytes(bytes));
+                return Err(NetworkError::Io {
+                    operation: "read asynchronous object RPC body source".to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
         if read == 0 {
+            drop(pooled_body_bytes(bytes));
             return Ok(None);
         }
         bytes.truncate(read);
-        Ok(Some(bytes))
+        Ok(Some(pooled_body_bytes(bytes)))
+    }
+}
+
+pub(crate) struct IncomingBodyProducer {
+    stream: ObjectRpcIncomingBodyChunkStream,
+    chunk_bytes: usize,
+    _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
+}
+
+impl IncomingBodyProducer {
+    async fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
+        self.stream
+            .next_chunk(self.chunk_bytes)
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "read ownership-moving object RPC body source".to_string(),
+                detail: source.to_string(),
+            })
     }
 }
 
 pub(crate) struct SyncBodyProducer {
-    receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, NetworkError>>,
+    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, NetworkError>>,
     task: tokio::task::JoinHandle<()>,
     _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
 }
@@ -3747,17 +3970,15 @@ impl SyncBodyProducer {
             // open file cannot be unlinked reliably.
             let _task_lifetime_guards = task_lifetime_guards;
             loop {
-                let mut bytes = match try_zeroed_body_buffer(chunk_bytes) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        let _ = sender.blocking_send(Err(error));
-                        return;
-                    }
-                };
+                let mut bytes = pooled_body_buffer(chunk_bytes);
                 let read = match reader.read(&mut bytes) {
                     Ok(read) => read,
-                    Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {
+                        drop(pooled_body_bytes(bytes));
+                        continue;
+                    }
                     Err(source) => {
+                        drop(pooled_body_bytes(bytes));
                         let _ = sender.blocking_send(Err(NetworkError::Io {
                             operation: "read synchronous object RPC body source".to_string(),
                             detail: source.to_string(),
@@ -3766,7 +3987,7 @@ impl SyncBodyProducer {
                     }
                 };
                 bytes.truncate(read);
-                if sender.blocking_send(Ok(bytes)).is_err() || read == 0 {
+                if sender.blocking_send(Ok(pooled_body_bytes(bytes))).is_err() || read == 0 {
                     return;
                 }
             }
@@ -3778,7 +3999,7 @@ impl SyncBodyProducer {
         })
     }
 
-    async fn next(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+    async fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
         match self.receiver.recv().await {
             Some(Ok(bytes)) if bytes.is_empty() => Ok(None),
             Some(Ok(bytes)) => Ok(Some(bytes)),
@@ -3795,16 +4016,12 @@ impl SyncBodyProducer {
     }
 }
 
-fn try_zeroed_body_buffer(len: usize) -> Result<Vec<u8>, NetworkError> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(len)
-        .map_err(|_| NetworkError::ResourceExhausted {
-            operation: "allocate object RPC body producer buffer".to_string(),
-            requested_bytes: len,
-        })?;
-    bytes.resize(len, 0);
-    Ok(bytes)
+fn pooled_body_buffer(len: usize) -> BytesMut {
+    shared_transfer_buffer_pool().acquire(len)
+}
+
+fn pooled_body_bytes(bytes: BytesMut) -> Bytes {
+    shared_transfer_buffer_pool().into_bytes(bytes)
 }
 
 fn read_sync_body_bounded(
@@ -3938,14 +4155,26 @@ mod body_tests {
         assert!(matches!(&empty_producer, BodyProducer::Bytes(_)));
         assert_eq!(empty_producer.next().await.expect("empty EOF"), None);
 
-        let source = ObjectRpcBodySource::bytes(vec![1_u8, 2, 3]);
+        let source_bytes = vec![1_u8, 2, 3];
+        let source_pointer = source_bytes.as_ptr();
+        let source = ObjectRpcBodySource::bytes(source_bytes);
         let mut producer = source.producer(2).expect("byte producer");
         assert!(matches!(&producer, BodyProducer::Bytes(_)));
+        let first = producer
+            .next()
+            .await
+            .expect("first chunk")
+            .expect("first bytes");
+        assert_eq!(first.as_ref(), &[1, 2]);
         assert_eq!(
-            producer.next().await.expect("first chunk"),
-            Some(vec![1, 2])
+            first.as_ptr(),
+            source_pointer,
+            "contiguous producers must slice the owned buffer without copying"
         );
-        assert_eq!(producer.next().await.expect("second chunk"), Some(vec![3]));
+        assert_eq!(
+            producer.next().await.expect("second chunk"),
+            Some(Bytes::from_static(&[3]))
+        );
         assert_eq!(producer.next().await.expect("EOF"), None);
         producer.finish().await.expect("finish byte producer");
 
@@ -3953,13 +4182,118 @@ mod body_tests {
         let mut exact_producer = exact.producer(2).expect("exact byte producer");
         assert_eq!(
             exact_producer.next().await.expect("first exact chunk"),
-            Some(vec![1, 2])
+            Some(Bytes::from_static(&[1, 2]))
         );
         assert_eq!(
             exact_producer.next().await.expect("second exact chunk"),
-            Some(vec![3, 4])
+            Some(Bytes::from_static(&[3, 4]))
         );
         assert_eq!(exact_producer.next().await.expect("exact EOF"), None);
+    }
+
+    #[tokio::test]
+    async fn incoming_chunk_producer_moves_received_bytes_without_copying() {
+        let (mut sender, incoming) = ObjectRpcIncomingBody::multiplexed_channel(Some(5));
+        let received = Bytes::from(vec![10_u8, 20, 30, 40, 50]);
+        let received_pointer = received.as_ptr();
+        sender.send(received).await.expect("queue incoming chunk");
+        sender.finish(5).await.expect("finish incoming body");
+
+        let source = ObjectRpcBodySource::from_incoming_chunk_stream(incoming);
+        assert!(!source.is_replayable());
+        let mut producer = source.producer(2).expect("incoming chunk producer");
+        assert!(matches!(&producer, BodyProducer::Incoming(_)));
+
+        let first = producer
+            .next()
+            .await
+            .expect("first incoming chunk")
+            .expect("first bytes");
+        assert_eq!(first.as_ref(), &[10, 20]);
+        assert_eq!(first.as_ptr(), received_pointer);
+
+        let second = producer
+            .next()
+            .await
+            .expect("second incoming chunk")
+            .expect("second bytes");
+        assert_eq!(second.as_ref(), &[30, 40]);
+        assert_eq!(second.as_ptr(), received_pointer.wrapping_add(2));
+
+        let third = producer
+            .next()
+            .await
+            .expect("third incoming chunk")
+            .expect("third bytes");
+        assert_eq!(third.as_ref(), &[50]);
+        assert_eq!(third.as_ptr(), received_pointer.wrapping_add(4));
+        assert_eq!(producer.next().await.expect("incoming EOF"), None);
+        producer.finish().await.expect("finish incoming producer");
+    }
+
+    #[tokio::test]
+    async fn incoming_body_natural_eof_detaches_completion_tasks_but_early_drop_aborts_them() {
+        let (mut sender, mut body) = ObjectRpcIncomingBody::multiplexed_channel(Some(1));
+        let natural_release = Arc::new(tokio::sync::Notify::new());
+        let (natural_finished_tx, natural_finished_rx) = tokio::sync::oneshot::channel();
+        let task_release = Arc::clone(&natural_release);
+        body.hold_completion_task(tokio::spawn(async move {
+            task_release.notified().await;
+            let _ = natural_finished_tx.send(());
+        }));
+        sender
+            .send(Bytes::from_static(b"x"))
+            .await
+            .expect("body byte");
+        sender.finish(1).await.expect("body completion");
+        assert_eq!(body.collect_to_vec(1).await.expect("natural EOF"), b"x");
+        natural_release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), natural_finished_rx)
+            .await
+            .expect("naturally completed body task must stay alive")
+            .expect("naturally completed body task must be detached");
+
+        let mut body = ObjectRpcIncomingBody::bytes(vec![1]);
+        let stream_release = Arc::new(tokio::sync::Notify::new());
+        let (stream_finished_tx, stream_finished_rx) = tokio::sync::oneshot::channel();
+        let task_release = Arc::clone(&stream_release);
+        body.hold_completion_task(tokio::spawn(async move {
+            task_release.notified().await;
+            let _ = stream_finished_tx.send(());
+        }));
+        let mut stream = body.into_chunk_stream();
+        assert_eq!(
+            stream.next_chunk(1).await.expect("stream byte"),
+            Some(Bytes::from_static(&[1]))
+        );
+        assert_eq!(stream.next_chunk(1).await.expect("stream EOF"), None);
+        drop(stream);
+        stream_release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream_finished_rx)
+            .await
+            .expect("naturally completed chunk-stream task must stay alive")
+            .expect("naturally completed chunk-stream task must be detached");
+
+        let mut body = ObjectRpcIncomingBody::bytes(vec![1]);
+        let early_release = Arc::new(tokio::sync::Notify::new());
+        let (early_started_tx, early_started_rx) = tokio::sync::oneshot::channel();
+        let (early_finished_tx, early_finished_rx) = tokio::sync::oneshot::channel();
+        let task_release = Arc::clone(&early_release);
+        body.hold_completion_task(tokio::spawn(async move {
+            let _ = early_started_tx.send(());
+            task_release.notified().await;
+            let _ = early_finished_tx.send(());
+        }));
+        early_started_rx.await.expect("early-drop task started");
+        drop(body);
+        early_release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), early_finished_rx)
+                .await
+                .expect("early-drop task cancellation must settle")
+                .is_err(),
+            "dropping an unread body must abort its completion tasks"
+        );
     }
 
     fn proof_public_key(data_dir: &SinomoDataDir) -> Vec<u8> {
@@ -4159,7 +4493,7 @@ mod body_tests {
         let grace = std::time::Duration::from_millis(5);
         let started = tokio::time::Instant::now();
         let outcome = sender.deliver_with_grace_for(b"c".to_vec(), grace).await;
-        assert!(matches!(outcome, IncomingDirectDelivery::Spill(bytes) if bytes == b"c"));
+        assert!(matches!(outcome, IncomingDirectDelivery::Spill(bytes) if bytes.as_ref() == b"c"));
         assert!(started.elapsed() >= grace);
     }
 
@@ -5863,7 +6197,7 @@ mod body_tests {
         let received = reader.receive().await.expect("trusted transport payload");
         assert!(matches!(
             received,
-            SessionInboundFrame::Data { payload, .. } if payload == b"evil"
+            SessionInboundFrame::Data { payload, .. } if payload.as_ref() == b"evil"
         ));
         send.await
             .expect("sender task")

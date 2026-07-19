@@ -14,6 +14,7 @@
 
 mod channel;
 mod channel_transport;
+mod channel_wire;
 mod connectivity;
 mod connectivity_store;
 mod daemon_auth;
@@ -64,6 +65,19 @@ pub use channel_transport::{
     accept_local_object_rpc_channel_async, connect_local_object_rpc_channel_async,
     local_object_rpc_channel_wire_prefix_matches,
 };
+/// Carrier-only surface needed by the daemon crate through the R0 facade.
+/// This is not a second application RPC API.
+#[doc(hidden)]
+pub mod __channel_carrier {
+    pub use super::channel_wire::{
+        OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES, OBJECT_RPC_CHANNEL_DATA_MAGIC,
+        OBJECT_RPC_CHANNEL_DATA_VERSION, OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_BYTES,
+        ObjectRpcChannelDataFrame, ObjectRpcChannelDataHeader, ObjectRpcChannelReceiveBufferPool,
+        ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
+        write_object_rpc_channel_data_frame_async, write_object_rpc_channel_transport_frame_async,
+        write_object_rpc_channel_transport_frame_async_timed,
+    };
+}
 pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
@@ -269,12 +283,14 @@ pub use session::{
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
 pub use tcp_tunnel::{
-    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL,
+    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+    CLUSTER_TCP_TUNNEL_FIXED_CHANNEL_DATA_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL,
     CLUSTER_TCP_TUNNEL_MIN_PROTOCOL_VERSION,
     CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
     CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame,
     ClusterTcpTunnelHandshakeProof, ClusterTcpTunnelHandshakeTranscript,
     ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
+    cluster_tcp_tunnel_protocol_supports_fixed_channel_data,
     cluster_tcp_tunnel_protocol_supports_object_rpc_channel, negotiate_cluster_tcp_tunnel_protocol,
     sign_cluster_tcp_tunnel_handshake_from_data_dir, verify_cluster_tcp_tunnel_handshake,
 };

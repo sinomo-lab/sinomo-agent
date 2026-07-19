@@ -1423,7 +1423,7 @@ pub(crate) async fn write_all_async_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn write_all_vectored_async_frame<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_all_vectored_async_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     prefix: &[u8],
     body: &[u8],

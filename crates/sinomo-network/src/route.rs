@@ -3049,7 +3049,7 @@ where
                         "incoming relay body is a one-pass stream and was already dispatched",
                     )
                 })?;
-                let body = ObjectRpcBodySource::from_incoming_body(body);
+                let body = ObjectRpcBodySource::from_incoming_chunk_stream(body);
                 let prepare_started = perf_enabled.then(Instant::now);
                 let timeline_prepare_started = timeline
                     .map(|_| crate::network_timeline_monotonic_ns())
