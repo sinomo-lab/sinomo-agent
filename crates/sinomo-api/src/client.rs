@@ -2113,6 +2113,318 @@ mod tests {
         remove_test_local_node_id_cache(&data_dir);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_control_join_over_warmed_loopback_channel_outlives_idle_window() {
+        const CALL_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+        const JOIN_HANDLER_DELAY: Duration = Duration::from_millis(150);
+
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-warmed-channel-cluster-join");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let expected = ClusterControlJoinResponse {
+            cluster_id: sinomo_core::node::ClusterId::from_legacy_named(
+                "cluster_api_warmed_channel_join",
+            )
+            .expect("cluster id"),
+            node_id: NodeId::from_legacy_named("node_api_warmed_channel_join").expect("node id"),
+            accepted_endpoint: Some("bridge.test:21353".to_string()),
+            migration: None,
+        };
+        let server_expected = expected.clone();
+        let server_data_dir = data_dir.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept local channel");
+            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
+                stream,
+                &server_data_dir,
+            )
+            .await
+            .expect("accept authenticated local channel");
+            let sinomo_core::network::AcceptedLocalObjectRpcChannel {
+                mut server,
+                transport,
+            } = accepted;
+
+            let warmup = server.accept().await.expect("warmup request");
+            assert_eq!(
+                warmup.request.request.route,
+                "/test/warm-cluster-control-channel"
+            );
+            warmup
+                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    ObjectRpcResponse::encode_body(
+                        "/test/warm-cluster-control-channel",
+                        &"warm".to_string(),
+                    )
+                    .expect("warmup response"),
+                ))
+                .await
+                .expect("respond to warmup");
+
+            tokio::select! {
+                join = server.accept() => {
+                    let join = join.expect("join request on warmed channel");
+                    assert_eq!(
+                        join.request.request.route,
+                        sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+                    );
+                    tokio::time::sleep(JOIN_HANDLER_DELAY).await;
+                    let payload = sinomo_core::cluster::cluster_control_join_response_rpc_payload(
+                        &server_expected,
+                    )
+                    .expect("join response payload");
+                    let _ = join
+                        .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                            ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
+                        ))
+                        .await;
+                }
+                stream = listener.accept() => {
+                    let stream = stream.expect("accept dedicated join session");
+                    let (incoming, responder) =
+                        sinomo_core::network::accept_object_rpc_server_session(
+                            Box::new(stream.into_inner()),
+                            server_data_dir.clone(),
+                            sinomo_core::network::NetworkCallPolicy::default(),
+                            |_request, _node_id, _public_key| Ok(()),
+                        )
+                        .await
+                        .expect("accept dedicated join session");
+                    assert_eq!(
+                        incoming.request.route,
+                        sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+                    );
+                    tokio::time::sleep(JOIN_HANDLER_DELAY).await;
+                    let payload = sinomo_core::cluster::cluster_control_join_response_rpc_payload(
+                        &server_expected,
+                    )
+                    .expect("join response payload");
+                    responder
+                        .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                            ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
+                        ))
+                        .await
+                        .expect("respond on dedicated join session");
+                }
+            }
+            transport.close("warmed cluster join test complete");
+        });
+
+        let runtime = tokio::runtime::Handle::current();
+        let warmup = ObjectRpcRequest::encode_body(
+            "/test/warm-cluster-control-channel",
+            "test",
+            &"warm".to_string(),
+        )
+        .expect("warmup request");
+        let warmup_result = call_daemon_address_session_async(
+            data_dir.clone(),
+            &address,
+            ObjectRpcSessionCall::value(warmup),
+            sinomo_core::network::ClusterObjectRpcOptions::new(
+                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            ),
+            &runtime,
+        )
+        .await
+        .expect("warm local channel");
+        assert_eq!(
+            warmup_result
+                .response
+                .decode_body::<String>()
+                .expect("warmup response"),
+            "warm"
+        );
+
+        let payload =
+            sinomo_core::cluster::cluster_control_join_rpc_payload(&ClusterControlJoinRequest {
+                invite: "sinomo-join://test-warmed-channel".to_string(),
+                node_display_name: Some("candidate".to_string()),
+                node_role: None,
+            })
+            .expect("join request payload");
+        let join_result = call_daemon_address_session_async(
+            data_dir.clone(),
+            &address,
+            ObjectRpcSessionCall::value(ObjectRpcRequest::from_encoded_body(
+                payload.route,
+                payload.category,
+                payload.body,
+            )),
+            sinomo_core::network::ClusterObjectRpcOptions::new(
+                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(CALL_IDLE_TIMEOUT),
+            ),
+            &runtime,
+        )
+        .await;
+
+        server.await.expect("server task");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        let result = join_result.expect(
+            "a healthy warmed daemon channel must not turn a long cluster join into a per-call idle timeout",
+        );
+        let actual = sinomo_core::cluster::decode_cluster_control_join_rpc_response_body(
+            &result.response.body,
+        )
+        .expect("join response");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cluster_control_joins_are_isolated_on_one_warmed_channel() {
+        const JOINERS: usize = 2;
+        let (_root, data_dir) =
+            test_channel_data_dir("sinomo-api-concurrent-warmed-channel-cluster-join");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("address");
+        let server_data_dir = data_dir.clone();
+        let (responses_observed_tx, responses_observed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept local channel");
+            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
+                stream,
+                &server_data_dir,
+            )
+            .await
+            .expect("accept authenticated local channel");
+            let sinomo_core::network::AcceptedLocalObjectRpcChannel {
+                mut server,
+                transport,
+            } = accepted;
+
+            let warmup = server.accept().await.expect("warmup request");
+            warmup
+                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    ObjectRpcResponse::encode_body(
+                        warmup.request.request.route.clone(),
+                        &"warm".to_string(),
+                    )
+                    .expect("warmup response"),
+                ))
+                .await
+                .expect("respond to warmup");
+
+            let mut responders = Vec::with_capacity(JOINERS);
+            for _ in 0..JOINERS {
+                let inbound = server.accept().await.expect("concurrent join request");
+                assert_eq!(
+                    inbound.request.request.route,
+                    sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+                );
+                let request = sinomo_core::cluster::decode_cluster_control_join_rpc_request_body(
+                    &inbound.request.request.body,
+                )
+                .expect("join request");
+                let suffix = request
+                    .node_display_name
+                    .as_deref()
+                    .expect("candidate name")
+                    .to_string();
+                responders.push(tokio::spawn(async move {
+                    if suffix.ends_with('a') {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    let response = ClusterControlJoinResponse {
+                        cluster_id: sinomo_core::node::ClusterId::from_legacy_named(
+                            "cluster_api_concurrent_join",
+                        )
+                        .expect("cluster id"),
+                        node_id: NodeId::from_legacy_named(format!(
+                            "node_api_concurrent_join_{suffix}"
+                        ))
+                        .expect("node id"),
+                        accepted_endpoint: Some("bridge.test:21353".to_string()),
+                        migration: None,
+                    };
+                    let payload =
+                        sinomo_core::cluster::cluster_control_join_response_rpc_payload(&response)
+                            .expect("join response payload");
+                    inbound
+                        .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                            ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
+                        ))
+                        .await
+                        .expect("respond to concurrent join");
+                }));
+            }
+            for responder in responders {
+                responder.await.expect("join responder");
+            }
+            let _ = responses_observed_rx.await;
+            transport.close("concurrent warmed cluster join test complete");
+        });
+
+        let runtime = tokio::runtime::Handle::current();
+        let warmup = ObjectRpcRequest::encode_body(
+            "/test/warm-concurrent-cluster-control-channel",
+            "test",
+            &"warm".to_string(),
+        )
+        .expect("warmup request");
+        call_daemon_address_session_async(
+            data_dir.clone(),
+            &address,
+            ObjectRpcSessionCall::value(warmup),
+            sinomo_core::network::ClusterObjectRpcOptions::default(),
+            &runtime,
+        )
+        .await
+        .expect("warm local channel");
+
+        let calls = ["candidate-a", "candidate-b"].map(|candidate| {
+            let data_dir = data_dir.clone();
+            let address = address.clone();
+            let runtime = runtime.clone();
+            async move {
+                let payload = sinomo_core::cluster::cluster_control_join_rpc_payload(
+                    &ClusterControlJoinRequest {
+                        invite: format!("sinomo-join://{candidate}"),
+                        node_display_name: Some(candidate.to_string()),
+                        node_role: None,
+                    },
+                )
+                .expect("join request payload");
+                call_daemon_address_session_async(
+                    data_dir,
+                    &address,
+                    ObjectRpcSessionCall::value(ObjectRpcRequest::from_encoded_body(
+                        payload.route,
+                        payload.category,
+                        payload.body,
+                    )),
+                    sinomo_core::network::ClusterObjectRpcOptions::new(
+                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                            Duration::from_secs(1),
+                        ),
+                    ),
+                    &runtime,
+                )
+                .await
+            }
+        });
+        let [first_call, second_call] = calls;
+        let (first, second) = tokio::join!(first_call, second_call);
+        let _ = responses_observed_tx.send(());
+        for result in [first, second] {
+            let result = result.expect("concurrent join call");
+            let response = sinomo_core::cluster::decode_cluster_control_join_rpc_response_body(
+                &result.response.body,
+            )
+            .expect("join response");
+            assert_eq!(
+                response.accepted_endpoint.as_deref(),
+                Some("bridge.test:21353")
+            );
+        }
+
+        server.await.expect("server task");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+    }
+
     fn synchronous_test_channel_call(
         data_dir: SinomoDataDir,
         address: String,
