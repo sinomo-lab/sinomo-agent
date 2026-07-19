@@ -2175,11 +2175,15 @@ mod tests {
                         &server_expected,
                     )
                     .expect("join response payload");
-                    let _ = join
-                        .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    join
+                        .responder()
+                        .respond_and_wait_written(
+                            sinomo_core::network::ObjectRpcSessionResponse::value(
                             ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
-                        ))
-                        .await;
+                            ),
+                        )
+                        .await
+                        .expect("write response on warmed channel before closing transport");
                 }
                 stream = listener.accept() => {
                     let stream = stream.expect("accept dedicated join session");
@@ -2672,7 +2676,7 @@ mod tests {
                 sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&request[..4])
             );
             let mut rejection = [0_u8; 8];
-            rejection[..4].copy_from_slice(b"SXS2");
+            rejection[..4].copy_from_slice(b"SXS4");
             stream
                 .write_all(&rejection)
                 .await

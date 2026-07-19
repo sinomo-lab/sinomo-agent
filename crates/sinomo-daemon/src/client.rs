@@ -1151,6 +1151,13 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         {
             return Box::pin(async move { Ok(Some(channel)) });
         }
+        // A direct daemon endpoint speaks the canonical session protocol on
+        // its next connection. Only the synthetic tunnel route may be used to
+        // establish a missing physical tunnel; probing a direct endpoint with
+        // the tunnel-open handshake corrupts that connection's wire dialect.
+        if !daemon_endpoint_is_tcp_tunnel(endpoint) {
+            return Box::pin(async { Ok(None) });
+        }
         let endpoint = endpoint.clone();
         let runtime = self.runtime.clone();
         let paths = self.paths.clone();
@@ -3877,7 +3884,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_object_rpc_channel_triggers_bounded_tunnel_reconnect() {
+    fn missing_object_rpc_channel_skips_tunnel_reconnect_for_direct_endpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-channel-cold-reconnect");
         let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
@@ -3909,6 +3916,60 @@ mod tests {
         let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), false)
             .with_paths(&daemon_paths);
 
+        let channel = runtime
+            .block_on(
+                sinomo_core::network::ClusterSignedObjectRpcAsyncHost::object_rpc_channel_async(
+                    &mut host,
+                    &endpoint,
+                    sinomo_core::network::NetworkHealthPolicy::new(
+                        Duration::from_millis(25),
+                        Duration::from_millis(25),
+                    ),
+                ),
+            )
+            .expect("direct endpoint channel lookup");
+
+        assert!(
+            channel.is_none(),
+            "a direct endpoint cold miss must fall back to its canonical session"
+        );
+    }
+
+    #[test]
+    fn missing_object_rpc_channel_attempts_reconnect_for_synthetic_tunnel_endpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-synthetic-channel-cold-reconnect");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let daemon_paths = crate::DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let target_node = sinomo_core::node::NodeId::from_legacy_named(
+            "node_synthetic_channel_cold_reconnect_target",
+        )
+        .expect("target node");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.synthetic-channel-cold-reconnect",
+                target_node.as_str(),
+            ),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                sinomo_core::network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target_node
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), false)
+            .with_paths(&daemon_paths);
+
         let reconnect = runtime.block_on(
             sinomo_core::network::ClusterSignedObjectRpcAsyncHost::object_rpc_channel_async(
                 &mut host,
@@ -3920,7 +3981,7 @@ mod tests {
             ),
         );
         let Err(error) = reconnect else {
-            panic!("a cold miss must attempt a bounded physical reconnect");
+            panic!("a synthetic tunnel cold miss must attempt a physical reconnect");
         };
         assert!(
             error.to_string().contains("connect"),

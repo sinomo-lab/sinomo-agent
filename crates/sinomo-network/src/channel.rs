@@ -347,6 +347,17 @@ pub enum ObjectRpcChannelWireFrame {
         direction: ObjectRpcChannelBodyDirection,
         total_bytes: u64,
     },
+    /// Call-scoped carrier liveness challenge. This is an internal channel
+    /// control message, not an application RPC or transport-wide keepalive.
+    LivenessProbe {
+        call_id: ObjectRpcChannelCallId,
+        probe_id: u64,
+    },
+    /// Response to one outstanding call-scoped liveness challenge.
+    LivenessResponse {
+        call_id: ObjectRpcChannelCallId,
+        probe_id: u64,
+    },
     Cancel {
         call_id: ObjectRpcChannelCallId,
         reason: String,
@@ -366,6 +377,8 @@ impl ObjectRpcChannelWireFrame {
             | Self::Data { call_id, .. }
             | Self::WindowUpdate { call_id, .. }
             | Self::BodyEnd { call_id, .. }
+            | Self::LivenessProbe { call_id, .. }
+            | Self::LivenessResponse { call_id, .. }
             | Self::Cancel { call_id, .. }
             | Self::Reset { call_id, .. } => *call_id,
         }
@@ -421,6 +434,7 @@ impl ObjectRpcChannelEndpoint {
             connection_id,
             role,
             next_call_id: AtomicU64::new(role.first_call_id()),
+            next_liveness_probe_id: AtomicU64::new(1),
             request_admission: Mutex::new(()),
             call_permits: Arc::new(Semaphore::new(config.max_calls)),
             max_calls: config.max_calls,
@@ -558,6 +572,7 @@ impl ObjectRpcChannelClient {
                     result_sender: Some(result_sender),
                     request_window: request_window.as_ref().map(Arc::clone),
                     response_ingress: None,
+                    outstanding_liveness_probe: None,
                     lifetime: Arc::clone(&lifetime),
                 },
             );
@@ -645,6 +660,16 @@ impl ObjectRpcChannelClient {
 
     pub fn queue_snapshot(&self) -> ObjectRpcChannelQueueSnapshot {
         self.shared.queue_snapshot()
+    }
+
+    /// Queues a call-scoped physical-channel liveness challenge without
+    /// treating the local write as progress. Only the matching response can
+    /// advance this call's progress generation.
+    pub(crate) fn request_liveness_probe(
+        &self,
+        call_id: ObjectRpcChannelCallId,
+    ) -> Result<(), NetworkError> {
+        self.shared.request_liveness_probe(call_id)
     }
 }
 
@@ -1241,6 +1266,7 @@ struct ChannelShared {
     connection_id: u64,
     role: ObjectRpcChannelRole,
     next_call_id: AtomicU64,
+    next_liveness_probe_id: AtomicU64,
     /// Serializes only id assignment through Request control-queue admission.
     /// The physical carrier is ordered, so this preserves the invariant used
     /// by the bounded retired-call high-water marks without serializing call
@@ -1433,6 +1459,47 @@ impl ChannelShared {
         Ok(ObjectRpcChannelCallId(value))
     }
 
+    fn next_liveness_probe_id(&self) -> Result<u64, NetworkError> {
+        let value = self.next_liveness_probe_id.fetch_add(1, Ordering::Relaxed);
+        if value == 0 || value == u64::MAX {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed object RPC liveness probe id overflow".to_string(),
+            });
+        }
+        Ok(value)
+    }
+
+    fn request_liveness_probe(&self, call_id: ObjectRpcChannelCallId) -> Result<(), NetworkError> {
+        self.ensure_open()?;
+        if !self.role.owns_call_id(call_id) {
+            return Err(unknown_call_error(call_id));
+        }
+        let (probe_id, timeline) = {
+            let mut pending = self.pending.lock().map_err(|_| channel_lock_error())?;
+            let call = pending
+                .get_mut(&call_id)
+                .ok_or_else(|| unknown_call_error(call_id))?;
+            if call.outstanding_liveness_probe.is_some() {
+                return Ok(());
+            }
+            let probe_id = self.next_liveness_probe_id()?;
+            call.outstanding_liveness_probe = Some(probe_id);
+            (probe_id, call.lifetime.timeline)
+        };
+        let queued = self.outbound.try_control_with_timeline(
+            ObjectRpcChannelWireFrame::LivenessProbe { call_id, probe_id },
+            timeline,
+        );
+        if queued.is_err()
+            && let Ok(mut pending) = self.pending.lock()
+            && let Some(call) = pending.get_mut(&call_id)
+            && call.outstanding_liveness_probe == Some(probe_id)
+        {
+            call.outstanding_liveness_probe = None;
+        }
+        queued
+    }
+
     fn queue_snapshot(&self) -> ObjectRpcChannelQueueSnapshot {
         ObjectRpcChannelQueueSnapshot {
             active_calls: self
@@ -1621,6 +1688,52 @@ impl ChannelShared {
             } => self
                 .body_ingress(call_id, direction)?
                 .accept_end(total_bytes),
+            ObjectRpcChannelWireFrame::LivenessProbe { call_id, probe_id } => {
+                if self.role.owns_call_id(call_id) {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "peer sent a liveness probe for locally owned multiplexed call {call_id}"
+                        ),
+                    });
+                }
+                let timeline = self
+                    .inbound
+                    .lock()
+                    .map_err(|_| channel_lock_error())?
+                    .get(&call_id)
+                    .map(|call| call.lifetime.timeline)
+                    .ok_or_else(|| unknown_call_error(call_id))?;
+                self.outbound.try_control_with_timeline(
+                    ObjectRpcChannelWireFrame::LivenessResponse { call_id, probe_id },
+                    timeline,
+                )
+            }
+            ObjectRpcChannelWireFrame::LivenessResponse { call_id, probe_id } => {
+                if !self.role.owns_call_id(call_id) {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "peer sent a liveness response for peer-owned multiplexed call {call_id}"
+                        ),
+                    });
+                }
+                let lifetime = {
+                    let mut pending = self.pending.lock().map_err(|_| channel_lock_error())?;
+                    let call = pending
+                        .get_mut(&call_id)
+                        .ok_or_else(|| unknown_call_error(call_id))?;
+                    if call.outstanding_liveness_probe != Some(probe_id) {
+                        return Err(NetworkError::Serialization {
+                            detail: format!(
+                                "unexpected multiplexed liveness response {probe_id} for call {call_id}"
+                            ),
+                        });
+                    }
+                    call.outstanding_liveness_probe = None;
+                    Arc::clone(&call.lifetime)
+                };
+                lifetime.mark_progress();
+                Ok(())
+            }
             ObjectRpcChannelWireFrame::Cancel { call_id, reason } => {
                 if self.role.owns_call_id(call_id)
                     || !self.try_reset_inbound(call_id, reason, false)
@@ -2271,6 +2384,7 @@ struct PendingCallState {
     result_sender: Option<oneshot::Sender<Result<ObjectRpcSessionResult, NetworkError>>>,
     request_window: Option<Arc<SendWindow>>,
     response_ingress: Option<Arc<BodyIngress>>,
+    outstanding_liveness_probe: Option<u64>,
     lifetime: Arc<ChannelCallLifetime>,
 }
 
@@ -3684,7 +3798,10 @@ fn channel_frame_timeline_flags(frame: &ObjectRpcChannelWireFrame) -> u16 {
             ObjectRpcChannelBodyDirection::Request => network_timeline_flag::REQUEST,
             ObjectRpcChannelBodyDirection::Response => network_timeline_flag::RESPONSE,
         },
-        ObjectRpcChannelWireFrame::Cancel { .. } | ObjectRpcChannelWireFrame::Reset { .. } => 0,
+        ObjectRpcChannelWireFrame::LivenessProbe { .. }
+        | ObjectRpcChannelWireFrame::LivenessResponse { .. }
+        | ObjectRpcChannelWireFrame::Cancel { .. }
+        | ObjectRpcChannelWireFrame::Reset { .. } => 0,
     };
     direction
         | if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
@@ -3721,8 +3838,10 @@ fn channel_frame_timeline_id(frame: &ObjectRpcChannelWireFrame) -> u64 {
             total_bytes,
             ..
         } => (6, channel_body_direction_bit(*direction), *total_bytes),
-        ObjectRpcChannelWireFrame::Cancel { .. } => (7, 0, 0),
-        ObjectRpcChannelWireFrame::Reset { .. } => (8, 0, 0),
+        ObjectRpcChannelWireFrame::LivenessProbe { probe_id, .. } => (7, 0, *probe_id),
+        ObjectRpcChannelWireFrame::LivenessResponse { probe_id, .. } => (8, 0, *probe_id),
+        ObjectRpcChannelWireFrame::Cancel { .. } => (9, 0, 0),
+        ObjectRpcChannelWireFrame::Reset { .. } => (10, 0, 0),
     };
     let id = frame.call_id().0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ kind.wrapping_mul(0xbf58_476d_1ce4_e5b9)
@@ -3769,7 +3888,9 @@ fn queued_frame_bytes(frame: &ObjectRpcChannelWireFrame) -> usize {
             .saturating_add(QUEUED_CONTROL_FRAME_OVERHEAD_BYTES),
         ObjectRpcChannelWireFrame::RequestAccepted { .. }
         | ObjectRpcChannelWireFrame::WindowUpdate { .. }
-        | ObjectRpcChannelWireFrame::BodyEnd { .. } => QUEUED_CONTROL_FRAME_OVERHEAD_BYTES,
+        | ObjectRpcChannelWireFrame::BodyEnd { .. }
+        | ObjectRpcChannelWireFrame::LivenessProbe { .. }
+        | ObjectRpcChannelWireFrame::LivenessResponse { .. } => QUEUED_CONTROL_FRAME_OVERHEAD_BYTES,
     }
 }
 
@@ -3825,6 +3946,14 @@ fn validate_wire_frame(frame: &ObjectRpcChannelWireFrame) -> Result<(), NetworkE
                     detail: "invalid multiplexed initial flow-control window".to_string(),
                 });
             }
+        }
+        ObjectRpcChannelWireFrame::LivenessProbe { probe_id, .. }
+        | ObjectRpcChannelWireFrame::LivenessResponse { probe_id, .. }
+            if *probe_id == 0 =>
+        {
+            return Err(NetworkError::Serialization {
+                detail: "multiplexed liveness probe id cannot be zero".to_string(),
+            });
         }
         ObjectRpcChannelWireFrame::Cancel { reason, .. }
         | ObjectRpcChannelWireFrame::Reset { reason, .. }
@@ -4141,6 +4270,8 @@ mod tests {
         data: AtomicUsize,
         window_updates: AtomicUsize,
         body_ends: AtomicUsize,
+        liveness_probes: AtomicUsize,
+        liveness_responses: AtomicUsize,
         cancels: AtomicUsize,
         resets: AtomicUsize,
     }
@@ -4154,6 +4285,8 @@ mod tests {
                 ObjectRpcChannelWireFrame::Data { .. } => &self.data,
                 ObjectRpcChannelWireFrame::WindowUpdate { .. } => &self.window_updates,
                 ObjectRpcChannelWireFrame::BodyEnd { .. } => &self.body_ends,
+                ObjectRpcChannelWireFrame::LivenessProbe { .. } => &self.liveness_probes,
+                ObjectRpcChannelWireFrame::LivenessResponse { .. } => &self.liveness_responses,
                 ObjectRpcChannelWireFrame::Cancel { .. } => &self.cancels,
                 ObjectRpcChannelWireFrame::Reset { .. } => &self.resets,
             };
@@ -4727,6 +4860,107 @@ mod tests {
             egress.next_frame().await.expect("call a cancel"),
             ObjectRpcChannelWireFrame::Cancel { call_id, .. } if call_id == call_a_id
         ));
+    }
+
+    #[tokio::test]
+    async fn liveness_response_advances_only_its_matching_active_call() {
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _server,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+
+        let mut call_a = client
+            .call(ObjectRpcSessionCall::value(request(
+                "/channel/liveness/a",
+                Vec::new(),
+            )))
+            .await
+            .expect("call a");
+        let mut progress_a = call_a.progress();
+        let initial_a = *progress_a.borrow_and_update();
+        let call_a_id = match egress.next_frame().await.expect("call a request") {
+            ObjectRpcChannelWireFrame::Request { call_id, .. } => call_id,
+            frame => panic!("expected call a request, got {frame:?}"),
+        };
+        let generation_a =
+            expect_call_progress(&mut progress_a, initial_a, "call a request head").await;
+
+        let mut call_b = client
+            .call(ObjectRpcSessionCall::value(request(
+                "/channel/liveness/b",
+                Vec::new(),
+            )))
+            .await
+            .expect("call b");
+        let mut progress_b = call_b.progress();
+        let initial_b = *progress_b.borrow_and_update();
+        let call_b_id = match egress.next_frame().await.expect("call b request") {
+            ObjectRpcChannelWireFrame::Request { call_id, .. } => call_id,
+            frame => panic!("expected call b request, got {frame:?}"),
+        };
+        let generation_b =
+            expect_call_progress(&mut progress_b, initial_b, "call b request head").await;
+
+        client
+            .request_liveness_probe(call_a_id)
+            .expect("queue call a liveness probe");
+        let probe_id = match egress.next_frame().await.expect("call a liveness probe") {
+            ObjectRpcChannelWireFrame::LivenessProbe { call_id, probe_id }
+                if call_id == call_a_id =>
+            {
+                probe_id
+            }
+            frame => panic!("expected call a liveness probe, got {frame:?}"),
+        };
+        assert_no_call_progress(&mut progress_a, "local liveness probe write").await;
+        assert_no_call_progress(&mut progress_b, "call a probe on call b").await;
+
+        let error = ingress
+            .receive(ObjectRpcChannelWireFrame::LivenessResponse {
+                call_id: call_a_id,
+                probe_id: probe_id + 1,
+            })
+            .expect_err("mismatched liveness response must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected multiplexed liveness response")
+        );
+        assert_no_call_progress(&mut progress_a, "mismatched liveness response").await;
+        assert_no_call_progress(&mut progress_b, "mismatched response on call b").await;
+
+        ingress
+            .receive(ObjectRpcChannelWireFrame::LivenessResponse {
+                call_id: call_a_id,
+                probe_id,
+            })
+            .expect("matching liveness response");
+        let _ =
+            expect_call_progress(&mut progress_a, generation_a, "matching liveness response").await;
+        assert_no_call_progress(&mut progress_b, "call a liveness on call b").await;
+        assert_eq!(*progress_b.borrow(), generation_b);
+
+        call_a.cancel("liveness isolation test complete");
+        call_b.cancel("liveness isolation test complete");
+        assert_eq!(client.queue_snapshot().active_calls, 0);
+        let cancel_ids = [
+            match egress.next_frame().await.expect("first cancel") {
+                ObjectRpcChannelWireFrame::Cancel { call_id, .. } => call_id,
+                frame => panic!("expected cancel, got {frame:?}"),
+            },
+            match egress.next_frame().await.expect("second cancel") {
+                ObjectRpcChannelWireFrame::Cancel { call_id, .. } => call_id,
+                frame => panic!("expected cancel, got {frame:?}"),
+            },
+        ];
+        assert!(cancel_ids.contains(&call_a_id));
+        assert!(cancel_ids.contains(&call_b_id));
     }
 
     #[tokio::test]

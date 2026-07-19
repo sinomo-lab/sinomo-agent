@@ -4027,6 +4027,7 @@ async fn cluster_object_rpc_channel_call_with_health(
         ),
     )
     .await?;
+    let call_id = pending.call_id();
     let mut progress = pending.progress();
     let result = pending.result();
     tokio::pin!(result);
@@ -4039,10 +4040,15 @@ async fn cluster_object_rpc_channel_call_with_health(
     };
     tokio::pin!(overall);
     let mut progress_open = true;
+    let probe_after = health.no_progress_timeout / 2;
     let mut idle_deadline = tokio::time::Instant::now() + health.no_progress_timeout;
+    let mut probe_deadline = tokio::time::Instant::now() + probe_after;
+    let mut probe_sent = false;
     loop {
         let idle = tokio::time::sleep_until(idle_deadline);
         tokio::pin!(idle);
+        let probe = tokio::time::sleep_until(probe_deadline);
+        tokio::pin!(probe);
         tokio::select! {
             biased;
             () = &mut overall => {
@@ -4058,9 +4064,18 @@ async fn cluster_object_rpc_channel_call_with_health(
                     Ok(()) => {
                         idle_deadline = tokio::time::Instant::now()
                             + health.no_progress_timeout;
+                        probe_deadline = tokio::time::Instant::now() + probe_after;
+                        probe_sent = false;
                     }
                     Err(_) => progress_open = false,
                 }
+            }
+            () = &mut probe, if !probe_sent => {
+                // The local write is deliberately not progress. Only the
+                // peer's matching response proves that this call's physical
+                // path is still responsive and refreshes its idle deadline.
+                channel.request_liveness_probe(call_id)?;
+                probe_sent = true;
             }
             () = &mut idle => {
                 return Err(NetworkError::timeout(
@@ -4773,9 +4788,17 @@ mod tests {
     }
 
     enum RecordingChannelAction {
-        Respond { responder_node_id: Option<NodeId> },
-        ReadBodyThenRespond { responder_node_id: Option<NodeId> },
-        StallAfterAccept,
+        Respond {
+            responder_node_id: Option<NodeId>,
+        },
+        ReadBodyThenRespond {
+            responder_node_id: Option<NodeId>,
+        },
+        DelayedResponse {
+            delay: Duration,
+            responder_node_id: Option<NodeId>,
+        },
+        BlackholeAfterAccept,
         CloseAfterAccept,
     }
 
@@ -4783,7 +4806,6 @@ mod tests {
         client: ObjectRpcChannelClient,
         ingress: crate::ObjectRpcChannelIngress,
         requests: tokio::sync::mpsc::UnboundedReceiver<ObjectRpcRequest>,
-        cancellations: tokio::sync::mpsc::UnboundedReceiver<String>,
         received_body_bytes: Arc<AtomicUsize>,
         tasks: Vec<tokio::task::JoinHandle<()>>,
     }
@@ -4823,6 +4845,8 @@ mod tests {
     }
 
     fn recording_channel(action: RecordingChannelAction) -> RecordingChannel {
+        let blackhole_after_request =
+            matches!(&action, RecordingChannelAction::BlackholeAfterAccept);
         let left = crate::ObjectRpcChannelEndpoint::new(
             crate::ObjectRpcChannelRole::Dialer,
             crate::ObjectRpcChannelConfig::default(),
@@ -4848,7 +4872,13 @@ mod tests {
         let response_ingress = left_ingress.clone();
         let close_ingress = left_ingress.clone();
         let left_pump = tokio::spawn(async move {
+            let mut request_delivered = false;
             while let Some(frame) = left_egress.next_frame().await {
+                if blackhole_after_request && request_delivered {
+                    continue;
+                }
+                request_delivered |=
+                    matches!(&frame, crate::ObjectRpcChannelWireFrame::Request { .. });
                 if right_ingress.receive(frame).is_err() {
                     break;
                 }
@@ -4862,7 +4892,6 @@ mod tests {
             }
         });
         let (requests_sender, requests) = tokio::sync::mpsc::unbounded_channel();
-        let (cancellations_sender, cancellations) = tokio::sync::mpsc::unbounded_channel();
         let received_body_bytes = Arc::new(AtomicUsize::new(0));
         let server_received_body_bytes = Arc::clone(&received_body_bytes);
         let server_task = tokio::spawn(async move {
@@ -4894,17 +4923,19 @@ mod tests {
                         .await
                         .expect("route test channel respond");
                 }
-                RecordingChannelAction::StallAfterAccept => {
-                    let mut cancellation = inbound.cancellation();
-                    loop {
-                        if let Some(reason) = cancellation.borrow().clone() {
-                            let _ = cancellations_sender.send(reason);
-                            break;
-                        }
-                        if cancellation.changed().await.is_err() {
-                            break;
-                        }
-                    }
+                RecordingChannelAction::DelayedResponse {
+                    delay,
+                    responder_node_id,
+                } => {
+                    tokio::time::sleep(delay).await;
+                    let response = recording_channel_response(request, responder_node_id);
+                    inbound
+                        .respond(crate::ObjectRpcSessionResponse::value(response))
+                        .await
+                        .expect("route test delayed channel respond");
+                }
+                RecordingChannelAction::BlackholeAfterAccept => {
+                    std::future::pending::<()>().await;
                 }
             }
         });
@@ -4912,7 +4943,6 @@ mod tests {
             client,
             ingress: left_ingress,
             requests,
-            cancellations,
             received_body_bytes,
             tasks: vec![left_pump, right_pump, server_task],
         }
@@ -5324,7 +5354,7 @@ mod tests {
             &target_node,
             crate::daemon_auth_encode_public_key(&[10_u8; 32]),
         );
-        let mut channel = recording_channel(RecordingChannelAction::StallAfterAccept);
+        let channel = recording_channel(RecordingChannelAction::BlackholeAfterAccept);
         let mut host = RecordingSignedHost {
             object_rpc_channel: Some(channel.client.clone()),
             ..RecordingSignedHost::default()
@@ -5366,13 +5396,55 @@ mod tests {
             tokio::time::Instant::now().duration_since(started_at),
             idle_timeout
         );
+        assert_eq!(channel.client.queue_snapshot().active_calls, 0);
+        assert_eq!(host.session_opens, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn endpoint_channel_liveness_responses_keep_a_slow_handler_healthy() {
+        let (_root, _paths, mut state, _local_node, target_node, endpoints) =
+            relay_retry_test_fixture("endpoint_channel_slow_handler_liveness");
+        set_member_public_key(
+            &mut state,
+            &target_node,
+            crate::daemon_auth_encode_public_key(&[13_u8; 32]),
+        );
+        let handler_delay = Duration::from_millis(350);
+        let idle_timeout = Duration::from_millis(100);
+        let channel = recording_channel(RecordingChannelAction::DelayedResponse {
+            delay: handler_delay,
+            responder_node_id: Some(target_node.clone()),
+        });
+        let mut host = RecordingSignedHost {
+            object_rpc_channel: Some(channel.client.clone()),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+        let request = ObjectRpcRequest::encode_body(
+            "/test/endpoint-channel-slow-handler-liveness",
+            "test",
+            &"request",
+        )
+        .expect("request");
+        let started_at = tokio::time::Instant::now();
+
+        let result = client
+            .call_endpoint(
+                &state,
+                &endpoints[0],
+                ObjectRpcSessionCall::value(request),
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::idle_only(idle_timeout)),
+            )
+            .await
+            .expect("a responsive carrier must keep a slow handler call healthy");
+
+        assert_eq!(
+            result.response.decode_body::<String>().expect("response"),
+            "channel-ok"
+        );
         assert!(
-            channel
-                .cancellations
-                .recv()
-                .await
-                .expect("logical call cancellation")
-                .contains("pending call handle dropped")
+            tokio::time::Instant::now().duration_since(started_at) >= handler_delay,
+            "handler must outlive multiple logical-call idle windows"
         );
         assert_eq!(channel.client.queue_snapshot().active_calls, 0);
         assert_eq!(host.session_opens, 0);
@@ -5461,7 +5533,7 @@ mod tests {
             &target_node,
             crate::daemon_auth_encode_public_key(&[12_u8; 32]),
         );
-        let mut channel = recording_channel(RecordingChannelAction::StallAfterAccept);
+        let channel = recording_channel(RecordingChannelAction::BlackholeAfterAccept);
         let mut host = RecordingSignedHost {
             object_rpc_channel: Some(channel.client.clone()),
             ..RecordingSignedHost::default()
@@ -5504,11 +5576,6 @@ mod tests {
             tokio::time::Instant::now().duration_since(started_at),
             overall_timeout
         );
-        channel
-            .cancellations
-            .recv()
-            .await
-            .expect("deadline cancellation");
         assert_eq!(channel.client.queue_snapshot().active_calls, 0);
     }
 

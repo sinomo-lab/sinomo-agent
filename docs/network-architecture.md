@@ -99,6 +99,13 @@ batch of up to four frames and 1 MiB with one exact byte-and-frame reservation,
 while the egress scheduler still writes at most one frame from a call lane
 before rotating to another ready lane.
 
+Long-running handlers use a private call-scoped liveness exchange on the same
+control lane. A probe is sent halfway through an otherwise idle health window;
+the local write is not progress, and only the peer's matching response refreshes
+that call's transport-health deadline. This keeps independent multiplexed calls
+isolated, preserves absolute operation deadlines, and still detects a
+blackholed carrier within the configured idle interval.
+
 Each physical carrier owns an 8 MiB bounded pool of reusable 256 KiB
 `BytesMut` receive slabs. A received ownership-bearing `Bytes` keeps both its
 slab and the pool permit alive through clones and zero-copy slices, so a slab
