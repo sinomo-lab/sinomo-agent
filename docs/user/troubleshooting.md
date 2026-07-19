@@ -1,0 +1,192 @@
+# Troubleshooting
+
+This guide starts with safe, read-only checks. It does not replace the command
+help or subsystem architecture when a repair changes authority.
+
+## Collect a Baseline
+
+Record the command, timestamp, host, Sinomo version, and selected data directory.
+Start with the [routine health baseline](operations.md#routine-health-baseline),
+then capture the additional evidence that remains available:
+
+```sh
+sinomo cluster status
+sinomo rollout diagnostics
+sinomo observe events --limit 200 --json
+sinomo observe logs --limit 200 --json
+```
+
+If a command fails, keep its exact output. A sequence showing which surfaces
+still work is more useful than repeatedly retrying the final failed mutation.
+
+## The CLI Shows an Empty or Different Installation
+
+Likely cause: the shell and installed daemon use different data directories.
+
+```sh
+printf '%s\n' "${SINOMO_DATA_DIR:-$HOME/.sinomo}"
+sinomo daemon status
+```
+
+Check the environment used by service startup and recent commands. Do not copy
+individual identity or Raft files between directories. Select the intended
+complete directory and restart the matching daemon.
+
+## The Main Daemon Is Unreachable
+
+Check both process roles:
+
+```sh
+sinomo daemon status
+sinomo daemon shadow status
+sinomo observe logs --component daemon --limit 100
+```
+
+If no rollout is in progress and the installed binary is known good, a normal
+`sinomo daemon start` is the narrow first recovery. If activation failed, keep
+the candidate and rollout evidence and follow
+[rollout recovery](rollout-operations.md#recover-a-failed-rollout).
+
+A stale lock, listener failure, and process crash are different conditions.
+Do not remove a lock file until the status output and process inspection prove
+that no owner remains.
+
+## Cluster Writes Fail but Reads Still Work
+
+Likely cause: the node has local committed state but cannot establish current
+quorum or leadership evidence.
+
+```sh
+sinomo cluster health
+sinomo cluster peers
+sinomo cluster doctor
+sinomo observe events --kind cluster. --limit 200 --json
+sinomo observe metrics --name sinomo.kv. --all --json
+```
+
+Restore reachability to the existing authority members. Do not initialize a
+new cluster or report a local/stale read as an authoritative result. Membership
+repair is appropriate only when its help matches the observed same-cluster
+condition.
+
+## Join or Invite Fails
+
+On the existing member, confirm the main daemon is reachable and the introducer
+address is usable from the joining machine. Create a new short-lived invite if
+the old one expired:
+
+```sh
+INTRODUCER=192.168.1.10:21353
+sinomo cluster status
+sinomo cluster invite --introducer "$INTRODUCER" --output join.txt
+```
+
+On the new machine, verify that its data directory is the intended new
+installation and that its daemon is running. If it is already settled in
+another cluster, inspect `sinomo cluster migrate plan` instead of forcing a
+fresh join.
+
+Invites are credentials. Do not paste their contents into public logs or issue
+reports.
+
+## Provider Authentication or Model Calls Fail
+
+Separate credential, catalog, account, quota, and transport checks:
+
+```sh
+PROVIDER=your-provider-id
+sinomo providers test "$PROVIDER"
+sinomo models list --provider "$PROVIDER"
+sinomo models options show --provider "$PROVIDER"
+sinomo usage --provider "$PROVIDER" --json
+```
+
+Confirm that the daemon and CLI use the same data directory and that the
+selected account can access the exact model ID. Provider outages and rate
+limits do not justify copying credentials into cluster configuration.
+
+## DFS Is Degraded or a File Is Missing
+
+Inspect before repairing:
+
+```sh
+SIFS_PATH=/sinomo/path/to/file
+sinomo dfs status --cluster --json
+sinomo dfs path "$SIFS_PATH" --json
+sinomo dfs repair --json
+sinomo dfs conflicts --json
+sinomo dfs services --json
+```
+
+Distinguish a missing replica, lagging metadata, unavailable primary, policy
+violation, and explicit conflict record. The current `dfs repair` command is an
+inspection surface that lists inferred missing-replica work; it does not apply
+repairs. Conflict resolution commands deliberately choose or remove history and
+should be run only after inspecting stored versions.
+
+Never delete content-store or metadata files directly. A byte that appears
+unreferenced locally may still be required by a committed version, repair, or
+another member.
+
+## A Rollout Is Stuck or Failed
+
+```sh
+sinomo rollout status
+sinomo rollout diagnostics
+sinomo cluster health
+sinomo daemon shadow status
+```
+
+Determine whether the failure occurred during source import, build resolution,
+artifact transfer, staging, candidate startup, or health observation. Preserve
+build and rollout evidence before retrying. `rollout clear-status` clears the
+recorded status only; it is not a repair and does not delete pending candidates.
+
+## Remote Management Is Denied
+
+Membership and reachability are insufficient. On the receiving node, a person
+must inspect and enable the permission locally:
+
+```sh
+sinomo node permissions show --json
+sinomo node permissions allow remote-management --json
+```
+
+If the permission is already present, use the target node ID with
+`sinomo remote info --target NODE_ID` and cluster diagnostics to distinguish
+policy rejection from route failure.
+There is intentionally no remote command that enables this permission.
+
+## A Sandbox Command Fails
+
+Inspect the sandbox, backend, pinned toolchain, and policy separately:
+
+```sh
+SANDBOX_ID=your-sandbox-id
+sinomo sandbox status "$SANDBOX_ID"
+sinomo sandbox config "$SANDBOX_ID"
+sinomo sandbox doctor "$SANDBOX_ID"
+sinomo sandbox logs "$SANDBOX_ID"
+sinomo sandbox policy show
+```
+
+Do not switch to an unsandboxed host command merely to bypass a denied
+capability. Confirm that the requested mount, toolchain command, memory limit,
+wall-time limit, and network policy are part of the intended sandbox contract.
+
+## When Reporting a Problem
+
+Include:
+
+- the Git commit or installed version and platform;
+- whether the worktree was dirty when the binary was built;
+- the command and complete error text;
+- local node and cluster IDs, redacted only where necessary;
+- the selected data-directory path without its credential contents;
+- relevant operation, trace, rollout, request, object, or session IDs;
+- health and doctor output from more than one member when possible;
+- the smallest reproduction and whether it survives a process restart.
+
+Remove API keys, invite material, identity private keys, raw prompts, private
+file content, and access tokens. Preserve structural IDs and timestamps when
+they are needed to correlate the evidence.

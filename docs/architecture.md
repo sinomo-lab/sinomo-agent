@@ -4,8 +4,11 @@ This document is the developer overview of Sinomo's runtime architecture. It
 defines the system boundaries and invariants that other design documents refine.
 It is not a command reference, implementation inventory, or delivery plan.
 
-Operators should start with the [documentation index](README.md). Future work
-and historical proposals live under [plans/](plans/README.md).
+Readers new to the project should start with the
+[system overview](system-overview.md). Operators should use the
+[user guide](user/README.md), and developers should use the
+[developer guide](developer/README.md). Future work and historical proposals
+live under [plans/](plans/README.md).
 
 ## System Goals
 
@@ -78,9 +81,11 @@ boundaries; context assembly controls what one model turn sees.
 
 ## Execution Model
 
-Sinomo separates control work by latency and effect:
+Sinomo separates control work by latency and effect. The ranges below are
+design targets used to shape scheduling and cancellation, not measured
+cross-platform service-level guarantees:
 
-| Loop | Typical latency | Responsibility |
+| Loop | Design target | Responsibility |
 |---|---:|---|
 | Reactive | 50-150 ms | Wake decisions, interruption, immediate safety checks, and acknowledgements. |
 | Interactive | 200 ms-2 s | Dialogue, bounded retrieval, short tool calls, and task updates. |

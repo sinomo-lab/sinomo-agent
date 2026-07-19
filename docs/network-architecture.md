@@ -280,8 +280,12 @@ loopback control uses the same authentication boundary for sensitive commands.
     do not implement transport chunking, transfer retry, or resume protocols.
 
 Operation-level idempotency is a protocol requirement, not a universal current
-capability. Stable KV request IDs remain tracked in the
-[reactive KV/Raft plan](plans/reactive-cluster-kv-raft-improvement-plan.md).
+capability. Cluster KV now provides stable request IDs, exact committed-response
+replay while the bounded committed-request record is retained, and an
+authoritative request-outcome query that reports expiry explicitly after that
+retention window. Other side-effecting domain protocols must define their own
+operation identity and retry contract rather than relying on networking to
+replay responses.
 
 The [clustering architecture](clustering-architecture.md) defines the authority
 projected into the directory. Current verification coverage and future proof

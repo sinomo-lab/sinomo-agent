@@ -106,8 +106,12 @@ Every model must be read as one of three evidence classes:
   result-authority refinement, not a proof of concrete RequestVote,
   AppendEntries, WAL, snapshot, or daemon scheduling behavior.
 - **Target hardening** states behavior that the implementation does not yet
-  enforce. The catch-up certificate required by the membership promotion model
-  is currently in this class.
+  enforce. Individual model sections identify those remaining gaps.
+
+The catch-up certificate required by the membership promotion model is now a
+current-behavior refinement. The Rust lifecycle requires sufficient learner
+match-index evidence before promotion, records terminal evidence, and performs
+bounded restart reconciliation of interrupted changes.
 
 Passing a bounded check proves none of the omitted mechanics. New and existing
 models should say which class they belong to, and target-hardening checks must
@@ -161,8 +165,9 @@ allowed to come online without catch-up, then accept a later committed entry
 without the earlier prefix. The Rust in-process cluster catches up a node when
 `set_node_online(..., true)` is called, so the spec now models that behavior.
 
-The focused reactive-contract evidence recorded on 2026-07-19 used Quint 0.32.0
-and Apalache 0.56.1:
+The focused reactive-contract evidence recorded on 2026-07-19 against
+implementation source revision `1cf40a35962bac388a533353ab74e99fa7f002c6`
+used Quint 0.32.0 and Apalache 0.56.1:
 
 ```bash
 QUINT_CASE_FILTER=raft-kv QUINT_COVERAGE_MAX_SAMPLES=5000 \
@@ -176,6 +181,19 @@ Coverage found no refined-safety violation and reached
 `witnessBrokenNoQuorumNoEffectCounterexample` in 5000 of 5000 traces. The
 five-step Apalache check of the refined `step` relation found no violation and
 completed in 175694 ms.
+
+Companion Rust evidence covers the mechanics intentionally excluded from this
+Quint slice: local-read availability without quorum, authoritative-read
+failure without a barrier, ordinary and semantic-no-effect write fencing,
+exact committed-request replay and outcome recovery, maintenance wake
+coalescing/backoff/shutdown/non-starvation, restart-safe config-change
+reconciliation, and intermittent-cluster catch-up. The focused entrypoints are:
+
+```bash
+cargo test -p sinomo-kv --test kv
+cargo test -p sinomo-cluster --lib
+cargo test -p sinomo-cluster --test control_plane
+```
 
 The `raft_protocol_safety.safety` invariant checks the deeper three-voter
 protocol slice:
@@ -456,9 +474,9 @@ Raft configuration validator from the broader membership lifecycle:
   three-to-two shrink, invalid direct/multiple additions, and insufficient
   acknowledgement.
 
-This maps to `validate_cluster_kv_raft_config_transition` and separates a
-current-behavior configuration proof from the target catch-up certificate in
-the broader membership model. The Rust table test
+This maps to `validate_cluster_kv_raft_config_transition` and separates the
+focused configuration-validator proof from the broader membership lifecycle's
+catch-up certificate. Both are current-behavior refinements. The Rust table test
 `cluster_kv_raft_config_transition_matches_bounded_model_cases` covers the same
 learner/non-voting promotion, direct and multiple addition rejection, and
 three-to-two versus two-to-one shrink cases.

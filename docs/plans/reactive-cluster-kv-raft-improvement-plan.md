@@ -1,6 +1,7 @@
 # Reactive Cluster KV/Raft Improvement Plan
 
-Status: proposed follow-up work. Last reviewed 2026-07-19.
+Status: recommended first implementation slice completed 2026-07-19; remaining
+P1-P3 follow-up work is identified below. Last reviewed 2026-07-19.
 
 ## Context
 
@@ -10,13 +11,35 @@ continuously. The KV/Raft layer should therefore converge opportunistically when
 nodes wake, operators run commands, apps connect, or peer traffic arrives. The
 goal is not to turn `sinomo-kv` into a conventional always-on Raft service.
 
-The current implementation already has useful safety machinery: persisted Raft
-hard state, WAL-backed log entries, quorum-gated mutation paths, append conflict
-checks, vote freshness checks, snapshots, materialized local snapshots, durable
-watches, and host-provided transport. The main gaps are around explicit
-consistency contracts, the local semantic-no-effect write fast path,
-passive-cluster liveness, idempotency, membership-change lifecycle, and
-operational recovery.
+The implementation now combines the earlier persisted Raft hard state,
+WAL-backed log entries, quorum-gated mutation paths, append conflict checks,
+vote freshness checks, snapshots, durable watches, and host-provided transport
+with the completed first slice: explicit local and authoritative consistency
+contracts, current-term barriers, semantic-no-effect write fencing, stable
+request identities and outcome recovery, reactive maintenance, peer progress
+hints, and restart-safe membership/config-change lifecycle records.
+
+## Delivery Status
+
+The numbered sections below preserve the design and verification rationale that
+guided the refactor. Their current status is:
+
+| Item | Status |
+|---|---|
+| P0.1-P0.4 consistency, barriers, request identity, config lifecycle | Completed. |
+| P1.5 opportunistic maintenance tick | Completed. |
+| P1.6 intermittent-node leader recovery | Partial: bounded recovery and structured failure evidence exist; proactive freshest-voter preference and complete CLI/app recommendations remain follow-up work. |
+| P1.7 peer replication progress hints | Completed; hints are persisted, consumed, term-validated, and safe to discard. |
+| P1.8 uncertain-write recovery | Completed through the authoritative request-outcome route. |
+| P2.9 noisy-write batching | Planned; semantic no-op suppression and maintenance wake coalescing do not constitute general short-window transaction batching. |
+| P2.10 keyspace read/projection behavior | Completed for explicit keyspace classification, critical-read authority defaults, and deferred materialized projections; broader retention tuning remains operational follow-up. |
+| P2.11 resumable snapshots | Planned. |
+| P2.12 diagnostics | Partial: structured authority/quorum evidence exists; complete last-success timestamps and CLI/app recovery presentation remain follow-up work. |
+| P3.13-P3.15 full joint consensus, ubiquitous ReadIndex, autonomous loop | Deliberately deferred. |
+
+Future-tense requirements under completed items describe the delivered contract;
+they are retained as design history rather than an assertion that the work is
+still missing.
 
 ## Design Principles
 
@@ -290,7 +313,7 @@ state a small independent invariant.
 
 ### Runtime and cluster evidence
 
-The implementation gate should include:
+The completed first slice is covered by:
 
 - focused tests proving local reads remain available without quorum while
   authoritative reads fail;
@@ -304,21 +327,28 @@ The implementation gate should include:
   failed authoritative operations, quorum restoration, catch-up, and eventual
   convergence.
 
-## Recommended First Implementation Slice
+## Completed First Implementation Slice
 
-1. Add the consistency contract to docs and route/type names.
-2. Implement the authoritative-read barrier and migrate the initial critical
+Completed 2026-07-19:
+
+1. Added the consistency contract to docs and route/type names.
+2. Implemented the authoritative-read barrier and migrated the initial critical
    callers.
-3. Close the semantic-no-effect fast path so write success always has quorum or
+3. Closed the semantic-no-effect fast path so write success always has quorum or
    durable prior-commit evidence.
-4. Add request IDs and idempotency records for KV transactions.
-5. Add the opportunistic maintenance tick and wire it to daemon/app/CLI wake
+4. Added request IDs, bounded committed-request retention, and outcome records
+   for KV transactions.
+5. Added the opportunistic maintenance tick and wired it to daemon/app/CLI wake
    points.
-6. Convert Raft config changes into explicit lifecycle operations with evidence.
+6. Converted Raft config changes into explicit lifecycle operations with
+   catch-up and terminal evidence plus restart reconciliation.
 
-Complete the small `raft_kv` contract refinement with steps 2-3. Use the runtime
-and cluster evidence above for step 5 instead of expanding the Raft protocol
-model.
+The small `raft_kv` contract refinement covers steps 2-3. Runtime and cluster
+tests cover step 5 instead of expanding the Raft protocol model. The focused
+formal run reached the deliberately broken no-quorum/no-effect witness in 5000
+of 5000 traces, and the five-step Apalache check of the corrected relation found
+no violation; exact commands and tool versions are recorded in the
+[formal verification guide](../formal/cluster-verification.md).
 
 This slice preserves Sinomo's passive design while addressing the most important
 correctness and recovery gaps first.

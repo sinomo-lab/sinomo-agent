@@ -105,10 +105,12 @@ expiry, issuer, and allowed-role data remain in committed cluster state.
 A joining installation presents its identity and capabilities to an
 introducer. The existing cluster validates the invite and commits the new
 member. Normal invitations use learner or non-voting roles. Authority promotion
-is a separate committed membership change. Catch-up proof before promotion is
-planned hardening, not an invariant enforced by the current implementation. If
-no introducer is reachable, the join fails explicitly instead of leaving an
-apparently joined but isolated member.
+is a separate committed membership change. The current lifecycle records learner
+admission, requires proof that the learner reached the required committed log
+index before promotion, and persists completion or failure evidence so restart
+reconciliation can resume an interrupted change. If no introducer is reachable,
+the join fails explicitly instead of leaving an apparently joined but isolated
+member.
 
 ### Migration and Leave
 
@@ -319,7 +321,8 @@ node from a removed node.
 
 The [formal verification guide](formal/cluster-verification.md) maps executable
 models to these safety boundaries. Future cluster work is tracked in
-[plans](plans/README.md), including catch-up-gated authority changes in the
+[plans](plans/README.md), including the remaining election-recovery,
+write-coalescing, resumable-snapshot, and diagnostic follow-ups retained in the
 [reactive KV/Raft plan](plans/reactive-cluster-kv-raft-improvement-plan.md).
-Completed phase-by-phase implementation history is not part of this
-architecture document.
+Completed phase-by-phase implementation history is not part of this architecture
+document.

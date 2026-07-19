@@ -106,7 +106,7 @@ Cluster state, DFS content, rollout build logs, registry state, sandbox
 artifacts, and module state belong to their corresponding crates, even when the
 daemon opens the files or triggers maintenance.
 
-## Target Network/KV Boundary
+## Current Network/KV Boundary
 
 Cluster networking and KV storage are separate domains. Their coupling is real
 but narrow: KV replication and KV RPC traffic use the cluster network for data
@@ -116,7 +116,7 @@ cluster KV by `sinomo-cluster`. The local connectivity file is a bootstrap cache
 used before the directory graph is readable. Those facts do not make either
 crate the owner of the other's domain.
 
-The target contract is:
+The current contract is:
 
 - `sinomo-network` owns the cluster network and routing layer: route choice,
   endpoint selection, endpoint scoring, relay decisions, peer transport
@@ -137,58 +137,52 @@ The target contract is:
   leadership; network decides which peer route carries the vote/append traffic.
   KV must not choose peer routes, score endpoints, relay packets, or interpret
   cluster connectivity topology.
+- `sinomo-cluster` is the only R0 bridge. It owns the transport-coupled Raft
+  and membership drivers, moves KV/Raft traffic over network-selected routes,
+  and projects committed cluster facts through the read-only network directory
+  surface. It does not move routing into KV or KV state-machine semantics into
+  networking.
 - `sinomo-daemon` owns host mechanics for both crates: daemon authentication
   context, local process probing, local identity/signing, data-directory access,
   generic daemon RPC transport, response routing, timers, and the small adapter
   objects needed to let network-owned and KV-owned logic run inside the daemon
   event loop.
 
-The coupling must be represented as explicit interfaces, not shared ownership:
+The coupling is represented as explicit interfaces, not shared ownership:
 
-- KV-to-network coupling should be a transport capability that sends KV/Raft RPC
+- KV-to-network coupling is a transport capability that sends KV/Raft RPC
   envelopes over routes selected by `sinomo-network`. The transport capability
   can be supplied by the daemon or by a network-owned adapter, but KV logic should
   see it as a send/replicate interface, not as routing internals.
-- Network-to-KV coupling should be a read-only connectivity graph query
+- Network-to-KV coupling is a read-only directory/connectivity query
   capability backed by KV state. The query returns network records; it must not
   expose transaction, watch, compaction, or Raft mechanics to routing code.
-- KV route/category/body payload contracts should live in `sinomo-kv`; the
+- KV route/category/body payload contracts live in `sinomo-kv`; the
   network layer may wrap those payloads in its generic object-RPC envelope and
   choose the peer route, but should not be the source of truth for KV payload
   semantics.
-- Local KV read/watch route dispatch should live in `sinomo-kv`. Cross-node
+- Local KV read/watch route dispatch lives in `sinomo-kv`. Cross-node
   watch-event fanout may still require network/cluster validation before events
   are appended locally, but the durable watch storage semantics should not live
   in the daemon.
-- Shared wire payloads or graph data types should live in the owning crate or a
+- Shared wire payloads or graph data types live in the owning crate or a
   focused contract crate. They should not cause `sinomo-network` to become a KV
   implementation or `sinomo-kv` to become a router. If a Rust crate dependency
   would imply the wrong ownership direction, introduce explicit traits or a small
   contract crate instead of hiding the dependency inside a broad module.
 
-Current migration debt:
+The production manifests and workspace boundary test enforce that
+`sinomo-network` and `sinomo-kv` do not depend on one another. Dev-only
+test-support dependencies do not change this ownership boundary.
 
-- `sinomo-network` still depends directly on `sinomo-kv` and still contains the
-  backing filesystem implementation for cluster KV range/watch helpers, KV/Raft
-  endpoint RPC envelope adapters, and some Raft helper orchestration because the
-  existing daemon transport and storage layout grew there first. This is not the
-  target model.
-- Those surfaces should split into two explicit interfaces: a `sinomo-kv` service
-  API with network transport traits for KV/Raft replication, and a
-  network-owned connectivity graph query backed by KV state. `sinomo-network`
-  should keep only routing, membership, endpoint, relay, connectivity graph,
-  and health behavior.
-- `sinomo-daemon` still contains relay transport adapters, KV route storage
-  adapters, DFS adapters, and broad membership maintenance glue. Raft append,
-  vote, and cluster membership object-RPC decode/encode now belongs to
-  `sinomo-network`; the daemon service supplies signer/process context, host
-  callbacks, and response routing. Later slices should reduce the remaining
-  adapters until the daemon is mostly lifecycle, auth, socket/event-loop
-  wiring, and service dispatch.
-- The crate root should re-export only CLI/runtime entry points and stable daemon
-  contracts. Control-loop helpers, frame codecs, periodic maintenance ticks,
-  and low-level peer-send helpers should stay crate-internal unless another
-  crate has a real integration need.
+The daemon still hosts narrow network, cluster, KV, DFS, and membership adapter
+objects because one process runs those services. Keep those adapters limited to
+lifecycle, authentication, scheduling, persistence handles, and response
+routing. New Raft, routing, or membership semantics belong in their owning
+crates rather than expanding daemon glue. The crate root should re-export only
+CLI/runtime entry points and stable daemon contracts; control-loop helpers,
+frame codecs, maintenance triggers, and low-level peer sends remain internal
+unless another crate has a reviewed integration need.
 
 ## Current DFS Boundary
 

@@ -188,13 +188,17 @@ sinomo daemon shadow status
 sinomo rollout diagnostics
 ```
 
-If the installed binary is known good, refresh and restart the installation:
+If the installed binary is known good and no activation is in progress, start
+the existing deployment without replacing it:
 
 ```sh
-sinomo install
+sinomo daemon start
 ```
 
-If it cannot read current local state, run install from a current checkout:
+Use `install` only when the deployment itself must be replaced. Verify the
+selected data directory, invoking checkout and commit, expected binary/module
+set, and outage first; installation may stop both daemons, advance managed
+source, rebuild native modules, rewrite boot entries, and restart processes:
 
 ```sh
 cargo run -p sinomo -- install
@@ -204,11 +208,12 @@ When the main daemon is unavailable but the shadow daemon is reachable, use the
 shadow's reported endpoint for diagnostics or a repair rollout:
 
 ```sh
-sinomo rollout diagnostics --target '<shadow-endpoint>'
+SHADOW_ENDPOINT=shadow-host.example:21354
+sinomo rollout diagnostics --target "$SHADOW_ENDPOINT"
 sinomo rollout cluster \
   --remote-build \
   --skip-local \
-  --target '<shadow-endpoint>'
+  --target "$SHADOW_ENDPOINT"
 ```
 
 Clear stale status only after independently confirming that the daemon is

@@ -72,9 +72,9 @@ Use the least invasive command that answers the question:
 
 | Command | Use |
 |---|---|
-| `sinomo cluster status` | Cluster identity and summary health counts. |
+| `sinomo cluster status` | Cluster/local identity, local membership state, term, KV revision/snapshot, member count, and state path. |
 | `sinomo cluster health` | Per-node reachability, version, platform, and rollout state. |
-| `sinomo cluster peers` | The known member and endpoint view. |
+| `sinomo cluster peers` | Known members with node ID, display name, descriptive role, and membership state. |
 | `sinomo cluster doctor` | Endpoint, reachability, stale-status, and storage diagnostics. |
 
 For a rollout problem, combine these checks with
@@ -85,9 +85,10 @@ For a rollout problem, combine these checks with
 The descriptive node role and control-plane authority are separate:
 
 ```sh
-sinomo cluster role <node-id> workstation
-sinomo cluster state-authority <node-id> observer
-sinomo cluster remove <node-id>
+NODE_ID=your-node-id
+sinomo cluster role "$NODE_ID" workstation
+sinomo cluster state-authority "$NODE_ID" observer
+sinomo cluster remove "$NODE_ID"
 ```
 
 Use `role` to describe placement intent such as workstation, mobile, server, or
@@ -95,6 +96,19 @@ sensor. Use `state-authority` only when deliberately changing replicated state
 membership. Keep an odd number of reliable authority nodes when possible;
 intermittent laptops and mobile devices should normally not be required for
 quorum.
+
+The `state-authority` command uses operator-facing tokens that map to the
+underlying membership roles:
+
+| Command token | Membership role | Meaning |
+|---|---|---|
+| `authority` | voter | Participates in quorum and replicates state. |
+| `replica` | learner | Replicates/catches up but does not vote. |
+| `observer` | non-voting | Remains an authorized member without a vote. |
+
+Join and reconfiguration output can temporarily show learner/catch-up state.
+These roles are independent from `cluster role` values such as workstation or
+mobile.
 
 `cluster remove` rejects members that still hold state authority. Confirm the
 remaining authority set is healthy before changing or removing a member.
@@ -104,7 +118,8 @@ remaining authority set is healthy before changing or removing a member.
 Preview a move without changing local state:
 
 ```sh
-sinomo cluster migrate plan <invite>
+INVITE_PATH=/trusted/path/to/join.txt
+sinomo cluster migrate plan "$INVITE_PATH"
 ```
 
 Joining another cluster from a settled one-node cluster uses the migration path.

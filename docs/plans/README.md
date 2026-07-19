@@ -9,7 +9,7 @@ tests for that.
 | Plan | Status |
 |---|---|
 | [R0/R1 crate boundary refactor](r0-r1-crate-boundary-refactor.md) | Completed implementation record. |
-| [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | Proposed follow-up work. |
+| [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | First implementation slice completed; retained P1-P3 follow-up work is classified in the plan. |
 | [DFS policy and authority hardening](dfs-policy-and-authority-hardening.md) | Proposed follow-up work. |
 | [Indexed-file memory implementation](indexed-file-memory-implementation.md) | Active; foundational contracts and the first local file-to-evidence slice are implemented. |
 | [Node health, device monitoring, and DFS storage locations](device-health-and-dfs-storage-locations.md) | Proposed follow-up work. |

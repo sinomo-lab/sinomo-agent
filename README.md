@@ -1,219 +1,146 @@
 # Sinomo
 
-Sinomo is a local-first, distributed runtime for a continuously operating AI
-system. It combines perception, typed events, model-backed agents, durable
-memory, situated actions, a shared filesystem, and controlled software rollout
-across one or more trusted devices.
+Sinomo is a local-first, distributed runtime for continuously operating AI
+systems. It brings agents, models, durable memory, tools, shared files,
+perception, devices, and controlled software updates into one explicit trust
+and authority model.
 
-A single machine is a one-node Sinomo cluster. The same runtime can extend to
-multiple nodes while keeping data placement, device ownership, policy, and
-authority explicit.
+A single machine is a complete one-node Sinomo cluster. Additional trusted
+devices extend the same runtime while keeping data placement, device ownership,
+privacy, availability, and final effect authority explicit.
 
-## What is in this repository
+Sinomo is an active pre-1.0 system. Its low-level cluster, network, KV/Raft,
+storage, DFS/SIFS, daemon, module, sandbox, and rollout foundations are
+implemented and the overall architecture is stable enough to document as a
+system. Higher-level agent, memory, multimodal, placement, evaluation, and
+self-evolution behavior continues to evolve.
 
-- `sinomo`, the main command-line entry point and interactive terminal UI;
-- `sinomo-app`, a graphical client for chat, SIFS files, cluster state, and
-  settings;
-- the daemon, cluster control plane, object RPC, KV/Raft, SIFS/DFS, storage,
-  policy, module, rollout, and observability foundations;
-- agent, memory, model-provider, audio, video, voice, action, and evolution
-  services;
-- native modules, Docker cluster harnesses, and executable Quint
-  specifications.
+## What Sinomo Provides
 
-The [architecture overview](docs/architecture.md) describes the system's stable
-boundaries and invariants. Use the [documentation index](docs/README.md) to find
-operator guides, subsystem designs, specifications, plans, and research notes.
+- a CLI, terminal interface, and graphical app over the same local runtime;
+- durable model-backed agents with tools, skills, sessions, cancellation,
+  steering, context assembly, and compaction;
+- explicit local versus authoritative cluster state backed by reactive Raft;
+- routed typed object RPC, service discovery, and direct or relayed transports;
+- SIFS, a shared versioned filesystem with per-object placement policy;
+- indexed-file memory with inspectable source evidence and rebuildable indexes;
+- node-local policy and permission boundaries for host, device, and remote
+  effects;
+- sandbox, module, build, evaluation, rollout, activation, and recovery paths;
+- structured operational events, logs, metrics, traces, profiling, integration
+  harnesses, and executable Quint specifications.
 
-## Quick start
+Sinomo is the runtime around model providers; it is not itself a hosted model
+service or a general-purpose distributed database.
 
-### Requirements
+## Quick Start from Source
 
-- Rust 1.90 or newer;
-- Git;
-- a supported desktop platform for the graphical app;
-- Docker with Compose, only for the containerized cluster and Android
-  workflows.
+The workspace requires Rust 1.95 or newer and Git.
 
-The desktop app tracks the public
-[SUI](https://github.com/sinomo-lab/sui) `main` branch. Cargo fetches it as a
-Git dependency, while `Cargo.lock` records the reviewed commit used by
-reproducible builds; no sibling checkout is required.
+Sinomo stores local state under `~/.sinomo` by default. To create a separate
+persistent installation, choose and export `SINOMO_DATA_DIR` before running
+`install`:
 
-Platform development libraries used by SUI/wgpu and the native audio and video
-backends must also be available when building the desktop app.
-
-The CLI-only build below does not build the graphical client.
-
-### Build and run the CLI
-
-From the repository root:
-
-```bash
-cargo build -p sinomo
-cargo run -p sinomo -- --help
-```
-
-Run without a subcommand to open the terminal UI:
-
-```bash
-cargo run -p sinomo --
-```
-
-The TUI connects to the local daemon when one is available. CLI commands can be
-entered inside it with a `/` prefix, such as `/models list`; use `/quit` or
-`/exit` to leave.
-
-For a persistent local installation with daemon startup integration:
-
-```bash
-cargo run -p sinomo -- install
-cargo run -p sinomo -- cluster init --name home
-cargo run -p sinomo -- cluster status
-```
-
-Run `cluster init` only for a fresh, uninitialized data directory. An existing
-installation should inspect its current cluster with `cluster status` instead.
-
-Inspect a command before using it with `sinomo <command> help`. The main command
-families cover clusters, daemons, DFS, rollouts, models and providers, agents,
-skills, voice, usage, and runtime tests.
-
-### Run the desktop app
-
-```bash
-cargo run -p sinomo-app
-```
-
-The app uses the same runtime and local state as the CLI. If arguments are
-provided, the `sinomo-app` binary behaves like the `sinomo` CLI instead of
-opening a window.
-
-## Local state and configuration
-
-Sinomo stores local state under `~/.sinomo` by default. Set `SINOMO_DATA_DIR` to
-use a different persistent data directory:
-
-```bash
+```sh
 export SINOMO_DATA_DIR="$HOME/.sinomo-dev"
-cargo run -p sinomo -- daemon start
 ```
 
-The data directory contains local and shared configuration, cluster state, DFS
-content, provider credentials, daemon state, managed rollout source, installed
-binaries, logs, and evolution artifacts. Do not commit it.
+From the repository root, build and install:
 
-Provider setup is available through the graphical settings UI or the CLI:
+`install` is a deployment transaction, not a read-only setup probe. On an
+existing installation it may stop daemons, replace installed binaries, advance
+managed source from the current checkout, build and install native modules,
+rewrite boot entries, and restart processes. Verify the selected data
+directory, repository, commit, and expected outage before running it.
 
-```bash
-cargo run -p sinomo -- providers help
-cargo run -p sinomo -- models help
-```
-
-## Common development commands
-
-```bash
-# Build the default workspace members.
-cargo build
-
-# Run all tests or a focused package/test.
-cargo test
-cargo test -p sinomo-core
-cargo test -p sinomo-core --test workspace_ring_boundaries
-
-# Formatting, linting, and a focused sandbox check.
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo check -p sinomo-sandbox --features wasix-runtime
-```
-
-Development builds use optimization level 2, so clean builds are slower than a
-typical Rust development profile.
-
-Every crate declares a trust ring in its `Cargo.toml`. The ring-boundary test
-enforces dependency direction: R0 is the minimal cluster foundation,
-`sinomo-core` is its facade, R1 is the trusted runtime,
-`sinomo-runtime` is the R1 facade, and R2/application crates consume those
-facades. Read [the crate-boundary plan](docs/plans/r0-r1-crate-boundary-refactor.md)
-before changing cross-crate dependencies.
-
-## Docker and Android
-
-The repository includes three container workflows:
-
-- [`docker-compose.yml`](docker-compose.yml) builds a full, self-rollout-capable
-  node;
-- [`docker/docker-compose.dev.yml`](docker/docker-compose.dev.yml) runs a
-  disposable six-node segmented development cluster using the host-built
-  `target/debug/sinomo` binary;
-- [`docker/docker-compose.single-node.yml`](docker/docker-compose.single-node.yml)
-  runs a minimal one-node smoke environment.
-
-A typical development-cluster loop is:
-
-```bash
+```sh
 cargo build -p sinomo
-docker compose -f docker/docker-compose.dev.yml up --build -d
-docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health
-docker compose -f docker/docker-compose.dev.yml down -v
+cargo run -p sinomo -- install
+cargo run -p sinomo -- cluster init --name workstation
+cargo run -p sinomo -- cluster health
 ```
 
-See the [Docker guide](docker/README.md) for topology, correctness suites,
-migration tests, performance gates, and failure artifacts.
+Run `cluster init` only for a new data directory. An existing installation
+should start with `sinomo cluster status` instead.
 
-The Android NativeActivity package can be built in the provided container:
+Authenticate a model provider, choose one of its available models, then open
+the terminal interface:
 
-```bash
-HOST_UID="$(id -u)" HOST_GID="$(id -g)" \
-  docker compose -f docker/docker-compose.android.yml run --build --rm android-apk
+```sh
+PROVIDER=your-provider-id
+MODEL=your-model-id
+sinomo providers auth "$PROVIDER"
+sinomo providers test "$PROVIDER"
+sinomo models list --provider "$PROVIDER"
+sinomo models default --provider "$PROVIDER" --model "$MODEL"
+sinomo
 ```
 
-The builder uses the `android-debug-small` profile and produces an aarch64 APK
-by default.
+The complete [getting-started guide](docs/user/getting-started.md) explains
+daemon lifecycle, provider choices, the graphical app, health checks, and safe
+next steps.
 
-For development on a connected ARM64 phone, install your distribution's Android
-udev rules, authorize the computer for USB debugging, and use the host helper:
+## System Shape
 
-```bash
-scripts/android-dev.sh doctor
-scripts/android-dev.sh run
-scripts/android-dev.sh logs
-scripts/android-dev.sh debug
+```text
+inputs and devices
+       |
+       v
+typed events and object requests
+       |
+       v
+reactive / interactive / deliberative control
+       |
+       +---- agents, models, memory, tools, actions
+       |
+       v
+versioned files, durable evidence, and authorized effects
+
+shared foundation:
+identity + cluster KV + routing + services + DFS/SIFS + policy + rollout
 ```
 
-`run` builds a debuggable APK, installs it, and launches the NativeActivity.
-`debug` rebuilds when needed and attaches the NDK LLDB frontend with Rust/native
-line tables. Set `ANDROID_SERIAL` if more than one device is connected. The
-smaller container artifact remains useful for normal testing where debugger
-symbols are unnecessary.
+Discovery never grants trust, model output never grants tool authority, and
+building an artifact never grants activation authority. The node that owns a
+device, secret, file, or host capability performs the final check.
 
-## Repository layout
-
-| Path | Purpose |
-|---|---|
-| `crates/sinomo` | Thin binary wrapper for the main CLI/TUI entry point. |
-| `crates/sinomo-cli` | CLI parsing, command handlers, daemon operations, and TUI. |
-| `crates/sinomo-app` | Shared graphical application and desktop binary. |
-| `crates/sinomo-app-android` | Android NativeActivity package wrapper. |
-| `crates/sinomo-core` | R0 facade over the minimal cluster foundation. |
-| `crates/sinomo-runtime` | R1 facade over trusted runtime services. |
-| `crates/` | Runtime, service, application, and test crates. |
-| `modules/` | Native network, sandbox, DFS, remote-management, and benchmark modules. |
-| `docs/` | Architecture, user guides, specifications, plans, and research. |
-| `specs/quint/` | Executable formal models, checks, and scenarios. |
-| `docker/` | Images, Compose files, and multi-node validation harnesses. |
+Read the [system overview](docs/system-overview.md) for the complete mental
+model and [architecture](docs/architecture.md) for normative boundaries.
 
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [Architecture overview](docs/architecture.md)
-- [Cluster operations](docs/user/cluster-operations.md)
-- [Rollout operations](docs/user/rollout-operations.md)
-- [Agent system architecture](docs/agent-system-architecture.md)
-- [DFS architecture](docs/dfs-architecture.md)
-- [Memory architecture](docs/memory-architecture.md)
-- [Formal verification](docs/formal/cluster-verification.md)
+| Audience | Start here |
+|---|---|
+| Users and operators | [User guide](docs/user/README.md) |
+| Developers | [Developer guide](docs/developer/README.md), including research and evaluation workflows |
+| Potential contributors | [Contributing](CONTRIBUTING.md) |
+| Everyone | [Documentation index](docs/README.md) and [glossary](docs/glossary.md) |
+
+Subsystem architecture, exact formats, formal verification, active plans, and
+literature notes are indexed in [docs/README.md](docs/README.md).
+
+## Repository Layout
+
+| Path | Purpose |
+|---|---|
+| `crates/` | R0 foundation, R1 trusted runtime, R2 services, and applications |
+| `modules/` | Native extension modules and opt-in benchmark adapters |
+| `docs/` | Audience guides, architecture, references, plans, evaluation guidance, and research notes |
+| `specs/quint/` | Executable protocol models, contracts, checks, and scenarios |
+| `docker/` | Container images and multi-node validation harnesses |
+| `scripts/` | CI, formal, debugging, and platform helpers |
+
+Every crate declares a trust ring in its manifest. The workspace boundary test
+enforces dependency direction and the separation between networking, KV, and
+the cluster bridge. See [workspace and trust rings](docs/developer/workspace-and-trust-rings.md).
+
+## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Read the owning architecture
+document before a cross-crate change, use CodeGraph first when the checkout is
+indexed, add evidence at the right layer, and keep generated artifacts and
+credentials out of commits.
 
 ## License
 
-The workspace metadata declares dual licensing under MIT or Apache-2.0.
+Workspace metadata declares dual licensing under MIT or Apache-2.0.

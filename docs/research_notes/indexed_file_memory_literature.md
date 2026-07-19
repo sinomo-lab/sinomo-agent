@@ -2,12 +2,18 @@
 
 Research date: 2026-07-05
 
+Status: historical design input. The indexed-file direction was adopted by the
+[memory architecture](../memory-architecture.md); the first local
+text/Markdown file-to-evidence slice is implemented, while the multimodal,
+federated, vector/graph, and model-defined-relation design discussed here
+remains broader than current behavior.
+
 ## Question
 
-Sinomo's current memory design is record-centric. The proposed redesign has one
-core concept: memories are indexed files. A memory should be a durable file or
-file-like object, while chunks, embeddings, summaries, entities, and
-heterogeneous relations are derived indexes over those files.
+At the research date, Sinomo's memory design was record-centric. The proposed
+redesign had one core concept: memories are indexed files. A memory should be a
+durable file or file-like object, while chunks, embeddings, summaries,
+entities, and heterogeneous relations are derived indexes over those files.
 
 The closest motivating implementation is
 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp), but the
@@ -18,7 +24,8 @@ defined, not only a fixed code-structure edge taxonomy.
 
 ## Short Answer
 
-I did not find a single system that combines all of these requirements:
+Within the systems and literature covered by this scoped review, I did not find
+a single system that combines all of these requirements:
 
 - file objects are the source of truth for agent memory;
 - indexes are rebuildable derived artifacts over those files;
@@ -271,6 +278,11 @@ record-style memory can remain as a compatibility layer, but records should
 either become memory files themselves or become index entries that cite memory
 file anchors.
 
+This compatibility-layer recommendation is superseded. The adopted
+[memory architecture](../memory-architecture.md) chose a clean file-first break
+without indefinite dual reads or dual writes; this paragraph is retained to
+show the option considered at the research stage.
+
 This gives Sinomo a clean rebuild story: if an extractor improves, the system can
 recompute chunks, embeddings, entities, summaries, and relation edges without
 rewriting the source memory.
@@ -380,6 +392,11 @@ restrictive source anchor used to derive the relation. Model-proposed relation
 labels should not bypass policy.
 
 ## Recommended MVP
+
+This is the historical MVP recommendation from the research date. In
+particular, item 2's compatibility layer was not adopted; current implementation
+status is summarized by the banner at the top of this note and the memory
+architecture.
 
 1. Define a `MemoryFile` namespace and metadata model, backed by SIFS or the
    existing durable storage path.
