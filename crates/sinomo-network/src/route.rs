@@ -39,6 +39,131 @@ pub(crate) fn network_perf_trace_elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn network_rpc_outcome(result: &Result<ObjectRpcSessionResult, NetworkError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(NetworkError::Timeout { .. }) => "timeout",
+        Err(
+            NetworkError::AuthDenied
+            | NetworkError::AuthExpired
+            | NetworkError::UnauthorizedNode { .. }
+            | NetworkError::CertificateExpired { .. }
+            | NetworkError::CertificateKeyMismatch { .. }
+            | NetworkError::CertificateSignatureMissing { .. },
+        ) => "auth",
+        Err(
+            NetworkError::ClusterOrphan
+            | NetworkError::UnknownNode { .. }
+            | NetworkError::UnknownRoute { .. },
+        ) => "no_route",
+        Err(
+            NetworkError::DeliveryLedgerFull { .. }
+            | NetworkError::NetworkServiceCommandQueueFull { .. }
+            | NetworkError::MailboxFull { .. }
+            | NetworkError::ObjectFrameMemoryUnavailable { .. }
+            | NetworkError::ObjectRpcRouteSaturated { .. }
+            | NetworkError::FrameTooLarge { .. }
+            | NetworkError::ResourceExhausted { .. },
+        ) => "saturated",
+        Err(
+            NetworkError::OutcomeUnknown { .. }
+            | NetworkError::StalePooledConnection { .. }
+            | NetworkError::RetryExhausted { .. }
+            | NetworkError::DeliveryFailed { .. },
+        ) => "delivery",
+        Err(NetworkError::Io { .. } | NetworkError::StorageIo { .. }) => "io",
+        Err(_) => "protocol",
+    }
+}
+
+fn record_network_rpc_metrics(
+    path: &'static str,
+    started: Instant,
+    request_head_bytes: usize,
+    result: &Result<ObjectRpcSessionResult, NetworkError>,
+) {
+    let outcome = network_rpc_outcome(result);
+    metrics::counter!(
+        "sinomo.network.rpc.requests",
+        "path" => path,
+        "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sinomo.network.rpc.total.us",
+        "path" => path,
+        "outcome" => outcome
+    )
+    .record(network_perf_trace_elapsed_us(started) as f64);
+    metrics::counter!("sinomo.network.rpc.request_head.bytes", "path" => path)
+        .increment(request_head_bytes as u64);
+    if let Ok(result) = result {
+        metrics::counter!("sinomo.network.rpc.response_head.bytes", "path" => path)
+            .increment(result.response.body.len() as u64);
+    }
+}
+
+fn network_transport_label(transport: &sinomo_base::ClusterTransportKind) -> &'static str {
+    match transport {
+        sinomo_base::ClusterTransportKind::InProcess => "in_process",
+        sinomo_base::ClusterTransportKind::Loopback => "loopback",
+        sinomo_base::ClusterTransportKind::LanTcp => "lan_tcp",
+        sinomo_base::ClusterTransportKind::LanQuic => "lan_quic",
+        sinomo_base::ClusterTransportKind::Iroh => "iroh",
+        sinomo_base::ClusterTransportKind::WebRtc => "web_rtc",
+        sinomo_base::ClusterTransportKind::TurnRelay => "turn_relay",
+        sinomo_base::ClusterTransportKind::HttpsRelay => "https_relay",
+    }
+}
+
+fn record_network_endpoint_open(
+    path: &'static str,
+    transport: &sinomo_base::ClusterTransportKind,
+    started: Instant,
+    succeeded: bool,
+) {
+    let transport = network_transport_label(transport);
+    let outcome = if succeeded { "ok" } else { "error" };
+    metrics::counter!(
+        "sinomo.network.endpoint.opens",
+        "path" => path,
+        "transport" => transport,
+        "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sinomo.network.endpoint.open.us",
+        "path" => path,
+        "transport" => transport,
+        "outcome" => outcome
+    )
+    .record(network_perf_trace_elapsed_us(started) as f64);
+}
+
+fn record_network_route_plan(
+    started: Instant,
+    cache: &'static str,
+    result: &Result<Option<ClusterDeliveryRoutePlan>, NetworkError>,
+) {
+    let outcome = match result {
+        Ok(Some(_)) => "found",
+        Ok(None) => "missing",
+        Err(_) => "error",
+    };
+    metrics::counter!(
+        "sinomo.network.route.plans",
+        "cache" => cache,
+        "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sinomo.network.route.plan.us",
+        "cache" => cache,
+        "outcome" => outcome
+    )
+    .record(network_perf_trace_elapsed_us(started) as f64);
+}
+
 fn object_rpc_call_is_channel_compatible(call: &ObjectRpcSessionCall) -> bool {
     if call.body.has_value_intent() {
         return call.request.body.len() <= OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES;
@@ -1136,6 +1261,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
     visited: &[NodeId],
     timeline: Option<crate::NetworkTimelineTraceContext>,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
+    let metric_started = Instant::now();
     let perf_started = network_perf_trace_enabled().then(Instant::now);
     let cache_lookup_started_ns = timeline
         .map(|_| crate::network_timeline_monotonic_ns())
@@ -1169,6 +1295,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
                 elapsed_us = network_perf_trace_elapsed_us(started),
             );
         }
+        record_network_route_plan(metric_started, "hit", &plan);
         return plan;
     }
 
@@ -1241,6 +1368,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
             elapsed_us = network_perf_trace_elapsed_us(started),
         );
     }
+    record_network_route_plan(metric_started, "miss", &result);
     result
 }
 
@@ -2495,6 +2623,22 @@ where
         call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let started = Instant::now();
+        let request_head_bytes = call.request.body.len();
+        let result = self
+            .call_endpoint_inner(state, endpoint, call, options)
+            .await;
+        record_network_rpc_metrics("endpoint", started, request_head_bytes, &result);
+        result
+    }
+
+    async fn call_endpoint_inner(
+        &mut self,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        call: ObjectRpcSessionCall,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let expected_public_key = cluster_authorized_member_public_key(state, &endpoint.node_id)?;
         let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
         self.call_authenticated_endpoint(endpoint, call, options, data_dir, expected_public_key)
@@ -2508,6 +2652,22 @@ where
     /// responder to the local main-daemon identity on disk; non-loopback calls
     /// must use [`Self::call_endpoint`] and an authorized cluster member.
     pub async fn call_loopback(
+        &mut self,
+        data_dir: &sinomo_local::SinomoDataDir,
+        address: &str,
+        call: ObjectRpcSessionCall,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let started = Instant::now();
+        let request_head_bytes = call.request.body.len();
+        let result = self
+            .call_loopback_inner(data_dir, address, call, options)
+            .await;
+        record_network_rpc_metrics("loopback", started, request_head_bytes, &result);
+        result
+    }
+
+    async fn call_loopback_inner(
         &mut self,
         data_dir: &sinomo_local::SinomoDataDir,
         address: &str,
@@ -2644,6 +2804,7 @@ where
             NetworkDeliveryState::DefinitelyNotSent,
         );
         let open_started = perf_enabled.then(Instant::now);
+        let metric_open_started = Instant::now();
         let timeline_open_started = timeline
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
@@ -2654,6 +2815,12 @@ where
             open_timeout,
         )
         .await;
+        record_network_endpoint_open(
+            "endpoint",
+            &endpoint.transport,
+            metric_open_started,
+            open_result.is_ok(),
+        );
         record_route_timeline_stage(
             timeline,
             crate::network_timeline_stage::ENDPOINT_OPEN,
@@ -2786,6 +2953,22 @@ where
         call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let started = Instant::now();
+        let request_head_bytes = call.request.body.len();
+        let result = self
+            .call_target_inner(state, target_node_id, call, options)
+            .await;
+        record_network_rpc_metrics("routed", started, request_head_bytes, &result);
+        result
+    }
+
+    async fn call_target_inner(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        call: ObjectRpcSessionCall,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let Some(context) = self.route_context else {
             return Err(NetworkError::Io {
                 operation: "cluster target object RPC session".to_string(),
@@ -2823,6 +3006,19 @@ where
     /// while the incoming body is piped through without application-level
     /// sharding or whole-body buffering.
     pub async fn forward_relay(
+        &mut self,
+        state: &ClusterBootstrapState,
+        request: crate::ObjectRpcSessionRequest,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        let started = Instant::now();
+        let request_head_bytes = request.request.body.len();
+        let result = self.forward_relay_inner(state, request, options).await;
+        record_network_rpc_metrics("relay", started, request_head_bytes, &result);
+        result
+    }
+
+    async fn forward_relay_inner(
         &mut self,
         state: &ClusterBootstrapState,
         request: crate::ObjectRpcSessionRequest,
@@ -2986,6 +3182,7 @@ where
                         NetworkDeliveryState::DefinitelyNotSent,
                     );
                     let open_started = perf_enabled.then(Instant::now);
+                    let metric_open_started = Instant::now();
                     let timeline_open_started = timeline
                         .map(|_| crate::network_timeline_monotonic_ns())
                         .unwrap_or(0);
@@ -2996,6 +3193,12 @@ where
                         open_timeout,
                     )
                     .await;
+                    record_network_endpoint_open(
+                        "relay",
+                        &endpoint.transport,
+                        metric_open_started,
+                        open_result.is_ok(),
+                    );
                     record_route_timeline_stage(
                         timeline,
                         crate::network_timeline_stage::ENDPOINT_OPEN,
@@ -3067,6 +3270,7 @@ where
                 };
                 let started = Instant::now();
                 let used_channel = channel.is_some();
+                metrics::counter!("sinomo.network.rpc.attempts", "path" => "relay").increment(1);
                 let result = if let Some(channel) = channel {
                     let channel_call = if final_hop {
                         // The inner origin signature remains attached. The
@@ -3439,6 +3643,7 @@ where
                 }
                 let stream = if channel.is_none() {
                     let open_started = perf_enabled.then(Instant::now);
+                    let metric_open_started = Instant::now();
                     let timeline_open_started = timeline
                         .map(|_| crate::network_timeline_monotonic_ns())
                         .unwrap_or(0);
@@ -3446,6 +3651,12 @@ where
                         .host
                         .open_object_rpc_session_stream_async(&endpoint, policy.health)
                         .await;
+                    record_network_endpoint_open(
+                        "routed",
+                        &endpoint.transport,
+                        metric_open_started,
+                        open_result.is_ok(),
+                    );
                     record_route_timeline_stage(
                         timeline,
                         crate::network_timeline_stage::ENDPOINT_OPEN,
@@ -3513,6 +3724,7 @@ where
                     .map(|_| crate::network_timeline_monotonic_ns())
                     .unwrap_or(0);
                 send_attempts = send_attempts.saturating_add(1);
+                metrics::counter!("sinomo.network.rpc.attempts", "path" => "routed").increment(1);
                 let started = Instant::now();
                 let used_channel = channel.is_some();
                 let result = if let Some(channel) = channel {
@@ -4762,6 +4974,27 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn network_rpc_outcomes_are_bounded_error_classes() {
+        let timeout = Err(NetworkError::timeout(
+            "test",
+            NetworkTimeoutPhase::Overall,
+            Duration::from_secs(1),
+            NetworkDeliveryState::DefinitelyNotSent,
+        ));
+        let saturation = Err(NetworkError::MailboxFull {
+            node_id: NodeId::from_legacy_named("peer").expect("peer node id"),
+            max_frames: 1,
+        });
+        let route = Err(NetworkError::UnknownNode {
+            node_id: NodeId::from_legacy_named("missing").expect("missing node id"),
+        });
+
+        assert_eq!(network_rpc_outcome(&timeout), "timeout");
+        assert_eq!(network_rpc_outcome(&saturation), "saturated");
+        assert_eq!(network_rpc_outcome(&route), "no_route");
+    }
 
     #[test]
     fn bulk_and_unknown_attachments_use_the_bdp_tuned_session() {

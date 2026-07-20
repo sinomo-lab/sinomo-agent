@@ -57,6 +57,7 @@ mod mounted_sifs;
 mod namespace;
 mod node_transport;
 mod operator;
+mod performance_metrics;
 mod placement;
 mod posix;
 mod posix_model;

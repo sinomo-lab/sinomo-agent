@@ -46,6 +46,7 @@ tokio.workspace = true
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support"] }

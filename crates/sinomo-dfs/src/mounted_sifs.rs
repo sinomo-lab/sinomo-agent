@@ -352,11 +352,38 @@ mod tests {
                 .expect("targets")
                 .push(target_node_id.clone());
             assert_eq!(call.request.route, sinomo_core::kv::CLUSTER_KV_TXN_ROUTE);
-            let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(&KvTxnResponse {
-                succeeded: true,
-                revision: KvRevision(7),
-                responses: Vec::new(),
-            })
+            let submitted =
+                sinomo_core::kv::decode_cluster_kv_txn_rpc_request_body(&call.request.body)
+                    .expect("txn request");
+            let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(
+                &sinomo_core::kv::ClusterKvTxnCommitResult {
+                    request_id: submitted.request_id,
+                    snapshot: sinomo_core::kv::KvSnapshot {
+                        revision: KvRevision(7),
+                        compacted_revision: KvRevision(0),
+                        entries: Vec::new(),
+                        leases: Vec::new(),
+                        events: Vec::new(),
+                        committed_requests: Vec::new(),
+                        expired_requests: Vec::new(),
+                    },
+                    txn_response: Some(KvTxnResponse {
+                        succeeded: true,
+                        revision: KvRevision(7),
+                        responses: Vec::new(),
+                    }),
+                    authority: sinomo_core::kv::KvAuthorityProof {
+                        term: 1,
+                        commit_index: 1,
+                        revision: KvRevision(7),
+                        basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                    replayed_committed_request: false,
+                },
+            )
             .expect("txn response payload");
             Ok(ObjectRpcSessionResult::value(
                 ObjectRpcResponse::from_encoded_body(payload.route, payload.body),

@@ -247,6 +247,10 @@ impl Service for DfsService {
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
+            let mut operation_metrics = crate::performance_metrics::DfsOperationMetricGuard::start(
+                request.route.as_str(),
+                "control",
+            );
             let response = match request.route.as_str() {
                 DFS_STATUS_ROUTE => {
                     let started_at = Instant::now();
@@ -333,6 +337,7 @@ impl Service for DfsService {
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
+            operation_metrics.succeed();
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -354,6 +359,10 @@ impl Service for DfsDataPlaneService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let service = self.clone();
         Box::pin(async move {
+            let mut operation_metrics = crate::performance_metrics::DfsOperationMetricGuard::start(
+                request.route.as_str(),
+                "data",
+            );
             let response = match request.route.as_str() {
                 DFS_SMOKE_ROUTE => {
                     let _: () = request.decode_body()?;
@@ -397,6 +406,7 @@ impl Service for DfsDataPlaneService {
                             attachment.descriptor,
                         )?;
                         ctx.respond_with_body(response, attachment.source)?;
+                        operation_metrics.succeed();
                         return Ok(ServiceDisposition::Continue);
                     }
                     ObjectRpcResponse::encode_body(route, &message_response.response)?
@@ -409,11 +419,13 @@ impl Service for DfsDataPlaneService {
                         )
                         .map_err(service_error)?;
                     ctx.respond_with_body(response.response, response.attachment)?;
+                    operation_metrics.succeed();
                     return Ok(ServiceDisposition::Continue);
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
+            operation_metrics.succeed();
             Ok(ServiceDisposition::Continue)
         })
     }

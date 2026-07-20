@@ -6,7 +6,9 @@ use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use sysinfo::{Disks, Networks, System};
 
 pub use sinomo_observe::OperationalSeverity;
 
@@ -14,6 +16,7 @@ pub(crate) fn register_observe_metric_exporters(
     service_hooks: &[crate::DaemonServiceRegistryHook],
 ) {
     register_observe_metric_descriptors();
+    initialize_node_resource_sampling();
     sinomo_observe::register_observe_metric_exporter_with_policy(
         "sinomo-dfs",
         ["sinomo.dfs."],
@@ -25,6 +28,12 @@ pub(crate) fn register_observe_metric_exporters(
         ["sinomo.kv."],
         Some(Duration::from_secs(5)),
         kv_observe_metrics,
+    );
+    sinomo_observe::register_observe_metric_exporter_with_policy(
+        "sinomo-node-resources",
+        ["sinomo.node."],
+        Some(Duration::from_secs(5)),
+        node_resource_observe_metrics,
     );
     for hook in service_hooks {
         hook.register_observe_metric_exporters();
@@ -83,6 +92,26 @@ fn register_observe_metric_descriptors() {
             "sinomo.kv.fanout.target_results",
             "KV background fanout target results.",
         ),
+        (
+            "sinomo.network.rpc.requests",
+            "Canonical object RPC calls made by this node.",
+        ),
+        (
+            "sinomo.network.rpc.attempts",
+            "Physical channel or session attempts made for routed and relayed object RPCs.",
+        ),
+        (
+            "sinomo.network.endpoint.opens",
+            "Concrete network endpoint open attempts.",
+        ),
+        (
+            "sinomo.network.route.plans",
+            "Cluster delivery route planning attempts.",
+        ),
+        (
+            "sinomo.dfs.operations",
+            "DFS control-plane and data-plane operations handled by this node.",
+        ),
     ] {
         register(
             name,
@@ -103,6 +132,22 @@ fn register_observe_metric_descriptors() {
         (
             "sinomo.kv.snapshot.write.bytes",
             "Bytes written to cluster KV snapshots.",
+        ),
+        (
+            "sinomo.node.network.received.bytes",
+            "Bytes received by this node's network interfaces since observation started.",
+        ),
+        (
+            "sinomo.node.network.transmitted.bytes",
+            "Bytes transmitted by this node's network interfaces since observation started.",
+        ),
+        (
+            "sinomo.network.rpc.request_head.bytes",
+            "Object RPC request-head bytes sent by this node.",
+        ),
+        (
+            "sinomo.network.rpc.response_head.bytes",
+            "Object RPC response-head bytes received by this node.",
         ),
     ] {
         register(
@@ -168,6 +213,22 @@ fn register_observe_metric_descriptors() {
         (
             "sinomo.kv.fanout.target.us",
             "KV background fanout target latency.",
+        ),
+        (
+            "sinomo.network.rpc.total.us",
+            "End-to-end canonical object RPC latency, including route selection and retries.",
+        ),
+        (
+            "sinomo.network.endpoint.open.us",
+            "Concrete network endpoint open latency.",
+        ),
+        (
+            "sinomo.network.route.plan.us",
+            "Cluster delivery route planning latency.",
+        ),
+        (
+            "sinomo.dfs.operation.total.us",
+            "End-to-end DFS operation handling latency.",
         ),
     ] {
         register(
@@ -247,6 +308,14 @@ fn register_observe_metric_descriptors() {
             "sinomo.observe.metric_exporter.errors",
             "Snapshot metric exporters currently failing.",
         ),
+        (
+            "sinomo.node.cpu.logical",
+            "Logical processors available to this node.",
+        ),
+        (
+            "sinomo.node.load.average",
+            "Operating-system load average for a bounded sampling period.",
+        ),
     ] {
         register(
             name,
@@ -264,6 +333,25 @@ fn register_observe_metric_descriptors() {
         (
             "sinomo.kv.materialized_snapshot.bytes",
             "Current materialized cluster KV snapshot size.",
+        ),
+        ("sinomo.node.memory.total.bytes", "Total node memory."),
+        ("sinomo.node.memory.used.bytes", "Used node memory."),
+        (
+            "sinomo.node.memory.available.bytes",
+            "Available node memory.",
+        ),
+        ("sinomo.node.swap.used.bytes", "Used node swap space."),
+        (
+            "sinomo.node.data_disk.total.bytes",
+            "Total size of the filesystem containing the Sinomo data directory.",
+        ),
+        (
+            "sinomo.node.data_disk.available.bytes",
+            "Available space on the filesystem containing the Sinomo data directory.",
+        ),
+        (
+            "sinomo.node.process.resident_memory.bytes",
+            "Resident memory used by the Sinomo daemon process.",
         ),
     ] {
         register(
@@ -284,6 +372,18 @@ fn register_observe_metric_descriptors() {
         ObserveMetricKind::Gauge,
         ObserveMetricUnit::Ratio,
         "Whether this node is the current cluster KV leader.",
+    );
+    register(
+        "sinomo.node.cpu.utilization",
+        ObserveMetricKind::Gauge,
+        ObserveMetricUnit::Ratio,
+        "Fraction of aggregate node CPU currently in use.",
+    );
+    register(
+        "sinomo.node.uptime.seconds",
+        ObserveMetricKind::Gauge,
+        ObserveMetricUnit::Seconds,
+        "Operating-system uptime.",
     );
 
     for name in [
@@ -338,6 +438,10 @@ fn observe_metric_domain(name: &str) -> Option<&'static str> {
         Some("dfs")
     } else if name.starts_with("sinomo.observe.") {
         Some("observe")
+    } else if name.starts_with("sinomo.node.") {
+        Some("node")
+    } else if name.starts_with("sinomo.network.") {
+        Some("network")
     } else {
         None
     }
@@ -362,6 +466,11 @@ fn observe_metric_aggregation(
             | "sinomo.kv.raft_snapshot.bytes"
             | "sinomo.kv.materialized_snapshot.bytes"
             | "sinomo.kv.raft.is_leader" => ObserveMetricAggregation::Sum,
+            "sinomo.node.cpu.utilization" | "sinomo.node.load.average" => {
+                ObserveMetricAggregation::Max
+            }
+            "sinomo.node.uptime.seconds" => ObserveMetricAggregation::Min,
+            name if name.starts_with("sinomo.node.") => ObserveMetricAggregation::Sum,
             "sinomo.kv.peer.progress_known" => ObserveMetricAggregation::Min,
             "sinomo.kv.peer.lag_entries" | "sinomo.kv.peer.progress_age.seconds" => {
                 ObserveMetricAggregation::Max
@@ -377,6 +486,18 @@ fn observe_metric_labels(name: &str) -> &'static [&'static str] {
         | "sinomo.daemon.service.dispatch.us"
         | "sinomo.daemon.service.total.us" => &["route", "category", "outcome"],
         "sinomo.daemon.service.context.us" => &["route", "category"],
+        "sinomo.network.rpc.requests" | "sinomo.network.rpc.total.us" => &["path", "outcome"],
+        "sinomo.network.rpc.attempts" => &["path"],
+        "sinomo.network.endpoint.opens" | "sinomo.network.endpoint.open.us" => {
+            &["path", "transport", "outcome"]
+        }
+        "sinomo.network.route.plans" | "sinomo.network.route.plan.us" => &["cache", "outcome"],
+        "sinomo.dfs.operations" | "sinomo.dfs.operation.total.us" => {
+            &["operation", "plane", "outcome"]
+        }
+        "sinomo.network.rpc.request_head.bytes" | "sinomo.network.rpc.response_head.bytes" => {
+            &["path"]
+        }
         "sinomo.kv.reads" | "sinomo.kv.read.total.us" => &["authority", "source", "outcome"],
         "sinomo.kv.commands" | "sinomo.kv.command.total.us" => &["command", "outcome"],
         "sinomo.kv.storage.operations" => &["operation", "outcome"],
@@ -400,6 +521,7 @@ fn observe_metric_labels(name: &str) -> &'static [&'static str] {
         "sinomo.kv.command.phase.us" => &["phase"],
         "sinomo.kv.quorum.acks" => &["kind"],
         "sinomo.observe.metric_exporter.errors" => &["exporter", "reason"],
+        "sinomo.node.load.average" => &["period"],
         "sinomo.dfs.metadata_shard.journal_next_sequence"
         | "sinomo.dfs.metadata_shard.journal_last_sequence"
         | "sinomo.dfs.metadata_shard.replicas" => {
@@ -441,6 +563,167 @@ fn observe_metric_labels(name: &str) -> &'static [&'static str] {
         | "sinomo.kv.peer.progress_age.seconds" => &["node_id", "peer_node_id"],
         _ => &[],
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct NodeResourceSnapshot {
+    uptime_seconds: u64,
+    logical_cpu_count: usize,
+    cpu_utilization: f64,
+    load_one: f64,
+    load_five: f64,
+    load_fifteen: f64,
+    memory_total_bytes: u64,
+    memory_available_bytes: u64,
+    swap_used_bytes: u64,
+    data_disk_total_bytes: u64,
+    data_disk_available_bytes: u64,
+    network_received_bytes: u64,
+    network_transmitted_bytes: u64,
+    process_resident_memory_bytes: u64,
+}
+
+static NODE_RESOURCE_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+static NODE_NETWORK_BASELINE: OnceLock<(u64, u64)> = OnceLock::new();
+
+fn initialize_node_resource_sampling() {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return;
+    }
+    let _ = node_resource_system();
+    let _ = NODE_NETWORK_BASELINE.set(node_network_totals());
+}
+
+fn node_resource_system() -> &'static Mutex<System> {
+    NODE_RESOURCE_SYSTEM.get_or_init(|| Mutex::new(System::new_all()))
+}
+
+fn node_network_totals() -> (u64, u64) {
+    Networks::new_with_refreshed_list().iter().fold(
+        (0_u64, 0_u64),
+        |(received, transmitted), (_, network)| {
+            (
+                received.saturating_add(network.total_received()),
+                transmitted.saturating_add(network.total_transmitted()),
+            )
+        },
+    )
+}
+
+fn node_resource_observe_metrics(
+    data_dir: &SinomoDataDir,
+) -> Result<Vec<sinomo_observe::ObserveMetricRecord>, sinomo_observe::ObserveError> {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return Ok(Vec::new());
+    }
+    let mut system =
+        node_resource_system()
+            .lock()
+            .map_err(|_| sinomo_observe::ObserveError::Runtime {
+                detail: "node resource sampler lock is poisoned".to_string(),
+            })?;
+    system.refresh_all();
+    let load = System::load_average();
+    let disks = Disks::new_with_refreshed_list();
+    let data_disk = disks
+        .list()
+        .iter()
+        .filter(|disk| data_dir.root().starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count());
+    let (network_received_total, network_transmitted_total) = node_network_totals();
+    let (network_received_baseline, network_transmitted_baseline) =
+        *NODE_NETWORK_BASELINE.get_or_init(|| (network_received_total, network_transmitted_total));
+    let process_resident_memory_bytes = sysinfo::get_current_pid()
+        .ok()
+        .and_then(|pid| system.process(pid))
+        .map(|process| process.memory())
+        .unwrap_or_default();
+    let snapshot = NodeResourceSnapshot {
+        uptime_seconds: System::uptime(),
+        logical_cpu_count: system.cpus().len(),
+        cpu_utilization: f64::from(system.global_cpu_usage()) / 100.0,
+        load_one: load.one,
+        load_five: load.five,
+        load_fifteen: load.fifteen,
+        memory_total_bytes: system.total_memory(),
+        memory_available_bytes: system.available_memory(),
+        swap_used_bytes: system.used_swap(),
+        data_disk_total_bytes: data_disk.map(|disk| disk.total_space()).unwrap_or_default(),
+        data_disk_available_bytes: data_disk
+            .map(|disk| disk.available_space())
+            .unwrap_or_default(),
+        network_received_bytes: network_received_total.saturating_sub(network_received_baseline),
+        network_transmitted_bytes: network_transmitted_total
+            .saturating_sub(network_transmitted_baseline),
+        process_resident_memory_bytes,
+    };
+    Ok(node_resource_metric_records(snapshot))
+}
+
+fn node_resource_metric_records(
+    snapshot: NodeResourceSnapshot,
+) -> Vec<sinomo_observe::ObserveMetricRecord> {
+    let gauge = |name, value| {
+        sinomo_observe::ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
+    };
+    let mut records = vec![
+        gauge("sinomo.node.uptime.seconds", snapshot.uptime_seconds),
+        gauge("sinomo.node.cpu.logical", snapshot.logical_cpu_count as u64),
+        sinomo_observe::ObserveMetricRecord::gauge(
+            "sinomo.node.cpu.utilization",
+            BTreeMap::new(),
+            snapshot.cpu_utilization.clamp(0.0, 1.0),
+        ),
+        gauge(
+            "sinomo.node.memory.total.bytes",
+            snapshot.memory_total_bytes,
+        ),
+        gauge(
+            "sinomo.node.memory.used.bytes",
+            snapshot
+                .memory_total_bytes
+                .saturating_sub(snapshot.memory_available_bytes),
+        ),
+        gauge(
+            "sinomo.node.memory.available.bytes",
+            snapshot.memory_available_bytes,
+        ),
+        gauge("sinomo.node.swap.used.bytes", snapshot.swap_used_bytes),
+        gauge(
+            "sinomo.node.data_disk.total.bytes",
+            snapshot.data_disk_total_bytes,
+        ),
+        gauge(
+            "sinomo.node.data_disk.available.bytes",
+            snapshot.data_disk_available_bytes,
+        ),
+        sinomo_observe::ObserveMetricRecord::counter(
+            "sinomo.node.network.received.bytes",
+            BTreeMap::new(),
+            snapshot.network_received_bytes,
+        ),
+        sinomo_observe::ObserveMetricRecord::counter(
+            "sinomo.node.network.transmitted.bytes",
+            BTreeMap::new(),
+            snapshot.network_transmitted_bytes,
+        ),
+        gauge(
+            "sinomo.node.process.resident_memory.bytes",
+            snapshot.process_resident_memory_bytes,
+        ),
+    ];
+    for (period, value) in [
+        ("1m", snapshot.load_one),
+        ("5m", snapshot.load_five),
+        ("15m", snapshot.load_fifteen),
+    ] {
+        records.push(sinomo_observe::ObserveMetricRecord::gauge(
+            "sinomo.node.load.average",
+            BTreeMap::from([("period".to_string(), period.to_string())]),
+            value,
+        ));
+    }
+    records
 }
 
 fn dfs_observe_metrics(
@@ -773,4 +1056,117 @@ fn operational_origin_node_id(paths: &DaemonPaths, data_dir: &Path) -> Id {
         "sinomo.daemon.operational.local-node",
         data_dir.display().to_string().as_bytes(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extended_metric_descriptors_publish_units_and_bounded_dimensions() {
+        register_observe_metric_descriptors();
+        let descriptors = sinomo_observe::observe_metric_descriptors();
+        let descriptor = |name: &str| {
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.name == name)
+                .unwrap_or_else(|| panic!("missing descriptor {name}"))
+        };
+
+        let network = descriptor("sinomo.network.rpc.total.us");
+        assert_eq!(
+            network.unit,
+            Some(sinomo_observe::ObserveMetricUnit::Microseconds)
+        );
+        assert_eq!(
+            network.semantics.labels,
+            ["outcome".to_string(), "path".to_string()]
+        );
+        let dfs = descriptor("sinomo.dfs.operations");
+        assert_eq!(
+            dfs.semantics.labels,
+            [
+                "operation".to_string(),
+                "outcome".to_string(),
+                "plane".to_string()
+            ]
+        );
+        let node = descriptor("sinomo.node.network.received.bytes");
+        assert_eq!(node.unit, Some(sinomo_observe::ObserveMetricUnit::Bytes));
+        assert!(node.semantics.labels.is_empty());
+    }
+
+    #[test]
+    fn node_resource_records_are_aggregated_and_identifier_free() {
+        let records = node_resource_metric_records(NodeResourceSnapshot {
+            uptime_seconds: 120,
+            logical_cpu_count: 8,
+            cpu_utilization: 0.25,
+            load_one: 1.0,
+            load_five: 0.5,
+            load_fifteen: 0.25,
+            memory_total_bytes: 1_000,
+            memory_available_bytes: 400,
+            swap_used_bytes: 10,
+            data_disk_total_bytes: 2_000,
+            data_disk_available_bytes: 750,
+            network_received_bytes: 100,
+            network_transmitted_bytes: 200,
+            process_resident_memory_bytes: 300,
+        });
+
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.name == "sinomo.node.memory.used.bytes")
+                .and_then(|record| record.value),
+            Some(600.0)
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.name == "sinomo.node.cpu.utilization")
+                .and_then(|record| record.value),
+            Some(0.25)
+        );
+        assert!(records.iter().all(|record| {
+            record.labels.is_empty()
+                || (record.name == "sinomo.node.load.average"
+                    && record.labels.keys().all(|label| label == "period"))
+        }));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.name == "sinomo.node.load.average")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn node_resource_exporter_collects_the_supported_host() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
+        initialize_node_resource_sampling();
+        let root = sinomo_testdir::TestDir::new("node-resource-observe");
+        let data_dir = SinomoDataDir::new(root.path());
+
+        let records = node_resource_observe_metrics(&data_dir).expect("node resource metrics");
+
+        assert!(
+            records
+                .iter()
+                .any(|record| record.name == "sinomo.node.cpu.utilization")
+        );
+        assert!(records.iter().any(|record| {
+            record.name == "sinomo.node.memory.total.bytes"
+                && record.value.is_some_and(|value| value > 0.0)
+        }));
+        assert!(records.iter().all(|record| {
+            record.labels.is_empty()
+                || (record.name == "sinomo.node.load.average"
+                    && record.labels.keys().all(|label| label == "period"))
+        }));
+    }
 }

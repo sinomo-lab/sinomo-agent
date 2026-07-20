@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::local::SinomoDataDir;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{Event, Subscriber, field};
@@ -1126,21 +1126,38 @@ pub fn observe_process_started_at() -> Option<OffsetDateTime> {
 }
 
 pub fn read_observe_metrics(request: &ObserveMetricsRequest) -> ObserveMetricsResponse {
-    finish_observe_metrics(observe_runtime_metrics(), request)
+    let started = Instant::now();
+    let mut metrics = observe_runtime_metrics();
+    metrics.extend(observe_self_health_metrics(
+        started.elapsed(),
+        std::iter::empty::<&ObserveMetricExporterHealth>(),
+    ));
+    append_observe_response_health(&mut metrics, request);
+    finish_observe_metrics(metrics, request)
 }
 
 pub fn read_observe_metrics_for_data_dir(
     data_dir: &SinomoDataDir,
     request: &ObserveMetricsRequest,
 ) -> ObserveMetricsResponse {
+    let started = Instant::now();
     let mut metrics = observe_runtime_metrics();
     let mut exporters = Vec::new();
+    let mut exporter_health = Vec::new();
     let mut partial = false;
     for (name, registration) in observe_metric_exporter_snapshot(request) {
         let exporter_started = Instant::now();
         match collect_observe_metric_exporter(&registration, data_dir) {
             Ok(collection) => {
+                let record_count = collection.records.len();
                 metrics.extend(collection.records);
+                exporter_health.push(ObserveMetricExporterHealth {
+                    name: name.clone(),
+                    duration_us: collection.duration_us,
+                    record_count,
+                    cached: collection.cached,
+                    success: true,
+                });
                 exporters.push(ObserveMetricExporterStatus {
                     name,
                     observed_at: collection.observed_at,
@@ -1162,6 +1179,13 @@ pub fn read_observe_metrics_for_data_dir(
                     labels,
                     1.0,
                 ));
+                exporter_health.push(ObserveMetricExporterHealth {
+                    name: name.clone(),
+                    duration_us: duration_as_micros_u64(exporter_started.elapsed()),
+                    record_count: 0,
+                    cached: false,
+                    success: false,
+                });
                 exporters.push(ObserveMetricExporterStatus {
                     name: name.clone(),
                     observed_at,
@@ -1179,10 +1203,217 @@ pub fn read_observe_metrics_for_data_dir(
             }
         }
     }
+    metrics.extend(observe_self_health_metrics(
+        started.elapsed(),
+        exporter_health.iter(),
+    ));
+    append_observe_response_health(&mut metrics, request);
     let mut response = finish_observe_metrics(metrics, request);
     response.exporters = exporters;
     response.partial = partial;
     response
+}
+
+struct ObserveMetricExporterHealth {
+    name: String,
+    duration_us: u64,
+    record_count: usize,
+    cached: bool,
+    success: bool,
+}
+
+fn observe_self_health_metrics<'a>(
+    collection_duration: Duration,
+    exporters: impl IntoIterator<Item = &'a ObserveMetricExporterHealth>,
+) -> Vec<ObserveMetricRecord> {
+    register_observe_self_metric_descriptors();
+    let (metric_series, trace_records, dropped_traces) = OBSERVE_RUNTIME
+        .get()
+        .map(|runtime| {
+            (
+                runtime.metrics.slot_count(),
+                runtime
+                    .traces
+                    .lock()
+                    .map(|traces| traces.len())
+                    .unwrap_or_default(),
+                runtime.dropped_traces.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or_default();
+    let mut records = vec![
+        ObserveMetricRecord::gauge(
+            "sinomo.observe.runtime.metric_series",
+            BTreeMap::new(),
+            metric_series as f64,
+        ),
+        ObserveMetricRecord::gauge(
+            "sinomo.observe.trace_buffer.records",
+            BTreeMap::new(),
+            trace_records as f64,
+        ),
+        ObserveMetricRecord::gauge(
+            "sinomo.observe.trace_buffer.utilization",
+            BTreeMap::new(),
+            trace_records as f64 / TRACE_BUFFER_LIMIT as f64,
+        ),
+        ObserveMetricRecord::counter(
+            "sinomo.observe.trace_buffer.dropped",
+            BTreeMap::new(),
+            dropped_traces,
+        ),
+        ObserveMetricRecord::gauge(
+            "sinomo.observe.collection.us",
+            BTreeMap::new(),
+            duration_as_micros_u64(collection_duration) as f64,
+        ),
+    ];
+    for exporter in exporters {
+        let labels = BTreeMap::from([
+            ("exporter".to_string(), exporter.name.clone()),
+            (
+                "outcome".to_string(),
+                if exporter.success { "success" } else { "error" }.to_string(),
+            ),
+            ("cached".to_string(), exporter.cached.to_string()),
+        ]);
+        records.push(ObserveMetricRecord::gauge(
+            "sinomo.observe.metric_exporter.collection.us",
+            labels,
+            exporter.duration_us as f64,
+        ));
+        records.push(ObserveMetricRecord::gauge(
+            "sinomo.observe.metric_exporter.records",
+            BTreeMap::from([("exporter".to_string(), exporter.name.clone())]),
+            exporter.record_count as f64,
+        ));
+    }
+    records
+}
+
+fn append_observe_response_health(
+    metrics: &mut Vec<ObserveMetricRecord>,
+    request: &ObserveMetricsRequest,
+) {
+    let self_records = [
+        "sinomo.observe.response.records",
+        "sinomo.observe.response.truncated",
+    ];
+    let matches_prefix = |name: &str| {
+        request
+            .name_prefix
+            .as_ref()
+            .is_none_or(|prefix| name.starts_with(prefix))
+    };
+    let total = metrics
+        .iter()
+        .filter(|record| matches_prefix(record.name.as_str()))
+        .count()
+        + self_records
+            .iter()
+            .filter(|name| matches_prefix(name))
+            .count();
+    let truncated = request.limit > 0 && total > request.limit;
+    let returned = if request.limit > 0 {
+        total.min(request.limit)
+    } else {
+        total
+    };
+    metrics.push(ObserveMetricRecord::gauge(
+        self_records[0],
+        BTreeMap::new(),
+        returned as f64,
+    ));
+    metrics.push(ObserveMetricRecord::gauge(
+        self_records[1],
+        BTreeMap::new(),
+        if truncated { 1.0 } else { 0.0 },
+    ));
+}
+
+fn register_observe_self_metric_descriptors() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        let register = |name, kind, unit, help, aggregation, labels| {
+            register_observe_metric_descriptor(
+                ObserveMetricDescriptor::new(name, kind, Some(unit), help).with_semantics(
+                    ObserveMetricSemantics::new("observe", aggregation, labels),
+                ),
+            );
+        };
+        register(
+            "sinomo.observe.runtime.metric_series",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            "Metric series retained by the process-local observation recorder.",
+            ObserveMetricAggregation::Sum,
+            Vec::<&str>::new(),
+        );
+        register(
+            "sinomo.observe.trace_buffer.records",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            "Trace records currently retained in the bounded observation buffer.",
+            ObserveMetricAggregation::Sum,
+            Vec::<&str>::new(),
+        );
+        register(
+            "sinomo.observe.trace_buffer.utilization",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Ratio,
+            "Fraction of the bounded observation trace buffer currently occupied.",
+            ObserveMetricAggregation::Max,
+            Vec::<&str>::new(),
+        );
+        register(
+            "sinomo.observe.trace_buffer.dropped",
+            ObserveMetricKind::Counter,
+            ObserveMetricUnit::Count,
+            "Trace records evicted from the bounded observation buffer.",
+            ObserveMetricAggregation::Sum,
+            Vec::<&str>::new(),
+        );
+        register(
+            "sinomo.observe.collection.us",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Microseconds,
+            "Time spent collecting live metrics and snapshot exporters before response shaping.",
+            ObserveMetricAggregation::Max,
+            Vec::<&str>::new(),
+        );
+        register(
+            "sinomo.observe.metric_exporter.collection.us",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Microseconds,
+            "Time spent in the latest snapshot exporter collection.",
+            ObserveMetricAggregation::Max,
+            vec!["exporter", "outcome", "cached"],
+        );
+        register(
+            "sinomo.observe.metric_exporter.records",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            "Metric records returned by the latest snapshot exporter collection.",
+            ObserveMetricAggregation::Sum,
+            vec!["exporter"],
+        );
+        register(
+            "sinomo.observe.response.records",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            "Metric records returned by the latest observation response after filtering and limits.",
+            ObserveMetricAggregation::Sum,
+            Vec::<&str>::new(),
+        );
+        register(
+            "sinomo.observe.response.truncated",
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Ratio,
+            "Whether the latest observation metric response was truncated by its record limit.",
+            ObserveMetricAggregation::Max,
+            Vec::<&str>::new(),
+        );
+    });
 }
 
 struct ObserveMetricExporterCollection {
@@ -1672,6 +1903,13 @@ impl ObserveMetricsRecorder {
         };
         slots.values().map(|slot| slot.snapshot()).collect()
     }
+
+    fn slot_count(&self) -> usize {
+        self.slots
+            .lock()
+            .map(|slots| slots.len())
+            .unwrap_or_default()
+    }
 }
 
 impl Recorder for ObserveMetricsRecorder {
@@ -1929,6 +2167,64 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::Registry;
+
+    #[test]
+    fn self_health_reports_current_exporter_state_with_bounded_labels() {
+        let exporter = ObserveMetricExporterHealth {
+            name: "sinomo-dfs".to_string(),
+            duration_us: 321,
+            record_count: 7,
+            cached: true,
+            success: true,
+        };
+
+        let records = observe_self_health_metrics(Duration::from_micros(900), [&exporter]);
+        let collection = records
+            .iter()
+            .find(|record| record.name == "sinomo.observe.metric_exporter.collection.us")
+            .expect("exporter collection metric");
+        assert_eq!(collection.value, Some(321.0));
+        assert_eq!(
+            collection.labels.get("exporter"),
+            Some(&"sinomo-dfs".to_string())
+        );
+        assert_eq!(
+            collection.labels.get("outcome"),
+            Some(&"success".to_string())
+        );
+        assert_eq!(collection.labels.get("cached"), Some(&"true".to_string()));
+        assert!(records.iter().any(|record| {
+            record.name == "sinomo.observe.metric_exporter.records" && record.value == Some(7.0)
+        }));
+        assert!(records.iter().any(|record| {
+            record.name == "sinomo.observe.collection.us" && record.value == Some(900.0)
+        }));
+    }
+
+    #[test]
+    fn response_self_health_reports_filter_limit_truncation() {
+        let request = ObserveMetricsRequest {
+            name_prefix: Some("sinomo.observe.".to_string()),
+            limit: 2,
+        };
+        let mut records = vec![
+            ObserveMetricRecord::gauge(
+                "sinomo.observe.runtime.metric_series",
+                BTreeMap::new(),
+                1.0,
+            ),
+            ObserveMetricRecord::gauge("sinomo.observe.trace_buffer.records", BTreeMap::new(), 1.0),
+        ];
+
+        append_observe_response_health(&mut records, &request);
+
+        assert!(records.iter().any(|record| {
+            record.name == "sinomo.observe.response.records" && record.value == Some(2.0)
+        }));
+        assert!(records.iter().any(|record| {
+            record.name == "sinomo.observe.response.truncated" && record.value == Some(1.0)
+        }));
+    }
 
     #[test]
     fn histogram_snapshot_exposes_cumulative_buckets_and_quantiles() {

@@ -133,15 +133,41 @@ derive interval rates and approximate percentiles from consecutive reads.
 `--samples <n>` for a bounded capture. Streaming JSON emits one compact object
 per interval so it can be redirected to a JSONL artifact.
 
-The daemon registers built-in DFS and KV exporters:
+The daemon registers built-in DFS, KV, and node-resource exporters:
 
 - `sinomo.dfs.*` reports DFS object, version, receipt, intent, conflict, repair,
-  namespace job, and metadata shard gauges.
+  namespace job, and metadata shard gauges. Runtime operation counters and
+  histograms classify the bounded control/data-plane operation, outcome, and
+  end-to-end handling time without using paths or object identifiers as labels.
 - `sinomo.kv.*` reports local cluster KV revision, compacted revision, entry,
   lease, retained event, Raft progress, durable file size, and bounded peer-lag
   gauges. Runtime counters and histograms separate command queueing, WAL append,
   quorum replication, local apply, compaction, cache fallback, and background
   fanout cost.
+- `sinomo.node.*` reports aggregate CPU, load, memory, swap, data-filesystem,
+  daemon RSS, uptime, and network byte counters. It never exports hostnames,
+  mount paths, interface names, addresses, or process lists. The sampler is
+  initialized at daemon startup and its successful snapshots are cached for
+  five seconds, so observation reads do not wait for a fresh CPU sampling
+  interval.
+
+The network crate records `sinomo.network.rpc.*` around the canonical endpoint,
+loopback, routed, and relay call boundaries. A routed call is counted once even
+when route selection or endpoint retry performs multiple internal attempts.
+Labels contain only the bounded path and outcome class; routes, endpoint
+addresses, node IDs, and error strings remain outside metric labels. Head-byte
+counters intentionally exclude streamed attachment bodies rather than
+presenting partial transfer sizes as whole-request throughput. Separate bounded
+attempt counters, route-plan latency/cache outcome, and endpoint-open
+latency/transport outcome distinguish routing churn from connection setup and
+application handling.
+
+`sinomo.observe.*` also reports the observation system itself: runtime metric
+series, trace-buffer occupancy and drops, per-exporter record counts and latest
+collection duration/outcome/cache state, total collection duration, returned
+record count, and response truncation. These are assembled directly into the
+current response, so a slow or failing snapshot exporter is visible on the same
+read that experienced it rather than only on a later scrape.
 
 Application-level crates register through daemon service hooks. The agent hook
 currently exports `sinomo.agent.*` gauges for persisted sessions, control
