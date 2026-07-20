@@ -876,8 +876,9 @@ impl IndexedFileMemoryStore {
                     .anchors
                     .get(continuation.next_anchor)
                     .ok_or_else(|| MemoryError::InvalidMemoryContinuation {
-                        detail: "ranked evidence continuation anchor is outside its pinned generation"
-                            .to_string(),
+                        detail:
+                            "ranked evidence continuation anchor is outside its pinned generation"
+                                .to_string(),
                     })?;
                 Some(RankedEvidenceCursor {
                     partition_id: continuation.next_partition_id.clone(),
@@ -995,10 +996,7 @@ impl IndexedFileMemoryStore {
                 break;
             }
             let generation: LexicalPartitionGeneration = self.read_required(
-                &self.partition_generation_path(
-                    &candidate.partition_id,
-                    &candidate.generation_id,
-                ),
+                &self.partition_generation_path(&candidate.partition_id, &candidate.generation_id),
                 "ranked evidence generation",
             )?;
             if !self.current_root_authorizes_generation(access, &generation)? {
@@ -1015,12 +1013,14 @@ impl IndexedFileMemoryStore {
                 bundle.trace.stale_partitions += 1;
                 continue;
             }
-            let lexical_anchor = generation
-                .anchors
-                .get(candidate.anchor_index)
-                .ok_or_else(|| MemoryError::InvalidMemoryContinuation {
-                    detail: "ranked evidence anchor is outside its pinned generation".to_string(),
-                })?;
+            let lexical_anchor =
+                generation
+                    .anchors
+                    .get(candidate.anchor_index)
+                    .ok_or_else(|| MemoryError::InvalidMemoryContinuation {
+                        detail: "ranked evidence anchor is outside its pinned generation"
+                            .to_string(),
+                    })?;
             let Some(content) = materialize_text_anchor(&text, &lexical_anchor.anchor.selector)
             else {
                 bundle.trace.stale_partitions += 1;
