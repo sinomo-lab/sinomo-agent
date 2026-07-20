@@ -1042,6 +1042,13 @@ mod tests {
         let ChatEvent::Ready { session_id, .. } = ready else {
             unreachable!("matched ready");
         };
+        let stable_channel_id = SessionId::from_str(&session_id).expect("stable channel id");
+        SifsAgentChannelStore::open(&temp.data_dir)
+            .expect("stable channel store")
+            .save_channel(&sinomo_agent::AgentChannel::with_default_title(
+                stable_channel_id.clone(),
+            ))
+            .expect("seed stable control channel");
         assert_eq!(
             runtime_control
                 .session_count()
@@ -1092,7 +1099,6 @@ mod tests {
         };
         assert!(follow_up_status.accepted && follow_up_status.runtime_attached);
 
-        let stable_channel_id = SessionId::from_str(&session_id).expect("stable channel id");
         let stable_channel = SifsAgentChannelStore::open(&temp.data_dir)
             .expect("stable channel store")
             .load_channel(&stable_channel_id)

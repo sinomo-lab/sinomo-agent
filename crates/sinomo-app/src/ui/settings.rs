@@ -67,7 +67,7 @@ use crate::backend::config::{
     set_provider_reasoning_budget, set_provider_text_verbosity, set_provider_vendor_options,
     set_value, test_provider_connection, text_verbosity_index,
 };
-use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState};
+use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
 use crate::backend::remote_management::{
     REMOTE_MANAGEMENT_ALLOW_COMMAND, REMOTE_MANAGEMENT_DENY_COMMAND,
     RemoteManagementSettingsSnapshot,
@@ -10247,18 +10247,6 @@ fn module_config_editor_row(
     )
 }
 
-fn module_ids_match(left: &str, right: &str) -> bool {
-    fn normalized(value: &str) -> Option<sinomo_runtime::core::Id> {
-        sinomo_runtime::core::Id::new(value.to_string())
-            .or_else(|_| sinomo_runtime::core::Id::from_legacy_named(value))
-            .ok()
-    }
-
-    normalized(left)
-        .zip(normalized(right))
-        .is_some_and(|(left, right)| left == right)
-}
-
 fn module_node_option(node: &crate::backend::modules::ModuleConfigNodeSummary) -> String {
     let suffix = if node.local { " · local" } else { "" };
     format!(
@@ -15107,6 +15095,12 @@ mod tests {
         state.set_agent_max_steps("4".to_string());
         state.set_agent_home_server_node_id("home-node".to_string());
         state.set_agent_skills_text("docs.skill\nreview.skill".to_string());
+        let default_tool_count = state.agent_form.definition.tools.len();
+        let added_tool = available_agent_tool_specs(&state.agent_form.definition.tools)
+            .get(state.agent_form.tool_add_index)
+            .expect("an additional agent tool")
+            .name
+            .clone();
         state.add_selected_agent_tool();
 
         let operation = state.agent_save_operation().expect("save operation");
@@ -15137,7 +15131,8 @@ mod tests {
             saved.placement.home_server_node_id.as_deref(),
             Some("home-node")
         );
-        assert_eq!(saved.tools.len(), 1);
+        assert_eq!(saved.tools.len(), default_tool_count + 1);
+        assert!(saved.tools.iter().any(|tool| tool.name == added_tool));
         let summaries = agent_summaries(backend.data_dir.as_ref());
         assert!(
             summaries.iter().any(|agent| {
@@ -15312,7 +15307,7 @@ mod tests {
             .expect("render agent summary");
         assert_eq!(
             agent_summary_line(&render_summary),
-            "main · Cluster default · custom",
+            "main · Cluster default · 4 tools · custom",
             "the agent menu detail should expose role, model policy, and source"
         );
         window

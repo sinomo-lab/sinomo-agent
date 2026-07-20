@@ -15,7 +15,6 @@ use sinomo_runtime::module::{
     ModuleRuntimeConfigEntry, ModuleRuntimeConfigSource, read_declarative_module_loader_states,
     read_native_dylib_module_cache_entries_excluding_cache_keys,
     read_native_dylib_module_loader_states, read_native_rust_module_runtime_states,
-    resolve_module_runtime_config,
 };
 use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
@@ -383,8 +382,18 @@ impl Backend {
             "native-dylib",
             "Privileged node administration module",
         );
-        if let Some(module) =
-            modules.get_mut(sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID)
+        let remote_management_module = modules
+            .keys()
+            .find(|module_id| {
+                module_ids_match(
+                    module_id,
+                    sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID,
+                )
+            })
+            .cloned();
+        if let Some(module) = remote_management_module
+            .as_ref()
+            .and_then(|module_id| modules.get_mut(module_id))
         {
             module.backend = "native-dylib".to_string();
             module.detail = "Privileged node administration module".to_string();
@@ -396,18 +405,24 @@ impl Backend {
             .map(|node| &node.config)
             .unwrap_or(&empty_node_config);
         for module in modules.values_mut() {
-            module.desired_enabled = cluster_config
-                .setting(&module.module_id)
+            module.desired_enabled = module_config_setting(cluster_config, &module.module_id)
                 .map(|setting| setting.enabled);
-            let effective =
-                resolve_module_runtime_config(node_config, cluster_config, &module.module_id);
-            module.effective_enabled = effective.enabled;
-            module.effective_source = effective.source;
+            let (effective_enabled, effective_source) = if let Some(setting) =
+                module_config_setting(node_config, &module.module_id)
+            {
+                (setting.enabled, ModuleRuntimeConfigSource::Node)
+            } else if let Some(setting) = module_config_setting(cluster_config, &module.module_id) {
+                (setting.enabled, ModuleRuntimeConfigSource::Cluster)
+            } else {
+                (false, ModuleRuntimeConfigSource::DisabledDefault)
+            };
+            module.effective_enabled = effective_enabled;
+            module.effective_source = effective_source;
             if selected_is_local {
                 let observation = if module.backend == "native-dylib" {
-                    native_dylib_observations.remove(&module.module_id)
+                    remove_matching_observation(&mut native_dylib_observations, &module.module_id)
                 } else {
-                    observations.remove(&module.module_id)
+                    remove_matching_observation(&mut observations, &module.module_id)
                 };
                 let (state, detail) = observation.unwrap_or_else(|| {
                     if module.backend == "native-dylib" {
@@ -511,11 +526,65 @@ fn apply_module_override(
     enabled: Option<bool>,
 ) -> Result<(), String> {
     match enabled {
-        Some(enabled) => config
-            .set(module_id, ModuleRuntimeConfigEntry::enabled(enabled))
-            .map_err(|error| error.to_string()),
-        None => config.clear(module_id).map_err(|error| error.to_string()),
+        Some(enabled) => {
+            let existing = config
+                .module_ids()
+                .find(|configured| module_ids_match(configured, module_id))
+                .map(str::to_string);
+            config
+                .set(
+                    existing.as_deref().unwrap_or(module_id),
+                    ModuleRuntimeConfigEntry::enabled(enabled),
+                )
+                .map_err(|error| error.to_string())
+        }
+        None => {
+            let matching = config
+                .module_ids()
+                .filter(|configured| module_ids_match(configured, module_id))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            for configured in matching {
+                config.clear(&configured)?;
+            }
+            Ok(())
+        }
     }
+}
+
+pub(crate) fn module_ids_match(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> Option<sinomo_runtime::module::ModuleId> {
+        sinomo_runtime::module::ModuleId::new(value.to_string())
+            .or_else(|_| sinomo_runtime::module::ModuleId::from_legacy_named(value))
+            .ok()
+    }
+
+    normalized(left)
+        .zip(normalized(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+pub(crate) fn module_config_setting(
+    config: &ModuleRuntimeConfig,
+    module_id: &str,
+) -> Option<ModuleRuntimeConfigEntry> {
+    config.setting(module_id).or_else(|| {
+        config
+            .module_ids()
+            .find(|configured| module_ids_match(configured, module_id))
+            .and_then(|configured| config.setting(configured))
+    })
+}
+
+fn remove_matching_observation(
+    observations: &mut BTreeMap<String, (ModuleObservedState, String)>,
+    module_id: &str,
+) -> Option<(ModuleObservedState, String)> {
+    let key = observations
+        .keys()
+        .find(|observed| module_ids_match(observed, module_id))
+        .cloned()?;
+    observations.remove(&key)
 }
 
 fn insert_module_summary(
@@ -526,6 +595,12 @@ fn insert_module_summary(
 ) {
     let module_id = module_id.trim();
     if module_id.is_empty() {
+        return;
+    }
+    if modules
+        .keys()
+        .any(|existing| module_ids_match(existing, module_id))
+    {
         return;
     }
     modules
@@ -550,7 +625,11 @@ fn insert_native_dylib_module_summary(
 ) {
     let detail = detail.into();
     insert_module_summary(modules, module_id, "native-dylib", detail.clone());
-    if let Some(module) = modules.get_mut(module_id.trim()) {
+    let matching = modules
+        .keys()
+        .find(|existing| module_ids_match(existing, module_id))
+        .cloned();
+    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching)) {
         if module.backend != "native-dylib" {
             module.backend = "native-dylib".to_string();
             module.detail = detail;

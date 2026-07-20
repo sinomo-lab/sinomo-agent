@@ -9,7 +9,9 @@ use sinomo_runtime::node::{LocalNodePermissionStore, LocalNodePermissions};
 use sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID;
 
 use crate::backend::Backend;
-use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState};
+use crate::backend::modules::{
+    ModuleConfigSnapshot, ModuleObservedState, module_config_setting, module_ids_match,
+};
 
 pub const REMOTE_MANAGEMENT_ALLOW_COMMAND: &str = "sinomo node permissions allow remote-management";
 pub const REMOTE_MANAGEMENT_DENY_COMMAND: &str = "sinomo node permissions deny remote-management";
@@ -176,7 +178,7 @@ impl Backend {
             module_snapshot
                 .modules
                 .iter()
-                .find(|module| module.module_id == REMOTE_MANAGEMENT_MODULE_ID)
+                .find(|module| module_ids_match(&module.module_id, REMOTE_MANAGEMENT_MODULE_ID))
         });
         let mut module_errors = module_snapshot.warnings.clone();
         if module_snapshot.selected_node.is_some() && selected_node.is_none() {
@@ -205,8 +207,7 @@ impl Backend {
                 .map(|node| node.summary.display_name.clone())
                 .unwrap_or_else(|| "This node".to_string()),
             module_override: selected_node.and_then(|node| {
-                node.config
-                    .setting(REMOTE_MANAGEMENT_MODULE_ID)
+                module_config_setting(&node.config, REMOTE_MANAGEMENT_MODULE_ID)
                     .map(|setting| setting.enabled)
             }),
             module_effective_enabled: module.is_some_and(|module| module.effective_enabled),

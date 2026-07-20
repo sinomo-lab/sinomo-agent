@@ -4155,6 +4155,11 @@ impl ChatState {
             Some(Err(TryRecvError::Empty)) | None => return false,
             Some(Err(TryRecvError::Disconnected)) => {
                 self.channel_create_rx = None;
+                if self.pending_session_reset.is_some()
+                    && self.pending_session_reset == self.session_edit_id
+                {
+                    self.pending_session_reset = None;
+                }
                 self.notice = Some("channel create failed: worker stopped".to_string());
                 self.push_activity(
                     "channel create",
@@ -4166,9 +4171,13 @@ impl ChatState {
         };
 
         self.channel_create_rx = None;
-        match result.result {
+        let ChannelCreateWorkerResult { session, result } = result;
+        let session_id = session.id.clone();
+        let activate_saved_channel = self.pending_session_reset.as_deref()
+            == Some(session_id.as_str())
+            && self.session_id == session_id;
+        match result {
             Ok(list_result) => {
-                let session = result.session;
                 // The channel worker's catalog snapshot was taken after the new channel was
                 // persisted. Discard any older catalog read that was already in flight so it
                 // cannot arrive later and temporarily erase the just-created sidebar entry.
@@ -4195,8 +4204,19 @@ impl ChatState {
                     "Saved channel to SIFS".to_string(),
                     ActivityTone::Good,
                 );
+                // The chat worker resumes a channel through the same SIFS snapshot. Notify it
+                // only after the create worker has committed that snapshot; sending this from
+                // `new_channel` lets the two writers race the same durable object. Do not switch
+                // back when the user moved to another conversation while the save was running.
+                if activate_saved_channel {
+                    self.handle
+                        .send_command(ChatCommand::NewSession { session_id });
+                }
             }
             Err(detail) => {
+                if self.pending_session_reset.as_deref() == Some(session_id.as_str()) {
+                    self.pending_session_reset = None;
+                }
                 self.notice = Some(format!("channel create failed: {detail}"));
                 self.push_activity("channel create", detail, ActivityTone::Warn);
             }
@@ -6422,9 +6442,6 @@ impl ChatState {
             "Saving channel to SIFS".to_string(),
             ActivityTone::Running,
         );
-        self.handle
-            .send_command(ChatCommand::NewSession { session_id });
-
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
@@ -6459,6 +6476,9 @@ impl ChatState {
             }
             Err(error) => {
                 self.channel_create_rx = None;
+                if self.pending_session_reset.as_deref() == Some(session_id.as_str()) {
+                    self.pending_session_reset = None;
+                }
                 let detail = error.to_string();
                 self.notice = Some(format!("channel create failed: {detail}"));
                 self.push_activity("channel create", detail, ActivityTone::Warn);
