@@ -1349,8 +1349,19 @@ where
     H: ClusterKvRaftQuorumCommitHost,
     H::Error: ToString,
 {
-    let _commit_sequence_lock = host.lock_cluster_raft_commit_sequence()?;
-    if let Some((snapshot, record)) = host.replay_cluster_raft_request_if_committed(&request)? {
+    let mut command_metrics = KvCommandMetricGuard::start(&request.command);
+    let mut concurrency_metrics = KvCommitConcurrencyMetricGuard::queued();
+    let _commit_sequence_lock = {
+        let _phase = KvCommandPhaseMetricGuard::start("commit_sequence_wait");
+        host.lock_cluster_raft_commit_sequence()?
+    };
+    concurrency_metrics.acquired();
+    let replay = {
+        let _phase = KvCommandPhaseMetricGuard::start("request_replay");
+        host.replay_cluster_raft_request_if_committed(&request)?
+    };
+    if let Some((snapshot, record)) = replay {
+        command_metrics.finish("replayed");
         return Ok(ClusterKvRaftQuorumCommitResult {
             snapshot,
             txn_response: record.txn_response.clone(),
@@ -1363,7 +1374,11 @@ where
             replayed_committed_request: true,
         });
     }
-    if !host.local_has_verified_raft_leadership(state)? {
+    let local_has_leadership = {
+        let _phase = KvCommandPhaseMetricGuard::start("leadership_check");
+        host.local_has_verified_raft_leadership(state)?
+    };
+    if !local_has_leadership {
         let failure = cluster_kv_authority_failure(
             state,
             if cluster_kv_raft_local_is_voter(state) {
@@ -1377,11 +1392,15 @@ where
             usize::from(cluster_kv_raft_local_is_voter(state)),
             None,
         );
+        command_metrics.finish("not_leader");
         host.record_cluster_raft_request_rejected_before_commit(&request, &failure)?;
         return Err(host.cluster_authority_error(failure));
     }
     let request_for_outcome = request.clone();
-    let entry = host.append_cluster_raft_request_uncommitted(request)?;
+    let entry = {
+        let _phase = KvCommandPhaseMetricGuard::start("local_append");
+        host.append_cluster_raft_request_uncommitted(request)?
+    };
 
     let mut voter_acks = RaftNodeIdSet::default();
     let mut fanout_node_ids = RaftNodeIdSet::default();
@@ -1395,6 +1414,7 @@ where
     let mut failures = Vec::new();
     let mut higher_term_observed: Option<u64> = None;
     let deadline = Instant::now() + options.timeout;
+    let quorum_metrics = KvCommandPhaseMetricGuard::start("quorum");
     let targets = host.remote_voter_targets(state)?;
     for target in &targets {
         if voter_acks.len() >= quorum_size {
@@ -1480,6 +1500,10 @@ where
             }
         }
     }
+    drop(quorum_metrics);
+    metrics::histogram!("sinomo.kv.quorum.acks", "kind" => "received")
+        .record(voter_acks.len() as f64);
+    metrics::histogram!("sinomo.kv.quorum.acks", "kind" => "required").record(quorum_size as f64);
 
     if voter_acks.len() < quorum_size || higher_term_observed.is_some() {
         let _ = host.discard_cluster_raft_uncommitted_tail_and_clear_leader();
@@ -1498,10 +1522,13 @@ where
             }
         );
         let reason = if higher_term_observed.is_some() {
+            command_metrics.finish("higher_term");
             KvAuthorityFailureReason::HigherTermObserved
         } else if Instant::now() >= deadline {
+            command_metrics.finish("timeout");
             KvAuthorityFailureReason::Timeout
         } else {
+            command_metrics.finish("no_quorum");
             KvAuthorityFailureReason::NoQuorum
         };
         host.record_cluster_raft_request_unknown(&request_for_outcome, &detail)?;
@@ -1516,7 +1543,11 @@ where
         )));
     }
 
-    let commit = host.commit_cluster_raft_index_with_events(entry.index)?;
+    let commit = {
+        let _phase = KvCommandPhaseMetricGuard::start("local_apply");
+        host.commit_cluster_raft_index_with_events(entry.index)?
+    };
+    command_metrics.finish("committed");
     for target in targets {
         if fanout_node_ids
             .try_insert_clone(
@@ -1537,11 +1568,14 @@ where
     // The fan-out replicates the committed history to every member (learners
     // included — they converge event-driven on commit), so it runs even when
     // there are no REMOTE VOTER targets (single-voter clusters).
-    host.fan_out_committed_cluster_raft_command(
-        state.clone(),
-        commit.events.clone(),
-        fanout_targets,
-    )?;
+    {
+        let _phase = KvCommandPhaseMetricGuard::start("fanout_dispatch");
+        host.fan_out_committed_cluster_raft_command(
+            state.clone(),
+            commit.events.clone(),
+            fanout_targets,
+        )?;
+    }
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
@@ -1567,11 +1601,20 @@ pub async fn commit_cluster_kv_raft_command_with_quorum_async<H>(
 where
     H: ClusterKvRaftQuorumCommitAsyncHost,
 {
-    let _commit_sequence_lock = host.lock_cluster_raft_commit_sequence_async().await?;
-    if let Some((snapshot, record)) = host
-        .replay_cluster_raft_request_if_committed_async(&request)
-        .await?
-    {
+    let mut command_metrics = KvCommandMetricGuard::start(&request.command);
+    let mut concurrency_metrics = KvCommitConcurrencyMetricGuard::queued();
+    let _commit_sequence_lock = {
+        let _phase = KvCommandPhaseMetricGuard::start("commit_sequence_wait");
+        host.lock_cluster_raft_commit_sequence_async().await?
+    };
+    concurrency_metrics.acquired();
+    let replay = {
+        let _phase = KvCommandPhaseMetricGuard::start("request_replay");
+        host.replay_cluster_raft_request_if_committed_async(&request)
+            .await?
+    };
+    if let Some((snapshot, record)) = replay {
+        command_metrics.finish("replayed");
         return Ok(ClusterKvRaftQuorumCommitResult {
             snapshot,
             txn_response: record.txn_response.clone(),
@@ -1584,7 +1627,11 @@ where
             replayed_committed_request: true,
         });
     }
-    if !host.local_has_verified_raft_leadership_async(state).await? {
+    let local_has_leadership = {
+        let _phase = KvCommandPhaseMetricGuard::start("leadership_check");
+        host.local_has_verified_raft_leadership_async(state).await?
+    };
+    if !local_has_leadership {
         let failure = cluster_kv_authority_failure(
             state,
             if cluster_kv_raft_local_is_voter(state) {
@@ -1598,14 +1645,17 @@ where
             usize::from(cluster_kv_raft_local_is_voter(state)),
             None,
         );
+        command_metrics.finish("not_leader");
         host.record_cluster_raft_request_rejected_before_commit_async(&request, &failure)
             .await?;
         return Err(host.cluster_authority_error(failure));
     }
     let request_for_outcome = request.clone();
-    let entry = host
-        .append_cluster_raft_request_uncommitted_async(request)
-        .await?;
+    let entry = {
+        let _phase = KvCommandPhaseMetricGuard::start("local_append");
+        host.append_cluster_raft_request_uncommitted_async(request)
+            .await?
+    };
 
     let mut voter_acks = RaftNodeIdSet::default();
     let mut fanout_node_ids = RaftNodeIdSet::default();
@@ -1619,6 +1669,7 @@ where
     let mut failures = Vec::new();
     let mut higher_term_observed: Option<u64> = None;
     let deadline = Instant::now() + options.timeout;
+    let quorum_metrics = KvCommandPhaseMetricGuard::start("quorum");
     let targets = host.remote_voter_targets_async(state).await?;
     let replication_targets = targets
         .iter()
@@ -1710,6 +1761,10 @@ where
             }
         }
     }
+    drop(quorum_metrics);
+    metrics::histogram!("sinomo.kv.quorum.acks", "kind" => "received")
+        .record(voter_acks.len() as f64);
+    metrics::histogram!("sinomo.kv.quorum.acks", "kind" => "required").record(quorum_size as f64);
 
     if voter_acks.len() < quorum_size && Instant::now() >= deadline {
         failures.push(format!(
@@ -1737,10 +1792,13 @@ where
             }
         );
         let reason = if higher_term_observed.is_some() {
+            command_metrics.finish("higher_term");
             KvAuthorityFailureReason::HigherTermObserved
         } else if Instant::now() >= deadline {
+            command_metrics.finish("timeout");
             KvAuthorityFailureReason::Timeout
         } else {
+            command_metrics.finish("no_quorum");
             KvAuthorityFailureReason::NoQuorum
         };
         host.record_cluster_raft_request_unknown_async(&request_for_outcome, &detail)
@@ -1756,9 +1814,12 @@ where
         )));
     }
 
-    let commit = host
-        .commit_cluster_raft_index_with_events_async(entry.index)
-        .await?;
+    let commit = {
+        let _phase = KvCommandPhaseMetricGuard::start("local_apply");
+        host.commit_cluster_raft_index_with_events_async(entry.index)
+            .await?
+    };
+    command_metrics.finish("committed");
     for target in targets {
         if fanout_node_ids
             .try_insert_clone(
@@ -1776,12 +1837,15 @@ where
             fanout_targets.push(target);
         }
     }
-    host.fan_out_committed_cluster_raft_command_async(
-        state.clone(),
-        commit.events.clone(),
-        fanout_targets,
-    )
-    .await?;
+    {
+        let _phase = KvCommandPhaseMetricGuard::start("fanout_dispatch");
+        host.fan_out_committed_cluster_raft_command_async(
+            state.clone(),
+            commit.events.clone(),
+            fanout_targets,
+        )
+        .await?;
+    }
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
@@ -2404,8 +2468,14 @@ pub fn compact_cluster_kv_raft_node_if_needed(
     if !cluster_kv_raft_node_should_compact(node, snapshot_bytes, policy) {
         return Ok(false);
     }
+    let mut metric = KvStorageMetricGuard::start("compaction", "sinomo.kv.compaction.us");
+    let log_entries_before = node.log().len();
     node.compact_event_history_to(policy.max_snapshot_events);
     node.save_snapshot()?;
+    metrics::counter!("sinomo.kv.compaction.runs", "outcome" => "ok").increment(1);
+    metrics::histogram!("sinomo.kv.compaction.removed_log_entries")
+        .record(log_entries_before.saturating_sub(node.log().len()) as f64);
+    metric.succeed();
     Ok(true)
 }
 
@@ -3727,6 +3797,7 @@ impl DurableRaftKvNode {
         discard_uncommitted_tail: bool,
         lock_wait: Duration,
     ) -> Result<Self, KvError> {
+        let mut metric = KvStorageMetricGuard::start("raft_open", "sinomo.kv.raft.open.us");
         paths.ensure()?;
         let lock = open_node_lock(&paths)?;
         lock_node_exclusive(&lock, &paths.lock, lock_wait)?;
@@ -3792,12 +3863,16 @@ impl DurableRaftKvNode {
         if truncated || load_truncated {
             rewrite_wal_entries(&paths.wal, &node.log)?;
         }
-        Ok(Self {
+        let opened = Self {
             node_id,
             paths,
             _lock: lock,
             node,
-        })
+        };
+        metrics::histogram!("sinomo.kv.raft.open.log_entries").record(opened.log().len() as f64);
+        opened.record_live_metrics();
+        metric.succeed();
+        Ok(opened)
     }
 
     pub async fn open_async(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
@@ -4003,8 +4078,11 @@ impl DurableRaftKvNode {
             return Err(error);
         }
         if let Some((commit_index, entries)) = entries_to_apply {
+            let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
             self.node.apply_preflighted_commit(entries, commit_index)?;
+            metric.succeed();
         }
+        self.record_live_metrics();
         Ok(preparation.response)
     }
 
@@ -4089,6 +4167,7 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
+        self.record_live_metrics();
         Ok(response)
     }
 
@@ -4101,6 +4180,7 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
+        self.record_live_metrics();
         Ok(true)
     }
 
@@ -4123,6 +4203,7 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
+        self.record_live_metrics();
         Ok(())
     }
 
@@ -4133,6 +4214,7 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
+        self.record_live_metrics();
         Ok(())
     }
 
@@ -4175,6 +4257,7 @@ impl DurableRaftKvNode {
             self.node.log = log_before;
             return Err(error);
         }
+        self.record_live_metrics();
         Ok(entry)
     }
 
@@ -4197,6 +4280,7 @@ impl DurableRaftKvNode {
             self.node.txn_responses = txn_responses_before;
             return Err(error);
         }
+        self.record_live_metrics();
         Ok(true)
     }
 
@@ -4205,6 +4289,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
+        let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
         let hard_state_before = self.node.hard_state.clone();
         if commit_index <= self.node.applied_index {
             if let Err(error) = self.node.commit_to(commit_index) {
@@ -4215,6 +4300,8 @@ impl DurableRaftKvNode {
                 self.node.hard_state = hard_state_before;
                 return Err(error);
             }
+            self.record_live_metrics();
+            metric.succeed();
             return Ok(());
         }
 
@@ -4225,10 +4312,17 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
-        self.node.apply_preflighted_commit(entries, commit_index)
+        let result = self.node.apply_preflighted_commit(entries, commit_index);
+        if result.is_ok() {
+            self.record_live_metrics();
+            metric.succeed();
+        }
+        result
     }
 
     pub fn save_snapshot(&mut self) -> Result<RaftSnapshot, KvError> {
+        let mut metric =
+            KvStorageMetricGuard::start("snapshot_write", "sinomo.kv.snapshot.write.us");
         let node_before = self.node.clone();
         let hard_state_before = node_before.hard_state.clone();
         let snapshot = RaftSnapshot {
@@ -4252,10 +4346,18 @@ impl DurableRaftKvNode {
             self.node = node_before;
             return Err(error);
         }
+        let written_bytes = fs::metadata(&self.paths.snapshot)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        metrics::counter!("sinomo.kv.snapshot.write.bytes").increment(written_bytes);
+        self.record_live_metrics();
+        metric.succeed();
         Ok(snapshot)
     }
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
+        let mut metric =
+            KvStorageMetricGuard::start("snapshot_restore", "sinomo.kv.snapshot.restore.us");
         let node_before = self.node.clone();
         let hard_state_before = node_before.hard_state.clone();
         write_object_file(&self.paths.snapshot, &snapshot)?;
@@ -4268,6 +4370,8 @@ impl DurableRaftKvNode {
             self.node = node_before;
             return Err(error);
         }
+        self.record_live_metrics();
+        metric.succeed();
         Ok(())
     }
 
@@ -4280,6 +4384,19 @@ impl DurableRaftKvNode {
             return Ok(());
         }
         self.persist_hard_state()
+    }
+
+    fn record_live_metrics(&self) {
+        record_cluster_kv_raft_live_metrics(
+            &self.paths.root,
+            self.node.hard_state.current_term,
+            self.node.hard_state.leader_id.clone(),
+            self.node.hard_state.commit_index,
+            self.node.applied_index,
+            self.node.last_log_index(),
+            self.node.snapshot_index,
+            self.node.log.len(),
+        );
     }
 
     fn restore_after_append_entries_persist_failure(

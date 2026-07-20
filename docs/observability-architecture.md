@@ -59,16 +59,57 @@ queried, which keeps durable state scans out of runtime hot paths. Exporters
 return normal `ObserveMetricRecord` values and may report exporter failures as
 `sinomo.observe.metric_exporter.errors`.
 
+Runtime histograms retain bounded cumulative buckets in addition to count, sum,
+minimum, and maximum. This keeps recorder memory fixed and permits clients to
+derive interval rates and approximate percentiles from consecutive reads.
+`sinomo observe metrics --watch <seconds>` performs that delta locally; add
+`--samples <n>` for a bounded capture. Streaming JSON emits one compact object
+per interval so it can be redirected to a JSONL artifact.
+
 The daemon registers built-in DFS and KV exporters:
 
 - `sinomo.dfs.*` reports DFS object, version, receipt, intent, conflict, repair,
   namespace job, and metadata shard gauges.
 - `sinomo.kv.*` reports local cluster KV revision, compacted revision, entry,
-  lease, and retained event gauges.
+  lease, retained event, Raft progress, durable file size, and bounded peer-lag
+  gauges. Runtime counters and histograms separate command queueing, WAL append,
+  quorum replication, local apply, compaction, cache fallback, and background
+  fanout cost.
 
 Application-level crates register through daemon service hooks. The agent hook
 currently exports `sinomo.agent.*` gauges for persisted sessions, control
 snapshots, active turns, buffered events, task statuses, and read errors.
+
+### KV performance diagnosis
+
+KV metrics use only bounded runtime labels: command class, phase, outcome,
+read authority/source, and replication payload type. Raw keys, prefixes,
+request IDs, routes, errors, and peer IDs never become hot-path labels. Peer IDs
+appear only in pull-time gauges constructed from current membership and the
+bounded Raft peer-progress ledger. KV telemetry is process-local observation; it
+must never be written back into cluster KV.
+
+The primary signatures are:
+
+- high `sinomo.kv.command.phase.us{phase="commit_sequence_wait"}` plus
+  `sinomo.kv.commit.queue_depth`: the ordered proposal stream is saturated;
+- high `phase="quorum"` with low `phase="local_append"`: routing, voter latency,
+  or follower catch-up dominates;
+- high WAL, apply, snapshot, or compaction duration: local durable storage or
+  write amplification dominates;
+- frequent `source="durable_raft_open"` or
+  `source="materialized_busy_fallback"`: the read-view cache is cold or Raft
+  storage is contended;
+- fast quorum with growing `sinomo.kv.peer.lag_entries`: asynchronous fanout is
+  not keeping followers converged.
+
+Use interval percentiles rather than lifetime maxima when deciding whether a
+deployment is currently degraded:
+
+```sh
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5 --samples 12 --json
+```
 
 ## Trace Context
 

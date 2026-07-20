@@ -7211,6 +7211,38 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_node_publishes_bounded_live_metric_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-live-metrics");
+        let paths = ClusterKvPaths::new(&root);
+        let node_id = NodeId::from_legacy_named("node_live_metrics").expect("node");
+        let mut node =
+            DurableRaftKvNode::open(node_id.clone(), paths.raft_wal_paths(&node_id)).expect("open");
+        node.become_leader(7).expect("become leader");
+        let entry = node
+            .append_local_command(
+                7,
+                KvCommand::Op(KvOp::Put {
+                    key: "/metrics/key".to_string(),
+                    value: b"value".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append");
+        node.commit_to(entry.index).expect("commit");
+        node.save_snapshot().expect("snapshot");
+
+        let metrics =
+            read_cluster_kv_raft_live_metrics(&paths, &node_id).expect("live raft metrics");
+        assert_eq!(metrics.current_term, 7);
+        assert_eq!(metrics.leader_id.as_ref(), Some(&node_id));
+        assert_eq!(metrics.commit_index, entry.index);
+        assert_eq!(metrics.applied_index, entry.index);
+        assert_eq!(metrics.last_log_index, entry.index);
+        assert_eq!(metrics.snapshot_index, entry.index);
+        assert_eq!(metrics.retained_log_entries, node.log().len());
+    }
+
+    #[test]
     fn quorum_commit_sequence_lock_serializes_concurrent_committers() {
         let root = sinomo_testdir::TestDir::new("sinomo-kv-commit-sequence-race");
         let kv_paths = ClusterKvPaths::new(&root);

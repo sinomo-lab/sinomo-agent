@@ -32,6 +32,44 @@ pub type ClusterRaftQuorumBatchOutcomes = Vec<(
     Result<ClusterRaftAppendResponse, NetworkError>,
 )>;
 
+fn cluster_kv_replication_status_label(
+    status: sinomo_kv::ClusterKvRaftTargetReplicationStatus,
+) -> &'static str {
+    match status {
+        sinomo_kv::ClusterKvRaftTargetReplicationStatus::Accepted => "accepted",
+        sinomo_kv::ClusterKvRaftTargetReplicationStatus::Rejected => "rejected",
+        sinomo_kv::ClusterKvRaftTargetReplicationStatus::Failed => "failed",
+    }
+}
+
+fn record_cluster_kv_replication_target_result(
+    status: sinomo_kv::ClusterKvRaftTargetReplicationStatus,
+    latency_ms: Option<u64>,
+) {
+    let outcome = cluster_kv_replication_status_label(status);
+    metrics::counter!("sinomo.kv.replication.target_results", "outcome" => outcome).increment(1);
+    if let Some(latency_ms) = latency_ms {
+        metrics::histogram!("sinomo.kv.replication.target.us", "outcome" => outcome)
+            .record(latency_ms.saturating_mul(1_000) as f64);
+    }
+}
+
+fn record_cluster_kv_replication_send(request: &ClusterRaftAppendRequest) {
+    let payload = if request.snapshot.is_some() {
+        "snapshot"
+    } else {
+        "append"
+    };
+    metrics::counter!("sinomo.kv.replication.attempts", "payload" => payload).increment(1);
+    metrics::histogram!("sinomo.kv.replication.entries", "payload" => payload)
+        .record(request.append.entries.len() as f64);
+}
+
+fn record_cluster_kv_replication_catch_up(outcome: &'static str, attempts: usize) {
+    metrics::histogram!("sinomo.kv.replication.catchup_attempts", "outcome" => outcome)
+        .record(attempts as f64);
+}
+
 fn lock_local_cluster_raft_command_storage<'a>(
     storage: &'a Mutex<LocalClusterRaftCommandStorage>,
     operation: &str,
@@ -1070,6 +1108,7 @@ where
         status: sinomo_kv::ClusterKvRaftTargetReplicationStatus,
         latency_ms: Option<u64>,
     ) -> Result<(), NetworkError> {
+        record_cluster_kv_replication_target_result(status, latency_ms);
         let connectivity_state = match status {
             sinomo_kv::ClusterKvRaftTargetReplicationStatus::Accepted
             | sinomo_kv::ClusterKvRaftTargetReplicationStatus::Rejected => {
@@ -1610,6 +1649,7 @@ where
                             })??
                     };
                     target.attempts = target.attempts.saturating_add(1);
+                    record_cluster_kv_replication_send(&request);
                     host.on_raft_append_sent_async().await?;
                     sends.push((
                         target.target.clone(),
@@ -1642,6 +1682,7 @@ where
                     let mut target = pending.swap_remove(position);
                     match result {
                         Ok(response) if response.accepted => {
+                            record_cluster_kv_replication_catch_up("accepted", target.attempts);
                             accepted = accepted.saturating_add(1);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
@@ -1657,6 +1698,7 @@ where
                             });
                         }
                         Ok(response) if response.append.term > request.append.term => {
+                            record_cluster_kv_replication_catch_up("higher_term", target.attempts);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
                                 latency_ms: Some(
@@ -1671,6 +1713,7 @@ where
                             });
                         }
                         Ok(response) if target.attempts < append_options.max_attempts => {
+                            metrics::counter!("sinomo.kv.replication.backtracks").increment(1);
                             target.next_index =
                                 sinomo_kv::cluster_kv_raft_next_index_after_rejection(
                                     target.next_index,
@@ -1681,6 +1724,7 @@ where
                             pending.push(target);
                         }
                         Ok(response) => {
+                            record_cluster_kv_replication_catch_up("rejected", target.attempts);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
                                 latency_ms: Some(
@@ -1695,6 +1739,7 @@ where
                             });
                         }
                         Err(error) => {
+                            record_cluster_kv_replication_catch_up("failed", target.attempts);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
                                 latency_ms: Some(
@@ -1714,6 +1759,7 @@ where
 
             if accepted < required_remote_acks {
                 for target in pending {
+                    record_cluster_kv_replication_catch_up("timeout", target.attempts);
                     let response =
                         target
                             .last_response
@@ -1757,6 +1803,7 @@ where
         let paths = self.paths;
         let host = &mut *self.host;
         Box::pin(async move {
+            record_cluster_kv_replication_target_result(status, latency_ms);
             let connectivity_state = match status {
                 sinomo_kv::ClusterKvRaftTargetReplicationStatus::Accepted
                 | sinomo_kv::ClusterKvRaftTargetReplicationStatus::Rejected => {

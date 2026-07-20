@@ -130,7 +130,7 @@ fn kv_observe_metrics(
         detail: format!("kv snapshot metric export failed: {source}"),
     })?;
     let node_labels = labels([("node_id", state.local_node_id.to_string())]);
-    Ok(vec![
+    let mut metrics = vec![
         sinomo_observe::ObserveMetricRecord::gauge(
             "sinomo.kv.revision",
             node_labels.clone(),
@@ -153,10 +153,111 @@ fn kv_observe_metrics(
         ),
         sinomo_observe::ObserveMetricRecord::gauge(
             "sinomo.kv.retained_events",
-            node_labels,
+            node_labels.clone(),
             snapshot.events.len() as f64,
         ),
-    ])
+    ];
+    let wal_paths = kv_paths.raft_wal_paths(&state.local_node_id);
+    metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+        "sinomo.kv.wal.bytes",
+        node_labels.clone(),
+        file_len(&wal_paths.wal) as f64,
+    ));
+    metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+        "sinomo.kv.raft_snapshot.bytes",
+        node_labels.clone(),
+        file_len(&wal_paths.snapshot) as f64,
+    ));
+    metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+        "sinomo.kv.materialized_snapshot.bytes",
+        node_labels.clone(),
+        file_len(&kv_paths.snapshot) as f64,
+    ));
+
+    if let Some(live) =
+        sinomo_core::kv::read_cluster_kv_raft_live_metrics(&kv_paths, &state.local_node_id)
+    {
+        for (name, value) in [
+            ("sinomo.kv.raft.term", live.current_term),
+            ("sinomo.kv.raft.commit_index", live.commit_index),
+            ("sinomo.kv.raft.applied_index", live.applied_index),
+            ("sinomo.kv.raft.last_log_index", live.last_log_index),
+            ("sinomo.kv.raft.snapshot_index", live.snapshot_index),
+            (
+                "sinomo.kv.raft.uncommitted_entries",
+                live.last_log_index.saturating_sub(live.commit_index),
+            ),
+            (
+                "sinomo.kv.raft.unsnapshotted_entries",
+                live.applied_index.saturating_sub(live.snapshot_index),
+            ),
+        ] {
+            metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+                name,
+                node_labels.clone(),
+                value as f64,
+            ));
+        }
+        metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+            "sinomo.kv.raft.retained_log_entries",
+            node_labels.clone(),
+            live.retained_log_entries as f64,
+        ));
+        metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+            "sinomo.kv.raft.is_leader",
+            node_labels.clone(),
+            if live.leader_id.as_ref() == Some(&state.local_node_id) {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+
+        let peer_progress =
+            sinomo_core::kv::read_cluster_kv_raft_peer_progress(&kv_paths).unwrap_or_default();
+        let now = time::OffsetDateTime::now_utc();
+        for member in state
+            .members
+            .iter()
+            .filter(|member| member.node_id != state.local_node_id)
+        {
+            let mut peer_labels = node_labels.clone();
+            peer_labels.insert("peer_node_id".to_string(), member.node_id.to_string());
+            let progress = peer_progress
+                .iter()
+                .find(|progress| progress.peer_node_id == member.node_id);
+            metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+                "sinomo.kv.peer.progress_known",
+                peer_labels.clone(),
+                if progress.is_some() { 1.0 } else { 0.0 },
+            ));
+            let Some(progress) = progress else {
+                continue;
+            };
+            let age_seconds = (now - progress.observed_at).whole_seconds().max(0) as f64;
+            for (name, value) in [
+                (
+                    "sinomo.kv.peer.lag_entries",
+                    live.last_log_index.saturating_sub(progress.match_index) as f64,
+                ),
+                ("sinomo.kv.peer.match_index", progress.match_index as f64),
+                ("sinomo.kv.peer.progress_age.seconds", age_seconds),
+            ] {
+                metrics.push(sinomo_observe::ObserveMetricRecord::gauge(
+                    name,
+                    peer_labels.clone(),
+                    value,
+                ));
+            }
+        }
+    }
+    Ok(metrics)
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 fn gauge(name: impl Into<String>, value: usize) -> sinomo_observe::ObserveMetricRecord {

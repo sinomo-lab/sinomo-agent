@@ -259,6 +259,7 @@ mod in_process;
 mod keyspace;
 mod model;
 mod paths;
+mod performance_metrics;
 mod raft;
 mod request;
 mod rpc;
@@ -273,6 +274,7 @@ mod internal {
     pub(crate) use super::keyspace::*;
     pub(crate) use super::model::*;
     pub(crate) use super::paths::*;
+    pub(crate) use super::performance_metrics::*;
     pub(crate) use super::raft::*;
     pub(crate) use super::rpc::*;
     pub(crate) use super::snapshot::*;
@@ -311,6 +313,7 @@ pub use paths::{
     CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, ClusterKvPaths, lock_cluster_kv_commit_sequence,
     register_storage_paths,
 };
+pub use performance_metrics::{ClusterKvRaftLiveMetrics, read_cluster_kv_raft_live_metrics};
 pub use raft::{
     ClusterKvRaftAppendReplicationAsyncHost, ClusterKvRaftAppendReplicationHost,
     ClusterKvRaftAppendReplicationOptions, ClusterKvRaftAppendReplicationOutcome,

@@ -37,18 +37,28 @@ pub fn read_cluster_kv_local_snapshot(
     paths: &ClusterKvPaths,
     node_id: &NodeId,
 ) -> Result<KvLocalRead<KvSnapshot>, KvError> {
-    let node = paths.raft_store().open_node(node_id)?;
-    // Read value and metadata from the same opened Raft view. Reopening via
-    // the materialized-cache helper here can observe a different applied
-    // index (or fall back while this node lock is held).
-    let snapshot = node.store().try_snapshot()?;
-    Ok(KvLocalRead {
-        revision: snapshot.revision,
-        observed_term: node.hard_state().current_term,
-        applied_index: node.applied_index(),
-        known_leader: node.hard_state().leader_id.clone(),
-        value: snapshot,
-    })
+    let started = Instant::now();
+    let result = (|| {
+        let node = paths.raft_store().open_node(node_id)?;
+        // Read value and metadata from the same opened Raft view. Reopening via
+        // the materialized-cache helper here can observe a different applied
+        // index (or fall back while this node lock is held).
+        let snapshot = node.store().try_snapshot()?;
+        Ok(KvLocalRead {
+            revision: snapshot.revision,
+            observed_term: node.hard_state().current_term,
+            applied_index: node.applied_index(),
+            known_leader: node.hard_state().leader_id.clone(),
+            value: snapshot,
+        })
+    })();
+    record_kv_read(
+        "local",
+        "durable_raft_snapshot",
+        if result.is_ok() { "ok" } else { "error" },
+        started,
+    );
+    result
 }
 
 pub fn read_cluster_kv_local_entry(
@@ -525,38 +535,74 @@ impl KvMaterializedCache {
         paths: KvWalPaths,
         refresh_materialized: bool,
     ) -> Result<Arc<KvSnapshot>, KvError> {
-        let (has_durable_state, identity) = raft_view_identity_for_read(&paths)?;
+        let started = Instant::now();
+        let (has_durable_state, identity) = match raft_view_identity_for_read(&paths) {
+            Ok(view) => view,
+            Err(error) => {
+                record_kv_read("local", "raft_metadata", "error", started);
+                return Err(error);
+            }
+        };
         if has_durable_state {
             if let Some(identity) = identity
                 && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
             {
+                record_kv_read("local", "raft_view_cache", "ok", started);
                 return Ok(snapshot);
             }
             let node =
                 match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
                     Ok(node) => node,
                     Err(error @ KvError::Busy { .. }) => {
-                        return match self.read_snapshot_arc_if_present()? {
-                            Some(snapshot) => Ok(snapshot),
-                            None => Err(error),
+                        let fallback = match self.read_snapshot_arc_if_present() {
+                            Ok(Some(snapshot)) => Ok(snapshot),
+                            Ok(None) => Err(error),
+                            Err(error) => Err(error),
                         };
+                        record_kv_read(
+                            "local",
+                            "materialized_busy_fallback",
+                            if fallback.is_ok() { "ok" } else { "error" },
+                            started,
+                        );
+                        return fallback;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        record_kv_read("local", "durable_raft_open", "error", started);
+                        return Err(error);
+                    }
                 };
-            let snapshot = node.store().try_snapshot()?.canonicalized();
-            if refresh_materialized {
-                self.write_snapshot_if_changed(&snapshot)?;
+            let snapshot = match node.store().try_snapshot() {
+                Ok(snapshot) => snapshot.canonicalized(),
+                Err(error) => {
+                    record_kv_read("local", "durable_raft_open", "error", started);
+                    return Err(error);
+                }
+            };
+            if refresh_materialized && let Err(error) = self.write_snapshot_if_changed(&snapshot) {
+                record_kv_read("local", "durable_raft_open", "error", started);
+                return Err(error);
             }
             let snapshot = Arc::new(snapshot);
             if let Some(identity) = raft_view_identity(&node.paths) {
                 cache_store_raft_view(&node.paths, identity, snapshot.clone());
             }
+            record_kv_read("local", "durable_raft_open", "ok", started);
             return Ok(snapshot);
         }
-        if let Some(snapshot) = self.read_snapshot_arc_if_present()? {
-            return Ok(snapshot);
+        match self.read_snapshot_arc_if_present() {
+            Ok(Some(snapshot)) => {
+                record_kv_read("local", "materialized_only", "ok", started);
+                return Ok(snapshot);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                record_kv_read("local", "materialized_only", "error", started);
+                return Err(error);
+            }
         }
         let snapshot = Arc::new(InProcessKvStore::new().try_snapshot()?.canonicalized());
+        record_kv_read("local", "empty", "ok", started);
         Ok(snapshot)
     }
 

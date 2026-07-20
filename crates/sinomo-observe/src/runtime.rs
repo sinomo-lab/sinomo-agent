@@ -26,6 +26,33 @@ const DFS_PERF_TRACE_DIRECTIVE: &str = "sinomo.dfs.perf=trace";
 const TRACE_BUFFER_LIMIT: usize = 4096;
 const CAPTURE_ID_MAX_BYTES: usize = 128;
 const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
+const OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS: &[f64] = &[
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_500_000.0,
+    5_000_000.0,
+    10_000_000.0,
+    25_000_000.0,
+    50_000_000.0,
+    100_000_000.0,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObserveRuntimeConfig {
@@ -176,6 +203,17 @@ pub struct ObserveMetricRecord {
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<ObserveHistogramBucket>,
+}
+
+/// One cumulative histogram bucket. `count` includes every recorded value less
+/// than or equal to `upper_bound`, which makes scrape-to-scrape deltas cheap and
+/// keeps the wire representation compatible with conventional histogram tools.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ObserveHistogramBucket {
+    pub upper_bound: f64,
+    pub count: u64,
 }
 
 impl ObserveMetricRecord {
@@ -189,6 +227,7 @@ impl ObserveMetricRecord {
             sum: None,
             min: None,
             max: None,
+            buckets: Vec::new(),
         }
     }
 
@@ -202,7 +241,24 @@ impl ObserveMetricRecord {
             sum: None,
             min: None,
             max: None,
+            buckets: Vec::new(),
         }
+    }
+
+    pub fn histogram_quantile(&self, quantile: f64) -> Option<f64> {
+        if self.kind != ObserveMetricKind::Histogram || !(0.0..=1.0).contains(&quantile) {
+            return None;
+        }
+        let count = self.count?;
+        if count == 0 {
+            return None;
+        }
+        let rank = ((count as f64) * quantile).ceil().max(1.0) as u64;
+        self.buckets
+            .iter()
+            .find(|bucket| bucket.count >= rank)
+            .map(|bucket| bucket.upper_bound)
+            .or(self.max)
     }
 }
 
@@ -1135,6 +1191,7 @@ impl ObserveMetricSlot {
                 sum: None,
                 min: None,
                 max: None,
+                buckets: Vec::new(),
             },
             ObserveMetricValue::Gauge(value) => ObserveMetricRecord {
                 name: self.name.clone(),
@@ -1145,12 +1202,14 @@ impl ObserveMetricSlot {
                 sum: None,
                 min: None,
                 max: None,
+                buckets: Vec::new(),
             },
             ObserveMetricValue::Histogram {
                 count,
                 sum,
                 min,
                 max,
+                bucket_counts,
             } => ObserveMetricRecord {
                 name: self.name.clone(),
                 kind: self.kind,
@@ -1160,6 +1219,7 @@ impl ObserveMetricSlot {
                 sum: Some(sum),
                 min,
                 max,
+                buckets: histogram_bucket_snapshot(&bucket_counts),
             },
         }
     }
@@ -1217,12 +1277,20 @@ impl HistogramFn for ObserveMetricSlot {
                 sum,
                 min,
                 max,
+                bucket_counts,
             } = &mut *state
         {
             *count = count.saturating_add(1);
             *sum += value;
             *min = Some(min.map_or(value, |current| current.min(value)));
             *max = Some(max.map_or(value, |current| current.max(value)));
+            if let Some(index) = OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS
+                .iter()
+                .position(|upper_bound| value <= *upper_bound)
+                && let Some(bucket_count) = bucket_counts.get_mut(index)
+            {
+                *bucket_count = bucket_count.saturating_add(1);
+            }
         }
     }
 }
@@ -1236,6 +1304,7 @@ enum ObserveMetricValue {
         sum: f64,
         min: Option<f64>,
         max: Option<f64>,
+        bucket_counts: Vec<u64>,
     },
 }
 
@@ -1249,9 +1318,26 @@ impl ObserveMetricValue {
                 sum: 0.0,
                 min: None,
                 max: None,
+                bucket_counts: vec![0; OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS.len()],
             },
         }
     }
+}
+
+fn histogram_bucket_snapshot(bucket_counts: &[u64]) -> Vec<ObserveHistogramBucket> {
+    let mut cumulative = 0_u64;
+    OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS
+        .iter()
+        .copied()
+        .zip(bucket_counts.iter().copied())
+        .map(|(upper_bound, bucket_count)| {
+            cumulative = cumulative.saturating_add(bucket_count);
+            ObserveHistogramBucket {
+                upper_bound,
+                count: cumulative,
+            }
+        })
+        .collect()
 }
 
 fn observe_metric_map_key(key: &Key, kind: ObserveMetricKind) -> String {
@@ -1277,6 +1363,43 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::Registry;
+
+    #[test]
+    fn histogram_snapshot_exposes_cumulative_buckets_and_quantiles() {
+        let slot = ObserveMetricSlot::new(
+            "sinomo.test.duration.us".to_string(),
+            BTreeMap::new(),
+            ObserveMetricKind::Histogram,
+        );
+        for value in [10.0, 20.0, 200.0, 2_000.0, 20_000.0] {
+            HistogramFn::record(&slot, value);
+        }
+
+        let snapshot = slot.snapshot();
+        assert_eq!(snapshot.count, Some(5));
+        assert_eq!(snapshot.sum, Some(22_230.0));
+        assert_eq!(snapshot.min, Some(10.0));
+        assert_eq!(snapshot.max, Some(20_000.0));
+        assert_eq!(snapshot.histogram_quantile(0.5), Some(250.0));
+        assert_eq!(snapshot.histogram_quantile(0.95), Some(25_000.0));
+        assert!(
+            snapshot
+                .buckets
+                .windows(2)
+                .all(|window| window[0].count <= window[1].count)
+        );
+        assert_eq!(snapshot.buckets.last().map(|bucket| bucket.count), Some(5));
+    }
+
+    #[test]
+    fn metric_record_deserializes_without_histogram_buckets() {
+        let record: ObserveMetricRecord = serde_json::from_str(
+            r#"{"name":"legacy","kind":"histogram","count":1,"sum":5,"min":5,"max":5}"#,
+        )
+        .expect("legacy metric record");
+        assert!(record.buckets.is_empty());
+        assert_eq!(record.histogram_quantile(0.95), Some(5.0));
+    }
 
     #[test]
     fn default_filter_includes_builtin_quiet_directives() {

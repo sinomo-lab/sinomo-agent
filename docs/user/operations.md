@@ -88,10 +88,15 @@ sinomo observe traces --limit 200
 
 sinomo observe events --all --limit 100 --json
 sinomo observe metrics --target "$TARGET_NODE" --json
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5 --samples 12 --json
 ```
 
 Narrow results by event kind, component, operation ID, metric name, traceparent,
 or target rather than enabling broad debug output indefinitely.
+Metric watch output reports counter rates and interval histogram percentiles;
+`--samples` bounds the capture, while an omitted sample count runs until
+interrupted. Streaming JSON is JSONL with one object per interval.
 
 Live trace controls are leased and explicit:
 

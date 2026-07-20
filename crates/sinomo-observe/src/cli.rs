@@ -19,6 +19,7 @@ use sinomo_cli_registry::{
 use sinomo_core::local::SinomoDataDir;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 
 const OBSERVE_DEFAULT_LIMIT: usize = 40;
@@ -49,6 +50,8 @@ struct ObserveOptions {
     capture_id: Option<String>,
     limit: usize,
     json: bool,
+    watch_interval_seconds: Option<u64>,
+    watch_samples: Option<usize>,
 }
 
 impl Default for ObserveOptions {
@@ -64,6 +67,8 @@ impl Default for ObserveOptions {
             capture_id: None,
             limit: OBSERVE_DEFAULT_LIMIT,
             json: false,
+            watch_interval_seconds: None,
+            watch_samples: None,
         }
     }
 }
@@ -262,7 +267,7 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Read local daemon/shadow operational events from the data directory.",
             "  sinomo observe logs [--component <name>] [--operation <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read local daemon/shadow operational logs from the data directory.",
-            "  sinomo observe metrics [--name <prefix>] [--target <node-id> | --all] [--limit <n>] [--json]",
+            "  sinomo observe metrics [--name <prefix>] [--target <node-id> | --all] [--limit <n>] [--watch <seconds> [--samples <n>]] [--json]",
             "      Read live runtime metrics.",
             "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--capture <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live bounded trace events.",
@@ -304,6 +309,16 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                     "--limit",
                     "maximum records to return",
                     CliAutocompleteValue::new("n", "record limit", []),
+                ),
+                CliAutocompleteOption::with_value(
+                    "--watch",
+                    "emit interval metric samples",
+                    CliAutocompleteValue::new("seconds", "sample interval in seconds", []),
+                ),
+                CliAutocompleteOption::with_value(
+                    "--samples",
+                    "stop after this many watch samples",
+                    CliAutocompleteValue::new("n", "positive sample count", []),
                 ),
                 CliAutocompleteOption::flag("--all", "query every cluster node"),
                 CliAutocompleteOption::flag("--json", "emit JSON"),
@@ -509,13 +524,13 @@ fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseE
             Ok(ObserveCliCommand::Help)
         }
         Some((command, rest)) if matches!(command.as_str(), "events" | "event") => Ok(
-            ObserveCliCommand::Events(parse_observe_options(rest, true, false)?),
+            ObserveCliCommand::Events(parse_observe_options(rest, true, false, false)?),
         ),
         Some((command, rest)) if matches!(command.as_str(), "logs" | "log") => Ok(
-            ObserveCliCommand::Logs(parse_observe_options(rest, false, false)?),
+            ObserveCliCommand::Logs(parse_observe_options(rest, false, false, false)?),
         ),
         Some((command, rest)) if matches!(command.as_str(), "metrics" | "metric") => Ok(
-            ObserveCliCommand::Metrics(parse_observe_options(rest, false, false)?),
+            ObserveCliCommand::Metrics(parse_observe_options(rest, false, false, true)?),
         ),
         Some((command, rest)) if matches!(command.as_str(), "traces" | "trace") => Ok(
             ObserveCliCommand::Traces(parse_observe_trace_options(rest)?),
@@ -706,7 +721,7 @@ fn parse_observe_cpu_profile_options(
 }
 
 fn parse_observe_trace_options(args: &[String]) -> Result<ObserveOptions, CliParseError> {
-    let mut options = parse_observe_options(args, false, true)?;
+    let mut options = parse_observe_options(args, false, true, false)?;
     if !args.iter().any(|argument| argument == "--limit") {
         // Trace capture is a diagnostic artifact: default to the complete
         // bounded ring and make explicit limits opt-in.
@@ -719,6 +734,7 @@ fn parse_observe_options(
     args: &[String],
     allow_kind: bool,
     allow_capture: bool,
+    allow_watch: bool,
 ) -> Result<ObserveOptions, CliParseError> {
     let mut options = ObserveOptions::default();
     let mut index = 0;
@@ -795,12 +811,51 @@ fn parse_observe_options(
                         detail: format!("invalid observe limit `{limit}`: {source}"),
                     })?;
             }
+            "--watch" if allow_watch => {
+                index += 1;
+                let Some(interval) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                let interval = interval
+                    .parse::<u64>()
+                    .map_err(|source| CliParseError::Parse {
+                        detail: format!("invalid observe watch interval `{interval}`: {source}"),
+                    })?;
+                if !(1..=3_600).contains(&interval) {
+                    return Err(CliParseError::Parse {
+                        detail: "observe watch interval must be between 1 and 3600 seconds"
+                            .to_string(),
+                    });
+                }
+                options.watch_interval_seconds = Some(interval);
+            }
+            "--samples" if allow_watch => {
+                index += 1;
+                let Some(samples) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                let samples = samples
+                    .parse::<usize>()
+                    .map_err(|source| CliParseError::Parse {
+                        detail: format!("invalid observe watch sample count `{samples}`: {source}"),
+                    })?;
+                if samples == 0 {
+                    return Err(CliParseError::Parse {
+                        detail: "observe watch sample count must be positive".to_string(),
+                    });
+                }
+                options.watch_samples = Some(samples);
+            }
+            "--watch" | "--samples" => return Err(CliParseError::Usage),
             "--json" => options.json = true,
             _ => return Err(CliParseError::Usage),
         }
         index += 1;
     }
     if options.target_all && options.target_node_id.is_some() {
+        return Err(CliParseError::Usage);
+    }
+    if options.watch_samples.is_some() && options.watch_interval_seconds.is_none() {
         return Err(CliParseError::Usage);
     }
     Ok(options)
@@ -1066,12 +1121,19 @@ fn observe_metrics(
         limit: options.limit,
     };
     if options.target_all {
-        let response = observe_rpc_all::<_, ObserveMetricsResponse>(
-            rpc,
-            target_lister,
-            OBSERVE_METRICS_ROUTE,
-            &request,
-        )?;
+        let response = observe_metrics_all_once(rpc, target_lister, &request)?;
+        if let Some(interval_seconds) = options.watch_interval_seconds {
+            return watch_observe_metrics_all(
+                context,
+                rpc,
+                target_lister,
+                &request,
+                response,
+                interval_seconds,
+                options.watch_samples,
+                options.json,
+            );
+        }
         return print_observe_fanout(
             context,
             response,
@@ -1079,17 +1141,249 @@ fn observe_metrics(
             |context, response, json| print_observe_metric_records(context, response.metrics, json),
         );
     }
-    let response = if rpc.is_some() {
-        observe_rpc::<_, ObserveMetricsResponse>(
+    let response = observe_metrics_once(rpc, options.target_node_id.as_deref(), &request)?;
+    if let Some(interval_seconds) = options.watch_interval_seconds {
+        return watch_observe_metrics(
+            context,
             rpc,
             options.target_node_id.as_deref(),
-            OBSERVE_METRICS_ROUTE,
             &request,
-        )?
-    } else {
-        read_observe_metrics(&request)
-    };
+            response,
+            interval_seconds,
+            options.watch_samples,
+            options.json,
+        );
+    }
     print_observe_metric_records(context, response.metrics, options.json)
+}
+
+fn observe_metrics_once(
+    rpc: Option<&ObserveCliRpc>,
+    target_node_id: Option<&str>,
+    request: &ObserveMetricsRequest,
+) -> Result<ObserveMetricsResponse, CliCommandError> {
+    if rpc.is_some() {
+        observe_rpc::<_, ObserveMetricsResponse>(
+            rpc,
+            target_node_id,
+            OBSERVE_METRICS_ROUTE,
+            request,
+        )
+    } else {
+        Ok(read_observe_metrics(request))
+    }
+}
+
+fn observe_metrics_all_once(
+    rpc: Option<&ObserveCliRpc>,
+    target_lister: Option<&ObserveCliTargetLister>,
+    request: &ObserveMetricsRequest,
+) -> Result<ObserveFanoutResponse<ObserveMetricsResponse>, CliCommandError> {
+    observe_rpc_all::<_, ObserveMetricsResponse>(rpc, target_lister, OBSERVE_METRICS_ROUTE, request)
+}
+
+#[derive(serde::Serialize)]
+struct ObserveMetricWatchSample<T> {
+    interval_seconds: f64,
+    sample: T,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn watch_observe_metrics(
+    context: &mut CliCommandContext<'_>,
+    rpc: Option<&ObserveCliRpc>,
+    target_node_id: Option<&str>,
+    request: &ObserveMetricsRequest,
+    mut previous: ObserveMetricsResponse,
+    interval_seconds: u64,
+    sample_limit: Option<usize>,
+    json: bool,
+) -> Result<(), CliCommandError> {
+    let interval = Duration::from_secs(interval_seconds);
+    let mut previous_at = Instant::now();
+    let mut samples = 0_usize;
+    loop {
+        std::thread::sleep(interval);
+        let current = observe_metrics_once(rpc, target_node_id, request)?;
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(previous_at)
+            .as_secs_f64()
+            .max(f64::EPSILON);
+        let metrics = observe_metric_interval_delta(&previous.metrics, &current.metrics);
+        print_observe_metric_watch_records(context, metrics, elapsed, json)?;
+        previous = current;
+        previous_at = now;
+        samples = samples.saturating_add(1);
+        if sample_limit.is_some_and(|limit| samples >= limit) {
+            return Ok(());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn watch_observe_metrics_all(
+    context: &mut CliCommandContext<'_>,
+    rpc: Option<&ObserveCliRpc>,
+    target_lister: Option<&ObserveCliTargetLister>,
+    request: &ObserveMetricsRequest,
+    mut previous: ObserveFanoutResponse<ObserveMetricsResponse>,
+    interval_seconds: u64,
+    sample_limit: Option<usize>,
+    json: bool,
+) -> Result<(), CliCommandError> {
+    let interval = Duration::from_secs(interval_seconds);
+    let mut previous_at = Instant::now();
+    let mut samples = 0_usize;
+    loop {
+        std::thread::sleep(interval);
+        let current = observe_metrics_all_once(rpc, target_lister, request)?;
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(previous_at)
+            .as_secs_f64()
+            .max(f64::EPSILON);
+        let sample = observe_metric_fanout_interval_delta(&previous, &current);
+        if json {
+            let json = serde_json::to_string(&ObserveMetricWatchSample {
+                interval_seconds: elapsed,
+                sample,
+            })
+            .map_err(command_error)?;
+            context.stdout_line(format_args!("{json}"))?;
+        } else {
+            context.stdout_line(format_args!("interval: {elapsed:.3}s"))?;
+            print_observe_fanout(context, sample, false, |context, response, _json| {
+                print_observe_metric_interval_records(context, response.metrics, elapsed)
+            })?;
+        }
+        previous = current;
+        previous_at = now;
+        samples = samples.saturating_add(1);
+        if sample_limit.is_some_and(|limit| samples >= limit) {
+            return Ok(());
+        }
+    }
+}
+
+fn print_observe_metric_watch_records(
+    context: &mut CliCommandContext<'_>,
+    metrics: Vec<crate::ObserveMetricRecord>,
+    interval_seconds: f64,
+    json: bool,
+) -> Result<(), CliCommandError> {
+    if json {
+        let json = serde_json::to_string(&ObserveMetricWatchSample {
+            interval_seconds,
+            sample: ObserveMetricsResponse { metrics },
+        })
+        .map_err(command_error)?;
+        context.stdout_line(format_args!("{json}"))?;
+        return Ok(());
+    }
+    context.stdout_line(format_args!("interval: {interval_seconds:.3}s"))?;
+    print_observe_metric_interval_records(context, metrics, interval_seconds)
+}
+
+fn observe_metric_fanout_interval_delta(
+    previous: &ObserveFanoutResponse<ObserveMetricsResponse>,
+    current: &ObserveFanoutResponse<ObserveMetricsResponse>,
+) -> ObserveFanoutResponse<ObserveMetricsResponse> {
+    let targets = current
+        .targets
+        .iter()
+        .map(|target| {
+            let previous_metrics = previous
+                .targets
+                .iter()
+                .find(|candidate| candidate.target_node_id == target.target_node_id)
+                .map(|candidate| candidate.response.metrics.as_slice())
+                .unwrap_or_default();
+            ObserveTargetResponse {
+                target_node_id: target.target_node_id.clone(),
+                response: ObserveMetricsResponse {
+                    metrics: observe_metric_interval_delta(
+                        previous_metrics,
+                        &target.response.metrics,
+                    ),
+                },
+            }
+        })
+        .collect();
+    ObserveFanoutResponse {
+        targets,
+        errors: current.errors.clone(),
+    }
+}
+
+fn observe_metric_interval_delta(
+    previous: &[crate::ObserveMetricRecord],
+    current: &[crate::ObserveMetricRecord],
+) -> Vec<crate::ObserveMetricRecord> {
+    current
+        .iter()
+        .map(|current| {
+            let previous = previous.iter().find(|previous| {
+                previous.name == current.name
+                    && previous.kind == current.kind
+                    && previous.labels == current.labels
+            });
+            observe_metric_record_interval_delta(previous, current)
+        })
+        .collect()
+}
+
+fn observe_metric_record_interval_delta(
+    previous: Option<&crate::ObserveMetricRecord>,
+    current: &crate::ObserveMetricRecord,
+) -> crate::ObserveMetricRecord {
+    let mut delta = current.clone();
+    match current.kind {
+        crate::ObserveMetricKind::Gauge => {}
+        crate::ObserveMetricKind::Counter => {
+            delta.value = Some(observe_f64_counter_delta(
+                previous.and_then(|record| record.value),
+                current.value.unwrap_or_default(),
+            ));
+        }
+        crate::ObserveMetricKind::Histogram => {
+            delta.count = Some(observe_u64_counter_delta(
+                previous.and_then(|record| record.count),
+                current.count.unwrap_or_default(),
+            ));
+            delta.sum = Some(observe_f64_counter_delta(
+                previous.and_then(|record| record.sum),
+                current.sum.unwrap_or_default(),
+            ));
+            delta.min = None;
+            delta.max = None;
+            for bucket in &mut delta.buckets {
+                let previous_count = previous.and_then(|record| {
+                    record
+                        .buckets
+                        .iter()
+                        .find(|candidate| {
+                            candidate.upper_bound.to_bits() == bucket.upper_bound.to_bits()
+                        })
+                        .map(|candidate| candidate.count)
+                });
+                bucket.count = observe_u64_counter_delta(previous_count, bucket.count);
+            }
+        }
+    }
+    delta
+}
+
+fn observe_u64_counter_delta(previous: Option<u64>, current: u64) -> u64 {
+    previous
+        .filter(|previous| *previous <= current)
+        .map_or(current, |previous| current - previous)
+}
+
+fn observe_f64_counter_delta(previous: Option<f64>, current: f64) -> f64 {
+    previous
+        .filter(|previous| previous.is_finite() && *previous <= current)
+        .map_or(current, |previous| current - previous)
 }
 
 fn print_observe_metric_records(
@@ -1129,14 +1423,81 @@ fn print_observe_metric_records(
                 ))?;
             }
             crate::ObserveMetricKind::Histogram => {
+                let count = metric.count.unwrap_or_default();
+                let sum = metric.sum.unwrap_or_default();
+                let average = if count == 0 { 0.0 } else { sum / count as f64 };
                 context.stdout_line(format_args!(
-                    "{:<9} {:<48} count={} sum={} min={} max={}{}",
+                    "{:<9} {:<48} count={} avg={:.3} min={} max={} p50<={} p95<={} p99<={}{}",
                     "histogram",
                     metric.name,
-                    metric.count.unwrap_or_default(),
-                    metric.sum.unwrap_or_default(),
+                    count,
+                    average,
                     metric.min.unwrap_or_default(),
                     metric.max.unwrap_or_default(),
+                    metric.histogram_quantile(0.50).unwrap_or_default(),
+                    metric.histogram_quantile(0.95).unwrap_or_default(),
+                    metric.histogram_quantile(0.99).unwrap_or_default(),
+                    labels
+                ))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_observe_metric_interval_records(
+    context: &mut CliCommandContext<'_>,
+    metrics: Vec<crate::ObserveMetricRecord>,
+    interval_seconds: f64,
+) -> Result<(), CliCommandError> {
+    if metrics.is_empty() {
+        context.stdout_line(format_args!("no observe metrics found"))?;
+        return Ok(());
+    }
+    for metric in metrics {
+        let labels = if metric.labels.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " labels={}",
+                serde_json::to_string(&metric.labels).map_err(command_error)?
+            )
+        };
+        match metric.kind {
+            crate::ObserveMetricKind::Gauge => {
+                context.stdout_line(format_args!(
+                    "{:<9} {:<48} value={}{}",
+                    "gauge",
+                    metric.name,
+                    metric.value.unwrap_or_default(),
+                    labels
+                ))?;
+            }
+            crate::ObserveMetricKind::Counter => {
+                let delta = metric.value.unwrap_or_default();
+                context.stdout_line(format_args!(
+                    "{:<9} {:<48} delta={} rate={:.3}/s{}",
+                    "counter",
+                    metric.name,
+                    delta,
+                    delta / interval_seconds,
+                    labels
+                ))?;
+            }
+            crate::ObserveMetricKind::Histogram => {
+                let count = metric.count.unwrap_or_default();
+                let sum = metric.sum.unwrap_or_default();
+                let average = if count == 0 { 0.0 } else { sum / count as f64 };
+                context.stdout_line(format_args!(
+                    "{:<9} {:<48} count={} rate={:.3}/s avg={:.3} p50<={} p95<={} p99<={}{}",
+                    "histogram",
+                    metric.name,
+                    count,
+                    count as f64 / interval_seconds,
+                    average,
+                    metric.histogram_quantile(0.50).unwrap_or_default(),
+                    metric.histogram_quantile(0.95).unwrap_or_default(),
+                    metric.histogram_quantile(0.99).unwrap_or_default(),
                     labels
                 ))?;
             }
@@ -1572,19 +1933,19 @@ fn print_observe_cpu_profile_response(
     Ok(())
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct ObserveFanoutResponse<Resp> {
     targets: Vec<ObserveTargetResponse<Resp>>,
     errors: Vec<ObserveTargetError>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct ObserveTargetResponse<Resp> {
     target_node_id: String,
     response: Resp,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct ObserveTargetError {
     target_node_id: String,
     error: String,
@@ -1839,6 +2200,10 @@ mod tests {
             "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
             "--limit".to_string(),
             "8".to_string(),
+            "--watch".to_string(),
+            "5".to_string(),
+            "--samples".to_string(),
+            "3".to_string(),
             "--json".to_string(),
         ])
         .expect("parse metrics");
@@ -1850,6 +2215,8 @@ mod tests {
                     Some("01hxy6qa9k0t9vr4g9n8d3q5d4")
                 );
                 assert_eq!(options.limit, 8);
+                assert_eq!(options.watch_interval_seconds, Some(5));
+                assert_eq!(options.watch_samples, Some(3));
                 assert!(options.json);
             }
             other => panic!("expected metrics command, got {other:?}"),
@@ -2011,6 +2378,15 @@ mod tests {
         ]);
         assert_eq!(result, Err(CliParseError::Usage));
 
+        assert_eq!(
+            parse_observe_command(&[
+                "metrics".to_string(),
+                "--samples".to_string(),
+                "2".to_string(),
+            ]),
+            Err(CliParseError::Usage)
+        );
+
         let result = parse_observe_command(&[
             "control".to_string(),
             "--clear-quiet-filters".to_string(),
@@ -2040,6 +2416,66 @@ mod tests {
             "--reset".to_string(),
         ]);
         assert_eq!(result, Err(CliParseError::Usage));
+    }
+
+    #[test]
+    fn metric_interval_delta_reports_counter_and_histogram_window() {
+        let previous = vec![
+            crate::ObserveMetricRecord::counter("sinomo.test.counter", Default::default(), 10),
+            crate::ObserveMetricRecord {
+                name: "sinomo.test.duration.us".to_string(),
+                kind: crate::ObserveMetricKind::Histogram,
+                labels: Default::default(),
+                value: None,
+                count: Some(4),
+                sum: Some(1_000.0),
+                min: Some(10.0),
+                max: Some(700.0),
+                buckets: vec![
+                    crate::ObserveHistogramBucket {
+                        upper_bound: 100.0,
+                        count: 2,
+                    },
+                    crate::ObserveHistogramBucket {
+                        upper_bound: 1_000.0,
+                        count: 4,
+                    },
+                ],
+            },
+        ];
+        let current = vec![
+            crate::ObserveMetricRecord::counter("sinomo.test.counter", Default::default(), 16),
+            crate::ObserveMetricRecord {
+                name: "sinomo.test.duration.us".to_string(),
+                kind: crate::ObserveMetricKind::Histogram,
+                labels: Default::default(),
+                value: None,
+                count: Some(7),
+                sum: Some(1_650.0),
+                min: Some(10.0),
+                max: Some(700.0),
+                buckets: vec![
+                    crate::ObserveHistogramBucket {
+                        upper_bound: 100.0,
+                        count: 4,
+                    },
+                    crate::ObserveHistogramBucket {
+                        upper_bound: 1_000.0,
+                        count: 7,
+                    },
+                ],
+            },
+        ];
+
+        let delta = observe_metric_interval_delta(&previous, &current);
+        assert_eq!(delta[0].value, Some(6.0));
+        assert_eq!(delta[1].count, Some(3));
+        assert_eq!(delta[1].sum, Some(650.0));
+        assert_eq!(delta[1].buckets[0].count, 2);
+        assert_eq!(delta[1].buckets[1].count, 3);
+        assert_eq!(delta[1].histogram_quantile(0.95), Some(1_000.0));
+        assert_eq!(delta[1].min, None);
+        assert_eq!(delta[1].max, None);
     }
 
     #[test]
