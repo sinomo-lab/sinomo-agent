@@ -1,6 +1,6 @@
 use crate::connectivity::{
-    ClusterConnectivityRecord, ClusterConnectivityState, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_record_for_command_auth_denied,
+    ClusterConnectivityRecord, ClusterConnectivityState, MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_record_for_command_auth_denied,
     cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
     cluster_connectivity_record_for_probe_outcome, cluster_connectivity_stable_eq,
@@ -11,13 +11,18 @@ use crate::object_file_store::{
     read_optional_object_file, remove_optional_file, write_object_file,
 };
 use crate::{ClusterEndpointId, ClusterPaths};
+use fs2::FileExt;
 use sinomo_base::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
 
@@ -293,10 +298,207 @@ pub async fn write_local_cluster_connectivity_record_set_async(
         })?
 }
 
+/// Merge record subsets owned by several source nodes in one process-safe
+/// local-store transaction.
+///
+/// This is intentionally merge-only: imported peer snapshots do not carry a
+/// source-set generation watermark, so an omitted key cannot authorize a
+/// deletion. Expiry and topology pruning remove stale imported observations.
+pub fn write_local_cluster_connectivity_record_groups(
+    paths: &ClusterPaths,
+    record_groups: &BTreeMap<NodeId, Vec<ClusterConnectivityRecord>>,
+) -> Result<(), NetworkError> {
+    if record_groups.is_empty() {
+        return Ok(());
+    }
+    let mut observed_records = 0_usize;
+    for (source_node_id, records) in record_groups {
+        observed_records = observed_records.checked_add(records.len()).ok_or(
+            NetworkError::ClusterConnectivitySnapshotRecordLimit {
+                observed_records: usize::MAX,
+                max_records: MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+            },
+        )?;
+        if observed_records > MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
+            return Err(NetworkError::ClusterConnectivitySnapshotRecordLimit {
+                observed_records,
+                max_records: MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+            });
+        }
+        validate_cluster_connectivity_records_for_source(source_node_id, records)?;
+    }
+
+    let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
+    let now = OffsetDateTime::now_utc();
+    let existing_records = read_persisted_live_local_cluster_connectivity_records(paths, now)?;
+    let mut merged = existing_records
+        .iter()
+        .map(|record| (cluster_connectivity_record_key(record), record.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for records in record_groups.values() {
+        for record in records {
+            if !cluster_network_record_live(record.expires_at, now) {
+                continue;
+            }
+            let key = cluster_connectivity_record_key(record);
+            if merged
+                .get(&key)
+                .is_some_and(|existing| existing.observed_at > record.observed_at)
+            {
+                continue;
+            }
+            merged.insert(key, record.clone());
+        }
+    }
+    if merged.len() > MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
+        return Err(NetworkError::ClusterConnectivitySnapshotRecordLimit {
+            observed_records: merged.len(),
+            max_records: MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+        });
+    }
+    for source_node_id in record_groups.keys() {
+        let retained_source_records = merged
+            .values()
+            .filter(|record| record.source_node_id == *source_node_id)
+            .count();
+        if retained_source_records > MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS {
+            return Err(NetworkError::ClusterConnectivityRecordLimit {
+                source_node_id: source_node_id.clone(),
+                observed_records: retained_source_records,
+                max_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+            });
+        }
+    }
+
+    let mut merged_records = Vec::new();
+    crate::object::try_reserve_vec(
+        &mut merged_records,
+        merged.len(),
+        "collect aggregate merged connectivity records",
+    )?;
+    merged_records.extend(merged.into_values());
+    sort_cluster_connectivity_records(&mut merged_records);
+
+    let records_changed = existing_records != merged_records;
+    let route_records_stable =
+        local_cluster_connectivity_route_records_stable(&existing_records, &merged_records);
+    let persisted_records_stable = route_records_stable
+        && local_cluster_connectivity_persisted_records_stable(&existing_records, &merged_records);
+    if !persisted_records_stable {
+        if merged_records.is_empty() {
+            remove_optional_file(&paths.connectivity_local)?;
+        } else {
+            write_object_file(&paths.connectivity_local, &merged_records)?;
+        }
+    }
+    let mut cache =
+        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+            .lock()
+            .map_err(|error| NetworkError::Io {
+                operation: "lock local cluster connectivity cache".to_string(),
+                detail: error.to_string(),
+            })?;
+    if merged_records.is_empty() {
+        cache.remove(&paths.root);
+    } else {
+        store_local_cluster_connectivity_cache_entry(
+            &mut cache,
+            paths.root.clone(),
+            merged_records,
+            now,
+        );
+    }
+    if records_changed {
+        bump_local_cluster_connectivity_content_generation(paths);
+    }
+    if !route_records_stable {
+        bump_local_cluster_connectivity_routing_generation(paths);
+    }
+    Ok(())
+}
+
+pub async fn write_local_cluster_connectivity_record_groups_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    record_groups: &BTreeMap<NodeId, Vec<ClusterConnectivityRecord>>,
+) -> Result<(), NetworkError> {
+    let paths = paths.clone();
+    let record_groups = record_groups.clone();
+    runtime
+        .spawn_blocking(move || {
+            write_local_cluster_connectivity_record_groups(&paths, &record_groups)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "write aggregate local cluster connectivity records".to_string(),
+            detail: format!("local cluster connectivity write task failed: {source}"),
+        })?
+}
+
+fn local_cluster_connectivity_mutation_lock_path(paths: &ClusterPaths) -> PathBuf {
+    let parent = paths
+        .connectivity_local
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = paths
+        .connectivity_local
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("connectivity-local.sobj");
+    parent.join(format!("{file_name}.lock"))
+}
+
+/// Serializes the complete on-disk connectivity read/modify/write transaction.
+///
+/// The main daemon, shadow daemon, and command clients can share the cluster
+/// directory. Atomic file replacement prevents torn reads, but without this
+/// advisory lock two writers updating different source-node sets can both read
+/// the same snapshot and let the last rename silently discard the other source.
+fn acquire_local_cluster_connectivity_mutation_lock(
+    paths: &ClusterPaths,
+) -> Result<std::fs::File, NetworkError> {
+    let lock_path = local_cluster_connectivity_mutation_lock_path(paths);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock = options
+        .open(&lock_path)
+        .map_err(|source| NetworkError::StorageIo {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    lock.lock_exclusive()
+        .map_err(|source| NetworkError::StorageIo {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(lock)
+}
+
+fn read_persisted_live_local_cluster_connectivity_records(
+    paths: &ClusterPaths,
+    now: OffsetDateTime,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    let mut records =
+        read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
+            .unwrap_or_default();
+    records.retain(|record| cluster_network_record_live(record.expires_at, now));
+    sort_cluster_connectivity_records(&mut records);
+    Ok(records)
+}
+
 pub fn prune_local_cluster_connectivity_records_for_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<usize, NetworkError> {
+    let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
     let now = OffsetDateTime::now_utc();
     let Some(mut existing_records) =
         read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
@@ -647,8 +849,12 @@ fn write_local_cluster_connectivity_records_inner(
     replace_source_records: bool,
 ) -> Result<(), NetworkError> {
     validate_cluster_connectivity_records_for_source(source_node_id, records)?;
+    let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
     let now = OffsetDateTime::now_utc();
-    let existing_records = read_local_cluster_connectivity_records(paths)?;
+    // Always reload the shared file after acquiring the process-safe lock. The
+    // in-process route cache is intentionally allowed to lag an external
+    // daemon-control writer and therefore cannot be the base of a mutation.
+    let existing_records = read_persisted_live_local_cluster_connectivity_records(paths, now)?;
     let replacement_keys = if replace_source_records {
         records
             .iter()
@@ -974,6 +1180,150 @@ mod tests {
                 [0]
             .state,
             ClusterConnectivityState::Degraded
+        );
+    }
+
+    #[test]
+    fn serialized_cross_source_mutation_preserves_external_source_set() {
+        let (_root, paths, state, source_a, endpoint, now) =
+            connectivity_generation_fixture("connectivity_cross_source_serialization");
+        let record_a = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("source a".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(
+            &paths,
+            &source_a,
+            std::slice::from_ref(&record_a),
+        )
+        .expect("seed and cache source a");
+
+        let source_b = NodeId::from_legacy_named("node_connectivity_cross_source_serialization_b")
+            .expect("source b");
+        let mut record_b = record_a.clone();
+        record_b.source_node_id = source_b.clone();
+        record_b.last_success_at = Some("source b".to_string());
+
+        let source_c = NodeId::from_legacy_named("node_connectivity_cross_source_serialization_c")
+            .expect("source c");
+        let mut record_c = record_a.clone();
+        record_c.source_node_id = source_c;
+        record_c.last_success_at = Some("external source c".to_string());
+        let mut expected = vec![record_a.clone(), record_b.clone(), record_c.clone()];
+        sort_cluster_connectivity_records(&mut expected);
+
+        // Model another process updating a different source while this
+        // process still has only source A cached. A concurrent source-B
+        // writer must wait for the transaction lock, then reload A+C from
+        // disk instead of building its replacement from the stale cache.
+        let mutation_lock =
+            acquire_local_cluster_connectivity_mutation_lock(&paths).expect("mutation lock");
+        write_object_file(
+            &paths.connectivity_local,
+            &vec![record_a.clone(), record_c.clone()],
+        )
+        .expect("external source c write");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_paths = paths.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce writer");
+            let result = write_local_cluster_connectivity_records(
+                &writer_paths,
+                &source_b,
+                std::slice::from_ref(&record_b),
+            );
+            done_tx.send(result).expect("report writer");
+        });
+        started_rx.recv().expect("writer started");
+        assert!(
+            matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a second connectivity mutation must wait for the process-safe transaction lock"
+        );
+        drop(mutation_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("writer should finish after lock release")
+            .expect("merge source b");
+        writer.join().expect("writer thread");
+
+        invalidate_local_cluster_connectivity_cache(&paths).expect("reload persisted records");
+        let stored =
+            read_local_cluster_connectivity_records(&paths).expect("read serialized source sets");
+        assert_eq!(stored, expected);
+    }
+
+    #[test]
+    fn aggregate_group_merge_rejects_merged_total_without_partial_persistence() {
+        let (_root, paths, state, source_a, endpoint, now) =
+            connectivity_generation_fixture("connectivity_aggregate_merged_limit");
+        let template = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("source a".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut existing = Vec::with_capacity(MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS - 1);
+        for index in 0..MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS - 1 {
+            let mut record = template.clone();
+            record.endpoint_id = ClusterEndpointId::derived(
+                "sinomo.test.connectivity.aggregate-limit.existing",
+                &index.to_le_bytes(),
+            );
+            record.address = format!("target:{index}");
+            existing.push(record);
+        }
+        write_local_cluster_connectivity_record_set(&paths, &source_a, &existing)
+            .expect("seed aggregate limit minus one");
+
+        let source_b = NodeId::from_legacy_named("node_connectivity_aggregate_merged_limit_b")
+            .expect("source b");
+        let mut incoming = Vec::new();
+        for index in 0_u64..2 {
+            let mut record = template.clone();
+            record.source_node_id = source_b.clone();
+            record.endpoint_id = ClusterEndpointId::derived(
+                "sinomo.test.connectivity.aggregate-limit.incoming",
+                &index.to_le_bytes(),
+            );
+            record.address = format!("incoming:{index}");
+            incoming.push(record);
+        }
+        let groups = BTreeMap::from([(source_b.clone(), incoming)]);
+
+        let error = write_local_cluster_connectivity_record_groups(&paths, &groups)
+            .expect_err("merged aggregate must remain bounded");
+        assert!(matches!(
+            error,
+            NetworkError::ClusterConnectivitySnapshotRecordLimit {
+                observed_records,
+                max_records: MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+            } if observed_records == MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS + 1
+        ));
+        let stored = read_local_cluster_connectivity_records(&paths)
+            .expect("read records after rejected aggregate merge");
+        assert_eq!(stored.len(), MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS - 1);
+        assert!(
+            stored
+                .iter()
+                .all(|record| record.source_node_id == source_a),
+            "aggregate rejection must happen before persisting any incoming source"
         );
     }
 

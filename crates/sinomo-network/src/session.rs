@@ -881,6 +881,7 @@ struct IncomingSpoolProgress {
     error: Option<String>,
 }
 
+#[derive(Debug)]
 struct SessionTransferStagingFile {
     file: Option<File>,
     _cleanup: Arc<SessionSpoolCleanup>,
@@ -1626,6 +1627,87 @@ fn outgoing_body_failure_can_race_response_head(error: &NetworkError) -> bool {
     }
 }
 
+/// Owns every background task and writer handle created while a canonical
+/// client session is still being established.
+///
+/// Route deadlines cancel the session future by dropping it. Tokio join
+/// handles detach on drop, so keeping the raw handles as locals would leave a
+/// cancelled reader/keepalive pair holding the socket open until the peer's
+/// no-progress timeout. This guard closes that cancellation hole. Successful
+/// calls transfer the tasks to the returned body, whose existing drop behavior
+/// then owns application-side cancellation.
+struct ClientSessionTaskGuard {
+    writer: Option<SessionWriterHandle>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+    keepalive: Option<tokio::task::JoinHandle<()>>,
+    outgoing: Option<tokio::task::JoinHandle<Result<(), NetworkError>>>,
+}
+
+impl ClientSessionTaskGuard {
+    fn new(
+        writer: SessionWriterHandle,
+        reader: tokio::task::JoinHandle<()>,
+        keepalive: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            writer: Some(writer),
+            reader: Some(reader),
+            keepalive: Some(keepalive),
+            outgoing: None,
+        }
+    }
+
+    fn writer(&self) -> &SessionWriterHandle {
+        self.writer
+            .as_ref()
+            .expect("client session writer remains owned until task transfer")
+    }
+
+    fn transfer_to_body(
+        mut self,
+        mut body: ObjectRpcIncomingBody,
+        outgoing_body_tx: IncomingBodySender,
+    ) -> ObjectRpcIncomingBody {
+        if let Some(task) = self.reader.take() {
+            body.hold_completion_task(task);
+        }
+        if let Some(task) = self.keepalive.take() {
+            body.hold_completion_task(task);
+        }
+        if let Some(task) = self.outgoing.take() {
+            body.hold_completion_task(tokio::spawn(async move {
+                match task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => outgoing_body_tx.fail(error.to_string()),
+                    Err(source) => outgoing_body_tx.fail(format!(
+                        "object RPC request body task failed after response head: {source}"
+                    )),
+                }
+            }));
+        }
+        // The transferred tasks retain any writer handles they still need.
+        // Dropping this establishment handle lets the scheduler and socket
+        // close as soon as those tasks complete or the returned body aborts.
+        self.writer.take();
+        body
+    }
+}
+
+impl Drop for ClientSessionTaskGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.reader.take() {
+            task.abort();
+        }
+        if let Some(task) = self.keepalive.take() {
+            task.abort();
+        }
+        if let Some(task) = self.outgoing.take() {
+            task.abort();
+        }
+        self.writer.take();
+    }
+}
+
 /// Starts one client-side canonical RPC session on an already-open transport.
 /// The request descriptor must be prepared before `request_auth` is produced.
 /// The returned body owns the background read/write pumps and surfaces their
@@ -1653,6 +1735,8 @@ pub(crate) async fn start_object_rpc_client_session(
     let perf_session_id = perf_enabled.then(|| session_id.clone());
     let response_proof_session_id = prepared.response_proof_session_id.clone();
     let response_proof_public_key = expected_response_origin_public_key;
+    let response_link_session_id = session_id.clone();
+    let response_link_public_key = expected_responder_public_key.clone();
     let request_open = prepared.descriptor.request_body.clone();
     let path_key = NetworkPathKey::for_peer_public_key(&expected_responder_public_key);
     let path_estimator = shared_network_path_estimator(&path_key);
@@ -1693,10 +1777,11 @@ pub(crate) async fn start_object_rpc_client_session(
         }
     });
     let keepalive_task = spawn_session_keepalive(writer.clone(), policy);
+    let mut tasks = ClientSessionTaskGuard::new(writer, reader_task, keepalive_task);
 
     let send_head_started = perf_enabled.then(std::time::Instant::now);
     let send_head_result = send_session_payload(
-        &writer,
+        tasks.writer(),
         SessionWirePayload::RequestHead {
             request: prepared.request,
             descriptor: prepared.descriptor,
@@ -1721,8 +1806,8 @@ pub(crate) async fn start_object_rpc_client_session(
     send_head_result?;
 
     let wait_response_started = perf_enabled.then(std::time::Instant::now);
-    let mut outgoing_task = if let Some(open) = request_open {
-        let outgoing_writer = writer.clone();
+    tasks.outgoing = if let Some(open) = request_open {
+        let outgoing_writer = tasks.writer().clone();
         let outgoing_path_estimator = path_estimator.clone();
         Some(tokio::spawn(async move {
             pump_outgoing_body(
@@ -1746,7 +1831,7 @@ pub(crate) async fn start_object_rpc_client_session(
         Head(Result<SessionWirePayload, tokio::sync::oneshot::error::RecvError>),
         Outgoing(Result<Result<(), NetworkError>, tokio::task::JoinError>),
     }
-    let first = if let Some(task) = outgoing_task.as_mut() {
+    let first = if let Some(task) = tasks.outgoing.as_mut() {
         tokio::select! {
             head = &mut head_rx => ClientSessionWait::Head(head),
             outgoing = task => ClientSessionWait::Outgoing(outgoing),
@@ -1760,7 +1845,7 @@ pub(crate) async fn start_object_rpc_client_session(
             detail: "session reader stopped before the response head".to_string(),
         })?,
         ClientSessionWait::Outgoing(outgoing) => {
-            outgoing_task.take();
+            tasks.outgoing.take();
             match outgoing {
                 Ok(Ok(())) => head_rx.await.map_err(|_| NetworkError::Io {
                     operation: "receive object RPC response session head".to_string(),
@@ -1768,8 +1853,6 @@ pub(crate) async fn start_object_rpc_client_session(
                 })?,
                 Ok(Err(error)) => {
                     if !outgoing_body_failure_can_race_response_head(&error) {
-                        reader_task.abort();
-                        keepalive_task.abort();
                         body_tx.fail(error.to_string());
                         return Err(error);
                     }
@@ -1790,16 +1873,12 @@ pub(crate) async fn start_object_rpc_client_session(
                             let error = outgoing_failure
                                 .take()
                                 .expect("outgoing failure was recorded");
-                            reader_task.abort();
-                            keepalive_task.abort();
                             body_tx.fail(error.to_string());
                             return Err(error);
                         }
                     }
                 }
                 Err(source) => {
-                    reader_task.abort();
-                    keepalive_task.abort();
                     let error = NetworkError::Io {
                         operation: "send object RPC request body".to_string(),
                         detail: format!("request body task failed: {source}"),
@@ -1847,6 +1926,18 @@ pub(crate) async fn start_object_rpc_client_session(
         &response_proof_public_key,
         &response_proof_session_id,
     );
+    // A relay can receive the final response over an authenticated pooled
+    // channel. Such a response carries the exact target node id but no
+    // canonical target proof for the upstream session, so the relay signs the
+    // canonical hop as itself. Keep that independently verified hop identity
+    // for the routing layer; it is never sufficient without an exact target
+    // attestation in the response metadata.
+    let response_link_verified = response_origin_verified
+        || response_origin_is_verified(
+            &response,
+            &response_link_public_key,
+            &response_link_session_id,
+        );
     if !response_origin_verified && !request_uses_relay {
         return Err(NetworkError::AuthDenied);
     }
@@ -1855,37 +1946,27 @@ pub(crate) async fn start_object_rpc_client_session(
         // body: the signed metadata is the complete error contract. Do not
         // wait for an outbound request value or attachment that the rejecting
         // server is required not to consume.
-        if let Some(task) = outgoing_task.take() {
-            task.abort();
-        }
-        reader_task.abort();
-        keepalive_task.abort();
         drop(incoming_body);
-        return Ok(ObjectRpcSessionResult::with_origin_verification(
+        return Ok(ObjectRpcSessionResult::with_response_verification(
             response,
             ObjectRpcIncomingBody::empty(),
             response_origin_verified,
+            response_link_verified,
         ));
     }
     if let Some(error) = outgoing_failure {
-        reader_task.abort();
-        keepalive_task.abort();
         body_tx.fail(error.to_string());
         return Err(error);
     }
     if body.is_none() {
-        if let Some(task) = outgoing_task.take() {
+        if let Some(task) = tasks.outgoing.take() {
             match task.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    reader_task.abort();
-                    keepalive_task.abort();
                     body_tx.fail(error.to_string());
                     return Err(error);
                 }
                 Err(source) => {
-                    reader_task.abort();
-                    keepalive_task.abort();
                     let error = NetworkError::Io {
                         operation: "finish object RPC request body".to_string(),
                         detail: format!("request body task failed: {source}"),
@@ -1902,19 +1983,15 @@ pub(crate) async fn start_object_rpc_client_session(
         incoming_body.set_role(body_role);
     }
     if body_role == ObjectRpcSessionBodyRole::Value
-        && let Some(task) = outgoing_task.take()
+        && let Some(task) = tasks.outgoing.take()
     {
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                reader_task.abort();
-                keepalive_task.abort();
                 body_tx.fail(error.to_string());
                 return Err(error);
             }
             Err(source) => {
-                reader_task.abort();
-                keepalive_task.abort();
                 let error = NetworkError::Io {
                     operation: "finish object RPC request body".to_string(),
                     detail: format!("request body task failed: {source}"),
@@ -1924,20 +2001,6 @@ pub(crate) async fn start_object_rpc_client_session(
             }
         }
     }
-    incoming_body.hold_completion_task(reader_task);
-    incoming_body.hold_completion_task(keepalive_task);
-    if let Some(task) = outgoing_task {
-        let outgoing_body_tx = body_tx;
-        incoming_body.hold_completion_task(tokio::spawn(async move {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => outgoing_body_tx.fail(error.to_string()),
-                Err(source) => outgoing_body_tx.fail(format!(
-                    "object RPC request body task failed after response head: {source}"
-                )),
-            }
-        }));
-    }
     if body_role == ObjectRpcSessionBodyRole::Value {
         let (value, forward) = incoming_body
             .collect_value_to_vec_for_forward("materialize object RPC response value")
@@ -1945,10 +2008,12 @@ pub(crate) async fn start_object_rpc_client_session(
         response.body = value;
         incoming_body = forward;
     }
-    Ok(ObjectRpcSessionResult::with_origin_verification(
+    let incoming_body = tasks.transfer_to_body(incoming_body, body_tx);
+    Ok(ObjectRpcSessionResult::with_response_verification(
         response,
         incoming_body,
         response_origin_verified,
+        response_link_verified,
     ))
 }
 
@@ -2697,39 +2762,103 @@ enum MultiplexedBodyTerminal {
 /// reader, so a stalled consumer cannot block unrelated calls.
 #[derive(Debug)]
 pub(crate) struct ObjectRpcChannelBodySender {
-    sender: Option<tokio::sync::mpsc::Sender<IncomingBodyItem>>,
+    sender: IncomingBodySender,
     terminal: Arc<Mutex<MultiplexedBodyTerminal>>,
+    staging_root: Result<PathBuf, String>,
+    transfer_id: TransferId,
+    staging: Option<SessionTransferStagingFile>,
+    received_bytes: u64,
+    consumer_closed: bool,
 }
 
 impl ObjectRpcChannelBodySender {
-    pub(crate) async fn send(&self, bytes: impl Into<Bytes>) -> Result<(), NetworkError> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(NetworkError::Io {
-                operation: "deliver multiplexed object RPC body".to_string(),
-                detail: "body receiver is already closed".to_string(),
-            });
-        };
-        sender
-            .send(IncomingBodyItem::Bytes(bytes.into()))
-            .await
-            .map_err(|_| NetworkError::Io {
-                operation: "deliver multiplexed object RPC body".to_string(),
-                detail: "body receiver closed before delivery".to_string(),
-            })
+    /// Moves one ordered channel quantum to the application fast path. A
+    /// consumer that remains full beyond the short direct-delivery grace gets
+    /// an on-disk suffix instead, releasing carrier-owned pooled bytes before
+    /// the physical reader advances to later calls or controls.
+    ///
+    /// `Ok(false)` means the public body was abandoned. Request ingress may
+    /// keep draining and crediting such a body; response ingress resets the
+    /// call because its only consumer disappeared.
+    pub(crate) async fn send(&mut self, bytes: impl Into<Bytes>) -> Result<bool, NetworkError> {
+        let bytes = bytes.into();
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let next_offset = self.received_bytes.checked_add(bytes_len).ok_or_else(|| {
+            NetworkError::Serialization {
+                detail: "multiplexed object RPC body offset overflow".to_string(),
+            }
+        })?;
+
+        if self.consumer_closed || self.sender.consumer_closed() {
+            self.consumer_closed = true;
+            self.received_bytes = next_offset;
+            return Ok(false);
+        }
+
+        if let Some(staging) = self.staging.as_mut() {
+            staging.append(bytes).await?;
+            self.received_bytes = next_offset;
+            self.sender.advance_available(next_offset)?;
+            return Ok(true);
+        }
+
+        match self.sender.deliver_with_grace(bytes).await {
+            IncomingDirectDelivery::Delivered => {
+                self.received_bytes = next_offset;
+                Ok(true)
+            }
+            IncomingDirectDelivery::ConsumerClosed => {
+                self.consumer_closed = true;
+                self.received_bytes = next_offset;
+                Ok(false)
+            }
+            IncomingDirectDelivery::Spill(bytes) => {
+                let staging_root =
+                    self.staging_root
+                        .as_ref()
+                        .map_err(|detail| NetworkError::Io {
+                            operation: "resolve multiplexed object RPC body staging root"
+                                .to_string(),
+                            detail: detail.clone(),
+                        })?;
+                let (mut staging, setup) = SessionTransferStagingFile::create(
+                    staging_root.clone(),
+                    self.transfer_id.clone(),
+                    self.received_bytes,
+                )
+                .await?;
+                self.sender.start_spool(setup)?;
+                staging.append(bytes).await?;
+                self.received_bytes = next_offset;
+                self.sender.advance_available(next_offset)?;
+                self.staging = Some(staging);
+                Ok(true)
+            }
+        }
     }
 
     pub(crate) fn fail(&mut self, detail: impl Into<String>) {
+        let detail = detail.into();
         if let Ok(mut terminal) = self.terminal.lock()
             && matches!(&*terminal, MultiplexedBodyTerminal::Pending)
         {
-            *terminal = MultiplexedBodyTerminal::Failed(detail.into());
+            *terminal = MultiplexedBodyTerminal::Failed(detail.clone());
         }
-        self.sender.take();
+        self.sender.fail(detail);
+        self.staging.take();
     }
 
     /// Marks the ordered body complete after its framing and declared length
     /// have been validated by the channel state machine.
-    pub(crate) async fn finish(&mut self, _total_bytes: u64) -> Result<(), NetworkError> {
+    pub(crate) async fn finish(&mut self, total_bytes: u64) -> Result<(), NetworkError> {
+        if total_bytes != self.received_bytes {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "multiplexed object RPC body completed at {total_bytes} after delivering {} bytes",
+                    self.received_bytes
+                ),
+            });
+        }
         let completion = self
             .terminal
             .lock()
@@ -2748,8 +2877,11 @@ impl ObjectRpcChannelBodySender {
                     detail: detail.clone(),
                 }),
             });
-        self.sender.take();
-        completion
+        completion?;
+        self.sender
+            .publish_completion(total_bytes, self.staging.is_some())?;
+        self.staging.take();
+        Ok(())
     }
 }
 
@@ -2813,25 +2945,36 @@ impl ObjectRpcIncomingBody {
     pub(crate) fn multiplexed_channel(
         total_bytes: Option<u64>,
     ) -> (ObjectRpcChannelBodySender, Self) {
+        let staging_root = SinomoDataDir::from_env_or_home()
+            .map(|data_dir| data_dir.root())
+            .map_err(|error| error.to_string());
+        Self::multiplexed_channel_with_staging_root(total_bytes, staging_root)
+    }
+
+    fn multiplexed_channel_with_staging_root(
+        total_bytes: Option<u64>,
+        staging_root: Result<PathBuf, String>,
+    ) -> (ObjectRpcChannelBodySender, Self) {
         // One queued chunk plus one chunk held by the isolated delivery task
         // bounds a stalled call to two channel quanta.
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let terminal = Arc::new(Mutex::new(MultiplexedBodyTerminal::Pending));
+        let (sender, body) = Self::channel_with_depth(
+            total_bytes,
+            ObjectRpcSessionBodyRole::Attachment,
+            1,
+            Some(Arc::clone(&terminal)),
+        );
         (
             ObjectRpcChannelBodySender {
-                sender: Some(sender),
+                sender,
                 terminal: Arc::clone(&terminal),
+                staging_root,
+                transfer_id: TransferId::generate(),
+                staging: None,
+                received_bytes: 0,
+                consumer_closed: false,
             },
-            Self {
-                inner: ObjectRpcIncomingBodyInner::Channel {
-                    receiver,
-                    current: None,
-                },
-                completion_tasks: Vec::new(),
-                total_bytes,
-                role: ObjectRpcSessionBodyRole::Attachment,
-                multiplexed_terminal: Some(terminal),
-            },
+            body,
         )
     }
 
@@ -2863,7 +3006,16 @@ impl ObjectRpcIncomingBody {
         total_bytes: Option<u64>,
         role: ObjectRpcSessionBodyRole,
     ) -> (IncomingBodySender, Self) {
-        let (body_sender, receiver) = tokio::sync::mpsc::channel(BODY_READER_BUFFER_DEPTH);
+        Self::channel_with_depth(total_bytes, role, BODY_READER_BUFFER_DEPTH, None)
+    }
+
+    fn channel_with_depth(
+        total_bytes: Option<u64>,
+        role: ObjectRpcSessionBodyRole,
+        depth: usize,
+        multiplexed_terminal: Option<Arc<Mutex<MultiplexedBodyTerminal>>>,
+    ) -> (IncomingBodySender, Self) {
+        let (body_sender, receiver) = tokio::sync::mpsc::channel(depth);
         let (setup_sender, setup_receiver) = tokio::sync::oneshot::channel();
         let (progress_sender, progress_receiver) =
             tokio::sync::watch::channel(IncomingSpoolProgress::default());
@@ -2891,7 +3043,7 @@ impl ObjectRpcIncomingBody {
                 completion_tasks: Vec::new(),
                 total_bytes,
                 role,
-                multiplexed_terminal: None,
+                multiplexed_terminal,
             },
         )
     }
@@ -3067,7 +3219,12 @@ impl ObjectRpcIncomingBodyChunkStream {
                         Some(IncomingBodyItem::Bytes(bytes)) => {
                             *current = Some(std::io::Cursor::new(bytes));
                         }
-                        Some(IncomingBodyItem::Error(error)) => return Err(error),
+                        Some(IncomingBodyItem::Error(error)) => {
+                            mark_multiplexed_body_terminal_error_delivered(
+                                self.body.multiplexed_terminal.as_ref(),
+                            );
+                            return Err(error);
+                        }
                         None => {
                             validate_multiplexed_body_eof(self.body.multiplexed_terminal.as_ref())?;
                             self.body.completion_tasks.clear();
@@ -3132,6 +3289,22 @@ fn validate_multiplexed_body_eof(
         Err(_) => Err(std::io::Error::other(
             "multiplexed body terminal state lock poisoned",
         )),
+    }
+}
+
+fn mark_multiplexed_body_terminal_error_delivered(
+    terminal: Option<&Arc<Mutex<MultiplexedBodyTerminal>>>,
+) {
+    let Some(terminal) = terminal else {
+        return;
+    };
+    if let Ok(mut terminal) = terminal.lock()
+        && matches!(&*terminal, MultiplexedBodyTerminal::Failed(_))
+    {
+        // The queued error is the single terminal-failure delivery. Mark it
+        // consumed so later reads observe ordinary closed-stream EOF instead
+        // of replaying the same failure indefinitely.
+        *terminal = MultiplexedBodyTerminal::Complete;
     }
 }
 
@@ -3226,6 +3399,9 @@ impl AsyncRead for ObjectRpcIncomingBody {
                             *current = Some(std::io::Cursor::new(bytes));
                         }
                         Poll::Ready(Some(IncomingBodyItem::Error(error))) => {
+                            mark_multiplexed_body_terminal_error_delivered(
+                                this.multiplexed_terminal.as_ref(),
+                            );
                             return Poll::Ready(Err(error));
                         }
                         Poll::Ready(None) => {
@@ -3262,6 +3438,17 @@ enum IncomingDirectDelivery {
 }
 
 impl IncomingBodySender {
+    fn consumer_closed(&self) -> bool {
+        self.direct
+            .lock()
+            .map(|direct| {
+                direct
+                    .as_ref()
+                    .is_none_or(tokio::sync::mpsc::Sender::is_closed)
+            })
+            .unwrap_or(true)
+    }
+
     fn try_deliver(&self, bytes: impl Into<Bytes>) -> IncomingDirectDelivery {
         let bytes = bytes.into();
         let direct = match self.direct.lock() {
@@ -3805,6 +3992,13 @@ pub struct ObjectRpcSessionResult {
     pub response: crate::ObjectRpcResponse,
     pub body: ObjectRpcIncomingBody,
     response_origin_verified: bool,
+    response_link_verified: bool,
+    // A multiplexed typed value is materialized into `response.body`. Keep its
+    // peer-memory reservation with the application-facing result instead of
+    // releasing it as soon as the materializer queues the result. Otherwise a
+    // caller can retain completed, unread results while recycling the channel
+    // call permit and bypass the aggregate materialized-value budget.
+    materialized_value_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl ObjectRpcSessionResult {
@@ -3813,6 +4007,8 @@ impl ObjectRpcSessionResult {
             response,
             body,
             response_origin_verified: true,
+            response_link_verified: true,
+            materialized_value_permit: None,
         }
     }
 
@@ -3836,20 +4032,55 @@ impl ObjectRpcSessionResult {
         (self.response, self.body)
     }
 
-    fn with_origin_verification(
+    /// Converts a received result into the response for the next relay hop.
+    ///
+    /// This is an internal carrier adapter: it preserves the public semantic
+    /// response-plus-attachment model while moving received `Bytes` chunks
+    /// directly into the outgoing producer.
+    #[doc(hidden)]
+    pub fn into_relay_response(self) -> Result<ObjectRpcSessionResponse, NetworkError> {
+        let Self {
+            response,
+            body,
+            materialized_value_permit,
+            ..
+        } = self;
+        let mut source = ObjectRpcBodySource::from_incoming_chunk_stream(body);
+        if let Some(permit) = materialized_value_permit {
+            source = source.with_lifetime_guard(permit)?;
+        }
+        Ok(ObjectRpcSessionResponse::new(response, source))
+    }
+
+    fn with_response_verification(
         response: crate::ObjectRpcResponse,
         body: ObjectRpcIncomingBody,
         response_origin_verified: bool,
+        response_link_verified: bool,
     ) -> Self {
         Self {
             response,
             body,
             response_origin_verified,
+            response_link_verified,
+            materialized_value_permit: None,
         }
+    }
+
+    pub(crate) fn with_materialized_value_permit(
+        mut self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        self.materialized_value_permit = Some(permit);
+        self
     }
 
     pub(crate) const fn response_origin_verified(&self) -> bool {
         self.response_origin_verified
+    }
+
+    pub(crate) const fn response_link_verified(&self) -> bool {
+        self.response_link_verified
     }
 }
 
@@ -4199,9 +4430,14 @@ mod body_tests {
         sender.send(received).await.expect("queue incoming chunk");
         sender.finish(5).await.expect("finish incoming body");
 
-        let source = ObjectRpcBodySource::from_incoming_chunk_stream(incoming);
-        assert!(!source.is_replayable());
-        let mut producer = source.producer(2).expect("incoming chunk producer");
+        let forwarded = ObjectRpcSessionResult::new(
+            crate::ObjectRpcResponse::from_encoded_body("/test/relay-zero-copy", Vec::new()),
+            incoming,
+        )
+        .into_relay_response()
+        .expect("relay response");
+        assert!(!forwarded.body.is_replayable());
+        let mut producer = forwarded.body.producer(2).expect("incoming chunk producer");
         assert!(matches!(&producer, BodyProducer::Incoming(_)));
 
         let first = producer
@@ -4229,6 +4465,82 @@ mod body_tests {
         assert_eq!(third.as_ptr(), received_pointer.wrapping_add(4));
         assert_eq!(producer.next().await.expect("incoming EOF"), None);
         producer.finish().await.expect("finish incoming producer");
+    }
+
+    #[tokio::test]
+    async fn multiplexed_body_spills_only_the_stalled_suffix_in_order_and_cleans_up() {
+        let root = sinomo_testdir::TestDir::new("sinomo-channel-body-spill");
+        let first = Bytes::from_static(b"first-");
+        let second = Bytes::from_static(b"second-");
+        let third = Bytes::from_static(b"third");
+        let total_bytes = first.len() + second.len() + third.len();
+        let (mut sender, body) = ObjectRpcIncomingBody::multiplexed_channel_with_staging_root(
+            Some(total_bytes as u64),
+            Ok(root.path().to_path_buf()),
+        );
+
+        assert!(sender.send(first).await.expect("direct prefix"));
+        assert!(sender.send(second).await.expect("start spilled suffix"));
+        assert!(sender.send(third).await.expect("append spilled suffix"));
+        let spool_dir = root.path().join("network-transfers");
+        assert_eq!(
+            std::fs::read_dir(&spool_dir)
+                .expect("read active channel spool")
+                .count(),
+            1,
+            "one stalled body must own exactly one staging file"
+        );
+        sender
+            .finish(total_bytes as u64)
+            .await
+            .expect("complete spilled channel body");
+        drop(sender);
+
+        assert_eq!(
+            body.collect_to_vec(total_bytes)
+                .await
+                .expect("collect direct prefix and spilled suffix"),
+            b"first-second-third"
+        );
+        assert_eq!(
+            std::fs::read_dir(&spool_dir)
+                .expect("read cleaned channel spool")
+                .count(),
+            0,
+            "the staging file must disappear after writer and tailer release it"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_multiplexed_body_discards_without_spooling() {
+        let root = sinomo_testdir::TestDir::new("sinomo-channel-body-abandoned");
+        let (mut sender, body) = ObjectRpcIncomingBody::multiplexed_channel_with_staging_root(
+            Some(6),
+            Ok(root.path().to_path_buf()),
+        );
+        assert!(
+            sender
+                .send(Bytes::from_static(b"abc"))
+                .await
+                .expect("initial body quantum")
+        );
+        drop(body);
+        assert!(
+            !sender
+                .send(Bytes::from_static(b"def"))
+                .await
+                .expect("discard abandoned quantum"),
+            "a dropped body must be reported to channel direction handling"
+        );
+        sender
+            .finish(6)
+            .await
+            .expect("finish discarded request body");
+        drop(sender);
+        assert!(
+            !root.path().join("network-transfers").exists(),
+            "abandonment must release pooled bytes without touching disk"
+        );
     }
 
     #[tokio::test]
@@ -5148,6 +5460,51 @@ mod body_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn response_identity_proof_can_authenticate_a_canonical_relay_hop() {
+        let target_root = sinomo_testdir::TestDir::new("sinomo-session-head-proof-hybrid-target");
+        let relay_root = sinomo_testdir::TestDir::new("sinomo-session-head-proof-hybrid-relay");
+        let target_data_dir = SinomoDataDir::new(target_root.path());
+        let relay_data_dir = SinomoDataDir::new(relay_root.path());
+        let target_public_key = proof_public_key(&target_data_dir);
+        let relay_public_key = proof_public_key(&relay_data_dir);
+        let target_session_id = TransferId::generate();
+        let relay_session_id = TransferId::generate();
+        let mut response = crate::ObjectRpcResponse::from_encoded_body(
+            "/test/session/hybrid-relay-proof",
+            b"response".to_vec(),
+        );
+        response.mark_responder_node_id("node_hybrid_relay_target");
+
+        // The relay received this result over an authenticated channel, which
+        // carries target identity metadata but deliberately has no canonical
+        // target proof. Its upstream canonical response therefore authenticates
+        // the relay hop and leaves final-target validation to the routing layer.
+        let (relay_stream, _relay_peer) = tokio::io::duplex(4096);
+        let relay_writer = Arc::new(tokio::sync::Mutex::new(
+            SessionFrameWriter::new(relay_stream, relay_data_dir, NetworkCallPolicy::default())
+                .expect("relay writer"),
+        ));
+        ensure_response_identity_proof(&relay_writer, &relay_session_id, &mut response)
+            .await
+            .expect("relay identity proof");
+
+        assert!(!response_origin_is_verified(
+            &response,
+            &target_public_key,
+            &target_session_id,
+        ));
+        assert!(response_origin_is_verified(
+            &response,
+            &relay_public_key,
+            &relay_session_id,
+        ));
+        assert_eq!(
+            response.responder_node_id(),
+            Some("node_hybrid_relay_target")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn full_duplex_response_does_not_wait_for_handler_to_drain_request() {
         let client_root = sinomo_testdir::TestDir::new("sinomo-session-spool-client");
@@ -5916,6 +6273,74 @@ mod body_tests {
         let request_body = server.await.expect("server task");
         assert_eq!(request_body, expected_request);
         assert_eq!(response_body, expected_response);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_client_session_before_response_closes_transport() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-cancel-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-cancel-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let (body_reader, _body_writer) = tokio::io::duplex(64);
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/cancel-before-response",
+            "test",
+            &"request-head",
+        )
+        .expect("request head");
+        let prepared = ObjectRpcSessionCall::new(
+            request,
+            ObjectRpcBodySource::async_reader(body_reader, Some(1)),
+        )
+        .prepare_for_signing()
+        .expect("prepare session call");
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(start_object_rpc_client_session(
+            Box::new(client_stream),
+            prepared,
+            request_auth,
+            client_data_dir,
+            server_public_key.clone(),
+            server_public_key,
+            NetworkCallPolicy::default(),
+        ));
+
+        let mut server_reader =
+            SessionFrameReader::new(server_stream, NetworkCallPolicy::default());
+        assert!(matches!(
+            server_reader.receive().await.expect("request head"),
+            SessionInboundFrame::Payload(SessionWirePayload::RequestHead { .. })
+        ));
+        assert!(matches!(
+            server_reader.receive().await.expect("request body open"),
+            SessionInboundFrame::Payload(SessionWirePayload::Transfer(TransferControl::Open(_)))
+        ));
+
+        client.abort();
+        assert!(
+            client
+                .await
+                .expect_err("client task must be cancelled")
+                .is_cancelled(),
+            "the client task ended for a reason other than cancellation"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match server_reader.receive().await {
+                    Err(_) => break,
+                    Ok(SessionInboundFrame::Payload(SessionWirePayload::HealthPing { .. })) => {
+                        continue;
+                    }
+                    Ok(_) => panic!("unexpected frame after client cancellation"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled session must promptly close its transport");
     }
 
     #[tokio::test(start_paused = true)]

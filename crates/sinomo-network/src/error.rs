@@ -139,6 +139,13 @@ pub enum NetworkError {
         max_records: usize,
     },
     #[error(
+        "too many cluster connectivity snapshot records: {observed_records} records; max {max_records}"
+    )]
+    ClusterConnectivitySnapshotRecordLimit {
+        observed_records: usize,
+        max_records: usize,
+    },
+    #[error(
         "certificate node {certificate_node_id} does not match material node {material_node_id}"
     )]
     CertificateNodeMismatch {

@@ -994,6 +994,11 @@ pub struct DfsTombstoneCompactionReport {
     pub eligible_tombstone_count: u64,
     pub compacted_tombstone_count: u64,
     pub retained_young_tombstone_count: u64,
+    /// Earliest wall-clock instant at which a currently young tombstone can
+    /// become retention-eligible. This lets reactive schedulers arm one exact
+    /// deadline instead of polling the whole metadata set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_at_unix_nanos: Option<u64>,
     pub retained_referenced_tombstone_count: u64,
     pub retained_limit_tombstone_count: u64,
     pub removed_object_record_count: u64,
@@ -1401,6 +1406,11 @@ impl DfsTombstoneCompactionReport {
         self.retained_young_tombstone_count = self
             .retained_young_tombstone_count
             .saturating_add(other.retained_young_tombstone_count);
+        self.next_eligible_at_unix_nanos = self
+            .next_eligible_at_unix_nanos
+            .into_iter()
+            .chain(other.next_eligible_at_unix_nanos)
+            .min();
         self.retained_referenced_tombstone_count = self
             .retained_referenced_tombstone_count
             .saturating_add(other.retained_referenced_tombstone_count);

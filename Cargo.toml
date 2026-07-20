@@ -121,5 +121,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "reg
 metrics = "0.24.6"
 pprof = { version = "0.15.0", default-features = false, features = ["framehop-unwinder", "prost-codec"] }
 netwatcher = { version = "0.7.1", features = ["tokio"] }
+notify = "8.2.0"
 ulid = "3.0.0"
 v4l = "0.14.0"

@@ -14,7 +14,12 @@ use crate::kv_local_store::{read_cluster_kv_cached_snapshot_if_present, read_clu
 use crate::kv_read_model::read_cluster_capability_policies_from_snapshot;
 use crate::local_membership::apply_cluster_node_role;
 use crate::local_membership::refresh_local_daemon_membership_from_disk;
-use crate::local_state_store::{read_cluster_state_without_kv, write_cluster_state};
+#[cfg(test)]
+use crate::local_state_store::write_cluster_state;
+use crate::local_state_store::{
+    acquire_local_cluster_state_mutation_lock, read_cluster_state_without_kv,
+    write_cluster_state_unlocked,
+};
 use crate::member_store::{
     apply_cluster_raft_role, cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store,
     cluster_legacy_shadow_orphan_artifact_node_ids_from_store,
@@ -310,6 +315,9 @@ pub fn sync_cluster_state_to_kv_with_host(
     let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut keyed_state)?;
     let store = InProcessKvStore::restore(authoritative.value.clone()).map_err(kv_err)?;
     let txn = cluster_state_sync_txn_from_store(&store, &keyed_state, true)?;
+    if txn.success.is_empty() {
+        return Ok(authoritative.value);
+    }
     let mut commit_state = keyed_state;
     let result = host.commit_cluster_kv_txn_with_quorum(
         paths,
@@ -345,6 +353,9 @@ pub async fn sync_cluster_state_to_kv_async_with_host(
             operation: "cluster state sync txn".to_string(),
             detail: format!("cluster state sync txn task failed: {source}"),
         })??;
+    if txn.success.is_empty() {
+        return Ok(authoritative.value);
+    }
     let mut commit_state = keyed_state;
     let result = host
         .commit_cluster_kv_txn_with_quorum_async(
@@ -385,16 +396,17 @@ pub fn update_cluster_node_role_with_host(
     let mut member: ClusterMemberRecord = member_entry.decode().map_err(kv_err)?;
     let previous_role = member.node_role.clone();
     let changed = previous_role != role;
-    let txn = if changed {
-        apply_cluster_node_role(&mut member, role.clone(), now);
-        cluster_member_update_txn_from_store(&store, member_entry, &member)?
-    } else {
-        KvTxn {
-            compares: Vec::new(),
-            success: Vec::new(),
-            failure: Vec::new(),
-        }
-    };
+    if !changed {
+        update_local_cluster_node_role_if_present(paths, &node_id, role.clone(), now)?;
+        return Ok(ClusterNodeRoleUpdate {
+            node_id,
+            previous_role,
+            role,
+            changed,
+        });
+    }
+    apply_cluster_node_role(&mut member, role.clone(), now);
+    let txn = cluster_member_update_txn_from_store(&store, member_entry, &member)?;
     let result =
         host.commit_cluster_kv_txn_with_quorum(paths, &mut state, KvTxnRequest::generated(txn))?;
     require_cluster_kv_txn_succeeded(result, "updating cluster node role")?;
@@ -426,16 +438,17 @@ pub fn update_cluster_node_name_with_host(
     let mut member: ClusterMemberRecord = member_entry.decode().map_err(kv_err)?;
     let previous_name = member.display_name.clone();
     let changed = previous_name != name;
-    let txn = if changed {
-        apply_cluster_node_name(&mut member, name.clone(), now);
-        cluster_member_update_txn_from_store(&store, member_entry, &member)?
-    } else {
-        KvTxn {
-            compares: Vec::new(),
-            success: Vec::new(),
-            failure: Vec::new(),
-        }
-    };
+    if !changed {
+        update_local_cluster_node_name_if_present(paths, &node_id, name.clone(), now)?;
+        return Ok(ClusterNodeNameUpdate {
+            node_id,
+            previous_name,
+            name,
+            changed,
+        });
+    }
+    apply_cluster_node_name(&mut member, name.clone(), now);
+    let txn = cluster_member_update_txn_from_store(&store, member_entry, &member)?;
     let result =
         host.commit_cluster_kv_txn_with_quorum(paths, &mut state, KvTxnRequest::generated(txn))?;
     require_cluster_kv_txn_succeeded(result, "updating cluster node name")?;
@@ -454,6 +467,7 @@ fn update_local_cluster_node_role_if_present(
     role: ClusterNodeRole,
     now: OffsetDateTime,
 ) -> Result<(), NetworkError> {
+    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
     let mut state = read_cluster_state_without_kv(paths)?;
     let Some(member) = state
         .members
@@ -467,7 +481,7 @@ fn update_local_cluster_node_role_if_present(
     }
     apply_cluster_node_role(member, role, now);
     state.updated_at = now;
-    write_cluster_state(paths, &state)?;
+    write_cluster_state_unlocked(paths, &state)?;
     Ok(())
 }
 
@@ -477,6 +491,7 @@ fn update_local_cluster_node_name_if_present(
     name: String,
     now: OffsetDateTime,
 ) -> Result<(), NetworkError> {
+    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
     let mut state = read_cluster_state_without_kv(paths)?;
     let mut changed = false;
     if state.local_node_id == *node_id && state.local_node_display_name != name {
@@ -490,7 +505,7 @@ fn update_local_cluster_node_name_if_present(
     else {
         if changed {
             state.updated_at = now;
-            write_cluster_state(paths, &state)?;
+            write_cluster_state_unlocked(paths, &state)?;
         }
         return Ok(());
     };
@@ -500,7 +515,7 @@ fn update_local_cluster_node_name_if_present(
     }
     if changed {
         state.updated_at = now;
-        write_cluster_state(paths, &state)?;
+        write_cluster_state_unlocked(paths, &state)?;
     }
     Ok(())
 }
@@ -560,13 +575,14 @@ fn commit_cluster_raft_config_change_record(
     require_cluster_kv_txn_succeeded(result, stage)
 }
 
-pub(crate) fn cluster_raft_config_change_apply_txn(
+fn cluster_raft_config_change_apply_txn_with_lifecycle_fence(
     store: &InProcessKvStore,
     node_id: &NodeId,
     change: &ClusterKvRaftConfigChange,
     term: u64,
     next_revision: sinomo_kv::KvRevision,
     now: OffsetDateTime,
+    lifecycle_fence: KvCompare,
 ) -> Result<KvTxn, NetworkError> {
     let config_key = sinomo_kv::cluster_kv_raft_config_key();
     let config_entry =
@@ -601,14 +617,6 @@ pub(crate) fn cluster_raft_config_change_apply_txn(
         | ClusterKvRaftConfigChangeKind::RemoveMember => ClusterMemberRole::NonVoting,
     };
     apply_cluster_raft_role(&mut member, next_role, now);
-    let change_key = sinomo_kv::cluster_kv_raft_config_change_key(&change.change_id);
-    let change_entry =
-        store
-            .get(&change_key)
-            .cloned()
-            .ok_or_else(|| NetworkError::ClusterReadOnly {
-                detail: format!("Raft config change `{}` is missing", change.change_id),
-            })?;
     let mut success = cluster_member_update_ops_from_store(store, &member)?;
     success.push(KvOp::put_serde(config_key.clone(), &next_config, None).map_err(kv_err)?);
     Ok(KvTxn {
@@ -621,13 +629,188 @@ pub(crate) fn cluster_raft_config_change_apply_txn(
                 key: member_key,
                 value: member_entry.value,
             },
-            KvCompare::ValueEquals {
-                key: change_key,
-                value: change_entry.value,
-            },
+            lifecycle_fence,
         ],
         success,
         failure: Vec::new(),
+    })
+}
+
+pub(crate) fn cluster_raft_config_change_apply_txn(
+    store: &InProcessKvStore,
+    node_id: &NodeId,
+    change: &ClusterKvRaftConfigChange,
+    term: u64,
+    next_revision: sinomo_kv::KvRevision,
+    now: OffsetDateTime,
+) -> Result<KvTxn, NetworkError> {
+    let change_key = sinomo_kv::cluster_kv_raft_config_change_key(&change.change_id);
+    let change_entry =
+        store
+            .get(&change_key)
+            .cloned()
+            .ok_or_else(|| NetworkError::ClusterReadOnly {
+                detail: format!("Raft config change `{}` is missing", change.change_id),
+            })?;
+    cluster_raft_config_change_apply_txn_with_lifecycle_fence(
+        store,
+        node_id,
+        change,
+        term,
+        next_revision,
+        now,
+        KvCompare::ValueEquals {
+            key: change_key,
+            value: change_entry.value,
+        },
+    )
+}
+
+/// Atomically records a fresh Planned change and applies its target config.
+///
+/// A new learner does not need a separately visible plan commit: the member,
+/// config, and durable lifecycle record either all commit or none do. Existing
+/// Planned records still use `cluster_raft_config_change_apply_txn`, preserving
+/// crash recovery for older/in-flight admissions.
+pub(crate) fn cluster_raft_config_change_plan_apply_txn(
+    store: &InProcessKvStore,
+    node_id: &NodeId,
+    change: &ClusterKvRaftConfigChange,
+    term: u64,
+    next_revision: sinomo_kv::KvRevision,
+    now: OffsetDateTime,
+) -> Result<KvTxn, NetworkError> {
+    let change_key = sinomo_kv::cluster_kv_raft_config_change_key(&change.change_id);
+    if store.get(&change_key).is_some() {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!("Raft config change `{}` already exists", change.change_id),
+        });
+    }
+    let plan_op = KvOp::put_serde(change_key.clone(), change, None).map_err(kv_err)?;
+    let mut txn = cluster_raft_config_change_apply_txn_with_lifecycle_fence(
+        store,
+        node_id,
+        change,
+        term,
+        next_revision,
+        now,
+        KvCompare::Missing { key: change_key },
+    )?;
+    txn.success.insert(0, plan_op);
+    Ok(txn)
+}
+
+pub(crate) enum ClusterRaftLearnerAdmissionPreparation {
+    AlreadyAdmitted(KvSnapshot),
+    Pending {
+        store: InProcessKvStore,
+        change: ClusterKvRaftConfigChange,
+        plan_required: bool,
+    },
+}
+
+pub(crate) fn prepare_cluster_raft_learner_admission(
+    snapshot: KvSnapshot,
+    node_id: &NodeId,
+    now: OffsetDateTime,
+) -> Result<ClusterRaftLearnerAdmissionPreparation, NetworkError> {
+    let store = InProcessKvStore::restore(snapshot).map_err(kv_err)?;
+    let member_key = cluster_member_key(node_id);
+    let member_entry =
+        store
+            .get(&member_key)
+            .cloned()
+            .ok_or_else(|| NetworkError::InvalidClusterCommand {
+                detail: format!("cluster member `{node_id}` was not found"),
+            })?;
+    let member: ClusterMemberRecord = member_entry.decode().map_err(kv_err)?;
+    let current_config: ClusterKvRaftConfigRecord = store
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .ok_or_else(|| NetworkError::ClusterReadOnly {
+            detail: "cluster raft config is missing".to_string(),
+        })?
+        .decode()
+        .map_err(kv_err)?;
+    match sinomo_kv::cluster_kv_raft_config_member_role(&current_config, node_id) {
+        Some(ClusterMemberRole::Learner)
+            if member.role == ClusterMemberRole::Learner
+                && member.state == ClusterMemberState::Learner =>
+        {
+            return Ok(ClusterRaftLearnerAdmissionPreparation::AlreadyAdmitted(
+                store.try_snapshot().map_err(kv_err)?,
+            ));
+        }
+        Some(role) => {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: format!(
+                    "cluster member `{node_id}` already has incompatible Raft role {role:?}"
+                ),
+            });
+        }
+        None if member.role == ClusterMemberRole::NonVoting
+            && member.state == ClusterMemberState::NonVoting => {}
+        None => {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: format!(
+                    "cluster member `{node_id}` must be seeded as non-voting before learner admission"
+                ),
+            });
+        }
+    }
+
+    let mut matching_change = None;
+    for entry in store.prefix_entries("/cluster/raft/config-changes/") {
+        let change: ClusterKvRaftConfigChange = entry.decode().map_err(kv_err)?;
+        if change.node_id != *node_id
+            || matches!(
+                change.phase,
+                ClusterKvRaftConfigChangePhase::Committed | ClusterKvRaftConfigChangePhase::Failed
+            )
+        {
+            continue;
+        }
+        let reusable = change.kind == ClusterKvRaftConfigChangeKind::AddLearner
+            && change.phase == ClusterKvRaftConfigChangePhase::Planned
+            && change.base_config_revision == current_config.kv_revision
+            && change.required_log_index.is_none()
+            && change.catch_up_proof.is_none();
+        if !reusable {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "cluster member `{node_id}` has incompatible in-flight Raft config change `{}`",
+                    change.change_id
+                ),
+            });
+        }
+        if matching_change.replace(change).is_some() {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "cluster member `{node_id}` has multiple in-flight Raft learner admissions"
+                ),
+            });
+        }
+    }
+    if let Some(change) = matching_change {
+        return Ok(ClusterRaftLearnerAdmissionPreparation::Pending {
+            store,
+            change,
+            plan_required: false,
+        });
+    }
+
+    let change = sinomo_kv::begin_cluster_kv_raft_config_change(
+        &current_config,
+        Id::generate(),
+        ClusterKvRaftConfigChangeKind::AddLearner,
+        node_id.clone(),
+        None,
+        now,
+    )
+    .map_err(kv_err)?;
+    Ok(ClusterRaftLearnerAdmissionPreparation::Pending {
+        store,
+        change,
+        plan_required: true,
     })
 }
 
@@ -1283,76 +1466,40 @@ pub async fn add_cluster_raft_learner_async_with_host(
     let authoritative = host
         .authoritative_cluster_kv_snapshot_async(paths, state)
         .await?;
-    let mut store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;
-    let member_key = cluster_member_key(node_id);
-    let member_entry =
-        store
-            .get(&member_key)
-            .cloned()
-            .ok_or_else(|| NetworkError::InvalidClusterCommand {
-                detail: format!("cluster member `{node_id}` was not found"),
+    let mut apply_term = authoritative.authority.term;
+    let (mut store, mut change, plan_required) =
+        match prepare_cluster_raft_learner_admission(authoritative.value, node_id, now)? {
+            ClusterRaftLearnerAdmissionPreparation::AlreadyAdmitted(snapshot) => {
+                // An exact registration retry still crosses a fresh quorum
+                // barrier above, but does not create duplicate change evidence.
+                return Ok(snapshot);
+            }
+            ClusterRaftLearnerAdmissionPreparation::Pending {
+                store,
+                change,
+                plan_required,
+            } => (store, change, plan_required),
+        };
+    if plan_required {
+        let planned = host
+            .commit_cluster_kv_txn_with_quorum_async(
+                paths,
+                state,
+                KvTxnRequest::generated(cluster_raft_config_change_record_txn(&store, &change)?),
+            )
+            .await
+            .and_then(|result| {
+                require_cluster_kv_txn_succeeded(result, "planning Raft learner admission")
             })?;
-    let member: ClusterMemberRecord = member_entry.decode().map_err(kv_err)?;
-    let current_config: ClusterKvRaftConfigRecord = store
-        .get(&sinomo_kv::cluster_kv_raft_config_key())
-        .ok_or_else(|| NetworkError::ClusterReadOnly {
-            detail: "cluster raft config is missing".to_string(),
-        })?
-        .decode()
-        .map_err(kv_err)?;
-    match sinomo_kv::cluster_kv_raft_config_member_role(&current_config, node_id) {
-        Some(ClusterMemberRole::Learner)
-            if member.role == ClusterMemberRole::Learner
-                && member.state == ClusterMemberState::Learner =>
-        {
-            // An exact registration retry still crosses a fresh quorum
-            // barrier above, but does not create duplicate change evidence.
-            return Ok(store.try_snapshot().map_err(kv_err)?);
-        }
-        Some(role) => {
-            return Err(NetworkError::InvalidClusterCommand {
-                detail: format!(
-                    "cluster member `{node_id}` already has incompatible Raft role {role:?}"
-                ),
-            });
-        }
-        None if member.role == ClusterMemberRole::NonVoting
-            && member.state == ClusterMemberState::NonVoting => {}
-        None => {
-            return Err(NetworkError::InvalidClusterCommand {
-                detail: format!(
-                    "cluster member `{node_id}` must be seeded as non-voting before learner admission"
-                ),
-            });
-        }
+        apply_term = planned.authority.term;
+        store = InProcessKvStore::restore(planned.snapshot).map_err(kv_err)?;
     }
-
-    let mut change = sinomo_kv::begin_cluster_kv_raft_config_change(
-        &current_config,
-        Id::generate(),
-        ClusterKvRaftConfigChangeKind::AddLearner,
-        node_id.clone(),
-        None,
-        now,
-    )
-    .map_err(kv_err)?;
-    let planned = host
-        .commit_cluster_kv_txn_with_quorum_async(
-            paths,
-            state,
-            KvTxnRequest::generated(cluster_raft_config_change_record_txn(&store, &change)?),
-        )
-        .await
-        .and_then(|result| {
-            require_cluster_kv_txn_succeeded(result, "planning Raft learner admission")
-        })?;
-    store = InProcessKvStore::restore(planned.snapshot).map_err(kv_err)?;
 
     let apply_txn = cluster_raft_config_change_apply_txn(
         &store,
         node_id,
         &change,
-        planned.authority.term,
+        apply_term,
         store.try_snapshot().map_err(kv_err)?.revision.next(),
         now,
     )?;
@@ -1548,20 +1695,6 @@ pub fn update_cluster_state_authority_with_host(
                 "repairing cluster state-authority member record",
             )?;
         }
-    } else {
-        let result = host.commit_cluster_kv_txn_with_quorum(
-            paths,
-            &mut state,
-            KvTxnRequest::generated(KvTxn {
-                compares: Vec::new(),
-                success: Vec::new(),
-                failure: Vec::new(),
-            }),
-        )?;
-        require_cluster_kv_txn_succeeded(
-            result,
-            "confirming unchanged cluster state-authority role",
-        )?;
     }
     Ok(ClusterStateAuthorityUpdate {
         node_id,
@@ -1579,8 +1712,6 @@ pub fn remove_cluster_members_with_host(
     node_ids: Vec<NodeId>,
     host: &mut impl ClusterMemberMutationHost,
 ) -> Result<ClusterMemberRemoval, NetworkError> {
-    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state)?;
-    let mut store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;
     let requested = node_ids.into_iter().collect::<BTreeSet<_>>();
     if requested.is_empty() {
         return Err(NetworkError::InvalidClusterCommand {
@@ -1593,6 +1724,25 @@ pub fn remove_cluster_members_with_host(
             detail: "use `sinomo cluster leave` to remove the local daemon members".to_string(),
         });
     }
+    // Member deletion is itself a Raft-config lifecycle entrypoint. Recover
+    // any older nonterminal transition before deriving removal work so this
+    // operation cannot race or bypass durable config-change ownership.
+    let reconciliation = reconcile_cluster_raft_config_changes_with_host(
+        paths,
+        &mut state,
+        OffsetDateTime::now_utc(),
+        host,
+    )?;
+    if reconciliation.deferred_change_count > 0 {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "deferred {} Raft config lifecycle recoveries; retry before removing cluster members",
+                reconciliation.deferred_change_count
+            ),
+        });
+    }
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state)?;
+    let mut store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;
 
     let mut removed = Vec::new();
     for node_id in &requested {
@@ -2197,6 +2347,47 @@ mod tests {
     }
 
     #[test]
+    fn member_removal_recovers_pending_config_lifecycle_before_new_transition() {
+        let (state, target, now) = non_voting_member_state();
+        let temp = sinomo_testdir::TestDir::new("cluster-remove-recovers-config-lifecycle");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(temp.path()));
+        let mut host = MemoryMutationHost::new(&state);
+        let pending = sinomo_kv::begin_cluster_kv_raft_config_change(
+            &host.raft_config(),
+            Id::from_legacy_named("remove_recovers_pending_learner").expect("change id"),
+            ClusterKvRaftConfigChangeKind::AddLearner,
+            target.clone(),
+            None,
+            now,
+        )
+        .expect("plan pending learner admission");
+        host.put_config_change(&pending);
+
+        let removal =
+            remove_cluster_members_with_host(&paths, state, vec![target.clone()], &mut host)
+                .expect("recover lifecycle then remove member");
+
+        assert_eq!(
+            removal
+                .removed
+                .iter()
+                .map(|member| member.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![target.clone()]
+        );
+        assert_eq!(
+            host.config_change(&pending.change_id).phase,
+            ClusterKvRaftConfigChangePhase::Committed,
+            "the older learner admission must be terminal before removal starts"
+        );
+        assert!(
+            sinomo_kv::cluster_kv_raft_config_member_role(&host.raft_config(), &target).is_none(),
+            "the removal lifecycle must own the final config transition"
+        );
+        assert!(host.store.get(&cluster_member_key(&target)).is_none());
+    }
+
+    #[test]
     fn cluster_state_sync_rejects_a_quorum_committed_compare_failure() {
         let (mut state, _target, _now) = non_voting_member_state();
         let temp = sinomo_testdir::TestDir::new("cluster-state-sync-compare-failure");
@@ -2225,6 +2416,42 @@ mod tests {
                 .contains("explicit config-change lifecycle"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn unchanged_member_attributes_do_not_commit_empty_transactions() {
+        let (state, target, now) = non_voting_member_state();
+        let temp = sinomo_testdir::TestDir::new("cluster-member-unchanged-read-only");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(temp.path()));
+        paths.ensure().expect("cluster paths");
+        write_cluster_state(&paths, &state).expect("local cluster state");
+        let target_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == target)
+            .expect("target member");
+        let role = target_member.node_role.clone();
+        let name = target_member.display_name.clone();
+        let mut host = MemoryMutationHost::new(&state);
+        let commit_index = host.commit_index;
+
+        let role_update = update_cluster_node_role_with_host(
+            &paths,
+            state.clone(),
+            target.clone(),
+            role,
+            now,
+            &mut host,
+        )
+        .expect("unchanged role");
+        assert!(!role_update.changed);
+        assert_eq!(host.commit_index, commit_index);
+
+        let name_update =
+            update_cluster_node_name_with_host(&paths, state, target, name, now, &mut host)
+                .expect("unchanged name");
+        assert!(!name_update.changed);
+        assert_eq!(host.commit_index, commit_index);
     }
 
     #[test]

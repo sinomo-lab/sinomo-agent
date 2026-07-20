@@ -2,9 +2,12 @@ use crate::ObserveError;
 use crate::runtime::observe_runtime_process_identity;
 use serde::{Deserialize, Serialize};
 use sinomo_core::network::{
-    NetworkTimelineEvent, NetworkTimelineSnapshot, network_timeline_capture_is_active,
-    network_timeline_stage_name, start_network_timeline_capture, stop_network_timeline_capture,
+    NetworkTimelineEndpointIdentity, NetworkTimelineEvent, NetworkTimelineSnapshot,
+    network_timeline_capture_is_active, network_timeline_stage_name,
+    start_network_timeline_capture, stop_network_timeline_capture,
 };
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -14,6 +17,8 @@ pub const OBSERVE_NETWORK_TIMELINE_MIN_DURATION_SECONDS: u64 = 1;
 pub const OBSERVE_NETWORK_TIMELINE_MAX_DURATION_SECONDS: u64 = 120;
 pub const OBSERVE_NETWORK_TIMELINE_DEFAULT_MAX_EVENTS: usize = 4 * 1024;
 pub const OBSERVE_NETWORK_TIMELINE_MAX_EVENTS: usize = 32 * 1024;
+pub const OBSERVE_NETWORK_TIMELINE_ARTIFACT_ROOT: &str = "observe/timelines";
+pub const OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME: &str = "timeline.json";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -44,6 +49,7 @@ pub struct ObserveNetworkTimelineEvent {
     pub trace_id: String,
     pub span_id: String,
     pub connection_id: u64,
+    pub endpoint_correlation_id: u64,
     pub call_id: u64,
     pub frame_id: u64,
     pub stage: u16,
@@ -70,6 +76,8 @@ pub struct ObserveNetworkTimelineResponse {
     pub event_count: usize,
     pub dropped_events: u64,
     pub overflowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_identities: Vec<NetworkTimelineEndpointIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<ObserveNetworkTimelineEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +220,76 @@ fn stop_timeline(
     Ok(response_from_capture(capture, true))
 }
 
+/// Finalizes and durably preserves an explicitly active process-local network
+/// timeline before a short-lived process exits.
+///
+/// Ordinary processes do no work here unless an operator already started a
+/// bounded timeline. Identity-changing daemon joins use this lifecycle hook so
+/// the joining generation's client-side events do not disappear when its
+/// replacement starts before the external observer can issue `stop`.
+pub fn persist_active_observe_network_timeline(
+    data_dir_root: &Path,
+) -> Result<Option<PathBuf>, ObserveError> {
+    let capture = {
+        let mut managed = managed_capture()
+            .lock()
+            .map_err(|_| timeline_lock_error())?;
+        let Some(capture) = managed.as_mut() else {
+            return Ok(None);
+        };
+        if capture.snapshot.is_none() && capture.error.is_none() {
+            match stop_network_timeline_capture() {
+                Ok(snapshot) => {
+                    capture.snapshot = Some(snapshot);
+                    capture.captured_at = Some(OffsetDateTime::now_utc());
+                }
+                Err(error) => capture.error = Some(error.to_string()),
+            }
+        }
+        managed.take().expect("managed capture exists")
+    };
+    let response = response_from_capture(capture, true);
+    let capture_id = response
+        .capture_id
+        .as_deref()
+        .ok_or_else(|| ObserveError::Runtime {
+            detail: "completed network timeline is missing its capture id".to_string(),
+        })?;
+    let artifact_dir = data_dir_root
+        .join(OBSERVE_NETWORK_TIMELINE_ARTIFACT_ROOT)
+        .join(capture_id);
+    fs::create_dir_all(&artifact_dir).map_err(|source| ObserveError::Runtime {
+        detail: format!(
+            "failed to create network timeline artifact directory {}: {source}",
+            artifact_dir.display()
+        ),
+    })?;
+    let artifact_path = artifact_dir.join(OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME);
+    let temporary_path = artifact_dir.join(format!(
+        ".{OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME}.{}.tmp",
+        std::process::id()
+    ));
+    let encoded = serde_json::to_vec_pretty(&response).map_err(|source| ObserveError::Runtime {
+        detail: format!("failed to encode completed network timeline: {source}"),
+    })?;
+    fs::write(&temporary_path, encoded).map_err(|source| ObserveError::Runtime {
+        detail: format!(
+            "failed to write network timeline artifact {}: {source}",
+            temporary_path.display()
+        ),
+    })?;
+    if let Err(source) = fs::rename(&temporary_path, &artifact_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(ObserveError::Runtime {
+            detail: format!(
+                "failed to publish network timeline artifact {}: {source}",
+                artifact_path.display()
+            ),
+        });
+    }
+    Ok(Some(artifact_path))
+}
+
 fn timeline_status() -> Result<ObserveNetworkTimelineResponse, ObserveError> {
     let managed = managed_capture()
         .lock()
@@ -249,6 +327,11 @@ fn timeline_status() -> Result<ObserveNetworkTimelineResponse, ObserveError> {
         event_count,
         dropped_events,
         overflowed,
+        endpoint_identities: capture
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.endpoint_identities.clone())
+            .unwrap_or_default(),
         events: Vec::new(),
         error: capture.error.clone(),
     })
@@ -273,6 +356,7 @@ fn response_from_capture(
         event_count: 0,
         dropped_events: 0,
         overflowed: false,
+        endpoint_identities: Vec::new(),
         events: Vec::new(),
         error: capture.error,
     };
@@ -330,6 +414,7 @@ fn observe_network_timeline_response_from_snapshot_at(
         event_count: snapshot.events.len(),
         dropped_events: snapshot.dropped_events,
         overflowed: snapshot.overflowed,
+        endpoint_identities: snapshot.endpoint_identities,
         events: snapshot.events.into_iter().map(event_record).collect(),
         error: None,
     }
@@ -350,6 +435,7 @@ fn empty_response() -> ObserveNetworkTimelineResponse {
         event_count: 0,
         dropped_events: 0,
         overflowed: false,
+        endpoint_identities: Vec::new(),
         events: Vec::new(),
         error: None,
     }
@@ -363,6 +449,7 @@ fn event_record(event: NetworkTimelineEvent) -> ObserveNetworkTimelineEvent {
         trace_id: encode_hex(&event.trace_id),
         span_id: encode_hex(&event.span_id),
         connection_id: event.connection_id,
+        endpoint_correlation_id: event.endpoint_correlation_id,
         call_id: event.call_id,
         frame_id: event.frame_id,
         stage: event.stage,
@@ -498,6 +585,7 @@ mod tests {
                     captured_monotonic_ns: 20,
                     max_events: 4,
                     events: Vec::new(),
+                    endpoint_identities: Vec::new(),
                     dropped_events: 0,
                     overflowed: false,
                     active: false,
@@ -510,5 +598,62 @@ mod tests {
 
         assert_eq!(response.captured_at, captured_at);
         assert_eq!(response.captured_monotonic_ns, 20);
+    }
+
+    #[test]
+    fn completed_short_lived_capture_is_persisted_under_its_capture_id() {
+        let root = sinomo_testdir::TestDir::new("observe-network-timeline-exit");
+        {
+            let mut managed = managed_capture().lock().expect("managed capture lock");
+            assert!(managed.is_none(), "test requires no active managed capture");
+            *managed = Some(ManagedTimelineCapture {
+                capture_id: "joining-daemon-19".to_string(),
+                max_events: 4,
+                snapshot: Some(NetworkTimelineSnapshot {
+                    started_monotonic_ns: 10,
+                    captured_monotonic_ns: 20,
+                    max_events: 4,
+                    events: vec![NetworkTimelineEvent {
+                        endpoint_correlation_id: 77,
+                        ..NetworkTimelineEvent::default()
+                    }],
+                    endpoint_identities: vec![NetworkTimelineEndpointIdentity {
+                        correlation_id: 77,
+                        endpoint_id: "01hxy6qa9k0t9vr4g9n8d3q5bf".to_string(),
+                        node_id: "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
+                        transport: "lan-tcp".to_string(),
+                    }],
+                    dropped_events: 0,
+                    overflowed: false,
+                    active: false,
+                }),
+                captured_at: Some(OffsetDateTime::from_unix_timestamp(1_234).expect("timestamp")),
+                error: None,
+            });
+        }
+
+        let artifact = persist_active_observe_network_timeline(root.path())
+            .expect("persist capture")
+            .expect("capture artifact");
+        assert_eq!(
+            artifact,
+            root.join(OBSERVE_NETWORK_TIMELINE_ARTIFACT_ROOT)
+                .join("joining-daemon-19")
+                .join(OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME)
+        );
+        let persisted: ObserveNetworkTimelineResponse =
+            serde_json::from_slice(&fs::read(&artifact).expect("read timeline artifact"))
+                .expect("decode timeline artifact");
+        assert_eq!(persisted.capture_id.as_deref(), Some("joining-daemon-19"));
+        assert_eq!(persisted.event_count, 1);
+        assert_eq!(persisted.events[0].endpoint_correlation_id, 77);
+        assert_eq!(persisted.endpoint_identities[0].correlation_id, 77);
+        assert!(
+            managed_capture()
+                .lock()
+                .expect("managed capture lock")
+                .is_none(),
+            "persist must consume the process-local managed capture"
+        );
     }
 }

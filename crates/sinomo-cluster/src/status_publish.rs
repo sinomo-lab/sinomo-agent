@@ -181,13 +181,12 @@ where
     H: ClusterNodeStatusPublishHost,
 {
     let already_current = cluster_node_status_publish_matches_with_host(paths, &status, host)?;
+    if already_current {
+        return Ok(None);
+    }
     let mut state = read_cluster_state(paths)?;
     let key = cluster_node_status_key_for_record(&status);
-    let success = if already_current {
-        Vec::new()
-    } else {
-        vec![KvOp::put_serde(key, &status, None).map_err(kv_err)?]
-    };
+    let success = vec![KvOp::put_serde(key, &status, None).map_err(kv_err)?];
     let snapshot = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
@@ -241,6 +240,9 @@ where
 {
     let already_current =
         cluster_node_status_publish_matches_async_with_host(runtime, paths, &status, host).await?;
+    if already_current {
+        return Ok(None);
+    }
 
     let state_paths = paths.clone();
     let mut state = runtime
@@ -254,15 +256,11 @@ where
         })?
         .map_err(H::Error::from)?;
     let key = cluster_node_status_key_for_record(&status);
-    let success = if already_current {
-        Vec::new()
-    } else {
-        vec![
-            KvOp::put_serde(key, &status, None)
-                .map_err(kv_err)
-                .map_err(H::Error::from)?,
-        ]
-    };
+    let success = vec![
+        KvOp::put_serde(key, &status, None)
+            .map_err(kv_err)
+            .map_err(H::Error::from)?,
+    ];
     let snapshot = host
         .commit_cluster_kv_txn_with_quorum_async(
             paths,
@@ -320,13 +318,13 @@ where
     H: ClusterNetworkInfoPublishHost,
 {
     let already_current = cluster_network_info_publish_matches_with_host(paths, &info, host)?;
+    if already_current {
+        return Ok(None);
+    }
     let mut state = read_cluster_state(paths)?;
     let node_id = info.node_id.clone();
-    let success = if already_current {
-        Vec::new()
-    } else {
-        vec![KvOp::put_serde(cluster_network_info_key(&node_id), &info, None).map_err(kv_err)?]
-    };
+    let success =
+        vec![KvOp::put_serde(cluster_network_info_key(&node_id), &info, None).map_err(kv_err)?];
     let snapshot = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
@@ -380,6 +378,9 @@ where
 {
     let already_current =
         cluster_network_info_publish_matches_async_with_host(runtime, paths, &info, host).await?;
+    if already_current {
+        return Ok(None);
+    }
 
     let state_paths = paths.clone();
     let mut state = runtime
@@ -393,15 +394,11 @@ where
         })?
         .map_err(H::Error::from)?;
     let node_id = info.node_id.clone();
-    let success = if already_current {
-        Vec::new()
-    } else {
-        vec![
-            KvOp::put_serde(cluster_network_info_key(&node_id), &info, None)
-                .map_err(kv_err)
-                .map_err(H::Error::from)?,
-        ]
-    };
+    let success = vec![
+        KvOp::put_serde(cluster_network_info_key(&node_id), &info, None)
+            .map_err(kv_err)
+            .map_err(H::Error::from)?,
+    ];
     let snapshot = host
         .commit_cluster_kv_txn_with_quorum_async(
             paths,

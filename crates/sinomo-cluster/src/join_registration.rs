@@ -11,11 +11,11 @@ use crate::local_membership::{
     ClusterLocalDaemonMembershipObservation, apply_local_daemon_membership_observation,
     merge_cluster_join_registration,
 };
-use crate::local_state_store::{
-    read_cluster_state, read_cluster_state_without_kv, write_cluster_state,
-};
+use crate::local_state_store::{persist_accepted_cluster_join_state, read_cluster_state};
 use crate::member_mutation::{
-    ClusterMemberMutationHost, require_cluster_kv_txn_succeeded,
+    ClusterMemberMutationHost, ClusterRaftLearnerAdmissionPreparation,
+    cluster_raft_config_change_apply_txn, cluster_raft_config_change_plan_apply_txn,
+    cluster_raft_config_change_record_txn, prepare_cluster_raft_learner_admission,
     update_cluster_state_authority_with_host,
 };
 use crate::member_store::{apply_cluster_raft_role, cluster_member_update_ops_from_store};
@@ -29,8 +29,11 @@ use crate::prelude::*;
 #[allow(unused_imports)]
 use sinomo_kv::KvSnapshot;
 use sinomo_kv::{
-    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, ClusterKvRaftConfigRecord, ClusterKvTxnCommitResult,
-    InProcessKvStore, KvAuthoritativeRead, KvCompare, KvOp, KvTxn, KvTxnRequest,
+    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, ClusterKvRaftConfigChange,
+    ClusterKvRaftConfigChangeEvidence, ClusterKvRaftConfigChangeKind,
+    ClusterKvRaftConfigChangePhase, ClusterKvRaftConfigRecord, ClusterKvTxnCommitResult,
+    InProcessKvStore, KvAuthoritativeRead, KvAuthorityProof, KvCommand, KvCompare, KvOp, KvTxn,
+    KvTxnRequest,
 };
 use sinomo_network::ClusterConnectivityState;
 use sinomo_network::ClusterMembershipRpcFuture;
@@ -48,18 +51,230 @@ use sinomo_node::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, ClusterInvitationStateRecord,
     cluster_member_is_local_process, cluster_member_stable_eq, shadow_daemon_node_id,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 const JOIN_RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+// A concurrent admission burst can legitimately put many requests on the same
+// KV generation. One winner advances the generation per round, so a very small
+// fixed cap rejects a still-valid tail request. Keep a generous safety cap
+// while a short exponential delay prevents a hot retry loop. At most 191 ms is
+// spent sleeping across all 16 attempts, leaving the enclosing RPC deadline
+// for quorum I/O.
+const CLUSTER_JOIN_ADMISSION_MAX_ATTEMPTS: usize = 16;
+const CLUSTER_JOIN_ADMISSION_MAX_RETRY_BACKOFF: Duration = Duration::from_millis(16);
+
+/// Serializes authority-local async join admission preparation while allowing
+/// a request that was already waiting to reuse the preceding admission's
+/// current-term quorum result.
+///
+/// Without this boundary, a burst prepares every learner from the same Raft
+/// config generation. All but one then spend a complete quorum round trip to
+/// discover the expected compare failure, even though the winning commit
+/// already returned the exact authoritative snapshot needed by the next
+/// waiter. The coordinator is process-local because every authority RPC is
+/// dispatched by one daemon process; the durable transaction fences and Raft
+/// quorum remain the cross-process authority.
+#[derive(Default)]
+struct AsyncClusterJoinAdmissionCoordinator {
+    turn: tokio::sync::Mutex<()>,
+    completed_generation: AtomicU64,
+    latest_authoritative: std::sync::Mutex<Option<KvAuthoritativeRead<KvSnapshot>>>,
+}
+
+static ASYNC_CLUSTER_JOIN_ADMISSION_COORDINATORS: LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Weak<AsyncClusterJoinAdmissionCoordinator>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn async_cluster_join_admission_coordinator(
+    paths: &ClusterPaths,
+) -> Arc<AsyncClusterJoinAdmissionCoordinator> {
+    let mut coordinators = ASYNC_CLUSTER_JOIN_ADMISSION_COORDINATORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(coordinator) = coordinators
+        .get(&paths.root)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return coordinator;
+    }
+    coordinators.retain(|_, coordinator| coordinator.strong_count() > 0);
+    let coordinator = Arc::new(AsyncClusterJoinAdmissionCoordinator::default());
+    coordinators.insert(paths.root.clone(), Arc::downgrade(&coordinator));
+    coordinator
+}
+
+impl AsyncClusterJoinAdmissionCoordinator {
+    fn generation(&self) -> u64 {
+        self.completed_generation.load(Ordering::Acquire)
+    }
+
+    fn authoritative_completed_after(
+        &self,
+        observed_generation: u64,
+    ) -> Option<KvAuthoritativeRead<KvSnapshot>> {
+        if self.generation() <= observed_generation {
+            return None;
+        }
+        self.latest_authoritative
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn publish(&self, authoritative: KvAuthoritativeRead<KvSnapshot>) {
+        if !matches!(
+            authoritative.authority.basis,
+            sinomo_kv::KvAuthorityBasis::CurrentTermQuorum { .. }
+        ) {
+            return;
+        }
+        *self
+            .latest_authoritative
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(authoritative);
+        self.completed_generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn cluster_join_admission_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(1_u64 << attempt.saturating_sub(1).min(4))
+        .min(CLUSTER_JOIN_ADMISSION_MAX_RETRY_BACKOFF)
+}
 
 fn join_registration_trace(args: std::fmt::Arguments<'_>) {
-    let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
-    if enabled {
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        detail = %args,
+        "cluster join registration stage"
+    );
+    if cluster_join_stderr_trace_enabled() {
         eprintln!("[sinomo cluster join] {args}");
     }
+}
+
+fn cluster_join_stderr_trace_enabled() -> bool {
+    std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_registration_authority_phase_trace(
+    phase: &'static str,
+    invite_id: &ClusterInviteId,
+    requested_learner_node_id: Option<&NodeId>,
+    attempt: usize,
+    duration: Duration,
+    revision: u64,
+    term: u64,
+    outcome: &'static str,
+    detail: std::fmt::Arguments<'_>,
+) {
+    let requested_learner_node_id = requested_learner_node_id.map(NodeId::as_str).unwrap_or("");
+    let duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        phase,
+        invite_id = %invite_id,
+        requested_learner_node_id,
+        attempt,
+        duration_us,
+        revision,
+        term,
+        outcome,
+        detail = %detail,
+        "cluster join authority registration phase"
+    );
+    if cluster_join_stderr_trace_enabled() {
+        eprintln!(
+            "[sinomo cluster join] authority phase={phase} invite={invite_id} learner={requested_learner_node_id} attempt={attempt} duration_us={duration_us} revision={revision} term={term} outcome={outcome}: {detail}"
+        );
+    }
+}
+
+#[derive(Clone)]
+struct ForwardedJoinAcceptanceTrace {
+    invite_id: ClusterInviteId,
+    requested_learner_node_id: Option<NodeId>,
+    stderr_enabled: bool,
+}
+
+impl ForwardedJoinAcceptanceTrace {
+    fn new(
+        invite_id: &ClusterInviteId,
+        requested_learner_node_id: Option<&NodeId>,
+    ) -> Option<Self> {
+        let stderr_enabled = cluster_join_stderr_trace_enabled();
+        if !stderr_enabled
+            && !tracing::enabled!(target: "sinomo.cluster.formation", tracing::Level::TRACE)
+        {
+            return None;
+        }
+        Some(Self {
+            invite_id: invite_id.clone(),
+            requested_learner_node_id: requested_learner_node_id.cloned(),
+            stderr_enabled,
+        })
+    }
+
+    fn phase(
+        &self,
+        phase: &'static str,
+        duration: Duration,
+        revision: u64,
+        term: u64,
+        outcome: &'static str,
+        detail: std::fmt::Arguments<'_>,
+    ) {
+        let requested_learner_node_id = self
+            .requested_learner_node_id
+            .as_ref()
+            .map(NodeId::as_str)
+            .unwrap_or("");
+        let duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        tracing::trace!(
+            target: "sinomo.cluster.formation",
+            phase,
+            invite_id = %self.invite_id,
+            requested_learner_node_id,
+            duration_us,
+            revision,
+            term,
+            outcome,
+            detail = %detail,
+            "forwarded join acceptance phase"
+        );
+        if self.stderr_enabled {
+            eprintln!(
+                "[sinomo cluster join] forwarded acceptance phase={phase} invite={} learner={requested_learner_node_id} duration_us={duration_us} revision={revision} term={term} outcome={outcome}: {detail}",
+                self.invite_id
+            );
+        }
+    }
+
+    fn start(
+        &self,
+        phase: &'static str,
+        revision: u64,
+        term: u64,
+        detail: std::fmt::Arguments<'_>,
+    ) -> Instant {
+        self.phase(phase, Duration::ZERO, revision, term, "started", detail);
+        // Exclude observation subscriber work from the measured operation.
+        Instant::now()
+    }
+}
+
+fn requested_join_learner_node_id(request: &ClusterJoinRegistrationRequest) -> Option<&NodeId> {
+    request
+        .members
+        .iter()
+        .find(|member| member.role == ClusterMemberRole::Learner)
+        .map(|member| &member.node_id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,7 +432,19 @@ fn prepare_authoritative_cluster_join_registration(
         ));
     };
     let persisted_invite: ClusterJoinInvite = invite_entry.decode().map_err(kv_err)?;
-    if persisted_invite != request.invite
+    // The ordinary `sinomo-join://` URI is deliberately a compact reference:
+    // it carries the invitation id, cluster authentication key, secret, and
+    // dialable channels, while policy, issuer, expiry, and signature remain in
+    // authoritative KV. Authenticate that reference, then enforce the full
+    // persisted invite below. A caller that supplies a full signed invite must
+    // still present the exact authoritative value.
+    let compact_reference_matches = request.invite.invite_id == persisted_invite.invite_id
+        && request.invite.cluster_public_key == persisted_invite.cluster_public_key
+        && request.invite.invitation_secret == persisted_invite.invitation_secret;
+    let embedded_signed_invite_matches = !crate::invite_has_embedded_signature(&request.invite)
+        || request.invite == persisted_invite;
+    if !compact_reference_matches
+        || !embedded_signed_invite_matches
         || request.invitation_secret.trim().is_empty()
         || request.invitation_secret != persisted_invite.invitation_secret
     {
@@ -341,7 +568,8 @@ fn prepare_authoritative_cluster_join_registration(
     let mut member_ids = BTreeSet::new();
     let mut member_public_keys = BTreeSet::new();
     if request.members.iter().any(|member| {
-        member.cluster_id != persisted_invite.cluster_id
+        (member.cluster_id != persisted_invite.cluster_id
+            && member.cluster_id.as_str() != crate::PENDING_INVITE_CLUSTER_ID)
             || member.node_public_key.trim().is_empty()
             || !member_ids.insert(member.node_id.clone())
             || !member_public_keys.insert(member.node_public_key.clone())
@@ -496,11 +724,479 @@ fn prepare_authoritative_cluster_join_registration(
     ))
 }
 
+fn cluster_join_registration_op_key(op: &KvOp) -> Option<&str> {
+    match op {
+        KvOp::Put { key, .. } | KvOp::Delete { key } => Some(key),
+        KvOp::DeletePrefix { .. }
+        | KvOp::LeaseGrant { .. }
+        | KvOp::LeaseKeepAlive { .. }
+        | KvOp::LeaseRevoke { .. } => None,
+    }
+}
+
+/// Combine member seeding and Raft learner admission into one authoritative
+/// transaction. All compares run against the pre-join snapshot; the local
+/// staged store exists only to derive the final member, endpoint-index, config,
+/// and planned lifecycle values that the admission commit publishes atomically.
+/// The ownership edge terminalizes that lifecycle immediately afterward, once
+/// the admission result supplies its exact committed term, index, and revision.
+struct ClusterJoinLearnerAdmissionTxn {
+    txn: KvTxn,
+    lifecycle_change_id: Option<sinomo_base::Id>,
+}
+
+fn pending_cluster_join_learner_admission_change_id(
+    store: &InProcessKvStore,
+    learner_node_id: &NodeId,
+) -> Result<Option<sinomo_base::Id>, NetworkError> {
+    let mut matching_change_id = None;
+    for entry in store.prefix_entries("/cluster/raft/config-changes/") {
+        let change: ClusterKvRaftConfigChange = entry.decode().map_err(kv_err)?;
+        if change.node_id != *learner_node_id
+            || matches!(
+                change.phase,
+                ClusterKvRaftConfigChangePhase::Committed | ClusterKvRaftConfigChangePhase::Failed
+            )
+        {
+            continue;
+        }
+        if change.kind != ClusterKvRaftConfigChangeKind::AddLearner
+            || change.phase != ClusterKvRaftConfigChangePhase::Planned
+        {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "cluster member `{learner_node_id}` has incompatible in-flight Raft config change `{}`",
+                    change.change_id
+                ),
+            });
+        }
+        if matching_change_id.replace(change.change_id).is_some() {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "cluster member `{learner_node_id}` has multiple in-flight Raft learner admissions"
+                ),
+            });
+        }
+    }
+    Ok(matching_change_id)
+}
+
+fn cluster_join_seed_and_learner_admission_txn(
+    snapshot: &KvSnapshot,
+    seed_txn: &KvTxn,
+    learner_node_id: &NodeId,
+    term: u64,
+    now: OffsetDateTime,
+) -> Result<ClusterJoinLearnerAdmissionTxn, NetworkError> {
+    let mut staged = InProcessKvStore::restore(snapshot.clone()).map_err(kv_err)?;
+    let (_, seed_response) = staged
+        .apply_command_with_response(KvCommand::Txn(seed_txn.clone()))
+        .map_err(kv_err)?;
+    if !seed_response.is_some_and(|response| response.succeeded) {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: "locally staged join seed transaction did not satisfy its own fences"
+                .to_string(),
+        });
+    }
+    let staged_snapshot = staged.try_snapshot().map_err(kv_err)?;
+    let (store, change, plan_required) =
+        match prepare_cluster_raft_learner_admission(staged_snapshot, learner_node_id, now)? {
+            ClusterRaftLearnerAdmissionPreparation::AlreadyAdmitted(snapshot) => {
+                // An exact retry after the apply commit but before lifecycle
+                // completion must finish that same record. A retry after full
+                // completion has no lifecycle work and only rechecks the
+                // invitation/member fences.
+                let store = InProcessKvStore::restore(snapshot).map_err(kv_err)?;
+                return Ok(ClusterJoinLearnerAdmissionTxn {
+                    txn: seed_txn.clone(),
+                    lifecycle_change_id: pending_cluster_join_learner_admission_change_id(
+                        &store,
+                        learner_node_id,
+                    )?,
+                });
+            }
+            ClusterRaftLearnerAdmissionPreparation::Pending {
+                store,
+                change,
+                plan_required,
+            } => (store, change, plan_required),
+        };
+    let lifecycle_change_id = change.change_id.clone();
+    let next_revision = snapshot.revision.next();
+    let apply_txn = if plan_required {
+        cluster_raft_config_change_plan_apply_txn(
+            &store,
+            learner_node_id,
+            &change,
+            term,
+            next_revision,
+            now,
+        )?
+    } else {
+        cluster_raft_config_change_apply_txn(
+            &store,
+            learner_node_id,
+            &change,
+            term,
+            next_revision,
+            now,
+        )?
+    };
+
+    // Seed compares are the authoritative pre-transaction fences. In
+    // particular, they assert that a fresh member key is Missing, while the
+    // staged apply builder sees the seeded value and would otherwise compare it
+    // as already present. Add only lifecycle/config fences for keys not already
+    // covered by the security-sensitive seed transaction.
+    let mut compares = seed_txn.compares.clone();
+    let mut compared_keys = compares
+        .iter()
+        .map(|compare| match compare {
+            KvCompare::Exists { key }
+            | KvCompare::Missing { key }
+            | KvCompare::ValueEquals { key, .. }
+            | KvCompare::VersionEquals { key, .. }
+            | KvCompare::CreateRevisionEquals { key, .. }
+            | KvCompare::ModifyRevisionEquals { key, .. }
+            | KvCompare::LeaseEquals { key, .. } => key.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    for compare in apply_txn.compares {
+        let key = match &compare {
+            KvCompare::Exists { key }
+            | KvCompare::Missing { key }
+            | KvCompare::ValueEquals { key, .. }
+            | KvCompare::VersionEquals { key, .. }
+            | KvCompare::CreateRevisionEquals { key, .. }
+            | KvCompare::ModifyRevisionEquals { key, .. }
+            | KvCompare::LeaseEquals { key, .. } => key,
+        };
+        if compared_keys.insert(key.clone()) {
+            compares.push(compare);
+        }
+    }
+
+    // The final learner apply overwrites the main member and its endpoint-index
+    // entries. Drop their intermediate seed puts while retaining a requested
+    // non-voting shadow's disjoint seed operations.
+    let apply_keys = apply_txn
+        .success
+        .iter()
+        .filter_map(cluster_join_registration_op_key)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut success = seed_txn
+        .success
+        .iter()
+        .filter(|op| {
+            cluster_join_registration_op_key(op).is_none_or(|key| !apply_keys.contains(key))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    success.extend(apply_txn.success);
+    Ok(ClusterJoinLearnerAdmissionTxn {
+        txn: KvTxn {
+            compares,
+            success,
+            failure: Vec::new(),
+        },
+        lifecycle_change_id: Some(lifecycle_change_id),
+    })
+}
+
+enum AuthoritativeClusterJoinAdmissionPreparation {
+    Rejected(ClusterJoinRegistrationResponse),
+    Commit {
+        prepared: PreparedAuthoritativeClusterJoin,
+        txn: KvTxn,
+        lifecycle_change_id: Option<sinomo_base::Id>,
+    },
+}
+
+fn require_current_term_join_admission_authority(
+    authoritative: &KvAuthoritativeRead<KvSnapshot>,
+) -> Result<(), NetworkError> {
+    if !matches!(
+        authoritative.authority.basis,
+        sinomo_kv::KvAuthorityBasis::CurrentTermQuorum { .. }
+    ) {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "join admission requires a current-term quorum authority proof".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn prepare_authoritative_cluster_join_admission(
+    state: ClusterBootstrapState,
+    snapshot: KvSnapshot,
+    request: ClusterJoinRegistrationRequest,
+    term: u64,
+    now: OffsetDateTime,
+) -> Result<AuthoritativeClusterJoinAdmissionPreparation, NetworkError> {
+    let prepared =
+        match prepare_authoritative_cluster_join_registration(state, &snapshot, request, now)? {
+            AuthoritativeClusterJoinPreparation::Rejected(response) => {
+                return Ok(AuthoritativeClusterJoinAdmissionPreparation::Rejected(
+                    response,
+                ));
+            }
+            AuthoritativeClusterJoinPreparation::Commit(prepared) => prepared,
+        };
+    let [learner_node_id] = prepared.learner_node_ids.as_slice() else {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: "validated join registration did not contain exactly one learner".to_string(),
+        });
+    };
+    let admission = cluster_join_seed_and_learner_admission_txn(
+        &snapshot,
+        &prepared.seed_txn,
+        learner_node_id,
+        term,
+        now,
+    )?;
+    Ok(AuthoritativeClusterJoinAdmissionPreparation::Commit {
+        prepared,
+        txn: admission.txn,
+        lifecycle_change_id: admission.lifecycle_change_id,
+    })
+}
+
+/// Build the terminal lifecycle record from the exact proof returned by the
+/// admission commit. This cannot safely be folded into the admission
+/// transaction: its final Raft log index and KV revision are unknowable until
+/// quorum commit, especially when unrelated writers can advance the log.
+fn cluster_join_learner_admission_completion_txn(
+    snapshot: &KvSnapshot,
+    lifecycle_change_id: &sinomo_base::Id,
+    learner_node_id: &NodeId,
+    authority: &KvAuthorityProof,
+    now: OffsetDateTime,
+) -> Result<Option<KvTxn>, NetworkError> {
+    if authority.revision != snapshot.revision {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "join admission authority revision {:?} does not match committed snapshot revision {:?}",
+                authority.revision, snapshot.revision
+            ),
+        });
+    }
+    let store = InProcessKvStore::restore(snapshot.clone()).map_err(kv_err)?;
+    let change_key = sinomo_kv::cluster_kv_raft_config_change_key(lifecycle_change_id);
+    let mut change: ClusterKvRaftConfigChange = store
+        .get(&change_key)
+        .ok_or_else(|| NetworkError::ClusterReadOnly {
+            detail: format!(
+                "committed join admission is missing Raft config lifecycle `{lifecycle_change_id}`"
+            ),
+        })?
+        .decode()
+        .map_err(kv_err)?;
+    if change.node_id != *learner_node_id
+        || change.kind != ClusterKvRaftConfigChangeKind::AddLearner
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "Raft config lifecycle `{lifecycle_change_id}` does not own learner admission for `{learner_node_id}`"
+            ),
+        });
+    }
+    match change.phase {
+        ClusterKvRaftConfigChangePhase::Committed => return Ok(None),
+        ClusterKvRaftConfigChangePhase::Planned => {}
+        ClusterKvRaftConfigChangePhase::CatchingUp
+        | ClusterKvRaftConfigChangePhase::ReadyToCommit
+        | ClusterKvRaftConfigChangePhase::Failed => {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "Raft config lifecycle `{lifecycle_change_id}` has incompatible phase {:?} after join admission",
+                    change.phase
+                ),
+            });
+        }
+    }
+    let member: ClusterMemberRecord = store
+        .get(&cluster_member_key(learner_node_id))
+        .ok_or_else(|| NetworkError::ClusterReadOnly {
+            detail: format!(
+                "committed join admission is missing learner member `{learner_node_id}`"
+            ),
+        })?
+        .decode()
+        .map_err(kv_err)?;
+    let config: ClusterKvRaftConfigRecord = store
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .ok_or_else(|| NetworkError::ClusterReadOnly {
+            detail: "committed join admission is missing the Raft config".to_string(),
+        })?
+        .decode()
+        .map_err(kv_err)?;
+    if member.role != ClusterMemberRole::Learner
+        || member.state != ClusterMemberState::Learner
+        || sinomo_kv::cluster_kv_raft_config_member_role(&config, learner_node_id)
+            != Some(ClusterMemberRole::Learner)
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "Raft config lifecycle `{lifecycle_change_id}` cannot finish before learner `{learner_node_id}` is atomically applied"
+            ),
+        });
+    }
+    sinomo_kv::finish_cluster_kv_raft_config_change(
+        &mut change,
+        true,
+        ClusterKvRaftConfigChangeEvidence {
+            detail: format!("join admission committed AddLearner for node {learner_node_id}"),
+            term: authority.term,
+            log_index: authority.commit_index,
+            revision: authority.revision,
+            observed_at: now,
+        },
+    )
+    .map_err(kv_err)?;
+    cluster_raft_config_change_record_txn(&store, &change).map(Some)
+}
+
+fn cluster_join_learner_admission_lifecycle_is_committed(
+    snapshot: &KvSnapshot,
+    lifecycle_change_id: &sinomo_base::Id,
+    learner_node_id: &NodeId,
+) -> Result<bool, NetworkError> {
+    let Some(entry) = snapshot.get(&sinomo_kv::cluster_kv_raft_config_change_key(
+        lifecycle_change_id,
+    )) else {
+        return Ok(false);
+    };
+    let change: ClusterKvRaftConfigChange = entry.decode().map_err(kv_err)?;
+    Ok(change.node_id == *learner_node_id
+        && change.kind == ClusterKvRaftConfigChangeKind::AddLearner
+        && change.phase == ClusterKvRaftConfigChangePhase::Committed)
+}
+
+fn finish_cluster_join_learner_admission_with_host(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    admitted: ClusterKvTxnCommitResult,
+    lifecycle_change_id: Option<&sinomo_base::Id>,
+    learner_node_id: &NodeId,
+    now: OffsetDateTime,
+    host: &mut impl ClusterJoinRegistrationHost,
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    let Some(lifecycle_change_id) = lifecycle_change_id else {
+        return Ok(admitted);
+    };
+    let Some(txn) = cluster_join_learner_admission_completion_txn(
+        &admitted.snapshot,
+        lifecycle_change_id,
+        learner_node_id,
+        &admitted.authority,
+        now,
+    )?
+    else {
+        return Ok(admitted);
+    };
+    let completed =
+        host.commit_join_registration_txn(paths, state, KvTxnRequest::generated(txn))?;
+    if completed
+        .txn_response
+        .as_ref()
+        .is_some_and(|response| response.succeeded)
+        || cluster_join_learner_admission_lifecycle_is_committed(
+            &completed.snapshot,
+            lifecycle_change_id,
+            learner_node_id,
+        )?
+    {
+        return Ok(completed);
+    }
+    Err(NetworkError::InvalidClusterCommand {
+        detail: format!(
+            "cluster KV compare failed while finishing join learner lifecycle `{lifecycle_change_id}`"
+        ),
+    })
+}
+
+async fn finish_cluster_join_learner_admission_async_with_host(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    admitted: ClusterKvTxnCommitResult,
+    lifecycle_change_id: Option<&sinomo_base::Id>,
+    learner_node_id: &NodeId,
+    now: OffsetDateTime,
+    host: &mut (impl ClusterJoinRegistrationAsyncHost + Send),
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    let Some(lifecycle_change_id) = lifecycle_change_id else {
+        return Ok(admitted);
+    };
+    let completion_snapshot = admitted.snapshot.clone();
+    let completion_change_id = lifecycle_change_id.clone();
+    let completion_node_id = learner_node_id.clone();
+    let completion_authority = admitted.authority;
+    let txn = runtime
+        .spawn_blocking(move || {
+            cluster_join_learner_admission_completion_txn(
+                &completion_snapshot,
+                &completion_change_id,
+                &completion_node_id,
+                &completion_authority,
+                now,
+            )
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "finish cluster join learner admission".to_string(),
+            detail: format!("join learner lifecycle preparation task failed: {source}"),
+        })??;
+    let Some(txn) = txn else {
+        return Ok(admitted);
+    };
+    let completed = host
+        .commit_join_registration_txn_async(paths, state, KvTxnRequest::generated(txn))
+        .await?;
+    if completed
+        .txn_response
+        .as_ref()
+        .is_some_and(|response| response.succeeded)
+        || cluster_join_learner_admission_lifecycle_is_committed(
+            &completed.snapshot,
+            lifecycle_change_id,
+            learner_node_id,
+        )?
+    {
+        return Ok(completed);
+    }
+    Err(NetworkError::InvalidClusterCommand {
+        detail: format!(
+            "cluster KV compare failed while finishing join learner lifecycle `{lifecycle_change_id}`"
+        ),
+    })
+}
+
 fn cluster_join_response_state_from_snapshot(
     mut state: ClusterBootstrapState,
     snapshot: &KvSnapshot,
     now: OffsetDateTime,
 ) -> Result<ClusterBootstrapState, NetworkError> {
+    let identity: ClusterIdentityRecord = snapshot
+        .get(&cluster_identity_key())
+        .ok_or_else(|| NetworkError::InvalidClusterCommand {
+            detail: "authoritative join snapshot is missing cluster identity".to_string(),
+        })?
+        .decode()
+        .map_err(kv_err)?;
+    if identity.cluster_id != state.cluster_id {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: format!(
+                "authoritative join snapshot cluster `{}` does not match local cluster `{}`",
+                identity.cluster_id, state.cluster_id
+            ),
+        });
+    }
+    // The name may have changed concurrently with join preparation. The
+    // committed identity, not the pre-transaction local projection, is the
+    // authority for the response generation.
+    state.cluster_name = identity.cluster_name;
     state.members = crate::read_cluster_members_from_snapshot(snapshot)?;
     state.kv_revision = snapshot.revision.0;
     if let Some(config) = snapshot
@@ -545,26 +1241,194 @@ pub fn handle_cluster_join_registration_request_with_host(
         return Ok(response);
     }
 
+    let requested_learner_node_id = requested_join_learner_node_id(&request);
+    let authority_open_started = Instant::now();
+    join_registration_authority_phase_trace(
+        "authority_snapshot_open",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        0,
+        Duration::ZERO,
+        state.kv_revision,
+        state.term,
+        "started",
+        format_args!("opening authoritative cluster KV snapshot"),
+    );
     let mut authority_state = state.clone();
-    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut authority_state)?;
-    let prepared = match prepare_authoritative_cluster_join_registration(
-        state,
-        &authoritative.value,
-        request.clone(),
-        now,
-    )? {
-        AuthoritativeClusterJoinPreparation::Rejected(response) => return Ok(response),
-        AuthoritativeClusterJoinPreparation::Commit(prepared) => prepared,
-    };
-    let mut commit_state = prepared.state.clone();
-    let seeded = host.commit_join_registration_txn(
-        paths,
-        &mut commit_state,
-        KvTxnRequest::generated(prepared.seed_txn),
-    )?;
-    let seeded = match require_cluster_kv_txn_succeeded(seeded, "seeding join members") {
-        Ok(seeded) => seeded,
-        Err(_) => {
+    let authoritative_result = host.authoritative_cluster_kv_snapshot(paths, &mut authority_state);
+    match &authoritative_result {
+        Ok(authoritative) => join_registration_authority_phase_trace(
+            "authority_snapshot_open",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            0,
+            authority_open_started.elapsed(),
+            authoritative.value.revision.0,
+            authoritative.authority.term,
+            "opened",
+            format_args!("authoritative cluster KV snapshot opened"),
+        ),
+        Err(error) => join_registration_authority_phase_trace(
+            "authority_snapshot_open",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            0,
+            authority_open_started.elapsed(),
+            state.kv_revision,
+            state.term,
+            "error",
+            format_args!("{error}"),
+        ),
+    }
+    let mut authoritative = authoritative_result?;
+    let mut commit_state = state.clone();
+    let mut admission_attempt = 0usize;
+    let (prepared, lifecycle_change_id, admitted) = loop {
+        require_current_term_join_admission_authority(&authoritative)?;
+        admission_attempt += 1;
+        let prepare_revision = authoritative.value.revision.0;
+        let prepare_term = authoritative.authority.term;
+        let prepare_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "admission_prepare",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            prepare_revision,
+            prepare_term,
+            "started",
+            format_args!("preparing fenced learner admission"),
+        );
+        let preparation_result = prepare_authoritative_cluster_join_admission(
+            state.clone(),
+            authoritative.value,
+            request.clone(),
+            prepare_term,
+            now,
+        );
+        match &preparation_result {
+            Ok(AuthoritativeClusterJoinAdmissionPreparation::Rejected(response)) => {
+                join_registration_authority_phase_trace(
+                    "admission_prepare",
+                    &request.invite.invite_id,
+                    requested_learner_node_id,
+                    admission_attempt,
+                    prepare_started.elapsed(),
+                    prepare_revision,
+                    prepare_term,
+                    "rejected",
+                    format_args!("{}", response.detail),
+                );
+            }
+            Ok(AuthoritativeClusterJoinAdmissionPreparation::Commit { .. }) => {
+                join_registration_authority_phase_trace(
+                    "admission_prepare",
+                    &request.invite.invite_id,
+                    requested_learner_node_id,
+                    admission_attempt,
+                    prepare_started.elapsed(),
+                    prepare_revision,
+                    prepare_term,
+                    "prepared",
+                    format_args!("fenced learner admission prepared"),
+                );
+            }
+            Err(error) => join_registration_authority_phase_trace(
+                "admission_prepare",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                prepare_started.elapsed(),
+                prepare_revision,
+                prepare_term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        let preparation = preparation_result?;
+        let (prepared, txn, lifecycle_change_id) = match preparation {
+            AuthoritativeClusterJoinAdmissionPreparation::Rejected(response) => {
+                return Ok(response);
+            }
+            AuthoritativeClusterJoinAdmissionPreparation::Commit {
+                prepared,
+                txn,
+                lifecycle_change_id,
+            } => (prepared, txn, lifecycle_change_id),
+        };
+        let commit_request = KvTxnRequest::generated(txn);
+        let commit_request_id = commit_request.request_id.clone();
+        let commit_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "quorum_commit",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            prepare_revision,
+            prepare_term,
+            "started",
+            format_args!(
+                "committing fenced learner admission through quorum request_id={commit_request_id}"
+            ),
+        );
+        let admitted_result =
+            host.commit_join_registration_txn(paths, &mut commit_state, commit_request);
+        match &admitted_result {
+            Ok(admitted) => {
+                let outcome = if admitted
+                    .txn_response
+                    .as_ref()
+                    .is_some_and(|response| response.succeeded)
+                {
+                    "committed"
+                } else {
+                    "compare_raced"
+                };
+                join_registration_authority_phase_trace(
+                    "quorum_commit",
+                    &request.invite.invite_id,
+                    requested_learner_node_id,
+                    admission_attempt,
+                    commit_started.elapsed(),
+                    admitted.snapshot.revision.0,
+                    admitted.authority.term,
+                    outcome,
+                    format_args!("quorum commit attempt completed request_id={commit_request_id}"),
+                );
+            }
+            Err(error) => join_registration_authority_phase_trace(
+                "quorum_commit",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                commit_started.elapsed(),
+                prepare_revision,
+                prepare_term,
+                "error",
+                format_args!("request_id={commit_request_id}: {error}"),
+            ),
+        }
+        let admitted = admitted_result?;
+        if admitted
+            .txn_response
+            .as_ref()
+            .is_some_and(|response| response.succeeded)
+        {
+            break (prepared, lifecycle_change_id, admitted);
+        }
+        // The failed quorum commit already carries the authoritative snapshot
+        // that defeated our compare. Re-prepare from it immediately so a
+        // legitimate concurrent member refresh or another join does not turn
+        // a still-valid invitation into a terminal rejection.
+        // Security-sensitive invite, issuer, membership, and config checks all
+        // run again against that newer snapshot.
+        authoritative = KvAuthoritativeRead {
+            value: admitted.snapshot,
+            authority: admitted.authority,
+        };
+        if admission_attempt >= CLUSTER_JOIN_ADMISSION_MAX_ATTEMPTS {
             return Ok(ClusterJoinRegistrationResponse {
                 accepted: false,
                 detail: "cluster invitation or membership changed during join admission"
@@ -574,16 +1438,181 @@ pub fn handle_cluster_join_registration_request_with_host(
                 responder_node_id: None,
             });
         }
+        let retry_backoff = cluster_join_admission_retry_backoff(admission_attempt);
+        join_registration_trace(format_args!(
+            "atomic join admission compare raced with another cluster mutation; retrying after {retry_backoff:?}"
+        ));
+        std::thread::sleep(retry_backoff);
     };
-    let mut snapshot = seeded.snapshot;
-    for learner_node_id in &prepared.learner_node_ids {
-        snapshot =
-            host.admit_cluster_raft_learner(paths, &mut commit_state, learner_node_id, now)?;
+    let learner_node_id = prepared
+        .learner_node_ids
+        .first()
+        .expect("validated join admission has one learner")
+        .clone();
+    let lifecycle_started = Instant::now();
+    let admitted = finish_cluster_join_learner_admission_with_host(
+        paths,
+        &mut commit_state,
+        admitted,
+        lifecycle_change_id.as_ref(),
+        &learner_node_id,
+        now,
+        host,
+    )?;
+    join_registration_trace(format_args!(
+        "join learner lifecycle completion node={learner_node_id} change={lifecycle_change_id:?} completed in {:?}",
+        lifecycle_started.elapsed()
+    ));
+    let snapshot = admitted.snapshot;
+    let response_revision = snapshot.revision.0;
+    let response_term = admitted.authority.term;
+    let projection_started = Instant::now();
+    join_registration_authority_phase_trace(
+        "response_projection",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        admission_attempt,
+        Duration::ZERO,
+        response_revision,
+        response_term,
+        "started",
+        format_args!("projecting accepted response from committed snapshot"),
+    );
+    let response_state_result =
+        cluster_join_response_state_from_snapshot(prepared.state, &snapshot, now);
+    match &response_state_result {
+        Ok(response_state) => join_registration_authority_phase_trace(
+            "response_projection",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            projection_started.elapsed(),
+            response_state.kv_revision,
+            response_state.term,
+            "projected",
+            format_args!("accepted response projection completed"),
+        ),
+        Err(error) => join_registration_authority_phase_trace(
+            "response_projection",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            projection_started.elapsed(),
+            response_revision,
+            response_term,
+            "error",
+            format_args!("{error}"),
+        ),
     }
-    let response_state = cluster_join_response_state_from_snapshot(prepared.state, &snapshot, now)?;
-    write_cluster_state(paths, &response_state)?;
+    let response_state = response_state_result?;
+    let persistence_started = Instant::now();
+    join_registration_authority_phase_trace(
+        "local_persistence",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        admission_attempt,
+        Duration::ZERO,
+        response_state.kv_revision,
+        response_state.term,
+        "started",
+        format_args!("persisting accepted response projection locally"),
+    );
+    let persistence_result = persist_accepted_cluster_join_state(paths, response_state.clone());
+    match &persistence_result {
+        Ok(crate::local_state_store::AcceptedClusterJoinStatePersistence::Applied {
+            persisted_revision,
+            ..
+        }) => join_registration_authority_phase_trace(
+            "local_persistence",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            persistence_started.elapsed(),
+            *persisted_revision,
+            response_state.term,
+            "applied",
+            format_args!("accepted response projection persisted locally"),
+        ),
+        Ok(crate::local_state_store::AcceptedClusterJoinStatePersistence::Superseded {
+            persisted_revision,
+            persisted_term,
+            ..
+        }) => join_registration_authority_phase_trace(
+            "local_persistence",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            persistence_started.elapsed(),
+            *persisted_revision,
+            *persisted_term,
+            "superseded",
+            format_args!("a newer accepted response projection was already persisted"),
+        ),
+        Err(error) => join_registration_authority_phase_trace(
+            "local_persistence",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            persistence_started.elapsed(),
+            response_state.kv_revision,
+            response_state.term,
+            "error",
+            format_args!("{error}"),
+        ),
+    }
+    persistence_result?;
     if join_registration_should_remember_successful_targets(&response_state, &request.invite) {
-        host.remember_successful_join_targets(paths, &response_state, &request.members)?;
+        let handoff_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "successful_target_handoff",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            response_state.kv_revision,
+            response_state.term,
+            "started",
+            format_args!("handing successful targets to connectivity tracking"),
+        );
+        let handoff_result =
+            host.remember_successful_join_targets(paths, &response_state, &request.members);
+        match &handoff_result {
+            Ok(()) => join_registration_authority_phase_trace(
+                "successful_target_handoff",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                handoff_started.elapsed(),
+                response_state.kv_revision,
+                response_state.term,
+                "completed",
+                format_args!("successful targets handed to connectivity tracking"),
+            ),
+            Err(error) => join_registration_authority_phase_trace(
+                "successful_target_handoff",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                handoff_started.elapsed(),
+                response_state.kv_revision,
+                response_state.term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        handoff_result?;
+    } else {
+        join_registration_authority_phase_trace(
+            "successful_target_handoff",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            response_state.kv_revision,
+            response_state.term,
+            "skipped",
+            format_args!("accepted invite did not require a successful-target handoff"),
+        );
     }
     Ok(ClusterJoinRegistrationResponse {
         accepted: true,
@@ -654,6 +1683,8 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
                 runtime,
                 paths,
                 &state,
+                &request.invite.invite_id,
+                requested_join_learner_node_id(&request),
                 &request.members,
                 &response,
                 host,
@@ -668,42 +1699,251 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         return Ok(response);
     }
 
-    let mut authority_state = state.clone();
-    let authoritative = host
-        .authoritative_cluster_kv_snapshot_async(paths, &mut authority_state)
-        .await?;
-    let prepare_state = state;
-    let prepare_snapshot = authoritative.value;
-    let prepare_request = request.clone();
-    let prepared = runtime
-        .spawn_blocking(move || {
-            prepare_authoritative_cluster_join_registration(
-                prepare_state,
-                &prepare_snapshot,
-                prepare_request,
-                now,
-            )
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster join registration prepare".to_string(),
-            detail: format!("join registration prepare task failed: {source}"),
-        })??;
-    let prepared = match prepared {
-        AuthoritativeClusterJoinPreparation::Rejected(response) => return Ok(response),
-        AuthoritativeClusterJoinPreparation::Commit(prepared) => prepared,
+    let requested_learner_node_id = requested_join_learner_node_id(&request);
+    let admission_coordinator = async_cluster_join_admission_coordinator(paths);
+    let observed_admission_generation = admission_coordinator.generation();
+    let admission_wait_started = Instant::now();
+    join_registration_authority_phase_trace(
+        "admission_coordinator",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        0,
+        Duration::ZERO,
+        state.kv_revision,
+        state.term,
+        "started",
+        format_args!("waiting for authority-local join admission turn"),
+    );
+    let admission_turn = admission_coordinator.turn.lock().await;
+    let coalesced_authoritative = admission_coordinator
+        .authoritative_completed_after(observed_admission_generation)
+        .filter(|authoritative| authoritative.authority.term >= state.term);
+    let (coordinator_revision, coordinator_term, coordinator_outcome) =
+        match coalesced_authoritative.as_ref() {
+            Some(authoritative) => (
+                authoritative.value.revision.0,
+                authoritative.authority.term,
+                "coalesced",
+            ),
+            None => (state.kv_revision, state.term, "acquired"),
+        };
+    join_registration_authority_phase_trace(
+        "admission_coordinator",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        0,
+        admission_wait_started.elapsed(),
+        coordinator_revision,
+        coordinator_term,
+        coordinator_outcome,
+        format_args!(
+            "authority-local join admission turn acquired at generation {}",
+            admission_coordinator.generation()
+        ),
+    );
+
+    let mut authoritative = if let Some(authoritative) = coalesced_authoritative {
+        authoritative
+    } else {
+        let authority_open_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "authority_snapshot_open",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            0,
+            Duration::ZERO,
+            state.kv_revision,
+            state.term,
+            "started",
+            format_args!("opening authoritative cluster KV snapshot"),
+        );
+        let mut authority_state = state.clone();
+        let authoritative_result = host
+            .authoritative_cluster_kv_snapshot_async(paths, &mut authority_state)
+            .await;
+        match &authoritative_result {
+            Ok(authoritative) => join_registration_authority_phase_trace(
+                "authority_snapshot_open",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                0,
+                authority_open_started.elapsed(),
+                authoritative.value.revision.0,
+                authoritative.authority.term,
+                "opened",
+                format_args!("authoritative cluster KV snapshot opened"),
+            ),
+            Err(error) => join_registration_authority_phase_trace(
+                "authority_snapshot_open",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                0,
+                authority_open_started.elapsed(),
+                state.kv_revision,
+                state.term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        authoritative_result?
     };
-    let mut commit_state = prepared.state.clone();
-    let seeded = host
-        .commit_join_registration_txn_async(
-            paths,
-            &mut commit_state,
-            KvTxnRequest::generated(prepared.seed_txn),
-        )
-        .await?;
-    let seeded = match require_cluster_kv_txn_succeeded(seeded, "seeding join members") {
-        Ok(seeded) => seeded,
-        Err(_) => {
+    let mut commit_state = state.clone();
+    let mut admission_attempt = 0usize;
+    let (prepared, lifecycle_change_id, admitted) = loop {
+        require_current_term_join_admission_authority(&authoritative)?;
+        admission_attempt += 1;
+        let prepare_state = state.clone();
+        let prepare_revision = authoritative.value.revision.0;
+        let prepare_snapshot = authoritative.value;
+        let prepare_term = authoritative.authority.term;
+        let prepare_request = request.clone();
+        let prepare_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "admission_prepare",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            prepare_revision,
+            prepare_term,
+            "started",
+            format_args!("preparing fenced learner admission"),
+        );
+        let preparation_result = match runtime
+            .spawn_blocking(move || {
+                prepare_authoritative_cluster_join_admission(
+                    prepare_state,
+                    prepare_snapshot,
+                    prepare_request,
+                    prepare_term,
+                    now,
+                )
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(source) => Err(NetworkError::Io {
+                operation: "cluster join registration prepare".to_string(),
+                detail: format!("join registration prepare task failed: {source}"),
+            }),
+        };
+        match &preparation_result {
+            Ok(AuthoritativeClusterJoinAdmissionPreparation::Rejected(response)) => {
+                join_registration_authority_phase_trace(
+                    "admission_prepare",
+                    &request.invite.invite_id,
+                    requested_learner_node_id,
+                    admission_attempt,
+                    prepare_started.elapsed(),
+                    prepare_revision,
+                    prepare_term,
+                    "rejected",
+                    format_args!("{}", response.detail),
+                );
+            }
+            Ok(AuthoritativeClusterJoinAdmissionPreparation::Commit { .. }) => {
+                join_registration_authority_phase_trace(
+                    "admission_prepare",
+                    &request.invite.invite_id,
+                    requested_learner_node_id,
+                    admission_attempt,
+                    prepare_started.elapsed(),
+                    prepare_revision,
+                    prepare_term,
+                    "prepared",
+                    format_args!("fenced learner admission prepared"),
+                );
+            }
+            Err(error) => join_registration_authority_phase_trace(
+                "admission_prepare",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                prepare_started.elapsed(),
+                prepare_revision,
+                prepare_term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        let preparation = preparation_result?;
+        let (prepared, txn, lifecycle_change_id) = match preparation {
+            AuthoritativeClusterJoinAdmissionPreparation::Rejected(response) => {
+                return Ok(response);
+            }
+            AuthoritativeClusterJoinAdmissionPreparation::Commit {
+                prepared,
+                txn,
+                lifecycle_change_id,
+            } => (prepared, txn, lifecycle_change_id),
+        };
+        let commit_request = KvTxnRequest::generated(txn);
+        let commit_request_id = commit_request.request_id.clone();
+        let commit_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "quorum_commit",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            prepare_revision,
+            prepare_term,
+            "started",
+            format_args!(
+                "committing fenced learner admission through quorum request_id={commit_request_id}"
+            ),
+        );
+        let admitted_result = host
+            .commit_join_registration_txn_async(paths, &mut commit_state, commit_request)
+            .await;
+        match &admitted_result {
+            Ok(admitted) => {
+                let outcome = if admitted
+                    .txn_response
+                    .as_ref()
+                    .is_some_and(|response| response.succeeded)
+                {
+                    "committed"
+                } else {
+                    "compare_raced"
+                };
+                join_registration_authority_phase_trace(
+                    "quorum_commit",
+                    &request.invite.invite_id,
+                    requested_learner_node_id,
+                    admission_attempt,
+                    commit_started.elapsed(),
+                    admitted.snapshot.revision.0,
+                    admitted.authority.term,
+                    outcome,
+                    format_args!("quorum commit attempt completed request_id={commit_request_id}"),
+                );
+            }
+            Err(error) => join_registration_authority_phase_trace(
+                "quorum_commit",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                commit_started.elapsed(),
+                prepare_revision,
+                prepare_term,
+                "error",
+                format_args!("request_id={commit_request_id}: {error}"),
+            ),
+        }
+        let admitted = admitted_result?;
+        if admitted
+            .txn_response
+            .as_ref()
+            .is_some_and(|response| response.succeeded)
+        {
+            break (prepared, lifecycle_change_id, admitted);
+        }
+        authoritative = KvAuthoritativeRead {
+            value: admitted.snapshot,
+            authority: admitted.authority,
+        };
+        if admission_attempt >= CLUSTER_JOIN_ADMISSION_MAX_ATTEMPTS {
             return Ok(ClusterJoinRegistrationResponse {
                 accepted: false,
                 detail: "cluster invitation or membership changed during join admission"
@@ -713,36 +1953,212 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
                 responder_node_id: None,
             });
         }
+        let retry_backoff = cluster_join_admission_retry_backoff(admission_attempt);
+        join_registration_trace(format_args!(
+            "async atomic join admission compare raced with another cluster mutation; retrying after {retry_backoff:?}"
+        ));
+        tokio::time::sleep(retry_backoff).await;
     };
-    let mut snapshot = seeded.snapshot;
-    for learner_node_id in &prepared.learner_node_ids {
-        snapshot = host
-            .admit_cluster_raft_learner_async(paths, &mut commit_state, learner_node_id, now)
-            .await?;
-    }
+    let learner_node_id = prepared
+        .learner_node_ids
+        .first()
+        .expect("validated join admission has one learner")
+        .clone();
+    let lifecycle_started = Instant::now();
+    let admitted = finish_cluster_join_learner_admission_async_with_host(
+        runtime,
+        paths,
+        &mut commit_state,
+        admitted,
+        lifecycle_change_id.as_ref(),
+        &learner_node_id,
+        now,
+        host,
+    )
+    .await?;
+    join_registration_trace(format_args!(
+        "async join learner lifecycle completion node={learner_node_id} change={lifecycle_change_id:?} completed in {:?}",
+        lifecycle_started.elapsed()
+    ));
+    admission_coordinator.publish(KvAuthoritativeRead {
+        value: admitted.snapshot.clone(),
+        authority: admitted.authority,
+    });
+    drop(admission_turn);
+    let snapshot = admitted.snapshot;
+    let response_revision = snapshot.revision.0;
+    let response_term = admitted.authority.term;
     let response_state_input = prepared.state;
     let response_snapshot = snapshot.clone();
-    let response_state = runtime
+    let projection_started = Instant::now();
+    join_registration_authority_phase_trace(
+        "response_projection",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        admission_attempt,
+        Duration::ZERO,
+        response_revision,
+        response_term,
+        "started",
+        format_args!("projecting accepted response from committed snapshot"),
+    );
+    let response_state_result = match runtime
         .spawn_blocking(move || {
             cluster_join_response_state_from_snapshot(response_state_input, &response_snapshot, now)
         })
         .await
-        .map_err(|source| NetworkError::Io {
+    {
+        Ok(result) => result,
+        Err(source) => Err(NetworkError::Io {
             operation: "cluster join registration response projection".to_string(),
             detail: format!("join response projection task failed: {source}"),
-        })??;
+        }),
+    };
+    match &response_state_result {
+        Ok(response_state) => join_registration_authority_phase_trace(
+            "response_projection",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            projection_started.elapsed(),
+            response_state.kv_revision,
+            response_state.term,
+            "projected",
+            format_args!("accepted response projection completed"),
+        ),
+        Err(error) => join_registration_authority_phase_trace(
+            "response_projection",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            projection_started.elapsed(),
+            response_revision,
+            response_term,
+            "error",
+            format_args!("{error}"),
+        ),
+    }
+    let response_state = response_state_result?;
     let write_paths = paths.clone();
     let write_state = response_state.clone();
-    runtime
-        .spawn_blocking(move || write_cluster_state(&write_paths, &write_state))
+    let persistence_started = Instant::now();
+    join_registration_authority_phase_trace(
+        "local_persistence",
+        &request.invite.invite_id,
+        requested_learner_node_id,
+        admission_attempt,
+        Duration::ZERO,
+        response_state.kv_revision,
+        response_state.term,
+        "started",
+        format_args!("persisting accepted response projection locally"),
+    );
+    let persistence_result = match runtime
+        .spawn_blocking(move || persist_accepted_cluster_join_state(&write_paths, write_state))
         .await
-        .map_err(|source| NetworkError::Io {
+    {
+        Ok(result) => result,
+        Err(source) => Err(NetworkError::Io {
             operation: "write cluster state".to_string(),
             detail: format!("cluster state write task failed: {source}"),
-        })??;
+        }),
+    };
+    match &persistence_result {
+        Ok(crate::local_state_store::AcceptedClusterJoinStatePersistence::Applied {
+            persisted_revision,
+            ..
+        }) => join_registration_authority_phase_trace(
+            "local_persistence",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            persistence_started.elapsed(),
+            *persisted_revision,
+            response_state.term,
+            "applied",
+            format_args!("accepted response projection persisted locally"),
+        ),
+        Ok(crate::local_state_store::AcceptedClusterJoinStatePersistence::Superseded {
+            persisted_revision,
+            persisted_term,
+            ..
+        }) => join_registration_authority_phase_trace(
+            "local_persistence",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            persistence_started.elapsed(),
+            *persisted_revision,
+            *persisted_term,
+            "superseded",
+            format_args!("a newer accepted response projection was already persisted"),
+        ),
+        Err(error) => join_registration_authority_phase_trace(
+            "local_persistence",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            persistence_started.elapsed(),
+            response_state.kv_revision,
+            response_state.term,
+            "error",
+            format_args!("{error}"),
+        ),
+    }
+    persistence_result?;
     if join_registration_should_remember_successful_targets(&response_state, &request.invite) {
-        host.remember_successful_join_targets_async(paths, &response_state, &request.members)
-            .await?;
+        let handoff_started = Instant::now();
+        join_registration_authority_phase_trace(
+            "successful_target_handoff",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            response_state.kv_revision,
+            response_state.term,
+            "started",
+            format_args!("handing successful targets to connectivity tracking"),
+        );
+        let handoff_result = host
+            .remember_successful_join_targets_async(paths, &response_state, &request.members)
+            .await;
+        match &handoff_result {
+            Ok(()) => join_registration_authority_phase_trace(
+                "successful_target_handoff",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                handoff_started.elapsed(),
+                response_state.kv_revision,
+                response_state.term,
+                "completed",
+                format_args!("successful targets handed to connectivity tracking"),
+            ),
+            Err(error) => join_registration_authority_phase_trace(
+                "successful_target_handoff",
+                &request.invite.invite_id,
+                requested_learner_node_id,
+                admission_attempt,
+                handoff_started.elapsed(),
+                response_state.kv_revision,
+                response_state.term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        handoff_result?;
+    } else {
+        join_registration_authority_phase_trace(
+            "successful_target_handoff",
+            &request.invite.invite_id,
+            requested_learner_node_id,
+            admission_attempt,
+            Duration::ZERO,
+            response_state.kv_revision,
+            response_state.term,
+            "skipped",
+            format_args!("accepted invite did not require a successful-target handoff"),
+        );
     }
     Ok(ClusterJoinRegistrationResponse {
         accepted: true,
@@ -822,9 +2238,7 @@ pub fn record_forwarded_join_registration_acceptance_with_host(
     if let Some(snapshot) = response.kv_snapshot.as_ref() {
         write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)?;
     }
-    let mut local_state = read_cluster_state_without_kv(paths)?;
-    merge_cluster_join_registration(&mut local_state, response.state.clone());
-    write_cluster_state(paths, &local_state)?;
+    persist_accepted_cluster_join_state(paths, response.state.clone())?;
     host.remember_successful_join_targets(paths, state, request_members)
 }
 
@@ -832,6 +2246,8 @@ pub async fn record_forwarded_join_registration_acceptance_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
+    invite_id: &ClusterInviteId,
+    requested_learner_node_id: Option<&NodeId>,
     request_members: &[ClusterMemberRecord],
     response: &ClusterJoinRegistrationResponse,
     host: &mut (impl ClusterJoinRegistrationAsyncHost + Send),
@@ -839,25 +2255,177 @@ pub async fn record_forwarded_join_registration_acceptance_async_with_host(
     if !response.accepted {
         return Ok(());
     }
+    let trace = ForwardedJoinAcceptanceTrace::new(invite_id, requested_learner_node_id);
     let paths_for_state = paths.clone();
     let response_state = response.state.clone();
     let snapshot = response.kv_snapshot.clone();
-    runtime
+    let revision = response.state.kv_revision;
+    let term = response.state.term;
+    let state_worker_started = trace.as_ref().map(|trace| {
+        trace.start(
+            "forwarded_acceptance_state_worker",
+            revision,
+            term,
+            format_args!("scheduling forwarded acceptance state persistence"),
+        )
+    });
+    let trace_for_state = trace.clone();
+    let state_result = match runtime
         .spawn_blocking(move || {
             if let Some(snapshot) = snapshot.as_ref() {
-                write_imported_cluster_kv_snapshot_if_changed(&paths_for_state, snapshot)?;
+                let started = trace_for_state.as_ref().map(|trace| {
+                    trace.start(
+                        "forwarded_imported_snapshot",
+                        revision,
+                        term,
+                        format_args!("importing the authority response snapshot"),
+                    )
+                });
+                let result =
+                    write_imported_cluster_kv_snapshot_if_changed(&paths_for_state, snapshot);
+                if let (Some(trace), Some(started)) = (trace_for_state.as_ref(), started) {
+                    match &result {
+                        Ok(wrote) => trace.phase(
+                            "forwarded_imported_snapshot",
+                            started.elapsed(),
+                            revision,
+                            term,
+                            if *wrote { "written" } else { "unchanged" },
+                            format_args!("authority response snapshot import completed"),
+                        ),
+                        Err(error) => trace.phase(
+                            "forwarded_imported_snapshot",
+                            started.elapsed(),
+                            revision,
+                            term,
+                            "error",
+                            format_args!("{error}"),
+                        ),
+                    }
+                }
+                result?;
+            } else if let Some(trace) = trace_for_state.as_ref() {
+                trace.phase(
+                    "forwarded_imported_snapshot",
+                    Duration::ZERO,
+                    revision,
+                    term,
+                    "skipped",
+                    format_args!("authority response did not include a KV snapshot"),
+                );
             }
-            let mut local_state = read_cluster_state_without_kv(&paths_for_state)?;
-            merge_cluster_join_registration(&mut local_state, response_state);
-            write_cluster_state(&paths_for_state, &local_state)
+            let started = trace_for_state.as_ref().map(|trace| {
+                trace.start(
+                    "local_accepted_state_persistence",
+                    revision,
+                    term,
+                    format_args!("persisting the forwarded accepted cluster state"),
+                )
+            });
+            let result = persist_accepted_cluster_join_state(&paths_for_state, response_state);
+            if let (Some(trace), Some(started)) = (trace_for_state.as_ref(), started) {
+                match &result {
+                    Ok(
+                        crate::local_state_store::AcceptedClusterJoinStatePersistence::Applied {
+                            persisted_revision,
+                            ..
+                        },
+                    ) => trace.phase(
+                        "local_accepted_state_persistence",
+                        started.elapsed(),
+                        *persisted_revision,
+                        term,
+                        "applied",
+                        format_args!("forwarded accepted state persisted locally"),
+                    ),
+                    Ok(
+                        crate::local_state_store::AcceptedClusterJoinStatePersistence::Superseded {
+                            persisted_revision,
+                            persisted_term,
+                            ..
+                        },
+                    ) => trace.phase(
+                        "local_accepted_state_persistence",
+                        started.elapsed(),
+                        *persisted_revision,
+                        *persisted_term,
+                        "superseded",
+                        format_args!("a newer accepted state was already persisted locally"),
+                    ),
+                    Err(error) => trace.phase(
+                        "local_accepted_state_persistence",
+                        started.elapsed(),
+                        revision,
+                        term,
+                        "error",
+                        format_args!("{error}"),
+                    ),
+                }
+            }
+            result.map(|_| ())
         })
         .await
-        .map_err(|source| NetworkError::Io {
+    {
+        Ok(result) => result,
+        Err(source) => Err(NetworkError::Io {
             operation: "cluster forwarded join acceptance".to_string(),
             detail: format!("forwarded join acceptance task failed: {source}"),
-        })??;
-    host.remember_successful_join_targets_async(paths, state, request_members)
-        .await
+        }),
+    };
+    if let (Some(trace), Some(started)) = (trace.as_ref(), state_worker_started) {
+        match &state_result {
+            Ok(()) => trace.phase(
+                "forwarded_acceptance_state_worker",
+                started.elapsed(),
+                revision,
+                term,
+                "completed",
+                format_args!("forwarded acceptance state persistence completed"),
+            ),
+            Err(error) => trace.phase(
+                "forwarded_acceptance_state_worker",
+                started.elapsed(),
+                revision,
+                term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+    }
+    state_result?;
+
+    let handoff_started = trace.as_ref().map(|trace| {
+        trace.start(
+            "successful_target_handoff",
+            revision,
+            term,
+            format_args!("handing successful join targets to connectivity tracking"),
+        )
+    });
+    let handoff_result = host
+        .remember_successful_join_targets_async(paths, state, request_members)
+        .await;
+    if let (Some(trace), Some(started)) = (trace.as_ref(), handoff_started) {
+        match &handoff_result {
+            Ok(()) => trace.phase(
+                "successful_target_handoff",
+                started.elapsed(),
+                revision,
+                term,
+                "completed",
+                format_args!("successful join targets handed to connectivity tracking"),
+            ),
+            Err(error) => trace.phase(
+                "successful_target_handoff",
+                started.elapsed(),
+                revision,
+                term,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+    }
+    handoff_result
 }
 
 pub fn reconcile_cluster_join_with_introducers_with_host(

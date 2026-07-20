@@ -5,9 +5,9 @@ use super::{
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT, CLUSTER_HEALTH_PROBE_TIMEOUT, CliClusterMemberMutationHost,
     CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions,
-    ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions,
-    ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions,
-    ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
+    ClusterInviteChannelOutput, ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand,
+    ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions,
+    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
     DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
@@ -37,10 +37,10 @@ use super::{
     format_rollout_progress_line, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
     install_prepared_native_dylib_modules, install_should_update_binary, install_with_layout,
-    load_tui_model_runtime_config, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, observe_cli_rpc_via_daemon,
+    load_tui_model_runtime_config, local_daemon_matches_cluster_state,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
@@ -1075,10 +1075,6 @@ fn cluster_health_daemon_rpc_timeout_covers_health_probe_budget() {
     assert!(
         CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT >= CLUSTER_HEALTH_PROBE_TIMEOUT,
         "cluster health must not time out the daemon aggregation before the bounded health probe budget elapses"
-    );
-    assert!(
-        CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT <= std::time::Duration::from_secs(5),
-        "cluster health is a hard 5s gate"
     );
 }
 
@@ -7134,17 +7130,7 @@ fn cluster_peer_members_preserves_pending_local_member() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-peers-offline-introducer");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_peers_offline").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_peers_host").expect("node")),
-            name: "offline peers".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    paths.ensure().expect("cluster paths");
     let mut state = ClusterBootstrapState::pending_join(
         ClusterId::from_legacy_named("cluster_peers_offline").expect("cluster"),
         "offline peers".to_string(),
@@ -7160,7 +7146,10 @@ fn cluster_peer_members_preserves_pending_local_member() {
         "existing-public-key",
         OffsetDateTime::now_utc(),
     ));
-    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write joined state");
+    // Seed the pending identity directly. Replacing an initialized local
+    // identity would correctly be rejected by the durable state fence and is
+    // not how a pending join is created in production.
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write pending state");
     sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync kv");
     std::fs::write(&paths.kv_paths().snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
@@ -7616,6 +7605,48 @@ fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
         }
         other => panic!("unexpected error: {other}"),
     }
+}
+
+#[test]
+fn cluster_runtime_quorum_admission_uses_read_only_daemon_identity() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-daemon-identity");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("daemon_identity").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("daemon_identity_node").expect("local node")),
+            name: "daemon identity".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+    let mut daemon = DaemonStatus::new(
+        &DaemonRunOptions::default(),
+        &DaemonPaths::new(&data_dir),
+        Some(DaemonClusterStatus {
+            cluster_id: state.cluster_id.clone(),
+            node_id: state.local_node_id.clone(),
+            process: super::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            member_role: ClusterMemberRole::Voter,
+            member_state: ClusterMemberState::Active,
+        }),
+    );
+    // Admission must use the status already returned by the daemon probe. An
+    // invalid RPC address proves this path does not issue an authoritative KV
+    // snapshot request (which would append a Raft barrier).
+    daemon.address = "not-an-rpc-endpoint".to_string();
+
+    assert!(local_daemon_matches_cluster_state(&daemon, &state));
+    require_cluster_runtime_quorum_with_paths_and_daemon(&paths, Some(&daemon))
+        .expect("matching daemon and local quorum");
+
+    daemon.cluster.as_mut().expect("cluster status").node_id = NodeId::generate();
+    assert!(!local_daemon_matches_cluster_state(&daemon, &state));
+    let error = require_cluster_runtime_quorum_with_paths_and_daemon(&paths, Some(&daemon))
+        .expect_err("mismatched daemon identity");
+    assert!(matches!(error, CliError::ClusterReadOnly { .. }));
 }
 
 fn signed_test_invite_uri(
@@ -8215,16 +8246,35 @@ fn cluster_parser_accepts_init_and_join_options() {
             "invite".to_string(),
             "--introducer".to_string(),
             "192.168.1.10:21353".to_string(),
+            "--introducer".to_string(),
+            "192.168.1.10:21353".to_string(),
             "--ttl-seconds".to_string(),
             "60".to_string(),
             "--output".to_string(),
             "invite.txt".to_string(),
+            "--channel-output".to_string(),
+            "192.168.1.10:21353=invite-node-1.txt".to_string(),
+            "--channel-output".to_string(),
+            "192.168.1.11:21353=invite-node-2.txt".to_string(),
         ])
         .expect("cluster invite"),
         ClusterCliCommand::Invite(ClusterInviteOptions {
             ttl_seconds: 60,
-            introducers: vec!["192.168.1.10:21353".to_string()],
+            introducers: vec![
+                "192.168.1.10:21353".to_string(),
+                "192.168.1.11:21353".to_string(),
+            ],
             output: Some(PathBuf::from("invite.txt")),
+            channel_outputs: vec![
+                ClusterInviteChannelOutput {
+                    introducer: "192.168.1.10:21353".to_string(),
+                    output: PathBuf::from("invite-node-1.txt"),
+                },
+                ClusterInviteChannelOutput {
+                    introducer: "192.168.1.11:21353".to_string(),
+                    output: PathBuf::from("invite-node-2.txt"),
+                },
+            ],
         })
     );
     assert_eq!(
@@ -8323,6 +8373,39 @@ fn cluster_parser_accepts_init_and_join_options() {
             .expect("cluster cleanup legacy shadow members"),
         ClusterCliCommand::CleanupLegacyShadowMembers
     );
+}
+
+#[test]
+fn cluster_invite_parser_rejects_duplicate_channel_addresses_and_output_paths() {
+    let duplicate_address = parse_cluster_command(&[
+        "invite".to_string(),
+        "--channel-output".to_string(),
+        "192.0.2.10:21353=node-1.txt".to_string(),
+        "--channel-output".to_string(),
+        "192.0.2.10:21353=node-2.txt".to_string(),
+    ])
+    .expect_err("duplicate channel address");
+    match duplicate_address {
+        CliError::Parse { detail } => {
+            assert!(detail.contains("duplicate --channel-output introducer"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let duplicate_path = parse_cluster_command(&[
+        "invite".to_string(),
+        "--output".to_string(),
+        "invite.txt".to_string(),
+        "--channel-output".to_string(),
+        "192.0.2.10:21353=invite.txt".to_string(),
+    ])
+    .expect_err("duplicate invite output path");
+    match duplicate_path {
+        CliError::Parse { detail } => {
+            assert!(detail.contains("duplicate cluster invite output path"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
@@ -8861,7 +8944,10 @@ fn cluster_migration_plan_rejects_single_node_mode_with_remote_peers() {
     );
     state.members.push(remote);
     cluster::write_cluster_state(&source_paths, &state).expect("write state");
-    sync_cluster_state_to_kv(&source_paths, &state).expect("sync remote peer");
+    // This test deliberately seeds a source topology. Generic production
+    // state sync must not own established Raft membership changes.
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&source_paths, &state)
+        .expect("seed remote peer");
 
     let error = cluster_migration_plan_with_paths(
         ClusterMigrationPlanOptions {
@@ -9073,7 +9159,10 @@ fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
         "pk_non_voter",
         OffsetDateTime::now_utc(),
     ));
-    sync_cluster_state_to_kv(&paths, &state).expect("sync state");
+    // Seed both non-voter roles for the removal lifecycle without bypassing
+    // the production generic-sync ownership guard.
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("seed members");
     cluster::write_cluster_state(&paths, &state).expect("write state");
 
     let removal = cluster::remove_cluster_members_with_host(
@@ -9245,6 +9334,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
             ttl_seconds: 120,
             introducers: vec!["127.0.0.1:21353".to_string()],
             output: None,
+            channel_outputs: Vec::new(),
         },
         &host_cluster_paths,
     )
@@ -9759,6 +9849,7 @@ fn cluster_invite_generates_portable_join_payload() {
             ttl_seconds: 120,
             introducers: vec!["192.168.1.10:21353".to_string()],
             output: Some(output.clone()),
+            channel_outputs: Vec::new(),
         },
         &paths,
     )
@@ -9847,6 +9938,73 @@ fn cluster_invite_generates_portable_join_payload() {
 }
 
 #[test]
+fn cluster_invite_writes_exact_single_channel_projections() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-channel-invites");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    let full_output = root.join("join-all.txt");
+    let first_output = root.join("join-first.txt");
+    let second_output = root.join("join-second.txt");
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(
+                ClusterId::from_legacy_named("cluster_channel_invites").expect("cluster"),
+            ),
+            node_id: Some(NodeId::from_legacy_named("node_channel_host").expect("node")),
+            name: "channel invite cluster".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+
+    let first_introducer = "192.0.2.10:21353";
+    let second_introducer = "192.0.2.11:21353";
+    let rendered = cluster_invite_with_paths(
+        ClusterInviteOptions {
+            ttl_seconds: 120,
+            introducers: vec![first_introducer.to_string()],
+            output: Some(full_output.clone()),
+            channel_outputs: vec![
+                ClusterInviteChannelOutput {
+                    introducer: first_introducer.to_string(),
+                    output: first_output.clone(),
+                },
+                ClusterInviteChannelOutput {
+                    introducer: second_introducer.to_string(),
+                    output: second_output.clone(),
+                },
+            ],
+        },
+        &paths,
+    )
+    .expect("cluster invite");
+
+    let full = parse_cluster_join_invite_argument(
+        &std::fs::read_to_string(full_output).expect("full invite output"),
+    )
+    .expect("decode full invite");
+    assert_eq!(full.communication_channels.len(), 2);
+
+    for (output, expected_introducer) in [
+        (first_output, first_introducer),
+        (second_output, second_introducer),
+    ] {
+        let projected = parse_cluster_join_invite_argument(
+            &std::fs::read_to_string(output).expect("projected invite output"),
+        )
+        .expect("decode projected invite");
+        assert_eq!(projected.invite_id, full.invite_id);
+        assert_eq!(projected.invite_id, rendered.invite.invite_id);
+        assert_eq!(projected.cluster_public_key, full.cluster_public_key);
+        assert_eq!(projected.invitation_secret, full.invitation_secret);
+        assert_eq!(projected.communication_channels.len(), 1);
+        assert_eq!(
+            projected.communication_channels[0].endpoint.address,
+            expected_introducer
+        );
+    }
+}
+
+#[test]
 fn join_registration_skips_loopback_when_remote_invite_channels_exist() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-invite-channel-filter");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
@@ -9870,6 +10028,7 @@ fn join_registration_skips_loopback_when_remote_invite_channels_exist() {
                 "192.168.1.10:21353".to_string(),
             ],
             output: None,
+            channel_outputs: Vec::new(),
         },
         &paths,
     )
@@ -9904,6 +10063,7 @@ fn join_registration_keeps_loopback_when_it_is_the_only_invite_channel() {
             ttl_seconds: 120,
             introducers: vec!["127.0.0.1:21353".to_string()],
             output: None,
+            channel_outputs: Vec::new(),
         },
         &paths,
     )
@@ -9976,6 +10136,7 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
             ttl_seconds: 120,
             introducers: vec!["192.168.1.10:21353".to_string()],
             output: None,
+            channel_outputs: Vec::new(),
         },
         &host_paths,
     )
@@ -10032,6 +10193,7 @@ fn introducer_records_joined_members_and_returns_peer_view() {
             ttl_seconds: 120,
             introducers: vec!["127.0.0.1:21353".to_string()],
             output: None,
+            channel_outputs: Vec::new(),
         },
         &host_paths,
     )

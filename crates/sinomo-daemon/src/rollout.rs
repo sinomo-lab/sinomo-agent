@@ -43,7 +43,7 @@ use sinomo_rollout::{
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -67,6 +67,651 @@ const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
 const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 const ROLLOUT_DAEMON_TERMINATE_WAIT: Duration = Duration::from_secs(5);
+const DAEMON_ROLLOUT_TELEMETRY_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const DAEMON_ROLLOUT_TELEMETRY_RETRY_MAX: Duration = Duration::from_secs(30);
+const DAEMON_ROLLOUT_TELEMETRY_INCOMPLETE_TAIL_RETRY: Duration = Duration::from_millis(10);
+const DAEMON_ROLLOUT_TELEMETRY_EVENT_READ_BUFFER_BYTES: usize = 64 * 1024;
+const DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DaemonRolloutTelemetryEventTailOutcome {
+    relevant_event_observed: bool,
+    incomplete_record: bool,
+}
+
+#[derive(Debug)]
+struct DaemonRolloutTelemetryEventLogTailer {
+    path: PathBuf,
+    offset: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonRolloutTelemetrySourcePaths {
+    event_log: PathBuf,
+    runtime_state: PathBuf,
+    gate_config: PathBuf,
+}
+
+fn daemon_rollout_telemetry_source_watcher(
+    source_paths: &DaemonRolloutTelemetrySourcePaths,
+    runtime_source_tx: tokio::sync::watch::Sender<u64>,
+    gate_source_tx: tokio::sync::watch::Sender<u64>,
+    event_file_source_tx: tokio::sync::watch::Sender<u64>,
+    watcher_fault_tx: tokio::sync::watch::Sender<u64>,
+) -> Result<notify::RecommendedWatcher, DaemonError> {
+    let callback_runtime_path = source_paths.runtime_state.clone();
+    let callback_gate_path = source_paths.gate_config.clone();
+    let callback_event_path = source_paths.event_log.clone();
+    let watcher_error_path = source_paths.event_log.clone();
+    let mut source_watcher =
+        notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
+            match result {
+                Ok(event) => {
+                    let paths = event.paths;
+                    if paths.iter().any(|path| path == &callback_runtime_path) {
+                        runtime_source_tx.send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    }
+                    if paths.iter().any(|path| path == &callback_gate_path) {
+                        gate_source_tx.send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    }
+                    if paths.iter().any(|path| path == &callback_event_path) {
+                        event_file_source_tx.send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "sinomo.rollout.telemetry",
+                        path = %watcher_error_path.display(),
+                        "rollout telemetry source watcher failed: {error}"
+                    );
+                    // A backend watcher error means the current observation
+                    // boundary can no longer be trusted. The reactor owns the
+                    // fault as a generation so it can rebuild the watcher and
+                    // reconcile every durable source after the new watches are
+                    // installed.
+                    watcher_fault_tx.send_modify(|generation| {
+                        *generation = generation.saturating_add(1);
+                    });
+                }
+            }
+        })
+        .map_err(|source| DaemonError::Io {
+            path: source_paths.event_log.display().to_string(),
+            detail: format!("create rollout telemetry source watcher: {source}"),
+        })?;
+    let mut watched_directories = BTreeSet::new();
+    for directory in [
+        source_paths.event_log.parent(),
+        source_paths.runtime_state.parent(),
+        source_paths.gate_config.parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if watched_directories.insert(directory.to_path_buf()) {
+            notify::Watcher::watch(
+                &mut source_watcher,
+                directory,
+                notify::RecursiveMode::NonRecursive,
+            )
+            .map_err(|source| DaemonError::Io {
+                path: directory.display().to_string(),
+                detail: format!("watch rollout telemetry source directory: {source}"),
+            })?;
+        }
+    }
+    Ok(source_watcher)
+}
+
+impl DaemonRolloutTelemetryEventLogTailer {
+    fn at_end(path: PathBuf) -> Result<Self, DaemonError> {
+        let offset = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+            Err(source) => {
+                return Err(DaemonError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
+        Ok(Self { path, offset })
+    }
+
+    fn catch_up(&mut self) -> Result<DaemonRolloutTelemetryEventTailOutcome, DaemonError> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.offset = 0;
+                return Ok(DaemonRolloutTelemetryEventTailOutcome::default());
+            }
+            Err(source) => {
+                return Err(DaemonError::Io {
+                    path: self.path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
+        let len = file
+            .metadata()
+            .map_err(|source| DaemonError::Io {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?
+            .len();
+        if len < self.offset {
+            self.offset = 0;
+        }
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|source| DaemonError::Io {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        let mut buffer = [0_u8; DAEMON_ROLLOUT_TELEMETRY_EVENT_READ_BUFFER_BYTES];
+        let mut line = Vec::new();
+        let mut committed_bytes = 0_u64;
+        let mut pending_record_bytes = 0_u64;
+        let mut relevant_event_observed = false;
+        loop {
+            let read = file.read(&mut buffer).map_err(|source| DaemonError::Io {
+                path: self.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if read == 0 {
+                break;
+            }
+            let mut cursor = 0_usize;
+            while cursor < read {
+                let remaining = &buffer[cursor..read];
+                let relative_newline = remaining.iter().position(|byte| *byte == b'\n');
+                let segment_len = relative_newline.unwrap_or(remaining.len());
+                if line.len().saturating_add(segment_len)
+                    > DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES
+                {
+                    return Err(DaemonError::Parse {
+                        detail: format!(
+                            "committed rollout telemetry event at {}+{} exceeds {} bytes",
+                            self.path.display(),
+                            self.offset.saturating_add(committed_bytes),
+                            DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES
+                        ),
+                    });
+                }
+                line.extend_from_slice(&remaining[..segment_len]);
+                pending_record_bytes = pending_record_bytes
+                    .saturating_add(u64::try_from(segment_len).unwrap_or(u64::MAX));
+                cursor = cursor.saturating_add(segment_len);
+                let Some(_) = relative_newline else {
+                    continue;
+                };
+
+                cursor = cursor.saturating_add(1);
+                pending_record_bytes = pending_record_bytes.saturating_add(1);
+                let record = line.strip_suffix(b"\r").unwrap_or(&line);
+                if !record.iter().all(u8::is_ascii_whitespace) {
+                    let stored: sinomo_core::events::StoredEvent =
+                        serde_json::from_slice(record).map_err(|source| DaemonError::Parse {
+                            detail: format!(
+                                "decode committed rollout telemetry event at {}+{}: {source}",
+                                self.path.display(),
+                                self.offset.saturating_add(committed_bytes)
+                            ),
+                        })?;
+                    relevant_event_observed |=
+                        sinomo_rollout::rollout_telemetry_event_kind_is_relevant(
+                            &stored.event.kind,
+                        );
+                }
+                committed_bytes = committed_bytes.saturating_add(pending_record_bytes);
+                pending_record_bytes = 0;
+                line.clear();
+            }
+        }
+        self.offset = self.offset.saturating_add(committed_bytes);
+        Ok(DaemonRolloutTelemetryEventTailOutcome {
+            relevant_event_observed,
+            incomplete_record: pending_record_bytes != 0,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DaemonRolloutTelemetrySourceGenerations {
+    runtime_state: u64,
+    gate_config: u64,
+    relevant_event: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonRolloutTelemetryArming {
+    /// No event or gate can create a runtime state/candidate or leave a
+    /// terminal stage. Only the runtime-state owner can re-arm the reactor.
+    RuntimeStateOnly,
+    /// A live candidate can change from telemetry, gates, or runtime state.
+    LiveCandidateSources,
+}
+
+/// Reactive owner for local rollout telemetry advancement.
+///
+/// The initial generation reconciles durable sources left by a previous
+/// process. Afterwards exact runtime/config commits and relevant event-log
+/// appends are the only healthy wake sources. Timers exist only while an
+/// attempted generation is failing or for the single bounded retry attached
+/// to an observed partial JSONL append.
+pub(crate) struct DaemonRolloutTelemetryReactor {
+    runtime_source_tx: tokio::sync::watch::Sender<u64>,
+    runtime_source_rx: tokio::sync::watch::Receiver<u64>,
+    gate_source_tx: tokio::sync::watch::Sender<u64>,
+    gate_source_rx: tokio::sync::watch::Receiver<u64>,
+    event_source_tx: tokio::sync::watch::Sender<u64>,
+    event_source_rx: tokio::sync::watch::Receiver<u64>,
+    event_file_source_tx: tokio::sync::watch::Sender<u64>,
+    event_file_source_rx: tokio::sync::watch::Receiver<u64>,
+    watcher_fault_tx: tokio::sync::watch::Sender<u64>,
+    watcher_fault_rx: tokio::sync::watch::Receiver<u64>,
+    source_paths: DaemonRolloutTelemetrySourcePaths,
+    source_watcher: notify::RecommendedWatcher,
+    event_log_tailer: DaemonRolloutTelemetryEventLogTailer,
+    completed_watcher_fault_generation: u64,
+    completed_event_file_generation: u64,
+    event_tail_retry_at: Option<Instant>,
+    event_tail_retry_generation: Option<u64>,
+    completed_generations: DaemonRolloutTelemetrySourceGenerations,
+    arming: DaemonRolloutTelemetryArming,
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl std::fmt::Debug for DaemonRolloutTelemetryReactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonRolloutTelemetryReactor")
+            .field(
+                "runtime_source_generation",
+                &*self.runtime_source_rx.borrow(),
+            )
+            .field("gate_source_generation", &*self.gate_source_rx.borrow())
+            .field("event_source_generation", &*self.event_source_rx.borrow())
+            .field(
+                "event_file_source_generation",
+                &*self.event_file_source_rx.borrow(),
+            )
+            .field("watcher_fault_generation", &*self.watcher_fault_rx.borrow())
+            .field("completed_generations", &self.completed_generations)
+            .field("arming", &self.arming)
+            .field("consecutive_failures", &self.consecutive_failures)
+            .field("retry_at", &self.retry_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DaemonRolloutTelemetryReactor {
+    pub(crate) fn new(paths: &DaemonPaths) -> Result<Self, DaemonError> {
+        let data_dir = paths
+            .root
+            .parent()
+            .ok_or_else(|| DaemonError::Io {
+                path: paths.root.display().to_string(),
+                detail: "daemon root has no data directory parent".to_string(),
+            })?
+            .to_path_buf();
+        let rollout_paths = SelfRolloutPaths::new(&data_dir);
+        let source_paths = DaemonRolloutTelemetrySourcePaths {
+            event_log: data_dir.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
+            runtime_state: sinomo_rollout::rollout_runtime_state_path(&rollout_paths),
+            gate_config: sinomo_rollout::rollout_telemetry_gate_config_path(&rollout_paths),
+        };
+        for parent in [
+            source_paths.event_log.parent(),
+            source_paths.runtime_state.parent(),
+            source_paths.gate_config.parent(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        // Generation one is the source-owned startup reconciliation for
+        // durable writes that occurred before this process started watching.
+        let (runtime_source_tx, runtime_source_rx) = tokio::sync::watch::channel(1_u64);
+        let (gate_source_tx, gate_source_rx) = tokio::sync::watch::channel(0_u64);
+        let (event_source_tx, event_source_rx) = tokio::sync::watch::channel(0_u64);
+        let (event_file_source_tx, event_file_source_rx) = tokio::sync::watch::channel(0_u64);
+        let (watcher_fault_tx, watcher_fault_rx) = tokio::sync::watch::channel(0_u64);
+        let source_watcher = daemon_rollout_telemetry_source_watcher(
+            &source_paths,
+            runtime_source_tx.clone(),
+            gate_source_tx.clone(),
+            event_file_source_tx.clone(),
+            watcher_fault_tx.clone(),
+        )?;
+        // Establish the OS watches first. The dirty startup generation owns
+        // the durable catch-up; later mutations cannot fall between sampling
+        // and watcher registration.
+        let event_log_tailer =
+            DaemonRolloutTelemetryEventLogTailer::at_end(source_paths.event_log.clone())?;
+        Ok(Self {
+            runtime_source_tx,
+            runtime_source_rx,
+            gate_source_tx,
+            gate_source_rx,
+            event_source_tx,
+            event_source_rx,
+            event_file_source_tx,
+            event_file_source_rx,
+            watcher_fault_tx,
+            watcher_fault_rx,
+            source_paths,
+            source_watcher,
+            event_log_tailer,
+            completed_watcher_fault_generation: 0,
+            completed_event_file_generation: 0,
+            event_tail_retry_at: None,
+            event_tail_retry_generation: None,
+            completed_generations: DaemonRolloutTelemetrySourceGenerations::default(),
+            arming: DaemonRolloutTelemetryArming::RuntimeStateOnly,
+            consecutive_failures: 0,
+            retry_at: None,
+        })
+    }
+
+    fn rebuild_source_watcher(&mut self) -> Result<(), DaemonError> {
+        // Install the replacement before dropping the old watcher. Once the
+        // exact-path watches are live, mark every durable source dirty so the
+        // reconciliation closes the observation gap that caused the fault.
+        let replacement = daemon_rollout_telemetry_source_watcher(
+            &self.source_paths,
+            self.runtime_source_tx.clone(),
+            self.gate_source_tx.clone(),
+            self.event_file_source_tx.clone(),
+            self.watcher_fault_tx.clone(),
+        )?;
+        self.source_watcher = replacement;
+        self.runtime_source_tx.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
+        self.gate_source_tx.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
+        self.event_file_source_tx.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
+        Ok(())
+    }
+
+    fn prepare_runnable_generations(
+        &mut self,
+        now: Instant,
+    ) -> Result<Option<DaemonRolloutTelemetrySourceGenerations>, DaemonError> {
+        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return Ok(None);
+        }
+
+        let watcher_fault_generation = *self.watcher_fault_rx.borrow_and_update();
+        if watcher_fault_generation > self.completed_watcher_fault_generation {
+            self.rebuild_source_watcher()?;
+            self.completed_watcher_fault_generation = watcher_fault_generation;
+        }
+
+        let runtime_state_generation = *self.runtime_source_rx.borrow_and_update();
+        let runtime_state_pending =
+            runtime_state_generation > self.completed_generations.runtime_state;
+        let event_file_generation = *self.event_file_source_rx.borrow_and_update();
+        let event_tail_retry_due = self
+            .event_tail_retry_at
+            .is_some_and(|retry_at| now >= retry_at);
+        let event_file_pending = event_file_generation > self.completed_event_file_generation;
+        if runtime_state_pending
+            || (self.arming == DaemonRolloutTelemetryArming::LiveCandidateSources
+                && (event_file_pending || event_tail_retry_due))
+        {
+            let tail_outcome = self.event_log_tailer.catch_up()?;
+            self.completed_event_file_generation = self
+                .completed_event_file_generation
+                .max(event_file_generation);
+            if tail_outcome.relevant_event_observed {
+                self.event_source_tx.send_modify(|generation| {
+                    *generation = generation.saturating_add(1);
+                });
+            }
+            if tail_outcome.incomplete_record {
+                // One short retry is attached to this observed file activity.
+                // If the writer still has not committed a newline then, the
+                // next filesystem mutation owns the next retry; a torn writer
+                // cannot turn into a healthy idle timer.
+                if self.event_tail_retry_generation == Some(event_file_generation)
+                    && event_tail_retry_due
+                {
+                    self.event_tail_retry_at = None;
+                    self.event_tail_retry_generation = None;
+                } else {
+                    self.event_tail_retry_at =
+                        now.checked_add(DAEMON_ROLLOUT_TELEMETRY_INCOMPLETE_TAIL_RETRY);
+                    self.event_tail_retry_generation = Some(event_file_generation);
+                }
+            } else {
+                self.event_tail_retry_at = None;
+                self.event_tail_retry_generation = None;
+            }
+        }
+
+        let source_generations = DaemonRolloutTelemetrySourceGenerations {
+            runtime_state: runtime_state_generation,
+            gate_config: *self.gate_source_rx.borrow_and_update(),
+            relevant_event: *self.event_source_rx.borrow_and_update(),
+        };
+        let runtime_state_pending =
+            source_generations.runtime_state > self.completed_generations.runtime_state;
+        let live_candidate_source_pending = self.arming
+            == DaemonRolloutTelemetryArming::LiveCandidateSources
+            && (source_generations.gate_config > self.completed_generations.gate_config
+                || source_generations.relevant_event > self.completed_generations.relevant_event);
+        if !runtime_state_pending && !live_candidate_source_pending {
+            return Ok(None);
+        }
+        Ok(Some(source_generations))
+    }
+
+    fn complete_generations(
+        &mut self,
+        generations: DaemonRolloutTelemetrySourceGenerations,
+        status: &sinomo_rollout::RolloutTelemetryAdvanceStatus,
+    ) {
+        self.completed_generations.runtime_state = self
+            .completed_generations
+            .runtime_state
+            .max(generations.runtime_state);
+        self.completed_generations.gate_config = self
+            .completed_generations
+            .gate_config
+            .max(generations.gate_config);
+        self.completed_generations.relevant_event = self
+            .completed_generations
+            .relevant_event
+            .max(generations.relevant_event);
+        self.arming = daemon_rollout_telemetry_arming_after(status);
+        if self.arming == DaemonRolloutTelemetryArming::RuntimeStateOnly {
+            self.event_tail_retry_at = None;
+            self.event_tail_retry_generation = None;
+        }
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+    }
+
+    fn fail_generation(&mut self, now: Instant) {
+        let retry_delay = daemon_rollout_telemetry_retry_delay(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.retry_at = now.checked_add(retry_delay).or(Some(now));
+    }
+
+    #[cfg(test)]
+    fn reconcile_pending_with<T, E>(
+        &mut self,
+        now: Instant,
+        reconcile: impl FnOnce() -> Result<(T, sinomo_rollout::RolloutTelemetryAdvanceStatus), E>,
+    ) -> Result<Option<T>, E> {
+        let Some(generations) = self
+            .prepare_runnable_generations(now)
+            .expect("prepare rollout telemetry sources")
+        else {
+            return Ok(None);
+        };
+        match reconcile() {
+            Ok((value, status)) => {
+                self.complete_generations(generations, &status);
+                Ok(Some(value))
+            }
+            Err(error) => {
+                self.fail_generation(now);
+                Err(error)
+            }
+        }
+    }
+
+    async fn wait_for_source_retry_or_shutdown(
+        &mut self,
+        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        if let Some(retry_at) = self.retry_at {
+            return tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)) => false,
+                changed = shutdown_rx.changed() => {
+                    changed.is_err() || *shutdown_rx.borrow()
+                }
+            };
+        }
+        match self.arming {
+            DaemonRolloutTelemetryArming::RuntimeStateOnly => {
+                tokio::select! {
+                    changed = self.runtime_source_rx.changed() => changed.is_err(),
+                    changed = self.watcher_fault_rx.changed() => changed.is_err(),
+                    changed = shutdown_rx.changed() => {
+                        changed.is_err() || *shutdown_rx.borrow()
+                    }
+                }
+            }
+            DaemonRolloutTelemetryArming::LiveCandidateSources => {
+                let event_tail_retry_at = self.event_tail_retry_at;
+                tokio::select! {
+                    changed = self.runtime_source_rx.changed() => changed.is_err(),
+                    changed = self.gate_source_rx.changed() => changed.is_err(),
+                    changed = self.event_file_source_rx.changed() => changed.is_err(),
+                    changed = self.watcher_fault_rx.changed() => changed.is_err(),
+                    _ = daemon_rollout_telemetry_wait_for_optional_retry(event_tail_retry_at) => false,
+                    changed = shutdown_rx.changed() => {
+                        changed.is_err() || *shutdown_rx.borrow()
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn run_until_stopped_async(
+        mut self,
+        paths: DaemonPaths,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        label: String,
+    ) {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let now = Instant::now();
+            let generations = match self.prepare_runnable_generations(now) {
+                Ok(generations) => generations,
+                Err(error) => {
+                    tracing::warn!(
+                        "sinomo {label} rollout telemetry source observation failed: {error}"
+                    );
+                    self.fail_generation(Instant::now());
+                    continue;
+                }
+            };
+            if let Some(generations) = generations {
+                let telemetry_paths = paths.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::control::run_daemon_rollout_telemetry_reconciliation_tick(
+                        &telemetry_paths,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(outcome)) => {
+                        if let Some(applied) = outcome.applied_transition {
+                            tracing::info!(
+                                "sinomo {label} rollout telemetry applied {:?} at {} bps",
+                                applied.transition.action,
+                                applied.transition.current_weight_bps
+                            );
+                        }
+                        self.complete_generations(generations, &outcome.status);
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            "sinomo {label} rollout telemetry reconciliation failed: {error}"
+                        );
+                        self.fail_generation(Instant::now());
+                    }
+                    Err(error) => {
+                        tracing::warn!("sinomo {label} rollout telemetry task failed: {error}");
+                        self.fail_generation(Instant::now());
+                    }
+                }
+                continue;
+            }
+            if self
+                .wait_for_source_retry_or_shutdown(&mut shutdown_rx)
+                .await
+            {
+                return;
+            }
+        }
+    }
+}
+
+async fn daemon_rollout_telemetry_wait_for_optional_retry(retry_at: Option<Instant>) {
+    match retry_at {
+        Some(retry_at) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn daemon_rollout_telemetry_arming_after(
+    status: &sinomo_rollout::RolloutTelemetryAdvanceStatus,
+) -> DaemonRolloutTelemetryArming {
+    match status {
+        sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState
+        | sinomo_rollout::RolloutTelemetryAdvanceStatus::NoCandidate
+        | sinomo_rollout::RolloutTelemetryAdvanceStatus::TerminalStage
+        | sinomo_rollout::RolloutTelemetryAdvanceStatus::AppliedTransition => {
+            DaemonRolloutTelemetryArming::RuntimeStateOnly
+        }
+        sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry
+        | sinomo_rollout::RolloutTelemetryAdvanceStatus::PromotionGateBlocked => {
+            DaemonRolloutTelemetryArming::LiveCandidateSources
+        }
+    }
+}
+
+fn daemon_rollout_telemetry_retry_delay(consecutive_failures: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(consecutive_failures.min(16))
+        .unwrap_or(u32::MAX);
+    DAEMON_ROLLOUT_TELEMETRY_RETRY_INITIAL
+        .saturating_mul(multiplier)
+        .min(DAEMON_ROLLOUT_TELEMETRY_RETRY_MAX)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RolloutTerminationMode {
@@ -231,9 +876,6 @@ fn rejected_cluster_rollout_response(
 }
 
 fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
-    crate::control::request_daemon_cluster_kv_maintenance(
-        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RolloutActivity,
-    );
     let daemon_paths = daemon_paths.clone();
     if let Err(error) = thread::Builder::new()
         .name("sinomo-rollout-progress-publish".to_string())
@@ -322,6 +964,7 @@ pub enum ShadowMainStart {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShadowMainExit {
     PendingActivation,
+    ImmediateRestartRequested,
     RestartRequested,
     Suppressed,
 }
@@ -443,6 +1086,10 @@ impl ShadowMainRestartBackoff {
             self.reset();
         }
     }
+}
+
+fn prepare_immediate_shadow_main_restart(backoff: &mut ShadowMainRestartBackoff) {
+    backoff.reset();
 }
 
 impl PendingShadowRolloutContext for ShadowMainRolloutMonitor {
@@ -1356,6 +2003,30 @@ pub fn run_shadow_daemon_supervision_loop(
                             }),
                         );
                         thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                    ShadowMainExit::ImmediateRestartRequested => {
+                        supervised_main = None;
+                        supervised_main_started_at = None;
+                        main_restart_suppressed = false;
+                        prepare_immediate_shadow_main_restart(&mut main_restart_backoff);
+                        main_probe_status = DaemonProbeStatus::NotRunning;
+                        last_main_probe = Instant::now();
+                        crate::append_operational_event_best_effort(
+                            &shadow_paths,
+                            crate::OperationalSeverity::Info,
+                            "shadow-daemon",
+                            "daemon.supervision.restart_immediate",
+                            "supervised main exited for an explicit clean restart",
+                            None,
+                            serde_json::json!({
+                                "main_binary": main_binary.display().to_string(),
+                            }),
+                        );
+                        // Re-enter the start decision immediately. This
+                        // identity/runtime handoff is neither a crash nor a
+                        // start failure, so it must not inherit their backoff
+                        // or the supervision loop's idle sleep.
                         continue;
                     }
                     ShadowMainExit::RestartRequested => {
@@ -3619,10 +4290,30 @@ pub fn handle_shadow_main_process_exit(
     let observation = crate::main_exit_observation_from_status(status);
     let kind = classify_main_exit(observation);
     record_rollout_main_exit(rollout_paths, observation, kind)?;
-    if supervisor_restart_requested || kind == sinomo_rollout::MainExitKind::Crash {
-        Ok(ShadowMainExit::RestartRequested)
+    Ok(classify_shadow_main_exit(
+        supervisor_restart_requested,
+        kind,
+    ))
+}
+
+fn classify_shadow_main_exit(
+    supervisor_restart_requested: bool,
+    kind: sinomo_rollout::MainExitKind,
+) -> ShadowMainExit {
+    if supervisor_restart_requested
+        && matches!(
+            kind,
+            sinomo_rollout::MainExitKind::CleanExit
+                | sinomo_rollout::MainExitKind::RequestedShutdown
+        )
+    {
+        ShadowMainExit::ImmediateRestartRequested
+    } else if supervisor_restart_requested || kind == sinomo_rollout::MainExitKind::Crash {
+        // Preserve the existing backoff for crashes and for an explicit
+        // request whose process did not exit cleanly.
+        ShadowMainExit::RestartRequested
     } else {
-        Ok(ShadowMainExit::Suppressed)
+        ShadowMainExit::Suppressed
     }
 }
 
@@ -4198,6 +4889,473 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn rollout_telemetry_reactor_test_event(label: &str, kind: &str) -> sinomo_core::EventEnvelope {
+        sinomo_core::EventEnvelope::new(
+            sinomo_core::Id::from_legacy_named(format!("event_{label}")).expect("event id"),
+            time::OffsetDateTime::now_utc(),
+            sinomo_core::node::NodeId::from_legacy_named("node_rollout_reactor").expect("node id"),
+            sinomo_core::Source::new("test.rollout-reactor").expect("source"),
+            sinomo_core::EventKind::new(kind).expect("event kind"),
+            sinomo_core::Salience::new(0.5).expect("salience"),
+            sinomo_core::Confidence::new(0.9).expect("confidence"),
+            sinomo_core::RoutingMetadata::new(
+                sinomo_core::RoutingScope::Local,
+                sinomo_core::LatencyClass::Reactive,
+                sinomo_core::PrivacyClass::Derived,
+            ),
+        )
+    }
+
+    fn rollout_telemetry_test_reactor(
+        label: &str,
+    ) -> (
+        sinomo_testdir::TestDir,
+        DaemonPaths,
+        DaemonRolloutTelemetryReactor,
+    ) {
+        let root = temp_rollout_test_root(label);
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).expect("daemon root");
+        let reactor = DaemonRolloutTelemetryReactor::new(&paths).expect("telemetry reactor");
+        (root, paths, reactor)
+    }
+
+    fn complete_rollout_telemetry_startup(
+        reactor: &mut DaemonRolloutTelemetryReactor,
+        status: sinomo_rollout::RolloutTelemetryAdvanceStatus,
+    ) {
+        assert_eq!(
+            reactor
+                .reconcile_pending_with(Instant::now(), || Ok::<_, ()>(("startup", status)))
+                .expect("startup reconciliation"),
+            Some("startup")
+        );
+    }
+
+    fn append_rollout_telemetry_event_raw(
+        path: &Path,
+        event: sinomo_core::EventEnvelope,
+        terminate_record: bool,
+    ) {
+        let stored = sinomo_core::events::StoredEvent {
+            sequence: sinomo_core::events::EventSequence(1),
+            appended_at: time::OffsetDateTime::now_utc(),
+            event,
+        };
+        let mut bytes = serde_json::to_vec(&stored).expect("stored event JSON");
+        if terminate_record {
+            bytes.push(b'\n');
+        }
+        append_rollout_telemetry_bytes_raw(path, &bytes);
+    }
+
+    fn append_rollout_telemetry_bytes_raw(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+
+        fs::create_dir_all(path.parent().expect("event log parent")).expect("event log parent");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("raw event log append");
+        file.write_all(&bytes).expect("raw event bytes");
+        file.flush().expect("raw event flush");
+    }
+
+    fn replace_rollout_telemetry_source_raw(path: &Path, bytes: &[u8]) {
+        let parent = path.parent().expect("source parent");
+        fs::create_dir_all(parent).expect("source parent");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("source file name");
+        let temporary = parent.join(format!(".{file_name}.external-replacement"));
+        fs::write(&temporary, bytes).expect("external source staging write");
+        sinomo_core::storage::durable_file::replace_file(&temporary, path)
+            .expect("external source atomic replacement");
+    }
+
+    async fn wait_for_source_generation_after(
+        source_rx: &mut tokio::sync::watch::Receiver<u64>,
+        generation: u64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *source_rx.borrow_and_update() <= generation {
+                source_rx.changed().await.expect("source owner retained");
+            }
+        })
+        .await
+        .expect("source filesystem notification");
+    }
+
+    fn prepared_rollout_telemetry_generations(
+        reactor: &mut DaemonRolloutTelemetryReactor,
+        now: Instant,
+    ) -> Option<DaemonRolloutTelemetrySourceGenerations> {
+        reactor
+            .prepare_runnable_generations(now)
+            .expect("prepare rollout telemetry sources")
+    }
+
+    #[tokio::test]
+    async fn rollout_telemetry_idle_and_terminal_generations_have_no_healthy_wake() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-idle-terminal");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
+        );
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+        assert_eq!(reactor.retry_at, None);
+
+        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_event_raw(
+            &event_log_path,
+            rollout_telemetry_reactor_test_event(
+                "no-runtime-relevant",
+                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
+            ),
+            true,
+        );
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+
+        let gate_generation = *reactor.gate_source_rx.borrow();
+        replace_rollout_telemetry_source_raw(&reactor.source_paths.gate_config, b"external gate");
+        wait_for_source_generation_after(&mut reactor.gate_source_rx, gate_generation).await;
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None,
+            "events and gates cannot create a missing runtime state"
+        );
+
+        let runtime_generation = *reactor.runtime_source_rx.borrow();
+        replace_rollout_telemetry_source_raw(
+            &reactor.source_paths.runtime_state,
+            b"external runtime state",
+        );
+        wait_for_source_generation_after(&mut reactor.runtime_source_rx, runtime_generation).await;
+        assert_eq!(
+            reactor
+                .reconcile_pending_with(Instant::now(), || {
+                    Ok::<_, ()>((
+                        "terminal",
+                        sinomo_rollout::RolloutTelemetryAdvanceStatus::TerminalStage,
+                    ))
+                })
+                .expect("terminal reconciliation"),
+            Some("terminal")
+        );
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_event_raw(
+            &event_log_path,
+            rollout_telemetry_reactor_test_event(
+                "terminal-relevant",
+                sinomo_module::MODULE_INVOCATION_DECISION_EVENT_KIND,
+            ),
+            true,
+        );
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+        assert_eq!(
+            prepared_rollout_telemetry_generations(
+                &mut reactor,
+                Instant::now() + Duration::from_secs(24 * 60 * 60)
+            ),
+            None,
+            "terminal state ignores telemetry until runtime state changes"
+        );
+        let runtime_generation = *reactor.runtime_source_rx.borrow();
+        replace_rollout_telemetry_source_raw(
+            &reactor.source_paths.runtime_state,
+            b"new external runtime state",
+        );
+        wait_for_source_generation_after(&mut reactor.runtime_source_rx, runtime_generation).await;
+        assert!(prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some());
+        assert_eq!(reactor.retry_at, None, "success must not retain a timer");
+    }
+
+    #[tokio::test]
+    async fn rollout_telemetry_disarmed_event_activity_does_not_wake_task() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-disarmed-wait");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
+        );
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
+        let event_writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            append_rollout_telemetry_event_raw(
+                &event_log_path,
+                rollout_telemetry_reactor_test_event(
+                    "disarmed",
+                    sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
+                ),
+                true,
+            );
+        });
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                reactor.wait_for_source_retry_or_shutdown(&mut shutdown_rx)
+            )
+            .await
+            .is_err(),
+            "event-log activity must not wake a reactor with no live candidate"
+        );
+        event_writer.await.expect("event writer");
+        assert!(
+            *reactor.event_file_source_rx.borrow() > event_generation,
+            "the filesystem watcher did observe the ignored event append"
+        );
+
+        let runtime_path = reactor.source_paths.runtime_state.clone();
+        let runtime_writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            replace_rollout_telemetry_source_raw(&runtime_path, b"external runtime rearm");
+        });
+        assert!(
+            !tokio::time::timeout(
+                Duration::from_secs(2),
+                reactor.wait_for_source_retry_or_shutdown(&mut shutdown_rx)
+            )
+            .await
+            .expect("runtime source wake"),
+            "runtime source activity re-arms the reactor"
+        );
+        runtime_writer.await.expect("runtime writer");
+    }
+
+    #[tokio::test]
+    async fn rollout_telemetry_irrelevant_external_event_does_not_wake_reactor() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-irrelevant-event");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
+        );
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_event_raw(
+            &root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
+            rollout_telemetry_reactor_test_event("irrelevant", "daemon.status.observed"),
+            true,
+        );
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn rollout_telemetry_relevant_external_event_runs_exactly_once() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-relevant-event");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
+        );
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_event_raw(
+            &root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
+            rollout_telemetry_reactor_test_event(
+                "relevant",
+                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
+            ),
+            true,
+        );
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+
+        let mut reconciliations = 0;
+        assert_eq!(
+            reactor
+                .reconcile_pending_with(Instant::now(), || {
+                    reconciliations += 1;
+                    Ok::<_, ()>((
+                        (),
+                        sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
+                    ))
+                })
+                .expect("event reconciliation"),
+            Some(())
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+        assert_eq!(reconciliations, 1);
+    }
+
+    #[tokio::test]
+    async fn rollout_telemetry_partial_external_event_gets_one_activity_bound_retry() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-partial-event");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
+        );
+        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_event_raw(
+            &event_log_path,
+            rollout_telemetry_reactor_test_event(
+                "partial",
+                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
+            ),
+            false,
+        );
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+        // A single append can map to more than one backend notification.
+        // Let that finite burst coalesce into the source generation before
+        // asserting the one retry owned by this write.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None,
+            "an uncommitted JSONL record is not a telemetry source"
+        );
+        let retry_at = reactor
+            .event_tail_retry_at
+            .expect("activity-bound partial-record retry");
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, retry_at),
+            None
+        );
+        assert_eq!(
+            reactor.event_tail_retry_at, None,
+            "a torn writer cannot create an indefinite timer"
+        );
+
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_bytes_raw(&event_log_path, b"\n");
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+        assert!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some(),
+            "the next committed file mutation completes and emits the relevant event generation"
+        );
+    }
+
+    #[test]
+    fn rollout_telemetry_watcher_fault_is_owned_and_reconciles_all_sources() {
+        let (_root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-watcher-fault");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
+        );
+        reactor.watcher_fault_tx.send_modify(|generation| {
+            *generation = generation.saturating_add(1);
+        });
+        assert!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some(),
+            "rebuilding the watcher dirties durable runtime state after the observation gap"
+        );
+        assert_eq!(
+            reactor.completed_watcher_fault_generation,
+            *reactor.watcher_fault_rx.borrow()
+        );
+    }
+
+    #[tokio::test]
+    async fn rollout_telemetry_blocked_gate_rearms_from_external_atomic_replacement() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-gate-source");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
+        );
+        let event_generation = *reactor.event_file_source_rx.borrow();
+        append_rollout_telemetry_event_raw(
+            &root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
+            rollout_telemetry_reactor_test_event(
+                "gate-blocked",
+                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
+            ),
+            true,
+        );
+        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
+        assert_eq!(
+            reactor
+                .reconcile_pending_with(Instant::now(), || {
+                    Ok::<_, ()>((
+                        "gate-blocked",
+                        sinomo_rollout::RolloutTelemetryAdvanceStatus::PromotionGateBlocked,
+                    ))
+                })
+                .expect("blocked gate reconciliation"),
+            Some("gate-blocked")
+        );
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+
+        let gate_generation = *reactor.gate_source_rx.borrow();
+        replace_rollout_telemetry_source_raw(
+            &reactor.source_paths.gate_config,
+            b"external gate replacement",
+        );
+        wait_for_source_generation_after(&mut reactor.gate_source_rx, gate_generation).await;
+        assert!(prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some());
+    }
+
+    #[test]
+    fn rollout_telemetry_retry_timer_exists_only_after_failure() {
+        let (_root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-failure-retry");
+        assert_eq!(reactor.retry_at, None);
+        let now = Instant::now();
+        let error = reactor
+            .reconcile_pending_with(now, || {
+                Err::<((), sinomo_rollout::RolloutTelemetryAdvanceStatus), _>("injected failure")
+            })
+            .expect_err("failed reconciliation");
+        assert_eq!(error, "injected failure");
+        let retry_at = reactor.retry_at.expect("failure-owned retry");
+        assert_eq!(
+            retry_at.saturating_duration_since(now),
+            DAEMON_ROLLOUT_TELEMETRY_RETRY_INITIAL
+        );
+
+        let mut ran_early = false;
+        assert_eq!(
+            reactor
+                .reconcile_pending_with(retry_at - Duration::from_millis(1), || {
+                    ran_early = true;
+                    Ok::<_, ()>((
+                        (),
+                        sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
+                    ))
+                })
+                .expect("retry not due"),
+            None
+        );
+        assert!(!ran_early);
+        assert_eq!(
+            reactor
+                .reconcile_pending_with(retry_at, || {
+                    Ok::<_, ()>((
+                        "recovered",
+                        sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
+                    ))
+                })
+                .expect("retry due"),
+            Some("recovered")
+        );
+        assert_eq!(reactor.retry_at, None);
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, retry_at),
+            None
+        );
+    }
+
     fn rollout_binary_test_manifest(bytes: &[u8]) -> ClusterRolloutBinaryManifest {
         ClusterRolloutBinaryManifest {
             upload_id: "upload-test".to_string(),
@@ -4501,6 +5659,41 @@ mod tests {
         backoff.reset_after_stable_start(Some(now), now + SHADOW_MAIN_RESTART_STABLE_RESET_AFTER);
         assert_eq!(backoff.consecutive_failures, 0);
         assert!(backoff.next_restart_at.is_none());
+    }
+
+    #[test]
+    fn explicit_clean_supervised_restart_is_distinct_from_a_crash() {
+        assert_eq!(
+            classify_shadow_main_exit(true, sinomo_rollout::MainExitKind::CleanExit),
+            ShadowMainExit::ImmediateRestartRequested
+        );
+        assert_eq!(
+            classify_shadow_main_exit(true, sinomo_rollout::MainExitKind::Crash),
+            ShadowMainExit::RestartRequested
+        );
+        assert_eq!(
+            classify_shadow_main_exit(false, sinomo_rollout::MainExitKind::Crash),
+            ShadowMainExit::RestartRequested
+        );
+        assert_eq!(
+            classify_shadow_main_exit(false, sinomo_rollout::MainExitKind::CleanExit),
+            ShadowMainExit::Suppressed
+        );
+    }
+
+    #[test]
+    fn explicit_clean_supervised_restart_clears_existing_backoff() {
+        let mut backoff = ShadowMainRestartBackoff::default();
+        let now = Instant::now();
+        backoff.schedule_after_failure(now);
+        backoff.schedule_after_failure(now);
+        assert!(!backoff.can_restart(now));
+
+        prepare_immediate_shadow_main_restart(&mut backoff);
+
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert!(backoff.next_restart_at.is_none());
+        assert!(backoff.can_restart(now));
     }
 
     #[test]

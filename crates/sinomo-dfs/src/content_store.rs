@@ -310,6 +310,10 @@ pub struct ContentStoreStagingGcReport {
     pub deleted_staging_bytes: u64,
     pub retained_young_staging_count: u64,
     pub retained_young_staging_bytes: u64,
+    /// Earliest wall-clock instant at which a retained staging file reaches
+    /// the configured age. Reactive callers can sleep until this deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_at_unix_nanos: Option<u64>,
     pub retained_limit_staging_count: u64,
     pub retained_limit_staging_bytes: u64,
     pub max_deletions_reached: bool,
@@ -1392,6 +1396,14 @@ impl LocalContentStore {
                 report.retained_young_staging_bytes = report
                     .retained_young_staging_bytes
                     .saturating_add(candidate.size_bytes);
+                let eligible_at = system_time_nanos_since_epoch_saturating(candidate.modified_at)
+                    .saturating_add(options.min_staging_age_nanos);
+                report.next_eligible_at_unix_nanos = Some(
+                    report
+                        .next_eligible_at_unix_nanos
+                        .map(|current| current.min(eligible_at))
+                        .unwrap_or(eligible_at),
+                );
                 continue;
             }
             report.eligible_staging_count = report.eligible_staging_count.saturating_add(1);
@@ -4421,6 +4433,37 @@ mod tests {
         );
         assert!(!content_root.exists());
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn young_staging_file_projects_exact_cleanup_deadline() {
+        let root = temp_root("young-staging-cleanup-deadline");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .stage_bytes("intent-young", b"pending")
+            .expect("stage bytes");
+        let staging_path = root.join("staging").join("intent-young");
+        let modified_at = staging_path
+            .metadata()
+            .expect("staging metadata")
+            .modified()
+            .expect("staging modified time");
+        let min_age = Duration::from_secs(60 * 60);
+
+        let projection = store
+            .collect_stale_staging(ContentStoreStagingGcOptions::dry_run(min_age))
+            .expect("staging projection");
+
+        assert_eq!(projection.eligible_staging_count, 0);
+        assert_eq!(projection.retained_young_staging_count, 1);
+        assert_eq!(
+            projection.next_eligible_at_unix_nanos,
+            Some(
+                system_time_nanos_since_epoch_saturating(modified_at)
+                    .saturating_add(duration_nanos_saturating(min_age))
+            )
+        );
         cleanup(&root);
     }
 

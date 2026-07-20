@@ -136,7 +136,9 @@ pub use control_plane::{
     DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
     metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
     metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    metadata_shards_prefix, placement_reconciliation_key, placement_reconciliations_prefix,
+    metadata_shards_prefix, placement_authority_permit_key,
+    placement_reconciliation_activity_index_key, placement_reconciliation_key,
+    placement_reconciliations_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -149,7 +151,8 @@ pub use default_cluster::{
     default_cluster_metadata_shards_with_async_host, default_cluster_metadata_shards_with_host,
     default_cluster_sifs, default_cluster_sifs_owner, default_cluster_sifs_subtree_policies,
     default_metadata_shard_primary_node_id, default_metadata_shard_replica_node_ids,
-    dfs_service_members, ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
+    default_metadata_shard_transition_awaits_head_watermark, dfs_service_members,
+    ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
     ensure_default_distributed_dfs_with_async_host, ensure_default_distributed_dfs_with_host,
     metadata_shard_layout_matches, metadata_shard_primary_transfer_ready_from_local_backend,
     metadata_shard_replica_node_ids, run_default_cluster_dfs_smoke_with_peer_transport,

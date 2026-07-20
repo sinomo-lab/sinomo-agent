@@ -227,40 +227,16 @@ where
             sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
         )?;
         if success.is_empty() {
-            if latest.is_some() {
-                // A previous commit in this call already crossed Raft. Warm
-                // the cache from its authoritative response and finish.
-                if let Some(published) =
-                    cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
-                {
-                    host.remember_published_connectivity_record_set(
-                        paths,
-                        source_node_id,
-                        &published,
-                    );
-                }
-                return Ok(latest);
-            }
-            if state.is_none() {
-                state = Some(read_cluster_state_without_kv(paths)?);
-            }
-            let committed = host.commit_cluster_kv_txn_with_quorum(
-                paths,
-                state
-                    .as_mut()
-                    .expect("cluster state is initialized before connectivity publish"),
-                KvTxnRequest::generated(KvTxn {
-                    compares: Vec::new(),
-                    success: Vec::new(),
-                    failure: Vec::new(),
-                }),
-            )?;
             if let Some(published) =
-                cluster_connectivity_records_for_source_from_snapshot(&committed, source_node_id)
+                cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
             {
                 host.remember_published_connectivity_record_set(paths, source_node_id, &published);
             }
-            return Ok(Some(committed));
+            // The local materialized snapshot already contains the complete
+            // source-owned record set. An unchanged publication is terminal;
+            // it must not manufacture an empty Raft transaction merely to
+            // refresh a cache derived from that same snapshot.
+            return Ok(latest);
         }
         if previous_ops.as_ref() == Some(&success) {
             return Ok(latest);
@@ -436,50 +412,7 @@ where
             }
         };
         if success.is_empty() {
-            if latest.is_some() {
-                // The earlier round already crossed Raft. Cache its stored
-                // values, not the incoming refresh, and finish.
-                if let Some(published) = published_on_noop {
-                    host.remember_published_connectivity_record_set_async(
-                        paths,
-                        source_node_id,
-                        &published,
-                    )
-                    .await?;
-                }
-                return Ok(latest);
-            }
-            if state.is_none() {
-                let state_paths = paths.clone();
-                state = Some(
-                    runtime
-                        .spawn_blocking(move || read_cluster_state_without_kv(&state_paths))
-                        .await
-                        .map_err(|source| {
-                            H::Error::from(NetworkError::Io {
-                                operation: "read cluster state".to_string(),
-                                detail: format!("cluster state read task failed: {source}"),
-                            })
-                        })?
-                        .map_err(H::Error::from)?,
-                );
-            }
-            let committed = host
-                .commit_cluster_kv_txn_with_quorum_async(
-                    paths,
-                    state
-                        .as_mut()
-                        .expect("cluster state is initialized before connectivity publish"),
-                    KvTxnRequest::generated(KvTxn {
-                        compares: Vec::new(),
-                        success: Vec::new(),
-                        failure: Vec::new(),
-                    }),
-                )
-                .await?;
-            if let Some(published) =
-                cluster_connectivity_records_for_source_from_snapshot(&committed, source_node_id)
-            {
+            if let Some(published) = published_on_noop {
                 host.remember_published_connectivity_record_set_async(
                     paths,
                     source_node_id,
@@ -487,7 +420,9 @@ where
                 )
                 .await?;
             }
-            return Ok(Some(committed));
+            // Source-change publication is already converged. Keep the
+            // operation read-only instead of appending an empty transaction.
+            return Ok(latest);
         }
         if previous_ops.as_ref() == Some(&success) {
             return Ok(latest);

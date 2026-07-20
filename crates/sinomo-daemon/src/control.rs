@@ -1,16 +1,14 @@
 use crate::cluster::{
     ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
-    cluster_paths_from_daemon_paths, handle_daemon_cluster_kv_snapshot,
-    prune_local_cluster_raft_uncommitted_tail,
+    DaemonDesiredRolloutReactor, cluster_paths_from_daemon_paths,
+    handle_daemon_cluster_kv_snapshot, prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
     DaemonDfsMaintenanceTickOutcome, DaemonDfsPendingMaintenanceWork,
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
     daemon_dfs_now_unix_nanos, daemon_dfs_pending_maintenance_work,
-    ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
-    evict_daemon_dfs_message_service_cache_on_shutdown,
-    recover_prior_process_default_dfs_placement_authority, register_daemon_dfs_data_owner_lock,
-    run_daemon_dfs_maintenance_tick_in_blocking_task,
+    ensure_default_local_dfs_expose, evict_daemon_dfs_message_service_cache_on_shutdown,
+    register_daemon_dfs_data_owner_lock, run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
     AuthenticatedDaemonCommand, DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR, DaemonClusterStatus,
@@ -32,16 +30,23 @@ use sinomo_rollout::{
 };
 use sinomo_sandbox::SandboxFileSystem;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
 #[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
-pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+// Durable work that is known but currently cannot run (for example, a repair
+// whose target is offline) gets a bounded read-only re-probe. This is not a
+// periodic maintenance pass: a fully idle projection has no DFS timer at all.
+const DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 const DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -50,10 +55,8 @@ const DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration:
 // their first acquisition by stable membership rank so a rolling restart does
 // not make every node hold its local lane while asking a peer to enter theirs.
 const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT: Duration = Duration::from_secs(20);
+const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW: Duration = Duration::from_secs(300);
 pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DAEMON_CLUSTER_KV_REACTIVE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
-pub const DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
 pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
@@ -75,9 +78,85 @@ const DAEMON_SANDBOX_LIFECYCLE_PENDING_MARKER_CONTENT: &[u8] =
     b"sinomo-sandbox-authoritative-recovery-pending-v1\n";
 
 static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
-static DAEMON_CLUSTER_KV_MAINTENANCE_COORDINATOR: OnceLock<
-    sinomo_core::cluster::ClusterKvMaintenanceCoordinator,
-> = OnceLock::new();
+static DAEMON_CLUSTER_MAINTENANCE_DIRTY: AtomicU8 = AtomicU8::new(0);
+
+const DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH: u8 = 1 << 0;
+const DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY: u8 = 1 << 1;
+const DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY: u8 = 1 << 2;
+const DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT: u8 = 1 << 3;
+
+/// Identifies the durable input that invalidated a cluster-maintenance
+/// projection. Callers publish intent instead of resetting the whole
+/// scheduler: the single maintenance owner then advances only the affected
+/// generation(s), preserving unrelated cadence and failure backoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonClusterMaintenanceReason {
+    /// Wake identity-fenced workers after init/join/leave without declaring
+    /// any projection stale. The replacement process owns the new identity.
+    LifecycleWake,
+    /// A local interface/address generation changed.
+    NetworkEnvironmentChanged,
+    /// The bounded join connectivity handoff could not publish its generation.
+    JoinConnectivityPublishFailed,
+    /// An accepted join changed membership and graph topology.
+    JoinAccepted,
+    /// A committed member display-name generation changed.
+    Rename,
+    /// A committed role generation changed scheduler and member projections.
+    RoleChanged,
+    /// Explicit operator request to reconcile every network projection.
+    ManualBroad,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DaemonClusterMaintenanceRequestPlan {
+    dirty: u8,
+    tunnel_reason: Option<crate::tcp_tunnel::TcpTunnelMaintenanceReason>,
+}
+
+const fn daemon_cluster_maintenance_request_plan(
+    reason: DaemonClusterMaintenanceReason,
+) -> DaemonClusterMaintenanceRequestPlan {
+    use DaemonClusterMaintenanceReason as Reason;
+
+    match reason {
+        Reason::LifecycleWake => DaemonClusterMaintenanceRequestPlan {
+            dirty: 0,
+            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::IdentityChanged),
+        },
+        Reason::NetworkEnvironmentChanged => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
+                | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
+            tunnel_reason: Some(
+                crate::tcp_tunnel::TcpTunnelMaintenanceReason::NetworkEnvironmentChanged,
+            ),
+        },
+        Reason::JoinConnectivityPublishFailed => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
+            tunnel_reason: None,
+        },
+        Reason::JoinAccepted => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
+                | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
+            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::MembershipChanged),
+        },
+        Reason::Rename => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
+            tunnel_reason: None,
+        },
+        Reason::RoleChanged => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
+            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::RoleChanged),
+        },
+        Reason::ManualBroad => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
+                | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
+                | DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY
+                | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
+            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::OperatorRefresh),
+        },
+    }
+}
 
 /// The main daemon owns the mandatory default DFS lifecycle. The shadow daemon
 /// is a supervisor and never owns cluster data; there is intentionally no
@@ -119,36 +198,133 @@ fn daemon_cluster_maintenance_notify() -> Arc<tokio::sync::Notify> {
     )
 }
 
-pub(crate) fn request_daemon_cluster_maintenance_refresh() {
-    crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh();
+pub(crate) fn request_daemon_cluster_maintenance(reason: DaemonClusterMaintenanceReason) {
+    let plan = daemon_cluster_maintenance_request_plan(reason);
+    if plan.dirty != 0 {
+        DAEMON_CLUSTER_MAINTENANCE_DIRTY.fetch_or(plan.dirty, Ordering::Release);
+    }
+    if let Some(reason) = plan.tunnel_reason {
+        crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh(reason);
+    }
     daemon_cluster_maintenance_notify().notify_one();
 }
 
-fn daemon_cluster_kv_maintenance_coordinator()
--> &'static sinomo_core::cluster::ClusterKvMaintenanceCoordinator {
-    DAEMON_CLUSTER_KV_MAINTENANCE_COORDINATOR
-        .get_or_init(sinomo_core::cluster::ClusterKvMaintenanceCoordinator::default)
+fn take_daemon_cluster_maintenance_dirty() -> u8 {
+    DAEMON_CLUSTER_MAINTENANCE_DIRTY.swap(0, Ordering::AcqRel)
 }
 
-pub(crate) fn request_daemon_cluster_kv_maintenance(
-    source: sinomo_core::cluster::ClusterKvMaintenanceWakeSource,
-) {
-    use sinomo_core::cluster::ClusterKvMaintenanceWakeDisposition;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonClusterNetworkMaintenancePhaseDisposition {
+    Completed,
+    TimedOut,
+}
 
-    let disposition = queue_daemon_cluster_kv_maintenance_wake(
-        daemon_cluster_kv_maintenance_coordinator(),
-        source,
-    );
-    if disposition != ClusterKvMaintenanceWakeDisposition::RejectedShutdown {
-        daemon_cluster_maintenance_notify().notify_one();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonClusterNetworkMaintenanceSubphase {
+    TickPlan,
+    PendingWork,
+}
+
+fn cluster_network_maintenance_subphase_name(
+    subphase: DaemonClusterNetworkMaintenanceSubphase,
+) -> &'static str {
+    match subphase {
+        DaemonClusterNetworkMaintenanceSubphase::TickPlan => "tick_plan",
+        DaemonClusterNetworkMaintenanceSubphase::PendingWork => "pending_work",
     }
 }
 
-fn queue_daemon_cluster_kv_maintenance_wake(
-    coordinator: &sinomo_core::cluster::ClusterKvMaintenanceCoordinator,
-    source: sinomo_core::cluster::ClusterKvMaintenanceWakeSource,
-) -> sinomo_core::cluster::ClusterKvMaintenanceWakeDisposition {
-    coordinator.request_wake(source)
+fn cluster_network_maintenance_phase_disposition_name(
+    disposition: DaemonClusterNetworkMaintenancePhaseDisposition,
+) -> &'static str {
+    match disposition {
+        DaemonClusterNetworkMaintenancePhaseDisposition::Completed => "completed",
+        DaemonClusterNetworkMaintenancePhaseDisposition::TimedOut => "timed_out",
+    }
+}
+
+fn maintenance_duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn observe_cluster_network_maintenance_phase(
+    disposition: DaemonClusterNetworkMaintenancePhaseDisposition,
+    duration: Duration,
+) {
+    let disposition = cluster_network_maintenance_phase_disposition_name(disposition);
+    let duration_us = maintenance_duration_us(duration);
+    metrics::counter!(
+        "sinomo.daemon.cluster_network.maintenance.phases",
+        "disposition" => disposition
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sinomo.daemon.cluster_network.maintenance.phase.us",
+        "disposition" => disposition
+    )
+    .record(duration_us as f64);
+    tracing::trace!(
+        target: "sinomo.daemon.cluster_network_maintenance",
+        disposition,
+        duration_us,
+        "cluster network maintenance phase completed"
+    );
+}
+
+struct DaemonClusterNetworkMaintenanceSubphaseObservation {
+    subphase: DaemonClusterNetworkMaintenanceSubphase,
+    started: Instant,
+    completed: bool,
+    has_pending_work: Option<bool>,
+}
+
+impl DaemonClusterNetworkMaintenanceSubphaseObservation {
+    fn start(subphase: DaemonClusterNetworkMaintenanceSubphase) -> Self {
+        tracing::trace!(
+            target: "sinomo.daemon.cluster_network_maintenance",
+            subphase = cluster_network_maintenance_subphase_name(subphase),
+            "cluster network maintenance subphase started"
+        );
+        Self {
+            subphase,
+            started: Instant::now(),
+            completed: false,
+            has_pending_work: None,
+        }
+    }
+
+    fn complete(&mut self, has_pending_work: Option<bool>) {
+        self.completed = true;
+        self.has_pending_work = has_pending_work;
+    }
+}
+
+impl Drop for DaemonClusterNetworkMaintenanceSubphaseObservation {
+    fn drop(&mut self) {
+        let subphase = cluster_network_maintenance_subphase_name(self.subphase);
+        let completed = if self.completed { "true" } else { "false" };
+        let duration_us = maintenance_duration_us(self.started.elapsed());
+        metrics::histogram!(
+            "sinomo.daemon.cluster_network.maintenance.subphase.us",
+            "subphase" => subphase,
+            "completed" => completed
+        )
+        .record(duration_us as f64);
+        metrics::counter!(
+            "sinomo.daemon.cluster_network.maintenance.subphases",
+            "subphase" => subphase,
+            "completed" => completed
+        )
+        .increment(1);
+        tracing::trace!(
+            target: "sinomo.daemon.cluster_network_maintenance",
+            subphase,
+            completed = self.completed,
+            has_pending_work = self.has_pending_work,
+            duration_us,
+            "cluster network maintenance subphase ended"
+        );
+    }
 }
 
 fn daemon_network_environment_watch_enabled() -> bool {
@@ -169,7 +345,6 @@ fn daemon_network_environment_watch_enabled_for(value: Option<&str>, is_linux: b
 }
 
 struct DaemonNetworkEnvironmentWatch {
-    notify: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -195,8 +370,6 @@ async fn start_daemon_network_environment_watch(
         "sinomo {label} network environment watcher initialized with {} interface(s)",
         initial.interfaces.len()
     );
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let task_notify = Arc::clone(&notify);
     let task_label = label.to_string();
     let task = tokio::spawn(async move {
         loop {
@@ -215,11 +388,12 @@ async fn start_daemon_network_environment_watch(
                 update.diff.removed.len(),
                 update.diff.modified.len()
             );
-            crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh();
-            task_notify.notify_one();
+            request_daemon_cluster_maintenance(
+                DaemonClusterMaintenanceReason::NetworkEnvironmentChanged,
+            );
         }
     });
-    Some(DaemonNetworkEnvironmentWatch { notify, task })
+    Some(DaemonNetworkEnvironmentWatch { task })
 }
 
 fn daemon_sandbox_lifecycle_recovery_state_dir(paths: &DaemonPaths) -> PathBuf {
@@ -885,31 +1059,14 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     }
     let daemon_runtime = crate::build_daemon_async_runtime_with_profile(label, execution_profile)?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
-    if daemon_role_owns_default_dfs(label) {
-        // Both process-lifetime locks are held and no listener or background
-        // service exists yet, so a prior local daemon session cannot still be
-        // mutating DFS metadata. Failure leaves the latch intact and placement
-        // blocked; the mandatory lifecycle retries once quorum is available.
-        if let Err(error) =
-            recover_prior_process_default_dfs_placement_authority(&paths, &daemon_runtime_handle)
-        {
-            tracing::warn!(
-                target: "sinomo.dfs.placement",
-                "prior-process SIFS placement authority recovery deferred: {error}"
-            );
-        }
-    }
+    // Identity-bound background work must use the immutable identity captured
+    // at process startup. Init/join/leave replace the process after responding;
+    // a daemon that started unclustered must never adopt the new disk identity.
+    let startup_cluster_runtime_enabled = cluster.is_some();
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = daemon_runtime.block_on(
         sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
     )?;
-    if daemon_role_owns_default_dfs(label) {
-        // The daemon lock above is the exclusive lifecycle boundary. Reopen
-        // the process-global coordinator only after that lock is held so stale
-        // scheduling hints from an earlier embedded/test generation are safe
-        // to discard.
-        daemon_cluster_kv_maintenance_coordinator().start_generation();
-    }
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_signal = shutdown_tx.clone();
     let mut runtime_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -987,55 +1144,67 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         }
     }
 
-    if let Some(task) = crate::cluster::start_daemon_network_module_context_task(
-        &paths,
-        &options,
-        cluster.as_ref(),
-        daemon_runtime_handle.clone(),
-        shutdown_rx.clone(),
-        label,
-    ) {
+    if startup_cluster_runtime_enabled
+        && let Some(task) = crate::cluster::start_daemon_network_module_context_task(
+            &paths,
+            &options,
+            cluster.as_ref(),
+            daemon_runtime_handle.clone(),
+            shutdown_rx.clone(),
+            label,
+        )
+    {
         runtime_tasks.push(("network module context", task));
     }
 
-    runtime_tasks.push((
-        "tcp tunnel maintenance",
-        crate::tcp_tunnel::start_tcp_tunnel_maintenance_task(
-            paths.clone(),
-            daemon_runtime_handle.clone(),
-            shutdown_rx.clone(),
-            label.to_string(),
-        ),
-    ));
+    if startup_cluster_runtime_enabled {
+        let startup_cluster = cluster
+            .as_ref()
+            .expect("clustered startup has captured daemon identity");
+        runtime_tasks.push((
+            "tcp tunnel maintenance",
+            crate::tcp_tunnel::start_tcp_tunnel_maintenance_task(
+                paths.clone(),
+                daemon_runtime_handle.clone(),
+                shutdown_rx.clone(),
+                label.to_string(),
+                startup_cluster.cluster_id.clone(),
+                startup_cluster.node_id.clone(),
+            )?,
+        ));
+    }
 
-    if daemon_role_owns_default_dfs(label) {
+    let mut default_dfs_reconciliation =
+        if daemon_role_owns_default_dfs(label) && startup_cluster_runtime_enabled {
+            let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+            let startup_cluster = cluster
+                .as_ref()
+                .expect("clustered default DFS startup has captured daemon identity");
+            Some(crate::dfs::DaemonDefaultDfsReconciliationReactor::new(
+                &cluster_paths,
+                &startup_cluster.node_id,
+            )?)
+        } else {
+            None
+        };
+    if let Some(reactor) = default_dfs_reconciliation.as_mut() {
+        // A settled solo node has no peer whose later publication can repair
+        // missing DFS placement. Consume this reactor's dirty startup
+        // generation before serving, then retain the same observed generation
+        // in the background task below. Multi-member nodes start the task
+        // dirty after the service host is ready so joining bridges can serve
+        // membership traffic while quorum becomes reachable.
         if daemon_default_dfs_bootstrap_must_complete_before_serving(&paths, label)? {
-            daemon_runtime.block_on(ensure_default_distributed_dfs_async_on_runtime(
+            let startup_cluster = cluster
+                .as_ref()
+                .expect("clustered default DFS startup has captured daemon identity");
+            daemon_runtime.block_on(reactor.reconcile_startup_until_idle_async(
                 &paths,
                 &options,
-                true,
-                daemon_runtime_handle.clone(),
+                &startup_cluster.cluster_id,
+                &startup_cluster.node_id,
+                &daemon_runtime_handle,
             ))?;
-        } else {
-            let bootstrap_paths = paths.clone();
-            let bootstrap_options = options.clone();
-            let bootstrap_label = label.to_string();
-            let bootstrap_runtime = daemon_runtime_handle.clone();
-            let bootstrap_task = daemon_runtime_handle.spawn(async move {
-                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
-                    &bootstrap_paths,
-                    &bootstrap_options,
-                    false,
-                    bootstrap_runtime,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "sinomo {bootstrap_label} distributed DFS bootstrap failed: {error}"
-                    );
-                }
-            });
-            runtime_tasks.push(("distributed DFS bootstrap", bootstrap_task));
         }
     }
 
@@ -1060,6 +1229,40 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     let maintenance_idle_stats = idle_stats.clone();
     let maintenance_service_registry = service_host.service_registry_snapshot_store();
     let maintenance_runtime = daemon_runtime_handle.clone();
+    let maintenance_startup_cluster = cluster.clone();
+    // A daemon that started without cluster identity is intentionally short-lived
+    // after a successful join. Its replacement owns distributed DFS maintenance;
+    // the stale process must not acquire a backend generation while draining.
+    let maintenance_default_dfs_enabled =
+        daemon_role_owns_default_dfs(label) && startup_cluster_runtime_enabled;
+    if let Some(reactor) = default_dfs_reconciliation.take() {
+        let startup_cluster = cluster
+            .as_ref()
+            .expect("default DFS reactor has captured daemon identity");
+        runtime_tasks.push((
+            "default DFS reconciliation",
+            daemon_runtime_handle.spawn(crate::dfs::run_daemon_default_dfs_reconciliation_reactor(
+                reactor,
+                paths.clone(),
+                options.clone(),
+                startup_cluster.cluster_id.clone(),
+                startup_cluster.node_id.clone(),
+                daemon_runtime_handle.clone(),
+                shutdown_rx.clone(),
+            )),
+        ));
+    }
+    if daemon_rollout_telemetry_enabled(label, startup_cluster_runtime_enabled) {
+        let reactor = crate::rollout::DaemonRolloutTelemetryReactor::new(&paths)?;
+        runtime_tasks.push((
+            "rollout telemetry reconciliation",
+            daemon_runtime_handle.spawn(reactor.run_until_stopped_async(
+                paths.clone(),
+                shutdown_rx.clone(),
+                label.to_string(),
+            )),
+        ));
+    }
     runtime_tasks.push((
         "background maintenance",
         daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
@@ -1069,7 +1272,9 @@ pub fn run_daemon_control_loop_with_services_and_profile(
             maintenance_idle_stats,
             maintenance_service_registry,
             maintenance_runtime,
-            execution_profile,
+            maintenance_startup_cluster,
+            startup_cluster_runtime_enabled,
+            maintenance_default_dfs_enabled,
             shutdown_rx.clone(),
         )),
     ));
@@ -1085,10 +1290,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         shutdown_rx.clone(),
     ))?;
     let _ = shutdown_signal.send(true);
-    if daemon_role_owns_default_dfs(label) {
-        let _ = daemon_cluster_kv_maintenance_coordinator().shutdown();
-        daemon_cluster_maintenance_notify().notify_waiters();
-    }
+    daemon_cluster_maintenance_notify().notify_waiters();
     for (task_label, task) in runtime_tasks {
         join_daemon_runtime_task(
             &daemon_runtime,
@@ -1119,6 +1321,20 @@ pub fn run_daemon_control_loop_with_services_and_profile(
             "pid": std::process::id(),
         }),
     );
+    match daemon_data_dir_path(&paths) {
+        Ok(data_dir_root) => {
+            if let Err(error) =
+                sinomo_observe::persist_active_observe_network_timeline(&data_dir_root)
+            {
+                tracing::warn!(
+                    "sinomo {label} network timeline shutdown artifact was not preserved: {error}"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            "sinomo {label} network timeline shutdown artifact root was unavailable: {error}"
+        ),
+    }
     daemon_runtime.shutdown_timeout(DAEMON_RUNTIME_SHUTDOWN_TIMEOUT);
     Ok(())
 }
@@ -1129,15 +1345,6 @@ fn join_daemon_runtime_task(
     task: tokio::task::JoinHandle<()>,
     abort_first: bool,
 ) {
-    if daemon_runtime_task_requires_completion_join(label) {
-        match runtime.block_on(task) {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::warn!("sinomo daemon {label} task stopped with error: {error}");
-            }
-        }
-        return;
-    }
     let abort_handle = task.abort_handle();
     if abort_first {
         abort_handle.abort();
@@ -1168,10 +1375,6 @@ fn daemon_runtime_task_join_timeout(label: &str) -> Duration {
 }
 
 fn daemon_runtime_task_abort_before_join(label: &str) -> bool {
-    matches!(label, "distributed DFS bootstrap")
-}
-
-fn daemon_runtime_task_requires_completion_join(label: &str) -> bool {
     label == "background maintenance"
 }
 
@@ -1207,7 +1410,7 @@ fn daemon_dfs_maintenance_member_phase(state: &sinomo_core::ClusterBootstrapStat
     // membership would otherwise make later ranks collide at the interval cap.
     let slot_nanos = DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT
         .as_nanos()
-        .min(DAEMON_DFS_MAINTENANCE_INTERVAL.as_nanos() / member_count);
+        .min(DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW.as_nanos() / member_count);
     let phase_nanos = slot_nanos.saturating_mul(rank);
     Duration::from_nanos(u64::try_from(phase_nanos).unwrap_or(u64::MAX))
 }
@@ -1225,17 +1428,58 @@ fn daemon_dfs_initial_maintenance_phase(paths: &DaemonPaths) -> Result<Duration,
 fn spawn_daemon_dfs_maintenance_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
-) -> tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>> {
-    tokio::spawn(run_daemon_dfs_maintenance_tick_in_blocking_task(
-        paths, runtime,
+) -> OwnedDaemonDfsMaintenanceTask {
+    OwnedDaemonDfsMaintenanceTask::new(tokio::spawn(
+        run_daemon_dfs_maintenance_tick_in_blocking_task(paths, runtime),
     ))
 }
 
-async fn join_daemon_dfs_maintenance_task(
-    task: tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
+struct OwnedDaemonDfsMaintenanceTask {
+    task: Option<tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>>,
+}
+
+impl OwnedDaemonDfsMaintenanceTask {
+    fn new(
+        task: tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
+    ) -> Self {
+        Self { task: Some(task) }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn join(&mut self, label: &str) -> Option<DaemonDfsMaintenanceTickOutcome> {
+        let result = match self.task.as_mut() {
+            Some(task) => task.await,
+            None => return None,
+        };
+        self.task.take();
+        daemon_dfs_maintenance_task_result(result, label)
+    }
+}
+
+impl Drop for OwnedDaemonDfsMaintenanceTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // The background-maintenance parent is deliberately abort-first
+            // so daemon replacement remains bounded. Explicitly abort its DFS
+            // child on cancellation instead of detaching it. A spawn_blocking
+            // section already in progress cannot be preempted by Tokio, but it
+            // retains the exclusive data-owner lock until the synchronous work
+            // exits, preventing a replacement generation from overlapping it.
+            task.abort();
+        }
+    }
+}
+
+fn daemon_dfs_maintenance_task_result(
+    result: Result<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>, tokio::task::JoinError>,
     label: &str,
 ) -> Option<DaemonDfsMaintenanceTickOutcome> {
-    match task.await {
+    match result {
         Ok(Ok(outcome)) => Some(outcome),
         Ok(Err(error)) => {
             tracing::warn!("sinomo {label} DFS maintenance tick failed: {error}");
@@ -1248,10 +1492,18 @@ async fn join_daemon_dfs_maintenance_task(
     }
 }
 
+#[cfg(test)]
+async fn join_daemon_dfs_maintenance_task(
+    task: tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
+    label: &str,
+) -> Option<DaemonDfsMaintenanceTickOutcome> {
+    daemon_dfs_maintenance_task_result(task.await, label)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DaemonDfsMaintenanceProbeDecision {
     trigger_maintenance: bool,
-    next_probe_at: Instant,
+    next_probe_at: Option<Instant>,
 }
 
 fn daemon_dfs_maintenance_probe_decision(
@@ -1262,9 +1514,11 @@ fn daemon_dfs_maintenance_probe_decision(
     let Some(work) = work else {
         return DaemonDfsMaintenanceProbeDecision {
             trigger_maintenance: false,
-            next_probe_at: observed_at
-                .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
-                .unwrap_or(observed_at),
+            next_probe_at: Some(
+                observed_at
+                    .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
+                    .unwrap_or(observed_at),
+            ),
         };
     };
     let trigger_maintenance = work.should_trigger_background_maintenance();
@@ -1272,18 +1526,21 @@ fn daemon_dfs_maintenance_probe_decision(
         // A successful maintenance pass performs its own follow-up probe. Keep
         // the short safety deadline in case the request is cancelled before a
         // pass starts or completes.
-        DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL
+        Some(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
     } else {
-        work.next_repair_retry_unix_nanos
+        work.next_maintenance_deadline_unix_nanos()
             .map(|retry_at| Duration::from_nanos(retry_at.saturating_sub(observed_at_unix_nanos)))
-            .unwrap_or(DAEMON_DFS_MAINTENANCE_INTERVAL)
-            .min(DAEMON_DFS_MAINTENANCE_INTERVAL)
+            .into_iter()
+            .chain(
+                work.has_deferred_work()
+                    .then_some(DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL),
+            )
+            .min()
     };
     DaemonDfsMaintenanceProbeDecision {
         trigger_maintenance,
-        next_probe_at: observed_at
-            .checked_add(next_probe_delay)
-            .unwrap_or(observed_at),
+        next_probe_at: next_probe_delay
+            .map(|delay| observed_at.checked_add(delay).unwrap_or(observed_at)),
     }
 }
 
@@ -1308,7 +1565,7 @@ fn daemon_dfs_maintenance_completion_decision(
 fn daemon_dfs_failed_maintenance_decision(
     observed_at: Instant,
     triggered_maintenance_requested: bool,
-    next_probe_at: Instant,
+    next_probe_at: Option<Instant>,
 ) -> DaemonDfsMaintenanceProbeDecision {
     let error_retry_at = observed_at
         .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
@@ -1319,28 +1576,36 @@ fn daemon_dfs_failed_maintenance_decision(
         // A notification is a request to inspect pending work, not proof that
         // a full pass is required. Preserve an already-due notification probe
         // across task failure while retaining the bounded error retry.
-        next_probe_at: next_probe_at.min(error_retry_at),
+        next_probe_at: Some(
+            next_probe_at
+                .map(|next_probe_at| next_probe_at.min(error_retry_at))
+                .unwrap_or(error_retry_at),
+        ),
     }
 }
 
 fn daemon_dfs_maintenance_notification_decision(
     observed_at: Instant,
     triggered_maintenance_requested: bool,
-    next_probe_at: Instant,
+    next_probe_at: Option<Instant>,
 ) -> DaemonDfsMaintenanceProbeDecision {
     // Notifications are edge-triggered hints from several sources, including
     // generic cluster refreshes and replicated metadata. They must wake the
     // classifier, not bypass it and launch a full metadata pass directly.
     DaemonDfsMaintenanceProbeDecision {
         trigger_maintenance: triggered_maintenance_requested,
-        next_probe_at: next_probe_at.min(observed_at),
+        next_probe_at: Some(
+            next_probe_at
+                .map(|next_probe_at| next_probe_at.min(observed_at))
+                .unwrap_or(observed_at),
+        ),
     }
 }
 
 fn apply_daemon_dfs_maintenance_probe_result(
     work: Option<DaemonDfsPendingMaintenanceWork>,
     triggered_maintenance_requested: &mut bool,
-    next_probe_at: &mut Instant,
+    next_probe_at: &mut Option<Instant>,
 ) {
     let decision =
         daemon_dfs_maintenance_probe_decision(Instant::now(), daemon_dfs_now_unix_nanos(), work);
@@ -1348,32 +1613,27 @@ fn apply_daemon_dfs_maintenance_probe_result(
     *next_probe_at = decision.next_probe_at;
 }
 
-fn daemon_dfs_maintenance_probe_is_due(now: Instant, next_probe_at: Instant) -> bool {
-    now >= next_probe_at
-}
-
-fn daemon_dfs_periodic_maintenance_is_due(
-    now: Instant,
-    initial_not_before: Instant,
-    last_maintenance: Instant,
-) -> bool {
-    now >= initial_not_before
-        && now.saturating_duration_since(last_maintenance) >= DAEMON_DFS_MAINTENANCE_INTERVAL
+fn daemon_dfs_maintenance_probe_is_due(now: Instant, next_probe_at: Option<Instant>) -> bool {
+    next_probe_at.is_some_and(|next_probe_at| now >= next_probe_at)
 }
 
 fn daemon_dfs_maintenance_should_launch(
-    periodic_due: bool,
     triggered_due: bool,
     triggered_work_revalidated: bool,
 ) -> bool {
-    periodic_due || (triggered_due && triggered_work_revalidated)
+    triggered_due && triggered_work_revalidated
 }
 
-fn daemon_rollout_telemetry_interval(execution_profile: crate::DaemonExecutionProfile) -> Duration {
-    match execution_profile {
-        crate::DaemonExecutionProfile::Standard => DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
-        crate::DaemonExecutionProfile::Mobile => DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL,
-    }
+fn daemon_rollout_telemetry_enabled(label: &str, maintain_cluster_runtime: bool) -> bool {
+    label == "daemon" && maintain_cluster_runtime
+}
+
+#[cfg(feature = "sandbox")]
+fn daemon_sandbox_lifecycle_maintenance_allowed(
+    label: &str,
+    startup_cluster_maintenance_attempted: bool,
+) -> bool {
+    label == "daemon" && startup_cluster_maintenance_attempted
 }
 
 async fn run_daemon_background_maintenance_loop(
@@ -1383,18 +1643,42 @@ async fn run_daemon_background_maintenance_loop(
     idle_stats: Arc<crate::IdleStatsAtomics>,
     service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     runtime: tokio::runtime::Handle,
-    execution_profile: crate::DaemonExecutionProfile,
+    startup_cluster: Option<DaemonClusterStatus>,
+    maintain_cluster_runtime: bool,
+    maintain_default_dfs: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone())
         .await
         .with_service_registry(service_registry);
+    let desired_rollout_task = if maintain_cluster_runtime && daemon_paths_are_shadow(&paths) {
+        match cluster_paths_from_daemon_paths(&paths).and_then(|cluster_paths| {
+            DaemonDesiredRolloutReactor::new(&cluster_paths).map(|reactor| (cluster_paths, reactor))
+        }) {
+            Ok((cluster_paths, reactor)) => {
+                let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+                let reactor_paths = paths.clone();
+                let reactor_runtime = runtime.clone();
+                let task = runtime.spawn(reactor.run_until_stopped_async(
+                    reactor_paths,
+                    cluster_paths,
+                    reactor_runtime,
+                    stop_rx,
+                ));
+                Some((stop_tx, task))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "sinomo {label} could not initialize the durable rollout watch: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let maintenance_started = std::time::Instant::now();
-    let mut last_cluster_kv_reactive_maintenance = maintenance_started
-        .checked_sub(DAEMON_CLUSTER_KV_REACTIVE_MAINTENANCE_INTERVAL)
-        .unwrap_or(maintenance_started);
-    let rollout_telemetry_interval = daemon_rollout_telemetry_interval(execution_profile);
-    let initial_dfs_maintenance_phase = if daemon_role_owns_default_dfs(&label) {
+    let initial_dfs_maintenance_phase = if maintain_default_dfs {
         let phase_paths = paths.clone();
         match tokio::task::spawn_blocking(move || {
             daemon_dfs_initial_maintenance_phase(&phase_paths)
@@ -1416,46 +1700,69 @@ async fn run_daemon_background_maintenance_loop(
     } else {
         Duration::ZERO
     };
-    let initial_dfs_maintenance_elapsed =
-        DAEMON_DFS_MAINTENANCE_INTERVAL.saturating_sub(initial_dfs_maintenance_phase);
     let initial_dfs_maintenance_not_before = maintenance_started
         .checked_add(initial_dfs_maintenance_phase)
         .unwrap_or(maintenance_started);
     let mut last_dfs_maintenance = maintenance_started
-        .checked_sub(initial_dfs_maintenance_elapsed)
+        .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
         .unwrap_or(maintenance_started);
     // Probe once immediately after startup. Successful quiet probes choose an
     // adaptive next deadline; only probe failures retain the short safety
     // retry cadence.
-    let mut next_dfs_maintenance_probe = maintenance_started;
-    let mut last_rollout_telemetry = maintenance_started
-        .checked_sub(rollout_telemetry_interval)
-        .unwrap_or(maintenance_started);
+    let mut next_dfs_maintenance_probe = Some(maintenance_started);
     #[cfg(feature = "sandbox")]
     let mut last_sandbox_lifecycle_maintenance = maintenance_started
         .checked_sub(DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL)
         .unwrap_or(maintenance_started);
+    // A clustered replacement must publish its startup liveness before broad
+    // sandbox recovery can consume a transport timeout reaching DFS peers.
+    // Unclustered daemons retain the existing immediate recovery opportunity.
+    #[cfg(feature = "sandbox")]
+    let mut startup_cluster_maintenance_attempted = !maintain_cluster_runtime;
     let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
     let cluster_maintenance_notify = daemon_cluster_maintenance_notify();
-    let network_environment_watch = if label == "daemon" {
+    let network_environment_watch = if label == "daemon" && maintain_cluster_runtime {
         start_daemon_network_environment_watch(&label, shutdown_rx.clone()).await
     } else {
         None
     };
     let mut dfs_triggered_maintenance_requested = false;
-    let mut dfs_maintenance_task: Option<
-        tokio::task::JoinHandle<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
-    > = None;
-
-    if label == "daemon" {
-        request_daemon_cluster_kv_maintenance(
-            sinomo_core::cluster::ClusterKvMaintenanceWakeSource::DaemonStartup,
-        );
-    }
+    let mut dfs_maintenance_task: Option<OwnedDaemonDfsMaintenanceTask> = None;
 
     loop {
         if daemon_shutdown_requested(&shutdown_rx) {
             break;
+        }
+        if maintain_cluster_runtime {
+            match daemon_cluster_identity_matches_startup(&paths, startup_cluster.as_ref()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        "sinomo {label} background maintenance stopped after daemon identity changed"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    // Identity-bound work must fail closed while the durable
+                    // state is unreadable, but an I/O or decode failure is not
+                    // evidence that a replacement daemon owns this process.
+                    // Retry instead of silently abandoning all cluster and DFS
+                    // maintenance for the remainder of the daemon lifetime.
+                    tracing::warn!(
+                        "sinomo {label} background maintenance deferred while startup identity could not be verified: {error}"
+                    );
+                    let retry = tokio::select! {
+                        _ = tokio::time::sleep(DAEMON_CLUSTER_TICK_INTERVAL) => true,
+                        changed = shutdown_rx.changed() => {
+                            changed.is_ok() && !daemon_shutdown_requested(&shutdown_rx)
+                        }
+                    };
+                    if !retry {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
 
         if label == "daemon" {
@@ -1499,9 +1806,11 @@ async fn run_daemon_background_maintenance_loop(
         }
 
         #[cfg(feature = "sandbox")]
-        if label == "daemon"
-            && last_sandbox_lifecycle_maintenance.elapsed()
-                >= DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL
+        if daemon_sandbox_lifecycle_maintenance_allowed(
+            &label,
+            startup_cluster_maintenance_attempted,
+        ) && last_sandbox_lifecycle_maintenance.elapsed()
+            >= DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL
         {
             let lifecycle_paths = paths.clone();
             let lifecycle_runtime = runtime.clone();
@@ -1530,13 +1839,12 @@ async fn run_daemon_background_maintenance_loop(
 
         if dfs_maintenance_task
             .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+            .is_some_and(OwnedDaemonDfsMaintenanceTask::is_finished)
         {
-            let completed_task = dfs_maintenance_task
+            let mut completed_task = dfs_maintenance_task
                 .take()
                 .expect("finished DFS maintenance task exists");
-            let completed_outcome =
-                join_daemon_dfs_maintenance_task(completed_task, label.as_str()).await;
+            let completed_outcome = completed_task.join(label.as_str()).await;
             match completed_outcome {
                 Some(outcome) => {
                     let probe_paths = paths.clone();
@@ -1592,19 +1900,10 @@ async fn run_daemon_background_maintenance_loop(
                 };
         }
 
-        if daemon_role_owns_default_dfs(&label)
+        if maintain_default_dfs
             && dfs_maintenance_task.is_none()
             && !dfs_triggered_maintenance_requested
             && daemon_dfs_maintenance_probe_is_due(Instant::now(), next_dfs_maintenance_probe)
-            // When the safety probe and the full periodic pass are due
-            // together, let the pass run first. Its completion probe observes
-            // the resulting durable state without an immediately redundant
-            // full metadata scan.
-            && !daemon_dfs_periodic_maintenance_is_due(
-                Instant::now(),
-                initial_dfs_maintenance_not_before,
-                last_dfs_maintenance,
-            )
         {
             let probe_paths = paths.clone();
             let work = match tokio::task::spawn_blocking(move || {
@@ -1634,64 +1933,44 @@ async fn run_daemon_background_maintenance_loop(
         }
 
         let maintenance_launch_now = Instant::now();
-        let mut dfs_periodic_maintenance_due = daemon_dfs_periodic_maintenance_is_due(
-            maintenance_launch_now,
-            initial_dfs_maintenance_not_before,
-            last_dfs_maintenance,
-        );
         let dfs_triggered_maintenance_due = dfs_triggered_maintenance_requested
             && maintenance_launch_now >= initial_dfs_maintenance_not_before
             && maintenance_launch_now.saturating_duration_since(last_dfs_maintenance)
                 >= DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
-        if daemon_role_owns_default_dfs(&label)
-            && dfs_maintenance_task.is_none()
-            && (dfs_periodic_maintenance_due || dfs_triggered_maintenance_due)
-        {
-            if dfs_triggered_maintenance_due && !dfs_periodic_maintenance_due {
-                // A trigger is a durable-work classification observed at an
-                // earlier point in time. Revalidate it at the launch boundary
-                // so a transient state produced around the previous pass cannot
-                // remain latched for the entire minimum interval and start an
-                // otherwise unnecessary broad metadata scan.
-                let probe_paths = paths.clone();
-                let work = match tokio::task::spawn_blocking(move || {
-                    daemon_dfs_pending_maintenance_work(&probe_paths)
-                })
-                .await
-                {
-                    Ok(Ok(work)) => Some(work),
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            "sinomo {label} DFS maintenance pre-launch probe failed: {error}"
-                        );
-                        None
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "sinomo {label} DFS maintenance pre-launch probe task failed: {error}"
-                        );
-                        None
-                    }
-                };
-                apply_daemon_dfs_maintenance_probe_result(
-                    work,
-                    &mut dfs_triggered_maintenance_requested,
-                    &mut next_dfs_maintenance_probe,
-                );
-                // The inspection is normally cheap, but it can cross the
-                // mandatory periodic deadline under storage pressure. Observe
-                // that boundary again before deciding whether to launch.
-                dfs_periodic_maintenance_due = daemon_dfs_periodic_maintenance_is_due(
-                    Instant::now(),
-                    initial_dfs_maintenance_not_before,
-                    last_dfs_maintenance,
-                );
-            }
+        if maintain_default_dfs && dfs_maintenance_task.is_none() && dfs_triggered_maintenance_due {
+            // A trigger is a durable-work classification observed at an
+            // earlier point in time. Revalidate it at the launch boundary so
+            // resolved work never acquires the broad DFS service lane or its
+            // distributed maintenance lease.
+            let probe_paths = paths.clone();
+            let work = match tokio::task::spawn_blocking(move || {
+                daemon_dfs_pending_maintenance_work(&probe_paths)
+            })
+            .await
+            {
+                Ok(Ok(work)) => Some(work),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "sinomo {label} DFS maintenance pre-launch probe failed: {error}"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "sinomo {label} DFS maintenance pre-launch probe task failed: {error}"
+                    );
+                    None
+                }
+            };
+            apply_daemon_dfs_maintenance_probe_result(
+                work,
+                &mut dfs_triggered_maintenance_requested,
+                &mut next_dfs_maintenance_probe,
+            );
             if daemon_shutdown_requested(&shutdown_rx) {
                 break;
             }
             if daemon_dfs_maintenance_should_launch(
-                dfs_periodic_maintenance_due,
                 dfs_triggered_maintenance_due,
                 dfs_triggered_maintenance_requested,
             ) {
@@ -1707,149 +1986,87 @@ async fn run_daemon_background_maintenance_loop(
             break;
         }
 
-        if label == "daemon"
-            && last_cluster_kv_reactive_maintenance.elapsed()
-                >= DAEMON_CLUSTER_KV_REACTIVE_MAINTENANCE_INTERVAL
-        {
-            request_daemon_cluster_kv_maintenance(
-                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::PeriodicOpportunity,
+        if maintain_cluster_runtime {
+            let cluster_network_phase_started = Instant::now();
+            let mut tick_observation = DaemonClusterNetworkMaintenanceSubphaseObservation::start(
+                DaemonClusterNetworkMaintenanceSubphase::TickPlan,
             );
-        }
-        let reactive_kv_wake = (label == "daemon")
-            .then(|| daemon_cluster_kv_maintenance_coordinator().take_pending_batch_if_due())
-            .flatten();
-        let had_reactive_kv_wake = reactive_kv_wake.is_some();
-        let mut reactive_kv_pass_outcome =
-            sinomo_core::cluster::ClusterKvMaintenancePassOutcome::Completed;
-        let cluster_network_phase = async {
-            let pending_work_deadline = Instant::now()
-                .checked_add(
-                    DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT
-                        .saturating_sub(Duration::from_millis(500)),
-                )
-                .unwrap_or_else(Instant::now);
-            if let Some(wake) = reactive_kv_wake {
-                match cluster_network
-                    .run_reactive_cluster_kv_maintenance_async(&paths, wake, runtime.clone())
-                    .await
-                {
-                    Ok(Some(report)) => {
-                        reactive_kv_pass_outcome = report.pass_outcome();
-                        for item in report.evidence {
-                            match item.disposition {
-                                sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::Failed
-                                | sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::TimedOut => {
-                                    tracing::warn!(
-                                        step = ?item.step,
-                                        code = item.code,
-                                        detail = item.detail,
-                                        "sinomo {label} reactive cluster KV maintenance step did not complete"
-                                    );
-                                }
-                                _ => {
-                                    tracing::debug!(
-                                        step = ?item.step,
-                                        disposition = ?item.disposition,
-                                        code = item.code,
-                                        detail = item.detail,
-                                        "sinomo {label} reactive cluster KV maintenance evidence"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        reactive_kv_pass_outcome =
-                            sinomo_core::cluster::ClusterKvMaintenancePassOutcome::RetryableFailure;
-                        tracing::warn!(
-                            "sinomo {label} reactive cluster KV maintenance failed: {error}"
-                        );
-                    }
-                }
-            }
-            match cluster_network
-                .tick_async(&paths, &options, runtime.clone())
-                .await
-            {
-                Ok(pending_work) => {
-                    if let Some(pending_work) = pending_work {
-                        cluster_network
-                            .run_pending_work_until_async(
-                                pending_work,
-                                runtime.clone(),
-                                pending_work_deadline,
-                            )
-                            .await;
-                    }
-                }
-                Err(error) => {
+            let Some(tick_result) = wait_for_daemon_maintenance_or_shutdown(
+                tokio::time::timeout(
+                    DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT,
+                    cluster_network.tick_async(&paths, &options, runtime.clone()),
+                ),
+                &mut shutdown_rx,
+            )
+            .await
+            else {
+                break;
+            };
+            let (pending_work, tick_timed_out) = match tick_result {
+                Ok(Ok(pending_work)) => (pending_work, false),
+                Ok(Err(error)) => {
+                    cluster_network.record_active_tick_plan_failure(Instant::now());
                     tracing::warn!("sinomo {label} cluster network tick failed: {error}");
+                    (None, false)
                 }
+                Err(_) => {
+                    cluster_network.record_active_tick_plan_failure(Instant::now());
+                    tracing::warn!(
+                        "sinomo {label} cluster network tick planning timed out after {}ms",
+                        DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT.as_millis()
+                    );
+                    (None, true)
+                }
+            };
+            tick_observation.complete(Some(pending_work.is_some()));
+            drop(tick_observation);
+
+            // The first bounded network pass has now had its opportunity to
+            // publish node status. Restore the ordinary sandbox recovery
+            // cadence even when planning was partial or timed out.
+            #[cfg(feature = "sandbox")]
+            {
+                startup_cluster_maintenance_attempted = true;
             }
-        };
-        let cluster_network_phase_timed_out = tokio::time::timeout(
-            DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT,
-            cluster_network_phase,
-        )
-        .await
-        .is_err();
-        if cluster_network_phase_timed_out {
-            tracing::warn!(
-                "sinomo {label} cluster network maintenance timed out after {}ms",
-                DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT.as_millis()
+
+            if let Some(pending_work) = pending_work {
+                let pending_work_deadline = Instant::now()
+                    .checked_add(
+                        DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT
+                            .saturating_sub(Duration::from_millis(500)),
+                    )
+                    .unwrap_or_else(Instant::now);
+                let mut pending_work_observation =
+                    DaemonClusterNetworkMaintenanceSubphaseObservation::start(
+                        DaemonClusterNetworkMaintenanceSubphase::PendingWork,
+                    );
+                let Some(()) = wait_for_daemon_maintenance_or_shutdown(
+                    cluster_network.run_pending_work_until_async(
+                        pending_work,
+                        runtime.clone(),
+                        pending_work_deadline,
+                    ),
+                    &mut shutdown_rx,
+                )
+                .await
+                else {
+                    break;
+                };
+                pending_work_observation.complete(Some(true));
+            }
+
+            observe_cluster_network_maintenance_phase(
+                if tick_timed_out {
+                    DaemonClusterNetworkMaintenancePhaseDisposition::TimedOut
+                } else {
+                    DaemonClusterNetworkMaintenancePhaseDisposition::Completed
+                },
+                cluster_network_phase_started.elapsed(),
             );
-            cluster_network.request_network_environment_refresh(Instant::now());
-        }
-        if had_reactive_kv_wake {
-            if cluster_network_phase_timed_out {
-                reactive_kv_pass_outcome =
-                    sinomo_core::cluster::ClusterKvMaintenancePassOutcome::RetryableFailure;
-            }
-            if reactive_kv_pass_outcome
-                == sinomo_core::cluster::ClusterKvMaintenancePassOutcome::RetryableFailure
-            {
-                request_daemon_cluster_kv_maintenance(
-                    sinomo_core::cluster::ClusterKvMaintenanceWakeSource::PeriodicOpportunity,
-                );
-            }
-            use sinomo_core::cluster::ClusterKvMaintenanceWorkerDisposition;
-            if daemon_cluster_kv_maintenance_coordinator().finish_pass(reactive_kv_pass_outcome)
-                == ClusterKvMaintenanceWorkerDisposition::ContinueAfterYield
-                && daemon_cluster_kv_maintenance_coordinator()
-                    .retry_delay()
-                    .is_none()
-            {
-                daemon_cluster_maintenance_notify().notify_one();
-            }
-            last_cluster_kv_reactive_maintenance = Instant::now();
         }
 
         if daemon_shutdown_requested(&shutdown_rx) {
             break;
-        }
-
-        if label == "daemon" && last_rollout_telemetry.elapsed() >= rollout_telemetry_interval {
-            let telemetry_paths = paths.clone();
-            match tokio::task::spawn_blocking(move || {
-                run_daemon_rollout_telemetry_maintenance_tick(&telemetry_paths)
-            })
-            .await
-            {
-                Ok(Ok(Some(applied))) => tracing::info!(
-                    "sinomo {label} rollout telemetry applied {:?} at {} bps",
-                    applied.transition.action,
-                    applied.transition.current_weight_bps
-                ),
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!("sinomo {label} rollout telemetry tick failed: {error}");
-                }
-                Err(error) => {
-                    tracing::warn!("sinomo {label} rollout telemetry task failed: {error}");
-                }
-            }
-            last_rollout_telemetry = std::time::Instant::now();
         }
 
         let sleep_started = Instant::now();
@@ -1871,7 +2088,7 @@ async fn run_daemon_background_maintenance_loop(
         } else {
             None
         };
-        let dfs_triggered_maintenance_due = if daemon_role_owns_default_dfs(&label)
+        let dfs_triggered_maintenance_due = if maintain_default_dfs
             && dfs_maintenance_task.is_none()
             && sleep_started >= initial_dfs_maintenance_not_before
             && dfs_triggered_maintenance_requested
@@ -1884,16 +2101,21 @@ async fn run_daemon_background_maintenance_loop(
         } else {
             None
         };
-        let dfs_maintenance_probe_due = if daemon_role_owns_default_dfs(&label)
+        let dfs_maintenance_probe_due = if maintain_default_dfs
             && dfs_maintenance_task.is_none()
             && !dfs_triggered_maintenance_requested
         {
-            Some(next_dfs_maintenance_probe.saturating_duration_since(sleep_started))
+            next_dfs_maintenance_probe
+                .map(|next_probe_at| next_probe_at.saturating_duration_since(sleep_started))
         } else {
             None
         };
         #[cfg(feature = "sandbox")]
-        let sandbox_lifecycle_maintenance_due = (label == "daemon").then(|| {
+        let sandbox_lifecycle_maintenance_due = daemon_sandbox_lifecycle_maintenance_allowed(
+            &label,
+            startup_cluster_maintenance_attempted,
+        )
+        .then(|| {
             daemon_maintenance_interval_remaining(
                 sleep_started,
                 last_sandbox_lifecycle_maintenance,
@@ -1902,43 +2124,22 @@ async fn run_daemon_background_maintenance_loop(
         });
         #[cfg(not(feature = "sandbox"))]
         let sandbox_lifecycle_maintenance_due = None;
-        // Do not let an already-due periodic timestamp collapse an in-flight
-        // pass to a 1ms spin. Give task completion its own bounded wakeup so a
-        // completed or deferred pass is observed promptly even when all other
-        // maintenance schedules are quiet.
+        // Give task completion its own bounded wakeup so a completed or
+        // deferred pass is observed promptly even when all other maintenance
+        // schedules are quiet.
         let dfs_maintenance_task_completion_due = dfs_maintenance_task
             .as_ref()
             .map(|_| DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
-        let dfs_schedule_anchor = if dfs_maintenance_task.is_some() {
-            sleep_started
-        } else {
-            last_dfs_maintenance
-        };
-        let mut sleep_duration = daemon_maintenance_sleep_duration(
+        let sleep_duration = daemon_maintenance_sleep_duration(
             sleep_started,
             cluster_network.next_due_duration(sleep_started),
-            dfs_schedule_anchor,
-            last_rollout_telemetry,
-            rollout_telemetry_interval,
             dfs_triggered_maintenance_due,
             dfs_maintenance_probe_due,
             dfs_maintenance_task_completion_due,
             shadow_finalization_due,
             sandbox_lifecycle_maintenance_due,
         );
-        let cluster_kv_retry_delay = (label == "daemon")
-            .then(|| daemon_cluster_kv_maintenance_coordinator().retry_delay())
-            .flatten();
-        // Keep retry timing inside the daemon's shutdown-aware select.
-        // Detached delay tasks could outlive this daemon generation and
-        // spuriously wake a later embedded/test generation.
-        sleep_duration =
-            daemon_cluster_kv_retry_sleep_duration(sleep_duration, cluster_kv_retry_delay);
-        let dfs_notify =
-            daemon_role_owns_default_dfs(&label).then(|| Arc::clone(&dfs_maintenance_notify));
-        let network_notify = network_environment_watch
-            .as_ref()
-            .map(|watch| Arc::clone(&watch.notify));
+        let dfs_notify = maintain_default_dfs.then(|| Arc::clone(&dfs_maintenance_notify));
         let cluster_notify = Some(Arc::clone(&cluster_maintenance_notify));
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
@@ -1956,33 +2157,78 @@ async fn run_daemon_background_maintenance_loop(
                 dfs_triggered_maintenance_requested = decision.trigger_maintenance;
                 next_dfs_maintenance_probe = decision.next_probe_at;
             }
-            _ = daemon_optional_notify(network_notify) => {
-                tracing::info!("sinomo {label} cluster maintenance refreshed after network environment change");
-                // Queue the KV convergence pass on the same worker that is
-                // already awake for network reconciliation. Do not emit a
-                // second notification: this loop owns the newly queued worker
-                // slot and will take the coalesced batch on its next pass.
-                let _ = queue_daemon_cluster_kv_maintenance_wake(
-                    daemon_cluster_kv_maintenance_coordinator(),
-                    sinomo_core::cluster::ClusterKvMaintenanceWakeSource::NetworkChange,
-                );
-                cluster_network.request_network_environment_refresh(Instant::now());
-            }
             _ = daemon_optional_notify(cluster_notify) => {
-                tracing::info!("sinomo {label} cluster maintenance refresh requested");
-                cluster_network.request_network_environment_refresh(Instant::now());
+                let dirty = take_daemon_cluster_maintenance_dirty();
+                tracing::info!(dirty, "sinomo {label} cluster maintenance refresh requested");
+                let now = Instant::now();
+                if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH != 0 {
+                    cluster_network.request_publish_refresh(now);
+                }
+                if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY != 0 {
+                    if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT != 0 {
+                        cluster_network.request_network_environment_refresh(now);
+                    } else {
+                        cluster_network.request_connectivity_refresh(now);
+                    }
+                }
+                if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY != 0 {
+                    cluster_network.request_discovery_refresh(now);
+                }
             }
         }
     }
-    // `JoinHandle::drop` detaches its task. A DFS pass may own the sole durable
-    // backend generation and may itself be awaiting nested blocking work, so a
-    // rollout/restart must not start a replacement daemon until this pass has
-    // released that generation.
-    if let Some(task) = dfs_maintenance_task {
-        let _ = join_daemon_dfs_maintenance_task(task, label.as_str()).await;
+    if let Some((stop_tx, task)) = desired_rollout_task {
+        let _ = stop_tx.send(true);
+        if let Err(error) = task.await {
+            tracing::warn!("sinomo {label} durable rollout watch task failed: {error}");
+        }
+    }
+    // Graceful shutdown drains a completed/cooperative pass. If the bounded
+    // outer shutdown aborts this future, `OwnedDaemonDfsMaintenanceTask::drop`
+    // explicitly aborts the async child, while any non-cancellable blocking
+    // section keeps the data-owner lock until it actually exits.
+    if let Some(mut task) = dfs_maintenance_task {
+        let _ = task.join(label.as_str()).await;
     }
     if let Some(watch) = network_environment_watch {
         let _ = watch.task.await;
+    }
+}
+
+fn daemon_cluster_identity_matches_startup(
+    paths: &DaemonPaths,
+    startup_cluster: Option<&DaemonClusterStatus>,
+) -> Result<bool, DaemonError> {
+    let Some(startup_cluster) = startup_cluster else {
+        return Ok(false);
+    };
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
+        Ok(state) => Ok(state.cluster_id == startup_cluster.cluster_id
+            && state.local_node_id == startup_cluster.node_id),
+        Err(sinomo_core::network::NetworkError::ClusterOrphan) => Ok(false),
+        Err(error) => Err(DaemonError::from(error)),
+    }
+}
+
+async fn wait_for_daemon_maintenance_or_shutdown<F>(
+    maintenance: F,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(maintenance);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || daemon_shutdown_requested(shutdown_rx) {
+                    return None;
+                }
+            }
+            result = &mut maintenance => return Some(result),
+        }
     }
 }
 
@@ -2081,6 +2327,9 @@ pub(crate) async fn handle_daemon_connection_async(
     // Raw framing is reserved for bootstrap handshakes. Consume the daemon
     // control wrapper at this ownership boundary so ordinary RPC code cannot
     // accidentally regain a generic raw-frame transport.
+    let raw_frame_started_ns = sinomo_core::network::network_timeline_capture_is_active()
+        .then(sinomo_core::network::network_timeline_monotonic_ns)
+        .unwrap_or(0);
     let mut stream = stream.into_inner();
     let request = match read_daemon_control_frame_async(&mut stream).await {
         Ok(request) => request,
@@ -2089,6 +2338,25 @@ pub(crate) async fn handle_daemon_connection_async(
             return Ok(false);
         }
     };
+    if let Some(timeline) =
+        sinomo_core::network::network_timeline_trace_context_for_request(&request)
+    {
+        sinomo_core::network::record_network_timeline_event_now(
+            sinomo_core::network::NetworkTimelineEvent::new(
+                timeline,
+                sinomo_core::network::network_timeline_stage::FRAME_INGRESS,
+                sinomo_core::network::network_timeline_flag::REQUEST
+                    | sinomo_core::network::network_timeline_flag::SUCCESS,
+                0,
+                0,
+                1,
+                u32::try_from(request.body.len()).unwrap_or(u32::MAX),
+                0,
+                sinomo_core::network::network_timeline_monotonic_ns()
+                    .saturating_sub(raw_frame_started_ns),
+            ),
+        );
+    }
     if request.route == sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE
         && request.category == sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
     {
@@ -2973,12 +3241,25 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
             elapsed_us = crate::tcp_tunnel::network_perf_trace_elapsed_us(started),
         );
     }
-    respond_result?;
+    finish_daemon_object_rpc_stream_response(&effective_route, stop, &paths, respond_result)
+}
+
+fn finish_daemon_object_rpc_stream_response(
+    effective_route: &str,
+    stop: bool,
+    paths: &DaemonPaths,
+    respond_result: Result<(), DaemonError>,
+) -> Result<bool, DaemonError> {
+    // Dispatch has already committed an identity-changing operation when it
+    // returns `stop`. Preserve the supervisor restart request even when the
+    // peer disconnects before receiving that committed response, then report
+    // the transport failure to the connection task.
     crate::service_adapter::mark_cluster_identity_restart_after_response(
-        &effective_route,
+        effective_route,
         stop,
-        Some(&paths),
+        Some(paths),
     );
+    respond_result?;
     Ok(stop)
 }
 
@@ -3261,10 +3542,7 @@ async fn handle_daemon_cluster_relay_session_async(
                 .await
             {
                 Ok(result) => Ok((
-                    sinomo_core::network::ObjectRpcSessionResponse::new(
-                        result.response,
-                        sinomo_core::network::ObjectRpcBodySource::from_incoming_body(result.body),
-                    ),
+                    result.into_relay_response().map_err(DaemonError::from)?,
                     false,
                     sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
                 )),
@@ -3345,23 +3623,13 @@ fn daemon_sleep_duration_or_min(duration: Duration) -> Duration {
     }
 }
 
-fn daemon_cluster_kv_retry_sleep_duration(
-    scheduled: Duration,
-    retry_delay: Option<Duration>,
-) -> Duration {
-    retry_delay.map_or(scheduled, |retry_delay| scheduled.min(retry_delay))
-}
-
 fn daemon_shutdown_requested(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
     *shutdown_rx.borrow()
 }
 
 fn daemon_maintenance_sleep_duration(
-    now: Instant,
+    _now: Instant,
     cluster_next_due: Duration,
-    last_dfs_maintenance: Instant,
-    last_rollout_telemetry: Instant,
-    rollout_telemetry_interval: Duration,
     dfs_triggered_maintenance_due: Option<Duration>,
     dfs_maintenance_probe_due: Option<Duration>,
     dfs_maintenance_task_completion_due: Option<Duration>,
@@ -3369,17 +3637,6 @@ fn daemon_maintenance_sleep_duration(
     sandbox_lifecycle_maintenance_due: Option<Duration>,
 ) -> Duration {
     let mut next_due = cluster_next_due;
-    next_due = next_due
-        .min(daemon_maintenance_interval_remaining(
-            now,
-            last_dfs_maintenance,
-            DAEMON_DFS_MAINTENANCE_INTERVAL,
-        ))
-        .min(daemon_maintenance_interval_remaining(
-            now,
-            last_rollout_telemetry,
-            rollout_telemetry_interval,
-        ));
     if let Some(dfs_triggered_maintenance_due) = dfs_triggered_maintenance_due {
         next_due = next_due.min(dfs_triggered_maintenance_due);
     }
@@ -5453,9 +5710,15 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
     Ok(dfs)
 }
 
-pub fn run_daemon_rollout_telemetry_maintenance_tick(
+#[derive(Debug)]
+pub(crate) struct DaemonRolloutTelemetryTickOutcome {
+    pub(crate) status: RolloutTelemetryAdvanceStatus,
+    pub(crate) applied_transition: Option<AppliedRolloutTransition>,
+}
+
+pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick(
     paths: &DaemonPaths,
-) -> Result<Option<AppliedRolloutTransition>, DaemonError> {
+) -> Result<DaemonRolloutTelemetryTickOutcome, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
     let rollout_paths = SelfRolloutPaths::new(&data_dir);
     let event_store = daemon_event_store(paths)?;
@@ -5469,17 +5732,23 @@ pub fn run_daemon_rollout_telemetry_maintenance_tick(
         &event_store,
         RolloutTelemetryAdvanceOptions::from(gate_config),
     )?;
-    let applied = match result.status {
-        RolloutTelemetryAdvanceStatus::AppliedTransition => result.applied_transition,
-        RolloutTelemetryAdvanceStatus::NoRuntimeState
-        | RolloutTelemetryAdvanceStatus::NoCandidate
-        | RolloutTelemetryAdvanceStatus::TerminalStage
-        | RolloutTelemetryAdvanceStatus::WaitingForTelemetry
-        | RolloutTelemetryAdvanceStatus::PromotionGateBlocked => None,
+    let status = result.status;
+    let applied_transition = if status == RolloutTelemetryAdvanceStatus::AppliedTransition {
+        result.applied_transition
+    } else {
+        None
     };
     publish_daemon_module_rollout_status_from_data_dir(&data_dir, &rollout_paths)?;
-    run_daemon_module_rollout_desired_reconciliation_tick(paths)?;
-    Ok(applied)
+    Ok(DaemonRolloutTelemetryTickOutcome {
+        status,
+        applied_transition,
+    })
+}
+
+pub fn run_daemon_rollout_telemetry_maintenance_tick(
+    paths: &DaemonPaths,
+) -> Result<Option<AppliedRolloutTransition>, DaemonError> {
+    Ok(run_daemon_rollout_telemetry_reconciliation_tick(paths)?.applied_transition)
 }
 
 fn publish_daemon_module_rollout_status_from_data_dir(
@@ -6091,60 +6360,97 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn network_change_and_raft_progress_wakes_share_one_coalesced_worker() {
-        use sinomo_core::cluster::{
-            ClusterKvMaintenanceCoordinator, ClusterKvMaintenanceWakeDisposition,
-            ClusterKvMaintenanceWakeSource,
-        };
-
-        let coordinator = ClusterKvMaintenanceCoordinator::new(4);
+    fn cluster_network_maintenance_observation_labels_are_bounded() {
         assert_eq!(
-            queue_daemon_cluster_kv_maintenance_wake(
-                &coordinator,
-                ClusterKvMaintenanceWakeSource::NetworkChange,
-            ),
-            ClusterKvMaintenanceWakeDisposition::StartWorker
-        );
-        assert_eq!(
-            queue_daemon_cluster_kv_maintenance_wake(
-                &coordinator,
-                ClusterKvMaintenanceWakeSource::RaftProgress,
-            ),
-            ClusterKvMaintenanceWakeDisposition::Coalesced
-        );
-        let batch = coordinator
-            .take_pending_batch_if_due()
-            .expect("coalesced wake batch");
-        assert_eq!(batch.coalesced_wake_count, 2);
-        assert_eq!(
-            batch.sources,
-            vec![
-                ClusterKvMaintenanceWakeSource::NetworkChange,
-                ClusterKvMaintenanceWakeSource::RaftProgress,
+            [
+                DaemonClusterNetworkMaintenancePhaseDisposition::Completed,
+                DaemonClusterNetworkMaintenancePhaseDisposition::TimedOut,
             ]
+            .map(cluster_network_maintenance_phase_disposition_name),
+            ["completed", "timed_out"]
+        );
+        assert_eq!(
+            [
+                DaemonClusterNetworkMaintenanceSubphase::TickPlan,
+                DaemonClusterNetworkMaintenanceSubphase::PendingWork,
+            ]
+            .map(cluster_network_maintenance_subphase_name),
+            ["tick_plan", "pending_work"]
         );
     }
 
     #[test]
-    fn cluster_kv_retry_cooldown_is_bounded_by_the_shutdown_aware_loop_sleep() {
-        assert_eq!(
-            daemon_cluster_kv_retry_sleep_duration(
-                Duration::from_secs(15),
-                Some(Duration::from_millis(250)),
+    fn cluster_maintenance_reasons_invalidate_only_owned_projections() {
+        use DaemonClusterMaintenanceReason as Reason;
+
+        let cases = [
+            (
+                Reason::LifecycleWake,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: 0,
+                    tunnel_reason: Some(
+                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::IdentityChanged,
+                    ),
+                },
             ),
-            Duration::from_millis(250)
-        );
-        assert_eq!(
-            daemon_cluster_kv_retry_sleep_duration(
-                Duration::from_millis(100),
-                Some(Duration::from_secs(30)),
+            (
+                Reason::NetworkEnvironmentChanged,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
+                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
+                    tunnel_reason: Some(
+                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::NetworkEnvironmentChanged,
+                    ),
+                },
             ),
-            Duration::from_millis(100)
-        );
-        assert_eq!(
-            daemon_cluster_kv_retry_sleep_duration(Duration::from_secs(15), None),
-            Duration::from_secs(15)
-        );
+            (
+                Reason::JoinConnectivityPublishFailed,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
+                    tunnel_reason: None,
+                },
+            ),
+            (
+                Reason::JoinAccepted,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
+                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
+                    tunnel_reason: Some(
+                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::MembershipChanged,
+                    ),
+                },
+            ),
+            (
+                Reason::Rename,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
+                    tunnel_reason: None,
+                },
+            ),
+            (
+                Reason::RoleChanged,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
+                    tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::RoleChanged),
+                },
+            ),
+            (
+                Reason::ManualBroad,
+                DaemonClusterMaintenanceRequestPlan {
+                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
+                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
+                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY
+                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
+                    tunnel_reason: Some(
+                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::OperatorRefresh,
+                    ),
+                },
+            ),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(daemon_cluster_maintenance_request_plan(reason), expected);
+        }
     }
 
     #[tokio::test]
@@ -6272,6 +6578,33 @@ mod tests {
     }
 
     #[test]
+    fn canonical_identity_response_failure_still_marks_supervisor_restart() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-canonical-response-failure-restart");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let marker = root.join("rollout").join("supervised-main-restart.request");
+        let response_error = DaemonError::Network {
+            address: "canonical response".to_string(),
+            detail: "injected peer disconnect".to_string(),
+        };
+
+        let error = finish_daemon_object_rpc_stream_response(
+            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE,
+            true,
+            &paths,
+            Err(response_error),
+        )
+        .expect_err("the response transport error must still propagate");
+
+        assert!(matches!(error, DaemonError::Network { .. }));
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("canonical restart marker"),
+            format!("{}\n", std::process::id()),
+            "a committed identity mutation must restart even when its response is lost"
+        );
+    }
+
+    #[test]
     fn outer_relay_session_requires_request_signer_to_match_link_signer() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-relay-session-link-signer");
         let paths = DaemonPaths::with_root(root.join("daemon"));
@@ -6328,15 +6661,136 @@ mod tests {
     }
 
     #[test]
-    fn daemon_background_maintenance_shutdown_preserves_owned_dfs_generation() {
+    fn daemon_background_maintenance_shutdown_remains_bounded() {
         assert!(
-            daemon_runtime_task_requires_completion_join("background maintenance"),
-            "shutdown must wait until maintenance releases its owned DFS generation"
+            daemon_runtime_task_abort_before_join("background maintenance"),
+            "background shutdown must start by cancelling non-owning orchestration work"
+        );
+        assert_eq!(
+            daemon_runtime_task_join_timeout("background maintenance"),
+            DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn daemon_background_abort_explicitly_cancels_inflight_dfs_child() {
+        struct MarkDropped(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for MarkDropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let child_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_child = Arc::clone(&child_dropped);
+        let background = runtime.spawn(async move {
+            let dfs_generation = tokio::spawn(async move {
+                let _drop_guard = MarkDropped(dropped_in_child);
+                started_tx.send(()).expect("signal DFS generation start");
+                std::future::pending::<Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>().await
+            });
+            let _owned_generation = OwnedDaemonDfsMaintenanceTask::new(dfs_generation);
+            std::future::pending::<()>().await;
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("DFS generation started");
+
+        join_daemon_runtime_task(
+            &runtime,
+            "background maintenance",
+            background,
+            daemon_runtime_task_abort_before_join("background maintenance"),
+        );
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !child_dropped.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned DFS child cancellation");
+        });
+    }
+
+    #[test]
+    fn daemon_background_maintenance_is_fenced_to_startup_identity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-maintenance-startup-identity");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let cluster_paths = cluster_paths_from_daemon_paths(&paths).expect("cluster paths");
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "daemon_maintenance_startup_identity_cluster",
+        )
+        .expect("cluster id");
+        let node_id =
+            NodeId::from_legacy_named("daemon_maintenance_startup_identity_node").expect("node id");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "maintenance startup identity",
+            node_id.clone(),
+            "node",
+            "pk-node",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        let startup = DaemonClusterStatus {
+            cluster_id,
+            node_id,
+            process: "daemon".to_string(),
+            member_role: sinomo_core::ClusterMemberRole::Voter,
+            member_state: sinomo_core::ClusterMemberState::Voter,
+        };
+
+        assert!(
+            daemon_cluster_identity_matches_startup(&paths, Some(&startup))
+                .expect("read matching startup identity")
+        );
+        let mut replacement = startup.clone();
+        replacement.cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "daemon_maintenance_replacement_cluster",
+        )
+        .expect("replacement cluster");
+        assert!(
+            !daemon_cluster_identity_matches_startup(&paths, Some(&replacement))
+                .expect("read changed startup identity")
         );
         assert!(
-            !daemon_runtime_task_abort_before_join("background maintenance"),
-            "aborting the wrapper would detach nested blocking DFS work"
+            !daemon_cluster_identity_matches_startup(&paths, None)
+                .expect("missing startup identity is a confirmed mismatch")
         );
+
+        std::fs::write(&cluster_paths.state, b"malformed cluster state")
+            .expect("write unreadable cluster state");
+        assert!(
+            daemon_cluster_identity_matches_startup(&paths, Some(&startup)).is_err(),
+            "unreadable durable state must not be misclassified as a replacement identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_interrupts_inflight_non_owning_maintenance() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let maintenance = tokio::spawn(async move {
+            wait_for_daemon_maintenance_or_shutdown(std::future::pending::<()>(), &mut shutdown_rx)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        shutdown_tx.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(1), maintenance)
+            .await
+            .expect("shutdown must interrupt non-owning maintenance")
+            .expect("maintenance task");
+
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -7180,14 +7634,39 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum RelayAttestationOriginTransport {
+        Channel,
+        Canonical,
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multiplexed_ping_response_carries_target_attestation_through_relay() {
-        let origin_root =
-            sinomo_testdir::TestDir::new("sinomo-daemon-channel-relay-attestation-origin");
-        let relay_root =
-            sinomo_testdir::TestDir::new("sinomo-daemon-channel-relay-attestation-relay");
-        let target_root =
-            sinomo_testdir::TestDir::new("sinomo-daemon-channel-relay-attestation-target");
+        assert_relay_preserves_multiplexed_target_attestation(
+            "all_channel",
+            RelayAttestationOriginTransport::Channel,
+        )
+        .await;
+        assert_relay_preserves_multiplexed_target_attestation(
+            "canonical_channel",
+            RelayAttestationOriginTransport::Canonical,
+        )
+        .await;
+    }
+
+    async fn assert_relay_preserves_multiplexed_target_attestation(
+        case: &str,
+        origin_transport: RelayAttestationOriginTransport,
+    ) {
+        let origin_root = sinomo_testdir::TestDir::new(&format!(
+            "sinomo-daemon-channel-relay-attestation-{case}-origin"
+        ));
+        let relay_root = sinomo_testdir::TestDir::new(&format!(
+            "sinomo-daemon-channel-relay-attestation-{case}-relay"
+        ));
+        let target_root = sinomo_testdir::TestDir::new(&format!(
+            "sinomo-daemon-channel-relay-attestation-{case}-target"
+        ));
         let origin_data_dir = SinomoDataDir::new(&origin_root);
         let relay_data_dir = SinomoDataDir::new(&relay_root);
         let target_data_dir = SinomoDataDir::new(&target_root);
@@ -7204,18 +7683,35 @@ mod tests {
             sinomo_core::node::load_or_create_main_node_identity(&target_data_dir.root())
                 .expect("target identity");
         let origin_node =
-            NodeId::from_legacy_named("channel_relay_attestation_origin").expect("origin node");
+            NodeId::from_legacy_named(format!("channel_relay_attestation_{case}_origin"))
+                .expect("origin node");
         let relay_node =
-            NodeId::from_legacy_named("channel_relay_attestation_relay").expect("relay node");
+            NodeId::from_legacy_named(format!("channel_relay_attestation_{case}_relay"))
+                .expect("relay node");
         let target_node =
-            NodeId::from_legacy_named("channel_relay_attestation_target").expect("target node");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("channel_relay_attestation_cluster")
-                .expect("cluster id");
+            NodeId::from_legacy_named(format!("channel_relay_attestation_{case}_target"))
+                .expect("target node");
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(format!(
+            "channel_relay_attestation_{case}_cluster"
+        ))
+        .expect("cluster id");
         let now = time::OffsetDateTime::now_utc();
+        let relay_listener = match origin_transport {
+            RelayAttestationOriginTransport::Channel => None,
+            RelayAttestationOriginTransport::Canonical => Some(
+                sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("relay canonical listener"),
+            ),
+        };
         let relay_endpoint = sinomo_core::network::daemon_lan_endpoint(
             &relay_node,
-            "127.0.0.1:40101".to_string(),
+            match relay_listener.as_ref() {
+                Some(listener) => listener
+                    .local_addr_string()
+                    .expect("relay canonical address"),
+                None => "127.0.0.1:40101".to_string(),
+            },
             0,
         );
         let target_endpoint = sinomo_core::network::daemon_lan_endpoint(
@@ -7404,41 +7900,69 @@ mod tests {
             "target test host must not install a registry ping route"
         );
 
-        let mut origin_to_relay = LinkedDaemonObjectRpcChannel::new();
+        let mut origin_to_relay =
+            matches!(origin_transport, RelayAttestationOriginTransport::Channel)
+                .then(LinkedDaemonObjectRpcChannel::new);
+        if let Some(origin_to_relay) = origin_to_relay.as_ref() {
+            crate::tcp_tunnel::insert_isolated_test_object_rpc_channel_client(
+                relay_node.clone(),
+                origin_to_relay.client.clone(),
+            );
+        }
         let mut relay_to_target = LinkedDaemonObjectRpcChannel::new();
-        let tunnel_registry_lease = crate::tcp_tunnel::lease_test_tcp_tunnel_registry();
-        crate::tcp_tunnel::insert_test_tcp_tunnel_object_rpc_channel_client(
-            relay_node.clone(),
-            origin_to_relay.client.clone(),
-        );
-        crate::tcp_tunnel::insert_test_tcp_tunnel_object_rpc_channel_client(
+        crate::tcp_tunnel::insert_isolated_test_object_rpc_channel_client(
             target_node.clone(),
             relay_to_target.client.clone(),
         );
-        let relay_server = origin_to_relay.take_server();
         let relay_server_paths = relay_paths.clone();
         let relay_runtime = service_runtime.clone();
-        let relay_peer = origin_node.clone();
-        let relay_dispatch = tokio::spawn(async move {
-            handle_daemon_object_rpc_channel_async(
-                relay_server,
-                relay_server_paths,
-                relay_service_host,
-                relay_runtime,
-                DaemonObjectRpcChannelPeer::ClusterNode(relay_peer),
-            )
-            .await
-        });
+        let relay_dispatch = if let Some(relay_server) = origin_to_relay
+            .as_mut()
+            .map(LinkedDaemonObjectRpcChannel::take_server)
+        {
+            let relay_peer = origin_node.clone();
+            tokio::spawn(async move {
+                handle_daemon_object_rpc_channel_async(
+                    relay_server,
+                    relay_server_paths,
+                    relay_service_host,
+                    relay_runtime,
+                    DaemonObjectRpcChannelPeer::ClusterNode(relay_peer),
+                )
+                .await
+            })
+        } else {
+            let relay_listener = relay_listener.expect("canonical relay listener");
+            tokio::spawn(async move {
+                let stream = relay_listener
+                    .accept()
+                    .await
+                    .expect("accept relay canonical session");
+                handle_daemon_object_rpc_stream_async(
+                    Box::new(stream.into_inner()),
+                    relay_server_paths,
+                    relay_service_host,
+                    relay_runtime,
+                )
+                .await
+            })
+        };
         let target_server = relay_to_target.take_server();
         let target_runtime = service_runtime.clone();
         let target_peer = relay_node.clone();
+        let (target_principal, target_responder_node_id) = daemon_object_rpc_channel_principal(
+            &target_paths,
+            &DaemonObjectRpcChannelPeer::ClusterNode(target_peer),
+        )
+        .expect("authenticated target channel principal");
         let target_dispatch = tokio::spawn(async move {
-            handle_daemon_object_rpc_channel_async(
+            drive_daemon_object_rpc_channel_async(
                 target_server,
                 target_paths,
                 target_service_host,
                 target_runtime,
-                DaemonObjectRpcChannelPeer::ClusterNode(target_peer),
+                target_principal,
+                target_responder_node_id,
             )
             .await
         });
@@ -7468,7 +7992,7 @@ mod tests {
                 sinomo_core::network::ClusterObjectRpcOptions::default(),
             )
             .await
-            .expect("one-hop relayed channel response");
+            .expect("relayed multiplexed final-hop response");
         assert_eq!(
             result.response.responder_node_id(),
             Some(target_node.as_str()),
@@ -7480,10 +8004,11 @@ mod tests {
             .expect("relayed ping response");
         assert_eq!(decoded.responder_node_id, target_node);
 
-        drop(tunnel_registry_lease);
-        crate::tcp_tunnel::remove_test_tcp_tunnel(&relay_node);
-        crate::tcp_tunnel::remove_test_tcp_tunnel(&target_node);
-        origin_to_relay.close("test complete");
+        if let Some(origin_to_relay) = origin_to_relay.as_ref() {
+            crate::tcp_tunnel::remove_isolated_test_object_rpc_channel_client(&relay_node);
+            origin_to_relay.close("test complete");
+        }
+        crate::tcp_tunnel::remove_isolated_test_object_rpc_channel_client(&target_node);
         relay_to_target.close("test complete");
         assert!(
             !tokio::time::timeout(Duration::from_secs(1), relay_dispatch)
@@ -8933,7 +9458,24 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_parked_work_uses_periodic_probe_deadline() {
+    fn daemon_dfs_idle_work_parks_without_a_timer_or_launch() {
+        let observed_at = Instant::now();
+        let decision = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork::default()),
+        );
+
+        assert!(!decision.trigger_maintenance);
+        assert_eq!(decision.next_probe_at, None);
+        assert!(
+            !daemon_dfs_maintenance_should_launch(true, false),
+            "an idle projection must never acquire the DFS lane or distributed lease"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_deferred_work_uses_bounded_read_only_reprobe() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_probe_decision(
             observed_at,
@@ -8941,29 +9483,18 @@ mod tests {
             Some(DaemonDfsPendingMaintenanceWork {
                 pending_repair_count: 3,
                 repair_attempt_count: 3,
+                deferred_work_count: 3,
                 ..DaemonDfsPendingMaintenanceWork::default()
             }),
         );
 
         assert!(!decision.trigger_maintenance);
         assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
-            DAEMON_DFS_MAINTENANCE_INTERVAL
-        );
-
-        let actionable = daemon_dfs_maintenance_probe_decision(
-            observed_at,
-            1_000_000_000,
-            Some(DaemonDfsPendingMaintenanceWork {
-                pending_write_count: 1,
-                ..DaemonDfsPendingMaintenanceWork::default()
-            }),
-        );
-        assert!(actionable.trigger_maintenance);
-        assert_eq!(
-            actionable.next_probe_at.duration_since(observed_at),
-            DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
-            "an interrupted actionable pass must retain a short safety probe"
+            decision
+                .next_probe_at
+                .expect("deferred work deadline")
+                .duration_since(observed_at),
+            DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL
         );
     }
 
@@ -8988,13 +9519,16 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
+            decision
+                .next_probe_at
+                .expect("repair deadline")
+                .duration_since(observed_at),
             retry_delay
         );
     }
 
     #[test]
-    fn daemon_dfs_probe_caps_future_repair_retry_at_periodic_deadline() {
+    fn daemon_dfs_probe_preserves_far_exact_deadline_without_periodic_cap() {
         let observed_at = Instant::now();
         let observed_at_unix_nanos = 1_000_000_000;
         let retry_delay = Duration::from_secs(900);
@@ -9014,8 +9548,36 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
-            DAEMON_DFS_MAINTENANCE_INTERVAL
+            decision
+                .next_probe_at
+                .expect("far repair deadline")
+                .duration_since(observed_at),
+            retry_delay
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_probe_uses_earliest_repair_or_lifecycle_deadline() {
+        let observed_at = Instant::now();
+        let observed_at_unix_nanos = 1_000_000_000;
+        let decision = daemon_dfs_maintenance_probe_decision(
+            observed_at,
+            observed_at_unix_nanos,
+            Some(DaemonDfsPendingMaintenanceWork {
+                next_repair_retry_unix_nanos: Some(observed_at_unix_nanos + 90_000_000_000),
+                next_time_based_maintenance_unix_nanos: Some(
+                    observed_at_unix_nanos + 17_000_000_000,
+                ),
+                ..DaemonDfsPendingMaintenanceWork::default()
+            }),
+        );
+
+        assert_eq!(
+            decision
+                .next_probe_at
+                .expect("lifecycle deadline")
+                .duration_since(observed_at),
+            Duration::from_secs(17)
         );
     }
 
@@ -9026,7 +9588,10 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
+            decision
+                .next_probe_at
+                .expect("probe error retry")
+                .duration_since(observed_at),
             DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL
         );
     }
@@ -9035,16 +9600,20 @@ mod tests {
     fn failed_dfs_maintenance_preserves_latched_request_and_short_probe() {
         let observed_at = Instant::now();
         let future_probe = observed_at
-            .checked_add(DAEMON_DFS_MAINTENANCE_INTERVAL)
+            .checked_add(DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL)
             .expect("future probe");
-        let decision = daemon_dfs_failed_maintenance_decision(observed_at, true, future_probe);
+        let decision =
+            daemon_dfs_failed_maintenance_decision(observed_at, true, Some(future_probe));
 
         assert!(
             decision.trigger_maintenance,
             "a request latched while the failed task was running must survive completion handling"
         );
         assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
+            decision
+                .next_probe_at
+                .expect("failure retry")
+                .duration_since(observed_at),
             DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
             "failed work must retain the bounded recovery probe"
         );
@@ -9053,9 +9622,7 @@ mod tests {
     #[test]
     fn dfs_maintenance_notification_requests_a_probe_without_forcing_a_pass() {
         let observed_at = Instant::now();
-        let mut next_probe_at = observed_at
-            .checked_add(DAEMON_DFS_MAINTENANCE_INTERVAL)
-            .expect("future probe");
+        let mut next_probe_at = None;
         let triggered_maintenance_requested = false;
 
         let notification = daemon_dfs_maintenance_notification_decision(
@@ -9080,13 +9647,14 @@ mod tests {
             next_probe_at,
         );
         assert_eq!(
-            decision.next_probe_at, observed_at,
+            decision.next_probe_at,
+            Some(observed_at),
             "task failure must not discard a notification probe already due"
         );
     }
 
     #[test]
-    fn completed_dfs_followup_probe_prevents_same_iteration_probe() {
+    fn completed_dfs_followup_probe_parks_when_state_is_idle() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_completion_decision(
             DaemonDfsMaintenanceTickOutcome::Completed,
@@ -9096,18 +9664,12 @@ mod tests {
         );
 
         assert!(!decision.trigger_maintenance);
-        assert!(!daemon_dfs_maintenance_probe_is_due(
-            observed_at,
-            decision.next_probe_at
-        ));
-        assert!(daemon_dfs_maintenance_probe_is_due(
-            decision.next_probe_at,
-            decision.next_probe_at
-        ));
+        assert_eq!(decision.next_probe_at, None);
+        assert!(!daemon_dfs_maintenance_probe_is_due(observed_at, None));
     }
 
     #[test]
-    fn deferred_dfs_followup_probe_does_not_latch_quiet_periodic_work() {
+    fn deferred_dfs_followup_probe_does_not_latch_quiet_work() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_completion_decision(
             DaemonDfsMaintenanceTickOutcome::Deferred,
@@ -9120,11 +9682,7 @@ mod tests {
             !decision.trigger_maintenance,
             "foreground preemption alone must not create triggered DFS work"
         );
-        assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
-            DAEMON_DFS_MAINTENANCE_INTERVAL,
-            "a quiet deferred pass returns to the periodic cadence"
-        );
+        assert_eq!(decision.next_probe_at, None);
     }
 
     #[test]
@@ -9142,66 +9700,41 @@ mod tests {
 
         assert!(decision.trigger_maintenance);
         assert_eq!(
-            decision.next_probe_at.duration_since(observed_at),
+            decision
+                .next_probe_at
+                .expect("actionable safety retry")
+                .duration_since(observed_at),
             DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
             "deferred actionable work retains the bounded safety probe"
         );
     }
 
     #[test]
-    fn periodic_dfs_maintenance_wins_a_same_deadline_probe() {
-        let now = Instant::now();
-        let last_maintenance = now
-            .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL)
-            .expect("periodic maintenance timestamp");
-
-        assert!(daemon_dfs_maintenance_probe_is_due(now, now));
-        assert!(daemon_dfs_periodic_maintenance_is_due(
-            now,
-            now,
-            last_maintenance
-        ));
-    }
-
-    #[test]
     fn triggered_dfs_maintenance_revalidates_work_at_launch() {
         assert!(
-            !daemon_dfs_maintenance_should_launch(false, true, false),
+            !daemon_dfs_maintenance_should_launch(true, false),
             "a stale triggered latch must not launch a broad maintenance pass"
         );
         assert!(
-            daemon_dfs_maintenance_should_launch(false, true, true),
+            daemon_dfs_maintenance_should_launch(true, true),
             "revalidated actionable work must still launch promptly"
         );
         assert!(
-            daemon_dfs_maintenance_should_launch(true, false, false),
-            "periodic maintenance must not depend on triggered-work classification"
-        );
-        assert!(
-            daemon_dfs_maintenance_should_launch(true, true, false),
-            "a simultaneous periodic deadline must win even when triggered work went quiet"
+            !daemon_dfs_maintenance_should_launch(false, true),
+            "work cannot launch before its admission phase/minimum interval"
         );
     }
 
     #[test]
     fn daemon_maintenance_sleep_uses_next_due_work_instead_of_fixed_tick() {
         let now = Instant::now();
-        let last_dfs = now
-            .checked_sub(Duration::from_secs(10))
-            .expect("dfs instant");
-        let last_rollout = now
-            .checked_sub(Duration::from_secs(20))
-            .expect("rollout instant");
 
         assert_eq!(
             daemon_maintenance_sleep_duration(
                 now,
                 Duration::from_secs(30),
-                last_dfs,
-                last_rollout,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
-                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 None,
                 Some(DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL),
                 None,
@@ -9213,11 +9746,8 @@ mod tests {
             daemon_maintenance_sleep_duration(
                 now,
                 Duration::from_secs(30),
-                last_dfs,
-                last_rollout,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
-                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 None,
                 Some(Duration::from_secs(5)),
                 None,
@@ -9229,50 +9759,30 @@ mod tests {
             daemon_maintenance_sleep_duration(
                 now,
                 Duration::from_secs(600),
-                last_dfs,
-                last_rollout,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 Some(Duration::from_secs(3)),
-                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 None,
                 None,
                 None,
             ),
             Duration::from_secs(3),
-            "triggered DFS namespace work should wake before the fixed five-minute tick"
+            "triggered DFS work should wake at its explicit admission deadline"
         );
-        let almost_due_dfs = now
-            .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL - Duration::from_secs(1))
-            .expect("almost due dfs instant");
         assert_eq!(
             daemon_maintenance_sleep_duration(
                 now,
                 Duration::from_secs(600),
-                almost_due_dfs,
-                now,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
-                Some(DAEMON_DFS_MAINTENANCE_INTERVAL),
+                None,
                 None,
                 None,
                 None,
             ),
-            Duration::from_secs(1),
-            "DFS maintenance must wake on its own even when no shadow finalization is pending"
+            Duration::from_secs(600),
+            "an idle DFS projection must not add a generic maintenance wakeup"
         );
         assert_eq!(
-            daemon_maintenance_sleep_duration(
-                now,
-                Duration::ZERO,
-                last_dfs,
-                last_rollout,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
+            daemon_maintenance_sleep_duration(now, Duration::ZERO, None, None, None, None, None,),
             Duration::from_millis(1),
             "overdue work should not create a zero-duration spin"
         );
@@ -9280,9 +9790,6 @@ mod tests {
             daemon_maintenance_sleep_duration(
                 now,
                 Duration::from_secs(600),
-                last_dfs,
-                last_rollout,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 None,
                 None,
@@ -9295,16 +9802,50 @@ mod tests {
     }
 
     #[test]
-    fn mobile_profile_reduces_rollout_telemetry_wake_frequency() {
-        assert_eq!(
-            daemon_rollout_telemetry_interval(crate::DaemonExecutionProfile::Standard),
-            DAEMON_ROLLOUT_TELEMETRY_INTERVAL
+    fn rollout_telemetry_requires_startup_cluster_runtime() {
+        assert!(daemon_rollout_telemetry_enabled("daemon", true));
+        assert!(
+            !daemon_rollout_telemetry_enabled("daemon", false),
+            "a daemon that started unclustered must not adopt later cluster state through telemetry"
         );
-        assert_eq!(
-            daemon_rollout_telemetry_interval(crate::DaemonExecutionProfile::Mobile),
-            DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL
+        assert!(
+            !daemon_rollout_telemetry_enabled("shadow-daemon", true),
+            "the shadow supervisor never owns cluster rollout telemetry"
         );
-        assert!(DAEMON_MOBILE_ROLLOUT_TELEMETRY_INTERVAL >= Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn rollout_telemetry_reconciliation_does_not_own_desired_rollout_state() {
+        let source = include_str!("control.rs");
+        let telemetry_reconciliation = source
+            .split_once("pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick")
+            .expect("telemetry reconciliation function")
+            .1
+            .split_once("pub fn run_daemon_rollout_telemetry_maintenance_tick")
+            .expect("telemetry compatibility wrapper")
+            .0;
+        assert!(
+            !telemetry_reconciliation
+                .contains("run_daemon_module_rollout_desired_reconciliation_tick"),
+            "telemetry source reconciliation must not poll or own desired rollout state"
+        );
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn clustered_startup_maintenance_precedes_sandbox_lifecycle_recovery() {
+        assert!(
+            !daemon_sandbox_lifecycle_maintenance_allowed("daemon", false),
+            "a fresh clustered replacement must get its first node-status pass before sandbox recovery"
+        );
+        assert!(
+            daemon_sandbox_lifecycle_maintenance_allowed("daemon", true),
+            "sandbox recovery resumes immediately after the bounded cluster startup pass"
+        );
+        assert!(
+            !daemon_sandbox_lifecycle_maintenance_allowed("shadow-daemon", true),
+            "the shadow supervisor never owns sandbox lifecycle recovery"
+        );
     }
 
     #[cfg(feature = "sandbox")]
@@ -9476,8 +10017,8 @@ mod tests {
         assert!(
             phases
                 .iter()
-                .all(|phase| *phase < DAEMON_DFS_MAINTENANCE_INTERVAL),
-            "every phase must stay inside the maintenance interval"
+                .all(|phase| *phase < DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW),
+            "every phase must stay inside the admission phase window"
         );
     }
 
@@ -9522,9 +10063,6 @@ mod tests {
             daemon_maintenance_sleep_duration(
                 now,
                 converged_cluster_due,
-                now,
-                now,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
                 None,
                 None,
                 Some(DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL),

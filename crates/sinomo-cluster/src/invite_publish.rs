@@ -18,6 +18,41 @@ use sinomo_kv::{
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_node::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
+use std::time::Instant;
+
+const CLUSTER_INVITE_PUBLISH_MAX_ATTEMPTS: usize = 3;
+
+#[allow(clippy::too_many_arguments)]
+fn invite_publication_phase_trace(
+    phase: &'static str,
+    invite_id: &ClusterInviteId,
+    attempt: usize,
+    duration: Duration,
+    revision: u64,
+    term: u64,
+    request_id: &str,
+    compare_count: usize,
+    success_op_count: usize,
+    outcome: &'static str,
+    detail: std::fmt::Arguments<'_>,
+) {
+    let duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        phase,
+        invite_id = %invite_id,
+        attempt,
+        duration_us,
+        revision,
+        term,
+        request_id,
+        compare_count,
+        success_op_count,
+        outcome,
+        detail = %detail,
+        "cluster invite publication phase"
+    );
+}
 
 pub trait ClusterInvitePublishHost {
     type Error: From<NetworkError> + ToString;
@@ -97,16 +132,161 @@ pub fn publish_cluster_invitation_to_quorum_with_host<H>(
 where
     H: ClusterInvitePublishHost,
 {
-    let mut commit_state = state.clone();
-    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut commit_state)?;
-    let txn =
-        cluster_invitation_publish_txn_from_authoritative_snapshot(&authoritative.value, invite)?;
-    let result = host.commit_cluster_kv_txn_with_quorum(
-        paths,
-        &mut commit_state,
-        KvTxnRequest::generated(txn),
-    )?;
-    require_invite_publish_commit(result).map_err(H::Error::from)
+    for attempt in 0..CLUSTER_INVITE_PUBLISH_MAX_ATTEMPTS {
+        let mut commit_state = state.clone();
+        let snapshot_started = Instant::now();
+        let authoritative = match host.authoritative_cluster_kv_snapshot(paths, &mut commit_state) {
+            Ok(authoritative) => authoritative,
+            Err(error) => {
+                let detail = error.to_string();
+                invite_publication_phase_trace(
+                    "authoritative_snapshot",
+                    &invite.invite_id,
+                    attempt + 1,
+                    snapshot_started.elapsed(),
+                    commit_state.kv_revision,
+                    commit_state.term,
+                    "",
+                    0,
+                    0,
+                    "failed",
+                    format_args!("{detail}"),
+                );
+                return Err(error);
+            }
+        };
+        invite_publication_phase_trace(
+            "authoritative_snapshot",
+            &invite.invite_id,
+            attempt + 1,
+            snapshot_started.elapsed(),
+            authoritative.value.revision.0,
+            authoritative.authority.term,
+            "",
+            0,
+            0,
+            "loaded",
+            format_args!("authoritative invitation snapshot loaded"),
+        );
+
+        let prepare_started = Instant::now();
+        let txn = match cluster_invitation_publish_txn_from_authoritative_snapshot(
+            &authoritative.value,
+            invite,
+        ) {
+            Ok(txn) => txn,
+            Err(error) => {
+                invite_publication_phase_trace(
+                    "prepare",
+                    &invite.invite_id,
+                    attempt + 1,
+                    prepare_started.elapsed(),
+                    authoritative.value.revision.0,
+                    authoritative.authority.term,
+                    "",
+                    0,
+                    0,
+                    "rejected",
+                    format_args!("{error}"),
+                );
+                return Err(H::Error::from(error));
+            }
+        };
+        let compare_count = txn.compares.len();
+        let success_op_count = txn.success.len();
+        let request = KvTxnRequest::generated(txn);
+        let request_id = request.request_id.to_string();
+        invite_publication_phase_trace(
+            "prepare",
+            &invite.invite_id,
+            attempt + 1,
+            prepare_started.elapsed(),
+            authoritative.value.revision.0,
+            authoritative.authority.term,
+            &request_id,
+            compare_count,
+            success_op_count,
+            "prepared",
+            format_args!("invitation transaction prepared"),
+        );
+
+        let commit_started = Instant::now();
+        let result = match host.commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, request)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let detail = error.to_string();
+                invite_publication_phase_trace(
+                    "quorum_commit",
+                    &invite.invite_id,
+                    attempt + 1,
+                    commit_started.elapsed(),
+                    commit_state.kv_revision,
+                    commit_state.term,
+                    &request_id,
+                    compare_count,
+                    success_op_count,
+                    "failed",
+                    format_args!("{detail}"),
+                );
+                return Err(error);
+            }
+        };
+        match require_invite_publish_commit(result) {
+            Ok(snapshot) => {
+                invite_publication_phase_trace(
+                    "quorum_commit",
+                    &invite.invite_id,
+                    attempt + 1,
+                    commit_started.elapsed(),
+                    snapshot.revision.0,
+                    commit_state.term,
+                    &request_id,
+                    compare_count,
+                    success_op_count,
+                    "committed",
+                    format_args!("invitation committed"),
+                );
+                return Ok(snapshot);
+            }
+            Err(_) if attempt + 1 < CLUSTER_INVITE_PUBLISH_MAX_ATTEMPTS => {
+                invite_publication_phase_trace(
+                    "quorum_commit",
+                    &invite.invite_id,
+                    attempt + 1,
+                    commit_started.elapsed(),
+                    commit_state.kv_revision,
+                    commit_state.term,
+                    &request_id,
+                    compare_count,
+                    success_op_count,
+                    "compare_raced",
+                    format_args!("authoritative state changed during invitation publication"),
+                );
+                // Member status publication rewrites the issuer record and can
+                // lose this authorization CAS without revoking the issuer.
+                // Re-read authoritative state immediately; a real revocation
+                // is rejected while preparing the next attempt.
+            }
+            Err(error) => {
+                invite_publication_phase_trace(
+                    "quorum_commit",
+                    &invite.invite_id,
+                    attempt + 1,
+                    commit_started.elapsed(),
+                    commit_state.kv_revision,
+                    commit_state.term,
+                    &request_id,
+                    compare_count,
+                    success_op_count,
+                    "rejected",
+                    format_args!("{error}"),
+                );
+                return Err(H::Error::from(error));
+            }
+        }
+    }
+    unreachable!("invite publication attempt loop always returns")
 }
 
 enum PreparedClusterInvitePublish {

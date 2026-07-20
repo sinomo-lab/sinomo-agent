@@ -1007,6 +1007,27 @@ impl SifsAgentChannelStore {
             .map_err(|detail| channel_store_io(path, detail))
     }
 
+    /// Best-effort materialization over immutable channel records.
+    ///
+    /// Concurrent writers may race the optimistic DFS version check. The
+    /// immutable records remain authoritative, so the losing cache writer must
+    /// not turn a committed mutation into an application failure; readers will
+    /// reject or repair the stale projection from those records.
+    fn write_materialized_cache(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), AgentChannelStoreError> {
+        match self.write_file(path, bytes) {
+            Err(AgentChannelStoreError::Io { detail, .. })
+                if detail.contains("metadata transaction conflict") =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     fn write_immutable_json<T: Serialize>(
         &self,
         path: &str,
@@ -1187,7 +1208,10 @@ impl SifsAgentChannelStore {
             // An append after the second stat only makes this older watermark
             // fail validation. It can never stamp this fold as covering the
             // newer record, even if this cache write wins the race.
-            return self.write_file(&Self::history_metadata_projection_path(channel_id), &bytes);
+            return self.write_materialized_cache(
+                &Self::history_metadata_projection_path(channel_id),
+                &bytes,
+            );
         }
 
         // This projection is an optimization. Under sustained concurrent
@@ -1424,13 +1448,7 @@ impl SifsAgentChannelStore {
                 detail: source.to_string(),
             }
         })?;
-        match self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes) {
-            // The snapshot is only a repairable cache over immutable metadata
-            // records. A concurrent writer winning the optimistic SIFS update
-            // must not make the immutable record append look unsuccessful.
-            Err(AgentChannelStoreError::Io { detail, .. }) if detail.contains("conflict") => Ok(()),
-            result => result,
-        }
+        self.write_materialized_cache(&Self::snapshot_path(&channel.channel_id), &bytes)
     }
 
     /// Resolve channel metadata from immutable state records. `snapshot.json`
@@ -11385,7 +11403,7 @@ mod tests {
     }
 
     #[test]
-    fn history_message_page_uses_directory_size_and_skips_oversized_bodies() {
+    fn history_message_page_uses_directory_size_and_defers_oversized_bodies() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-history-bounded-message-page");
         let data_dir = SinomoDataDir::new(&root);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
@@ -11405,17 +11423,18 @@ mod tests {
             .expect("open history VFS");
 
         let reads_before = store.message_record_body_read_count();
-        let omitted = store
+        let deferred = store
             .load_immutable_message_record_page(&history_vfs, &channel_id, None, 0, 1, 1)
             .expect("scan oversized record");
-        assert!(omitted.records.is_empty());
-        assert_eq!(omitted.consumed_entries, 1);
-        assert_eq!(omitted.read_bytes, 0);
-        assert_eq!(omitted.omitted_records, 1);
+        assert!(deferred.records.is_empty());
+        assert_eq!(deferred.consumed_entries, 0);
+        assert_eq!(deferred.read_bytes, 0);
+        assert_eq!(deferred.omitted_records, 0);
+        assert!(deferred.required_bytes.is_some_and(|bytes| bytes > 1));
         assert_eq!(
             store.message_record_body_read_count(),
             reads_before,
-            "an entry larger than the remaining budget must advance without a body read"
+            "an entry larger than the remaining budget must defer without a body read"
         );
 
         let loaded = store

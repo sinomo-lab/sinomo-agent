@@ -58,6 +58,7 @@ use crate::metadata_summary::{
     metadata_summary_from_tables,
 };
 use crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION;
+use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -2260,6 +2261,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(())
     }
 
+    fn tombstone_compaction_projection(
+        &self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        let mut report = DfsTombstoneCompactionReport::for_options(&options);
+        let now = options
+            .now_unix_nanos
+            .unwrap_or_else(metadata_now_unix_nanos);
+        for (shard_id, backend) in &self.shards {
+            if self.metadata_shard_authoritative_writes_frozen(shard_id)? {
+                continue;
+            }
+            let tables = backend.current_tables_snapshot()?;
+            report.merge(plan_tombstone_compaction(&tables, &options, now).report);
+        }
+        Ok(report)
+    }
+
     fn compact_tombstones(
         &mut self,
         options: DfsTombstoneCompactionOptions,
@@ -2268,6 +2287,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let shard_ids = self.shard_ids();
         let mut compacted_object_ids = Vec::new();
         for shard_id in shard_ids {
+            if self.metadata_shard_authoritative_writes_frozen(&shard_id)? {
+                // A retiring primary deliberately keeps its local shard
+                // frozen after activating the successor generation. That
+                // shard remains available for replica ingest, but optional
+                // lifecycle mutation must leave it untouched. Independent
+                // active shards must still reach metadata publication later
+                // in the same maintenance tick.
+                continue;
+            }
             let mut shard_options = options.clone();
             if !options.dry_run
                 && let Some(max_compactions) = options.max_compactions
@@ -2279,9 +2307,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 }
                 shard_options.max_compactions = Some(remaining);
             }
-            let (shard_report, shard_compacted_object_ids) = self
+            let compacted = self
                 .shard_backend_mut(&shard_id)?
-                .compact_tombstones_with_ids(shard_options)?;
+                .compact_tombstones_with_ids(shard_options);
+            let (shard_report, shard_compacted_object_ids) = match compacted {
+                Ok(compacted) => compacted,
+                Err(MetadataBackendError::MembershipHandoffFrozen { .. }) => {
+                    // A handoff can install its freeze after the read above.
+                    // Preserve the same safe skip across that race.
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             report.merge(shard_report);
             compacted_object_ids.extend(shard_compacted_object_ids);
         }

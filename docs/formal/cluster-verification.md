@@ -154,10 +154,11 @@ relation and reached only through `coverageStep`.
 exhibit that contract violation before the refinement is accepted; symbolic
 verification continues to check only the corrected `step` relation.
 
-This slice intentionally does not model daemon wake sources, maintenance timers,
-coalescing, retry backoff, routing, snapshot RPCs, or app/CLI wiring. Reactive
-wakes change when existing Raft actions run; they are scheduling evidence, not
-quorum or freshness evidence. Those mechanics belong in deterministic Rust and
+This slice intentionally does not model daemon scheduling, source-change
+coalescing, retry backoff, routing, snapshot RPCs, or app/CLI wiring. The
+action-owned reactive boundary determines which concrete operation runs an
+existing Raft action; it is not quorum or freshness evidence. Observational
+reads schedule no KV work. Those mechanics belong in deterministic Rust and
 cluster tests rather than `raft_kv` or the deeper `raft_protocol` model.
 
 The model already caught one useful bug during drafting: an offline node was

@@ -402,6 +402,14 @@ impl KvWatchPrefixIndex {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct KvCommittedRequestEntry {
+    // Retained records are immutable, so this one-time measurement remains exact
+    // until the entry is evicted.
+    record: KvCommittedRequestRecord,
+    encoded_bytes: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InProcessKvStore {
     pub(crate) revision: KvRevision,
@@ -416,7 +424,9 @@ pub struct InProcessKvStore {
     pub(crate) watches: KvWatchIndex,
     pub(crate) watch_prefixes: KvWatchPrefixIndex,
     pub(crate) next_watch_id: u64,
-    pub(crate) committed_requests: BTreeMap<KvRequestId, KvCommittedRequestRecord>,
+    pub(crate) committed_requests: BTreeMap<KvRequestId, KvCommittedRequestEntry>,
+    // Exact sum of `KvCommittedRequestEntry::encoded_bytes` for the map above.
+    pub(crate) committed_request_encoded_bytes: usize,
     pub(crate) expired_request_ids: BTreeSet<KvRequestId>,
     pub(crate) expired_request_order: VecDeque<KvRequestId>,
 }
@@ -435,7 +445,9 @@ impl InProcessKvStore {
     }
 
     pub fn committed_request(&self, request_id: &KvRequestId) -> Option<&KvCommittedRequestRecord> {
-        self.committed_requests.get(request_id)
+        self.committed_requests
+            .get(request_id)
+            .map(|entry| &entry.record)
     }
 
     pub fn request_id_expired(&self, request_id: &KvRequestId) -> bool {
@@ -452,27 +464,48 @@ impl InProcessKvStore {
             });
         }
         if let Some(existing) = self.committed_requests.get(&record.request_id) {
-            if existing.command_digest != record.command_digest {
+            if existing.record.command_digest != record.command_digest {
                 return Err(KvError::RequestIdConflict {
                     request_id: record.request_id,
                 });
             }
             return Ok(());
         }
-        self.committed_requests
-            .insert(record.request_id.clone(), record);
+        let encoded_bytes = encode_kv_value(&record)?.len();
+        let committed_request_encoded_bytes = self
+            .committed_request_encoded_bytes
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| KvError::ResourceExhausted {
+                operation: "measure committed KV request records".to_string(),
+                requested_bytes: usize::MAX,
+            })?;
+        self.committed_requests.insert(
+            record.request_id.clone(),
+            KvCommittedRequestEntry {
+                record,
+                encoded_bytes,
+            },
+        );
+        self.committed_request_encoded_bytes = committed_request_encoded_bytes;
         while self.committed_requests.len() > MAX_COMMITTED_KV_REQUESTS
-            || self.committed_request_encoded_bytes()? > MAX_COMMITTED_KV_REQUEST_BYTES
+            || self.committed_request_encoded_bytes > MAX_COMMITTED_KV_REQUEST_BYTES
         {
             let Some(expired_id) = self
                 .committed_requests
                 .values()
-                .min_by_key(|record| record.log_index)
-                .map(|record| record.request_id.clone())
+                .min_by_key(|entry| entry.record.log_index)
+                .map(|entry| entry.record.request_id.clone())
             else {
                 break;
             };
-            self.committed_requests.remove(&expired_id);
+            let expired = self
+                .committed_requests
+                .remove(&expired_id)
+                .expect("selected committed KV request must remain present");
+            self.committed_request_encoded_bytes = self
+                .committed_request_encoded_bytes
+                .checked_sub(expired.encoded_bytes)
+                .expect("committed KV request byte accounting must not underflow");
             if self.expired_request_ids.insert(expired_id.clone()) {
                 self.expired_request_order.push_back(expired_id);
             }
@@ -483,19 +516,6 @@ impl InProcessKvStore {
             }
         }
         Ok(())
-    }
-
-    fn committed_request_encoded_bytes(&self) -> Result<usize, KvError> {
-        let mut total = 0_usize;
-        for record in self.committed_requests.values() {
-            total = total
-                .checked_add(encode_kv_value(record)?.len())
-                .ok_or_else(|| KvError::ResourceExhausted {
-                    operation: "measure committed KV request records".to_string(),
-                    requested_bytes: usize::MAX,
-                })?;
-        }
-        Ok(total)
     }
 
     pub fn event_history_len(&self) -> usize {
@@ -878,13 +898,18 @@ impl InProcessKvStore {
             entries,
             leases: self.try_current_leases_for_snapshot()?,
             events,
-            committed_requests: self.committed_requests.values().cloned().collect(),
+            committed_requests: self
+                .committed_requests
+                .values()
+                .map(|entry| entry.record.clone())
+                .collect(),
             expired_requests: self.expired_request_order.iter().cloned().collect(),
         })
     }
 
     pub fn restore(snapshot: KvSnapshot) -> Result<Self, KvError> {
-        snapshot.validate_resource_bounds()?;
+        let committed_request_encoded_sizes =
+            snapshot.validate_resource_bounds_with_committed_request_sizes()?;
         let KvSnapshot {
             revision,
             compacted_revision,
@@ -913,16 +938,36 @@ impl InProcessKvStore {
         for event in snapshot_events {
             events.push(Arc::new(event));
         }
-        let mut committed_requests = BTreeMap::new();
-        for record in snapshot_committed_requests {
+        let mut committed_requests: BTreeMap<KvRequestId, KvCommittedRequestEntry> =
+            BTreeMap::new();
+        let mut committed_request_encoded_bytes = 0_usize;
+        for (record, encoded_bytes) in snapshot_committed_requests
+            .into_iter()
+            .zip(committed_request_encoded_sizes)
+        {
             if let Some(existing) = committed_requests.get(&record.request_id)
-                && existing != &record
+                && existing.record != record
             {
                 return Err(KvError::RequestIdConflict {
                     request_id: record.request_id,
                 });
             }
-            committed_requests.insert(record.request_id.clone(), record);
+            if committed_requests.contains_key(&record.request_id) {
+                continue;
+            }
+            committed_request_encoded_bytes = committed_request_encoded_bytes
+                .checked_add(encoded_bytes)
+                .ok_or_else(|| KvError::ResourceExhausted {
+                    operation: "restore committed KV request byte accounting".to_string(),
+                    requested_bytes: usize::MAX,
+                })?;
+            committed_requests.insert(
+                record.request_id.clone(),
+                KvCommittedRequestEntry {
+                    record,
+                    encoded_bytes,
+                },
+            );
         }
         let mut expired_request_order = VecDeque::new();
         let mut expired_request_ids = BTreeSet::new();
@@ -945,6 +990,7 @@ impl InProcessKvStore {
             watch_prefixes: KvWatchPrefixIndex::default(),
             next_watch_id: 1,
             committed_requests,
+            committed_request_encoded_bytes,
             expired_request_ids,
             expired_request_order,
         })

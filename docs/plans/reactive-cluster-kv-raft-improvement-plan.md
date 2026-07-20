@@ -1,23 +1,27 @@
 # Reactive Cluster KV/Raft Improvement Plan
 
-Status: recommended first implementation slice completed 2026-07-19; remaining
-P1-P3 follow-up work is identified below. Last reviewed 2026-07-19.
+Status: recommended first implementation slice completed 2026-07-19; the
+generic maintenance design was removed in favor of action-owned convergence on
+2026-07-20. Remaining P1-P3 follow-up work is identified below. Last reviewed
+2026-07-20.
 
 ## Context
 
 Sinomo's intended cluster shape is reactive and passive. A cluster may be made of
 home PCs, laptops, and mobile devices where no node is guaranteed to be online
-continuously. The KV/Raft layer should therefore converge opportunistically when
-nodes wake, operators run commands, apps connect, or peer traffic arrives. The
-goal is not to turn `sinomo-kv` into a conventional always-on Raft service.
+continuously. The KV/Raft layer therefore converges through the operation or
+state transition that made work necessary. It has no generic maintenance task,
+periodic sweep, or read-triggered convergence path. The goal is not to turn
+`sinomo-kv` into a conventional always-on Raft service.
 
 The implementation now combines the earlier persisted Raft hard state,
 WAL-backed log entries, quorum-gated mutation paths, append conflict checks,
 vote freshness checks, snapshots, durable watches, and host-provided transport
 with the completed first slice: explicit local and authoritative consistency
 contracts, current-term barriers, semantic-no-effect write fencing, stable
-request identities and outcome recovery, reactive maintenance, peer progress
-hints, and restart-safe membership/config-change lifecycle records.
+request identities and outcome recovery, action-owned reactive convergence,
+peer progress hints, and restart-safe membership/config-change lifecycle
+records.
 
 ## Delivery Status
 
@@ -27,11 +31,11 @@ guided the refactor. Their current status is:
 | Item | Status |
 |---|---|
 | P0.1-P0.4 consistency, barriers, request identity, config lifecycle | Completed. |
-| P1.5 opportunistic maintenance tick | Completed. |
+| P1.5 action-owned reactive convergence | Completed; this replaces the withdrawn generic maintenance-tick design. |
 | P1.6 intermittent-node leader recovery | Partial: bounded recovery and structured failure evidence exist; proactive freshest-voter preference and complete CLI/app recommendations remain follow-up work. |
 | P1.7 peer replication progress hints | Completed; hints are persisted, consumed, term-validated, and safe to discard. |
 | P1.8 uncertain-write recovery | Completed through the authoritative request-outcome route. |
-| P2.9 noisy-write batching | Planned; semantic no-op suppression and maintenance wake coalescing do not constitute general short-window transaction batching. |
+| P2.9 noisy-write batching | Planned; semantic no-op suppression and source-change coalescing do not constitute general short-window transaction batching. |
 | P2.10 keyspace read/projection behavior | Completed for explicit keyspace classification, critical-read authority defaults, and deferred materialized projections; broader retention tuning remains operational follow-up. |
 | P2.11 resumable snapshots | Planned. |
 | P2.12 diagnostics | Partial: structured authority/quorum evidence exists; complete last-success timestamps and CLI/app recovery presentation remain follow-up work. |
@@ -44,9 +48,9 @@ still missing.
 ## Design Principles
 
 1. Preserve the passive cluster model.
-   Raft work should be driven by user actions, daemon wakeups, app sessions,
-   rollout activity, peer RPCs, and periodic opportunistic maintenance when a
-   daemon is already alive.
+   Every Raft action should be owned by the operation, committed transition, or
+   concrete recovery signal that requires it. Daemon wakeups, app sessions,
+   status reads, and generic timers are not work by themselves.
 
 2. Separate local availability from cluster authority.
    Reads expose either a local view that may be stale or an authoritative view
@@ -62,9 +66,10 @@ still missing.
    identity, authorization, runtime scheduling, and local persistence.
 
 4. Prefer bounded convergence over background churn.
-   A node that wakes should quickly discover current leadership, catch up its
-   local KV view, publish status, and drain queued work without assuming an
-   always-on server set.
+   A mutation or authoritative operation establishes the authority it needs;
+   an actual replication gap initiates targeted catch-up; and an actual source
+   change initiates publication. An idle node with no changed inputs performs
+   no KV work.
 
 ## P0: Safety And Correctness
 
@@ -150,31 +155,38 @@ than ad hoc config writes.
 
 ## P1: Passive-Cluster Liveness
 
-### 5. Add an opportunistic maintenance tick
+### 5. Make reactive convergence action-owned
 
-Create a reusable maintenance action that can run whenever the daemon is already
-active. It should not require an always-on Raft loop.
+The original implementation introduced a reusable maintenance action that
+coalesced daemon, app, CLI, status, health, Raft, and timer wakes into one broad
+sweep. That design is withdrawn. It caused unrelated observations to schedule
+authority barriers, catch-up, configuration reconciliation, and publication,
+and allowed work completed by one sweep to wake another sweep. A fully reactive
+KV does not need a generic maintenance task.
 
-The tick should:
+Convergence belongs at the exact edge that has both the evidence and authority
+to perform it:
 
-- Refresh known leader and observed term.
-- Send or respond to append heartbeats when appropriate.
-- Pull or apply missing KV snapshots.
-- Catch up local WAL/snapshot state.
-- Compact Raft state when thresholds are met.
-- Drain and fan out watch events.
-- Publish node status and endpoint observations.
-- Record structured evidence for any skipped step.
+| Origin | Work owned by that origin |
+|---|---|
+| Successful commit | Apply the committed entries, deliver their watch events, fan them out to the exact peers selected for that commit, and persist peer-progress hints from the same fanout report. |
+| Mutation or authoritative operation | Establish leadership and quorum evidence required by that operation; do not enqueue unrelated follow-up work. |
+| Membership or Raft-configuration lifecycle operation | Reconcile its own durable transition before and after the operation. Startup may directly resume a known nonterminal transition, but must not start a general sweep. |
+| Append gap, explicit startup recovery, or restored route to a known-behind peer | Run targeted log or snapshot recovery for that peer and gap. Snapshot transfer is not a periodic freshness probe. |
+| WAL, log, or snapshot mutation | Compact when the owning store crosses its mutation or size threshold. Compaction is not timer-driven maintenance. |
+| Local member, endpoint, or connectivity source change | Publish the changed semantic value, coalesced by its typed key. An unchanged source produces no RPC and no KV mutation. |
+| Peer Raft RPC | Validate and apply or answer that request, including any exact catch-up evidence it reveals. It does not wake a broader coordinator. |
+| Local status, health, app, or CLI read | Return the requested observation only. It never schedules KV convergence. An authoritative read owns only its requested quorum barrier. |
 
-The tick schedules existing Raft actions; it must not introduce a second
-consensus path, weaken quorum rules, or make timer/wake evidence authoritative.
+Retries remain bounded and attached to the originating operation or typed,
+keyed source-change job. They must not be converted into a process-wide
+"something may need maintenance" notification. Observation records what an
+owned action attempted and why it stopped; observation is never itself a work
+trigger.
 
-Trigger it from daemon startup, app/CLI connection, cluster status/health,
-rollout activity, migration operations, peer RPC handling, and low-frequency
-daemon timers when the daemon is already running.
-
-Expected outcome: clusters converge when touched without requiring dedicated
-server nodes.
+Expected outcome: clusters converge from concrete changes without dedicated
+server nodes, while a quiescent cluster performs no control-plane writes,
+barriers, snapshots, or generic convergence passes.
 
 ### 6. Improve leader recovery for intermittent nodes
 
@@ -290,10 +302,11 @@ capability for deployments that intentionally run stable always-on nodes.
 
 ### Quint boundary
 
-Do not model daemon wake sources, maintenance timers, backoff, routing, snapshot
-RPCs, or app/CLI wiring in Quint. The reactive refactor changes when existing
-Raft actions run, not the core consensus algorithm. Model those implementation
-mechanics with deterministic Rust and cluster tests.
+Do not model daemon scheduling, source-change coalescing, retry backoff, routing,
+snapshot RPCs, or app/CLI wiring in Quint. The reactive refactor changes which
+concrete operation owns an existing Raft action, not the core consensus
+algorithm. Model those implementation mechanics with deterministic Rust and
+cluster tests.
 
 Keep `specs/quint/models/kv/raft_kv.qnt` as the small algorithm contract. Extend
 it only enough to express:
@@ -313,7 +326,8 @@ state a small independent invariant.
 
 ### Runtime and cluster evidence
 
-The completed first slice is covered by:
+The completed first slice and the 2026-07-20 action-ownership correction are
+accepted only with:
 
 - focused tests proving local reads remain available without quorum while
   authoritative reads fail;
@@ -321,15 +335,20 @@ The completed first slice is covered by:
   without quorum;
 - tests proving quorum-backed writes, authoritative reads, and exact committed
   retries return the expected revision/result;
-- deterministic virtual-time tests for wake coalescing, retry backoff, shutdown,
-  and non-starvation of maintenance work; and
+- deterministic tests proving exact commit fanout and peer-progress persistence,
+  operation-owned configuration reconciliation, threshold-owned compaction,
+  targeted snapshot recovery, and source-change publication;
+- tests proving local status, health, app, and CLI reads do not schedule KV work;
+- an idle-cluster quietness gate proving that a quiescent control plane emits no
+  commits, quorum barriers, snapshot pulls, or generic convergence passes; and
 - a three-node intermittent-cluster scenario covering offline local reads,
   failed authoritative operations, quorum restoration, catch-up, and eventual
   convergence.
 
 ## Completed First Implementation Slice
 
-Completed 2026-07-19:
+Initial slice completed 2026-07-19; action-ownership correction completed
+2026-07-20:
 
 1. Added the consistency contract to docs and route/type names.
 2. Implemented the authoritative-read barrier and migrated the initial critical
@@ -338,13 +357,17 @@ Completed 2026-07-19:
    durable prior-commit evidence.
 4. Added request IDs, bounded committed-request retention, and outcome records
    for KV transactions.
-5. Added the opportunistic maintenance tick and wired it to daemon/app/CLI wake
-   points.
+5. Made convergence action-owned: exact commit fanout persists its own peer
+   progress, configuration operations reconcile their own lifecycle, storage
+   mutations own compaction, recovery signals target the affected peer, and
+   changed member/endpoint sources own publication. Removed the generic
+   maintenance task and observational wake points.
 6. Converted Raft config changes into explicit lifecycle operations with
    catch-up and terminal evidence plus restart reconciliation.
 
 The small `raft_kv` contract refinement covers steps 2-3. Runtime and cluster
-tests cover step 5 instead of expanding the Raft protocol model. The focused
+tests cover the action-ownership boundaries in step 5 instead of expanding the
+Raft protocol model. The focused
 formal run reached the deliberately broken no-quorum/no-effect witness in 5000
 of 5000 traces, and the five-step Apalache check of the corrected relation found
 no violation; exact commands and tool versions are recorded in the

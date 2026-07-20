@@ -33,6 +33,12 @@ const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
 // caller fall back to a less capable local-only sweep.
 const CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(2);
+// Start a peer-view hedge once directly reachable members have had a short
+// opportunity to answer. The full request budget is still available for a
+// second direct pass after peer expansion, so this improves relayed topologies
+// without turning this latency hedge into a production liveness deadline.
+const CLUSTER_HEALTH_DIRECT_PROBE_HEDGE_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(100);
 // Live status fanout and any peer expansion share this semantic operation
 // budget. The daemon RPC transport has a 5s no-progress timeout, so retaining
 // one second for dispatch, storage reads, and response encoding keeps a
@@ -40,6 +46,255 @@ const CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET: std::time::Duration =
 const CLUSTER_HEALTH_LIVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 const CLUSTER_HEALTH_LIVE_PROBES_METADATA_KEY: &str = "sinomo-health-live-probes";
 const CLUSTER_HEALTH_LIVE_PROBES_METADATA_VALUE: &str = "true";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClusterHealthTraceStats {
+    reportable_member_count: usize,
+    live_status_count: usize,
+    row_count: usize,
+    online_count: usize,
+    unresolved_count: usize,
+    timeout_us: u64,
+}
+
+impl ClusterHealthTraceStats {
+    fn from_rows(rows: &[ClusterHealthRow]) -> Self {
+        let online_count = rows
+            .iter()
+            .filter(|row| row.availability == ClusterNodeAvailability::Online)
+            .count();
+        Self {
+            reportable_member_count: rows.len(),
+            row_count: rows.len(),
+            online_count,
+            unresolved_count: rows.len().saturating_sub(online_count),
+            ..Self::default()
+        }
+    }
+}
+
+/// A diagnostic-only lifecycle record for one `/cluster/health` request.
+///
+/// The Docker formation gate may cancel the client at its absolute deadline.
+/// A completion-only trace would make that indistinguishable from a handler
+/// that never started, so `Drop` records cancellation when the handler future
+/// is actually retired before a normal result is produced.
+struct ClusterHealthRequestTrace {
+    request_id: String,
+    traceparent: String,
+    started: std::time::Instant,
+    local_scope: bool,
+    include_peer_views: bool,
+    live_probes: bool,
+    local_node_id: String,
+    kv_revision: u64,
+    member_count: usize,
+    state_loaded: bool,
+    result_stats: ClusterHealthTraceStats,
+    finished: bool,
+}
+
+impl ClusterHealthRequestTrace {
+    fn new(request: &ObjectRpcRequest) -> Option<Self> {
+        if request.route != CLUSTER_HEALTH_ROUTE
+            || !tracing::enabled!(target: "sinomo.cluster.health", tracing::Level::TRACE)
+        {
+            return None;
+        }
+        let trace = Self {
+            request_id: sinomo_base::Id::generate().to_string(),
+            traceparent: request.traceparent().unwrap_or_default().to_string(),
+            started: std::time::Instant::now(),
+            local_scope: cluster_health_rpc_request_is_local_scope(request),
+            include_peer_views: cluster_health_rpc_request_includes_peer_views(request),
+            live_probes: cluster_health_rpc_request_uses_live_probes(request),
+            local_node_id: String::new(),
+            kv_revision: 0,
+            member_count: 0,
+            state_loaded: false,
+            result_stats: ClusterHealthTraceStats::default(),
+            finished: false,
+        };
+        trace.emit_instant(
+            "cluster_health_request",
+            "started",
+            "",
+            ClusterHealthTraceStats::default(),
+        );
+        Some(trace)
+    }
+
+    fn observe_state(&mut self, state: &ClusterBootstrapState, outcome: &'static str) {
+        self.local_node_id = state.local_node_id.to_string();
+        self.kv_revision = state.kv_revision;
+        self.member_count = state.members.len();
+        self.state_loaded = true;
+        self.emit_instant(
+            "cluster_health_state_snapshot",
+            outcome,
+            "",
+            ClusterHealthTraceStats {
+                reportable_member_count: state
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        !matches!(member.state, ClusterMemberState::Removed)
+                            && cluster_health_member_is_reportable(member)
+                    })
+                    .count(),
+                ..ClusterHealthTraceStats::default()
+            },
+        );
+    }
+
+    fn observe_rows(&mut self, rows: &[ClusterHealthRow]) {
+        self.result_stats = ClusterHealthTraceStats::from_rows(rows);
+    }
+
+    fn emit_instant(
+        &self,
+        stage: &'static str,
+        outcome: &'static str,
+        target_node_id: &str,
+        stats: ClusterHealthTraceStats,
+    ) {
+        tracing::trace!(
+            target: "sinomo.cluster.health",
+            stage,
+            outcome,
+            request_id = %self.request_id,
+            traceparent = %self.traceparent,
+            local_node_id = %self.local_node_id,
+            target_node_id,
+            local_scope = self.local_scope,
+            include_peer_views = self.include_peer_views,
+            live_probes = self.live_probes,
+            state_loaded = self.state_loaded,
+            kv_revision = self.kv_revision,
+            member_count = self.member_count,
+            reportable_member_count = stats.reportable_member_count,
+            live_status_count = stats.live_status_count,
+            row_count = stats.row_count,
+            online_count = stats.online_count,
+            unresolved_count = stats.unresolved_count,
+            timeout_us = stats.timeout_us,
+            "cluster health observation"
+        );
+    }
+
+    fn emit_duration(
+        &self,
+        stage: &'static str,
+        started: std::time::Instant,
+        outcome: &'static str,
+        target_node_id: &str,
+        stats: ClusterHealthTraceStats,
+    ) {
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        tracing::trace!(
+            target: "sinomo.cluster.health",
+            stage,
+            outcome,
+            request_id = %self.request_id,
+            traceparent = %self.traceparent,
+            local_node_id = %self.local_node_id,
+            target_node_id,
+            local_scope = self.local_scope,
+            include_peer_views = self.include_peer_views,
+            live_probes = self.live_probes,
+            state_loaded = self.state_loaded,
+            kv_revision = self.kv_revision,
+            member_count = self.member_count,
+            reportable_member_count = stats.reportable_member_count,
+            live_status_count = stats.live_status_count,
+            row_count = stats.row_count,
+            online_count = stats.online_count,
+            unresolved_count = stats.unresolved_count,
+            timeout_us = stats.timeout_us,
+            elapsed_us,
+            "cluster health observation"
+        );
+    }
+
+    fn finish(mut self, outcome: &'static str) {
+        self.emit_duration(
+            "cluster_health_request",
+            self.started,
+            outcome,
+            "",
+            self.result_stats,
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for ClusterHealthRequestTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit_duration(
+                "cluster_health_request",
+                self.started,
+                "cancelled",
+                "",
+                self.result_stats,
+            );
+        }
+    }
+}
+
+struct ClusterHealthPhaseTrace<'a> {
+    request: &'a ClusterHealthRequestTrace,
+    stage: &'static str,
+    target_node_id: String,
+    started: std::time::Instant,
+    initial_stats: ClusterHealthTraceStats,
+    finished: bool,
+}
+
+impl<'a> ClusterHealthPhaseTrace<'a> {
+    fn new(
+        request: &'a ClusterHealthRequestTrace,
+        stage: &'static str,
+        target_node_id: impl Into<String>,
+        stats: ClusterHealthTraceStats,
+    ) -> Self {
+        let target_node_id = target_node_id.into();
+        request.emit_instant(stage, "started", &target_node_id, stats);
+        Self {
+            request,
+            stage,
+            target_node_id,
+            started: std::time::Instant::now(),
+            initial_stats: stats,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, outcome: &'static str, stats: ClusterHealthTraceStats) {
+        self.request.emit_duration(
+            self.stage,
+            self.started,
+            outcome,
+            &self.target_node_id,
+            stats,
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for ClusterHealthPhaseTrace<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.request.emit_duration(
+                self.stage,
+                self.started,
+                "cancelled",
+                &self.target_node_id,
+                self.initial_stats,
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterHealthRow {
@@ -242,6 +497,33 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
     request: ObjectRpcRequest,
     observed_at: OffsetDateTime,
 ) -> Result<ObjectRpcResponse, NetworkError> {
+    let mut trace = ClusterHealthRequestTrace::new(&request);
+    if let Some(trace) = trace.as_mut() {
+        trace.observe_state(state, "provided");
+    }
+    let result = handle_cluster_health_rpc_request_async_observed(
+        paths,
+        state,
+        probe,
+        request,
+        observed_at,
+        &mut trace,
+    )
+    .await;
+    if let Some(trace) = trace.take() {
+        trace.finish(if result.is_ok() { "completed" } else { "error" });
+    }
+    result
+}
+
+async fn handle_cluster_health_rpc_request_async_observed<P: ClusterStatusAsyncProbe + ?Sized>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    request: ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+    trace: &mut Option<ClusterHealthRequestTrace>,
+) -> Result<ObjectRpcResponse, NetworkError> {
     match request.route.as_str() {
         CLUSTER_HEALTH_ROUTE => {
             let _: () = request.decode_body()?;
@@ -249,31 +531,103 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
             let include_peer_views = cluster_health_rpc_request_includes_peer_views(&request);
             let live_probes = cluster_health_rpc_request_uses_live_probes(&request);
             let rows = if local_scope {
-                cluster_health_rows_with_async_probe_for_scope(
-                    paths,
-                    state,
-                    probe,
-                    false,
-                    true,
-                    observed_at,
-                )
-                .await?
+                if trace.is_some() {
+                    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+                        paths,
+                        state,
+                        probe,
+                        false,
+                        true,
+                        observed_at,
+                        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+                        trace.as_ref(),
+                    )
+                    .await?
+                } else {
+                    cluster_health_rows_with_async_probe_for_scope(
+                        paths,
+                        state,
+                        probe,
+                        false,
+                        true,
+                        observed_at,
+                    )
+                    .await?
+                }
             } else if live_probes {
-                cluster_health_rows_with_async_probe(paths, state, probe, false, observed_at)
+                if trace.is_some() {
+                    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+                        paths,
+                        state,
+                        probe,
+                        false,
+                        false,
+                        observed_at,
+                        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+                        trace.as_ref(),
+                    )
                     .await?
+                } else {
+                    cluster_health_rows_with_async_probe(paths, state, probe, false, observed_at)
+                        .await?
+                }
             } else if !include_peer_views {
-                cluster_health_rows_from_stored_statuses_async(paths, state, false, observed_at)
-                    .await?
-            } else {
-                cluster_health_rows_with_async_probe(
+                let phase = trace.as_ref().map(|trace| {
+                    ClusterHealthPhaseTrace::new(
+                        trace,
+                        "cluster_health_stored_status_read",
+                        "",
+                        ClusterHealthTraceStats::default(),
+                    )
+                });
+                match cluster_health_rows_from_stored_statuses_async(
                     paths,
                     state,
-                    probe,
-                    include_peer_views,
+                    false,
                     observed_at,
                 )
-                .await?
+                .await
+                {
+                    Ok(rows) => {
+                        if let Some(phase) = phase {
+                            phase.finish("completed", ClusterHealthTraceStats::from_rows(&rows));
+                        }
+                        rows
+                    }
+                    Err(error) => {
+                        if let Some(phase) = phase {
+                            phase.finish("error", ClusterHealthTraceStats::default());
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                if trace.is_some() {
+                    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+                        paths,
+                        state,
+                        probe,
+                        include_peer_views,
+                        false,
+                        observed_at,
+                        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+                        trace.as_ref(),
+                    )
+                    .await?
+                } else {
+                    cluster_health_rows_with_async_probe(
+                        paths,
+                        state,
+                        probe,
+                        include_peer_views,
+                        observed_at,
+                    )
+                    .await?
+                }
             };
+            if let Some(trace) = trace.as_mut() {
+                trace.observe_rows(&rows);
+            }
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
         CLUSTER_NETWORK_PING_ROUTE => {
@@ -294,8 +648,66 @@ pub async fn handle_current_cluster_health_rpc_request_async<
     request: ObjectRpcRequest,
     observed_at: OffsetDateTime,
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    let state = read_cluster_state_async(runtime, paths).await?;
-    handle_cluster_health_rpc_request_async(paths, &state, probe, request, observed_at).await
+    let mut trace = ClusterHealthRequestTrace::new(&request);
+    let state_read_started = std::time::Instant::now();
+    if let Some(trace) = trace.as_ref() {
+        trace.emit_instant(
+            "cluster_health_state_snapshot_read",
+            "started",
+            "",
+            ClusterHealthTraceStats::default(),
+        );
+    }
+    let state = match read_cluster_state_async(runtime, paths).await {
+        Ok(state) => {
+            if let Some(trace) = trace.as_mut() {
+                trace.observe_state(&state, "loaded");
+                trace.emit_duration(
+                    "cluster_health_state_snapshot_read",
+                    state_read_started,
+                    "completed",
+                    "",
+                    ClusterHealthTraceStats {
+                        reportable_member_count: state.members.len(),
+                        ..ClusterHealthTraceStats::default()
+                    },
+                );
+            }
+            state
+        }
+        Err(error) => {
+            if let Some(trace) = trace.as_ref() {
+                trace.emit_duration(
+                    "cluster_health_state_snapshot_read",
+                    state_read_started,
+                    "error",
+                    "",
+                    ClusterHealthTraceStats::default(),
+                );
+            }
+            if let Some(trace) = trace.take() {
+                trace.finish("error");
+            }
+            return Err(error);
+        }
+    };
+    if trace.is_none() {
+        return handle_cluster_health_rpc_request_async(paths, &state, probe, request, observed_at)
+            .await;
+    }
+    let result = handle_cluster_health_rpc_request_async_observed(
+        paths,
+        &state,
+        probe,
+        request,
+        observed_at,
+        &mut trace,
+    )
+    .await;
+    if let Some(trace) = trace.take() {
+        trace.finish(if result.is_ok() { "completed" } else { "error" });
+    }
+    result
 }
 
 pub fn handle_cluster_network_ping_rpc_request(
@@ -641,6 +1053,32 @@ async fn cluster_health_rows_with_async_probe_for_scope_with_budget<
     observed_at: OffsetDateTime,
     live_budget: std::time::Duration,
 ) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+        paths,
+        state,
+        probe,
+        include_peer_views,
+        local_scope,
+        observed_at,
+        live_budget,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cluster_health_rows_with_async_probe_for_scope_with_budget_observed<
+    P: ClusterStatusAsyncProbe + ?Sized,
+>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    include_peer_views: bool,
+    local_scope: bool,
+    observed_at: OffsetDateTime,
+    live_budget: std::time::Duration,
+    trace: Option<&ClusterHealthRequestTrace>,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
     let deadline = tokio::time::Instant::now() + live_budget;
     // A stalled direct member must not consume the only opportunity to learn
     // about it through a healthy bridge. Recursive health reserves the peer
@@ -651,18 +1089,54 @@ async fn cluster_health_rows_with_async_probe_for_scope_with_budget<
     } else {
         std::time::Duration::ZERO
     };
-    let probe_deadline = deadline
+    let direct_probe_deadline = deadline
         .checked_sub(peer_budget_reserve)
         .unwrap_or(deadline);
+    let probe_deadline = if include_peer_views {
+        direct_probe_deadline.min(
+            tokio::time::Instant::now()
+                .checked_add(CLUSTER_HEALTH_DIRECT_PROBE_HEDGE_DELAY)
+                .unwrap_or(direct_probe_deadline),
+        )
+    } else {
+        direct_probe_deadline
+    };
     let paths_for_statuses = paths.clone();
+    let stored_status_read = trace.map(|trace| {
+        ClusterHealthPhaseTrace::new(
+            trace,
+            "cluster_health_stored_status_read",
+            "",
+            ClusterHealthTraceStats::default(),
+        )
+    });
     let stored_statuses = tokio::task::spawn_blocking(move || {
         read_cluster_node_statuses_from_kv(&paths_for_statuses)
     })
-    .await
-    .map_err(|source| NetworkError::Io {
-        operation: "cluster health status read".to_string(),
-        detail: format!("cluster health status read task failed: {source}"),
-    })??;
+    .await;
+    let stored_statuses = match stored_statuses {
+        Ok(Ok(statuses)) => {
+            if let Some(stored_status_read) = stored_status_read {
+                stored_status_read.finish("completed", ClusterHealthTraceStats::default());
+            }
+            statuses
+        }
+        Ok(Err(error)) => {
+            if let Some(stored_status_read) = stored_status_read {
+                stored_status_read.finish("error", ClusterHealthTraceStats::default());
+            }
+            return Err(error);
+        }
+        Err(source) => {
+            if let Some(stored_status_read) = stored_status_read {
+                stored_status_read.finish("error", ClusterHealthTraceStats::default());
+            }
+            return Err(NetworkError::Io {
+                operation: "cluster health status read".to_string(),
+                detail: format!("cluster health status read task failed: {source}"),
+            });
+        }
+    };
     let connectivity = ClusterConnectivityGraph::read_for_local(paths, state);
     let reportable_members = state
         .members
@@ -672,18 +1146,109 @@ async fn cluster_health_rows_with_async_probe_for_scope_with_budget<
         .collect::<Vec<_>>();
     let mut live_statuses = BTreeMap::new();
     if tokio::time::Instant::now() < probe_deadline {
+        let timeout_us = u64::try_from(
+            probe_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
+        let live_probe = trace.map(|trace| {
+            ClusterHealthPhaseTrace::new(
+                trace,
+                "cluster_health_live_probe_batch",
+                "",
+                ClusterHealthTraceStats {
+                    reportable_member_count: reportable_members.len(),
+                    timeout_us,
+                    ..ClusterHealthTraceStats::default()
+                },
+            )
+        });
         match tokio::time::timeout_at(
             probe_deadline,
             probe.probe_member_statuses_async(state, &reportable_members, &mut live_statuses),
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(())) => {
+                if let Some(live_probe) = live_probe {
+                    live_probe.finish(
+                        "completed",
+                        ClusterHealthTraceStats {
+                            reportable_member_count: reportable_members.len(),
+                            live_status_count: live_statuses
+                                .values()
+                                .filter(|status| status.is_some())
+                                .count(),
+                            timeout_us,
+                            ..ClusterHealthTraceStats::default()
+                        },
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                if let Some(live_probe) = live_probe {
+                    live_probe.finish(
+                        "error",
+                        ClusterHealthTraceStats {
+                            reportable_member_count: reportable_members.len(),
+                            live_status_count: live_statuses
+                                .values()
+                                .filter(|status| status.is_some())
+                                .count(),
+                            timeout_us,
+                            ..ClusterHealthTraceStats::default()
+                        },
+                    );
+                }
+                return Err(error);
+            }
             Err(_) => {
+                if let Some(live_probe) = live_probe {
+                    live_probe.finish(
+                        "timed_out",
+                        ClusterHealthTraceStats {
+                            reportable_member_count: reportable_members.len(),
+                            live_status_count: live_statuses
+                                .values()
+                                .filter(|status| status.is_some())
+                                .count(),
+                            timeout_us,
+                            ..ClusterHealthTraceStats::default()
+                        },
+                    );
+                }
                 // The probe writes each completed status into caller-owned
                 // state, so cancellation retains useful rows while the
                 // remaining members fall back to stored/unknown status below.
             }
+        }
+    } else if let Some(trace) = trace {
+        trace.emit_instant(
+            "cluster_health_live_probe_batch",
+            "budget_exhausted",
+            "",
+            ClusterHealthTraceStats {
+                reportable_member_count: reportable_members.len(),
+                ..ClusterHealthTraceStats::default()
+            },
+        );
+    }
+    if let Some(trace) = trace {
+        for member in &reportable_members {
+            let live = live_statuses
+                .get(&member.node_id)
+                .is_some_and(|status| status.is_some());
+            trace.emit_instant(
+                "cluster_health_live_probe_result",
+                if live { "observed" } else { "unresolved" },
+                member.node_id.as_str(),
+                ClusterHealthTraceStats {
+                    reportable_member_count: reportable_members.len(),
+                    live_status_count: usize::from(live),
+                    ..ClusterHealthTraceStats::default()
+                },
+            );
         }
     }
     let mut rows = Vec::new();
@@ -723,7 +1288,109 @@ async fn cluster_health_rows_with_async_probe_for_scope_with_budget<
         });
     }
     if include_peer_views {
-        merge_reachable_peer_health_rows_async(state, &mut rows, probe, deadline).await?;
+        merge_reachable_peer_health_rows_async_observed(state, &mut rows, probe, deadline, trace)
+            .await?;
+        if cluster_health_rows_have_unresolved_members(&rows)
+            && tokio::time::Instant::now() < deadline
+        {
+            let retry_members = rows
+                .iter()
+                .filter(|row| row.availability != ClusterNodeAvailability::Online)
+                .map(|row| row.member.clone())
+                .collect::<Vec<_>>();
+            let timeout_us = u64::try_from(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let retry_trace = trace.map(|trace| {
+                ClusterHealthPhaseTrace::new(
+                    trace,
+                    "cluster_health_live_probe_retry",
+                    "",
+                    ClusterHealthTraceStats {
+                        reportable_member_count: retry_members.len(),
+                        timeout_us,
+                        ..ClusterHealthTraceStats::from_rows(&rows)
+                    },
+                )
+            });
+            let mut retry_statuses = BTreeMap::new();
+            let retry_result = tokio::time::timeout_at(
+                deadline,
+                probe.probe_member_statuses_async(state, &retry_members, &mut retry_statuses),
+            )
+            .await;
+            let retry_live_count = retry_statuses
+                .values()
+                .filter(|status| status.is_some())
+                .count();
+            match retry_result {
+                Ok(Ok(())) => {
+                    if let Some(retry_trace) = retry_trace {
+                        retry_trace.finish(
+                            "completed",
+                            ClusterHealthTraceStats {
+                                reportable_member_count: retry_members.len(),
+                                live_status_count: retry_live_count,
+                                timeout_us,
+                                ..ClusterHealthTraceStats::from_rows(&rows)
+                            },
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    if let Some(retry_trace) = retry_trace {
+                        retry_trace.finish(
+                            "error",
+                            ClusterHealthTraceStats {
+                                reportable_member_count: retry_members.len(),
+                                live_status_count: retry_live_count,
+                                timeout_us,
+                                ..ClusterHealthTraceStats::from_rows(&rows)
+                            },
+                        );
+                    }
+                    return Err(error);
+                }
+                Err(_) => {
+                    if let Some(retry_trace) = retry_trace {
+                        retry_trace.finish(
+                            "timed_out",
+                            ClusterHealthTraceStats {
+                                reportable_member_count: retry_members.len(),
+                                live_status_count: retry_live_count,
+                                timeout_us,
+                                ..ClusterHealthTraceStats::from_rows(&rows)
+                            },
+                        );
+                    }
+                }
+            }
+            for row in &mut rows {
+                if row.availability == ClusterNodeAvailability::Online {
+                    continue;
+                }
+                let expected_process = cluster_member_expected_daemon_process(&row.member);
+                let Some(mut live) = retry_statuses
+                    .get(&row.member.node_id)
+                    .and_then(|status| status.clone())
+                    .filter(|status| {
+                        cluster_node_status_matches_member(status, &row.member, expected_process)
+                    })
+                else {
+                    continue;
+                };
+                if live.rollout.is_none() {
+                    live.rollout = row.status.rollout.clone();
+                }
+                live.availability = ClusterNodeAvailability::Online;
+                row.status = live;
+                row.availability = ClusterNodeAvailability::Online;
+                row.live_probe_observed = true;
+            }
+        }
     }
     rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
     Ok(rows)
@@ -1116,11 +1783,22 @@ fn next_online_peer_to_query(
         .map(|row| row.member.clone())
 }
 
+#[cfg(test)]
 async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Sized>(
     state: &ClusterBootstrapState,
     rows: &mut [ClusterHealthRow],
     probe: &P,
     live_deadline: tokio::time::Instant,
+) -> Result<(), NetworkError> {
+    merge_reachable_peer_health_rows_async_observed(state, rows, probe, live_deadline, None).await
+}
+
+async fn merge_reachable_peer_health_rows_async_observed<P: ClusterStatusAsyncProbe + ?Sized>(
+    state: &ClusterBootstrapState,
+    rows: &mut [ClusterHealthRow],
+    probe: &P,
+    live_deadline: tokio::time::Instant,
+    trace: Option<&ClusterHealthRequestTrace>,
 ) -> Result<(), NetworkError> {
     let mut queried = std::collections::BTreeSet::new();
     queried.insert(state.local_node_id.clone());
@@ -1128,33 +1806,134 @@ async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Si
         live_deadline.min(tokio::time::Instant::now() + CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET);
     while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
         if !cluster_health_rows_have_unresolved_members(rows) {
+            if let Some(trace) = trace {
+                trace.emit_instant(
+                    "cluster_health_peer_frontier",
+                    "all_resolved",
+                    "",
+                    ClusterHealthTraceStats::from_rows(rows),
+                );
+            }
             return Ok(());
         }
         let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
+            if let Some(trace) = trace {
+                trace.emit_instant(
+                    "cluster_health_peer_frontier",
+                    "no_reachable_peer",
+                    "",
+                    ClusterHealthTraceStats::from_rows(rows),
+                );
+            }
             return Ok(());
         };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if let Some(trace) = trace {
+                trace.emit_instant(
+                    "cluster_health_peer_frontier",
+                    "budget_exhausted",
+                    member.node_id.as_str(),
+                    ClusterHealthTraceStats::from_rows(rows),
+                );
+            }
             return Ok(());
         }
         // Preserve the absolute deadline while letting the preferred bridge
         // finish one bounded nonrecursive view. Later peers receive whatever
         // remains after this attempt returns.
         let timeout = remaining;
+        let timeout_us = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
         queried.insert(member.node_id.clone());
+        let peer_query = trace.map(|trace| {
+            ClusterHealthPhaseTrace::new(
+                trace,
+                "cluster_health_peer_query",
+                member.node_id.to_string(),
+                ClusterHealthTraceStats {
+                    reportable_member_count: rows.len(),
+                    timeout_us,
+                    ..ClusterHealthTraceStats::from_rows(rows)
+                },
+            )
+        });
         let peer_rows = match tokio::time::timeout(
             timeout,
             probe.peer_health_rows_async(state, &member, timeout),
         )
         .await
         {
-            Ok(rows) => rows?,
-            Err(_) => continue,
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                if let Some(peer_query) = peer_query {
+                    peer_query.finish(
+                        "error",
+                        ClusterHealthTraceStats {
+                            reportable_member_count: rows.len(),
+                            timeout_us,
+                            ..ClusterHealthTraceStats::from_rows(rows)
+                        },
+                    );
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Some(peer_query) = peer_query {
+                    peer_query.finish(
+                        "timed_out",
+                        ClusterHealthTraceStats {
+                            reportable_member_count: rows.len(),
+                            timeout_us,
+                            ..ClusterHealthTraceStats::from_rows(rows)
+                        },
+                    );
+                }
+                continue;
+            }
         };
         let Some(peer_rows) = peer_rows else {
+            if let Some(peer_query) = peer_query {
+                peer_query.finish(
+                    "unavailable",
+                    ClusterHealthTraceStats {
+                        reportable_member_count: rows.len(),
+                        timeout_us,
+                        ..ClusterHealthTraceStats::from_rows(rows)
+                    },
+                );
+            }
             continue;
         };
-        merge_online_peer_health_rows(rows, peer_rows);
+        let peer_row_count = peer_rows.len();
+        let peer_live_count = peer_rows
+            .iter()
+            .filter(|row| {
+                row.availability == ClusterNodeAvailability::Online && row.live_probe_observed
+            })
+            .count();
+        let changed = merge_online_peer_health_rows(rows, peer_rows);
+        if let Some(peer_query) = peer_query {
+            let aggregate = ClusterHealthTraceStats::from_rows(rows);
+            peer_query.finish(
+                if changed { "merged" } else { "unchanged" },
+                ClusterHealthTraceStats {
+                    reportable_member_count: rows.len(),
+                    live_status_count: peer_live_count,
+                    row_count: peer_row_count,
+                    online_count: aggregate.online_count,
+                    unresolved_count: aggregate.unresolved_count,
+                    timeout_us,
+                },
+            );
+        }
+    }
+    if let Some(trace) = trace {
+        trace.emit_instant(
+            "cluster_health_peer_frontier",
+            "peer_limit_reached",
+            "",
+            ClusterHealthTraceStats::from_rows(rows),
+        );
     }
     Ok(())
 }
@@ -2139,6 +2918,111 @@ mod tests {
             .expect("deep row");
         assert_eq!(deep_row.availability, ClusterNodeAvailability::Online);
         assert_eq!(deep_row.status.commit.as_deref(), Some("via-bridge"));
+    }
+
+    #[tokio::test]
+    async fn peer_hedge_retries_slow_direct_member_when_no_peer_view_is_available() {
+        struct SlowThenResponsiveProbe {
+            cluster_id: ClusterId,
+            remote_node_id: NodeId,
+            observed_at: OffsetDateTime,
+            remote_attempts: std::sync::atomic::AtomicUsize,
+        }
+
+        impl ClusterStatusAsyncProbe for SlowThenResponsiveProbe {
+            fn probe_member_status_async<'a>(
+                &'a self,
+                _state: &'a ClusterBootstrapState,
+                member: &'a ClusterMemberRecord,
+            ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+                let is_remote = member.node_id == self.remote_node_id;
+                let attempt = is_remote.then(|| {
+                    self.remote_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                });
+                let status = health_test_status(
+                    &self.cluster_id,
+                    &member.node_id,
+                    if is_remote {
+                        "remote-direct-retry"
+                    } else {
+                        "local-direct"
+                    },
+                    self.observed_at,
+                );
+                Box::pin(async move {
+                    if attempt == Some(0) {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    } else if attempt.is_some() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Ok(Some(status))
+                })
+            }
+        }
+
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-health-peer-hedge-direct-retry");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_health_peer_hedge_direct_retry")
+            .expect("cluster");
+        let local_id =
+            NodeId::from_legacy_named("node_health_peer_hedge_direct_retry_local").expect("local");
+        let remote_id = NodeId::from_legacy_named("node_health_peer_hedge_direct_retry_remote")
+            .expect("remote");
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "peer hedge direct retry".to_string(),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![
+                health_test_member(&cluster_id, &local_id, "local", now),
+                health_test_member(&cluster_id, &remote_id, "remote", now),
+            ],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let probe = SlowThenResponsiveProbe {
+            cluster_id,
+            remote_node_id: remote_id.clone(),
+            observed_at: now,
+            remote_attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let started = tokio::time::Instant::now();
+        let rows = cluster_health_rows_with_async_probe_for_scope_with_budget(
+            &paths,
+            &state,
+            &probe,
+            true,
+            false,
+            now,
+            std::time::Duration::from_millis(350),
+        )
+        .await
+        .expect("hedged direct retry rows");
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(
+            probe
+                .remote_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a peer hedge must fall back to the remaining direct-probe budget"
+        );
+        let remote_row = rows
+            .iter()
+            .find(|row| row.member.node_id == remote_id)
+            .expect("remote row");
+        assert_eq!(remote_row.availability, ClusterNodeAvailability::Online);
+        assert_eq!(
+            remote_row.status.commit.as_deref(),
+            Some("remote-direct-retry")
+        );
     }
 
     #[test]

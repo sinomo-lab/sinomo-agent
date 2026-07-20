@@ -7,9 +7,11 @@ use crate::kv_local_store::read_cluster_kv_current_snapshot_arc;
 use crate::kv_local_store::record_current_cluster_kv_reader_node_id_cache;
 use crate::kv_read_model::read_cluster_members_from_kv;
 use crate::local_membership::{
-    locally_learned_remote_route_endpoints, preserve_locally_learned_remote_route_endpoints,
+    locally_learned_remote_route_endpoints, merge_cluster_join_registration,
+    preserve_locally_learned_remote_route_endpoints,
 };
 use crate::member_store::merge_member_record;
+use fs2::FileExt;
 use sinomo_base::{
     ClusterBootstrapState, ClusterMemberRole, ClusterMemberState, DAEMON_MAIN_RUN_CAPABILITY,
 };
@@ -27,7 +29,10 @@ use sinomo_node::{
     cluster_bootstrap_state_stable_eq, cluster_node_is_local_process, upsert_member_record,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -442,17 +447,216 @@ pub async fn read_cluster_state_async(
         })?
 }
 
-pub fn write_cluster_state(
+fn finish_cluster_state_write(paths: &ClusterPaths, state: &ClusterBootstrapState) {
+    invalidate_cluster_state_cache(paths);
+    sinomo_network::invalidate_cluster_delivery_routing_table_cache(paths);
+    record_current_cluster_kv_reader_node_id_cache(paths, state.local_node_id.clone());
+}
+
+/// Writes a state while its caller holds the local-state mutation lock.
+///
+/// Keep this separate from [`write_cluster_state`] so read/modify/write paths
+/// can cover their read and their atomic rename with one lock acquisition.
+/// Calling the public writer from such a path would recursively acquire the
+/// advisory lock and can deadlock on platforms where independent file handles
+/// conflict even inside one process.
+pub(crate) fn write_cluster_state_unlocked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
     write_object_file_with_semantic_skip(&paths.state, state, |existing| {
         cluster_bootstrap_state_stable_eq(existing, state)
     })?;
-    invalidate_cluster_state_cache(paths);
-    sinomo_network::invalidate_cluster_delivery_routing_table_cache(paths);
-    record_current_cluster_kv_reader_node_id_cache(paths, state.local_node_id.clone());
+    finish_cluster_state_write(paths, state);
     Ok(())
+}
+
+/// Persists an authoritative projection even when only its KV revision moved.
+///
+/// The ordinary local-state comparator deliberately ignores revision churn.
+/// Accepted joins instead need the revision on disk as a generation fence for
+/// delayed local read/modify/write work, so only an exact revision match may
+/// take the semantic-skip path here.
+fn write_accepted_cluster_state_unlocked(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<(), NetworkError> {
+    write_object_file_with_semantic_skip(&paths.state, state, |existing| {
+        existing.kv_revision == state.kv_revision
+            && cluster_bootstrap_state_stable_eq(existing, state)
+    })?;
+    finish_cluster_state_write(paths, state);
+    Ok(())
+}
+
+pub fn write_cluster_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<(), NetworkError> {
+    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
+    // A caller may have read this projection before awaiting endpoint or
+    // daemon discovery. Once an accepted join has durably advanced the local
+    // generation, that delayed writer must not last-rename the old membership
+    // over it. Different cluster identities are intentional bootstrap/join
+    // transitions and therefore are not compared on this fence.
+    match read_optional_object_file::<ClusterBootstrapState>(&paths.state) {
+        Ok(Some(existing))
+            if existing.cluster_id == state.cluster_id
+                && (state.kv_revision, state.term) < (existing.kv_revision, existing.term) =>
+        {
+            tracing::debug!(
+                target: "sinomo.cluster.formation",
+                candidate_revision = state.kv_revision,
+                candidate_term = state.term,
+                persisted_revision = existing.kv_revision,
+                persisted_term = existing.term,
+                "skipping superseded local cluster state write"
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // The caller is supplying a complete replacement object. A torn
+            // or trailing-byte predecessor cannot provide a trustworthy
+            // generation fence, but it also must not make the durable writer
+            // incapable of repairing that object through atomic replacement.
+            tracing::warn!(
+                target: "sinomo.cluster.formation",
+                path = %paths.state.display(),
+                %error,
+                "replacing unreadable local cluster state"
+            );
+        }
+    }
+    write_cluster_state_unlocked(paths, state)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptedClusterJoinStatePersistence {
+    Applied {
+        previous_revision: u64,
+        persisted_revision: u64,
+    },
+    Superseded {
+        accepted_revision: u64,
+        accepted_term: u64,
+        persisted_revision: u64,
+        persisted_term: u64,
+    },
+}
+
+fn local_cluster_state_mutation_lock_path(paths: &ClusterPaths) -> PathBuf {
+    let parent = paths.state.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = paths
+        .state
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.sobj");
+    parent.join(format!("{file_name}.lock"))
+}
+
+/// Serializes local-state read/merge/write transactions.
+///
+/// Atomic replacement protects readers from torn object files, but it cannot
+/// prevent two accepted joins from reading the same state and letting the last
+/// rename discard the other join. The main daemon, shadow daemon, and command
+/// clients may share this directory, so this must be a cross-process advisory
+/// lock rather than only an in-process mutex.
+pub(crate) fn acquire_local_cluster_state_mutation_lock(
+    paths: &ClusterPaths,
+) -> Result<std::fs::File, NetworkError> {
+    let lock_path = local_cluster_state_mutation_lock_path(paths);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock = options
+        .open(&lock_path)
+        .map_err(|source| NetworkError::StorageIo {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let wait_started = Instant::now();
+    lock.lock_exclusive()
+        .map_err(|source| NetworkError::StorageIo {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        path = %lock_path.display(),
+        wait_ms = wait_started.elapsed().as_secs_f64() * 1_000.0,
+        "acquired local cluster state mutation lock"
+    );
+    Ok(lock)
+}
+
+/// Merge an accepted join projection without allowing an older response to
+/// replace a newer durable membership view.
+///
+/// The authoritative KV transaction is already fenced separately. This helper
+/// protects only the local bootstrap projection, preserving its local identity
+/// and locally learned route endpoints through `merge_cluster_join_registration`.
+pub(crate) fn persist_accepted_cluster_join_state(
+    paths: &ClusterPaths,
+    accepted_state: ClusterBootstrapState,
+) -> Result<AcceptedClusterJoinStatePersistence, NetworkError> {
+    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
+    let mut local_state = read_cluster_state_without_kv(paths)?;
+    if local_state.cluster_id != accepted_state.cluster_id {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: format!(
+                "accepted cluster {} does not match local cluster {}",
+                accepted_state.cluster_id, local_state.cluster_id
+            ),
+        });
+    }
+    // Revision is the primary projection generation. For equal revisions, a
+    // higher term is the newer authority observation; accepting a lower-term
+    // response at that revision could roll membership back after an election.
+    if (accepted_state.kv_revision, accepted_state.term)
+        < (local_state.kv_revision, local_state.term)
+    {
+        tracing::trace!(
+            target: "sinomo.cluster.formation",
+            accepted_revision = accepted_state.kv_revision,
+            accepted_term = accepted_state.term,
+            persisted_revision = local_state.kv_revision,
+            persisted_term = local_state.term,
+            "accepted join projection was superseded before local persistence"
+        );
+        return Ok(AcceptedClusterJoinStatePersistence::Superseded {
+            accepted_revision: accepted_state.kv_revision,
+            accepted_term: accepted_state.term,
+            persisted_revision: local_state.kv_revision,
+            persisted_term: local_state.term,
+        });
+    }
+
+    let previous_revision = local_state.kv_revision;
+    let previous_term = local_state.term;
+    merge_cluster_join_registration(&mut local_state, accepted_state);
+    local_state.term = local_state.term.max(previous_term);
+    local_state.kv_revision = local_state.kv_revision.max(previous_revision);
+    let persisted_revision = local_state.kv_revision;
+    write_accepted_cluster_state_unlocked(paths, &local_state)?;
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        previous_revision,
+        persisted_revision,
+        persisted_term = local_state.term,
+        "persisted accepted join projection"
+    );
+    Ok(AcceptedClusterJoinStatePersistence::Applied {
+        previous_revision,
+        persisted_revision,
+    })
 }
 
 pub async fn write_cluster_state_async(
@@ -532,8 +736,10 @@ pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_base::ClusterMemberRecord;
     use sinomo_local::SinomoDataDir;
     use sinomo_node::{ClusterId, NodeId};
+    use std::sync::Barrier;
     use time::OffsetDateTime;
 
     fn test_state(name: &str) -> ClusterBootstrapState {
@@ -545,6 +751,224 @@ mod tests {
             "pk-local",
             OffsetDateTime::now_utc(),
         )
+    }
+
+    fn add_learner(state: &mut ClusterBootstrapState, name: &str) -> NodeId {
+        let node_id = NodeId::from_legacy_named(format!("node_{name}")).expect("learner node id");
+        let mut member = ClusterMemberRecord::pending_learner(
+            state.cluster_id.clone(),
+            node_id.clone(),
+            name,
+            format!("pk-{name}"),
+            OffsetDateTime::now_utc(),
+        );
+        member.state = ClusterMemberState::Learner;
+        state.members.push(member);
+        state
+            .members
+            .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        node_id
+    }
+
+    #[test]
+    fn accepted_join_persistence_rejects_cluster_mismatch() {
+        let root = sinomo_testdir::TestDir::new("accepted-join-state-cluster-mismatch");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let local = test_state("accepted_join_local_cluster");
+        write_cluster_state(&paths, &local).expect("write local state");
+
+        let error = persist_accepted_cluster_join_state(
+            &paths,
+            test_state("accepted_join_foreign_cluster"),
+        )
+        .expect_err("foreign accepted state must be rejected");
+        assert!(matches!(
+            error,
+            NetworkError::InvalidClusterCommand { detail }
+                if detail.contains("does not match local cluster")
+        ));
+        assert_eq!(
+            read_cluster_state_without_kv(&paths).expect("unchanged local state"),
+            local
+        );
+    }
+
+    #[test]
+    fn accepted_join_persistence_durably_advances_revision_only_projection() {
+        let root = sinomo_testdir::TestDir::new("accepted-join-state-revision-only");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut initial = test_state("accepted_join_revision_only");
+        initial.kv_revision = 10;
+        write_cluster_state(&paths, &initial).expect("write initial state");
+
+        let mut accepted = initial.clone();
+        accepted.kv_revision = 11;
+        assert_eq!(
+            persist_accepted_cluster_join_state(&paths, accepted)
+                .expect("persist revision-only accepted projection"),
+            AcceptedClusterJoinStatePersistence::Applied {
+                previous_revision: 10,
+                persisted_revision: 11,
+            }
+        );
+        assert_eq!(
+            read_cluster_state_without_kv(&paths)
+                .expect("read exact accepted projection")
+                .kv_revision,
+            11,
+            "accepted revision is a durable fence, not volatile bookkeeping"
+        );
+    }
+
+    #[test]
+    fn delayed_local_state_write_cannot_overwrite_accepted_join_generation() {
+        let root = sinomo_testdir::TestDir::new("accepted-join-state-delayed-writer");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut initial = test_state("accepted_join_delayed_writer");
+        initial.kv_revision = 10;
+        write_cluster_state(&paths, &initial).expect("write initial state");
+
+        // Model a daemon membership refresh that read before endpoint discovery
+        // awaited. Its final write occurs only after the join has committed and
+        // persisted a larger membership projection.
+        let mut delayed = read_cluster_state_without_kv(&paths).expect("read delayed candidate");
+        delayed.local_node_display_name = "delayed local refresh".to_string();
+        let mut accepted = initial.clone();
+        let joined = add_learner(&mut accepted, "accepted_join_during_refresh");
+        accepted.kv_revision = 11;
+        persist_accepted_cluster_join_state(&paths, accepted).expect("persist accepted join");
+        write_cluster_state(&paths, &delayed).expect("skip superseded delayed write");
+
+        let stored = read_cluster_state_without_kv(&paths).expect("read fenced local state");
+        assert_eq!(stored.kv_revision, 11);
+        assert!(stored.members.iter().any(|member| member.node_id == joined));
+        assert_ne!(
+            stored.local_node_display_name,
+            delayed.local_node_display_name
+        );
+    }
+
+    #[test]
+    fn accepted_join_persistence_does_not_regress_newer_state() {
+        let root = sinomo_testdir::TestDir::new("accepted-join-state-no-regression");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut newest = test_state("accepted_join_no_regression");
+        let first = add_learner(&mut newest, "accepted_join_first");
+        let second = add_learner(&mut newest, "accepted_join_second");
+        newest.kv_revision = 30;
+        newest.term = 7;
+        write_cluster_state(&paths, &newest).expect("write newest state");
+
+        let mut older = newest.clone();
+        older.local_node_id =
+            NodeId::from_legacy_named("node_remote_authority").expect("remote authority id");
+        older.local_node_display_name = "remote authority".to_string();
+        older.members.retain(|member| member.node_id != second);
+        older.term = 6;
+        let outcome = persist_accepted_cluster_join_state(&paths, older)
+            .expect("ignore superseded accepted state");
+
+        assert_eq!(
+            outcome,
+            AcceptedClusterJoinStatePersistence::Superseded {
+                accepted_revision: 30,
+                accepted_term: 6,
+                persisted_revision: 30,
+                persisted_term: 7,
+            }
+        );
+        let stored = read_cluster_state_without_kv(&paths).expect("stored newest state");
+        assert_eq!(stored.local_node_id, newest.local_node_id);
+        assert_eq!(
+            stored.local_node_display_name,
+            newest.local_node_display_name
+        );
+        assert!(stored.members.iter().any(|member| member.node_id == first));
+        assert!(stored.members.iter().any(|member| member.node_id == second));
+        assert_eq!(stored.kv_revision, 30);
+        assert_eq!(stored.term, 7);
+
+        let mut lower_revision = newest.clone();
+        lower_revision
+            .members
+            .retain(|member| member.node_id != second);
+        lower_revision.kv_revision = 29;
+        lower_revision.term = 8;
+        assert_eq!(
+            persist_accepted_cluster_join_state(&paths, lower_revision)
+                .expect("ignore lower-revision accepted state"),
+            AcceptedClusterJoinStatePersistence::Superseded {
+                accepted_revision: 29,
+                accepted_term: 8,
+                persisted_revision: 30,
+                persisted_term: 7,
+            },
+            "a newer term cannot make an older projection revision current"
+        );
+    }
+
+    #[test]
+    fn concurrent_accepted_join_persistence_keeps_newest_projection() {
+        let root = sinomo_testdir::TestDir::new("accepted-join-state-concurrent");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut initial = test_state("accepted_join_concurrent");
+        initial.kv_revision = 10;
+        write_cluster_state(&paths, &initial).expect("write initial state");
+
+        let mut first = initial.clone();
+        let first_node = add_learner(&mut first, "accepted_join_concurrent_first");
+        first.kv_revision = 11;
+        let mut second = first.clone();
+        let second_node = add_learner(&mut second, "accepted_join_concurrent_second");
+        second.kv_revision = 12;
+
+        let start = Arc::new(Barrier::new(3));
+        let first_start = Arc::clone(&start);
+        let first_paths = paths.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_start.wait();
+            persist_accepted_cluster_join_state(&first_paths, first)
+        });
+        let second_start = Arc::clone(&start);
+        let second_paths = paths.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_start.wait();
+            persist_accepted_cluster_join_state(&second_paths, second)
+        });
+        start.wait();
+        first_thread
+            .join()
+            .expect("first persistence thread")
+            .expect("persist first accepted state");
+        second_thread
+            .join()
+            .expect("second persistence thread")
+            .expect("persist second accepted state");
+
+        let stored = read_cluster_state_without_kv(&paths).expect("stored concurrent state");
+        assert_eq!(stored.kv_revision, 12);
+        assert!(
+            stored
+                .members
+                .iter()
+                .any(|member| member.node_id == first_node)
+        );
+        assert!(
+            stored
+                .members
+                .iter()
+                .any(|member| member.node_id == second_node)
+        );
     }
 
     #[test]

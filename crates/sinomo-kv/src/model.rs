@@ -1055,6 +1055,8 @@ pub enum KvError {
         requested: KvRevision,
         current: KvRevision,
     },
+    #[error("imported KV snapshot conflicts with materialized revision {revision:?}")]
+    ImportedSnapshotRevisionConflict { revision: KvRevision },
     #[error("unknown lease: {lease_id:?}")]
     UnknownLease { lease_id: LeaseId },
     #[error("invalid lease ttl: {ttl_ticks}")]

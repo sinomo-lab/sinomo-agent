@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 const FILE_CACHE_CAPACITY: usize = 4096;
@@ -203,21 +204,113 @@ pub fn write_cluster_kv_snapshot(
     Ok(())
 }
 
+fn imported_cluster_kv_snapshot_phase_trace(
+    phase: &'static str,
+    duration: Duration,
+    snapshot_revision: u64,
+    route_materialization_required: bool,
+    outcome: &'static str,
+    detail: std::fmt::Arguments<'_>,
+) {
+    let duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        phase,
+        duration_us,
+        snapshot_revision,
+        route_materialization_required,
+        outcome,
+        detail = %detail,
+        "cluster imported KV snapshot phase"
+    );
+}
+
 pub fn write_imported_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    let wrote = if imported_snapshot_requires_route_read_model_materialization(paths, snapshot)? {
-        sinomo_kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot)
-            .map_err(kv_err)?
+    let trace_enabled =
+        tracing::enabled!(target: "sinomo.cluster.formation", tracing::Level::TRACE);
+    let route_projection_started = trace_enabled.then(|| {
+        imported_cluster_kv_snapshot_phase_trace(
+            "route_projection_current_snapshot_read",
+            Duration::ZERO,
+            snapshot.revision.0,
+            false,
+            "started",
+            format_args!(
+                "reading the current materialized snapshot and comparing route projection"
+            ),
+        );
+        Instant::now()
+    });
+    let route_materialization_result =
+        imported_snapshot_requires_route_read_model_materialization(paths, snapshot);
+    if let Some(started) = route_projection_started {
+        match &route_materialization_result {
+            Ok(route_materialization_required) => imported_cluster_kv_snapshot_phase_trace(
+                "route_projection_current_snapshot_read",
+                started.elapsed(),
+                snapshot.revision.0,
+                *route_materialization_required,
+                "completed",
+                format_args!("current snapshot read and route projection comparison completed"),
+            ),
+            Err(error) => imported_cluster_kv_snapshot_phase_trace(
+                "route_projection_current_snapshot_read",
+                started.elapsed(),
+                snapshot.revision.0,
+                false,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+    }
+    let route_materialization_required = route_materialization_result?;
+    let materialized_write_started = trace_enabled.then(|| {
+        imported_cluster_kv_snapshot_phase_trace(
+            "imported_materialized_snapshot_write",
+            Duration::ZERO,
+            snapshot.revision.0,
+            route_materialization_required,
+            "started",
+            format_args!(
+                "writing imported snapshot with route-sensitive materialization={route_materialization_required}"
+            ),
+        );
+        Instant::now()
+    });
+    let write_result = if route_materialization_required {
+        sinomo_kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot).map_err(kv_err)
     } else {
         sinomo_kv::write_imported_cluster_kv_snapshot_if_changed(
             &paths.kv_paths(),
             snapshot,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map_err(kv_err)?
+        .map_err(kv_err)
     };
+    if let Some(started) = materialized_write_started {
+        match &write_result {
+            Ok(wrote) => imported_cluster_kv_snapshot_phase_trace(
+                "imported_materialized_snapshot_write",
+                started.elapsed(),
+                snapshot.revision.0,
+                route_materialization_required,
+                if *wrote { "written" } else { "unchanged" },
+                format_args!("imported snapshot materialization completed"),
+            ),
+            Err(error) => imported_cluster_kv_snapshot_phase_trace(
+                "imported_materialized_snapshot_write",
+                started.elapsed(),
+                snapshot.revision.0,
+                route_materialization_required,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+    }
+    let wrote = write_result?;
     observe_cluster_kv_snapshot_write(paths, wrote, Some(snapshot));
     Ok(wrote)
 }
@@ -753,6 +846,13 @@ impl LocalClusterRaftCommandStorage {
         self.inner.append_uncommitted(request).map_err(kv_err)
     }
 
+    pub(crate) fn append_uncommitted_observed(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> sinomo_kv::ClusterKvRaftObservedAppend {
+        self.inner.append_uncommitted_observed(request)
+    }
+
     pub(crate) fn record_rejected_before_commit(
         &mut self,
         request: &KvCommandRequest,
@@ -871,7 +971,17 @@ impl ClusterKvPathsExt for sinomo_network::ClusterPaths {
 /// Wraps a KV store error for the networking error type. Lives with the
 /// KV-backed store code; moves to `sinomo-cluster` with it.
 pub fn kv_err(error: sinomo_kv::KvError) -> sinomo_network::NetworkError {
-    sinomo_network::NetworkError::Directory {
-        detail: error.to_string(),
+    match error {
+        sinomo_kv::KvError::AuthorityUnavailable { detail } => {
+            sinomo_network::NetworkError::ClusterReadOnly { detail }
+        }
+        error @ sinomo_kv::KvError::InvalidRaftConfigTransition { .. } => {
+            sinomo_network::NetworkError::InvalidClusterCommand {
+                detail: error.to_string(),
+            }
+        }
+        error => sinomo_network::NetworkError::Directory {
+            detail: error.to_string(),
+        },
     }
 }

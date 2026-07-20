@@ -88,6 +88,11 @@ async fn run_membership_forward_attempt_with_deadline<T>(
 }
 
 fn membership_forward_trace(args: std::fmt::Arguments<'_>) {
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        detail = %args,
+        "cluster membership forward stage"
+    );
     let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));

@@ -307,7 +307,13 @@ fn placement_reconciliation_queue_key(file_system_id: &DfsFileSystemId) -> Strin
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-queue-v1")
 }
 
-fn placement_reconciliation_activity_index_key(file_system_id: &DfsFileSystemId) -> String {
+/// Bounded cluster-control projection for recent placement-job activity.
+///
+/// A filesystem's first config transaction creates the empty index alongside
+/// the config. Its presence therefore distinguishes a filesystem with no
+/// post-schema activity from an older filesystem whose unindexed history may
+/// be incomplete; per-path and per-version metadata never enters this key.
+pub fn placement_reconciliation_activity_index_key(file_system_id: &DfsFileSystemId) -> String {
     format!(
         "{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-activity-index-v1"
     )
@@ -323,7 +329,12 @@ fn placement_reconciliation_activity_record_key(
     )
 }
 
-fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> String {
+/// Exact non-expiring placement-authority permit key for one filesystem.
+///
+/// Daemon-side committed-snapshot reactors use this key to recover a dead
+/// process's exact permit when it becomes observable, without polling the
+/// complete DFS control plane.
+pub fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> String {
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-authority-permit-v1")
 }
 

@@ -770,8 +770,8 @@ where
     // write immediately. The committed-append fan-out runs on the voter and
     // can miss this node (cold formation: no relay route back yet), and
     // re-committing the same payload is a semantic no-effect that triggers no
-    // new fan-out — without this import a forwarded write can stay invisible
-    // locally until the periodic snapshot pull.
+    // new fan-out. Importing the response here makes convergence owned by the
+    // forwarded operation instead of relying on a background snapshot sweep.
     let import_paths = paths.clone();
     let import_snapshot = result.snapshot.clone();
     runtime

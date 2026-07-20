@@ -1499,7 +1499,7 @@ pub fn default_cluster_metadata_shard_with_host(
     let connectivity_graph = host.connectivity_graph(state);
     desired.primary_node_id = default_metadata_shard_target_primary_node_id(
         connectivity_graph.as_ref(),
-        state,
+        &state.local_node_id,
         &service_node_ids,
         default_target_primary_node_id,
         &current,
@@ -1576,7 +1576,7 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     let connectivity_graph = host.connectivity_graph(state);
     desired.primary_node_id = default_metadata_shard_target_primary_node_id(
         connectivity_graph.as_ref(),
-        state,
+        &state.local_node_id,
         &service_node_ids,
         default_target_primary_node_id,
         &current,
@@ -1616,36 +1616,60 @@ pub async fn default_cluster_metadata_shard_with_async_host(
 
 fn default_metadata_shard_target_primary_node_id(
     connectivity_graph: Option<&ClusterConnectivityGraph>,
-    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
     service_node_ids: &[NodeId],
     default_target_primary_node_id: NodeId,
     current: &DfsMetadataShardConfig,
 ) -> NodeId {
-    if current.primary_node_id == state.local_node_id {
+    if current.primary_node_id == *local_node_id {
         return default_target_primary_node_id;
     }
     if !service_node_ids
         .iter()
-        .any(|node_id| node_id == &state.local_node_id)
+        .any(|node_id| node_id == local_node_id)
     {
         return default_target_primary_node_id;
     }
     if !current
         .replica_node_ids
         .iter()
-        .any(|node_id| node_id == &state.local_node_id)
+        .any(|node_id| node_id == local_node_id)
     {
         return default_target_primary_node_id;
     }
     let Some(graph) = connectivity_graph else {
         return default_target_primary_node_id;
     };
-    if cluster_healthy_route_next_hop(graph, &state.local_node_id, &current.primary_node_id)
-        .is_some()
-    {
+    if cluster_healthy_route_next_hop(graph, local_node_id, &current.primary_node_id).is_some() {
         return default_target_primary_node_id;
     }
-    state.local_node_id.clone()
+    local_node_id.clone()
+}
+
+/// Whether the default placement policy is waiting for exact head evidence
+/// before it can move this shard's primary.
+///
+/// This is the same target calculation used by default-cluster
+/// reconciliation. Exposing the predicate lets a committed-state reactor
+/// subscribe to high-frequency head-watermark changes only while a topology
+/// or failover transition can actually consume them.
+pub fn default_metadata_shard_transition_awaits_head_watermark(
+    connectivity_graph: Option<&ClusterConnectivityGraph>,
+    local_node_id: &NodeId,
+    service_node_ids: &[NodeId],
+    current: &DfsMetadataShardConfig,
+    primary_offset: usize,
+) -> bool {
+    let fallback_node_id = service_node_ids.first().unwrap_or(local_node_id);
+    let default_target_primary_node_id =
+        default_metadata_shard_primary_node_id(service_node_ids, fallback_node_id, primary_offset);
+    default_metadata_shard_target_primary_node_id(
+        connectivity_graph,
+        local_node_id,
+        service_node_ids,
+        default_target_primary_node_id,
+        current,
+    ) != current.primary_node_id
 }
 
 pub fn default_metadata_shard_primary_node_id(
@@ -1763,6 +1787,8 @@ fn publish_local_dfs_service_advertisement_with_host(
     let mut content = DfsNodeAdvertisement::content(member.node_id.clone());
     metadata.zone = local_zone.map(str::to_string);
     content.zone = local_zone.map(str::to_string);
+    let metadata = stable_dfs_advertisement(host, &metadata_key, metadata, false)?;
+    let content = stable_dfs_advertisement(host, &content_key, content, false)?;
     host.put_node_advertisement(metadata_key, &metadata)?;
     host.put_node_advertisement(content_key, &content)
 }
@@ -1816,6 +1842,9 @@ async fn publish_local_dfs_service_advertisement_with_async_host(
     let mut content = DfsNodeAdvertisement::content(member.node_id.clone());
     metadata.zone = local_zone.map(str::to_string);
     content.zone = local_zone.map(str::to_string);
+    let metadata =
+        stable_dfs_advertisement_async(host, metadata_key.clone(), metadata, false).await?;
+    let content = stable_dfs_advertisement_async(host, content_key.clone(), content, false).await?;
     host.put_node_advertisement_async(metadata_key, metadata)
         .await?;
     host.put_node_advertisement_async(content_key, content)
@@ -2227,6 +2256,51 @@ mod tests {
     }
 
     #[test]
+    fn stable_local_replica_advertisements_do_not_refresh_timestamps_or_commit() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-stable-local-replica-advertisement");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_stable_local_replica").expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_stable_local_replica").expect("local");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "stable local replica",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let control_plane =
+            crate::SharedDfsControlPlaneKvClient::new(sinomo_core::kv::InProcessKvStore::new());
+        let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+            data_dir,
+            cluster_paths,
+            local,
+            Box::new(control_plane.clone()),
+        );
+        let options = DfsDefaultClusterBootstrapOptions {
+            publish_cluster_control: false,
+            materialize_local_metadata: false,
+            local_zone: Some("rack-a".to_string()),
+        };
+
+        ensure_default_distributed_dfs_with_host(&state, &mut host, options.clone())
+            .expect("first local replica advertisement");
+        let first_revision = control_plane.with_client(|store| store.revision());
+        assert!(first_revision > sinomo_core::kv::KvRevision::ZERO);
+
+        ensure_default_distributed_dfs_with_host(&state, &mut host, options)
+            .expect("stable local replica advertisement");
+        assert_eq!(
+            control_plane.with_client(|store| store.revision()),
+            first_revision,
+            "a stable local advertisement must preserve its stored timestamp and avoid another transaction"
+        );
+    }
+
+    #[test]
     fn metadata_shard_failover_targets_local_replica_when_current_primary_unhealthy() {
         let state = test_cluster_state_with_members(
             "cluster_dfs_default_unhealthy_primary",
@@ -2353,11 +2427,49 @@ mod tests {
                 ClusterConnectivityState::Healthy,
             )],
         );
+        let default_primary_offset = service_nodes
+            .iter()
+            .position(|node_id| node_id == &default_primary)
+            .expect("default primary is eligible");
+
+        assert!(
+            default_metadata_shard_transition_awaits_head_watermark(
+                Some(&healthy_graph),
+                &state.local_node_id,
+                &service_nodes,
+                &current,
+                default_primary_offset,
+            ),
+            "normal topology convergence needs head evidence before moving to the default primary"
+        );
+        assert!(
+            !default_metadata_shard_transition_awaits_head_watermark(
+                None,
+                &state.local_node_id,
+                &service_nodes,
+                &DfsMetadataShardConfig {
+                    primary_node_id: default_primary.clone(),
+                    ..current.clone()
+                },
+                default_primary_offset,
+            ),
+            "a stable default primary must not subscribe to POSIX head updates"
+        );
+        assert!(
+            default_metadata_shard_transition_awaits_head_watermark(
+                Some(&current_unreachable_graph),
+                &state.local_node_id,
+                &service_nodes,
+                &current,
+                default_primary_offset,
+            ),
+            "failover must subscribe to the head evidence needed for promotion"
+        );
 
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
                 Some(&healthy_graph),
-                &state,
+                &state.local_node_id,
                 &service_nodes,
                 default_primary.clone(),
                 &current,
@@ -2368,7 +2480,7 @@ mod tests {
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
                 None,
-                &state,
+                &state.local_node_id,
                 &service_nodes,
                 default_primary.clone(),
                 &current,
@@ -2379,7 +2491,7 @@ mod tests {
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
                 Some(&current_unreachable_graph),
-                &state,
+                &state.local_node_id,
                 &service_nodes,
                 default_primary.clone(),
                 &DfsMetadataShardConfig {
@@ -2393,7 +2505,7 @@ mod tests {
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
                 Some(&current_unreachable_graph),
-                &state,
+                &state.local_node_id,
                 &service_nodes,
                 default_primary,
                 &current,

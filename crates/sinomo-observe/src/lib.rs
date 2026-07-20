@@ -45,11 +45,13 @@ pub use runtime::{
     register_observe_metric_exporter, update_observe_control,
 };
 pub use timeline::{
+    OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME, OBSERVE_NETWORK_TIMELINE_ARTIFACT_ROOT,
     OBSERVE_NETWORK_TIMELINE_DEFAULT_DURATION_SECONDS, OBSERVE_NETWORK_TIMELINE_DEFAULT_MAX_EVENTS,
     OBSERVE_NETWORK_TIMELINE_MAX_DURATION_SECONDS, OBSERVE_NETWORK_TIMELINE_MAX_EVENTS,
     OBSERVE_NETWORK_TIMELINE_MIN_DURATION_SECONDS, ObserveNetworkTimelineAction,
     ObserveNetworkTimelineEvent, ObserveNetworkTimelineRequest, ObserveNetworkTimelineResponse,
     handle_observe_network_timeline, observe_network_timeline_response_from_snapshot,
+    persist_active_observe_network_timeline,
 };
 
 pub const OBSERVE_PROTOCOL: &str = "sinomo.observe.v1";

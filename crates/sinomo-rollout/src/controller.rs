@@ -574,6 +574,22 @@ fn rollout_telemetry_query(
     query
 }
 
+/// Returns whether an appended event can change the live rollout telemetry
+/// projection. Keep this aligned with the exact replay prefixes above so the
+/// daemon only wakes for inputs the controller can consume.
+pub fn rollout_telemetry_event_kind_is_relevant(kind: &EventKind) -> bool {
+    [
+        MODULE_SHADOW_DECISION_EVENT_KIND,
+        MODULE_INVOCATION_DECISION_EVENT_KIND,
+        MODULE_USER_CORRECTION_EVENT_KIND,
+        MODULE_CRASH_EVENT_KIND,
+        MODULE_TIMEOUT_EVENT_KIND,
+        MODULE_POLICY_BLOCKED_EVENT_KIND,
+    ]
+    .into_iter()
+    .any(|prefix| kind.as_str().starts_with(prefix))
+}
+
 fn rollout_candidate_artifact_id(state: &RolloutRuntimeState) -> Option<ArtifactId> {
     state
         .loader_state

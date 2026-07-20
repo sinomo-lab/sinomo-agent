@@ -1167,6 +1167,17 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
+    /// Project retention-eligible tombstones without taking a write lock.
+    ///
+    /// Reactive maintenance schedulers use the returned due count and next
+    /// eligibility deadline to avoid periodic full passes on idle metadata.
+    fn tombstone_compaction_projection(
+        &self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        Ok(DfsTombstoneCompactionReport::for_options(&options))
+    }
+
     /// Compact eligible tombstone records according to backend policy.
     fn compact_tombstones(
         &mut self,

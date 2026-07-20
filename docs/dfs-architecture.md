@@ -211,7 +211,7 @@ verified.
 
 | Layer | Authority and responsibility |
 |---|---|
-| Cluster KV | Filesystem configuration, metadata-shard placement, primary epochs, compact policies, and service discovery. |
+| Cluster KV | Filesystem configuration, metadata-shard placement, primary epochs, compact policies, bounded placement-workflow coordination and activity projections, and service discovery. |
 | Metadata shards | Paths, object identity, versions, write intents, receipts, namespace transactions, durable jobs, and journals. |
 | Content stores | Immutable blobs, extent manifests, staging data, local quotas, and garbage collection. |
 | Network data plane | Bounded metadata batches, manifests, ranges, chunks, receipts, and repair traffic. |

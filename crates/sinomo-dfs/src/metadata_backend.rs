@@ -4429,6 +4429,17 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(tables.namespace_prepares.get(operation_id).cloned())
     }
 
+    fn tombstone_compaction_projection(
+        &self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        let tables = self.current_tables_snapshot()?;
+        let now = options
+            .now_unix_nanos
+            .unwrap_or_else(metadata_now_unix_nanos);
+        Ok(plan_tombstone_compaction(&tables, &options, now).report)
+    }
+
     fn compact_tombstones(
         &mut self,
         options: DfsTombstoneCompactionOptions,
@@ -11836,6 +11847,68 @@ mod tests {
                 .kind,
             DfsObjectKind::Tombstone
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_compaction_skips_activated_retiring_shard() {
+        let root = temp_root("sharded_backend_compaction_skips_retiring_shard");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut root_tombstone = object(version("version_compaction_active_root"));
+        root_tombstone.path = "/deleted.md".to_string();
+        root_tombstone.kind = DfsObjectKind::Tombstone;
+        root_tombstone.content_hash = None;
+        root_tombstone.changed_at_unix_nanos = 1;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&root_tombstone).expect("root tombstone");
+
+        let services = DfsMetadataShardId::new("services");
+        backend
+            .freeze_metadata_shard_for_membership_handoff(&services, "handoff-retired-services", 1)
+            .expect("freeze services shard")
+            .expect("configured services shard");
+        backend
+            .mark_metadata_shard_membership_handoff_activated(
+                &services,
+                "handoff-retired-services",
+                2,
+            )
+            .expect("mark successor activation");
+
+        let report = backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::ZERO)
+                    .with_now_unix_nanos(100),
+            )
+            .expect("an unrelated retired shard must not abort compaction");
+        assert_eq!(report.compacted_tombstone_count, 1);
+        assert_eq!(
+            backend
+                .get_object(&root_tombstone.object_id)
+                .expect("compacted root tombstone"),
+            None
+        );
+        assert!(matches!(
+            backend
+                .shard_backend_mut(&services)
+                .expect("services backend")
+                .put_object(&object(version("version_retired_shard_stays_frozen"))),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
 
         cleanup(&root);
     }

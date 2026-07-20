@@ -17,6 +17,14 @@ const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 /// asserts this at compile time) so a full source record set survives a
 /// prefix read.
 pub const MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS: usize = 4096;
+/// Maximum records carried by one private connectivity snapshot RPC or
+/// accepted by one aggregate local-store merge.
+///
+/// This remains equal to the cluster KV whole-prefix range limit without
+/// introducing an R0 network -> KV dependency. A snapshot over this limit is
+/// rejected rather than truncated because an incomplete graph can look valid
+/// while omitting the only route to the state authority.
+pub const MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS: usize = 4096;
 
 /// Whether a network-domain record (connectivity/network-info) is still live
 /// at `now` per its `expires_at` stamp.

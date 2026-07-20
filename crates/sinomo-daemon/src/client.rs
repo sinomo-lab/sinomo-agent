@@ -468,40 +468,173 @@ async fn send_daemon_join_bootstrap_to_endpoint_async(
             detail: "raw join bootstrap transport only accepts cluster join handshakes".to_string(),
         });
     }
+    let call_started_ns = sinomo_core::network::network_timeline_capture_is_active()
+        .then(sinomo_core::network::network_timeline_monotonic_ns)
+        .unwrap_or(0);
     let mut request = request.clone();
+    if call_started_ns != 0 && request.auth.is_none() {
+        request.ensure_trace_context();
+        request
+            .metadata
+            .entry(sinomo_core::network::OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY.to_string())
+            .or_insert_with(|| "true".to_string());
+    }
+    let timeline = sinomo_core::network::network_timeline_trace_context_for_request(&request);
+    let endpoint_correlation_id = timeline
+        .and_then(|_| sinomo_core::network::register_network_timeline_endpoint(endpoint))
+        .unwrap_or(0);
+    record_raw_join_bootstrap_timeline_stage(
+        timeline,
+        endpoint_correlation_id,
+        sinomo_core::network::network_timeline_stage::CALL_PREPARE,
+        sinomo_core::network::network_timeline_flag::REQUEST,
+        0,
+        call_started_ns,
+        true,
+        u32::try_from(request.body.len()).unwrap_or(u32::MAX),
+    );
+    let result = async {
     if request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE {
         let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
         let signed_request = request.clone();
-        request.auth = Some(
-            runtime
-                .spawn_blocking(move || {
-                    sinomo_core::network::sign_daemon_rpc_request_from_data_dir(
-                        &data_dir,
-                        &signed_request,
-                    )
-                })
-                .await
-                .map_err(|source| DaemonError::Network {
-                    address: endpoint.address.clone(),
-                    detail: format!("join registration signing task failed: {source}"),
-                })??,
+        let sign_started_ns = timeline
+            .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
+            .unwrap_or(0);
+        let sign_result = runtime
+            .spawn_blocking(move || {
+                sinomo_core::network::sign_daemon_rpc_request_from_data_dir(
+                    &data_dir,
+                    &signed_request,
+                )
+            })
+            .await
+            .map_err(|source| DaemonError::Network {
+                address: endpoint.address.clone(),
+                detail: format!("join registration signing task failed: {source}"),
+            });
+        record_raw_join_bootstrap_timeline_stage(
+            timeline,
+            endpoint_correlation_id,
+            sinomo_core::network::network_timeline_stage::REQUEST_SIGN,
+            sinomo_core::network::network_timeline_flag::REQUEST,
+            0,
+            sign_started_ns,
+            sign_result.as_ref().is_ok_and(|result| result.is_ok()),
+            0,
         );
+        request.auth = Some(sign_result??);
     } else {
         request.auth = None;
     }
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_paths(daemon_paths);
-    let mut stream = sinomo_core::network::ClusterSignedObjectRpcAsyncHost::open_object_rpc_session_stream_async(
-        &mut host,
-        endpoint,
-        sinomo_core::network::NetworkHealthPolicy::new(timeout, timeout),
-    )
-    .await?;
+    let open_started_ns = timeline
+        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
+        .unwrap_or(0);
+    let open_result = sinomo_core::network::ClusterSignedObjectRpcAsyncHost::open_object_rpc_session_stream_async(
+            &mut host,
+            endpoint,
+            sinomo_core::network::NetworkHealthPolicy::new(timeout, timeout),
+        )
+        .await;
+    record_raw_join_bootstrap_timeline_stage(
+        timeline,
+        endpoint_correlation_id,
+        sinomo_core::network::network_timeline_stage::ENDPOINT_OPEN,
+        sinomo_core::network::network_timeline_flag::REQUEST,
+        0,
+        open_started_ns,
+        open_result.is_ok(),
+        0,
+    );
+    let mut stream = open_result?;
     let io = sinomo_core::network::ObjectFrameIoOptions::idle_timeout(timeout);
-    sinomo_core::network::write_object_frame_async(&mut stream, &request, io).await?;
-    let response: sinomo_core::network::ObjectRpcResponse =
-        sinomo_core::network::read_object_frame_async(&mut stream, io).await?;
+    let write_started_ns = timeline
+        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
+        .unwrap_or(0);
+    let write_result = sinomo_core::network::write_object_frame_async(&mut stream, &request, io).await;
+    record_raw_join_bootstrap_timeline_stage(
+        timeline,
+        endpoint_correlation_id,
+        sinomo_core::network::network_timeline_stage::FRAME_SOCKET_WRITE,
+        sinomo_core::network::network_timeline_flag::REQUEST,
+        1,
+        write_started_ns,
+        write_result.is_ok(),
+        u32::try_from(request.body.len()).unwrap_or(u32::MAX),
+    );
+    write_result?;
+    let read_started_ns = timeline
+        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
+        .unwrap_or(0);
+    let response_result: Result<sinomo_core::network::ObjectRpcResponse, _> =
+        sinomo_core::network::read_object_frame_async(&mut stream, io).await;
+    record_raw_join_bootstrap_timeline_stage(
+        timeline,
+        endpoint_correlation_id,
+        sinomo_core::network::network_timeline_stage::FRAME_READ,
+        sinomo_core::network::network_timeline_flag::RESPONSE,
+        2,
+        read_started_ns,
+        response_result.is_ok(),
+        response_result
+            .as_ref()
+            .map(|response| u32::try_from(response.body.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0),
+    );
+    let response = response_result?;
     response.error_detail()?;
     Ok(response)
+    }
+    .await;
+    record_raw_join_bootstrap_timeline_stage(
+        timeline,
+        endpoint_correlation_id,
+        sinomo_core::network::network_timeline_stage::CALL_COMPLETE,
+        sinomo_core::network::network_timeline_flag::REQUEST
+            | sinomo_core::network::network_timeline_flag::RESPONSE,
+        0,
+        call_started_ns,
+        result.is_ok(),
+        0,
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_raw_join_bootstrap_timeline_stage(
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+    endpoint_correlation_id: u64,
+    stage: u16,
+    flags: u16,
+    frame_id: u64,
+    started_ns: u64,
+    success: bool,
+    bytes: u32,
+) {
+    let Some(timeline) = timeline else {
+        return;
+    };
+    let duration_ns =
+        sinomo_core::network::network_timeline_monotonic_ns().saturating_sub(started_ns);
+    sinomo_core::network::record_network_timeline_event_now(
+        sinomo_core::network::NetworkTimelineEvent::new(
+            timeline,
+            stage,
+            flags
+                | if success {
+                    sinomo_core::network::network_timeline_flag::SUCCESS
+                } else {
+                    0
+                },
+            0,
+            0,
+            frame_id,
+            bytes,
+            0,
+            duration_ns,
+        )
+        .with_endpoint_correlation_id(endpoint_correlation_id),
+    );
 }
 
 async fn send_daemon_rpc_to_endpoint_with_options_async(
@@ -2025,6 +2158,24 @@ pub(crate) fn fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime(
     )
 }
 
+pub(crate) async fn fetch_cluster_kv_local_snapshot_from_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvLocalRead<KvSnapshot>, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_local_snapshot_rpc_payload()?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_async(
+        endpoint,
+        &rpc_request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        runtime,
+        decode_cluster_kv_local_snapshot_rpc_response,
+    )
+    .await
+}
+
 pub fn fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     prefix: &str,
@@ -2064,6 +2215,25 @@ pub fn start_cluster_kv_authoritative_watch_from_endpoint_on_runtime(
     )
 }
 
+pub(crate) async fn start_cluster_kv_authoritative_watch_from_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    prefix: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvAuthoritativeRead<ClusterKvWatchRegistration>, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_authoritative_watch_start_rpc_payload(prefix)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_async(
+        endpoint,
+        &rpc_request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        runtime,
+        decode_cluster_kv_authoritative_watch_start_rpc_response,
+    )
+    .await
+}
+
 pub fn drain_cluster_kv_watch_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchDrainRequest,
@@ -2082,6 +2252,25 @@ pub fn drain_cluster_kv_watch_from_endpoint_on_runtime(
     )
 }
 
+pub(crate) async fn drain_cluster_kv_watch_from_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterKvWatchDrainRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterKvWatchDrainResponse, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_local_watch_drain_rpc_payload(request)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_async(
+        endpoint,
+        &rpc_request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        runtime,
+        decode_cluster_kv_watch_drain_rpc_response,
+    )
+    .await
+}
+
 pub fn cancel_cluster_kv_watch_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchCancelRequest,
@@ -2098,6 +2287,25 @@ pub fn cancel_cluster_kv_watch_from_endpoint_on_runtime(
         runtime,
         decode_cluster_kv_watch_cancel_rpc_response,
     )
+}
+
+pub(crate) async fn cancel_cluster_kv_watch_from_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterKvWatchCancelRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterKvWatchCancelResponse, DaemonError> {
+    let rpc_request = object_rpc_request_from_kv_payload(
+        sinomo_core::kv::cluster_kv_local_watch_cancel_rpc_payload(request)?,
+    );
+    send_daemon_rpc_request_to_endpoint_with_decoder_async(
+        endpoint,
+        &rpc_request,
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        runtime,
+        decode_cluster_kv_watch_cancel_rpc_response,
+    )
+    .await
 }
 
 pub(crate) fn send_cluster_raft_append_on_runtime(

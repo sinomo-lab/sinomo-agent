@@ -1313,9 +1313,8 @@ fn cli_local_cluster_quorum_if_relevant(
     let paths = cluster_paths_from_defaults()?;
     match read_cluster_state(&paths) {
         Ok(state) => Ok(Some(
-            daemon.is_some_and(|daemon| {
-                local_daemon_can_serve_authoritative_cluster_kv_snapshot(daemon, &state)
-            }) || cluster_has_local_quorum(&paths, &state),
+            daemon.is_some_and(|daemon| local_daemon_matches_cluster_state(daemon, &state))
+                && cluster_has_local_quorum(&paths, &state),
         )),
         Err(CliError::ClusterOrphan) => Ok(None),
         Err(error) => Err(error),
@@ -5705,7 +5704,7 @@ fn decode_cluster_kv_local_snapshot_rpc_response(
 ) -> Result<KvLocalRead<KvSnapshot>, network::NetworkError> {
     response.error_detail()?;
     let read = sinomo_runtime::kv::decode_cluster_kv_local_snapshot_rpc_body(&response.body)
-        .map_err(sinomo_runtime::network::NetworkError::directory)?;
+        .map_err(sinomo_runtime::cluster::kv_err)?;
     if read.revision != read.value.revision {
         return Err(network::NetworkError::Serialization {
             detail: format!(
@@ -5732,7 +5731,7 @@ fn decode_cluster_kv_authoritative_snapshot_rpc_response(
     response.error_detail()?;
     let read =
         sinomo_runtime::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
-            .map_err(sinomo_runtime::network::NetworkError::directory)?;
+            .map_err(sinomo_runtime::cluster::kv_err)?;
     if read.authority.term == 0
         || !matches!(
             read.authority.basis,

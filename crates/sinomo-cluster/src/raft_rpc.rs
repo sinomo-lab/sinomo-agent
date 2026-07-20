@@ -3,7 +3,8 @@ use crate::kv_local_store::apply_cluster_raft_append;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 use crate::local_state_store::{
-    project_committed_cluster_raft_config, read_cluster_consensus_state, write_cluster_state,
+    acquire_local_cluster_state_mutation_lock, project_committed_cluster_raft_config,
+    read_cluster_consensus_state, write_cluster_state_unlocked,
 };
 use crate::member_store::merge_cluster_state_from_peer;
 use crate::membership_rpc::ClusterAuthenticatedPeer;
@@ -62,6 +63,7 @@ pub fn handle_cluster_raft_append_request(
     request: ClusterRaftAppendRequest,
     authenticated_peer: &ClusterAuthenticatedPeer,
 ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
     let mut state = read_cluster_consensus_state(paths)?;
     if request.state.cluster_id != state.cluster_id {
         return cluster_raft_append_rejection(
@@ -92,7 +94,7 @@ pub fn handle_cluster_raft_append_request(
     }
     merge_cluster_state_from_peer(&mut state, request.state);
     project_committed_cluster_raft_config(paths, &mut state)?;
-    write_cluster_state(paths, &state)?;
+    write_cluster_state_unlocked(paths, &state)?;
     let append = apply_cluster_raft_append(
         paths,
         &state.local_node_id,
@@ -102,7 +104,7 @@ pub fn handle_cluster_raft_append_request(
     // The append may itself have committed a new config. Persist its effective
     // role projection so restart/local demotion cannot resurrect stale voters.
     project_committed_cluster_raft_config(paths, &mut state)?;
-    write_cluster_state(paths, &state)?;
+    write_cluster_state_unlocked(paths, &state)?;
     Ok(ClusterRaftAppendResponse {
         accepted: append.success,
         detail: if append.success {
@@ -146,6 +148,7 @@ pub fn handle_cluster_raft_vote_request(
     request: ClusterRaftVoteRequest,
     authenticated_peer: &ClusterAuthenticatedPeer,
 ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
     let mut state = read_cluster_consensus_state(paths)?;
     if request.state.cluster_id != state.cluster_id {
         return paths
@@ -183,7 +186,7 @@ pub fn handle_cluster_raft_vote_request(
     }
     merge_cluster_state_from_peer(&mut state, request.state);
     project_committed_cluster_raft_config(paths, &mut state)?;
-    write_cluster_state(paths, &state)?;
+    write_cluster_state_unlocked(paths, &state)?;
     paths
         .kv_paths()
         .apply_raft_vote_response(&state, request.vote)

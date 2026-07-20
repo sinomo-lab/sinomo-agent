@@ -46,12 +46,31 @@ fn object_rpc_call_is_channel_compatible(call: &ObjectRpcSessionCall) -> bool {
     if call.body.is_empty() {
         return true;
     }
-    // The pooled channel remains the bounded latency path. Bulk or unknown-size
-    // attachments use the canonical session, whose independently negotiated
-    // chunks and BDP-sized receive window can fill a high-bandwidth path.
-    call.body.total_bytes().is_some_and(|bytes| {
-        bytes <= u64::try_from(OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES).unwrap_or(u64::MAX)
-    })
+    // Known-size attachments can stream through the fixed-data channel under
+    // its bounded per-call window regardless of their total length. Unknown-size
+    // sources retain the canonical session path because the channel body head
+    // cannot make the same finite-length admission guarantee for them.
+    call.body.total_bytes().is_some()
+}
+
+/// Makes a bounded, explicitly active timeline capture observe locally
+/// originated RPCs without requiring every domain caller to know about the
+/// diagnostic metadata contract.
+///
+/// The metadata is attached before the request is signed and only when the
+/// request is still unsigned. An explicit sampled value remains authoritative,
+/// so callers can suppress a particularly noisy operation even during a
+/// capture. Ordinary traffic still pays only the timeline's relaxed atomic
+/// active check.
+fn prepare_call_for_active_network_timeline(call: &mut ObjectRpcSessionCall) {
+    if !crate::network_timeline_capture_is_active() || call.request.auth.is_some() {
+        return;
+    }
+    call.request.ensure_trace_context();
+    call.request
+        .metadata
+        .entry(crate::OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY.to_string())
+        .or_insert_with(|| "true".to_string());
 }
 
 fn record_route_timeline_stage(
@@ -1019,10 +1038,26 @@ fn cluster_delivery_route_candidate_hop_rank(
     candidate: &ClusterDeliveryRouteCandidate,
     target_node_id: &NodeId,
 ) -> u8 {
-    if candidate.plan.next_hop == *target_node_id {
+    if candidate.plan.next_hop != *target_node_id {
+        return 1;
+    }
+    // A synthetic tunnel is cached fallback evidence, not a physical direct
+    // hop. Let a fully verified physical relay outrank a tunnel-only target
+    // candidate; otherwise one stale tunnel can consume the whole operation
+    // deadline before the known-good segmented route is attempted.
+    // `endpoints_for_next_hop` orders these by the edge cost that made the
+    // candidate complete. Looking only at the cheapest endpoint matters for a
+    // mixed candidate: the presence of a degraded physical socket must not
+    // make a healthy synthetic tunnel look like verified physical evidence.
+    if candidate
+        .plan
+        .endpoints
+        .first()
+        .is_some_and(|endpoint| !cluster_delivery_endpoint_is_tcp_tunnel(endpoint))
+    {
         0
     } else {
-        1
+        2
     }
 }
 
@@ -2492,9 +2527,10 @@ where
         &mut self,
         state: &ClusterBootstrapState,
         endpoint: &ClusterEndpointRecord,
-        call: ObjectRpcSessionCall,
+        mut call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
+        prepare_call_for_active_network_timeline(&mut call);
         let expected_public_key = cluster_authorized_member_public_key(state, &endpoint.node_id)?;
         let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
         self.call_authenticated_endpoint(endpoint, call, options, data_dir, expected_public_key)
@@ -2511,7 +2547,7 @@ where
         &mut self,
         data_dir: &sinomo_local::SinomoDataDir,
         address: &str,
-        call: ObjectRpcSessionCall,
+        mut call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
         if !crate::is_loopback_connect_address(address) {
@@ -2530,6 +2566,7 @@ where
             address.to_string(),
             0,
         );
+        prepare_call_for_active_network_timeline(&mut call);
         self.call_authenticated_endpoint(
             &endpoint,
             call,
@@ -2783,7 +2820,7 @@ where
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        mut call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let Some(context) = self.route_context else {
@@ -2800,6 +2837,7 @@ where
             NetworkDeliveryState::PossiblyApplied,
             &[],
         );
+        prepare_call_for_active_network_timeline(&mut call);
         cluster_object_rpc_call_with_deadline(
             self.call_target_from_paths(
                 context.runtime,
@@ -3764,7 +3802,9 @@ where
                         }
                         if !cluster_relay_session_response_origin_is_acceptable(
                             &result.response,
+                            target_node_id,
                             result.response_origin_verified(),
+                            result.response_link_verified(),
                         ) {
                             return Err(NetworkError::outcome_unknown(
                                 format!("cluster target object RPC session to {target_node_id}"),
@@ -4667,9 +4707,12 @@ fn cluster_relay_session_response_disposition(
 
 fn cluster_relay_session_response_origin_is_acceptable(
     response: &ObjectRpcResponse,
+    target_node_id: &NodeId,
     response_origin_verified: bool,
+    response_link_verified: bool,
 ) -> bool {
     response_origin_verified
+        || (response_link_verified && response.responder_node_id() == Some(target_node_id.as_str()))
         || cluster_relay_session_response_disposition(response)
             != ClusterRelaySessionResponseDisposition::Delivered
 }
@@ -4686,7 +4729,9 @@ fn validate_and_normalize_forwarded_relay_result(
     }
     if !cluster_relay_session_response_origin_is_acceptable(
         &result.response,
+        &envelope.target_node_id,
         result.response_origin_verified(),
+        result.response_link_verified(),
     ) {
         return Err(NetworkError::outcome_unknown(
             format!(
@@ -4764,7 +4809,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
-    fn bulk_and_unknown_attachments_use_the_bdp_tuned_session() {
+    fn known_attachments_use_the_channel_regardless_of_size() {
         let request = || {
             ObjectRpcRequest::from_encoded_body("/test/channel-compatibility", "test", Vec::new())
         };
@@ -4783,8 +4828,42 @@ mod tests {
         );
 
         assert!(object_rpc_call_is_channel_compatible(&small));
-        assert!(!object_rpc_call_is_channel_compatible(&bulk));
+        assert!(object_rpc_call_is_channel_compatible(&bulk));
         assert!(!object_rpc_call_is_channel_compatible(&unknown));
+    }
+
+    #[test]
+    fn active_timeline_samples_unsigned_outgoing_calls_without_overriding_policy() {
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(16).expect("start route timeline capture");
+
+        let request = || {
+            ObjectRpcRequest::from_encoded_body(
+                "/test/active-timeline-auto-sampling",
+                "test",
+                Vec::new(),
+            )
+        };
+        let mut sampled = ObjectRpcSessionCall::value(request());
+        prepare_call_for_active_network_timeline(&mut sampled);
+        assert!(sampled.request.traceparent().is_some());
+        assert!(sampled.request.observe_sampled());
+
+        let mut explicitly_unsampled =
+            ObjectRpcSessionCall::value(request().with_observe_sampled(false));
+        prepare_call_for_active_network_timeline(&mut explicitly_unsampled);
+        assert!(explicitly_unsampled.request.traceparent().is_some());
+        assert!(!explicitly_unsampled.request.observe_sampled());
+
+        let mut already_signed = ObjectRpcSessionCall::value(request().with_auth(vec![1, 2, 3]));
+        prepare_call_for_active_network_timeline(&mut already_signed);
+        assert!(already_signed.request.traceparent().is_none());
+        assert!(!already_signed.request.observe_sampled());
+
+        crate::stop_network_timeline_capture().expect("stop route timeline capture");
     }
 
     enum RecordingChannelAction {
@@ -6234,20 +6313,52 @@ mod tests {
 
     #[test]
     fn session_relay_requires_target_attestation_only_for_delivered_responses() {
-        let delivered =
+        let target_node =
+            NodeId::from_legacy_named("node_session_relay_target_proof").expect("target node");
+        let mut delivered =
             ObjectRpcResponse::encode_body("/test/session-relay-target-proof", &"delivered")
                 .expect("delivered response");
         assert!(cluster_relay_session_response_origin_is_acceptable(
-            &delivered, true,
+            &delivered,
+            &target_node,
+            true,
+            false,
         ));
         assert!(!cluster_relay_session_response_origin_is_acceptable(
-            &delivered, false,
+            &delivered,
+            &target_node,
+            false,
+            false,
+        ));
+        assert!(!cluster_relay_session_response_origin_is_acceptable(
+            &delivered,
+            &target_node,
+            false,
+            true,
+        ));
+        let mut wrong_target = delivered.clone();
+        wrong_target.mark_responder_node_id("node_session_relay_wrong_target");
+        assert!(!cluster_relay_session_response_origin_is_acceptable(
+            &wrong_target,
+            &target_node,
+            false,
+            true,
+        ));
+        delivered.mark_responder_node_id(target_node.to_string());
+        assert!(cluster_relay_session_response_origin_is_acceptable(
+            &delivered,
+            &target_node,
+            false,
+            true,
         ));
 
         let routing = ObjectRpcResponse::encode_error(CLUSTER_RELAY_ROUTE, "no route")
             .expect("routing response");
         assert!(cluster_relay_session_response_origin_is_acceptable(
-            &routing, false,
+            &routing,
+            &target_node,
+            false,
+            false,
         ));
     }
 
@@ -6471,6 +6582,109 @@ mod tests {
         );
         assert_eq!(candidates[0].cost, 30);
         assert!(candidates[0].complete);
+    }
+
+    #[test]
+    fn route_candidates_prefer_verified_physical_relay_over_tunnel_only_target() {
+        let local = NodeId::from_legacy_named("node_route_tunnel_origin").expect("local node");
+        let bridge = NodeId::from_legacy_named("node_route_tunnel_bridge").expect("bridge node");
+        let target = NodeId::from_legacy_named("node_route_tunnel_target").expect("target node");
+        let bridge_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &bridge,
+            "bridge.example.test:21353".to_string(),
+            0,
+        );
+        let tunnel_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_route_tunnel_target")
+                .expect("tunnel endpoint"),
+            node_id: target.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: Some(0),
+        };
+        let mut graph = ClusterDeliveryRouteGraph::default();
+        graph
+            .push_edge_clone(&local, &target, Some(&tunnel_endpoint), 12_000)
+            .expect("local tunnel target");
+        graph
+            .push_edge_clone(&local, &bridge, Some(&bridge_endpoint), 20)
+            .expect("local bridge");
+        graph
+            .push_edge_clone(&bridge, &target, None, 20)
+            .expect("bridge target");
+
+        let candidates =
+            cluster_delivery_route_candidates(&graph, &local, &target).expect("route candidates");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].plan.next_hop, bridge);
+        assert_eq!(candidates[1].plan.next_hop, target);
+    }
+
+    #[test]
+    fn route_candidates_do_not_promote_mixed_target_from_degraded_physical_endpoint() {
+        let local = NodeId::from_legacy_named("node_route_mixed_origin").expect("local node");
+        let bridge = NodeId::from_legacy_named("node_route_mixed_bridge").expect("bridge node");
+        let target = NodeId::from_legacy_named("node_route_mixed_target").expect("target node");
+        let bridge_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &bridge,
+            "bridge.example.test:21353".to_string(),
+            0,
+        );
+        let physical_target = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target,
+            "target.example.test:21353".to_string(),
+            0,
+        );
+        let tunnel_target = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_route_mixed_tunnel")
+                .expect("tunnel endpoint"),
+            node_id: target.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: Some(0),
+        };
+        let mut graph = ClusterDeliveryRouteGraph::default();
+        graph
+            .push_edge_clone(&local, &target, Some(&tunnel_target), 12_000)
+            .expect("local tunnel target");
+        graph
+            .push_edge_clone(&local, &target, Some(&physical_target), 50_000)
+            .expect("degraded physical target");
+        graph
+            .push_edge_clone(&local, &bridge, Some(&bridge_endpoint), 20)
+            .expect("local bridge");
+        graph
+            .push_edge_clone(&bridge, &target, None, 20)
+            .expect("bridge target");
+
+        let candidates =
+            cluster_delivery_route_candidates(&graph, &local, &target).expect("route candidates");
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].plan.next_hop, bridge);
+        assert_eq!(candidates[1].plan.next_hop, target);
+        assert!(cluster_delivery_endpoint_is_tcp_tunnel(
+            candidates[1]
+                .plan
+                .endpoints
+                .first()
+                .expect("cheapest mixed endpoint")
+        ));
     }
 
     #[tokio::test(start_paused = true)]

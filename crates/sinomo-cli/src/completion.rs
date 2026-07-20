@@ -968,7 +968,12 @@ fn slash_command_registry() -> CommandSpec {
                         "invite",
                         "create a portable join invite",
                         vec![],
-                        opts(&["--introducer", "--ttl-seconds", "--output"]),
+                        opts(&[
+                            "--introducer",
+                            "--ttl-seconds",
+                            "--output",
+                            "--channel-output",
+                        ]),
                         vec![],
                     ),
                     cmd(
@@ -1831,6 +1836,7 @@ fn option_placeholder(name: &str) -> &'static str {
         "--text-verbosity" => "verbosity",
         "--vendor-option" => "key=value",
         "--clear-vendor-option" => "key",
+        "--channel-output" => "introducer=path",
         "--container-runtime" => "docker|podman",
         "--container-image" | "--docker" | "--podman" => "image",
         "--repo"
@@ -1927,6 +1933,7 @@ fn option_detail(name: &str) -> &'static str {
         "--library-name" => "native library file name",
         "--source" => "source label",
         "--target" => "target host:port",
+        "--channel-output" => "single-channel invite output as introducer=path",
         "--force-source" | "--force-overwrite" => "stash and overwrite managed source",
         "--daemon" => "use daemon-backed storage",
         "--container-runtime" => "container runtime",
@@ -2175,6 +2182,23 @@ mod tests {
                 .iter()
                 .any(|item| { item.kind == SlashCompletionKind::Hint && item.label == "prefix" })
         );
+
+        let invite_options = slash_completions("/cluster invite --", "/cluster invite --".len())
+            .expect("cluster invite options");
+        assert!(
+            invite_options
+                .items
+                .iter()
+                .any(|item| item.label == "--channel-output")
+        );
+        let channel_output = slash_completions(
+            "/cluster invite --channel-output ",
+            "/cluster invite --channel-output ".len(),
+        )
+        .expect("cluster channel output hint");
+        assert!(channel_output.items.iter().any(|item| {
+            item.kind == SlashCompletionKind::Hint && item.label == "introducer=path"
+        }));
     }
 
     #[test]

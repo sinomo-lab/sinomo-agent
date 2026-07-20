@@ -54,9 +54,15 @@ services:
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       SINOMO_NETWORK_PERF_TRACE: "${SINOMO_NETWORK_PERF_TRACE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE: "${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS: "${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+      SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ: "${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+      SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES: "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+      SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS: "${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+      SINOMO_TEST_FORMATION_OBSERVE_FILTER: "${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
       SINOMO_DFS_ZONE: "seg-a"
-      # The seed (voter) publishes a join invite for every segment, each naming the
-      # reachable bridge as that segment's introducer (node2,3 reach node1; node4 reaches
+      # The seed (voter) quorum-publishes one invite with every introducer, then writes an
+      # exact one-channel compact reference per segment (node2,3 reach node1; node4 reaches
       # node3; node5,6 reach node4). Bridge learners cannot mint invites, so only node1 does.
       PUBLISH_INVITES: "node1:21353=/shared/seg-a-invite.json node3:21353=/shared/seg-ab-invite.json node4:21353=/shared/seg-b-invite.json"
     volumes:
@@ -79,6 +85,12 @@ services:
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       SINOMO_NETWORK_PERF_TRACE: "${SINOMO_NETWORK_PERF_TRACE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE: "${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS: "${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+      SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ: "${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+      SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES: "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+      SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS: "${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+      SINOMO_TEST_FORMATION_OBSERVE_FILTER: "${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
       SINOMO_DFS_ZONE: "seg-a"
       WAIT_FOR_INTRODUCER_READY: "1"
       INTRODUCER: node1:21353
@@ -104,6 +116,12 @@ services:
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       SINOMO_NETWORK_PERF_TRACE: "${SINOMO_NETWORK_PERF_TRACE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE: "${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS: "${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+      SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ: "${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+      SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES: "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+      SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS: "${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+      SINOMO_TEST_FORMATION_OBSERVE_FILTER: "${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
       SINOMO_DFS_ZONE: "bridge"
       WAIT_FOR_INTRODUCER_READY: "1"
       INTRODUCER: node1:21353
@@ -129,6 +147,12 @@ services:
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       SINOMO_NETWORK_PERF_TRACE: "${SINOMO_NETWORK_PERF_TRACE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE: "${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS: "${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+      SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ: "${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+      SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES: "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+      SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS: "${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+      SINOMO_TEST_FORMATION_OBSERVE_FILTER: "${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
       SINOMO_DFS_ZONE: "bridge"
       INTRODUCER: node3:21353
       JOIN_INVITE: /shared/seg-ab-invite.json
@@ -153,6 +177,12 @@ services:
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       SINOMO_NETWORK_PERF_TRACE: "${SINOMO_NETWORK_PERF_TRACE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE: "${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS: "${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+      SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ: "${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+      SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES: "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+      SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS: "${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+      SINOMO_TEST_FORMATION_OBSERVE_FILTER: "${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
       SINOMO_DFS_ZONE: "seg-b"
       INTRODUCER: node4:21353
       JOIN_INVITE: /shared/seg-b-invite.json
@@ -177,6 +207,12 @@ services:
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       SINOMO_NETWORK_PERF_TRACE: "${SINOMO_NETWORK_PERF_TRACE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE: "${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+      SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS: "${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+      SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ: "${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+      SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES: "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+      SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS: "${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+      SINOMO_TEST_FORMATION_OBSERVE_FILTER: "${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
       SINOMO_DFS_ZONE: "seg-b"
       INTRODUCER: node4:21353
       JOIN_INVITE: /shared/seg-b-invite.json

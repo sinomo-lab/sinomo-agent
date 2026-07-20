@@ -17,7 +17,7 @@ use sinomo_dfs::{
     DfsWriteIntentStatus, LocalSobjMetadataBackend, NetworkedDfsReadFreshness,
     NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
     NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_key, sifs_node_files_path,
+    metadata_shard_key, placement_reconciliation_activity_index_key, sifs_node_files_path,
 };
 use std::fs;
 use std::io::{Read, Result as IoResult};
@@ -2186,7 +2186,7 @@ fn networked_dfs_rejects_stage_blob_from_non_owner() {
 }
 
 #[test]
-fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
+fn networked_dfs_uses_kv_only_for_bounded_control_plane_records() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -2308,6 +2308,11 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
                 .file_system_id,
             file_system_id
         );
+        let placement_activity = control
+            .placement_reconciliation_activity(&file_system_id, &[], None, None, 1)
+            .expect("read placement control-plane projection");
+        assert!(placement_activity.activities.is_empty());
+        assert!(!placement_activity.history_truncated);
         let dfs_keys: Vec<_> = kv
             .range_prefix("/dfs/")
             .expect("dfs range")
@@ -2319,6 +2324,7 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
             vec![
                 file_system_config_key(&file_system_id),
                 metadata_shard_key(&file_system_id, "root"),
+                placement_reconciliation_activity_index_key(&file_system_id),
             ]
         );
     });

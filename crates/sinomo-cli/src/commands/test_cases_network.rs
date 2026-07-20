@@ -2545,13 +2545,16 @@ mod tests {
 
     #[test]
     fn client_timeline_capacity_covers_one_mib_full_duplex_payloads() {
+        let payload_quanta = 2 * ARBITRARY_MESSAGE_PAYLOAD_BYTES
+            .div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES);
         assert_eq!(
             benchmark_client_timeline_capacity(
                 1,
                 ARBITRARY_MESSAGE_PAYLOAD_BYTES,
                 ARBITRARY_MESSAGE_PAYLOAD_BYTES,
             ),
-            1056
+            payload_quanta * CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM
+                + CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE
         );
     }
 

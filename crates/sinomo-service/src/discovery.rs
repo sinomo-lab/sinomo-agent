@@ -120,23 +120,30 @@ pub fn discover_service_instances(
     service_instances_from_entries(&read.value)
 }
 
-/// Publishes the local registry's instance records. A locally unchanged batch
-/// is still submitted as an empty stable-ID transaction so success is backed
-/// by a quorum commit rather than a stale local equality check.
+/// Reconciles the local registry's source-owned instance records against the
+/// applied local cluster-KV view. A fully unchanged batch returns `None`
+/// without creating a transaction; changed records and records for services
+/// removed from the local registry are committed together.
 pub async fn publish_local_service_instances(
     cluster: &dyn ClusterAccess,
     registry: &ServiceRegistry,
     node_id: &NodeId,
     registry_version: u64,
     now: OffsetDateTime,
-) -> Result<ClusterKvTxnCommitResult, ServiceError> {
+) -> Result<Option<ClusterKvTxnCommitResult>, ServiceError> {
     let records = service_instance_records_from_registry(registry, node_id, registry_version, now);
+    let mut existing_by_key: std::collections::BTreeMap<String, KvEntry> = cluster
+        .kv_range_prefix_local(CLUSTER_SERVICES_KV_PREFIX)?
+        .value
+        .into_iter()
+        .filter(|entry| service_instance_key_belongs_to_node(&entry.key, node_id))
+        .map(|entry| (entry.key.clone(), entry))
+        .collect();
     let mut ops = Vec::new();
     for record in records {
         let key = cluster_service_instance_key(&record.service, node_id);
-        let unchanged = cluster
-            .kv_get_local(&key)?
-            .value
+        let unchanged = existing_by_key
+            .remove(&key)
             .and_then(|entry| entry.decode::<ServiceInstanceRecord>().ok())
             .is_some_and(|stored| stored.stable_eq(&record));
         if unchanged {
@@ -144,12 +151,25 @@ pub async fn publish_local_service_instances(
         }
         ops.push(KvOp::put_serde(key, &record, None)?);
     }
+    ops.extend(existing_by_key.into_keys().map(|key| KvOp::Delete { key }));
+    if ops.is_empty() {
+        return Ok(None);
+    }
     let txn = KvTxn {
         compares: Vec::new(),
         success: ops,
         failure: Vec::new(),
     };
-    cluster.kv_commit_async(KvTxnRequest::generated(txn)).await
+    cluster
+        .kv_commit_async(KvTxnRequest::generated(txn))
+        .await
+        .map(Some)
+}
+
+fn service_instance_key_belongs_to_node(key: &str, node_id: &NodeId) -> bool {
+    key.strip_prefix(CLUSTER_SERVICES_KV_PREFIX)
+        .and_then(|relative| relative.rsplit_once('/'))
+        .is_some_and(|(service, owner)| !service.is_empty() && owner == node_id.as_str())
 }
 
 /// How [`ServiceTargetSelector`] orders candidate nodes for a service.
@@ -269,9 +289,172 @@ fn order_by_endpoint_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Service, ServiceContext, ServiceDisposition, ServiceFuture};
     use sinomo_base::{ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource};
+    use sinomo_kv::{
+        KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvLocalRead, KvRevision,
+        KvSnapshot, KvTxnResponse, KvVersion,
+    };
+    use sinomo_network::ObjectRpcRequest;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     struct FixedDirectory(Vec<ClusterEndpointRecord>);
+
+    struct PublishedService {
+        routes: &'static [&'static str],
+    }
+
+    impl Service for PublishedService {
+        fn name(&self) -> &'static str {
+            "dfs"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            self.routes
+        }
+
+        fn handle(&self, _ctx: ServiceContext, _request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            Box::pin(async { Ok(ServiceDisposition::Continue) })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingClusterAccess {
+        entries: Mutex<BTreeMap<String, KvEntry>>,
+        commits: Mutex<Vec<KvTxnRequest>>,
+    }
+
+    impl RecordingClusterAccess {
+        fn with_instances(records: impl IntoIterator<Item = ServiceInstanceRecord>) -> Self {
+            let entries = records
+                .into_iter()
+                .map(|record| {
+                    let key = cluster_service_instance_key(&record.service, &record.node_id);
+                    let entry = KvEntry {
+                        key: key.clone(),
+                        value: sinomo_kv::encode_kv_value(&record).expect("instance record"),
+                        create_revision: KvRevision(1),
+                        modify_revision: KvRevision(1),
+                        version: KvVersion(1),
+                        lease_id: None,
+                    };
+                    (key, entry)
+                })
+                .collect();
+            Self {
+                entries: Mutex::new(entries),
+                commits: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn committed_requests(&self) -> Vec<KvTxnRequest> {
+            self.commits.lock().expect("commit lock").clone()
+        }
+
+        fn local_read<T>(&self, value: T) -> KvLocalRead<T> {
+            KvLocalRead {
+                value,
+                revision: KvRevision(1),
+                observed_term: 1,
+                applied_index: 1,
+                known_leader: None,
+            }
+        }
+    }
+
+    impl ClusterAccess for RecordingClusterAccess {
+        fn kv_get_local(&self, key: &str) -> Result<KvLocalRead<Option<KvEntry>>, ServiceError> {
+            let value = self.entries.lock().expect("entry lock").get(key).cloned();
+            Ok(self.local_read(value))
+        }
+
+        fn kv_range_prefix_local(
+            &self,
+            prefix: &str,
+        ) -> Result<KvLocalRead<Vec<KvEntry>>, ServiceError> {
+            let value = self
+                .entries
+                .lock()
+                .expect("entry lock")
+                .values()
+                .filter(|entry| entry.key.starts_with(prefix))
+                .cloned()
+                .collect();
+            Ok(self.local_read(value))
+        }
+
+        fn kv_get_authoritative_async<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<KvAuthoritativeRead<Option<KvEntry>>, ServiceError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let read = self.kv_get_local(key)?;
+                Ok(KvAuthoritativeRead {
+                    value: read.value,
+                    authority: KvAuthorityProof {
+                        term: 1,
+                        commit_index: 1,
+                        revision: read.revision,
+                        basis: KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                })
+            })
+        }
+
+        fn kv_commit_async<'a>(
+            &'a self,
+            request: KvTxnRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ClusterKvTxnCommitResult, ServiceError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let request_id = request.request_id.clone();
+                self.commits.lock().expect("commit lock").push(request);
+                Ok(ClusterKvTxnCommitResult {
+                    request_id,
+                    snapshot: KvSnapshot {
+                        revision: KvRevision(1),
+                        compacted_revision: KvRevision::ZERO,
+                        entries: Vec::new(),
+                        leases: Vec::new(),
+                        events: Vec::new(),
+                        committed_requests: Vec::new(),
+                        expired_requests: Vec::new(),
+                    },
+                    txn_response: Some(KvTxnResponse {
+                        succeeded: true,
+                        revision: KvRevision(1),
+                        responses: Vec::new(),
+                    }),
+                    authority: KvAuthorityProof {
+                        term: 1,
+                        commit_index: 1,
+                        revision: KvRevision(1),
+                        basis: KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                    replayed_committed_request: false,
+                })
+            })
+        }
+    }
 
     impl ClusterDirectory for FixedDirectory {
         fn members(&self) -> Result<Vec<sinomo_base::ClusterMemberRecord>, NetworkError> {
@@ -306,6 +489,26 @@ mod tests {
         NodeId::from_legacy_named(name).expect("node id")
     }
 
+    fn published_registry(routes: &'static [&'static str]) -> ServiceRegistry {
+        ServiceRegistry::builder()
+            .register(PublishedService { routes })
+            .build()
+    }
+
+    fn published_instance(
+        node_id: &NodeId,
+        routes: impl IntoIterator<Item = &'static str>,
+    ) -> ServiceInstanceRecord {
+        ServiceInstanceRecord {
+            service: "dfs".to_string(),
+            node_id: node_id.clone(),
+            registry_version: 1,
+            routes: routes.into_iter().map(str::to_string).collect(),
+            capabilities: Vec::new(),
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
     fn instance(service: &str, node_id: &NodeId) -> ServiceInstanceRecord {
         ServiceInstanceRecord {
             service: service.to_string(),
@@ -315,6 +518,95 @@ mod tests {
             capabilities: Vec::new(),
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_source_owned_instances_do_not_submit_a_transaction() {
+        let local = node("node_publish_unchanged");
+        let registry = published_registry(&["/dfs/read"]);
+        let cluster =
+            RecordingClusterAccess::with_instances([published_instance(&local, ["/dfs/read"])]);
+
+        let result = publish_local_service_instances(
+            &cluster,
+            &registry,
+            &local,
+            2,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("publish unchanged instances");
+
+        assert!(result.is_none());
+        assert!(
+            cluster.committed_requests().is_empty(),
+            "an unchanged applied source-owned record must not produce a Raft transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_removal_commits_the_reconciled_instance_record() {
+        let local = node("node_publish_changed");
+        let registry = published_registry(&["/dfs/read"]);
+        let cluster = RecordingClusterAccess::with_instances([published_instance(
+            &local,
+            ["/dfs/read", "/dfs/write"],
+        )]);
+
+        let result = publish_local_service_instances(
+            &cluster,
+            &registry,
+            &local,
+            2,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("publish changed instances");
+
+        assert!(result.is_some());
+        let commits = cluster.committed_requests();
+        assert_eq!(commits.len(), 1);
+        let [KvOp::Put { key, value, .. }] = commits[0].txn.success.as_slice() else {
+            panic!("route removal should publish one replacement record");
+        };
+        assert_eq!(key, &cluster_service_instance_key("dfs", &local));
+        let record: ServiceInstanceRecord =
+            sinomo_kv::decode_kv_value(value).expect("published instance record");
+        assert_eq!(record.routes, vec!["/dfs/read"]);
+    }
+
+    #[tokio::test]
+    async fn removed_local_service_is_deleted_without_touching_remote_owner() {
+        let local = node("node_publish_removed_local");
+        let remote = node("node_publish_removed_remote");
+        let cluster = RecordingClusterAccess::with_instances([
+            published_instance(&local, ["/dfs/read"]),
+            published_instance(&remote, ["/dfs/read"]),
+        ]);
+
+        let result = publish_local_service_instances(
+            &cluster,
+            &ServiceRegistry::default(),
+            &local,
+            2,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("remove local instance");
+
+        assert!(result.is_some());
+        let commits = cluster.committed_requests();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].txn.success,
+            vec![KvOp::Delete {
+                key: cluster_service_instance_key("dfs", &local),
+            }]
+        );
+        assert!(commits[0].txn.success.iter().all(|op| match op {
+            KvOp::Delete { key } => key != &cluster_service_instance_key("dfs", &remote),
+            _ => true,
+        }));
     }
 
     fn endpoint(node_id: &NodeId, priority: u16, latency: Option<u32>) -> ClusterEndpointRecord {

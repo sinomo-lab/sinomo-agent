@@ -275,20 +275,6 @@ impl DaemonClusterAccess {
         }
     }
 
-    pub(crate) fn new_with_control_plane_timeouts(
-        paths: DaemonPaths,
-        data_dir: &SinomoDataDir,
-        runtime: Option<&tokio::runtime::Handle>,
-        control_plane_timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
-    ) -> Self {
-        Self {
-            cluster_paths: ClusterPaths::new(data_dir),
-            paths,
-            runtime: runtime.cloned(),
-            control_plane_timeouts,
-        }
-    }
-
     fn runtime(&self) -> Result<&tokio::runtime::Handle, ServiceError> {
         require_service_runtime(self.runtime.as_ref(), "daemon cluster access")
     }
@@ -619,9 +605,6 @@ impl Service for DaemonControlService {
             if request.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || request.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
             {
-                crate::control::request_daemon_cluster_kv_maintenance(
-                    sinomo_core::cluster::ClusterKvMaintenanceWakeSource::AppConnection,
-                );
                 let forward_route = request.route.clone();
                 let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
                 let runtime =
@@ -644,9 +627,6 @@ impl Service for DaemonControlService {
             let (response, disposition) = match request.route.as_str() {
                 DAEMON_STATUS_ROUTE => {
                     let _: () = request.decode_body()?;
-                    crate::control::request_daemon_cluster_kv_maintenance(
-                        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::ClusterStatus,
-                    );
                     let status = daemon_status_response_async(&paths, runtime.as_ref())
                         .await
                         .map_err(daemon_error)?;
@@ -678,9 +658,8 @@ impl Service for DaemonControlService {
                 }
                 DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE => {
                     let _: crate::DaemonClusterMaintenanceRefreshRequest = request.decode_body()?;
-                    crate::control::request_daemon_cluster_maintenance_refresh();
-                    crate::control::request_daemon_cluster_kv_maintenance(
-                        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::ExplicitOperatorRequest,
+                    crate::control::request_daemon_cluster_maintenance(
+                        crate::control::DaemonClusterMaintenanceReason::ManualBroad,
                     );
                     crate::dfs::notify_daemon_dfs_maintenance_work();
                     if let Some(runtime) = runtime.as_ref() {
@@ -873,12 +852,11 @@ impl Service for ClusterKvService {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            // App/CLI KV activity is an opportunistic wake source for the
-            // passive cluster. Notifications coalesce in the daemon's single
-            // maintenance loop; this does not create a second Raft driver.
-            crate::control::request_daemon_cluster_kv_maintenance(
-                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::CliConnection,
-            );
+            // KV reads, barriers, and transactions are also used internally by
+            // the maintenance pass itself. They therefore cannot be scheduling
+            // edges for that pass: waking here makes every completed pass queue
+            // its successor. External app/control boundaries and actual Raft
+            // replication progress provide the independent wake sources.
             let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
             let route = request.route.clone();
             if CLUSTER_KV_LOCAL_READ_WATCH_ROUTES.contains(&route.as_str()) {
@@ -1106,15 +1084,6 @@ impl Service for ClusterKvService {
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            if route != CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE {
-                // A successful authority barrier or transaction may have
-                // advanced the local Raft log even when the materialized KV
-                // revision was unchanged. Schedule catch-up after completion
-                // so the wake cannot race ahead of the progress it represents.
-                crate::control::request_daemon_cluster_kv_maintenance(
-                    sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RaftProgress,
-                );
-            }
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
@@ -1126,6 +1095,30 @@ impl Service for ClusterKvService {
 struct ClusterHealthService {
     paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
+}
+
+fn validate_cluster_connectivity_snapshot_record_count(
+    observed_records: usize,
+) -> Result<(), sinomo_core::network::NetworkError> {
+    if observed_records > sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
+        return Err(
+            sinomo_core::network::NetworkError::ClusterConnectivitySnapshotRecordLimit {
+                observed_records,
+                max_records: sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn read_bounded_cluster_connectivity_snapshot(
+    paths: &ClusterPaths,
+) -> Result<Vec<sinomo_core::network::ClusterConnectivityRecord>, ServiceError> {
+    let records = sinomo_core::network::read_local_cluster_connectivity_records(paths)
+        .map_err(ServiceError::from)?;
+    validate_cluster_connectivity_snapshot_record_count(records.len())
+        .map_err(ServiceError::from)?;
+    Ok(records)
 }
 
 impl Service for ClusterHealthService {
@@ -1149,11 +1142,6 @@ impl Service for ClusterHealthService {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            // A status/health touch should also advance bounded cluster
-            // convergence while the daemon is already active.
-            crate::control::request_daemon_cluster_kv_maintenance(
-                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::ClusterHealth,
-            );
             let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
             if request.route == CLUSTER_NETWORK_PING_ROUTE {
                 let responder_node_id =
@@ -1174,15 +1162,7 @@ impl Service for ClusterHealthService {
                     CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
                     "cluster network connectivity",
                     move || {
-                        let state =
-                            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-                                .map_err(ServiceError::from)?;
-                        let records =
-                            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
-                                &cluster_paths,
-                                &state.local_node_id,
-                            )
-                            .map_err(ServiceError::from)?;
+                        let records = read_bounded_cluster_connectivity_snapshot(&cluster_paths)?;
                         ObjectRpcResponse::encode_body(CLUSTER_NETWORK_CONNECTIVITY_ROUTE, &records)
                             .map_err(ServiceError::from)
                     },
@@ -1252,30 +1232,55 @@ pub(crate) fn mark_daemon_rpc_response_responder(
     response.mark_responder_node_id(node_id.to_string());
 }
 
-/// Daemon adapter for the KV-owned consensus routes. Request identity flows through
-/// `ServiceContext::signer`; `sinomo-network` validates that identity against cluster
-/// membership and applies the transport policy.
-fn cluster_kv_consensus_completion_wake(
-    route: &str,
-) -> sinomo_core::cluster::ClusterKvMaintenanceWakeSource {
-    if route == CLUSTER_RAFT_APPEND_ROUTE {
-        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RaftProgress
+fn service_signer_origin_name(signer: &ServiceSigner) -> &'static str {
+    if signer.is_local() { "local" } else { "remote" }
+}
+
+fn cluster_member_publish_outcome_name(accepted: bool, detail: &str) -> &'static str {
+    if !accepted {
+        "rejected"
+    } else if detail == "member endpoints already current" {
+        "already_current"
+    } else if detail == "member endpoints published" {
+        "published"
     } else {
-        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::LeaderObservation
+        "accepted_other"
     }
 }
 
-fn cluster_membership_completion_wake(
-    route: &str,
-    accepted: bool,
-) -> Option<sinomo_core::cluster::ClusterKvMaintenanceWakeSource> {
-    accepted.then(|| {
-        if route == CLUSTER_INVITE_PUBLISH_ROUTE {
-            sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RaftProgress
-        } else {
-            sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MembershipChange
-        }
-    })
+fn observe_cluster_member_publish_response(
+    signer_origin: &'static str,
+    signer_node_id: &str,
+    member_count: usize,
+    response: &sinomo_core::cluster::ClusterMemberPublishResponse,
+    duration: Duration,
+) {
+    let outcome = cluster_member_publish_outcome_name(response.accepted, &response.detail);
+    let duration_us = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+    metrics::counter!(
+        "sinomo.daemon.cluster.member_publish.responses",
+        "origin" => signer_origin,
+        "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sinomo.daemon.cluster.member_publish.us",
+        "origin" => signer_origin,
+        "outcome" => outcome
+    )
+    .record(duration_us as f64);
+    tracing::trace!(
+        target: "sinomo.daemon.cluster_member_publish",
+        signer_origin,
+        signer_node_id,
+        member_count,
+        outcome,
+        accepted = response.accepted,
+        snapshot_returned = response.kv_snapshot.is_some(),
+        duration_us,
+        detail = %response.detail,
+        "cluster member publish completed"
+    );
 }
 
 struct ClusterKvConsensusService {
@@ -1301,12 +1306,6 @@ impl Service for ClusterKvConsensusService {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             let route = request.route.clone();
-            // Peer consensus traffic proves the passive cluster is active.
-            // Wake the shared maintenance action so catch-up, compaction,
-            // watch fan-out, and publication can follow this RPC.
-            crate::control::request_daemon_cluster_kv_maintenance(
-                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::PeerRpc,
-            );
             if route == CLUSTER_RAFT_APPEND_ROUTE
                 && let Some(stats) = crate::process_idle_stats()
             {
@@ -1323,8 +1322,6 @@ impl Service for ClusterKvConsensusService {
             )
             .await
             .map_err(ServiceError::from)?;
-            let progress_source = cluster_kv_consensus_completion_wake(&route);
-            crate::control::request_daemon_cluster_kv_maintenance(progress_source);
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
@@ -1357,43 +1354,11 @@ fn service_signer_cluster_identity(
 /// Daemon adapter for cluster membership object-RPC routes. The domain join decision
 /// lives in `sinomo-network`; the daemon handler still supplies host-local member refresh,
 /// authority forwarding, and cluster state persistence.
-/// Server-side budgets for join handling, deliberately below the joiner's
-/// 30s idle deadline so a stuck step yields a structured error for the
-/// one-shot join attempt.
+/// Server-side budgets for join handling. These are intentionally tolerant of
+/// real-world transports; the Docker cluster's stricter formation gate belongs
+/// only to its near-instant test environment.
 const CLUSTER_JOIN_CHALLENGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 const CLUSTER_JOIN_REGISTRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
-static CLUSTER_JOIN_REGISTRATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-async fn remember_accepted_join_response_state_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    accepted_state: sinomo_core::ClusterBootstrapState,
-) -> Result<(usize, usize), NetworkError> {
-    let paths = paths.clone();
-    runtime
-        .spawn_blocking(move || {
-            let mut local_state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
-            if local_state.cluster_id != accepted_state.cluster_id {
-                return Err(NetworkError::Io {
-                    operation: "remember accepted cluster join".to_string(),
-                    detail: format!(
-                        "accepted cluster {} does not match local cluster {}",
-                        accepted_state.cluster_id, local_state.cluster_id
-                    ),
-                });
-            }
-            let before_members = local_state.members.len();
-            sinomo_core::cluster::merge_cluster_join_registration(&mut local_state, accepted_state);
-            let after_members = local_state.members.len();
-            sinomo_core::cluster::write_cluster_state(&paths, &local_state)?;
-            Ok((before_members, after_members))
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "remember accepted cluster join".to_string(),
-            detail: format!("accepted cluster join state task failed: {source}"),
-        })?
-}
 
 struct ClusterMembershipService {
     paths: DaemonPaths,
@@ -1537,16 +1502,6 @@ impl Service for ClusterMembershipService {
                     invite_id,
                     payload.members.len()
                 ));
-                let lock_started = std::time::Instant::now();
-                let _registration_guard = CLUSTER_JOIN_REGISTRATION_LOCK
-                    .get_or_init(|| tokio::sync::Mutex::new(()))
-                    .lock()
-                    .await;
-                crate::cluster_join_trace(format_args!(
-                    "register invite={} acquired registration lock in {:?}",
-                    invite_id,
-                    lock_started.elapsed()
-                ));
                 let service_runtime =
                     require_service_runtime(runtime.as_ref(), "cluster join registration")?;
                 let response = tokio::time::timeout(
@@ -1582,34 +1537,13 @@ impl Service for ClusterMembershipService {
                     register_started.elapsed()
                 ));
                 if response.accepted {
-                    match remember_accepted_join_response_state_async(
-                        service_runtime,
-                        &cluster_paths,
-                        response.state.clone(),
-                    )
-                    .await
-                    {
-                        Ok((before_members, after_members)) => {
-                            crate::cluster_join_trace(format_args!(
-                                "register invite={} remembered accepted state locally members {} -> {}",
-                                invite_id, before_members, after_members
-                            ));
-                            crate::control::request_daemon_cluster_maintenance_refresh();
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                "sinomo daemon join registration accepted invite {} but failed to refresh local state: {}",
-                                invite_id,
-                                error
-                            );
-                        }
-                    }
-                }
-                if let Some(wake) = cluster_membership_completion_wake(
-                    CLUSTER_JOIN_REGISTER_ROUTE,
-                    response.accepted,
-                ) {
-                    crate::control::request_daemon_cluster_kv_maintenance(wake);
+                    // The cluster join handler has already persisted its
+                    // revision-fenced local projection. Wake maintenance here;
+                    // a second read/merge/write would only duplicate I/O and
+                    // could reapply an older response after a concurrent join.
+                    crate::control::request_daemon_cluster_maintenance(
+                        crate::control::DaemonClusterMaintenanceReason::JoinAccepted,
+                    );
                 }
                 ctx.respond(ObjectRpcResponse::encode_body(
                     CLUSTER_JOIN_REGISTER_ROUTE,
@@ -1637,18 +1571,16 @@ impl Service for ClusterMembershipService {
                         )
                         .await
                         .map_err(ServiceError::from)?;
-                    if let Some(wake) = cluster_membership_completion_wake(
-                        CLUSTER_INVITE_PUBLISH_ROUTE,
-                        response.accepted,
-                    ) {
-                        crate::control::request_daemon_cluster_kv_maintenance(wake);
-                    }
                     ObjectRpcResponse::encode_body(CLUSTER_INVITE_PUBLISH_ROUTE, &response)?
                 }
                 CLUSTER_MEMBER_PUBLISH_ROUTE => {
-                    let payload = request.decode_body().map_err(ServiceError::from)?;
+                    let payload: sinomo_core::cluster::ClusterMemberPublishRequest =
+                        request.decode_body().map_err(ServiceError::from)?;
+                    let member_count = payload.members.len();
+                    let signer_origin = service_signer_origin_name(&ctx.signer);
                     let (signer_node_id, _) =
                         service_signer_cluster_identity(&ctx.signer, CLUSTER_MEMBER_PUBLISH_ROUTE)?;
+                    let publish_started = Instant::now();
                     let response =
                         sinomo_core::cluster::handle_cluster_member_publish_request_async_with_host(
                             service_runtime,
@@ -1659,12 +1591,13 @@ impl Service for ClusterMembershipService {
                         )
                         .await
                         .map_err(ServiceError::from)?;
-                    if let Some(wake) = cluster_membership_completion_wake(
-                        CLUSTER_MEMBER_PUBLISH_ROUTE,
-                        response.accepted,
-                    ) {
-                        crate::control::request_daemon_cluster_kv_maintenance(wake);
-                    }
+                    observe_cluster_member_publish_response(
+                        signer_origin,
+                        &signer_node_id,
+                        member_count,
+                        &response,
+                        publish_started.elapsed(),
+                    );
                     ObjectRpcResponse::encode_body(CLUSTER_MEMBER_PUBLISH_ROUTE, &response)?
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -1814,16 +1747,6 @@ async fn authorize_cluster_control_service_request(
     validate_remote_cluster_control_authority(&authoritative.value, signer).map(Some)
 }
 
-fn cluster_control_completion_wake(
-    route: &str,
-) -> sinomo_core::cluster::ClusterKvMaintenanceWakeSource {
-    if route == sinomo_core::cluster::CLUSTER_CONTROL_INVITE_ROUTE {
-        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RaftProgress
-    } else {
-        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MembershipChange
-    }
-}
-
 impl Service for ClusterControlService {
     fn name(&self) -> &'static str {
         "cluster-control"
@@ -1852,8 +1775,6 @@ impl Service for ClusterControlService {
                 handle_daemon_cluster_control_request(&paths, &request, &runtime, remote_authority)
             })
             .await?;
-            let wake = cluster_control_completion_wake(&route);
-            crate::control::request_daemon_cluster_kv_maintenance(wake);
             ctx.respond(response)?;
             Ok(cluster_control_service_disposition(&route))
         })
@@ -1882,10 +1803,11 @@ fn cluster_control_service_restart_required(route: &str) -> bool {
     )
 }
 
-/// Mark a completed identity-changing response so a clean main-daemon exit is
-/// classified as an intentional supervisor restart. Call this only after the
-/// response has been delivered; otherwise a failed response could leave a
-/// stale PID-scoped restart marker behind.
+/// Mark a committed identity-changing operation after its response write has
+/// been attempted so a clean main-daemon exit is classified as an intentional
+/// supervisor restart. The mutation remains committed when the peer disconnects
+/// during that write, so callers must mark the restart before propagating the
+/// transport error.
 pub(crate) fn mark_cluster_identity_restart_after_response(
     route: &str,
     stop: bool,
@@ -7324,40 +7246,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_consensus_and_membership_events_select_specific_maintenance_wakes() {
-        use sinomo_core::cluster::ClusterKvMaintenanceWakeSource;
-
-        assert_eq!(
-            cluster_kv_consensus_completion_wake(CLUSTER_RAFT_APPEND_ROUTE),
-            ClusterKvMaintenanceWakeSource::RaftProgress
-        );
-        assert_eq!(
-            cluster_kv_consensus_completion_wake("/cluster/raft/vote"),
-            ClusterKvMaintenanceWakeSource::LeaderObservation
-        );
-        assert_eq!(
-            cluster_membership_completion_wake(CLUSTER_INVITE_PUBLISH_ROUTE, true),
-            Some(ClusterKvMaintenanceWakeSource::RaftProgress)
-        );
-        assert_eq!(
-            cluster_membership_completion_wake(CLUSTER_MEMBER_PUBLISH_ROUTE, true),
-            Some(ClusterKvMaintenanceWakeSource::MembershipChange)
-        );
-        assert_eq!(
-            cluster_membership_completion_wake(CLUSTER_JOIN_REGISTER_ROUTE, false),
-            None
-        );
-        assert_eq!(
-            cluster_control_completion_wake(sinomo_core::cluster::CLUSTER_CONTROL_INVITE_ROUTE),
-            ClusterKvMaintenanceWakeSource::RaftProgress
-        );
-        assert_eq!(
-            cluster_control_completion_wake(sinomo_core::cluster::CLUSTER_CONTROL_ROLE_ROUTE),
-            ClusterKvMaintenanceWakeSource::MembershipChange
-        );
-    }
-
-    #[test]
     fn daemon_forward_transport_preserves_distinct_connect_and_idle_timeouts() {
         let payload = crate::DaemonObjectRpcForwardRequest {
             target_node_id: sinomo_core::node::NodeId::from_legacy_named(
@@ -9858,6 +9746,32 @@ mod tests {
                 .iter()
                 .any(|event| event.key == "/service/after-barrier")
         );
+
+        let cancel_response = runtime
+            .block_on(call_value_object_rpc_service_async(&mut router, {
+                let payload = sinomo_core::kv::cluster_kv_local_watch_cancel_rpc_payload(
+                    &ClusterKvWatchCancelRequest {
+                        watch_id: watch.value.watch_id,
+                    },
+                )
+                .expect("watch cancel payload");
+                let mut request = ObjectRpcRequest::from_encoded_body(
+                    payload.route,
+                    payload.category,
+                    payload.body,
+                );
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
+            .expect("watch cancel response");
+        let cancelled =
+            sinomo_core::kv::decode_cluster_kv_local_watch_cancel_rpc_body(&cancel_response.body)
+                .expect("watch cancel");
+        assert_eq!(cancelled.watch_id, watch.value.watch_id);
+        assert!(
+            cancelled.cancelled,
+            "watch shutdown must release its durable registration"
+        );
     }
 
     #[test]
@@ -11451,6 +11365,94 @@ mod tests {
                 .object_rpc_route_descriptor(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE)
                 .is_none(),
             "shadow host must not advertise DFS placement-authority administration"
+        );
+    }
+
+    #[test]
+    fn daemon_status_and_local_health_leave_cluster_kv_unchanged() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-read-only-rpc-kv-quietness");
+        let data_dir = Arc::new(SinomoDataDir::new(&root));
+        data_dir.ensure_root_layout().expect("data directory");
+        let paths = DaemonPaths::new(data_dir.as_ref());
+        paths.ensure().expect("daemon paths");
+        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+        cluster_paths.ensure().expect("cluster paths");
+
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(
+                "cluster_daemon_read_only_rpc_kv_quietness",
+            )
+            .expect("cluster id"),
+            "daemon read-only RPC KV quietness",
+            sinomo_core::node::NodeId::from_legacy_named("node_daemon_read_only_rpc_kv_quietness")
+                .expect("node id"),
+            "quiet node",
+            "quiet-public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("seed cluster KV");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let registry = ServiceRegistry::builder()
+            .register(DaemonControlService {
+                paths: paths.clone(),
+                runtime: Some(runtime.handle().clone()),
+            })
+            .register(ClusterHealthService {
+                paths: paths.clone(),
+                runtime: Some(runtime.handle().clone()),
+            })
+            .build();
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("service host");
+        let mut router = host.route_policy_layer().layer(host.active_router());
+        let cluster = crate::daemon_cluster_status(&state, crate::DaemonClusterProcess::Main)
+            .expect("daemon cluster status");
+        let _daemon_lock =
+            crate::DaemonLock::acquire(&paths, &crate::DaemonRunOptions::default(), Some(cluster))
+                .expect("hold daemon status fixture lock");
+        assert!(paths.status.exists(), "daemon status fixture must exist");
+        let before = sinomo_core::cluster::read_cluster_kv_local_snapshot(&cluster_paths, &state)
+            .expect("KV snapshot before read-only RPCs");
+
+        for _ in 0..8 {
+            let mut status_request =
+                ObjectRpcRequest::encode_body(DAEMON_STATUS_ROUTE, DAEMON_RPC_CATEGORY, &())
+                    .expect("status request");
+            annotate_test_request(&mut status_request, DaemonSignerAuthority::Local);
+            let status_response = runtime
+                .block_on(call_value_object_rpc_service_async(
+                    &mut router,
+                    status_request,
+                ))
+                .expect("status response");
+            status_response
+                .decode_body::<crate::DaemonStatus>()
+                .expect("decode daemon status");
+
+            let mut health_request = sinomo_core::cluster::cluster_local_health_rpc_request()
+                .expect("local health request");
+            annotate_test_request(&mut health_request, DaemonSignerAuthority::Local);
+            let health_response = runtime
+                .block_on(call_value_object_rpc_service_async(
+                    &mut router,
+                    health_request,
+                ))
+                .expect("local health response");
+            sinomo_core::cluster::decode_cluster_health_rpc_response(&health_response)
+                .expect("decode local health response");
+        }
+
+        let after = sinomo_core::cluster::read_cluster_kv_local_snapshot(&cluster_paths, &state)
+            .expect("KV snapshot after read-only RPCs");
+        assert_eq!(
+            after, before,
+            "daemon status and health observations must not advance or rewrite cluster KV"
         );
     }
 }
