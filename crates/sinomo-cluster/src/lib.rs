@@ -211,7 +211,10 @@ pub use raft_fanout::{
     ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,
     spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
-pub use raft_quorum::{ClusterKvQuorumAsyncHost, ClusterRaftQuorumCommitHost};
+pub use raft_quorum::{
+    ClusterKvQuorumAsyncHost, ClusterRaftQuorumBatch, ClusterRaftQuorumBatchOutcomes,
+    ClusterRaftQuorumCommitHost,
+};
 pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
 pub use reactive_maintenance::{
     ClusterControlPlaneMaintenanceDriver, ClusterKvMaintenanceActionResult,

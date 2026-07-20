@@ -9348,7 +9348,7 @@ mod tests {
                 max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
             },
         );
-        let mut storage = ClusterKvRaftLocalCommandStorage::new(store, node_id, |_| false);
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(store, node_id.clone(), |_| false);
 
         let entry = match storage
             .append_uncommitted_or_replay(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
@@ -9363,6 +9363,15 @@ mod tests {
                 panic!("fresh request should append")
             }
         };
+        let mut state = quorum_commit_test_state(
+            &node_id,
+            &NodeId::from_legacy_named("node_kv_local_command_storage_peer").expect("peer"),
+        );
+        state.members.truncate(1);
+        let append_request = storage
+            .build_cluster_raft_append_request_from_next_index(&state, entry.index)
+            .expect("build append request from resident node");
+        assert_eq!(append_request.append.entries, vec![entry.clone()]);
         let commit = storage
             .commit_index_with_events(entry.index)
             .expect("commit command");
@@ -9389,6 +9398,32 @@ mod tests {
             .expect("discard tail");
         assert!(discarded.get("/raft-local-storage/discarded").is_none());
         assert_eq!(storage.take_last_snapshot_publish_wrote(), Some(false));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let reopen_node_id = node_id.clone();
+        let reopen = std::thread::spawn(move || {
+            started_tx.send(()).expect("notify reopen started");
+            let reopened = DurableRaftKvNode::open(reopen_node_id, wal_paths)
+                .expect("reopen after resident command session");
+            opened_tx
+                .send(reopened.last_log_index())
+                .expect("report reopened log index");
+        });
+        started_rx.recv().expect("wait for reopen attempt");
+        assert!(
+            opened_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the command session must retain the durable node lock between phases"
+        );
+        drop(storage);
+        assert_eq!(
+            opened_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reopen after command session drops"),
+            1
+        );
+        reopen.join().expect("join reopen thread");
     }
 
     #[test]

@@ -14,10 +14,10 @@ use sinomo_base::ClusterBootstrapState;
 #[cfg(any(test, feature = "test-support"))]
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvWalPaths};
 use sinomo_kv::{
-    ClusterKvRaftCommitResult, DurableRaftKvNode, InProcessKvStore, KvCommand, KvCommandRequest,
-    KvCommittedRequestRecord, KvEntry, KvLocalCache, KvLogEntry, KvOp, KvRevision, KvSnapshot,
-    KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
-    RaftRequestVoteResponse, RaftSnapshot,
+    ClusterKvRaftCommitResult, ClusterRaftAppendRequest, DurableRaftKvNode, InProcessKvStore,
+    KvCommand, KvCommandRequest, KvCommittedRequestRecord, KvEntry, KvLocalCache, KvLogEntry, KvOp,
+    KvRevision, KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, HashMap};
@@ -661,84 +661,6 @@ pub fn append_cluster_raft_command_uncommitted(
         .map_err(kv_err)
 }
 
-pub(crate) async fn replay_cluster_raft_request_if_committed_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    request: &KvCommandRequest,
-) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, NetworkError> {
-    let paths = paths.clone();
-    let node_id = node_id.clone();
-    let request = request.clone();
-    runtime
-        .spawn_blocking(move || {
-            LocalClusterRaftCommandStorage::new(&paths, node_id).replay_if_committed(&request)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft replay committed request".to_string(),
-            detail: format!("cluster raft replay committed request task failed: {source}"),
-        })?
-}
-
-pub(crate) async fn append_cluster_raft_request_uncommitted_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    request: KvCommandRequest,
-) -> Result<KvLogEntry, NetworkError> {
-    let paths = paths.clone();
-    let node_id = node_id.clone();
-    runtime
-        .spawn_blocking(move || {
-            LocalClusterRaftCommandStorage::new(&paths, node_id).append_uncommitted(request)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft append uncommitted command".to_string(),
-            detail: format!("cluster raft append uncommitted command task failed: {source}"),
-        })?
-}
-
-pub async fn discard_cluster_raft_uncommitted_tail_and_clear_leader_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<KvSnapshot, NetworkError> {
-    let paths = paths.clone();
-    let node_id = node_id.clone();
-    runtime
-        .spawn_blocking(move || {
-            LocalClusterRaftCommandStorage::new(&paths, node_id)
-                .discard_uncommitted_tail_and_clear_leader()
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft discard uncommitted tail".to_string(),
-            detail: format!("cluster raft discard uncommitted tail task failed: {source}"),
-        })?
-}
-
-pub async fn commit_cluster_raft_index_with_events_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    commit_index: u64,
-) -> Result<ClusterKvRaftCommitResult, NetworkError> {
-    let paths = paths.clone();
-    let node_id = node_id.clone();
-    runtime
-        .spawn_blocking(move || {
-            LocalClusterRaftCommandStorage::new(&paths, node_id)
-                .commit_index_with_events(commit_index)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft commit index".to_string(),
-            detail: format!("cluster raft commit index task failed: {source}"),
-        })?
-}
-
 pub fn apply_cluster_raft_append(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -774,15 +696,15 @@ pub(crate) fn locked_apply_cluster_raft_vote(
         .map_err(kv_err)
 }
 
-pub struct LocalClusterRaftCommandStorage<'a> {
-    paths: &'a ClusterPaths,
+pub struct LocalClusterRaftCommandStorage {
+    paths: ClusterPaths,
     inner: sinomo_kv::ClusterKvRaftLocalCommandStorage<fn(&str) -> bool>,
 }
 
-impl<'a> LocalClusterRaftCommandStorage<'a> {
-    pub fn new(paths: &'a ClusterPaths, local_node_id: NodeId) -> Self {
+impl LocalClusterRaftCommandStorage {
+    pub fn new(paths: &ClusterPaths, local_node_id: NodeId) -> Self {
         Self {
-            paths,
+            paths: paths.clone(),
             inner: paths.kv_paths().local_raft_command_storage(
                 local_node_id,
                 sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
@@ -792,8 +714,29 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
 
     fn observe_last_snapshot_publish(&mut self, snapshot: &KvSnapshot) {
         if let Some(wrote) = self.inner.take_last_snapshot_publish_wrote() {
-            observe_cluster_kv_snapshot_write(self.paths, wrote, Some(snapshot));
+            observe_cluster_kv_snapshot_write(&self.paths, wrote, Some(snapshot));
         }
+    }
+
+    pub(crate) fn local_is_leader(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        self.inner.local_is_leader(state).map_err(kv_err)
+    }
+
+    pub(crate) fn last_log_index(&mut self) -> Result<u64, NetworkError> {
+        self.inner.last_log_index().map_err(kv_err)
+    }
+
+    pub(crate) fn build_raft_append_request(
+        &mut self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, NetworkError> {
+        self.inner
+            .build_cluster_raft_append_request_from_next_index(state, next_index)
+            .map_err(kv_err)
     }
 
     pub(crate) fn replay_if_committed(
@@ -853,7 +796,7 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
     }
 }
 
-impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage<'_> {
+impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
     type Error = NetworkError;
 
     fn kv_error(error: KvError) -> Self::Error {

@@ -265,14 +265,18 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
     options: ClusterRaftCommittedFanoutOptions,
     mut host_factory: F,
 ) where
-    H: ClusterRaftCommittedFanoutAsyncHost,
+    H: ClusterRaftCommittedFanoutAsyncHost + Send + 'static,
     F: FnMut() -> H,
 {
     loop {
         while CLUSTER_RAFT_FANOUT_PENDING.swap(false, Ordering::AcqRel) {
-            let mut host = host_factory();
-            let _ = fan_out_committed_cluster_raft_command_async_with_host(
-                &runtime, &paths, &state, &events, options, &mut host,
+            let _ = fan_out_committed_cluster_raft_command_async_with_factory(
+                &runtime,
+                &paths,
+                &state,
+                &events,
+                options,
+                &mut host_factory,
             )
             .await;
             if let Some((latest_state, latest_events)) =
@@ -292,6 +296,98 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
             break;
         }
     }
+}
+
+async fn fan_out_committed_cluster_raft_command_async_with_factory<H, F>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    events: &[KvEvent],
+    options: ClusterRaftCommittedFanoutOptions,
+    host_factory: &mut F,
+) -> Result<ClusterRaftCommittedFanoutReport, NetworkError>
+where
+    H: ClusterRaftCommittedFanoutAsyncHost + Send + 'static,
+    F: FnMut() -> H,
+{
+    let targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
+        runtime,
+        paths,
+        state,
+        ClusterEndpointInternalSelectionPurpose::RaftMemberReplication,
+    )
+    .await?;
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut scheduled = BTreeSet::new();
+    for target_node_id in targets {
+        if target_node_id == state.local_node_id || !scheduled.insert(target_node_id.clone()) {
+            continue;
+        }
+        let mut host = host_factory();
+        let paths = paths.clone();
+        let state = state.clone();
+        let events = events.to_vec();
+        tasks.spawn(async move {
+            let outcome = host
+                .replicate_cluster_raft_to_node_async(
+                    &paths,
+                    &state,
+                    &target_node_id,
+                    &events,
+                    options.raft_append_timeout,
+                )
+                .await;
+            let mut watch_event_batches_sent = 0_usize;
+            if outcome
+                .as_ref()
+                .is_ok_and(|outcome| outcome.response.accepted && outcome.watch_event_fanout_needed)
+            {
+                watch_event_batches_sent =
+                    send_cluster_kv_watch_event_fanout_batches_async_with_host(
+                        &state,
+                        &target_node_id,
+                        &events,
+                        options.watch_event_timeout,
+                        &mut host,
+                    )
+                    .await;
+            }
+            (target_node_id, outcome, watch_event_batches_sent)
+        });
+    }
+
+    let mut report = ClusterRaftCommittedFanoutReport {
+        attempted_nodes: scheduled.len(),
+        ..ClusterRaftCommittedFanoutReport::default()
+    };
+    while let Some(joined) = tasks.join_next().await {
+        let Ok((target_node_id, Ok(outcome), watch_event_batches_sent)) = joined else {
+            continue;
+        };
+        if !outcome.response.accepted {
+            continue;
+        }
+        let match_index = outcome.response.append.match_index;
+        report
+            .peer_progress_hints
+            .push(sinomo_kv::ClusterKvRaftPeerProgress {
+                peer_node_id: target_node_id.clone(),
+                term: outcome.response.append.term,
+                next_index: match_index.saturating_add(1),
+                match_index,
+                last_accepted_index: match_index,
+                observed_at: time::OffsetDateTime::now_utc(),
+            });
+        report.replicated_nodes.push(target_node_id);
+        report.watch_event_batches_sent = report
+            .watch_event_batches_sent
+            .saturating_add(watch_event_batches_sent);
+    }
+    report.replicated_nodes.sort();
+    report
+        .peer_progress_hints
+        .sort_by(|left, right| left.peer_node_id.cmp(&right.peer_node_id));
+    Ok(report)
 }
 
 async fn read_latest_cluster_raft_fanout_inputs_async(
@@ -365,7 +461,7 @@ struct CommittedFanoutNodeAppendHost<'a, H> {
 
 impl<H> sinomo_kv::ClusterKvRaftAppendReplicationAsyncHost for CommittedFanoutNodeAppendHost<'_, H>
 where
-    H: ClusterKvQuorumAsyncHost + Send,
+    H: ClusterKvQuorumAsyncHost,
 {
     type Error = NetworkError;
     type Target = NodeId;
@@ -451,7 +547,7 @@ pub async fn replicate_cluster_kv_to_node_async_with_host(
     watch_events: &[KvEvent],
     timeouts: ClusterControlPlaneTimeouts,
     timeout: Duration,
-    host: &mut (impl ClusterKvQuorumAsyncHost + Send),
+    host: &mut impl ClusterKvQuorumAsyncHost,
 ) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
     let options = timeouts.raft_append_replication_options(timeout);
     let mut append_host = CommittedFanoutNodeAppendHost {

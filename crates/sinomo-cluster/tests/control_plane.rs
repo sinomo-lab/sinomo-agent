@@ -20620,6 +20620,321 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
 }
 
 #[test]
+fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
+    struct ConcurrentQuorumHost {
+        delays: BTreeMap<NodeId, Duration>,
+        higher_term_rejection: Option<(NodeId, u64)>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        connectivity_records: Vec<(NodeId, ClusterConnectivityState)>,
+    }
+
+    impl ClusterRaftQuorumAsyncHost for ConcurrentQuorumHost {
+        fn last_local_raft_log_index_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+        ) -> ClusterMembershipRpcFuture<'a, u64> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_last_raft_log_index_async(&state.local_node_id)
+                    .await
+                    .map_err(kv_err)
+            })
+        }
+
+        fn build_raft_append_request_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            next_index: u64,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                    .await
+                    .map_err(kv_err)
+            })
+        }
+
+        fn send_raft_append_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            Box::pin(async {
+                Err(NetworkError::Io {
+                    operation: "sequential quorum append".to_string(),
+                    detail: "concurrent batch path was not used".to_string(),
+                })
+            })
+        }
+
+        fn send_raft_appends_to_quorum_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            attempts: sinomo_cluster::ClusterRaftQuorumBatch,
+            required_acks: usize,
+        ) -> ClusterMembershipRpcFuture<'a, sinomo_cluster::ClusterRaftQuorumBatchOutcomes>
+        {
+            let delays = self.delays.clone();
+            let higher_term_rejection = self.higher_term_rejection.clone();
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                let mut tasks = tokio::task::JoinSet::new();
+                for (target, request, _timeout) in attempts {
+                    let delay = delays
+                        .get(&target)
+                        .copied()
+                        .unwrap_or(Duration::from_secs(2));
+                    let started = Arc::clone(&started);
+                    let higher_term_rejection = higher_term_rejection.clone();
+                    tasks.spawn(async move {
+                        started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(delay).await;
+                        let match_index = request
+                            .append
+                            .entries
+                            .last()
+                            .map(|entry| entry.index)
+                            .unwrap_or(request.append.prev_log_index);
+                        let rejected_term =
+                            higher_term_rejection
+                                .as_ref()
+                                .and_then(|(rejected_node_id, term)| {
+                                    (rejected_node_id == &target).then_some(*term)
+                                });
+                        let response = ClusterRaftAppendResponse {
+                            accepted: rejected_term.is_none(),
+                            detail: if rejected_term.is_some() {
+                                "higher term".to_string()
+                            } else {
+                                "accepted".to_string()
+                            },
+                            state: request.state.clone(),
+                            append: RaftAppendEntriesResponse {
+                                term: rejected_term.unwrap_or(request.append.term),
+                                success: rejected_term.is_none(),
+                                match_index,
+                            },
+                        };
+                        (target, request, Ok(response))
+                    });
+                }
+                let mut accepted = 0_usize;
+                let mut outcomes = Vec::new();
+                while let Some(joined) = tasks.join_next().await {
+                    let outcome = joined.map_err(|source| NetworkError::Io {
+                        operation: "join test quorum append".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                    if outcome.2.as_ref().is_ok_and(|response| response.accepted) {
+                        accepted = accepted.saturating_add(1);
+                    }
+                    outcomes.push(outcome);
+                    if accepted >= required_acks {
+                        tasks.abort_all();
+                        break;
+                    }
+                }
+                Ok(outcomes)
+            })
+        }
+
+        fn record_node_command_connectivity(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            target_node_id: &NodeId,
+            connectivity_state: ClusterConnectivityState,
+            _latency_ms: Option<u64>,
+        ) {
+            self.connectivity_records
+                .push((target_node_id.clone(), connectivity_state));
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-concurrent-raft-quorum");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_concurrent_raft_quorum").expect("cluster");
+    let local = NodeId::from_legacy_named("node_concurrent_raft_quorum_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "concurrent raft quorum",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+
+    let mut remotes = Vec::new();
+    for index in 0..4 {
+        let remote =
+            NodeId::from_legacy_named(format!("node_concurrent_raft_quorum_remote_{index}"))
+                .expect("remote");
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote.clone(),
+            format!("remote {index}"),
+            format!("pk-remote-{index}"),
+            now,
+        );
+        member.capabilities =
+            vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![daemon_lan_endpoint(
+            &remote,
+            format!("10.81.0.{}:21353", index + 2),
+            10,
+        )];
+        state.members.push(member);
+        remotes.push(remote);
+    }
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    locked_set_cluster_raft_leader(&paths, &local, 1).expect("set leader");
+
+    let delays = remotes
+        .iter()
+        .cloned()
+        .zip([
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ])
+        .collect();
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut host = ConcurrentQuorumHost {
+        delays,
+        higher_term_rejection: None,
+        started: Arc::clone(&started),
+        connectivity_records: Vec::new(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let began = std::time::Instant::now();
+    let result = runtime
+        .block_on(
+            sinomo_cluster::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/test/concurrent-quorum".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                })),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(3),
+                },
+                ClusterRaftAppendReplicationOptions {
+                    timeout: Duration::from_secs(3),
+                    max_attempts: 3,
+                    tcp_command_timeout: Duration::from_secs(1),
+                    iroh_command_timeout: Duration::from_secs(1),
+                    tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                    public_foreground_attempt_timeout: Duration::from_secs(1),
+                    iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ),
+        )
+        .expect("concurrent quorum commit");
+
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "quorum commit waited for a slow voter: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::Relaxed),
+        remotes.len(),
+        "all voter RPCs should start concurrently"
+    );
+    assert_eq!(host.connectivity_records.len(), 2);
+    assert_eq!(
+        result
+            .snapshot
+            .get("/test/concurrent-quorum")
+            .expect("committed value")
+            .value,
+        b"ok".to_vec()
+    );
+
+    locked_set_cluster_raft_leader(&paths, &local, 2).expect("restore leader");
+    state.term = 2;
+    host.delays = remotes
+        .iter()
+        .cloned()
+        .zip([
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_secs(2),
+        ])
+        .collect();
+    host.higher_term_rejection = Some((remotes[0].clone(), 3));
+    started.store(0, std::sync::atomic::Ordering::Relaxed);
+    let error = runtime
+        .block_on(
+            sinomo_cluster::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/test/concurrent-higher-term".to_string(),
+                    value: b"must-not-commit".to_vec(),
+                    lease_id: None,
+                })),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(3),
+                },
+                ClusterRaftAppendReplicationOptions {
+                    timeout: Duration::from_secs(3),
+                    max_attempts: 3,
+                    tcp_command_timeout: Duration::from_secs(1),
+                    iroh_command_timeout: Duration::from_secs(1),
+                    tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                    public_foreground_attempt_timeout: Duration::from_secs(1),
+                    iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ),
+        )
+        .expect_err("completed higher-term rejection must prevent commit");
+    assert!(matches!(error, NetworkError::ClusterReadOnly { .. }));
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::Relaxed),
+        remotes.len(),
+        "all voter RPCs should still race before the higher term is observed"
+    );
+    assert!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("snapshot after higher term")
+            .get("/test/concurrent-higher-term")
+            .is_none()
+    );
+    let node = open_cluster_raft_kv_node(&paths, &local).expect("raft after higher term");
+    assert_eq!(node.hard_state().current_term, 3);
+    assert_eq!(node.hard_state().leader_id, None);
+}
+
+#[test]
 fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
     #[derive(Default)]
     struct StaticClusterStatusProbe {

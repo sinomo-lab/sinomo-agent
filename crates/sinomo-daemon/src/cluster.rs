@@ -7834,6 +7834,57 @@ impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for DaemonClusterControlPlan
         })
     }
 
+    fn send_cluster_kv_replications_to_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+        attempts: sinomo_core::cluster::ClusterRaftQuorumBatch,
+        required_acks: usize,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        sinomo_core::cluster::ClusterRaftQuorumBatchOutcomes,
+    > {
+        let runtime = self.rpc_mode.runtime().clone();
+        let paths = paths.clone();
+        Box::pin(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (target_node_id, request, timeout) in attempts {
+                let runtime = runtime.clone();
+                let paths = paths.clone();
+                tasks.spawn(async move {
+                    let result = send_cluster_raft_append_routed_async(
+                        &paths,
+                        &target_node_id,
+                        &request,
+                        timeout,
+                        &runtime,
+                    )
+                    .await;
+                    (target_node_id, request, result)
+                });
+            }
+
+            let mut accepted = 0_usize;
+            let mut outcomes = Vec::new();
+            while let Some(joined) = tasks.join_next().await {
+                let (target_node_id, request, result) =
+                    joined.map_err(|source| sinomo_core::network::NetworkError::Io {
+                        operation: "join concurrent cluster Raft append".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                if result.as_ref().is_ok_and(|response| response.accepted) {
+                    accepted = accepted.saturating_add(1);
+                }
+                outcomes.push((target_node_id, request, result));
+                if accepted >= required_acks {
+                    tasks.abort_all();
+                    break;
+                }
+            }
+            Ok(outcomes)
+        })
+    }
+
     fn on_kv_replication_sent_async<'a>(
         &'a mut self,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ()> {

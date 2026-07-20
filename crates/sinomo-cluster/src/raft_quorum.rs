@@ -3,18 +3,11 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 use crate::control_plane_options::ClusterControlPlaneTimeouts;
 use crate::control_plane_options::ClusterRaftAppendReplicationOptions;
 use crate::kv_local_store::ClusterKvPathsExt;
+use crate::kv_local_store::LocalClusterRaftCommandStorage;
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::{
-    LocalClusterRaftCommandStorage, append_cluster_raft_request_uncommitted_async,
-    commit_cluster_raft_index_with_events_async,
-    discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
-    replay_cluster_raft_request_if_committed_async,
-};
 use crate::local_state_store::project_committed_cluster_raft_config;
 use crate::member_store::merge_cluster_state_from_peer;
 use crate::prelude::*;
-#[cfg(any(test, feature = "test-support"))]
-use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::{
@@ -27,9 +20,29 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-pub trait ClusterKvQuorumAsyncHost {
+type SharedLocalClusterRaftCommandStorage = Arc<Mutex<LocalClusterRaftCommandStorage>>;
+
+pub type ClusterRaftQuorumBatch = Vec<(NodeId, ClusterRaftAppendRequest, Duration)>;
+pub type ClusterRaftQuorumBatchOutcomes = Vec<(
+    NodeId,
+    ClusterRaftAppendRequest,
+    Result<ClusterRaftAppendResponse, NetworkError>,
+)>;
+
+fn lock_local_cluster_raft_command_storage<'a>(
+    storage: &'a Mutex<LocalClusterRaftCommandStorage>,
+    operation: &str,
+) -> Result<MutexGuard<'a, LocalClusterRaftCommandStorage>, NetworkError> {
+    storage.lock().map_err(|error| NetworkError::Io {
+        operation: operation.to_string(),
+        detail: format!("local cluster Raft command session lock poisoned: {error}"),
+    })
+}
+
+pub trait ClusterKvQuorumAsyncHost: Send {
     fn last_local_kv_replication_index_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -51,6 +64,50 @@ pub trait ClusterKvQuorumAsyncHost {
         request: &'a ClusterRaftAppendRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse>;
+
+    fn send_cluster_kv_replications_to_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        attempts: ClusterRaftQuorumBatch,
+        required_acks: usize,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftQuorumBatchOutcomes> {
+        Box::pin(async move {
+            let deadline = std::time::Instant::now()
+                + attempts
+                    .iter()
+                    .map(|(_, _, timeout)| *timeout)
+                    .max()
+                    .unwrap_or_default();
+            let mut accepted = 0_usize;
+            let mut outcomes = Vec::new();
+            for (target, request, timeout) in attempts {
+                if accepted >= required_acks {
+                    break;
+                }
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    break;
+                }
+                let result = self
+                    .send_cluster_kv_replication_to_node_async(
+                        paths,
+                        state,
+                        &target,
+                        &request,
+                        timeout.min(remaining),
+                    )
+                    .await;
+                if result.as_ref().is_ok_and(|response| response.accepted) {
+                    accepted = accepted.saturating_add(1);
+                }
+                outcomes.push((target, request, result));
+            }
+            Ok(outcomes)
+        })
+    }
 
     fn on_kv_replication_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
@@ -77,7 +134,7 @@ pub trait ClusterKvQuorumAsyncHost {
     }
 }
 
-pub trait ClusterRaftQuorumAsyncHost {
+pub trait ClusterRaftQuorumAsyncHost: Send {
     fn last_local_raft_log_index_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -99,6 +156,50 @@ pub trait ClusterRaftQuorumAsyncHost {
         request: &'a ClusterRaftAppendRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse>;
+
+    fn send_raft_appends_to_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        attempts: ClusterRaftQuorumBatch,
+        required_acks: usize,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftQuorumBatchOutcomes> {
+        Box::pin(async move {
+            let deadline = std::time::Instant::now()
+                + attempts
+                    .iter()
+                    .map(|(_, _, timeout)| *timeout)
+                    .max()
+                    .unwrap_or_default();
+            let mut accepted = 0_usize;
+            let mut outcomes = Vec::new();
+            for (target, request, timeout) in attempts {
+                if accepted >= required_acks {
+                    break;
+                }
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    break;
+                }
+                let result = self
+                    .send_raft_append_to_node_async(
+                        paths,
+                        state,
+                        &target,
+                        &request,
+                        timeout.min(remaining),
+                    )
+                    .await;
+                if result.as_ref().is_ok_and(|response| response.accepted) {
+                    accepted = accepted.saturating_add(1);
+                }
+                outcomes.push((target, request, result));
+            }
+            Ok(outcomes)
+        })
+    }
 
     fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
@@ -161,6 +262,16 @@ where
             request,
             timeout,
         )
+    }
+
+    fn send_raft_appends_to_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        attempts: ClusterRaftQuorumBatch,
+        required_acks: usize,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftQuorumBatchOutcomes> {
+        self.send_cluster_kv_replications_to_quorum_async(paths, state, attempts, required_acks)
     }
 
     fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
@@ -238,12 +349,94 @@ impl<T> ClusterRaftQuorumCommitHost for T where
 
 #[cfg(any(test, feature = "test-support"))]
 pub struct LocalClusterRaftQuorumCommitHost<'a, S, R, F, O> {
-    storage: LocalClusterRaftCommandStorage<'a>,
+    storage: LocalClusterRaftCommandStorage,
+    _paths: std::marker::PhantomData<&'a ClusterPaths>,
     control_plane_timeouts: ClusterControlPlaneTimeouts,
     send_raft_append: S,
     record_endpoint_command_connectivity: R,
     fan_out_committed_cluster_raft_command: F,
     on_raft_append_sent: O,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct LocalResidentRaftAppendReplicationHost<'a, S, O> {
+    paths: &'a ClusterPaths,
+    storage: &'a mut LocalClusterRaftCommandStorage,
+    options: ClusterRaftAppendReplicationOptions,
+    send_raft_append: &'a mut S,
+    on_raft_append_sent: &'a mut O,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<S, O> sinomo_kv::ClusterKvRaftAppendReplicationHost
+    for LocalResidentRaftAppendReplicationHost<'_, S, O>
+where
+    S: FnMut(
+        &ClusterEndpointRecord,
+        &ClusterRaftAppendRequest,
+        Duration,
+    ) -> Result<ClusterRaftAppendResponse, NetworkError>,
+    O: FnMut(),
+{
+    type Error = NetworkError;
+    type Target = ClusterEndpointRecord;
+
+    fn kv_error(error: KvError) -> Self::Error {
+        kv_err(error)
+    }
+
+    fn last_local_raft_log_index(
+        &mut self,
+        _state: &ClusterBootstrapState,
+    ) -> Result<u64, Self::Error> {
+        self.storage.last_log_index()
+    }
+
+    fn raft_peer_progress_next_index_hint(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target: &Self::Target,
+        last_local_raft_log_index: u64,
+    ) -> Option<u64> {
+        sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint(
+            &self.paths.kv_paths(),
+            &target.node_id,
+            state.term,
+            last_local_raft_log_index,
+        )
+    }
+
+    fn build_raft_append_request(
+        &mut self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, Self::Error> {
+        self.storage.build_raft_append_request(state, next_index)
+    }
+
+    fn append_attempt_timeout(
+        &mut self,
+        target: &Self::Target,
+        remaining: Duration,
+        request: &ClusterRaftAppendRequest,
+    ) -> Duration {
+        self.options
+            .append_attempt_timeout(target, remaining, request)
+    }
+
+    fn on_raft_append_sent(&mut self) -> Result<(), Self::Error> {
+        (self.on_raft_append_sent)();
+        Ok(())
+    }
+
+    fn send_raft_append(
+        &mut self,
+        target: &Self::Target,
+        request: &ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, Self::Error> {
+        (self.send_raft_append)(target, request, timeout)
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -351,17 +544,22 @@ where
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
         let endpoint = representative_cluster_endpoint_for_node(state, target_node_id)?;
-        let send_raft_append = &mut self.send_raft_append;
-        let on_raft_append_sent = &mut self.on_raft_append_sent;
-        replicate_cluster_raft_to_endpoint_with_local_host(
+        let options = self
+            .control_plane_timeouts
+            .raft_append_replication_options(timeout);
+        let mut host = LocalResidentRaftAppendReplicationHost {
             paths,
+            storage: &mut self.storage,
+            options,
+            send_raft_append: &mut self.send_raft_append,
+            on_raft_append_sent: &mut self.on_raft_append_sent,
+        };
+        sinomo_kv::replicate_cluster_kv_raft_to_target_with_host(
             state,
             &endpoint,
             &[],
-            self.control_plane_timeouts
-                .raft_append_replication_options(timeout),
-            |endpoint, request, timeout| send_raft_append(endpoint, request, timeout),
-            || on_raft_append_sent(),
+            options.kv_options(),
+            &mut host,
         )
         .map(|outcome| outcome.response)
     }
@@ -418,6 +616,7 @@ where
 {
     let mut host = LocalClusterRaftQuorumCommitHost {
         storage: LocalClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
+        _paths: std::marker::PhantomData,
         control_plane_timeouts,
         send_raft_append,
         record_endpoint_command_connectivity,
@@ -429,6 +628,7 @@ where
 
 struct DriverNodeRaftAppendReplicationHost<'a, T> {
     paths: &'a ClusterPaths,
+    storage: Option<&'a mut LocalClusterRaftCommandStorage>,
     options: ClusterRaftAppendReplicationOptions,
     transport: &'a mut T,
 }
@@ -448,6 +648,9 @@ where
         &mut self,
         state: &ClusterBootstrapState,
     ) -> Result<u64, Self::Error> {
+        if let Some(storage) = self.storage.as_deref_mut() {
+            return storage.last_log_index();
+        }
         self.paths
             .kv_paths()
             .locked_last_raft_log_index(&state.local_node_id)
@@ -473,6 +676,9 @@ where
         state: &ClusterBootstrapState,
         next_index: u64,
     ) -> Result<ClusterRaftAppendRequest, Self::Error> {
+        if let Some(storage) = self.storage.as_deref_mut() {
+            return storage.build_raft_append_request(state, next_index);
+        }
         self.paths
             .kv_paths()
             .locked_build_raft_append_request_from_next_index(state, next_index)
@@ -505,7 +711,7 @@ where
 }
 
 struct DriverRaftQuorumCommitHost<'a, T> {
-    storage: LocalClusterRaftCommandStorage<'a>,
+    storage: LocalClusterRaftCommandStorage,
     driver: &'a mut ClusterControlPlaneDriver<T>,
 }
 
@@ -608,6 +814,7 @@ where
             .raft_append_replication_options(timeout);
         let mut host = DriverNodeRaftAppendReplicationHost {
             paths,
+            storage: Some(&mut self.storage),
             options,
             transport: &mut self.driver.transport,
         };
@@ -689,6 +896,7 @@ where
         .raft_append_replication_options(driver.timeouts.raft_append_timeout);
     let mut host = DriverNodeRaftAppendReplicationHost {
         paths,
+        storage: None,
         options,
         transport: &mut driver.transport,
     };
@@ -943,7 +1151,7 @@ struct AsyncNodeRaftAppendReplicationHost<'a, H> {
 impl<H> sinomo_kv::ClusterKvRaftAppendReplicationAsyncHost
     for AsyncNodeRaftAppendReplicationHost<'_, H>
 where
-    H: ClusterRaftQuorumAsyncHost + Send,
+    H: ClusterRaftQuorumAsyncHost,
 {
     type Error = NetworkError;
     type Target = NodeId;
@@ -1024,7 +1232,7 @@ where
 struct NetworkClusterKvRaftQuorumCommitAsyncHost<'a, H> {
     runtime: &'a tokio::runtime::Handle,
     paths: &'a ClusterPaths,
-    local_node_id: NodeId,
+    storage: SharedLocalClusterRaftCommandStorage,
     append_options: ClusterRaftAppendReplicationOptions,
     host: &'a mut H,
 }
@@ -1032,7 +1240,7 @@ struct NetworkClusterKvRaftQuorumCommitAsyncHost<'a, H> {
 impl<H> sinomo_kv::ClusterKvRaftQuorumCommitAsyncHost
     for NetworkClusterKvRaftQuorumCommitAsyncHost<'_, H>
 where
-    H: ClusterRaftQuorumAsyncHost + Send,
+    H: ClusterRaftQuorumAsyncHost,
 {
     type Error = NetworkError;
 
@@ -1046,17 +1254,22 @@ where
         state: &'a ClusterBootstrapState,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, bool, NetworkError> {
         let runtime = self.runtime;
-        let kv_paths = self.paths.kv_paths();
+        let storage = Arc::clone(&self.storage);
         let state = state.clone();
         Box::pin(async move {
             runtime
-                .spawn_blocking(move || kv_paths.locked_raft_local_is_leader(&state))
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "verify local Raft leadership",
+                    )?
+                    .local_is_leader(&state)
+                })
                 .await
                 .map_err(|source| NetworkError::Io {
                     operation: "verify local raft leadership".to_string(),
                     detail: format!("local raft leadership task failed: {source}"),
                 })?
-                .map_err(kv_err)
         })
     }
 
@@ -1092,11 +1305,22 @@ where
         NetworkError,
     > {
         let runtime = self.runtime;
-        let paths = self.paths;
-        let local_node_id = self.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
+        let request = request.clone();
         Box::pin(async move {
-            replay_cluster_raft_request_if_committed_async(runtime, paths, &local_node_id, request)
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "replay committed cluster Raft request",
+                    )?
+                    .replay_if_committed(&request)
+                })
                 .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft replay committed request".to_string(),
+                    detail: format!("cluster raft replay committed request task failed: {source}"),
+                })?
         })
     }
 
@@ -1105,11 +1329,23 @@ where
         request: KvCommandRequest,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, sinomo_kv::KvLogEntry, NetworkError> {
         let runtime = self.runtime;
-        let paths = self.paths;
-        let local_node_id = self.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
         Box::pin(async move {
-            append_cluster_raft_request_uncommitted_async(runtime, paths, &local_node_id, request)
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "append uncommitted cluster Raft request",
+                    )?
+                    .append_uncommitted(request)
+                })
                 .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft append uncommitted command".to_string(),
+                    detail: format!(
+                        "cluster raft append uncommitted command task failed: {source}"
+                    ),
+                })?
         })
     }
 
@@ -1119,15 +1355,17 @@ where
         failure: &'a sinomo_kv::KvAuthorityFailure,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
         let runtime = self.runtime;
-        let paths = self.paths.clone();
-        let local_node_id = self.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
         let request = request.clone();
         let failure = failure.clone();
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
-                    LocalClusterRaftCommandStorage::new(&paths, local_node_id)
-                        .record_rejected_before_commit(&request, &failure)
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "record rejected cluster Raft request",
+                    )?
+                    .record_rejected_before_commit(&request, &failure)
                 })
                 .await
                 .map_err(|source| NetworkError::Io {
@@ -1143,15 +1381,17 @@ where
         detail: &'a str,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
         let runtime = self.runtime;
-        let paths = self.paths.clone();
-        let local_node_id = self.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
         let request = request.clone();
         let detail = detail.to_string();
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
-                    LocalClusterRaftCommandStorage::new(&paths, local_node_id)
-                        .record_unknown(&request, &detail)
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "record unknown cluster Raft request",
+                    )?
+                    .record_unknown(&request, &detail)
                 })
                 .await
                 .map_err(|source| NetworkError::Io {
@@ -1165,16 +1405,22 @@ where
         &'a mut self,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
         let runtime = self.runtime;
-        let paths = self.paths;
-        let local_node_id = self.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
         Box::pin(async move {
-            discard_cluster_raft_uncommitted_tail_and_clear_leader_async(
-                runtime,
-                paths,
-                &local_node_id,
-            )
-            .await
-            .map(|_| ())
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "discard uncommitted cluster Raft tail",
+                    )?
+                    .discard_uncommitted_tail_and_clear_leader()
+                    .map(|_| ())
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft discard uncommitted tail".to_string(),
+                    detail: format!("cluster raft discard uncommitted tail task failed: {source}"),
+                })?
         })
     }
 
@@ -1184,10 +1430,18 @@ where
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, sinomo_kv::ClusterKvRaftCommitResult, NetworkError>
     {
         let runtime = self.runtime;
-        let paths = self.paths;
-        let local_node_id = self.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
         Box::pin(async move {
-            commit_cluster_raft_index_with_events_async(runtime, paths, &local_node_id, index).await
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(&storage, "commit cluster Raft index")?
+                        .commit_index_with_events(index)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft commit index".to_string(),
+                    detail: format!("cluster raft commit index task failed: {source}"),
+                })?
         })
     }
 
@@ -1255,6 +1509,244 @@ where
         })
     }
 
+    fn replicate_cluster_raft_to_quorum_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        targets: Vec<Self::Target>,
+        required_remote_acks: usize,
+        timeout: Duration,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
+        'a,
+        Vec<sinomo_kv::ClusterKvRaftTargetReplicationAttempt<Self::Target, Self::Error>>,
+        Self::Error,
+    > {
+        let runtime = self.runtime;
+        let paths = self.paths;
+        let storage = Arc::clone(&self.storage);
+        let append_options = self.append_options;
+        let host = &mut *self.host;
+        Box::pin(async move {
+            if required_remote_acks == 0 || targets.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            struct PendingTarget {
+                target: NodeId,
+                next_index: u64,
+                attempts: usize,
+                started: std::time::Instant,
+                last_response: Option<ClusterRaftAppendResponse>,
+            }
+
+            let last_log_index = {
+                let storage = Arc::clone(&storage);
+                runtime
+                    .spawn_blocking(move || {
+                        lock_local_cluster_raft_command_storage(
+                            &storage,
+                            "read resident cluster Raft log index",
+                        )?
+                        .last_log_index()
+                    })
+                    .await
+                    .map_err(|source| NetworkError::Io {
+                        operation: "read resident cluster Raft log index".to_string(),
+                        detail: format!("resident Raft log index task failed: {source}"),
+                    })??
+            };
+            let default_next_index = last_log_index.saturating_add(1);
+            let mut pending = Vec::new();
+            for target in targets {
+                let next_index = sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint_async(
+                    paths.kv_paths(),
+                    target.clone(),
+                    state.term,
+                    last_log_index,
+                )
+                .await
+                .filter(|next_index| (1..=default_next_index).contains(next_index))
+                .unwrap_or(default_next_index);
+                pending.push(PendingTarget {
+                    target,
+                    next_index,
+                    attempts: 0,
+                    started: std::time::Instant::now(),
+                    last_response: None,
+                });
+            }
+
+            let deadline = std::time::Instant::now() + timeout;
+            let mut accepted = 0_usize;
+            let mut completed = Vec::new();
+            while accepted < required_remote_acks && !pending.is_empty() {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    break;
+                }
+
+                let mut sends = Vec::new();
+                for target in &mut pending {
+                    if target.attempts >= append_options.max_attempts {
+                        continue;
+                    }
+                    let request = {
+                        let storage = Arc::clone(&storage);
+                        let state = state.clone();
+                        let next_index = target.next_index;
+                        runtime
+                            .spawn_blocking(move || {
+                                lock_local_cluster_raft_command_storage(
+                                    &storage,
+                                    "build resident cluster Raft append request",
+                                )?
+                                .build_raft_append_request(&state, next_index)
+                            })
+                            .await
+                            .map_err(|source| NetworkError::Io {
+                                operation: "build resident cluster Raft append request".to_string(),
+                                detail: format!("resident Raft append build task failed: {source}"),
+                            })??
+                    };
+                    target.attempts = target.attempts.saturating_add(1);
+                    host.on_raft_append_sent_async().await?;
+                    sends.push((
+                        target.target.clone(),
+                        request,
+                        append_options.routed_node_append_attempt_timeout(remaining),
+                    ));
+                }
+                if sends.is_empty() {
+                    break;
+                }
+
+                let outcomes = host
+                    .send_raft_appends_to_quorum_async(
+                        paths,
+                        state,
+                        sends,
+                        required_remote_acks.saturating_sub(accepted),
+                    )
+                    .await?;
+                if outcomes.is_empty() {
+                    break;
+                }
+                for (target_node_id, request, result) in outcomes {
+                    let Some(position) = pending
+                        .iter()
+                        .position(|pending| pending.target == target_node_id)
+                    else {
+                        continue;
+                    };
+                    let mut target = pending.swap_remove(position);
+                    match result {
+                        Ok(response) if response.accepted => {
+                            accepted = accepted.saturating_add(1);
+                            completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
+                                target: target.target,
+                                latency_ms: Some(
+                                    target
+                                        .started
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                ),
+                                result: Ok(response),
+                            });
+                        }
+                        Ok(response) if response.append.term > request.append.term => {
+                            completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
+                                target: target.target,
+                                latency_ms: Some(
+                                    target
+                                        .started
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                ),
+                                result: Ok(response),
+                            });
+                        }
+                        Ok(response) if target.attempts < append_options.max_attempts => {
+                            target.next_index =
+                                sinomo_kv::cluster_kv_raft_next_index_after_rejection(
+                                    target.next_index,
+                                    &request,
+                                    response.append.match_index,
+                                );
+                            target.last_response = Some(response);
+                            pending.push(target);
+                        }
+                        Ok(response) => {
+                            completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
+                                target: target.target,
+                                latency_ms: Some(
+                                    target
+                                        .started
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                ),
+                                result: Ok(response),
+                            });
+                        }
+                        Err(error) => {
+                            completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
+                                target: target.target,
+                                latency_ms: Some(
+                                    target
+                                        .started
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                ),
+                                result: Err(error),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if accepted < required_remote_acks {
+                for target in pending {
+                    let response =
+                        target
+                            .last_response
+                            .unwrap_or_else(|| ClusterRaftAppendResponse {
+                                accepted: false,
+                                detail: format!(
+                                    "raft append did not complete before {}ms catch-up budget",
+                                    timeout.as_millis()
+                                ),
+                                state: state.clone(),
+                                append: sinomo_kv::RaftAppendEntriesResponse {
+                                    term: 0,
+                                    success: false,
+                                    match_index: 0,
+                                },
+                            });
+                    completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
+                        target: target.target,
+                        latency_ms: Some(
+                            target
+                                .started
+                                .elapsed()
+                                .as_millis()
+                                .min(u128::from(u64::MAX)) as u64,
+                        ),
+                        result: Ok(response),
+                    });
+                }
+            }
+            Ok(completed)
+        })
+    }
+
     fn record_target_replication_status_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
@@ -1299,26 +1791,22 @@ where
 
     fn observe_cluster_raft_term_async<'a>(
         &'a mut self,
-        state: &'a ClusterBootstrapState,
+        _state: &'a ClusterBootstrapState,
         term: u64,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
-        let paths = self.paths.clone();
-        let node_id = state.local_node_id.clone();
+        let storage = Arc::clone(&self.storage);
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
-                    paths
-                        .kv_paths()
-                        .locked_observe_raft_term_and_write_snapshot_if_changed(&node_id, term)
+                    lock_local_cluster_raft_command_storage(&storage, "observe cluster Raft term")?
+                        .observe_term(term)
                 })
                 .await
                 .map_err(|source| NetworkError::Io {
                     operation: "cluster raft term observation".to_string(),
                     detail: format!("term observation task failed: {source}"),
                 })?
-                .map(|_| ())
-                .map_err(kv_err)
         })
     }
 
@@ -1353,7 +1841,7 @@ pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
     host: &mut H,
 ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
 where
-    H: ClusterRaftQuorumAsyncHost + Send,
+    H: ClusterRaftQuorumAsyncHost,
 {
     let project_paths = paths.clone();
     let mut consensus_state = state.clone();
@@ -1367,10 +1855,14 @@ where
             operation: "project committed cluster Raft config".to_string(),
             detail: format!("Raft config projection task failed: {source}"),
         })??;
+    let storage = Arc::new(Mutex::new(LocalClusterRaftCommandStorage::new(
+        paths,
+        consensus_state.local_node_id.clone(),
+    )));
     let mut kv_host = NetworkClusterKvRaftQuorumCommitAsyncHost {
         runtime,
         paths,
-        local_node_id: consensus_state.local_node_id.clone(),
+        storage,
         append_options,
         host,
     };
