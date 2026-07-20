@@ -134,7 +134,9 @@ impl TargetObservationSummary {
     fn freshness(&self, now: OffsetDateTime) -> &'static str {
         if self.error.is_some() {
             "Offline"
-        } else if (now - self.received_at).whole_seconds() > OBSERVATION_FRESH_SECONDS {
+        } else if (now - self.observed_at.unwrap_or(self.received_at)).whole_seconds()
+            > OBSERVATION_FRESH_SECONDS
+        {
             "Stale"
         } else if self.partial {
             "Partial"
@@ -1172,7 +1174,7 @@ fn cluster_overview_host(
 fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let theme = shared.theme();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let (history, targets, in_flight) = {
+    let (history, mut targets, in_flight, local_node_id) = {
         let cluster = shared.cluster();
         (
             cluster.observation.history.clone(),
@@ -1183,12 +1185,14 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .cloned()
                 .collect::<Vec<_>>(),
             cluster.observation.in_flight,
+            cluster.snapshot.local_node_id.clone(),
         )
     };
+    sort_target_summaries(&mut targets, local_node_id.as_deref());
     let latest = history.back();
     let mut cards = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
-        .align_items(Alignment::Stretch)
+        .align_items(Alignment::Start)
         .gap(12.0);
     for metric in DashboardMetric::ALL {
         let values = history
@@ -1216,8 +1220,8 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 pal.text,
             )))
             .with_child(Sparkline::new(metric, values, theme, pal.accent));
-        cards.push(
-            SizedBox::new().width(280.0).height(142.0).with_child(
+        cards.push_item(
+            SizedBox::new().height(142.0).with_child(
                 Surface::panel(card)
                     .name(metric.title())
                     .appearance(SurfaceAppearance::Raised)
@@ -1226,6 +1230,11 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                     .fill()
                     .theme_when(clone_reader(reader)),
             ),
+            FlexItem::new()
+                .grow(1.0)
+                .basis_gap_aware_fraction(0.25)
+                .min_width(220.0)
+                .max_width(360.0),
         );
     }
 
@@ -1302,7 +1311,7 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             ),
         refresh,
     )
-    .trailing_width(132.0)
+    .trailing_width(160.0)
     .trailing_height(32.0)
     .gap(12.0);
 
@@ -1365,6 +1374,7 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                     queue_depth, failed_tasks
                 ),
             )
+            .max_value_lines(2)
             .theme_when(clone_reader(reader)),
         )
         .with_child(cards)
@@ -1488,6 +1498,16 @@ fn format_dashboard_value(metric: DashboardMetric, value: Option<f64>) -> String
             format!("{value:.0}")
         }
     }
+}
+
+fn sort_target_summaries(targets: &mut [TargetObservationSummary], local_node_id: Option<&str>) {
+    targets.sort_by(|left, right| {
+        let left_local = local_node_id.is_some_and(|local| left.node_id == local);
+        let right_local = local_node_id.is_some_and(|local| right.node_id == local);
+        right_local
+            .cmp(&left_local)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
 }
 
 fn format_optional(value: Option<f64>, suffix: &str) -> String {
@@ -1646,7 +1666,7 @@ fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         ("Refreshing".to_string(), SemanticTone::Accent)
     } else {
         (
-            cluster_health_summary(&snapshot),
+            cluster_health_badge_summary(&snapshot),
             cluster_health_tone(&snapshot),
         )
     };
@@ -2305,13 +2325,11 @@ fn cluster_header_summary(snapshot: &ClusterSnapshot, topology: &Topology) -> St
         .filter(|node| node.public_reachable)
         .count();
     format!(
-        "{} · {} · LAN {} · public {}/{} · {}",
+        "{} · LAN {} · public {}/{}",
         count_noun(snapshot.nodes.len(), "node", "nodes"),
-        cluster_health_summary(snapshot).replace(" / ", "/"),
         count_noun(topology.lan_segments.len(), "segment", "segments"),
         public,
-        snapshot.nodes.len(),
-        source_summary(&snapshot.source)
+        snapshot.nodes.len()
     )
 }
 
@@ -2329,6 +2347,15 @@ fn cluster_health_summary(snapshot: &ClusterSnapshot) -> String {
         parts.push(plural_count(counts.unknown, "unknown"));
     }
     parts.join(", ")
+}
+
+fn cluster_health_badge_summary(snapshot: &ClusterSnapshot) -> String {
+    let counts = availability_counts(snapshot);
+    if counts.total == 0 {
+        "No nodes".to_string()
+    } else {
+        format!("{} / {} online", counts.online, counts.total)
+    }
 }
 
 fn direct_topology_edge_count(topology: &Topology) -> usize {
@@ -3185,6 +3212,117 @@ mod tests {
         }
     }
 
+    fn seed_performance_dashboard(shared: &Shared) {
+        let now = OffsetDateTime::now_utc();
+        let mut online = node("node-edge-east");
+        online.display_name = "edge-east".to_string();
+        let mut partial = node("node-compute-02");
+        partial.display_name = "compute-02".to_string();
+        let mut offline = node("node-offline-lab");
+        offline.display_name = "offline-lab".to_string();
+        offline.availability = "offline".to_string();
+
+        let mut cluster = shared.cluster_mut();
+        cluster.snapshot = ClusterSnapshot {
+            nodes: vec![online, partial, offline],
+            local_node_id: Some("node-edge-east".to_string()),
+            source: "visual performance fixture".to_string(),
+            observed_at: now.to_string(),
+            ..ClusterSnapshot::default()
+        };
+        cluster.observation.in_flight = false;
+        cluster.observation.history = (0..18)
+            .map(|index| {
+                let index = index as f64;
+                DashboardPoint {
+                    at: now - time::Duration::seconds((17.0 - index) as i64 * 5),
+                    values: BTreeMap::from([
+                        (DashboardMetric::RpcRate, Some(18.0 + index * 1.7)),
+                        (
+                            DashboardMetric::RpcErrorRate,
+                            Some(if index % 6.0 == 0.0 { 0.8 } else { 0.15 }),
+                        ),
+                        (DashboardMetric::RpcP95Ms, Some(22.0 + (index % 5.0) * 3.4)),
+                        (DashboardMetric::KvP95Ms, Some(7.0 + (index % 4.0) * 1.8)),
+                        (
+                            DashboardMetric::DfsBacklog,
+                            Some((14.0 - index * 0.6).max(2.0)),
+                        ),
+                        (DashboardMetric::AgentActiveTurns, Some(2.0 + (index % 5.0))),
+                    ]),
+                }
+            })
+            .collect();
+        cluster.observation.targets = BTreeMap::from([
+            (
+                "node-edge-east".to_string(),
+                TargetObservationSummary {
+                    node_id: "node-edge-east".to_string(),
+                    observed_at: Some(now - time::Duration::seconds(1)),
+                    received_at: now,
+                    partial: false,
+                    error: None,
+                    rpc_rate: Some(31.4),
+                    rpc_p95_ms: Some(28.2),
+                    kv_queue_depth: Some(1.0),
+                    dfs_backlog: Some(2.0),
+                    failed_tasks: Some(0.0),
+                },
+            ),
+            (
+                "node-compute-02".to_string(),
+                TargetObservationSummary {
+                    node_id: "node-compute-02".to_string(),
+                    observed_at: Some(now - time::Duration::seconds(2)),
+                    received_at: now,
+                    partial: true,
+                    error: None,
+                    rpc_rate: Some(15.5),
+                    rpc_p95_ms: Some(34.7),
+                    kv_queue_depth: Some(3.0),
+                    dfs_backlog: Some(2.0),
+                    failed_tasks: Some(1.0),
+                },
+            ),
+            (
+                "node-offline-lab".to_string(),
+                TargetObservationSummary {
+                    node_id: "node-offline-lab".to_string(),
+                    observed_at: Some(now - time::Duration::seconds(18)),
+                    received_at: now,
+                    partial: false,
+                    error: Some("observe route unavailable".to_string()),
+                    rpc_rate: None,
+                    rpc_p95_ms: None,
+                    kv_queue_depth: None,
+                    dfs_backlog: None,
+                    failed_tasks: None,
+                },
+            ),
+        ]);
+        cluster.observation.activity = VecDeque::from([
+            ObservationActivity {
+                at: now - time::Duration::seconds(12),
+                node_id: "node-compute-02".to_string(),
+                detail: "metric snapshot was partial; failed exporters: agent-runtime".to_string(),
+                warning: true,
+            },
+            ObservationActivity {
+                at: now - time::Duration::seconds(7),
+                node_id: "node-edge-east".to_string(),
+                detail: "process restarted; interval baseline reset".to_string(),
+                warning: false,
+            },
+            ObservationActivity {
+                at: now - time::Duration::seconds(2),
+                node_id: "node-offline-lab".to_string(),
+                detail: "metrics unavailable: observe route unavailable".to_string(),
+                warning: true,
+            },
+        ]);
+        cluster.observation.revision = cluster.observation.revision.wrapping_add(1);
+    }
+
     #[test]
     fn observation_uses_first_sample_as_baseline_and_resets_after_restart() {
         let process_started_at = test_time(1);
@@ -3469,6 +3607,261 @@ mod tests {
     }
 
     #[test]
+    fn overview_metric_cards_wrap_without_viewport_height_stretch() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        seed_performance_dashboard(&shared);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster performance layout")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1280.0, 720.0,
+            ))))?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        let card_tops = DashboardMetric::ALL
+            .into_iter()
+            .map(|metric| {
+                snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .find(|node| node.name.as_deref() == Some(metric.title()))
+                    .unwrap_or_else(|| panic!("missing {} card semantics", metric.title()))
+                    .bounds
+                    .y()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(card_tops.len(), DashboardMetric::ALL.len());
+        let first = card_tops.iter().copied().reduce(f32::min).unwrap();
+        let last = card_tops.iter().copied().reduce(f32::max).unwrap();
+        assert!(
+            last - first < 200.0,
+            "the second card row should follow the first instead of stretching to viewport height: {card_tops:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_header_badge_uses_a_compact_single_line_health_summary() {
+        let snapshot = ClusterSnapshot {
+            nodes: vec![node("node-a"), node("node-b"), {
+                let mut node = node("node-c");
+                node.availability = "offline".to_string();
+                node
+            }],
+            ..ClusterSnapshot::default()
+        };
+
+        assert_eq!(cluster_health_badge_summary(&snapshot), "2 / 3 online");
+        assert_eq!(
+            cluster_health_badge_summary(&ClusterSnapshot::default()),
+            "No nodes"
+        );
+        assert_eq!(
+            cluster_health_summary(&snapshot),
+            "2 / 3 online, 1 offline",
+            "detail surfaces retain the full availability breakdown"
+        );
+    }
+
+    #[test]
+    fn observation_freshness_uses_source_time_and_keeps_local_node_first() {
+        let now = test_time(100);
+        let mut stale = TargetObservationSummary {
+            node_id: "node-remote".to_string(),
+            observed_at: Some(test_time(80)),
+            received_at: now,
+            partial: false,
+            error: None,
+            rpc_rate: None,
+            rpc_p95_ms: None,
+            kv_queue_depth: None,
+            dfs_backlog: None,
+            failed_tasks: None,
+        };
+        assert_eq!(stale.freshness(now), "Stale");
+        stale.observed_at = Some(test_time(95));
+        assert_eq!(stale.freshness(now), "Fresh");
+
+        let mut local = stale.clone();
+        local.node_id = "node-local".to_string();
+        let mut other = stale;
+        other.node_id = "node-alpha".to_string();
+        let mut targets = vec![other, local];
+        sort_target_summaries(&mut targets, Some("node-local"));
+        assert_eq!(targets[0].node_id, "node-local");
+        assert_eq!(targets[1].node_id, "node-alpha");
+    }
+
+    #[test]
+    fn performance_refresh_action_starts_collection() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        seed_performance_dashboard(&shared);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster performance refresh")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        let revision_before = shared.cluster().observation.revision;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Refresh now")
+            .click()?;
+        assert!(shared.cluster().observation.in_flight);
+        assert!(shared.cluster().observation.revision > revision_before);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "dev dashboard capture; run explicitly with --ignored --nocapture"]
+    fn capture_cluster_performance_dashboard() -> sui::Result<()> {
+        use sui::{PointerButtons, PointerEvent, WindowEvent};
+
+        let output = std::env::var("SINOMO_APP_SHOTS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        std::fs::create_dir_all(&output).expect("create dashboard capture directory");
+        let mut state = AppState::ready(Backend::local_fallback());
+        state.active_tab = Tab::Cluster;
+        let shared = Shared::new(state);
+        shared.borrow_mut().theme_mode = AppThemeMode::Dark;
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        seed_performance_dashboard(&shared);
+        app.run_until_idle()?;
+
+        let capture = |name: &str| {
+            let shot = window
+                .capture_screenshot()
+                .expect("capture dashboard screenshot");
+            let path = output.join(name);
+            shot.write_png(&path).expect("write dashboard screenshot");
+            println!(
+                "wrote {} ({}x{})",
+                path.display(),
+                shot.width(),
+                shot.height()
+            );
+        };
+
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                1280.0, 900.0,
+            ))))?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-performance-wide.png");
+
+        shared.set_theme_mode(AppThemeMode::Light);
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-performance-wide-light.png");
+
+        shared.set_theme_mode(AppThemeMode::Dark);
+        shared.set_text_scale(AppTextScale::ExtraLarge);
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-performance-wide-large-text.png");
+
+        shared.set_text_scale(AppTextScale::Standard);
+        app.run_until_idle()?;
+
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(520.0, 800.0))))?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-performance-narrow.png");
+
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("Cluster performance overview")
+            .scroll_pixels(sui::Vector::new(0.0, -560.0))?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-performance-narrow-scrolled.png");
+
+        seed_performance_dashboard(&shared);
+        app.run_until_idle()?;
+
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(390.0, 844.0))))?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-performance-phone.png");
+
+        let snapshot = window.snapshot()?;
+        let sections = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar
+                    && node.name.as_deref() == Some("cluster-sections")
+            })
+            .expect("cluster section tab bar semantics")
+            .bounds;
+        let point = Point::new(
+            sections.x() + sections.width() * (5.0 / 6.0),
+            sections.y() + sections.height() * 0.5,
+        );
+        let root = window.root();
+        root.dispatch_event(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            point,
+        )))?;
+        let mut down = PointerEvent::new(PointerEventKind::Down, point);
+        down.button = Some(PointerButton::Primary);
+        down.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(down))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, point);
+        up.button = Some(PointerButton::Primary);
+        root.dispatch_event(Event::Pointer(up))?;
+        app.run_until_idle()?;
+
+        assert_eq!(shared.cluster().subview, ClusterSubview::Activity);
+        capture("sinomo-app-cluster-performance-activity.png");
+
+        let revision_before_overview = shared.cluster().observation.revision;
+        let point = Point::new(
+            sections.x() + sections.width() * (1.0 / 6.0),
+            sections.y() + sections.height() * 0.5,
+        );
+        root.dispatch_event(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            point,
+        )))?;
+        let mut down = PointerEvent::new(PointerEventKind::Down, point);
+        down.button = Some(PointerButton::Primary);
+        down.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(down))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, point);
+        up.button = Some(PointerButton::Primary);
+        root.dispatch_event(Event::Pointer(up))?;
+        app.run_until_idle()?;
+        assert_eq!(shared.cluster().subview, ClusterSubview::Overview);
+        assert!(
+            shared.cluster().observation.revision > revision_before_overview,
+            "returning to Overview starts a new collection attempt"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn selected_copy_details_preserves_full_id_address_and_endpoints() {
         let mut selected = node("node-01jz7x9m4k2p8q6r5s3t1v0w9y");
         selected.address = Some("https://10.20.30.40:21353/control".to_string());
@@ -3639,7 +4032,7 @@ mod tests {
 
         assert_eq!(
             cluster_header_summary(&snapshot, &topology),
-            "2 nodes · 2/2 online · LAN 0 segments · public 1/2 · daemon connected"
+            "2 nodes · LAN 0 segments · public 1/2"
         );
         assert_eq!(lines[0], "Cluster overview");
         assert!(lines.iter().any(|line| line == "health: 2 / 2 online"));
