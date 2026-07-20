@@ -1,23 +1,25 @@
 //! "Cluster" tab - network-topology graph of known cluster nodes.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use time::OffsetDateTime;
 
 use sui::{
     Alignment, ArrangeCtx, Button, ButtonAppearance, Color, Constraints, DefaultTheme, DetailRow,
-    Dock, EmptyState, Event, EventCtx, Flex, FlexItem, FontWeight, IconGlyph, Insets, KeyState,
-    Label, MeasureCtx, PaintCtx, PanelSection, Path, PathBuilder, Point, PointerButton,
+    Dock, EmptyState, Event, EventCtx, Flex, FlexItem, FlexWrap, FontWeight, IconGlyph, Insets,
+    KeyState, Label, MeasureCtx, PaintCtx, PanelSection, Path, PathBuilder, Point, PointerButton,
     PointerEventKind, RebuildOnChange, Rect, ScrollView, SemanticTone, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, Size, StatusBadge, StrokeStyle, Surface,
-    SurfaceAppearance, SurfaceBorder, SurfaceElevation, TrailingSlotRow, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor,
+    SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Size, SizedBox, StatusBadge,
+    StrokeStyle, Surface, SurfaceAppearance, SurfaceBorder, SurfaceElevation, SwitchView, TabBar,
+    TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
 };
 
 use crate::backend::Backend;
 use crate::backend::cluster::{ClusterLinkInfo, ClusterNodeInfo, ClusterSnapshot};
+use crate::backend::observe::ObserveSampleBatch;
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
 use crate::ui::settings::SettingsSection;
@@ -34,6 +36,153 @@ const DETAIL_BUTTON_H: f32 = 30.0;
 const LEGEND_H: f32 = 32.0;
 const VERTEX_TEXT_TOP_GAP: f32 = 6.0;
 const VERTEX_TEXT_LINE_GAP: f32 = 2.0;
+const CLUSTER_SECTION_H: f32 = 42.0;
+const OBSERVATION_HISTORY_LIMIT: usize = 180;
+const OBSERVATION_ACTIVITY_LIMIT: usize = 100;
+const OBSERVATION_ACTIVITY_DETAIL_LIMIT: usize = 180;
+const OBSERVATION_FRESH_SECONDS: i64 = 10;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClusterSubview {
+    #[default]
+    Overview,
+    Topology,
+    Activity,
+}
+
+impl ClusterSubview {
+    const ALL: [Self; 3] = [Self::Overview, Self::Topology, Self::Activity];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Topology => 1,
+            Self::Activity => 2,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Topology => "Topology",
+            Self::Activity => "Activity",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DashboardMetric {
+    RpcRate,
+    RpcErrorRate,
+    RpcP95Ms,
+    KvP95Ms,
+    DfsBacklog,
+    AgentActiveTurns,
+}
+
+impl DashboardMetric {
+    const ALL: [Self; 6] = [
+        Self::RpcRate,
+        Self::RpcErrorRate,
+        Self::RpcP95Ms,
+        Self::KvP95Ms,
+        Self::DfsBacklog,
+        Self::AgentActiveTurns,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::RpcRate => "RPC throughput",
+            Self::RpcErrorRate => "RPC errors",
+            Self::RpcP95Ms => "RPC max-node p95",
+            Self::KvP95Ms => "KV max-node p95",
+            Self::DfsBacklog => "DFS backlog",
+            Self::AgentActiveTurns => "Active agent turns",
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            Self::RpcRate | Self::RpcErrorRate => "/s",
+            Self::RpcP95Ms | Self::KvP95Ms => "ms",
+            Self::DfsBacklog | Self::AgentActiveTurns => "",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DashboardPoint {
+    at: OffsetDateTime,
+    values: BTreeMap<DashboardMetric, Option<f64>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TargetObservationSummary {
+    node_id: String,
+    observed_at: Option<OffsetDateTime>,
+    received_at: OffsetDateTime,
+    partial: bool,
+    error: Option<String>,
+    rpc_rate: Option<f64>,
+    rpc_p95_ms: Option<f64>,
+    kv_queue_depth: Option<f64>,
+    dfs_backlog: Option<f64>,
+    failed_tasks: Option<f64>,
+}
+
+impl TargetObservationSummary {
+    fn freshness(&self, now: OffsetDateTime) -> &'static str {
+        if self.error.is_some() {
+            "Offline"
+        } else if (now - self.received_at).whole_seconds() > OBSERVATION_FRESH_SECONDS {
+            "Stale"
+        } else if self.partial {
+            "Partial"
+        } else {
+            "Fresh"
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ObservationActivity {
+    at: OffsetDateTime,
+    node_id: String,
+    detail: String,
+    warning: bool,
+}
+
+struct ClusterObservationState {
+    generation: u64,
+    in_flight: bool,
+    sample_rx: Option<Receiver<ObserveSampleBatch>>,
+    previous: BTreeMap<
+        String,
+        (
+            sinomo_runtime::observe::ObserveMetricsResponse,
+            OffsetDateTime,
+        ),
+    >,
+    targets: BTreeMap<String, TargetObservationSummary>,
+    history: VecDeque<DashboardPoint>,
+    activity: VecDeque<ObservationActivity>,
+    revision: u64,
+}
+
+impl Default for ClusterObservationState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            in_flight: false,
+            sample_rx: None,
+            previous: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            history: VecDeque::new(),
+            activity: VecDeque::new(),
+            revision: 0,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusterSelection {
@@ -43,10 +192,12 @@ pub enum ClusterSelection {
 
 pub struct ClusterState {
     pub snapshot: ClusterSnapshot,
+    pub subview: ClusterSubview,
     pub selected: Option<ClusterSelection>,
     pub diagnostics_open: bool,
     pub refreshing: bool,
     refresh_rx: Option<Receiver<ClusterSnapshot>>,
+    observation: ClusterObservationState,
 }
 
 /// Cloneable UI projection shared by the Cluster tab's structural selectors.
@@ -54,9 +205,11 @@ pub struct ClusterState {
 pub struct ClusterStructureKey {
     theme: DefaultTheme,
     snapshot: ClusterSnapshot,
+    subview: ClusterSubview,
     selected: Option<ClusterSelection>,
     diagnostics_open: bool,
     refreshing: bool,
+    observation_revision: u64,
 }
 
 impl ClusterStructureKey {
@@ -65,17 +218,21 @@ impl ClusterStructureKey {
             return Self {
                 theme,
                 snapshot: ClusterSnapshot::default(),
+                subview: ClusterSubview::Overview,
                 selected: None,
                 diagnostics_open: false,
                 refreshing: false,
+                observation_revision: 0,
             };
         };
         Self {
             theme,
             snapshot: cluster.snapshot.clone(),
+            subview: cluster.subview,
             selected: cluster.selected.clone(),
             diagnostics_open: cluster.diagnostics_open,
             refreshing: cluster.refreshing,
+            observation_revision: cluster.observation.revision,
         }
     }
 }
@@ -84,10 +241,12 @@ impl ClusterState {
     pub fn new(backend: &Backend) -> Self {
         Self {
             snapshot: backend.cluster_startup_snapshot(),
+            subview: ClusterSubview::Overview,
             selected: None,
             diagnostics_open: false,
             refreshing: false,
             refresh_rx: None,
+            observation: ClusterObservationState::default(),
         }
     }
 
@@ -131,6 +290,11 @@ impl ClusterState {
     ) -> bool {
         self.refresh_rx = None;
         self.refreshing = false;
+        self.observation.generation = self.observation.generation.wrapping_add(1);
+        self.observation.sample_rx = None;
+        self.observation.in_flight = false;
+        self.observation.previous.clear();
+        self.observation.revision = self.observation.revision.wrapping_add(1);
         self.begin_refresh(backend, waker)
     }
 
@@ -156,6 +320,71 @@ impl ClusterState {
         self.snapshot = snapshot;
         true
     }
+
+    fn begin_observation(&mut self, backend: Backend, waker: Option<sui::UiHandle>) -> bool {
+        if self.observation.in_flight {
+            return false;
+        }
+        let generation = self.observation.generation;
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-cluster-observe".to_string())
+            .spawn(move || {
+                let batch = backend.observe_cluster_metrics(generation);
+                let _ = tx.send(batch);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.observation.in_flight = true;
+                self.observation.sample_rx = Some(rx);
+                self.observation.revision = self.observation.revision.wrapping_add(1);
+                true
+            }
+            Err(error) => {
+                self.observation.in_flight = false;
+                self.observation.sample_rx = None;
+                push_observation_activity(
+                    &mut self.observation,
+                    OffsetDateTime::now_utc(),
+                    "local",
+                    format!("observation worker failed to start: {error}"),
+                    true,
+                );
+                self.observation.revision = self.observation.revision.wrapping_add(1);
+                true
+            }
+        }
+    }
+
+    fn pump_observation(&mut self) -> bool {
+        let batch = match self.observation.sample_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(batch)) => batch,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.observation.sample_rx = None;
+                self.observation.in_flight = false;
+                push_observation_activity(
+                    &mut self.observation,
+                    OffsetDateTime::now_utc(),
+                    "local",
+                    "observation worker stopped before returning a sample".to_string(),
+                    true,
+                );
+                self.observation.revision = self.observation.revision.wrapping_add(1);
+                return true;
+            }
+        };
+        self.observation.sample_rx = None;
+        self.observation.in_flight = false;
+        if batch.generation != self.observation.generation {
+            return false;
+        }
+        apply_observation_batch(&mut self.observation, batch);
+        self.observation.revision = self.observation.revision.wrapping_add(1);
+        true
+    }
 }
 
 pub fn request_refresh(shared: &Shared) -> bool {
@@ -174,6 +403,318 @@ pub fn pump_refresh(shared: &Shared) -> bool {
         return false;
     }
     shared.cluster_mut().pump_refresh()
+}
+
+pub fn request_observation(shared: &Shared) -> bool {
+    let (backend, waker) = {
+        let app = shared.borrow();
+        let Some(ready) = app.ready.as_ref() else {
+            return false;
+        };
+        (ready.backend.clone(), app.waker.clone())
+    };
+    shared.cluster_mut().begin_observation(backend, waker)
+}
+
+pub fn pump_observation(shared: &Shared) -> bool {
+    if !shared.is_ready() {
+        return false;
+    }
+    shared.cluster_mut().pump_observation()
+}
+
+pub fn overview_visible(shared: &Shared) -> bool {
+    shared.is_ready()
+        && shared.active_tab() == Tab::Cluster
+        && shared.cluster().subview == ClusterSubview::Overview
+}
+
+fn apply_observation_batch(state: &mut ClusterObservationState, batch: ObserveSampleBatch) {
+    let sampled_nodes = batch
+        .targets
+        .iter()
+        .map(|target| target.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .targets
+        .retain(|node_id, _| sampled_nodes.contains(node_id));
+    state
+        .previous
+        .retain(|node_id, _| sampled_nodes.contains(node_id));
+    let mut aggregate: BTreeMap<DashboardMetric, Option<f64>> = DashboardMetric::ALL
+        .into_iter()
+        .map(|metric| (metric, None))
+        .collect();
+
+    for target in batch.targets {
+        let node_id = target.node_id;
+        let response = match target.response {
+            Ok(response) => response,
+            Err(error) => {
+                let error = short(&error, 240);
+                let observed_at = state
+                    .targets
+                    .get(&node_id)
+                    .and_then(|target| target.observed_at);
+                state.targets.insert(
+                    node_id.clone(),
+                    TargetObservationSummary {
+                        node_id: node_id.clone(),
+                        observed_at,
+                        received_at: batch.received_at,
+                        partial: false,
+                        error: Some(error.clone()),
+                        rpc_rate: None,
+                        rpc_p95_ms: None,
+                        kv_queue_depth: None,
+                        dfs_backlog: None,
+                        failed_tasks: None,
+                    },
+                );
+                push_observation_activity(
+                    state,
+                    batch.received_at,
+                    &node_id,
+                    format!("metrics unavailable: {}", short(&error, 180)),
+                    true,
+                );
+                continue;
+            }
+        };
+
+        let observed_at = response.observed_at.unwrap_or(batch.received_at);
+        let previous = state.previous.get(&node_id);
+        let process_restarted = previous.is_some_and(|(previous, _)| {
+            matches!(
+                (previous.process_started_at, response.process_started_at),
+                (Some(previous), Some(current)) if previous != current
+            )
+        });
+        let same_process = previous.is_some_and(|(previous, _)| {
+            previous.process_started_at.is_none()
+                || response.process_started_at.is_none()
+                || previous.process_started_at == response.process_started_at
+        });
+        let elapsed_seconds = previous
+            .map(|(previous, received_at)| {
+                let previous_at = previous.observed_at.unwrap_or(*received_at);
+                (observed_at - previous_at).as_seconds_f64()
+            })
+            .filter(|elapsed| *elapsed > f64::EPSILON);
+        let interval = (same_process && elapsed_seconds.is_some()).then(|| {
+            sinomo_runtime::observe::observe_metrics_interval_delta(
+                &previous
+                    .expect("same process requires a previous response")
+                    .0,
+                &response,
+            )
+        });
+        let values = dashboard_values(&response, interval.as_ref(), elapsed_seconds);
+        if process_restarted {
+            push_observation_activity(
+                state,
+                batch.received_at,
+                &node_id,
+                "process restarted; interval baseline reset".to_string(),
+                false,
+            );
+        }
+        for (metric, value) in &values {
+            let Some(value) = value else {
+                continue;
+            };
+            let slot = aggregate.entry(*metric).or_insert(None);
+            *slot = Some(match (*slot, metric) {
+                (Some(current), DashboardMetric::RpcP95Ms | DashboardMetric::KvP95Ms) => {
+                    current.max(*value)
+                }
+                (Some(current), _) => current + *value,
+                (None, _) => *value,
+            });
+        }
+        let partial = response.partial;
+        if partial {
+            let failed = response
+                .exporters
+                .iter()
+                .filter(|exporter| !exporter.success)
+                .map(|exporter| exporter.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            push_observation_activity(
+                state,
+                batch.received_at,
+                &node_id,
+                if failed.is_empty() {
+                    "metric snapshot was partial".to_string()
+                } else {
+                    format!("metric snapshot was partial; failed exporters: {failed}")
+                },
+                true,
+            );
+        }
+        state.targets.insert(
+            node_id.clone(),
+            TargetObservationSummary {
+                node_id: node_id.clone(),
+                observed_at: Some(observed_at),
+                received_at: batch.received_at,
+                partial,
+                error: None,
+                rpc_rate: values[&DashboardMetric::RpcRate],
+                rpc_p95_ms: values[&DashboardMetric::RpcP95Ms],
+                kv_queue_depth: metric_value_sum(
+                    &response.metrics,
+                    "sinomo.kv.commit.queue_depth",
+                    |_| true,
+                ),
+                dfs_backlog: values[&DashboardMetric::DfsBacklog],
+                failed_tasks: metric_value_sum(&response.metrics, "sinomo.agent.tasks", |record| {
+                    matches!(
+                        record.labels.get("status").map(String::as_str),
+                        Some("failed" | "timed_out")
+                    )
+                }),
+            },
+        );
+        state
+            .previous
+            .insert(node_id, (response, batch.received_at));
+    }
+
+    state.history.push_back(DashboardPoint {
+        at: batch.received_at,
+        values: aggregate,
+    });
+    while state.history.len() > OBSERVATION_HISTORY_LIMIT {
+        state.history.pop_front();
+    }
+}
+
+fn dashboard_values(
+    current: &sinomo_runtime::observe::ObserveMetricsResponse,
+    interval: Option<&sinomo_runtime::observe::ObserveMetricsResponse>,
+    elapsed_seconds: Option<f64>,
+) -> BTreeMap<DashboardMetric, Option<f64>> {
+    let rpc_filter = |record: &sinomo_runtime::observe::ObserveMetricRecord| {
+        record.labels.get("category").map(String::as_str) != Some("observe")
+            && record.labels.get("route").map(String::as_str) != Some("/observe/metrics")
+    };
+    let rpc_rate = interval
+        .zip(elapsed_seconds)
+        .and_then(|(interval, elapsed)| {
+            metric_value_sum(
+                &interval.metrics,
+                "sinomo.daemon.service.requests",
+                rpc_filter,
+            )
+            .map(|value| value / elapsed)
+        });
+    let rpc_error_rate = interval
+        .zip(elapsed_seconds)
+        .and_then(|(interval, elapsed)| {
+            metric_value_sum(
+                &interval.metrics,
+                "sinomo.daemon.service.requests",
+                |record| {
+                    rpc_filter(record)
+                        && record.labels.get("outcome").map(String::as_str) == Some("error")
+                },
+            )
+            .map(|value| value / elapsed)
+        });
+    let rpc_p95_ms = interval.and_then(|interval| {
+        metric_histogram_quantile_max(
+            &interval.metrics,
+            "sinomo.daemon.service.total.us",
+            0.95,
+            rpc_filter,
+        )
+        .map(|value| value / 1_000.0)
+    });
+    let kv_p95_ms = interval.and_then(|interval| {
+        metric_histogram_quantile_max(
+            &interval.metrics,
+            "sinomo.kv.command.total.us",
+            0.95,
+            |record| record.labels.get("outcome").map(String::as_str) == Some("ok"),
+        )
+        .map(|value| value / 1_000.0)
+    });
+    let dfs_backlog = [
+        "sinomo.dfs.pending_repairs",
+        "sinomo.dfs.open_conflicts",
+        "sinomo.dfs.pending_writes",
+        "sinomo.dfs.failed_namespace_jobs",
+    ]
+    .into_iter()
+    .filter_map(|name| metric_value_sum(&current.metrics, name, |_| true))
+    .reduce(|left, right| left + right);
+    let agent_active_turns =
+        metric_value_sum(&current.metrics, "sinomo.agent.active_turns", |_| true);
+
+    BTreeMap::from([
+        (DashboardMetric::RpcRate, rpc_rate),
+        (DashboardMetric::RpcErrorRate, rpc_error_rate),
+        (DashboardMetric::RpcP95Ms, rpc_p95_ms),
+        (DashboardMetric::KvP95Ms, kv_p95_ms),
+        (DashboardMetric::DfsBacklog, dfs_backlog),
+        (DashboardMetric::AgentActiveTurns, agent_active_turns),
+    ])
+}
+
+fn metric_value_sum(
+    records: &[sinomo_runtime::observe::ObserveMetricRecord],
+    name: &str,
+    include: impl Fn(&sinomo_runtime::observe::ObserveMetricRecord) -> bool,
+) -> Option<f64> {
+    records
+        .iter()
+        .filter(|record| record.name == name && include(record))
+        .filter_map(|record| record.value)
+        .filter(|value| value.is_finite())
+        .reduce(|left, right| left + right)
+}
+
+fn metric_histogram_quantile_max(
+    records: &[sinomo_runtime::observe::ObserveMetricRecord],
+    name: &str,
+    quantile: f64,
+    include: impl Fn(&sinomo_runtime::observe::ObserveMetricRecord) -> bool,
+) -> Option<f64> {
+    records
+        .iter()
+        .filter(|record| record.name == name && include(record))
+        .filter_map(|record| record.histogram_quantile(quantile))
+        .filter(|value| value.is_finite())
+        .reduce(f64::max)
+}
+
+fn push_observation_activity(
+    state: &mut ClusterObservationState,
+    at: OffsetDateTime,
+    node_id: impl Into<String>,
+    detail: String,
+    warning: bool,
+) {
+    let node_id = node_id.into();
+    let detail = short(&detail, OBSERVATION_ACTIVITY_DETAIL_LIMIT);
+    if state
+        .activity
+        .back()
+        .is_some_and(|entry| entry.node_id == node_id && entry.detail == detail)
+    {
+        return;
+    }
+    state.activity.push_back(ObservationActivity {
+        at,
+        node_id,
+        detail,
+        warning,
+    });
+    while state.activity.len() > OBSERVATION_ACTIVITY_LIMIT {
+        state.activity.pop_front();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -246,13 +787,62 @@ struct LayoutVertex {
 }
 
 pub fn view(shared: Shared) -> impl Widget {
-    ClusterView::new(shared)
+    let reader = cluster_theme_reader(&shared);
+    let section_source = shared
+        .signals()
+        .cluster_structure
+        .select_named("cluster section selection", |key| key.subview.index());
+    let tab_section_source = shared
+        .signals()
+        .cluster_structure
+        .select_named("cluster tab selection", |key| Some(key.subview.index()));
+    let body = SwitchView::new()
+        .selected_from(section_source.clone())
+        .with_child(cluster_overview_host(&shared, &reader))
+        .with_child(ClusterView::new(shared.clone()))
+        .with_child(cluster_activity_host(&shared, &reader));
+    let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
+    Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
+        .top(HEADER_H, cluster_header_host(&shared, &reader))
+}
+
+fn build_cluster_section_bar(
+    shared: &Shared,
+    reader: &ThemeReader,
+    selected: impl sui::Observable<Option<usize>> + 'static,
+) -> Surface {
+    let change_shared = shared.clone();
+    let tabs = TabBar::new("cluster-sections")
+        .tabs(ClusterSubview::ALL.into_iter().map(ClusterSubview::title))
+        .selected_from(selected)
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _label| {
+            let Some(subview) = ClusterSubview::ALL.get(index).copied() else {
+                return;
+            };
+            if change_shared.cluster().subview == subview {
+                return;
+            }
+            change_shared.cluster_mut().subview = subview;
+            if subview == ClusterSubview::Overview {
+                request_observation(&change_shared);
+            }
+        });
+    Surface::window(tabs)
+        .border(SurfaceBorder::Bottom)
+        .padding(Insets {
+            left: PAD,
+            right: PAD,
+            top: 5.0,
+            bottom: 5.0,
+        })
+        .fill()
+        .theme_when(clone_reader(reader))
 }
 
 struct ClusterView {
     shared: Shared,
     keyboard_focus: RefCell<Option<ClusterSelection>>,
-    header: WidgetPod,
     empty: WidgetPod,
     legend: WidgetPod,
     detail: WidgetPod,
@@ -262,7 +852,6 @@ impl ClusterView {
     fn new(shared: Shared) -> Self {
         let reader = cluster_theme_reader(&shared);
         Self {
-            header: WidgetPod::new(cluster_header_host(&shared, &reader)),
             empty: WidgetPod::new(cluster_empty_host(&shared, &reader)),
             legend: WidgetPod::new(cluster_legend(&reader)),
             detail: WidgetPod::new(cluster_detail_host(&shared, &reader)),
@@ -403,10 +992,6 @@ impl Widget for ClusterView {
         let legend = legend_rect(bounds);
         let has_vertices = !self.shared.cluster().snapshot.nodes.is_empty();
 
-        self.header.measure(
-            ctx,
-            Constraints::tight(Size::new(bounds.width(), HEADER_H.min(bounds.height()))),
-        );
         if has_vertices {
             self.empty.measure(ctx, Constraints::tight(Size::ZERO));
             self.legend
@@ -423,13 +1008,6 @@ impl Widget for ClusterView {
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let header = Rect::new(
-            bounds.x(),
-            bounds.y(),
-            bounds.width(),
-            HEADER_H.min(bounds.height()),
-        );
-        self.header.arrange(ctx, header);
         if self.shared.cluster().snapshot.nodes.is_empty() {
             self.empty.arrange(ctx, graph_rect(bounds));
             self.legend.arrange(ctx, Rect::ZERO);
@@ -454,8 +1032,6 @@ impl Widget for ClusterView {
         };
 
         ctx.fill_bounds(pal.window);
-        self.header.paint(ctx);
-
         if topology.vertices.is_empty() {
             self.empty.paint(ctx);
             return;
@@ -522,7 +1098,6 @@ impl Widget for ClusterView {
             ctx.push(item);
         }
 
-        self.header.semantics(ctx);
         if topology.vertices.is_empty() {
             self.empty.semantics(ctx);
         } else {
@@ -532,14 +1107,12 @@ impl Widget for ClusterView {
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.header);
         visitor.visit(&self.empty);
         visitor.visit(&self.legend);
         visitor.visit(&self.detail);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.header);
         visitor.visit(&mut self.empty);
         visitor.visit(&mut self.legend);
         visitor.visit(&mut self.detail);
@@ -565,6 +1138,459 @@ fn cluster_theme_reader(shared: &Shared) -> ThemeReader {
 fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || reader()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ClusterObservationViewKey {
+    theme: DefaultTheme,
+    snapshot: ClusterSnapshot,
+    observation_revision: u64,
+}
+
+fn cluster_overview_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<ClusterObservationViewKey> {
+    let source =
+        shared
+            .signals()
+            .cluster_structure
+            .select_named("cluster overview structure", |key| {
+                ClusterObservationViewKey {
+                    theme: key.theme,
+                    snapshot: key.snapshot.clone(),
+                    observation_revision: key.observation_revision,
+                }
+            });
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_overview(&build_shared, &reader)
+    })
+}
+
+fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let (history, targets, in_flight) = {
+        let cluster = shared.cluster();
+        (
+            cluster.observation.history.clone(),
+            cluster
+                .observation
+                .targets
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            cluster.observation.in_flight,
+        )
+    };
+    let latest = history.back();
+    let mut cards = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .align_items(Alignment::Stretch)
+        .gap(12.0);
+    for metric in DashboardMetric::ALL {
+        let values = history
+            .iter()
+            .map(|point| point.values.get(&metric).copied().flatten())
+            .collect::<Vec<_>>();
+        let value = latest
+            .and_then(|point| point.values.get(&metric))
+            .copied()
+            .flatten();
+        let value_label = format_dashboard_value(metric, value);
+        let card = Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(4.0)
+            .with_child(Label::new(metric.title()).style(pal.text_style(
+                &theme,
+                theme.text.sm.size,
+                FontWeight::MEDIUM,
+                pal.text_muted,
+            )))
+            .with_child(Label::new(value_label).style(pal.text_style(
+                &theme,
+                theme.text.xl.size,
+                FontWeight::SEMIBOLD,
+                pal.text,
+            )))
+            .with_child(Sparkline::new(metric, values, theme, pal.accent));
+        cards.push(
+            SizedBox::new().width(280.0).height(142.0).with_child(
+                Surface::panel(card)
+                    .name(metric.title())
+                    .appearance(SurfaceAppearance::Raised)
+                    .elevation(SurfaceElevation::Small)
+                    .padding(Insets::all(12.0))
+                    .fill()
+                    .theme_when(clone_reader(reader)),
+            ),
+        );
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let fresh = targets
+        .iter()
+        .filter(|target| target.freshness(now) == "Fresh")
+        .count();
+    let partial = targets
+        .iter()
+        .filter(|target| target.freshness(now) == "Partial")
+        .count();
+    let failed = targets
+        .iter()
+        .filter(|target| target.error.is_some())
+        .count();
+    let queue_depth = targets
+        .iter()
+        .filter_map(|target| target.kv_queue_depth)
+        .sum::<f64>();
+    let failed_tasks = targets
+        .iter()
+        .filter_map(|target| target.failed_tasks)
+        .sum::<f64>();
+    let status = if in_flight && targets.is_empty() {
+        "Collecting first sample".to_string()
+    } else if targets.is_empty() {
+        "Waiting for live metrics".to_string()
+    } else {
+        format!("{fresh} fresh · {partial} partial · {failed} unavailable")
+    };
+    let status_tone = if failed > 0 {
+        SemanticTone::Danger
+    } else if partial > 0 || fresh < targets.len() {
+        SemanticTone::Warning
+    } else {
+        SemanticTone::Success
+    };
+    let refresh_shared = shared.clone();
+    let refresh = Button::new(if in_flight {
+        "Collecting"
+    } else {
+        "Refresh now"
+    })
+    .icon(IconGlyph::Redo)
+    .description("Collect live metrics from authorized cluster nodes")
+    .appearance(ButtonAppearance::Tonal)
+    .tone(SemanticTone::Accent)
+    .enabled(!in_flight)
+    .theme_when(clone_reader(reader))
+    .on_press_with_ctx(move |ctx| {
+        request_observation(&refresh_shared);
+        ctx.request_paint();
+        ctx.request_semantics();
+    });
+    let summary = TrailingSlotRow::new(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(2.0)
+            .with_child(Label::new("Live performance").style(pal.text_style(
+                &theme,
+                theme.text.lg.size,
+                FontWeight::SEMIBOLD,
+                pal.text,
+            )))
+            .with_child(
+                Label::new("Short in-memory history; use Prometheus and Grafana for retention.")
+                    .style(pal.text_style(
+                        &theme,
+                        theme.text.sm.size,
+                        FontWeight::NORMAL,
+                        pal.text_muted,
+                    )),
+            ),
+        refresh,
+    )
+    .trailing_width(132.0)
+    .trailing_height(32.0)
+    .gap(12.0);
+
+    let mut target_rows = Flex::vertical().align_items(Alignment::Stretch).gap(6.0);
+    if targets.is_empty() {
+        target_rows.push(
+            DetailRow::new("Observation", "No node sample has completed yet")
+                .theme_when(clone_reader(reader)),
+        );
+    } else {
+        for target in &targets {
+            let health = {
+                let cluster = shared.cluster();
+                cluster
+                    .snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == target.node_id)
+                    .map(|node| node.availability.clone())
+                    .unwrap_or_else(|| "unknown".to_string())
+            };
+            let detail = if let Some(error) = target.error.as_deref() {
+                format!(
+                    "health {health} · observation Offline · {}",
+                    short(error, 72)
+                )
+            } else {
+                format!(
+                    "health {health} · observation {} · RPC {} · p95 {} · KV queue {} · DFS {} · failed/timed out tasks {}",
+                    target.freshness(now),
+                    format_optional(target.rpc_rate, "/s"),
+                    format_optional(target.rpc_p95_ms, " ms"),
+                    format_optional(target.kv_queue_depth, ""),
+                    format_optional(target.dfs_backlog, ""),
+                    format_optional(target.failed_tasks, "")
+                )
+            };
+            target_rows.push(
+                DetailRow::new(short(&target.node_id, 22), detail)
+                    .max_value_lines(2)
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+    }
+
+    let content = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(14.0)
+        .with_child(summary)
+        .with_child(
+            StatusBadge::new(status)
+                .tone(status_tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            DetailRow::new(
+                "Current pressure",
+                format!(
+                    "KV queue depth {:.0} across sampled nodes · failed/timed-out agent tasks {:.0}",
+                    queue_depth, failed_tasks
+                ),
+            )
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(cards)
+        .with_child(
+            PanelSection::new("Per-node status", target_rows)
+                .theme_when(clone_reader(reader)),
+        );
+    WidgetPod::new(
+        Surface::window(
+            ScrollView::vertical(content)
+                .name("Cluster performance overview")
+                .theme(theme)
+                .viewport_width_hint(true),
+        )
+        .padding(Insets::all(PAD))
+        .fill()
+        .theme_when(clone_reader(reader)),
+    )
+}
+
+fn cluster_activity_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<ClusterObservationViewKey> {
+    let source =
+        shared
+            .signals()
+            .cluster_structure
+            .select_named("cluster activity structure", |key| {
+                ClusterObservationViewKey {
+                    theme: key.theme,
+                    snapshot: key.snapshot.clone(),
+                    observation_revision: key.observation_revision,
+                }
+            });
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_activity(&build_shared, &reader)
+    })
+}
+
+fn build_cluster_activity(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let theme = shared.theme();
+    let (warnings, activity) = {
+        let cluster = shared.cluster();
+        (
+            cluster.snapshot.warnings.clone(),
+            cluster
+                .observation
+                .activity
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    if warnings.is_empty() && activity.is_empty() {
+        return WidgetPod::new(
+            EmptyState::new(
+                "No recent cluster activity",
+                "Collection failures and topology warnings appear here",
+            )
+            .name("Cluster activity")
+            .icon(IconGlyph::Check)
+            .detail("The live dashboard keeps at most 100 activity items in memory.")
+            .transparent()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
+    for warning in warnings {
+        rows.push(
+            DetailRow::new("Topology warning", warning)
+                .max_value_lines(3)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    for entry in activity.into_iter().rev() {
+        let time = format!(
+            "{:02}:{:02}:{:02}",
+            entry.at.hour(),
+            entry.at.minute(),
+            entry.at.second()
+        );
+        rows.push(
+            DetailRow::new(
+                format!("{time} · {}", short(&entry.node_id, 18)),
+                entry.detail,
+            )
+            .max_value_lines(if entry.warning { 3 } else { 2 })
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    WidgetPod::new(
+        Surface::window(
+            ScrollView::vertical(
+                PanelSection::new("Operational activity", rows).theme_when(clone_reader(reader)),
+            )
+            .name("Cluster operational activity")
+            .theme(theme)
+            .viewport_width_hint(true),
+        )
+        .padding(Insets::all(PAD))
+        .fill()
+        .theme_when(clone_reader(reader)),
+    )
+}
+
+fn format_dashboard_value(metric: DashboardMetric, value: Option<f64>) -> String {
+    let Some(value) = value.filter(|value| value.is_finite()) else {
+        return "—".to_string();
+    };
+    match metric {
+        DashboardMetric::RpcRate | DashboardMetric::RpcErrorRate => {
+            format!("{value:.2}{}", metric.unit())
+        }
+        DashboardMetric::RpcP95Ms | DashboardMetric::KvP95Ms => {
+            format!("{value:.1} {}", metric.unit())
+        }
+        DashboardMetric::DfsBacklog | DashboardMetric::AgentActiveTurns => {
+            format!("{value:.0}")
+        }
+    }
+}
+
+fn format_optional(value: Option<f64>, suffix: &str) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.1}{suffix}"))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+struct Sparkline {
+    metric: DashboardMetric,
+    values: Vec<Option<f64>>,
+    theme: DefaultTheme,
+    color: Color,
+}
+
+impl Sparkline {
+    fn new(
+        metric: DashboardMetric,
+        values: Vec<Option<f64>>,
+        theme: DefaultTheme,
+        color: Color,
+    ) -> Self {
+        Self {
+            metric,
+            values,
+            theme,
+            color,
+        }
+    }
+
+    fn finite_values(&self) -> impl Iterator<Item = f64> + '_ {
+        self.values
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|value| value.is_finite())
+    }
+
+    fn description(&self) -> String {
+        let values = self.finite_values().collect::<Vec<_>>();
+        let Some(current) = values.last().copied() else {
+            return format!("{} history has no interval sample yet", self.metric.title());
+        };
+        let min = values.iter().copied().reduce(f64::min).unwrap_or(current);
+        let max = values.iter().copied().reduce(f64::max).unwrap_or(current);
+        format!(
+            "{} short live history; current {}; minimum {}; maximum {}; {} samples",
+            self.metric.title(),
+            format_dashboard_value(self.metric, Some(current)),
+            format_dashboard_value(self.metric, Some(min)),
+            format_dashboard_value(self.metric, Some(max)),
+            values.len()
+        )
+    }
+}
+
+impl Widget for Sparkline {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(256.0, 56.0))
+    }
+
+    fn arrange(&mut self, _ctx: &mut ArrangeCtx, _bounds: Rect) {}
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let bounds = ctx.bounds();
+        let values = self.finite_values().collect::<Vec<_>>();
+        if values.len() < 2 || bounds.is_empty() {
+            ctx.stroke_rect(bounds, self.theme.palette.border, StrokeStyle::new(1.0));
+            return;
+        }
+        let min = values.iter().copied().reduce(f64::min).unwrap_or_default();
+        let max = values.iter().copied().reduce(f64::max).unwrap_or(min);
+        let span = (max - min).max(f64::EPSILON);
+        let denominator = (self.values.len().saturating_sub(1)).max(1) as f32;
+        let mut path = PathBuilder::new();
+        let mut drawing = false;
+        for (index, value) in self.values.iter().enumerate() {
+            let Some(value) = value.filter(|value| value.is_finite()) else {
+                drawing = false;
+                continue;
+            };
+            let x = bounds.x() + bounds.width() * index as f32 / denominator;
+            let normalized = ((value - min) / span) as f32;
+            let y = bounds.max_y() - normalized * bounds.height();
+            if drawing {
+                path.line_to(Point::new(x, y));
+            } else {
+                path.move_to(Point::new(x, y));
+                drawing = true;
+            }
+        }
+        ctx.stroke(path.build(), self.color, StrokeStyle::new(1.75));
+        ctx.stroke_rect(bounds, self.theme.palette.border, StrokeStyle::new(1.0));
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Image, ctx.bounds());
+        node.name = Some(format!("{} history", self.metric.title()));
+        node.description = Some(self.description());
+        node.value = Some(SemanticsValue::Text(self.description()));
+        ctx.push(node);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1609,7 +2635,7 @@ fn node_needs_connection_settings(node: &ClusterNodeInfo) -> bool {
 
 fn detail_panel_rect(bounds: Rect) -> Rect {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
-    let y = bounds.y() + HEADER_H + 18.0;
+    let y = bounds.y() + 18.0;
     let available_h = (bounds.max_y() - y - PAD).max(0.0);
     Rect::new(
         bounds.max_x() - panel_w - PAD,
@@ -1660,9 +2686,9 @@ fn graph_rect(bounds: Rect) -> Rect {
     let right_reserve = if reserve_panel { panel_w + PAD } else { 0.0 };
     Rect::new(
         bounds.x() + PAD,
-        bounds.y() + HEADER_H + PAD,
+        bounds.y() + PAD,
         (bounds.width() - PAD * 2.0 - right_reserve).max(1.0),
-        (bounds.height() - HEADER_H - PAD * 2.0 - 34.0).max(1.0),
+        (bounds.height() - PAD * 2.0 - 34.0).max(1.0),
     )
 }
 
@@ -1995,7 +3021,10 @@ fn short(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_string();
     }
-    let head = max.saturating_sub(1);
+    if max <= 3 {
+        return ".".repeat(max);
+    }
+    let head = max - 3;
     let trimmed = value.chars().take(head).collect::<String>();
     format!("{trimmed}...")
 }
@@ -2006,6 +3035,10 @@ mod tests {
     use crate::backend::Backend;
     use crate::state::AppState;
     use crate::theme::{AppTextScale, AppThemeMode, resolve_theme, resolve_theme_with_preferences};
+    use sinomo_runtime::observe::{
+        ObserveHistogramBucket, ObserveMetricExporterStatus, ObserveMetricKind,
+        ObserveMetricRecord, ObserveMetricsResponse,
+    };
 
     fn node(id: &str) -> ClusterNodeInfo {
         ClusterNodeInfo {
@@ -2083,6 +3116,356 @@ mod tests {
             public_ip: true,
             reachable,
         }
+    }
+
+    fn test_time(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    fn metric_labels(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn metric_counter(name: &str, value: u64, labels: &[(&str, &str)]) -> ObserveMetricRecord {
+        ObserveMetricRecord::counter(name, metric_labels(labels), value)
+    }
+
+    fn metric_histogram(
+        name: &str,
+        count: u64,
+        upper_bound: f64,
+        labels: &[(&str, &str)],
+    ) -> ObserveMetricRecord {
+        ObserveMetricRecord {
+            name: name.to_string(),
+            kind: ObserveMetricKind::Histogram,
+            labels: metric_labels(labels),
+            value: None,
+            count: Some(count),
+            sum: Some(upper_bound * count as f64),
+            min: Some(upper_bound),
+            max: Some(upper_bound),
+            buckets: vec![ObserveHistogramBucket { upper_bound, count }],
+        }
+    }
+
+    fn metrics_response(
+        observed_at: OffsetDateTime,
+        process_started_at: OffsetDateTime,
+        metrics: Vec<ObserveMetricRecord>,
+    ) -> ObserveMetricsResponse {
+        ObserveMetricsResponse {
+            observed_at: Some(observed_at),
+            process_started_at: Some(process_started_at),
+            process_role: Some("daemon".to_string()),
+            node_id: Some("node-a".to_string()),
+            exporters: Vec::new(),
+            partial: false,
+            descriptors: Vec::new(),
+            metrics,
+        }
+    }
+
+    fn sample_batch(
+        at: OffsetDateTime,
+        node_id: &str,
+        response: Result<ObserveMetricsResponse, String>,
+    ) -> ObserveSampleBatch {
+        ObserveSampleBatch {
+            generation: 0,
+            requested_at: at,
+            received_at: at,
+            targets: vec![crate::backend::observe::ObserveTargetSample {
+                node_id: node_id.to_string(),
+                response,
+            }],
+        }
+    }
+
+    #[test]
+    fn observation_uses_first_sample_as_baseline_and_resets_after_restart() {
+        let process_started_at = test_time(1);
+        let labels = [
+            ("category", "object"),
+            ("route", "/objects"),
+            ("outcome", "ok"),
+        ];
+        let mut state = ClusterObservationState::default();
+
+        apply_observation_batch(
+            &mut state,
+            sample_batch(
+                test_time(10),
+                "node-a",
+                Ok(metrics_response(
+                    test_time(10),
+                    process_started_at,
+                    vec![metric_counter(
+                        "sinomo.daemon.service.requests",
+                        1_000_000,
+                        &labels,
+                    )],
+                )),
+            ),
+        );
+        assert_eq!(
+            state.history.back().unwrap().values[&DashboardMetric::RpcRate],
+            None,
+            "a cumulative first snapshot must not render as an interval spike"
+        );
+
+        apply_observation_batch(
+            &mut state,
+            sample_batch(
+                test_time(15),
+                "node-a",
+                Ok(metrics_response(
+                    test_time(15),
+                    process_started_at,
+                    vec![metric_counter(
+                        "sinomo.daemon.service.requests",
+                        1_000_030,
+                        &labels,
+                    )],
+                )),
+            ),
+        );
+        assert_eq!(
+            state.history.back().unwrap().values[&DashboardMetric::RpcRate],
+            Some(6.0)
+        );
+
+        apply_observation_batch(
+            &mut state,
+            sample_batch(
+                test_time(20),
+                "node-a",
+                Ok(metrics_response(
+                    test_time(20),
+                    test_time(19),
+                    vec![metric_counter(
+                        "sinomo.daemon.service.requests",
+                        4_000_000,
+                        &labels,
+                    )],
+                )),
+            ),
+        );
+        assert_eq!(
+            state.history.back().unwrap().values[&DashboardMetric::RpcRate],
+            None,
+            "a restarted process must establish a new interval baseline"
+        );
+        assert!(state.activity.iter().any(|entry| {
+            entry.node_id == "node-a"
+                && entry.detail == "process restarted; interval baseline reset"
+                && !entry.warning
+        }));
+    }
+
+    #[test]
+    fn observation_history_keeps_only_the_latest_180_samples() {
+        let mut state = ClusterObservationState::default();
+        for seconds in 0..(OBSERVATION_HISTORY_LIMIT as i64 + 5) {
+            let at = test_time(seconds);
+            apply_observation_batch(
+                &mut state,
+                sample_batch(
+                    at,
+                    "node-a",
+                    Ok(metrics_response(at, test_time(-1), Vec::new())),
+                ),
+            );
+        }
+
+        assert_eq!(state.history.len(), OBSERVATION_HISTORY_LIMIT);
+        assert_eq!(state.history.front().unwrap().at, test_time(5));
+        assert_eq!(
+            state.history.back().unwrap().at,
+            test_time(OBSERVATION_HISTORY_LIMIT as i64 + 4)
+        );
+    }
+
+    #[test]
+    fn observation_state_prunes_nodes_missing_from_the_latest_batch() {
+        let mut state = ClusterObservationState::default();
+        let mut first = sample_batch(
+            test_time(1),
+            "node-a",
+            Ok(metrics_response(test_time(1), test_time(0), Vec::new())),
+        );
+        first
+            .targets
+            .push(crate::backend::observe::ObserveTargetSample {
+                node_id: "node-b".to_string(),
+                response: Ok(metrics_response(test_time(1), test_time(0), Vec::new())),
+            });
+        apply_observation_batch(&mut state, first);
+        assert_eq!(state.targets.len(), 2);
+        assert_eq!(state.previous.len(), 2);
+
+        apply_observation_batch(
+            &mut state,
+            sample_batch(
+                test_time(2),
+                "node-b",
+                Ok(metrics_response(test_time(2), test_time(0), Vec::new())),
+            ),
+        );
+
+        assert_eq!(
+            state.targets.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["node-b"]
+        );
+        assert_eq!(
+            state
+                .previous
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["node-b"]
+        );
+    }
+
+    #[test]
+    fn dashboard_rates_and_latency_exclude_observation_self_traffic() {
+        let user_labels = [
+            ("category", "object"),
+            ("route", "/objects"),
+            ("outcome", "ok"),
+        ];
+        let user_error_labels = [
+            ("category", "object"),
+            ("route", "/objects"),
+            ("outcome", "error"),
+        ];
+        let observe_labels = [
+            ("category", "observe"),
+            ("route", "/observe/metrics"),
+            ("outcome", "ok"),
+        ];
+        let interval = metrics_response(
+            test_time(5),
+            test_time(0),
+            vec![
+                metric_counter("sinomo.daemon.service.requests", 20, &user_labels),
+                metric_counter("sinomo.daemon.service.requests", 5, &user_error_labels),
+                metric_counter("sinomo.daemon.service.requests", 10_000, &observe_labels),
+                metric_histogram("sinomo.daemon.service.total.us", 25, 1_000.0, &user_labels),
+                metric_histogram(
+                    "sinomo.daemon.service.total.us",
+                    10_000,
+                    1_000_000.0,
+                    &observe_labels,
+                ),
+            ],
+        );
+        let values = dashboard_values(&interval, Some(&interval), Some(5.0));
+
+        assert_eq!(values[&DashboardMetric::RpcRate], Some(5.0));
+        assert_eq!(values[&DashboardMetric::RpcErrorRate], Some(1.0));
+        assert_eq!(values[&DashboardMetric::RpcP95Ms], Some(1.0));
+    }
+
+    #[test]
+    fn partial_samples_remain_useful_and_collection_errors_are_bounded() {
+        let at = test_time(20);
+        let mut partial = metrics_response(
+            at,
+            test_time(1),
+            vec![
+                ObserveMetricRecord::gauge("sinomo.agent.active_turns", BTreeMap::new(), 3.0),
+                ObserveMetricRecord::gauge("sinomo.dfs.pending_repairs", BTreeMap::new(), 2.0),
+                ObserveMetricRecord::gauge("sinomo.kv.commit.queue_depth", BTreeMap::new(), 4.0),
+            ],
+        );
+        partial.partial = true;
+        partial.exporters = vec![ObserveMetricExporterStatus {
+            name: "agent-runtime".to_string(),
+            observed_at: at,
+            duration_us: 12,
+            cached: false,
+            success: false,
+            error_code: Some("temporarily-unavailable".to_string()),
+        }];
+        let long_error = "route unavailable ".repeat(40);
+        let mut state = ClusterObservationState::default();
+        let mut batch = sample_batch(at, "node-partial", Ok(partial));
+        batch
+            .targets
+            .push(crate::backend::observe::ObserveTargetSample {
+                node_id: "node-offline".to_string(),
+                response: Err(long_error),
+            });
+
+        apply_observation_batch(&mut state, batch);
+
+        let latest = state.history.back().unwrap();
+        assert_eq!(
+            latest.values[&DashboardMetric::AgentActiveTurns],
+            Some(3.0),
+            "successful metric families from a partial snapshot stay visible"
+        );
+        assert_eq!(latest.values[&DashboardMetric::DfsBacklog], Some(2.0));
+        assert!(state.targets["node-partial"].partial);
+        assert_eq!(state.targets["node-partial"].kv_queue_depth, Some(4.0));
+        assert!(state.targets["node-offline"].error.is_some());
+        assert!(
+            state.targets["node-offline"]
+                .error
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count()
+                <= 240
+        );
+        assert_eq!(state.activity.len(), 2);
+        assert!(state.activity.iter().all(|entry| {
+            entry.warning && entry.detail.chars().count() <= OBSERVATION_ACTIVITY_DETAIL_LIMIT
+        }));
+    }
+
+    #[test]
+    fn sparkline_exposes_a_textual_history_summary() -> sui::Result<()> {
+        let theme = resolve_theme(AppThemeMode::Dark);
+        let expected = "RPC throughput short live history; current 2.00/s; minimum 1.00/s; maximum 3.00/s; 3 samples";
+        let runtime =
+            sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new()
+                        .title("Cluster sparkline semantics")
+                        .root(SizedBox::new().width(280.0).height(80.0).with_child(
+                            Sparkline::new(
+                                DashboardMetric::RpcRate,
+                                vec![None, Some(1.0), Some(3.0), Some(2.0)],
+                                theme.clone(),
+                                theme.palette.accent,
+                            ),
+                        )),
+                )
+                .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        let sparkline = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Image
+                    && node.name.as_deref() == Some("RPC throughput history")
+            })
+            .expect("sparkline image semantics");
+
+        assert_eq!(sparkline.description.as_deref(), Some(expected));
+        assert_eq!(
+            sparkline.value,
+            Some(SemanticsValue::Text(expected.to_string()))
+        );
+        Ok(())
     }
 
     #[test]
@@ -2172,10 +3555,14 @@ mod tests {
     #[test]
     fn rendered_cluster_nodes_are_semantic_and_keyboard_selectable() -> sui::Result<()> {
         let shared = Shared::new(AppState::ready(Backend::local_fallback()));
-        shared.cluster_mut().snapshot = ClusterSnapshot {
-            nodes: vec![node("node-a"), node("node-b")],
-            ..ClusterSnapshot::default()
-        };
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Topology;
+            cluster.snapshot = ClusterSnapshot {
+                nodes: vec![node("node-a"), node("node-b")],
+                ..ClusterSnapshot::default()
+            };
+        }
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
@@ -2477,10 +3864,12 @@ mod tests {
                 nodes: vec![node("node-a"), node("node-b")],
                 ..ClusterSnapshot::default()
             },
+            subview: ClusterSubview::Topology,
             selected: Some(ClusterSelection::Node("node-b".to_string())),
             diagnostics_open: true,
             refreshing: true,
             refresh_rx: Some(rx),
+            observation: ClusterObservationState::default(),
         };
         tx.send(ClusterSnapshot {
             nodes: vec![node("node-a")],
@@ -2518,6 +3907,7 @@ mod tests {
         let shared = Shared::new(AppState::ready(backend));
         {
             let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Topology;
             cluster.snapshot = ClusterSnapshot {
                 source: "daemon 127.0.0.1:21353".to_string(),
                 nodes: vec![node("node-a")],
@@ -2554,6 +3944,7 @@ mod tests {
         let shared = Shared::new(AppState::ready(backend));
         {
             let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Topology;
             cluster.snapshot = ClusterSnapshot {
                 source: "daemon 127.0.0.1:21353".to_string(),
                 nodes: vec![node("node-a")],
@@ -2596,6 +3987,7 @@ mod tests {
         offline.availability = "offline".to_string();
         {
             let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Topology;
             cluster.snapshot = ClusterSnapshot {
                 source: "daemon 127.0.0.1:21353".to_string(),
                 nodes: vec![node("node-a"), offline],
@@ -2645,6 +4037,7 @@ mod tests {
         offline.endpoints = vec![endpoint("127.0.0.1:21353", false)];
         {
             let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Topology;
             cluster.snapshot = ClusterSnapshot {
                 source: "daemon 127.0.0.1:21353".to_string(),
                 nodes: vec![offline],
@@ -2727,6 +4120,7 @@ mod tests {
         let shared = Shared::new(AppState::ready(backend));
         {
             let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Topology;
             cluster.snapshot = ClusterSnapshot {
                 cluster_id: Some("cluster-test-123456789".to_string()),
                 local_node_id: Some("node-a".to_string()),

@@ -793,6 +793,7 @@ impl Shared {
                 .sync_media_setup_visibility(tab == Tab::Sinomo);
             if tab == Tab::Cluster {
                 crate::ui::cluster::request_refresh(self);
+                crate::ui::cluster::request_observation(self);
             }
         }
         self.signals.active_tab.set(tab);

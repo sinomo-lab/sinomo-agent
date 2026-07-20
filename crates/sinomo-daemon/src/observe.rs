@@ -6,16 +6,320 @@ use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use sinomo_observe::OperationalSeverity;
 
 pub(crate) fn register_observe_metric_exporters(
     service_hooks: &[crate::DaemonServiceRegistryHook],
 ) {
-    sinomo_observe::register_observe_metric_exporter("sinomo-dfs", dfs_observe_metrics);
-    sinomo_observe::register_observe_metric_exporter("sinomo-kv", kv_observe_metrics);
+    register_observe_metric_descriptors();
+    sinomo_observe::register_observe_metric_exporter_with_policy(
+        "sinomo-dfs",
+        ["sinomo.dfs."],
+        Some(Duration::from_secs(5)),
+        dfs_observe_metrics,
+    );
+    sinomo_observe::register_observe_metric_exporter_with_policy(
+        "sinomo-kv",
+        ["sinomo.kv."],
+        Some(Duration::from_secs(5)),
+        kv_observe_metrics,
+    );
     for hook in service_hooks {
         hook.register_observe_metric_exporters();
+    }
+}
+
+fn register_observe_metric_descriptors() {
+    use sinomo_observe::{ObserveMetricDescriptor, ObserveMetricKind, ObserveMetricUnit};
+
+    let register = |name: &str, kind: ObserveMetricKind, unit: ObserveMetricUnit, help: &str| {
+        sinomo_observe::register_observe_metric_descriptor(ObserveMetricDescriptor {
+            name: name.to_string(),
+            kind,
+            unit: Some(unit),
+            help: help.to_string(),
+        });
+    };
+
+    for (name, help) in [
+        (
+            "sinomo.daemon.service.requests",
+            "Daemon object RPC requests.",
+        ),
+        ("sinomo.kv.reads", "Cluster KV reads."),
+        ("sinomo.kv.commands", "Cluster KV commands."),
+        (
+            "sinomo.kv.storage.operations",
+            "Cluster KV storage operations.",
+        ),
+        ("sinomo.kv.compaction.runs", "Cluster KV compaction runs."),
+        (
+            "sinomo.kv.replication.target_results",
+            "KV replication target results.",
+        ),
+        ("sinomo.kv.replication.attempts", "KV replication attempts."),
+        (
+            "sinomo.kv.replication.backtracks",
+            "KV replication backtracks.",
+        ),
+        (
+            "sinomo.kv.fanout.coalesced",
+            "KV background fanout requests coalesced.",
+        ),
+        ("sinomo.kv.fanout.passes", "KV background fanout passes."),
+        (
+            "sinomo.kv.fanout.watch_event_batches",
+            "KV watch event batches fanned out.",
+        ),
+        (
+            "sinomo.kv.fanout.target_results",
+            "KV background fanout target results.",
+        ),
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Counter,
+            ObserveMetricUnit::Count,
+            help,
+        );
+    }
+    for (name, help) in [
+        (
+            "sinomo.kv.wal.append.bytes",
+            "Bytes appended to the cluster KV WAL.",
+        ),
+        (
+            "sinomo.kv.wal.rewrite.bytes",
+            "Bytes written while rewriting the cluster KV WAL.",
+        ),
+        (
+            "sinomo.kv.snapshot.write.bytes",
+            "Bytes written to cluster KV snapshots.",
+        ),
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Counter,
+            ObserveMetricUnit::Bytes,
+            help,
+        );
+    }
+    for (name, help) in [
+        (
+            "sinomo.daemon.service.context.us",
+            "Time spent preparing daemon service request context.",
+        ),
+        (
+            "sinomo.daemon.service.dispatch.us",
+            "Time spent dispatching daemon service requests.",
+        ),
+        (
+            "sinomo.daemon.service.total.us",
+            "End-to-end daemon service request latency.",
+        ),
+        (
+            "sinomo.kv.command.phase.us",
+            "Cluster KV command phase latency.",
+        ),
+        (
+            "sinomo.kv.read.total.us",
+            "End-to-end cluster KV read latency.",
+        ),
+        (
+            "sinomo.kv.command.total.us",
+            "End-to-end cluster KV command latency.",
+        ),
+        ("sinomo.kv.wal.read.us", "Cluster KV WAL read latency."),
+        ("sinomo.kv.wal.append.us", "Cluster KV WAL append latency."),
+        (
+            "sinomo.kv.wal.rewrite.us",
+            "Cluster KV WAL rewrite latency.",
+        ),
+        ("sinomo.kv.compaction.us", "Cluster KV compaction latency."),
+        (
+            "sinomo.kv.raft.open.us",
+            "Cluster KV Raft store open latency.",
+        ),
+        ("sinomo.kv.apply.us", "Cluster KV command apply latency."),
+        (
+            "sinomo.kv.snapshot.write.us",
+            "Cluster KV snapshot write latency.",
+        ),
+        (
+            "sinomo.kv.snapshot.restore.us",
+            "Cluster KV snapshot restore latency.",
+        ),
+        (
+            "sinomo.kv.replication.target.us",
+            "KV replication target latency.",
+        ),
+        (
+            "sinomo.kv.fanout.pass.us",
+            "KV background fanout pass latency.",
+        ),
+        (
+            "sinomo.kv.fanout.target.us",
+            "KV background fanout target latency.",
+        ),
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Histogram,
+            ObserveMetricUnit::Microseconds,
+            help,
+        );
+    }
+    for (name, help) in [
+        (
+            "sinomo.kv.wal.read.entries",
+            "Entries returned by cluster KV WAL reads.",
+        ),
+        (
+            "sinomo.kv.wal.append.entries",
+            "Entries appended to the cluster KV WAL.",
+        ),
+        (
+            "sinomo.kv.wal.rewrite.entries",
+            "Entries written during cluster KV WAL rewrites.",
+        ),
+        (
+            "sinomo.kv.quorum.acks",
+            "Acknowledgements observed for cluster KV quorum commits.",
+        ),
+        (
+            "sinomo.kv.compaction.removed_log_entries",
+            "Raft log entries removed by KV compaction.",
+        ),
+        (
+            "sinomo.kv.raft.open.log_entries",
+            "Raft log entries loaded while opening cluster KV.",
+        ),
+        (
+            "sinomo.kv.replication.entries",
+            "Entries carried by a KV replication attempt.",
+        ),
+        (
+            "sinomo.kv.replication.catchup_attempts",
+            "Attempts needed for KV follower catch-up.",
+        ),
+        (
+            "sinomo.kv.fanout.attempted_nodes",
+            "Nodes attempted by a KV background fanout pass.",
+        ),
+        (
+            "sinomo.kv.fanout.replicated_nodes",
+            "Nodes updated by a KV background fanout pass.",
+        ),
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Histogram,
+            ObserveMetricUnit::Count,
+            help,
+        );
+    }
+    for (name, help) in [
+        (
+            "sinomo.kv.commit.queue_depth",
+            "KV commits waiting for the ordered proposal stream.",
+        ),
+        (
+            "sinomo.kv.commit.inflight",
+            "KV commits currently in the ordered proposal stream.",
+        ),
+        (
+            "sinomo.kv.fanout.pending",
+            "Whether a KV background fanout pass is pending.",
+        ),
+        (
+            "sinomo.kv.fanout.active",
+            "Whether a KV background fanout pass is active.",
+        ),
+        (
+            "sinomo.observe.metric_exporter.errors",
+            "Snapshot metric exporters currently failing.",
+        ),
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            help,
+        );
+    }
+    for (name, help) in [
+        ("sinomo.kv.wal.bytes", "Current cluster KV WAL size."),
+        (
+            "sinomo.kv.raft_snapshot.bytes",
+            "Current cluster KV Raft snapshot size.",
+        ),
+        (
+            "sinomo.kv.materialized_snapshot.bytes",
+            "Current materialized cluster KV snapshot size.",
+        ),
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Bytes,
+            help,
+        );
+    }
+    register(
+        "sinomo.kv.peer.progress_age.seconds",
+        ObserveMetricKind::Gauge,
+        ObserveMetricUnit::Seconds,
+        "Age of the latest known KV peer replication progress.",
+    );
+    register(
+        "sinomo.kv.raft.is_leader",
+        ObserveMetricKind::Gauge,
+        ObserveMetricUnit::Ratio,
+        "Whether this node is the current cluster KV leader.",
+    );
+
+    for name in [
+        "sinomo.dfs.filesystems",
+        "sinomo.dfs.objects",
+        "sinomo.dfs.versions",
+        "sinomo.dfs.receipts",
+        "sinomo.dfs.intents",
+        "sinomo.dfs.pending_writes",
+        "sinomo.dfs.open_conflicts",
+        "sinomo.dfs.pending_repairs",
+        "sinomo.dfs.pending_namespace_jobs",
+        "sinomo.dfs.failed_namespace_jobs",
+        "sinomo.dfs.metadata_shard.journal_next_sequence",
+        "sinomo.dfs.metadata_shard.journal_last_sequence",
+        "sinomo.dfs.metadata_shard.replicas",
+        "sinomo.dfs.metadata_shard.replica_lag_entries",
+        "sinomo.dfs.metadata_shard.replica_replicated_through_sequence",
+        "sinomo.dfs.metadata_shard.replay_replayed_through_sequence",
+        "sinomo.kv.revision",
+        "sinomo.kv.compacted_revision",
+        "sinomo.kv.entries",
+        "sinomo.kv.leases",
+        "sinomo.kv.retained_events",
+        "sinomo.kv.raft.term",
+        "sinomo.kv.raft.commit_index",
+        "sinomo.kv.raft.applied_index",
+        "sinomo.kv.raft.last_log_index",
+        "sinomo.kv.raft.snapshot_index",
+        "sinomo.kv.raft.uncommitted_entries",
+        "sinomo.kv.raft.unsnapshotted_entries",
+        "sinomo.kv.raft.retained_log_entries",
+        "sinomo.kv.peer.progress_known",
+        "sinomo.kv.peer.lag_entries",
+        "sinomo.kv.peer.match_index",
+    ] {
+        register(
+            name,
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            "Current daemon snapshot value.",
+        );
     }
 }
 

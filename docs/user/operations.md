@@ -90,6 +90,10 @@ sinomo observe events --all --limit 100 --json
 sinomo observe metrics --target "$TARGET_NODE" --json
 sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5
 sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5 --samples 12 --json
+
+# Cached OpenMetrics for a local Prometheus/Grafana deployment.
+sinomo observe prometheus serve --all
+# Then scrape http://127.0.0.1:9464/metrics (default refresh: 15 seconds).
 ```
 
 Narrow results by event kind, component, operation ID, metric name, traceparent,
@@ -97,6 +101,13 @@ or target rather than enabling broad debug output indefinitely.
 Metric watch output reports counter rates and interval histogram percentiles;
 `--samples` bounds the capture, while an omitted sample count runs until
 interrupted. Streaming JSON is JSONL with one object per interval.
+
+The Prometheus bridge is loopback-only and keeps only its latest encoded
+snapshot. Repeated HTTP scrapes read that cache rather than repeating cluster
+RPC and snapshot-exporter work. Use `--name`, `--target`, `--all`, `--refresh`,
+and `--listen` to scope it; use Prometheus/Grafana for retention and alerting.
+The graphical app's Cluster tab provides Overview, Topology, and Activity for
+on-demand live operation without requiring Prometheus.
 
 Live trace controls are leased and explicit:
 

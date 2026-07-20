@@ -1,15 +1,21 @@
+use crate::prometheus_server::{
+    PROMETHEUS_DEFAULT_LISTEN, PROMETHEUS_DEFAULT_REFRESH_SECONDS, PROMETHEUS_MAX_REFRESH_SECONDS,
+    PROMETHEUS_MIN_REFRESH_SECONDS, PrometheusCollector, PrometheusHttpServer, PrometheusShutdown,
+    install_prometheus_shutdown_signals,
+};
 use crate::{
     OBSERVE_CONTROL_ROUTE, OBSERVE_CPU_PROFILE_ROUTE, OBSERVE_EVENTS_ROUTE, OBSERVE_LOGS_ROUTE,
     OBSERVE_METRICS_ROUTE, OBSERVE_NETWORK_TIMELINE_ROUTE, OBSERVE_RPC_CATEGORY,
     OBSERVE_TRACES_ROUTE, ObserveControlRequest, ObserveControlResponse, ObserveCpuProfileAction,
     ObserveCpuProfileRequest, ObserveCpuProfileResponse, ObserveEventsRequest,
-    ObserveEventsResponse, ObserveLogsRequest, ObserveLogsResponse, ObserveMetricsRequest,
-    ObserveMetricsResponse, ObserveNetworkTimelineAction, ObserveNetworkTimelineRequest,
-    ObserveNetworkTimelineResponse, ObserveTracesRequest, ObserveTracesResponse,
-    OperationalEventQuery, OperationalEventRecord, OperationalLogQuery, OperationalLogRecord,
-    handle_observe_cpu_profile, handle_observe_network_timeline, observe_control_snapshot,
-    observe_module_enabled, read_observe_metrics, read_observe_traces, read_operational_events,
-    read_operational_logs, update_observe_control,
+    ObserveEventsResponse, ObserveLogsRequest, ObserveLogsResponse, ObserveMetricDescriptor,
+    ObserveMetricRecord, ObserveMetricUnit, ObserveMetricsRequest, ObserveMetricsResponse,
+    ObserveNetworkTimelineAction, ObserveNetworkTimelineRequest, ObserveNetworkTimelineResponse,
+    ObserveTracesRequest, ObserveTracesResponse, OperationalEventQuery, OperationalEventRecord,
+    OperationalLogQuery, OperationalLogRecord, handle_observe_cpu_profile,
+    handle_observe_network_timeline, observe_control_snapshot, observe_module_enabled,
+    read_observe_metrics, read_observe_traces, read_operational_events, read_operational_logs,
+    update_observe_control,
 };
 use sinomo_cli_registry::{
     CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue, CliCommand,
@@ -18,7 +24,9 @@ use sinomo_cli_registry::{
 };
 use sinomo_core::local::SinomoDataDir;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 
@@ -32,10 +40,34 @@ enum ObserveCliCommand {
     Events(ObserveOptions),
     Logs(ObserveOptions),
     Metrics(ObserveOptions),
+    Prometheus(ObservePrometheusOptions),
     Traces(ObserveOptions),
     Control(ObserveControlOptions),
     CpuProfile(ObserveCpuProfileOptions),
     NetworkTimeline(ObserveNetworkTimelineOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ObservePrometheusOptions {
+    listen: SocketAddr,
+    refresh_interval_seconds: u64,
+    name_prefix: Option<String>,
+    target_node_id: Option<String>,
+    target_all: bool,
+}
+
+impl Default for ObservePrometheusOptions {
+    fn default() -> Self {
+        Self {
+            listen: PROMETHEUS_DEFAULT_LISTEN
+                .parse()
+                .expect("default Prometheus exporter address is valid"),
+            refresh_interval_seconds: PROMETHEUS_DEFAULT_REFRESH_SECONDS,
+            name_prefix: None,
+            target_node_id: None,
+            target_all: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -226,6 +258,12 @@ impl CliCommand for ObserveCliCommandRunner {
                 self.target_lister.as_ref(),
                 options,
             ),
+            ObserveCliCommand::Prometheus(options) => observe_prometheus(
+                context,
+                self.rpc.as_ref(),
+                self.target_lister.as_ref(),
+                options,
+            ),
             ObserveCliCommand::Traces(options) => observe_traces(
                 context,
                 self.rpc.as_ref(),
@@ -269,6 +307,8 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Read local daemon/shadow operational logs from the data directory.",
             "  sinomo observe metrics [--name <prefix>] [--target <node-id> | --all] [--limit <n>] [--watch <seconds> [--samples <n>]] [--json]",
             "      Read live runtime metrics.",
+            "  sinomo observe prometheus serve [--listen <loopback-ip:port>] [--refresh <seconds>] [--name <prefix>] [--target <node-id> | --all]",
+            "      Serve cached live metrics for Prometheus; use Prometheus or Grafana for durable history.",
             "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--capture <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live bounded trace events.",
             "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--capture <id> | --clear-capture --expected-capture <id>] [--clear-traces] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
@@ -361,6 +401,34 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                 CliAutocompleteOption::flag("--all", "query every cluster node"),
                 CliAutocompleteOption::flag("--json", "emit JSON"),
             ]),
+            CliAutocompleteSpec::new("prometheus", "serve a Prometheus metrics bridge")
+                .with_children([CliAutocompleteSpec::new(
+                    "serve",
+                    "serve cached OpenMetrics over loopback HTTP",
+                )
+                .with_options([
+                    CliAutocompleteOption::with_value(
+                        "--listen",
+                        "loopback listen address",
+                        CliAutocompleteValue::new("ip:port", "loopback IP address and port", []),
+                    ),
+                    CliAutocompleteOption::with_value(
+                        "--refresh",
+                        "metric collection interval",
+                        CliAutocompleteValue::new("seconds", "refresh interval in seconds", []),
+                    ),
+                    CliAutocompleteOption::with_value(
+                        "--name",
+                        "metric name prefix",
+                        CliAutocompleteValue::new("prefix", "metric name prefix", []),
+                    ),
+                    CliAutocompleteOption::with_value(
+                        "--target",
+                        "target node id",
+                        CliAutocompleteValue::new("node-id", "target node id", []),
+                    ),
+                    CliAutocompleteOption::flag("--all", "query every cluster node"),
+                ])]),
             CliAutocompleteSpec::new("traces", "read live trace events").with_options([
                 CliAutocompleteOption::with_value(
                     "--target-prefix",
@@ -532,6 +600,9 @@ fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseE
         Some((command, rest)) if matches!(command.as_str(), "metrics" | "metric") => Ok(
             ObserveCliCommand::Metrics(parse_observe_options(rest, false, false, true)?),
         ),
+        Some((command, rest)) if command == "prometheus" => Ok(ObserveCliCommand::Prometheus(
+            parse_observe_prometheus_options(rest)?,
+        )),
         Some((command, rest)) if matches!(command.as_str(), "traces" | "trace") => Ok(
             ObserveCliCommand::Traces(parse_observe_trace_options(rest)?),
         ),
@@ -546,6 +617,89 @@ fn parse_observe_command(args: &[String]) -> Result<ObserveCliCommand, CliParseE
         )),
         _ => Err(CliParseError::Usage),
     }
+}
+
+fn parse_observe_prometheus_options(
+    args: &[String],
+) -> Result<ObservePrometheusOptions, CliParseError> {
+    let Some((action, args)) = args.split_first() else {
+        return Err(CliParseError::Usage);
+    };
+    if action != "serve" {
+        return Err(CliParseError::Usage);
+    }
+    let mut options = ObservePrometheusOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--listen" => {
+                index += 1;
+                let Some(address) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                let address =
+                    address
+                        .parse::<SocketAddr>()
+                        .map_err(|source| CliParseError::Parse {
+                            detail: format!(
+                                "invalid Prometheus exporter listen address `{address}`: {source}"
+                            ),
+                        })?;
+                if !address.ip().is_loopback() {
+                    return Err(CliParseError::Parse {
+                        detail: format!(
+                            "Prometheus exporter listen address `{address}` is not loopback; expose it through an authenticated reverse proxy"
+                        ),
+                    });
+                }
+                options.listen = address;
+            }
+            "--refresh" | "--refresh-seconds" => {
+                index += 1;
+                let Some(interval) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                let interval = interval
+                    .parse::<u64>()
+                    .map_err(|source| CliParseError::Parse {
+                        detail: format!(
+                            "invalid Prometheus exporter refresh interval `{interval}`: {source}"
+                        ),
+                    })?;
+                if !(PROMETHEUS_MIN_REFRESH_SECONDS..=PROMETHEUS_MAX_REFRESH_SECONDS)
+                    .contains(&interval)
+                {
+                    return Err(CliParseError::Parse {
+                        detail: format!(
+                            "Prometheus exporter refresh interval must be between {PROMETHEUS_MIN_REFRESH_SECONDS} and {PROMETHEUS_MAX_REFRESH_SECONDS} seconds"
+                        ),
+                    });
+                }
+                options.refresh_interval_seconds = interval;
+            }
+            "--name" | "--name-prefix" => {
+                index += 1;
+                let Some(name_prefix) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                options.name_prefix = Some(non_empty_observe_value("--name", name_prefix)?);
+            }
+            "--target" | "--node" => {
+                index += 1;
+                let Some(target_node_id) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                options.target_node_id = Some(non_empty_observe_value("--target", target_node_id)?);
+            }
+            "--all" => options.target_all = true,
+            _ => return Err(CliParseError::Usage),
+        }
+        index += 1;
+    }
+    if options.target_all && options.target_node_id.is_some() {
+        return Err(CliParseError::Usage);
+    }
+    Ok(options)
 }
 
 fn parse_observe_network_timeline_options(
@@ -1157,6 +1311,193 @@ fn observe_metrics(
     print_observe_metric_records(context, response.metrics, options.json)
 }
 
+fn observe_prometheus(
+    context: &mut CliCommandContext<'_>,
+    rpc: Option<&ObserveCliRpc>,
+    target_lister: Option<&ObserveCliTargetLister>,
+    options: ObservePrometheusOptions,
+) -> Result<(), CliCommandError> {
+    let server = PrometheusHttpServer::bind(options.listen).map_err(CliCommandError::new)?;
+    let listen = server.local_addr().map_err(CliCommandError::new)?;
+    let refresh_interval = Duration::from_secs(options.refresh_interval_seconds);
+    let rpc = rpc.cloned();
+    let target_lister = target_lister.cloned();
+    let collector_options = options.clone();
+    let (external_shutdown, _signal_guard) =
+        install_prometheus_shutdown_signals().map_err(CliCommandError::new)?;
+    let collector_shutdown = Arc::clone(&external_shutdown);
+    let collector: PrometheusCollector = Arc::new(move || {
+        collect_prometheus_metrics(
+            rpc.as_ref(),
+            target_lister.as_ref(),
+            &collector_options,
+            Some(&collector_shutdown),
+        )
+    });
+
+    context.stdout_line(format_args!(
+        "Prometheus exporter listening on http://{listen}/metrics (refresh={}s)",
+        options.refresh_interval_seconds
+    ))?;
+    context.stdout_line(format_args!(
+        "Short live snapshots only; use Prometheus or Grafana for retention and alerting."
+    ))?;
+    server
+        .serve(
+            refresh_interval,
+            collector,
+            PrometheusShutdown::default(),
+            external_shutdown,
+        )
+        .map_err(CliCommandError::new)
+}
+
+fn collect_prometheus_metrics(
+    rpc: Option<&ObserveCliRpc>,
+    target_lister: Option<&ObserveCliTargetLister>,
+    options: &ObservePrometheusOptions,
+    cancellation: Option<&AtomicBool>,
+) -> Result<String, String> {
+    let request = ObserveMetricsRequest {
+        name_prefix: options.name_prefix.clone(),
+        limit: 0,
+    };
+    let mut records = Vec::new();
+    let mut descriptors = Vec::new();
+    let mut collection_complete;
+    if options.target_all {
+        let response =
+            observe_metrics_all_once_with_cancel(rpc, target_lister, &request, cancellation)
+                .map_err(|error| error.to_string())?;
+        collection_complete = response.errors.is_empty();
+        for target in response.targets {
+            if target.response.partial {
+                collection_complete = false;
+            }
+            append_prometheus_target_metrics(
+                &mut records,
+                &mut descriptors,
+                &target.target_node_id,
+                target.response,
+            )?;
+            records.push(prometheus_target_up_record(&target.target_node_id, true));
+        }
+        for error in response.errors {
+            records.push(prometheus_target_up_record(&error.target_node_id, false));
+        }
+    } else {
+        let response = observe_metrics_once(rpc, options.target_node_id.as_deref(), &request)
+            .map_err(|error| error.to_string())?;
+        let target_node_id = options
+            .target_node_id
+            .clone()
+            .or_else(|| response.node_id.clone())
+            .unwrap_or_else(|| "local".to_string());
+        collection_complete = !response.partial;
+        append_prometheus_target_metrics(
+            &mut records,
+            &mut descriptors,
+            &target_node_id,
+            response,
+        )?;
+        records.push(prometheus_target_up_record(&target_node_id, true));
+    }
+    records.push(ObserveMetricRecord::gauge(
+        "sinomo.observe.prometheus.collection_success",
+        Default::default(),
+        if collection_complete { 1.0 } else { 0.0 },
+    ));
+
+    for descriptor in prometheus_bridge_descriptors() {
+        descriptors.retain(|existing| existing.name != descriptor.name);
+        descriptors.push(descriptor);
+    }
+    crate::encode_openmetrics(&records, &descriptors).map_err(|error| error.to_string())
+}
+
+fn append_prometheus_target_metrics(
+    records: &mut Vec<ObserveMetricRecord>,
+    descriptors: &mut Vec<ObserveMetricDescriptor>,
+    target_node_id: &str,
+    response: ObserveMetricsResponse,
+) -> Result<(), String> {
+    for descriptor in response.descriptors {
+        match descriptors
+            .iter()
+            .find(|existing| existing.name == descriptor.name)
+        {
+            Some(existing)
+                if existing.kind != descriptor.kind || existing.unit != descriptor.unit =>
+            {
+                return Err(format!(
+                    "metric descriptor `{}` changed kind or unit between targets",
+                    descriptor.name
+                ));
+            }
+            Some(_) => {
+                // Help text may legitimately drift during a mixed-version
+                // rollout. Keep the first compatible descriptor.
+            }
+            None => descriptors.push(descriptor),
+        }
+    }
+    for mut record in response.metrics {
+        insert_prometheus_constant_label(&mut record, "node_id", target_node_id)?;
+        if let Some(process_role) = response.process_role.as_deref() {
+            insert_prometheus_constant_label(&mut record, "process_role", process_role)?;
+        }
+        records.push(record);
+    }
+    Ok(())
+}
+
+fn insert_prometheus_constant_label(
+    record: &mut ObserveMetricRecord,
+    label: &str,
+    value: &str,
+) -> Result<(), String> {
+    if let Some(existing) = record.labels.get(label) {
+        if existing == value {
+            return Ok(());
+        }
+        return Err(format!(
+            "metric `{}` label `{label}` conflicts with exporter value `{value}`",
+            record.name
+        ));
+    }
+    record.labels.insert(label.to_string(), value.to_string());
+    Ok(())
+}
+
+fn prometheus_target_up_record(target_node_id: &str, up: bool) -> ObserveMetricRecord {
+    ObserveMetricRecord::gauge(
+        "sinomo.observe.prometheus.target_up",
+        [("node_id".to_string(), target_node_id.to_string())]
+            .into_iter()
+            .collect(),
+        if up { 1.0 } else { 0.0 },
+    )
+}
+
+fn prometheus_bridge_descriptors() -> [ObserveMetricDescriptor; 2] {
+    [
+        ObserveMetricDescriptor {
+            name: "sinomo.observe.prometheus.collection_success".to_string(),
+            kind: crate::ObserveMetricKind::Gauge,
+            unit: Some(ObserveMetricUnit::Count),
+            help: "Whether the latest cached cluster observation collection completed without target errors."
+                .to_string(),
+        },
+        ObserveMetricDescriptor {
+            name: "sinomo.observe.prometheus.target_up".to_string(),
+            kind: crate::ObserveMetricKind::Gauge,
+            unit: Some(ObserveMetricUnit::Count),
+            help: "Whether the latest cached observation request reached and decoded the target node."
+                .to_string(),
+        },
+    ]
+}
+
 fn observe_metrics_once(
     rpc: Option<&ObserveCliRpc>,
     target_node_id: Option<&str>,
@@ -1180,6 +1521,21 @@ fn observe_metrics_all_once(
     request: &ObserveMetricsRequest,
 ) -> Result<ObserveFanoutResponse<ObserveMetricsResponse>, CliCommandError> {
     observe_rpc_all::<_, ObserveMetricsResponse>(rpc, target_lister, OBSERVE_METRICS_ROUTE, request)
+}
+
+fn observe_metrics_all_once_with_cancel(
+    rpc: Option<&ObserveCliRpc>,
+    target_lister: Option<&ObserveCliTargetLister>,
+    request: &ObserveMetricsRequest,
+    cancellation: Option<&AtomicBool>,
+) -> Result<ObserveFanoutResponse<ObserveMetricsResponse>, CliCommandError> {
+    observe_rpc_all_with_cancel::<_, ObserveMetricsResponse>(
+        rpc,
+        target_lister,
+        OBSERVE_METRICS_ROUTE,
+        request,
+        cancellation,
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -1210,7 +1566,8 @@ fn watch_observe_metrics(
             .duration_since(previous_at)
             .as_secs_f64()
             .max(f64::EPSILON);
-        let metrics = observe_metric_interval_delta(&previous.metrics, &current.metrics);
+        let metrics =
+            crate::observe_metric_records_interval_delta(&previous.metrics, &current.metrics);
         print_observe_metric_watch_records(context, metrics, elapsed, json)?;
         previous = current;
         previous_at = now;
@@ -1275,7 +1632,7 @@ fn print_observe_metric_watch_records(
     if json {
         let json = serde_json::to_string(&ObserveMetricWatchSample {
             interval_seconds,
-            sample: ObserveMetricsResponse { metrics },
+            sample: ObserveMetricsResponse::from_metrics(metrics),
         })
         .map_err(command_error)?;
         context.stdout_line(format_args!("{json}"))?;
@@ -1299,14 +1656,14 @@ fn observe_metric_fanout_interval_delta(
                 .find(|candidate| candidate.target_node_id == target.target_node_id)
                 .map(|candidate| candidate.response.metrics.as_slice())
                 .unwrap_or_default();
+            let mut response = target.response.clone();
+            response.metrics = crate::observe_metric_records_interval_delta(
+                previous_metrics,
+                &target.response.metrics,
+            );
             ObserveTargetResponse {
                 target_node_id: target.target_node_id.clone(),
-                response: ObserveMetricsResponse {
-                    metrics: observe_metric_interval_delta(
-                        previous_metrics,
-                        &target.response.metrics,
-                    ),
-                },
+                response,
             }
         })
         .collect();
@@ -1316,86 +1673,15 @@ fn observe_metric_fanout_interval_delta(
     }
 }
 
-fn observe_metric_interval_delta(
-    previous: &[crate::ObserveMetricRecord],
-    current: &[crate::ObserveMetricRecord],
-) -> Vec<crate::ObserveMetricRecord> {
-    current
-        .iter()
-        .map(|current| {
-            let previous = previous.iter().find(|previous| {
-                previous.name == current.name
-                    && previous.kind == current.kind
-                    && previous.labels == current.labels
-            });
-            observe_metric_record_interval_delta(previous, current)
-        })
-        .collect()
-}
-
-fn observe_metric_record_interval_delta(
-    previous: Option<&crate::ObserveMetricRecord>,
-    current: &crate::ObserveMetricRecord,
-) -> crate::ObserveMetricRecord {
-    let mut delta = current.clone();
-    match current.kind {
-        crate::ObserveMetricKind::Gauge => {}
-        crate::ObserveMetricKind::Counter => {
-            delta.value = Some(observe_f64_counter_delta(
-                previous.and_then(|record| record.value),
-                current.value.unwrap_or_default(),
-            ));
-        }
-        crate::ObserveMetricKind::Histogram => {
-            delta.count = Some(observe_u64_counter_delta(
-                previous.and_then(|record| record.count),
-                current.count.unwrap_or_default(),
-            ));
-            delta.sum = Some(observe_f64_counter_delta(
-                previous.and_then(|record| record.sum),
-                current.sum.unwrap_or_default(),
-            ));
-            delta.min = None;
-            delta.max = None;
-            for bucket in &mut delta.buckets {
-                let previous_count = previous.and_then(|record| {
-                    record
-                        .buckets
-                        .iter()
-                        .find(|candidate| {
-                            candidate.upper_bound.to_bits() == bucket.upper_bound.to_bits()
-                        })
-                        .map(|candidate| candidate.count)
-                });
-                bucket.count = observe_u64_counter_delta(previous_count, bucket.count);
-            }
-        }
-    }
-    delta
-}
-
-fn observe_u64_counter_delta(previous: Option<u64>, current: u64) -> u64 {
-    previous
-        .filter(|previous| *previous <= current)
-        .map_or(current, |previous| current - previous)
-}
-
-fn observe_f64_counter_delta(previous: Option<f64>, current: f64) -> f64 {
-    previous
-        .filter(|previous| previous.is_finite() && *previous <= current)
-        .map_or(current, |previous| current - previous)
-}
-
 fn print_observe_metric_records(
     context: &mut CliCommandContext<'_>,
     metrics: Vec<crate::ObserveMetricRecord>,
     json: bool,
 ) -> Result<(), CliCommandError> {
     if json {
-        let json = serde_json::to_string_pretty(&ObserveMetricsResponse {
-            metrics: metrics.clone(),
-        })
-        .map_err(command_error)?;
+        let json =
+            serde_json::to_string_pretty(&ObserveMetricsResponse::from_metrics(metrics.clone()))
+                .map_err(command_error)?;
         context.stdout_line(format_args!("{json}"))?;
         return Ok(());
     }
@@ -1961,6 +2247,20 @@ where
     Req: serde::Serialize + ?Sized,
     Resp: serde::de::DeserializeOwned,
 {
+    observe_rpc_all_with_cancel(rpc, target_lister, route, body, None)
+}
+
+fn observe_rpc_all_with_cancel<Req, Resp>(
+    rpc: Option<&ObserveCliRpc>,
+    target_lister: Option<&ObserveCliTargetLister>,
+    route: &'static str,
+    body: &Req,
+    cancellation: Option<&AtomicBool>,
+) -> Result<ObserveFanoutResponse<Resp>, CliCommandError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
     let Some(target_lister) = target_lister else {
         return Err(CliCommandError::new(
             "observe --all requires daemon-backed cluster target discovery",
@@ -1993,6 +2293,9 @@ where
         for _ in 0..worker_count {
             workers.push(scope.spawn(|| {
                 loop {
+                    if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                        break;
+                    }
                     let index = next_target.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(target_node_id) = targets.get(index).cloned() else {
                         break;
@@ -2370,6 +2673,74 @@ mod tests {
             other => panic!("expected metrics command, got {other:?}"),
         }
 
+        let command = parse_observe_command(&[
+            "prometheus".to_string(),
+            "serve".to_string(),
+            "--listen".to_string(),
+            "[::1]:19464".to_string(),
+            "--refresh".to_string(),
+            "30".to_string(),
+            "--name".to_string(),
+            "sinomo.kv.".to_string(),
+            "--all".to_string(),
+        ])
+        .expect("parse Prometheus exporter");
+        match command {
+            ObserveCliCommand::Prometheus(options) => {
+                assert_eq!(options.listen, "[::1]:19464".parse().expect("address"));
+                assert_eq!(options.refresh_interval_seconds, 30);
+                assert_eq!(options.name_prefix.as_deref(), Some("sinomo.kv."));
+                assert!(options.target_all);
+                assert!(options.target_node_id.is_none());
+            }
+            other => panic!("expected Prometheus command, got {other:?}"),
+        }
+
+        let defaults = parse_observe_command(&["prometheus".to_string(), "serve".to_string()])
+            .expect("parse Prometheus defaults");
+        assert_eq!(
+            defaults,
+            ObserveCliCommand::Prometheus(ObservePrometheusOptions::default())
+        );
+        assert_eq!(
+            parse_observe_command(&[
+                "prometheus".to_string(),
+                "serve".to_string(),
+                "--listen".to_string(),
+                "0.0.0.0:9464".to_string(),
+            ]),
+            Err(CliParseError::Parse {
+                detail: "Prometheus exporter listen address `0.0.0.0:9464` is not loopback; expose it through an authenticated reverse proxy".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_observe_command(&[
+                "prometheus".to_string(),
+                "serve".to_string(),
+                "--refresh".to_string(),
+                "0".to_string(),
+            ]),
+            Err(CliParseError::Parse {
+                detail: format!(
+                    "Prometheus exporter refresh interval must be between {PROMETHEUS_MIN_REFRESH_SECONDS} and {PROMETHEUS_MAX_REFRESH_SECONDS} seconds"
+                ),
+            })
+        );
+        assert_eq!(
+            parse_observe_command(&[
+                "prometheus".to_string(),
+                "serve".to_string(),
+                "--target".to_string(),
+                "node-a".to_string(),
+                "--all".to_string(),
+            ]),
+            Err(CliParseError::Usage)
+        );
+        assert_eq!(
+            parse_observe_command(&["prometheus".to_string()]),
+            Err(CliParseError::Usage)
+        );
+
         let result = parse_observe_command(&[
             "traces".to_string(),
             "--all".to_string(),
@@ -2467,7 +2838,7 @@ mod tests {
             },
         ];
 
-        let delta = observe_metric_interval_delta(&previous, &current);
+        let delta = crate::observe_metric_records_interval_delta(&previous, &current);
         assert_eq!(delta[0].value, Some(6.0));
         assert_eq!(delta[1].count, Some(3));
         assert_eq!(delta[1].sum, Some(650.0));
@@ -2499,9 +2870,7 @@ mod tests {
                 }
                 sinomo_core::network::ObjectRpcResponse::encode_body(
                     OBSERVE_METRICS_ROUTE,
-                    &ObserveMetricsResponse {
-                        metrics: Vec::new(),
-                    },
+                    &ObserveMetricsResponse::from_metrics(Vec::new()),
                 )
                 .map_err(|error| error.to_string())
             })
@@ -2537,6 +2906,54 @@ mod tests {
     }
 
     #[test]
+    fn partial_cluster_prometheus_collection_marks_failed_and_partial_targets() {
+        let rpc: ObserveCliRpc = Arc::new(|target_node_id, request| {
+            let target_node_id = target_node_id.expect("target node id");
+            let request: ObserveMetricsRequest = request.decode_body().expect("metrics request");
+            assert_eq!(request.name_prefix.as_deref(), Some("sinomo.test."));
+            assert_eq!(request.limit, 0);
+            if target_node_id == "node-b" {
+                return Err("node unavailable".to_string());
+            }
+            let mut response =
+                ObserveMetricsResponse::from_metrics(vec![ObserveMetricRecord::gauge(
+                    "sinomo.test.load",
+                    Default::default(),
+                    0.5,
+                )]);
+            response.node_id = Some(target_node_id.to_string());
+            response.process_role = Some("main".to_string());
+            response.partial = true;
+            response.descriptors = vec![ObserveMetricDescriptor {
+                name: "sinomo.test.load".to_string(),
+                kind: crate::ObserveMetricKind::Gauge,
+                unit: Some(ObserveMetricUnit::Ratio),
+                help: "Test load ratio.".to_string(),
+            }];
+            sinomo_core::network::ObjectRpcResponse::encode_body(OBSERVE_METRICS_ROUTE, &response)
+                .map_err(|error| error.to_string())
+        });
+        let target_lister: ObserveCliTargetLister =
+            Arc::new(|| Ok(vec!["node-a".to_string(), "node-b".to_string()]));
+        let options = ObservePrometheusOptions {
+            name_prefix: Some("sinomo.test.".to_string()),
+            target_all: true,
+            ..ObservePrometheusOptions::default()
+        };
+
+        let output = collect_prometheus_metrics(Some(&rpc), Some(&target_lister), &options, None)
+            .expect("partial OpenMetrics snapshot");
+
+        assert!(output.contains("sinomo_observe_prometheus_target_up{node_id=\"node-a\"} 1\n"));
+        assert!(output.contains("sinomo_observe_prometheus_target_up{node_id=\"node-b\"} 0\n"));
+        assert!(output.contains("sinomo_observe_prometheus_collection_success 0\n"));
+        assert!(
+            output
+                .contains("sinomo_test_load_ratio{node_id=\"node-a\",process_role=\"main\"} 0.5\n")
+        );
+    }
+
+    #[test]
     fn observe_all_bounds_worker_count_for_large_membership() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -2553,9 +2970,7 @@ mod tests {
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 sinomo_core::network::ObjectRpcResponse::encode_body(
                     OBSERVE_METRICS_ROUTE,
-                    &ObserveMetricsResponse {
-                        metrics: Vec::new(),
-                    },
+                    &ObserveMetricsResponse::from_metrics(Vec::new()),
                 )
                 .map_err(|error| error.to_string())
             })

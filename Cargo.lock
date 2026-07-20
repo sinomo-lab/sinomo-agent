@@ -9096,6 +9096,7 @@ dependencies = [
  "pprof",
  "serde",
  "serde_json",
+ "signal-hook",
  "sinomo-cli-registry",
  "sinomo-core",
  "sinomo-module",
