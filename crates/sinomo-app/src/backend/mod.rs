@@ -14,6 +14,7 @@ pub mod cluster;
 pub mod config;
 pub mod evolution;
 pub mod modules;
+pub mod observe;
 pub mod remote_management;
 pub mod sifs;
 

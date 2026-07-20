@@ -21,7 +21,7 @@ use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
@@ -220,9 +220,12 @@ pub(crate) fn spawn_cluster_raft_committed_fanout_worker_on_runtime<H, F>(
 {
     let options = timeouts.committed_fanout_options();
     CLUSTER_RAFT_FANOUT_PENDING.store(true, Ordering::Release);
+    metrics::gauge!("sinomo.kv.fanout.pending").set(1.0);
     if CLUSTER_RAFT_FANOUT_ACTIVE.swap(true, Ordering::AcqRel) {
+        metrics::counter!("sinomo.kv.fanout.coalesced").increment(1);
         return;
     }
+    metrics::gauge!("sinomo.kv.fanout.active").set(1.0);
     let worker_runtime = runtime.clone();
     runtime.spawn(async move {
         run_cluster_raft_committed_fanout_worker_async_with_host(
@@ -271,7 +274,9 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
 {
     loop {
         while CLUSTER_RAFT_FANOUT_PENDING.swap(false, Ordering::AcqRel) {
-            match fan_out_committed_cluster_raft_command_async_with_factory(
+            metrics::gauge!("sinomo.kv.fanout.pending").set(0.0);
+            let started = Instant::now();
+            let result = fan_out_committed_cluster_raft_command_async_with_factory(
                 &runtime,
                 &paths,
                 &state,
@@ -279,9 +284,19 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
                 options,
                 &mut host_factory,
             )
-            .await
-            {
+            .await;
+            let outcome = if result.is_ok() { "ok" } else { "error" };
+            metrics::counter!("sinomo.kv.fanout.passes", "outcome" => outcome).increment(1);
+            metrics::histogram!("sinomo.kv.fanout.pass.us", "outcome" => outcome)
+                .record(started.elapsed().as_micros().min(u128::from(u64::MAX)) as f64);
+            match result {
                 Ok(report) => {
+                    metrics::histogram!("sinomo.kv.fanout.attempted_nodes")
+                        .record(report.attempted_nodes as f64);
+                    metrics::histogram!("sinomo.kv.fanout.replicated_nodes")
+                        .record(report.replicated_nodes.len() as f64);
+                    metrics::counter!("sinomo.kv.fanout.watch_event_batches")
+                        .increment(report.watch_event_batches_sent as u64);
                     persist_fanout_peer_progress_hints(
                         &runtime,
                         &paths,
@@ -307,10 +322,19 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
             }
         }
 
-        if !claim_next_cluster_raft_fanout_pass(
+        let claimed = claim_next_cluster_raft_fanout_pass(
             &CLUSTER_RAFT_FANOUT_ACTIVE,
             &CLUSTER_RAFT_FANOUT_PENDING,
-        ) {
+        );
+        metrics::gauge!("sinomo.kv.fanout.active").set(if claimed { 1.0 } else { 0.0 });
+        metrics::gauge!("sinomo.kv.fanout.pending").set(
+            if CLUSTER_RAFT_FANOUT_PENDING.load(Ordering::Acquire) {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        if !claimed {
             break;
         }
     }
@@ -375,6 +399,7 @@ where
         let state = state.clone();
         let events = events.to_vec();
         tasks.spawn(async move {
+            let started = Instant::now();
             let outcome = host
                 .replicate_cluster_raft_to_node_async(
                     &paths,
@@ -399,6 +424,21 @@ where
                     )
                     .await;
             }
+            let outcome_label = match &outcome {
+                Ok(outcome) if outcome.response.accepted => "accepted",
+                Ok(_) => "rejected",
+                Err(_) => "failed",
+            };
+            metrics::counter!(
+                "sinomo.kv.fanout.target_results",
+                "outcome" => outcome_label
+            )
+            .increment(1);
+            metrics::histogram!(
+                "sinomo.kv.fanout.target.us",
+                "outcome" => outcome_label
+            )
+            .record(started.elapsed().as_micros().min(u128::from(u64::MAX)) as f64);
             (target_node_id, outcome, watch_event_batches_sent)
         });
     }

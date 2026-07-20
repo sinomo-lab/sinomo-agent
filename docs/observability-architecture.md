@@ -47,6 +47,40 @@ network routing layer.
 `sinomo observe ... --target <node-id>` reads one node. `--all` fans out over the
 authorized cluster members known to the local node and prints per-node results.
 
+## Operator Surfaces
+
+The graphical app's Cluster surface is the built-in live console:
+
+- **Overview** samples up to 32 authorized nodes (local first) every five
+  seconds while that view is visible. It shows RPC throughput/errors/latency, KV latency and queue
+  pressure, DFS backlog, agent work, and per-node observation freshness.
+- **Topology** retains the cluster graph and node inspector.
+- **Activity** combines topology warnings with recent observation failures,
+  partial exporter results, and process restarts.
+
+Overview retains at most 180 derived samples (about 15 minutes) and 100 activity
+items in the app process. It never writes metric history to cluster KV or local
+storage. Health and observation freshness remain separate: an online node can
+have stale, partial, or unsupported metrics, and a failed observation does not
+rewrite cluster health.
+
+For retention, dashboards, or alerting, run the companion Prometheus bridge:
+
+```sh
+sinomo observe prometheus serve --all
+sinomo observe prometheus serve --all --name sinomo.kv. --refresh 15
+```
+
+It listens on `127.0.0.1:9464` by default and exposes `/metrics` plus
+`/-/healthy`. The listener is loopback-only; place an authenticated reverse
+proxy in front before exposing it beyond the host. One background collector
+refreshes an immutable OpenMetrics snapshot, so Prometheus scrapes do not each
+trigger cluster RPC or DFS/KV snapshot scans. Partial fan-out remains
+scrapeable: reachable node series are retained, per-target `target_up` reports
+failures, and `collection_success` distinguishes a complete collection from a
+partial one. Prometheus or Grafana owns durable history; Sinomo does not embed a
+time-series database.
+
 ## Metrics Model
 
 There are two metric sources:
@@ -56,19 +90,69 @@ There are two metric sources:
 
 Snapshot exporters are pull-based. They run only when `/observe/metrics` is
 queried, which keeps durable state scans out of runtime hot paths. Exporters
-return normal `ObserveMetricRecord` values and may report exporter failures as
-`sinomo.observe.metric_exporter.errors`.
+declare the metric prefixes they own, and successful DFS/KV results are cached
+for five seconds (agent snapshots for fifteen seconds). Filtered requests skip
+unrelated exporters. Exporters return normal `ObserveMetricRecord` values and
+may report exporter failures as `sinomo.observe.metric_exporter.errors`.
+
+Metric responses carry observation time, process incarnation, process role,
+node identity, partial/exporter status, and descriptors for the returned metric
+families. Descriptors define type, help text, and units across the RPC boundary;
+the OpenMetrics encoder therefore converts explicit microseconds to seconds
+without guessing from a metric name. Older responses remain readable because
+the added metadata is optional.
+
+Runtime histograms retain bounded cumulative buckets in addition to count, sum,
+minimum, and maximum. This keeps recorder memory fixed and permits clients to
+derive interval rates and approximate percentiles from consecutive reads.
+`sinomo observe metrics --watch <seconds>` performs that delta locally; add
+`--samples <n>` for a bounded capture. Streaming JSON emits one compact object
+per interval so it can be redirected to a JSONL artifact.
 
 The daemon registers built-in DFS and KV exporters:
 
 - `sinomo.dfs.*` reports DFS object, version, receipt, intent, conflict, repair,
   namespace job, and metadata shard gauges.
 - `sinomo.kv.*` reports local cluster KV revision, compacted revision, entry,
-  lease, and retained event gauges.
+  lease, retained event, Raft progress, durable file size, and bounded peer-lag
+  gauges. Runtime counters and histograms separate command queueing, WAL append,
+  quorum replication, local apply, compaction, cache fallback, and background
+  fanout cost.
 
 Application-level crates register through daemon service hooks. The agent hook
 currently exports `sinomo.agent.*` gauges for persisted sessions, control
 snapshots, active turns, buffered events, task statuses, and read errors.
+
+### KV performance diagnosis
+
+KV metrics use only bounded runtime labels: command class, phase, outcome,
+read authority/source, and replication payload type. Raw keys, prefixes,
+request IDs, routes, errors, and peer IDs never become hot-path labels. Peer IDs
+appear only in pull-time gauges constructed from current membership and the
+bounded Raft peer-progress ledger. KV telemetry is process-local observation; it
+must never be written back into cluster KV.
+
+The primary signatures are:
+
+- high `sinomo.kv.command.phase.us{phase="commit_sequence_wait"}` plus
+  `sinomo.kv.commit.queue_depth`: the ordered proposal stream is saturated;
+- high `phase="quorum"` with low `phase="local_append"`: routing, voter latency,
+  or follower catch-up dominates;
+- high WAL, apply, snapshot, or compaction duration: local durable storage or
+  write amplification dominates;
+- frequent `source="durable_raft_open"` or
+  `source="materialized_busy_fallback"`: the read-view cache is cold or Raft
+  storage is contended;
+- fast quorum with growing `sinomo.kv.peer.lag_entries`: asynchronous fanout is
+  not keeping followers converged.
+
+Use interval percentiles rather than lifetime maxima when deciding whether a
+deployment is currently degraded:
+
+```sh
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5 --samples 12 --json
+```
 
 ## Trace Context
 
@@ -144,11 +228,14 @@ millisecond sleeps in the benchmark are driver polling between
 root after collecting its JSONL output.
 
 Use two separate Docker projects or fully tear down the first project between
-the durability and algorithm measurements. The disk-backed suite remains the
-correctness, restart, damage, and convergence gate:
+the durability and algorithm measurements. Docker formation has a fixed,
+non-configurable ten-second acceptance gate. Both performance projects must be
+formed fresh with formation observation disabled; an observation-enabled
+project is diagnostic evidence, not a benchmark environment. The disk-backed
+suite remains the correctness, restart, damage, and convergence gate:
 
 ```sh
-SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_WAIT=120 \
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_OBSERVE=0 \
   SINOMO_DFS_PERF_TRACE=1 docker/test-cluster.sh
 ```
 
@@ -158,7 +245,7 @@ have all passed, measure the three live shard primaries, and tear it down with
 the same compose files:
 
 ```sh
-SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_WAIT=120 \
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_OBSERVE=0 \
   SINOMO_TEST_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
   SINOMO_TEST_NETWORK_ONLY=1 SINOMO_TEST_KEEP=1 SINOMO_DFS_PERF_TRACE=1 \
   docker/test-cluster.sh

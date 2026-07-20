@@ -23,6 +23,7 @@ sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 thiserror.workspace = true
 time.workspace = true
 fs2.workspace = true
+metrics.workspace = true
 tokio.workspace = true
 sinomo-base = { path = "../sinomo-base" }
 sinomo-node = { path = "../sinomo-node" }

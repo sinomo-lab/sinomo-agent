@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 
 mod agent;
@@ -93,8 +94,47 @@ pub fn register_storage_paths(
 }
 
 pub fn register_observe_metric_exporters() {
-    sinomo_runtime::observe::register_observe_metric_exporter(
+    use sinomo_runtime::observe::{ObserveMetricDescriptor, ObserveMetricKind, ObserveMetricUnit};
+
+    for (name, help) in [
+        ("sinomo.agent.sessions", "Persisted agent sessions."),
+        (
+            "sinomo.agent.invalid_session_dirs",
+            "Invalid persisted agent session directories.",
+        ),
+        (
+            "sinomo.agent.session_snapshots",
+            "Persisted agent session snapshots.",
+        ),
+        (
+            "sinomo.agent.control_snapshots",
+            "Persisted agent control snapshots.",
+        ),
+        ("sinomo.agent.active_turns", "Agent turns currently active."),
+        (
+            "sinomo.agent.buffered_events",
+            "Agent events currently buffered.",
+        ),
+        (
+            "sinomo.agent.tasks",
+            "Agent tasks by bounded lifecycle status.",
+        ),
+        (
+            "sinomo.agent.control_snapshot_read_errors",
+            "Agent control snapshots that could not be read.",
+        ),
+    ] {
+        sinomo_runtime::observe::register_observe_metric_descriptor(ObserveMetricDescriptor {
+            name: name.to_string(),
+            kind: ObserveMetricKind::Gauge,
+            unit: Some(ObserveMetricUnit::Count),
+            help: help.to_string(),
+        });
+    }
+    sinomo_runtime::observe::register_observe_metric_exporter_with_policy(
         "sinomo-agent",
+        ["sinomo.agent."],
+        Some(Duration::from_secs(15)),
         agent_observe_metrics,
     );
 }

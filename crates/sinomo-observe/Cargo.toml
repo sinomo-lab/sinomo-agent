@@ -20,6 +20,7 @@ fs2.workspace = true
 metrics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-module = { path = "../sinomo-module" }

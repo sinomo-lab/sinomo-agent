@@ -76,7 +76,10 @@ const DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DaemonRolloutTelemetryEventTailOutcome {
     relevant_event_observed: bool,
-    incomplete_record: bool,
+    /// Absolute end offset of the observed incomplete record. This is source
+    /// progress, unlike filesystem watcher generations: one append may emit
+    /// several indistinguishable backend notifications.
+    incomplete_record_end_offset: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -276,7 +279,8 @@ impl DaemonRolloutTelemetryEventLogTailer {
         self.offset = self.offset.saturating_add(committed_bytes);
         Ok(DaemonRolloutTelemetryEventTailOutcome {
             relevant_event_observed,
-            incomplete_record: pending_record_bytes != 0,
+            incomplete_record_end_offset: (pending_record_bytes != 0)
+                .then(|| self.offset.saturating_add(pending_record_bytes)),
         })
     }
 }
@@ -321,7 +325,7 @@ pub(crate) struct DaemonRolloutTelemetryReactor {
     completed_watcher_fault_generation: u64,
     completed_event_file_generation: u64,
     event_tail_retry_at: Option<Instant>,
-    event_tail_retry_generation: Option<u64>,
+    event_tail_retry_end_offset: Option<u64>,
     completed_generations: DaemonRolloutTelemetrySourceGenerations,
     arming: DaemonRolloutTelemetryArming,
     consecutive_failures: u32,
@@ -416,7 +420,7 @@ impl DaemonRolloutTelemetryReactor {
             completed_watcher_fault_generation: 0,
             completed_event_file_generation: 0,
             event_tail_retry_at: None,
-            event_tail_retry_generation: None,
+            event_tail_retry_end_offset: None,
             completed_generations: DaemonRolloutTelemetrySourceGenerations::default(),
             arming: DaemonRolloutTelemetryArming::RuntimeStateOnly,
             consecutive_failures: 0,
@@ -483,24 +487,24 @@ impl DaemonRolloutTelemetryReactor {
                     *generation = generation.saturating_add(1);
                 });
             }
-            if tail_outcome.incomplete_record {
-                // One short retry is attached to this observed file activity.
-                // If the writer still has not committed a newline then, the
-                // next filesystem mutation owns the next retry; a torn writer
-                // cannot turn into a healthy idle timer.
-                if self.event_tail_retry_generation == Some(event_file_generation)
-                    && event_tail_retry_due
-                {
-                    self.event_tail_retry_at = None;
-                    self.event_tail_retry_generation = None;
+            if let Some(incomplete_record_end_offset) = tail_outcome.incomplete_record_end_offset {
+                // One short retry is attached to observed source progress, not
+                // a watcher generation. Backends may emit duplicate events for
+                // one append; the same incomplete length can neither extend a
+                // pending retry nor re-arm a consumed retry. Newly appended
+                // bytes produce a new end offset and may own one new retry.
+                if self.event_tail_retry_end_offset == Some(incomplete_record_end_offset) {
+                    if event_tail_retry_due {
+                        self.event_tail_retry_at = None;
+                    }
                 } else {
                     self.event_tail_retry_at =
                         now.checked_add(DAEMON_ROLLOUT_TELEMETRY_INCOMPLETE_TAIL_RETRY);
-                    self.event_tail_retry_generation = Some(event_file_generation);
+                    self.event_tail_retry_end_offset = Some(incomplete_record_end_offset);
                 }
             } else {
                 self.event_tail_retry_at = None;
-                self.event_tail_retry_generation = None;
+                self.event_tail_retry_end_offset = None;
             }
         }
 
@@ -541,7 +545,7 @@ impl DaemonRolloutTelemetryReactor {
         self.arming = daemon_rollout_telemetry_arming_after(status);
         if self.arming == DaemonRolloutTelemetryArming::RuntimeStateOnly {
             self.event_tail_retry_at = None;
-            self.event_tail_retry_generation = None;
+            self.event_tail_retry_end_offset = None;
         }
         self.consecutive_failures = 0;
         self.retry_at = None;
@@ -5239,6 +5243,66 @@ mod tests {
         assert!(
             prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some(),
             "the next committed file mutation completes and emits the relevant event generation"
+        );
+    }
+
+    #[test]
+    fn rollout_telemetry_duplicate_notification_cannot_rearm_incomplete_tail_retry() {
+        let (root, _paths, mut reactor) =
+            rollout_telemetry_test_reactor("telemetry-reactor-duplicate-partial-notification");
+        complete_rollout_telemetry_startup(
+            &mut reactor,
+            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
+        );
+        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
+        append_rollout_telemetry_event_raw(
+            &event_log_path,
+            rollout_telemetry_reactor_test_event(
+                "partial-duplicate",
+                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
+            ),
+            false,
+        );
+        reactor
+            .event_file_source_tx
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+        let retry_at = reactor
+            .event_tail_retry_at
+            .expect("first incomplete length owns one retry");
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, retry_at),
+            None
+        );
+        assert_eq!(reactor.event_tail_retry_at, None);
+
+        reactor
+            .event_file_source_tx
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+        assert_eq!(
+            reactor.event_tail_retry_at, None,
+            "a duplicate watcher notification at the same incomplete length cannot re-arm"
+        );
+
+        append_rollout_telemetry_bytes_raw(&event_log_path, b" ");
+        reactor
+            .event_file_source_tx
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+        assert_eq!(
+            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
+            None
+        );
+        assert!(
+            reactor.event_tail_retry_at.is_some(),
+            "newly appended bytes may own one bounded retry"
         );
     }
 

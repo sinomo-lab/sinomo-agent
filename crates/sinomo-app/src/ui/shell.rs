@@ -69,6 +69,7 @@ impl BackgroundWorkController {
             }
             if self.shared.active_tab() == Tab::Cluster {
                 cluster::request_refresh(&self.shared);
+                cluster::request_observation(&self.shared);
             }
         }
 
@@ -82,6 +83,7 @@ impl BackgroundWorkController {
         let files_attachment_changed = ready && drain_files_chat_attachment(&self.shared);
         let connection_changed = self.shared.pump_connection_probe();
         let cluster_changed = cluster::pump_refresh(&self.shared);
+        let cluster_observation_changed = cluster::pump_observation(&self.shared);
 
         let chat_visible = self.shared.active_tab() == Tab::Sinomo;
         let (chat_changed, chat_semantics_changed, chat_layout_changed) = if ready {
@@ -122,6 +124,7 @@ impl BackgroundWorkController {
             || files_attachment_changed
             || connection_changed
             || cluster_changed
+            || cluster_observation_changed
             || chat_layout_changed
             || settings_changed
             || settings_operations_changed
@@ -189,6 +192,7 @@ const HEALTH_CONTENT_MAX_H: f32 = 548.0;
 const HEALTH_ISSUE_ESTIMATED_H: f32 = 104.0;
 const HEALTH_ACTION_H: f32 = 30.0;
 const HEALTH_PROBE_INTERVAL_SECS: f64 = 5.0;
+const CLUSTER_OBSERVE_INTERVAL_SECS: f64 = 5.0;
 /// Stock spinner shown in the centered launch-progress surface.
 const LOADING_SPINNER_SIZE: f32 = 24.0;
 /// Loading screen: show the per-step elapsed time once a launch step has been in
@@ -228,6 +232,9 @@ pub struct Shell {
     connect_status_timer: Cell<Option<TimerToken>>,
     /// Periodic live daemon observation; the probe itself always runs on a background thread.
     health_probe_timer: Cell<Option<TimerToken>>,
+    /// Five-second live metrics cadence while Cluster / Overview is visible.
+    cluster_observe_timer: Cell<Option<TimerToken>>,
+    window_occluded: Cell<bool>,
     body_rect: Rect,
 }
 
@@ -266,6 +273,8 @@ impl Shell {
             tab_strip_rect: Rect::ZERO,
             connect_status_timer: Cell::new(None),
             health_probe_timer: Cell::new(None),
+            cluster_observe_timer: Cell::new(None),
+            window_occluded: Cell::new(false),
             body_rect: Rect::ZERO,
         };
         if shell.shared.is_ready() {
@@ -296,6 +305,20 @@ impl Shell {
         }
         self.health_probe_timer
             .set(Some(ctx.schedule_timer_after(HEALTH_PROBE_INTERVAL_SECS)));
+    }
+
+    fn schedule_cluster_observe_timer(&self, ctx: &mut EventCtx) {
+        if !crate::mobile_runtime::interactive()
+            || self.window_occluded.get()
+            || !cluster::overview_visible(&self.shared)
+            || self.cluster_observe_timer.get().is_some()
+            || self.shared.borrow().waker.is_none()
+        {
+            return;
+        }
+        self.cluster_observe_timer.set(Some(
+            ctx.schedule_timer_after(CLUSTER_OBSERVE_INTERVAL_SECS),
+        ));
     }
 
     fn sync_render_options(&self, ctx: &mut EventCtx) {
@@ -749,6 +772,7 @@ impl Widget for Shell {
             if *interactive {
                 self.schedule_connect_status_timer(ctx);
                 self.schedule_health_probe_timer(ctx);
+                self.schedule_cluster_observe_timer(ctx);
                 if let Some(waker) = self.shared.borrow().waker.clone() {
                     waker.wake();
                 }
@@ -772,6 +796,13 @@ impl Widget for Shell {
         }
         if ctx.phase() != EventPhase::Target {
             return;
+        }
+        if let Event::Window(WindowEvent::Occluded(occluded)) = event {
+            self.window_occluded.set(*occluded);
+            if !occluded && cluster::overview_visible(&self.shared) {
+                cluster::request_observation(&self.shared);
+                self.schedule_cluster_observe_timer(ctx);
+            }
         }
         if let Event::Window(window_event) = event
             && self.handle_external_file_window_event(window_event)
@@ -806,9 +837,24 @@ impl Widget for Shell {
             self.schedule_health_probe_timer(ctx);
             return;
         }
+        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
+            && self.cluster_observe_timer.get() == Some(*token)
+        {
+            self.cluster_observe_timer.set(None);
+            if crate::mobile_runtime::interactive()
+                && !self.window_occluded.get()
+                && cluster::overview_visible(&self.shared)
+                && cluster::request_observation(&self.shared)
+            {
+                ctx.request_semantics();
+            }
+            self.schedule_cluster_observe_timer(ctx);
+            return;
+        }
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             self.schedule_connect_status_timer(ctx);
             self.schedule_health_probe_timer(ctx);
+            self.schedule_cluster_observe_timer(ctx);
             self.sync_render_options(ctx);
         }
     }

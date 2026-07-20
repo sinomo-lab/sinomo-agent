@@ -62,6 +62,7 @@ sinomo cluster peers
 sinomo cluster doctor
 sinomo observe events --kind cluster. --limit 200 --json
 sinomo observe metrics --name sinomo.kv. --all --json
+sinomo observe metrics --name sinomo.kv. --all --limit 0 --watch 5 --samples 12
 ```
 
 Restore reachability to the existing authority members. Do not initialize a

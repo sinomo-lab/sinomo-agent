@@ -26,6 +26,33 @@ const DFS_PERF_TRACE_DIRECTIVE: &str = "sinomo.dfs.perf=trace";
 const TRACE_BUFFER_LIMIT: usize = 4096;
 const CAPTURE_ID_MAX_BYTES: usize = 128;
 const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
+const OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS: &[f64] = &[
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_500_000.0,
+    5_000_000.0,
+    10_000_000.0,
+    25_000_000.0,
+    50_000_000.0,
+    100_000_000.0,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObserveRuntimeConfig {
@@ -111,7 +138,77 @@ pub struct ObserveMetricsRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ObserveMetricsResponse {
+    /// Wall-clock time at which this process assembled the response. Older
+    /// daemons omit it, so clients must retain their local receive time as a
+    /// compatibility fallback.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub observed_at: Option<OffsetDateTime>,
+    /// Start time of the process that owns the cumulative counters. A change
+    /// tells interval consumers to treat the next sample as a fresh baseline.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub process_started_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Snapshot exporters that were actually invoked for this request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exporters: Vec<ObserveMetricExporterStatus>,
+    /// True when one or more requested exporters failed. Successfully
+    /// collected metrics remain useful and are still returned.
+    #[serde(default)]
+    pub partial: bool,
+    /// Metric-family metadata for records present in this snapshot. Carrying
+    /// it over the observe route keeps remote Prometheus bridges from guessing
+    /// units or descriptions from metric names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descriptors: Vec<ObserveMetricDescriptor>,
     pub metrics: Vec<ObserveMetricRecord>,
+}
+
+impl ObserveMetricsResponse {
+    pub fn from_metrics(metrics: Vec<ObserveMetricRecord>) -> Self {
+        let (process_role, node_id) = observe_runtime_process_identity();
+        let descriptor_names = metrics
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let descriptors = observe_metric_descriptors()
+            .into_iter()
+            .filter(|descriptor| descriptor_names.contains(descriptor.name.as_str()))
+            .collect();
+        Self {
+            observed_at: Some(OffsetDateTime::now_utc()),
+            process_started_at: observe_process_started_at(),
+            process_role: (process_role != "uninitialized").then_some(process_role),
+            node_id,
+            exporters: Vec::new(),
+            partial: false,
+            descriptors,
+            metrics,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ObserveMetricExporterStatus {
+    pub name: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub observed_at: OffsetDateTime,
+    pub duration_us: u64,
+    #[serde(default)]
+    pub cached: bool,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -150,6 +247,25 @@ pub enum ObserveMetricKind {
     Histogram,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObserveMetricUnit {
+    Count,
+    Bytes,
+    Seconds,
+    Microseconds,
+    Ratio,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ObserveMetricDescriptor {
+    pub name: String,
+    pub kind: ObserveMetricKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<ObserveMetricUnit>,
+    pub help: String,
+}
+
 impl ObserveMetricKind {
     fn as_key_prefix(self) -> &'static str {
         match self {
@@ -176,6 +292,17 @@ pub struct ObserveMetricRecord {
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<ObserveHistogramBucket>,
+}
+
+/// One cumulative histogram bucket. `count` includes every recorded value less
+/// than or equal to `upper_bound`, which makes scrape-to-scrape deltas cheap and
+/// keeps the wire representation compatible with conventional histogram tools.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ObserveHistogramBucket {
+    pub upper_bound: f64,
+    pub count: u64,
 }
 
 impl ObserveMetricRecord {
@@ -189,6 +316,7 @@ impl ObserveMetricRecord {
             sum: None,
             min: None,
             max: None,
+            buckets: Vec::new(),
         }
     }
 
@@ -202,8 +330,113 @@ impl ObserveMetricRecord {
             sum: None,
             min: None,
             max: None,
+            buckets: Vec::new(),
         }
     }
+
+    pub fn histogram_quantile(&self, quantile: f64) -> Option<f64> {
+        if self.kind != ObserveMetricKind::Histogram || !(0.0..=1.0).contains(&quantile) {
+            return None;
+        }
+        let count = self.count?;
+        if count == 0 {
+            return None;
+        }
+        let rank = ((count as f64) * quantile).ceil().max(1.0) as u64;
+        self.buckets
+            .iter()
+            .find(|bucket| bucket.count >= rank)
+            .map(|bucket| bucket.upper_bound)
+            .or(self.max)
+    }
+}
+
+/// Derives one interval sample from cumulative process metrics. Gauge values
+/// remain instantaneous. Counter resets (including a process restart) use the
+/// current value as the first delta instead of producing a negative result.
+pub fn observe_metrics_interval_delta(
+    previous: &ObserveMetricsResponse,
+    current: &ObserveMetricsResponse,
+) -> ObserveMetricsResponse {
+    let same_process = previous.process_started_at.is_none()
+        || current.process_started_at.is_none()
+        || previous.process_started_at == current.process_started_at;
+    let previous_metrics = same_process
+        .then_some(previous.metrics.as_slice())
+        .unwrap_or_default();
+    let mut delta = current.clone();
+    delta.metrics = observe_metric_records_interval_delta(previous_metrics, &current.metrics);
+    delta
+}
+
+pub fn observe_metric_records_interval_delta(
+    previous: &[ObserveMetricRecord],
+    current: &[ObserveMetricRecord],
+) -> Vec<ObserveMetricRecord> {
+    current
+        .iter()
+        .map(|current| {
+            let previous = previous.iter().find(|previous| {
+                previous.name == current.name
+                    && previous.kind == current.kind
+                    && previous.labels == current.labels
+            });
+            observe_metric_record_interval_delta(previous, current)
+        })
+        .collect()
+}
+
+fn observe_metric_record_interval_delta(
+    previous: Option<&ObserveMetricRecord>,
+    current: &ObserveMetricRecord,
+) -> ObserveMetricRecord {
+    let mut delta = current.clone();
+    match current.kind {
+        ObserveMetricKind::Gauge => {}
+        ObserveMetricKind::Counter => {
+            delta.value = Some(observe_f64_counter_delta(
+                previous.and_then(|record| record.value),
+                current.value.unwrap_or_default(),
+            ));
+        }
+        ObserveMetricKind::Histogram => {
+            delta.count = Some(observe_u64_counter_delta(
+                previous.and_then(|record| record.count),
+                current.count.unwrap_or_default(),
+            ));
+            delta.sum = Some(observe_f64_counter_delta(
+                previous.and_then(|record| record.sum),
+                current.sum.unwrap_or_default(),
+            ));
+            delta.min = None;
+            delta.max = None;
+            for bucket in &mut delta.buckets {
+                let previous_count = previous.and_then(|record| {
+                    record
+                        .buckets
+                        .iter()
+                        .find(|candidate| {
+                            candidate.upper_bound.to_bits() == bucket.upper_bound.to_bits()
+                        })
+                        .map(|candidate| candidate.count)
+                });
+                bucket.count = observe_u64_counter_delta(previous_count, bucket.count);
+            }
+        }
+    }
+    delta
+}
+
+fn observe_u64_counter_delta(previous: Option<u64>, current: u64) -> u64 {
+    previous
+        .filter(|previous| *previous <= current)
+        .map_or(current, |previous| current - previous)
+}
+
+fn observe_f64_counter_delta(previous: Option<f64>, current: f64) -> f64 {
+    previous
+        .filter(|previous| previous.is_finite() && *previous <= current)
+        .map_or(current, |previous| current - previous)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -224,6 +457,7 @@ pub struct ObserveTraceRecord {
 #[derive(Clone)]
 struct ObserveRuntime {
     config: ObserveRuntimeConfig,
+    started_at: OffsetDateTime,
     filter: Arc<Mutex<ObserveFilterState>>,
     filter_handle: reload::Handle<EnvFilter, Registry>,
     metrics: Arc<ObserveMetricsRecorder>,
@@ -264,7 +498,26 @@ struct ObserveFilterState {
 static OBSERVE_RUNTIME: OnceLock<ObserveRuntime> = OnceLock::new();
 type ObserveMetricExporter =
     Arc<dyn Fn(&SinomoDataDir) -> Result<Vec<ObserveMetricRecord>, ObserveError> + Send + Sync>;
-static OBSERVE_METRIC_EXPORTERS: OnceLock<Mutex<BTreeMap<String, ObserveMetricExporter>>> =
+#[derive(Clone)]
+struct ObserveMetricExporterRegistration {
+    prefixes: Vec<String>,
+    exporter: ObserveMetricExporter,
+    cache_ttl: Option<Duration>,
+    cache: Arc<Mutex<Option<ObserveMetricExporterCache>>>,
+}
+
+#[derive(Clone)]
+struct ObserveMetricExporterCache {
+    data_dir: std::path::PathBuf,
+    collected_at: OffsetDateTime,
+    cached_at: Instant,
+    duration_us: u64,
+    records: Vec<ObserveMetricRecord>,
+}
+static OBSERVE_METRIC_EXPORTERS: OnceLock<
+    Mutex<BTreeMap<String, ObserveMetricExporterRegistration>>,
+> = OnceLock::new();
+static OBSERVE_METRIC_DESCRIPTORS: OnceLock<Mutex<BTreeMap<String, ObserveMetricDescriptor>>> =
     OnceLock::new();
 
 pub fn register_observe_metric_exporter(
@@ -274,10 +527,62 @@ pub fn register_observe_metric_exporter(
     + Sync
     + 'static,
 ) {
+    register_observe_metric_exporter_with_prefixes(name, Vec::<String>::new(), exporter);
+}
+
+/// Registers a pull-time exporter together with the metric prefixes it can
+/// produce. Prefix metadata lets a filtered live view skip unrelated durable
+/// state scans. An empty prefix list preserves the legacy always-run behavior.
+pub fn register_observe_metric_exporter_with_prefixes(
+    name: impl Into<String>,
+    prefixes: impl IntoIterator<Item = impl Into<String>>,
+    exporter: impl Fn(&SinomoDataDir) -> Result<Vec<ObserveMetricRecord>, ObserveError>
+    + Send
+    + Sync
+    + 'static,
+) {
+    register_observe_metric_exporter_with_policy(name, prefixes, None, exporter);
+}
+
+/// Registers an exporter with optional successful-result caching. The cache is
+/// process-local, bounded to one snapshot, and keyed by the authoritative data
+/// directory so test or embedded runtimes cannot reuse another instance's
+/// durable-state view.
+pub fn register_observe_metric_exporter_with_policy(
+    name: impl Into<String>,
+    prefixes: impl IntoIterator<Item = impl Into<String>>,
+    cache_ttl: Option<Duration>,
+    exporter: impl Fn(&SinomoDataDir) -> Result<Vec<ObserveMetricRecord>, ObserveError>
+    + Send
+    + Sync
+    + 'static,
+) {
     observe_metric_exporters()
         .lock()
         .expect("observe metric exporters lock poisoned")
-        .insert(name.into(), Arc::new(exporter));
+        .insert(
+            name.into(),
+            ObserveMetricExporterRegistration {
+                prefixes: prefixes.into_iter().map(Into::into).collect(),
+                exporter: Arc::new(exporter),
+                cache_ttl,
+                cache: Arc::new(Mutex::new(None)),
+            },
+        );
+}
+
+pub fn register_observe_metric_descriptor(descriptor: ObserveMetricDescriptor) {
+    observe_metric_descriptors_store()
+        .lock()
+        .expect("observe metric descriptors lock poisoned")
+        .insert(descriptor.name.clone(), descriptor);
+}
+
+pub fn observe_metric_descriptors() -> Vec<ObserveMetricDescriptor> {
+    observe_metric_descriptors_store()
+        .lock()
+        .map(|descriptors| descriptors.values().cloned().collect())
+        .unwrap_or_default()
 }
 
 pub fn init_observe_runtime(config: ObserveRuntimeConfig) -> Result<(), ObserveError> {
@@ -333,6 +638,7 @@ fn init_observe_runtime_inner(
     let dropped_traces = Arc::new(AtomicU64::new(0));
     let capture = Arc::new(Mutex::new(None));
     let runtime = ObserveRuntime {
+        started_at: OffsetDateTime::now_utc(),
         filter: Arc::new(Mutex::new(initial_state)),
         filter_handle,
         metrics: Arc::clone(&metrics),
@@ -651,6 +957,10 @@ pub(crate) fn observe_runtime_process_identity() -> (String, Option<String>) {
         .unwrap_or_else(|| ("uninitialized".to_string(), None))
 }
 
+pub fn observe_process_started_at() -> Option<OffsetDateTime> {
+    OBSERVE_RUNTIME.get().map(|runtime| runtime.started_at)
+}
+
 pub fn read_observe_metrics(request: &ObserveMetricsRequest) -> ObserveMetricsResponse {
     finish_observe_metrics(observe_runtime_metrics(), request)
 }
@@ -660,22 +970,104 @@ pub fn read_observe_metrics_for_data_dir(
     request: &ObserveMetricsRequest,
 ) -> ObserveMetricsResponse {
     let mut metrics = observe_runtime_metrics();
-    for (name, exporter) in observe_metric_exporter_snapshot() {
-        match exporter(data_dir) {
-            Ok(records) => metrics.extend(records),
+    let mut exporters = Vec::new();
+    let mut partial = false;
+    for (name, registration) in observe_metric_exporter_snapshot(request) {
+        let exporter_started = Instant::now();
+        match collect_observe_metric_exporter(&registration, data_dir) {
+            Ok(collection) => {
+                metrics.extend(collection.records);
+                exporters.push(ObserveMetricExporterStatus {
+                    name,
+                    observed_at: collection.observed_at,
+                    duration_us: collection.duration_us,
+                    cached: collection.cached,
+                    success: true,
+                    error_code: None,
+                });
+            }
             Err(error) => {
+                partial = true;
+                let error_code = observe_error_code(&error).to_string();
+                let observed_at = OffsetDateTime::now_utc();
                 let mut labels = BTreeMap::new();
-                labels.insert("exporter".to_string(), name);
-                labels.insert("error".to_string(), error.to_string());
+                labels.insert("exporter".to_string(), name.clone());
+                labels.insert("reason".to_string(), error_code.clone());
                 metrics.push(ObserveMetricRecord::gauge(
                     "sinomo.observe.metric_exporter.errors",
                     labels,
                     1.0,
                 ));
+                exporters.push(ObserveMetricExporterStatus {
+                    name: name.clone(),
+                    observed_at,
+                    duration_us: duration_as_micros_u64(exporter_started.elapsed()),
+                    cached: false,
+                    success: false,
+                    error_code: Some(error_code),
+                });
+                tracing::warn!(
+                    target: "sinomo.observe.exporter",
+                    exporter = %name,
+                    error = %error,
+                    "observe metric exporter failed"
+                );
             }
         }
     }
-    finish_observe_metrics(metrics, request)
+    let mut response = finish_observe_metrics(metrics, request);
+    response.exporters = exporters;
+    response.partial = partial;
+    response
+}
+
+struct ObserveMetricExporterCollection {
+    records: Vec<ObserveMetricRecord>,
+    observed_at: OffsetDateTime,
+    duration_us: u64,
+    cached: bool,
+}
+
+fn collect_observe_metric_exporter(
+    registration: &ObserveMetricExporterRegistration,
+    data_dir: &SinomoDataDir,
+) -> Result<ObserveMetricExporterCollection, ObserveError> {
+    let data_dir_root = data_dir.root();
+    if let Some(ttl) = registration.cache_ttl
+        && let Ok(cache) = registration.cache.lock()
+        && let Some(cache) = cache.as_ref()
+        && cache.data_dir == data_dir_root
+        && cache.cached_at.elapsed() <= ttl
+    {
+        return Ok(ObserveMetricExporterCollection {
+            records: cache.records.clone(),
+            observed_at: cache.collected_at,
+            duration_us: cache.duration_us,
+            cached: true,
+        });
+    }
+
+    let started = Instant::now();
+    let observed_at = OffsetDateTime::now_utc();
+    let records = (registration.exporter)(data_dir)?;
+    let duration_us = duration_as_micros_u64(started.elapsed());
+    if registration.cache_ttl.is_some()
+        && let Ok(mut cache) = registration.cache.lock()
+    {
+        *cache = Some(ObserveMetricExporterCache {
+            data_dir: data_dir_root.to_path_buf(),
+            collected_at: observed_at,
+            cached_at: Instant::now(),
+            duration_us,
+            records: records.clone(),
+        });
+    }
+    Ok(ObserveMetricExporterCollection {
+        records,
+        observed_at,
+        duration_us,
+        cached: false,
+    })
 }
 
 fn observe_runtime_metrics() -> Vec<ObserveMetricRecord> {
@@ -700,23 +1092,59 @@ fn finish_observe_metrics(
     if request.limit > 0 && metrics.len() > request.limit {
         metrics.truncate(request.limit);
     }
-    ObserveMetricsResponse { metrics }
+    ObserveMetricsResponse::from_metrics(metrics)
 }
 
-fn observe_metric_exporters() -> &'static Mutex<BTreeMap<String, ObserveMetricExporter>> {
+fn observe_metric_exporters() -> &'static Mutex<BTreeMap<String, ObserveMetricExporterRegistration>>
+{
     OBSERVE_METRIC_EXPORTERS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn observe_metric_exporter_snapshot() -> Vec<(String, ObserveMetricExporter)> {
+fn observe_metric_exporter_snapshot(
+    request: &ObserveMetricsRequest,
+) -> Vec<(String, ObserveMetricExporterRegistration)> {
     observe_metric_exporters()
         .lock()
         .map(|exporters| {
             exporters
                 .iter()
-                .map(|(name, exporter)| (name.clone(), Arc::clone(exporter)))
+                .filter(|(_, registration)| exporter_matches_request(registration, request))
+                .map(|(name, registration)| (name.clone(), registration.clone()))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn observe_metric_descriptors_store() -> &'static Mutex<BTreeMap<String, ObserveMetricDescriptor>> {
+    OBSERVE_METRIC_DESCRIPTORS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn exporter_matches_request(
+    registration: &ObserveMetricExporterRegistration,
+    request: &ObserveMetricsRequest,
+) -> bool {
+    let Some(requested) = request.name_prefix.as_deref() else {
+        return true;
+    };
+    registration.prefixes.is_empty()
+        || registration
+            .prefixes
+            .iter()
+            .any(|prefix| prefix.starts_with(requested) || requested.starts_with(prefix))
+}
+
+fn duration_as_micros_u64(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn observe_error_code(error: &ObserveError) -> &'static str {
+    match error {
+        ObserveError::Io { .. } => "io",
+        ObserveError::Json { .. } => "json",
+        ObserveError::Parse { .. } => "parse",
+        ObserveError::ModuleState { .. } => "module-state",
+        ObserveError::Runtime { .. } => "runtime",
+    }
 }
 
 pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesResponse {
@@ -1083,11 +1511,17 @@ impl ObserveMetricsRecorder {
 }
 
 impl Recorder for ObserveMetricsRecorder {
-    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        describe_observe_metric(key, ObserveMetricKind::Counter, unit, description);
+    }
 
-    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        describe_observe_metric(key, ObserveMetricKind::Gauge, unit, description);
+    }
 
-    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        describe_observe_metric(key, ObserveMetricKind::Histogram, unit, description);
+    }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
         Counter::from_arc(self.slot(key, ObserveMetricKind::Counter))
@@ -1099,6 +1533,30 @@ impl Recorder for ObserveMetricsRecorder {
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         Histogram::from_arc(self.slot(key, ObserveMetricKind::Histogram))
+    }
+}
+
+fn describe_observe_metric(
+    key: KeyName,
+    kind: ObserveMetricKind,
+    unit: Option<Unit>,
+    description: SharedString,
+) {
+    register_observe_metric_descriptor(ObserveMetricDescriptor {
+        name: key.as_str().to_string(),
+        kind,
+        unit: unit.and_then(observe_metric_unit),
+        help: description.to_string(),
+    });
+}
+
+fn observe_metric_unit(unit: Unit) -> Option<ObserveMetricUnit> {
+    match unit {
+        Unit::Count => Some(ObserveMetricUnit::Count),
+        Unit::Bytes => Some(ObserveMetricUnit::Bytes),
+        Unit::Seconds => Some(ObserveMetricUnit::Seconds),
+        Unit::Microseconds => Some(ObserveMetricUnit::Microseconds),
+        _ => None,
     }
 }
 
@@ -1135,6 +1593,7 @@ impl ObserveMetricSlot {
                 sum: None,
                 min: None,
                 max: None,
+                buckets: Vec::new(),
             },
             ObserveMetricValue::Gauge(value) => ObserveMetricRecord {
                 name: self.name.clone(),
@@ -1145,12 +1604,14 @@ impl ObserveMetricSlot {
                 sum: None,
                 min: None,
                 max: None,
+                buckets: Vec::new(),
             },
             ObserveMetricValue::Histogram {
                 count,
                 sum,
                 min,
                 max,
+                bucket_counts,
             } => ObserveMetricRecord {
                 name: self.name.clone(),
                 kind: self.kind,
@@ -1160,6 +1621,7 @@ impl ObserveMetricSlot {
                 sum: Some(sum),
                 min,
                 max,
+                buckets: histogram_bucket_snapshot(&bucket_counts),
             },
         }
     }
@@ -1217,12 +1679,20 @@ impl HistogramFn for ObserveMetricSlot {
                 sum,
                 min,
                 max,
+                bucket_counts,
             } = &mut *state
         {
             *count = count.saturating_add(1);
             *sum += value;
             *min = Some(min.map_or(value, |current| current.min(value)));
             *max = Some(max.map_or(value, |current| current.max(value)));
+            if let Some(index) = OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS
+                .iter()
+                .position(|upper_bound| value <= *upper_bound)
+                && let Some(bucket_count) = bucket_counts.get_mut(index)
+            {
+                *bucket_count = bucket_count.saturating_add(1);
+            }
         }
     }
 }
@@ -1236,6 +1706,7 @@ enum ObserveMetricValue {
         sum: f64,
         min: Option<f64>,
         max: Option<f64>,
+        bucket_counts: Vec<u64>,
     },
 }
 
@@ -1249,9 +1720,26 @@ impl ObserveMetricValue {
                 sum: 0.0,
                 min: None,
                 max: None,
+                bucket_counts: vec![0; OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS.len()],
             },
         }
     }
+}
+
+fn histogram_bucket_snapshot(bucket_counts: &[u64]) -> Vec<ObserveHistogramBucket> {
+    let mut cumulative = 0_u64;
+    OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS
+        .iter()
+        .copied()
+        .zip(bucket_counts.iter().copied())
+        .map(|(upper_bound, bucket_count)| {
+            cumulative = cumulative.saturating_add(bucket_count);
+            ObserveHistogramBucket {
+                upper_bound,
+                count: cumulative,
+            }
+        })
+        .collect()
 }
 
 fn observe_metric_map_key(key: &Key, kind: ObserveMetricKind) -> String {
@@ -1277,6 +1765,142 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::Registry;
+
+    #[test]
+    fn histogram_snapshot_exposes_cumulative_buckets_and_quantiles() {
+        let slot = ObserveMetricSlot::new(
+            "sinomo.test.duration.us".to_string(),
+            BTreeMap::new(),
+            ObserveMetricKind::Histogram,
+        );
+        for value in [10.0, 20.0, 200.0, 2_000.0, 20_000.0] {
+            HistogramFn::record(&slot, value);
+        }
+
+        let snapshot = slot.snapshot();
+        assert_eq!(snapshot.count, Some(5));
+        assert_eq!(snapshot.sum, Some(22_230.0));
+        assert_eq!(snapshot.min, Some(10.0));
+        assert_eq!(snapshot.max, Some(20_000.0));
+        assert_eq!(snapshot.histogram_quantile(0.5), Some(250.0));
+        assert_eq!(snapshot.histogram_quantile(0.95), Some(25_000.0));
+        assert!(
+            snapshot
+                .buckets
+                .windows(2)
+                .all(|window| window[0].count <= window[1].count)
+        );
+        assert_eq!(snapshot.buckets.last().map(|bucket| bucket.count), Some(5));
+    }
+
+    #[test]
+    fn metrics_response_accepts_legacy_payload_without_snapshot_metadata() {
+        let response: ObserveMetricsResponse =
+            serde_json::from_str(r#"{"metrics":[]}"#).expect("legacy metrics response");
+        assert_eq!(response.observed_at, None);
+        assert_eq!(response.process_started_at, None);
+        assert_eq!(response.process_role, None);
+        assert_eq!(response.node_id, None);
+        assert!(response.exporters.is_empty());
+        assert!(!response.partial);
+        assert!(response.descriptors.is_empty());
+    }
+
+    #[test]
+    fn interval_delta_resets_baseline_when_process_start_changes() {
+        let mut previous =
+            ObserveMetricsResponse::from_metrics(vec![ObserveMetricRecord::counter(
+                "sinomo.test.requests",
+                BTreeMap::new(),
+                90,
+            )]);
+        previous.process_started_at = Some(OffsetDateTime::UNIX_EPOCH);
+        let mut current = ObserveMetricsResponse::from_metrics(vec![ObserveMetricRecord::counter(
+            "sinomo.test.requests",
+            BTreeMap::new(),
+            4,
+        )]);
+        current.process_started_at = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+
+        let delta = observe_metrics_interval_delta(&previous, &current);
+        assert_eq!(delta.metrics[0].value, Some(4.0));
+        assert_eq!(delta.process_started_at, current.process_started_at);
+    }
+
+    #[test]
+    fn exporter_prefixes_skip_unrelated_snapshot_collectors() {
+        let registration = ObserveMetricExporterRegistration {
+            prefixes: vec!["sinomo.kv.".to_string()],
+            exporter: Arc::new(|_| Ok(Vec::new())),
+            cache_ttl: None,
+            cache: Arc::new(Mutex::new(None)),
+        };
+        assert!(exporter_matches_request(
+            &registration,
+            &ObserveMetricsRequest {
+                name_prefix: Some("sinomo.kv.peer.".to_string()),
+                limit: 0,
+            }
+        ));
+        assert!(exporter_matches_request(
+            &registration,
+            &ObserveMetricsRequest {
+                name_prefix: Some("sinomo.".to_string()),
+                limit: 0,
+            }
+        ));
+        assert!(!exporter_matches_request(
+            &registration,
+            &ObserveMetricsRequest {
+                name_prefix: Some("sinomo.dfs.".to_string()),
+                limit: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn exporter_cache_reuses_one_bounded_snapshot_for_its_ttl() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registration = ObserveMetricExporterRegistration {
+            prefixes: vec!["sinomo.test.".to_string()],
+            exporter: {
+                let calls = Arc::clone(&calls);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(vec![ObserveMetricRecord::gauge(
+                        "sinomo.test.value",
+                        BTreeMap::new(),
+                        1.0,
+                    )])
+                })
+            },
+            cache_ttl: Some(Duration::from_secs(30)),
+            cache: Arc::new(Mutex::new(None)),
+        };
+        let root = sinomo_testdir::TestDir::new("observe-exporter-cache");
+        let data_dir = SinomoDataDir::new(root.path());
+
+        let first =
+            collect_observe_metric_exporter(&registration, &data_dir).expect("first collection");
+        let second =
+            collect_observe_metric_exporter(&registration, &data_dir).expect("cached collection");
+
+        assert!(!first.cached);
+        assert!(second.cached);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.records, second.records);
+        assert_eq!(first.observed_at, second.observed_at);
+    }
+
+    #[test]
+    fn metric_record_deserializes_without_histogram_buckets() {
+        let record: ObserveMetricRecord = serde_json::from_str(
+            r#"{"name":"legacy","kind":"histogram","count":1,"sum":5,"min":5,"max":5}"#,
+        )
+        .expect("legacy metric record");
+        assert!(record.buckets.is_empty());
+        assert_eq!(record.histogram_quantile(0.95), Some(5.0));
+    }
 
     #[test]
     fn default_filter_includes_builtin_quiet_directives() {
@@ -1488,6 +2112,7 @@ mod tests {
                 filter: original.base_filter.clone(),
                 quiet_filter_directives: original.quiet_filter_directives.clone(),
             },
+            started_at: OffsetDateTime::now_utc(),
             filter: Arc::new(Mutex::new(original.clone())),
             filter_handle,
             metrics: Arc::new(ObserveMetricsRecorder::default()),

@@ -488,9 +488,11 @@ pub(crate) fn read_wal_entries(
     max_index: Option<u64>,
     retain_after_index: u64,
 ) -> Result<WalRead, KvError> {
+    let mut metric = KvStorageMetricGuard::start("wal_read", "sinomo.kv.wal.read.us");
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            metric.succeed();
             return Ok(WalRead::default());
         }
         Err(source) => {
@@ -578,13 +580,18 @@ pub(crate) fn read_wal_entries(
             }
         }
     }
+    metrics::histogram!("sinomo.kv.wal.read.entries").record(entries.len() as f64);
+    metric.succeed();
     Ok(WalRead { entries, truncated })
 }
 
 pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
+    let mut metric = KvStorageMetricGuard::start("wal_append", "sinomo.kv.wal.append.us");
     if entries.is_empty() {
+        metric.finish("skipped");
         return Ok(());
     }
+    let mut appended_bytes = 0_u64;
     let mut file = open_wal_file_for_append(path)?;
     fs2::FileExt::lock_exclusive(&file).map_err(|source| KvError::Io {
         path: path.display().to_string(),
@@ -592,6 +599,9 @@ pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<
     })?;
     match encode_wal_record_payloads(entries, path) {
         Ok(records) => {
+            appended_bytes = records.iter().fold(0_u64, |total, record| {
+                total.saturating_add(record.len() as u64).saturating_add(4)
+            });
             durable_file::append_length_prefixed_records(
                 &mut file,
                 path,
@@ -605,6 +615,9 @@ pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<
         Err(KvError::ResourceExhausted { .. }) => {
             for entry in entries {
                 let record = encode_wal_record_payload(entry, path)?;
+                appended_bytes = appended_bytes
+                    .saturating_add(record.len() as u64)
+                    .saturating_add(4);
                 durable_file::append_length_prefixed_records(
                     &mut file,
                     path,
@@ -622,6 +635,9 @@ pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    metrics::counter!("sinomo.kv.wal.append.bytes").increment(appended_bytes);
+    metrics::histogram!("sinomo.kv.wal.append.entries").record(entries.len() as f64);
+    metric.succeed();
     Ok(())
 }
 
@@ -732,9 +748,11 @@ pub(crate) fn wal_file_matches_entries(
 }
 
 pub(crate) fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
+    let mut metric = KvStorageMetricGuard::start("wal_rewrite", "sinomo.kv.wal.rewrite.us");
     // Callers hold the per-node raft lock. Stage through a temp file instead of
     // truncating the live WAL so a failed rewrite leaves the previous log intact.
     if wal_file_matches_entries(path, entries)? {
+        metric.finish("skipped");
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -779,6 +797,13 @@ pub(crate) fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result
     let result = replace_file(&temp_path, path).and_then(|()| sync_directory(parent));
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
+    } else {
+        let written_bytes = fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        metrics::counter!("sinomo.kv.wal.rewrite.bytes").increment(written_bytes);
+        metrics::histogram!("sinomo.kv.wal.rewrite.entries").record(entries.len() as f64);
+        metric.succeed();
     }
     result
 }

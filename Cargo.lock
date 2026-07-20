@@ -8983,6 +8983,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fs2",
+ "metrics",
  "serde",
  "serde_bytes",
  "sinomo-base",
@@ -9172,6 +9173,7 @@ dependencies = [
  "pprof",
  "serde",
  "serde_json",
+ "signal-hook",
  "sinomo-cli-registry",
  "sinomo-core",
  "sinomo-module",
