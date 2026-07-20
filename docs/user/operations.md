@@ -106,8 +106,15 @@ The Prometheus bridge is loopback-only and keeps only its latest encoded
 snapshot. Repeated HTTP scrapes read that cache rather than repeating cluster
 RPC and snapshot-exporter work. Use `--name`, `--target`, `--all`, `--refresh`,
 and `--listen` to scope it; use Prometheus/Grafana for retention and alerting.
-The graphical app's Cluster tab provides Overview, Topology, and Activity for
-on-demand live operation without requiring Prometheus.
+The graphical app's Cluster tab provides a curated Overview, a generic Explore
+browser for every registered metric, Topology, and Activity for on-demand live
+operation without requiring Prometheus. Use an Overview card's **Inspect**
+action to open its exact metric query, or use Explore directly to search by
+name/help, filter by metric kind, node, and labels, and select counter or
+histogram transforms. Explore's 1/5/15-minute windows use local collection time
+and leave visible gaps across resets, restarts, or unavailable samples. It
+retains only a short bounded history for the active query; use
+Prometheus/Grafana when history, alerting, or durable dashboards are required.
 
 Live trace controls are leased and explicit:
 

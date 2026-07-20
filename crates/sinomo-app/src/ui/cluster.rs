@@ -1,5 +1,6 @@
 //! "Cluster" tab - network-topology graph of known cluster nodes.
 
+use sinomo_runtime::observe::{ObserveMetricKind, ObserveMetricUnit, ObserveMetricsResponse};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -8,20 +9,26 @@ use std::thread;
 use time::OffsetDateTime;
 
 use sui::{
-    Alignment, ArrangeCtx, Button, ButtonAppearance, Color, Constraints, DefaultTheme, DetailRow,
-    Dock, EmptyState, Event, EventCtx, Flex, FlexItem, FlexWrap, FontWeight, IconGlyph, Insets,
-    KeyState, Label, MeasureCtx, PaintCtx, PanelSection, Path, PathBuilder, Point, PointerButton,
-    PointerEventKind, RebuildOnChange, Rect, ScrollView, SemanticTone, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Size, SizedBox, StatusBadge,
-    StrokeStyle, Surface, SurfaceAppearance, SurfaceBorder, SurfaceElevation, SwitchView, TabBar,
-    TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    Alignment, ArrangeCtx, Button, ButtonAppearance, Color, Command, ConstraintQuery,
+    ConstraintView, Constraints, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, Flex,
+    FlexItem, FlexWrap, FontWeight, IconGlyph, Insets, KeyState, Label, MasterDetail,
+    MasterDetailState, MeasureCtx, PaintCtx, PanelSection, Path, PathBuilder, Point, PointerButton,
+    PointerEventKind, RebuildOnChange, Rect, ScrollView, SegmentedControl, Select, SemanticTone,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Size, SizedBox,
+    SplitState, StatusBadge, StrokeStyle, Surface, SurfaceAppearance, SurfaceBorder,
+    SurfaceElevation, SwitchView, TabBar, TextInput, TrailingSlotRow, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
 };
 
 use crate::backend::Backend;
 use crate::backend::cluster::{ClusterLinkInfo, ClusterNodeInfo, ClusterSnapshot};
 use crate::backend::observe::ObserveSampleBatch;
+use crate::metrics::{
+    MetricCatalogEntry, MetricQueryResult, MetricSelection, MetricSeries, MetricStore,
+    MetricTransform, metric_process_identity_matches, strict_metrics_interval_delta,
+};
 use crate::state::{Shared, Tab};
-use crate::theme::Palette;
+use crate::theme::{AppTextScale, Palette};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -41,31 +48,188 @@ const OBSERVATION_HISTORY_LIMIT: usize = 180;
 const OBSERVATION_ACTIVITY_LIMIT: usize = 100;
 const OBSERVATION_ACTIVITY_DETAIL_LIMIT: usize = 180;
 const OBSERVATION_FRESH_SECONDS: i64 = 10;
+const EXPLORER_CATALOG_CONTROLS_H: f32 = 104.0;
+const EXPLORER_CHART_H: f32 = 280.0;
+const EXPLORER_CATALOG_RESULT_LIMIT: usize = 100;
+const EXPLORER_CHART_SERIES_LIMIT: usize = 6;
+const SCROLLBAR_GUTTER: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ClusterSubview {
     #[default]
     Overview,
+    Explore,
     Topology,
     Activity,
 }
 
 impl ClusterSubview {
-    const ALL: [Self; 3] = [Self::Overview, Self::Topology, Self::Activity];
+    const ALL: [Self; 4] = [
+        Self::Overview,
+        Self::Explore,
+        Self::Topology,
+        Self::Activity,
+    ];
 
     fn index(self) -> usize {
         match self {
             Self::Overview => 0,
-            Self::Topology => 1,
-            Self::Activity => 2,
+            Self::Explore => 1,
+            Self::Topology => 2,
+            Self::Activity => 3,
         }
     }
 
     fn title(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Explore => "Explore",
             Self::Topology => "Topology",
             Self::Activity => "Activity",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExplorerTransform {
+    #[default]
+    Auto,
+    Current,
+    Rate,
+    Delta,
+    P50,
+    P95,
+    P99,
+}
+
+impl ExplorerTransform {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Current => "Value",
+            Self::Rate => "Rate / second",
+            Self::Delta => "Interval delta",
+            Self::P50 => "p50",
+            Self::P95 => "p95",
+            Self::P99 => "p99",
+        }
+    }
+
+    fn available(kind: sinomo_runtime::observe::ObserveMetricKind) -> &'static [Self] {
+        use sinomo_runtime::observe::ObserveMetricKind;
+
+        const COUNTER: &[ExplorerTransform] = &[
+            ExplorerTransform::Auto,
+            ExplorerTransform::Rate,
+            ExplorerTransform::Delta,
+            ExplorerTransform::Current,
+        ];
+        const GAUGE: &[ExplorerTransform] = &[ExplorerTransform::Auto, ExplorerTransform::Current];
+        const HISTOGRAM: &[ExplorerTransform] = &[
+            ExplorerTransform::Auto,
+            ExplorerTransform::P50,
+            ExplorerTransform::P95,
+            ExplorerTransform::P99,
+        ];
+        match kind {
+            ObserveMetricKind::Counter => COUNTER,
+            ObserveMetricKind::Gauge => GAUGE,
+            ObserveMetricKind::Histogram => HISTOGRAM,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExplorerKindFilter {
+    #[default]
+    All,
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+impl ExplorerKindFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Counter, Self::Gauge, Self::Histogram];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Counter => "Count",
+            Self::Gauge => "Gauge",
+            Self::Histogram => "Hist",
+        }
+    }
+
+    fn includes(self, kind: sinomo_runtime::observe::ObserveMetricKind) -> bool {
+        use sinomo_runtime::observe::ObserveMetricKind;
+
+        matches!(
+            (self, kind),
+            (Self::All, _)
+                | (Self::Counter, ObserveMetricKind::Counter)
+                | (Self::Gauge, ObserveMetricKind::Gauge)
+                | (Self::Histogram, ObserveMetricKind::Histogram)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExplorerWindow {
+    OneMinute,
+    FiveMinutes,
+    #[default]
+    FifteenMinutes,
+}
+
+impl ExplorerWindow {
+    const ALL: [Self; 3] = [Self::OneMinute, Self::FiveMinutes, Self::FifteenMinutes];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OneMinute => "1m",
+            Self::FiveMinutes => "5m",
+            Self::FifteenMinutes => "15m",
+        }
+    }
+
+    fn sample_limit(self) -> usize {
+        match self {
+            Self::OneMinute => 12,
+            Self::FiveMinutes => 60,
+            Self::FifteenMinutes => OBSERVATION_HISTORY_LIMIT,
+        }
+    }
+
+    fn duration(self) -> time::Duration {
+        match self {
+            Self::OneMinute => time::Duration::minutes(1),
+            Self::FiveMinutes => time::Duration::minutes(5),
+            Self::FifteenMinutes => time::Duration::minutes(15),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MetricExplorerState {
+    search: String,
+    kind_filter: ExplorerKindFilter,
+    selected_metric: Option<String>,
+    selected_node: Option<String>,
+    label_filters: BTreeMap<String, String>,
+    transform: ExplorerTransform,
+    window: ExplorerWindow,
+}
+
+impl Default for MetricExplorerState {
+    fn default() -> Self {
+        Self {
+            search: String::new(),
+            kind_filter: ExplorerKindFilter::All,
+            selected_metric: Some("sinomo.daemon.service.requests".to_string()),
+            selected_node: None,
+            label_filters: BTreeMap::new(),
+            transform: ExplorerTransform::Auto,
+            window: ExplorerWindow::FifteenMinutes,
         }
     }
 }
@@ -91,24 +255,93 @@ impl DashboardMetric {
     ];
 
     fn title(self) -> &'static str {
-        match self {
-            Self::RpcRate => "RPC throughput",
-            Self::RpcErrorRate => "RPC errors",
-            Self::RpcP95Ms => "RPC max-node p95",
-            Self::KvP95Ms => "KV max-node p95",
-            Self::DfsBacklog => "DFS backlog",
-            Self::AgentActiveTurns => "Active agent turns",
-        }
+        self.spec().title
     }
 
     fn unit(self) -> &'static str {
-        match self {
-            Self::RpcRate | Self::RpcErrorRate => "/s",
-            Self::RpcP95Ms | Self::KvP95Ms => "ms",
-            Self::DfsBacklog | Self::AgentActiveTurns => "",
-        }
+        self.spec().unit
+    }
+
+    fn spec(self) -> &'static DashboardPanelSpec {
+        DEFAULT_DASHBOARD
+            .panels
+            .iter()
+            .find(|panel| panel.metric == self)
+            .expect("default dashboard covers every curated metric")
     }
 }
+
+struct DashboardPanelSpec {
+    metric: DashboardMetric,
+    title: &'static str,
+    unit: &'static str,
+    explorer_metric: &'static str,
+    explorer_transform: ExplorerTransform,
+    explorer_labels: &'static [(&'static str, &'static str)],
+}
+
+struct DashboardSpec {
+    title: &'static str,
+    description: &'static str,
+    panels: &'static [DashboardPanelSpec],
+}
+
+const DEFAULT_DASHBOARD_PANELS: [DashboardPanelSpec; 6] = [
+    DashboardPanelSpec {
+        metric: DashboardMetric::RpcRate,
+        title: "RPC throughput",
+        unit: "/s",
+        explorer_metric: "sinomo.daemon.service.requests",
+        explorer_transform: ExplorerTransform::Rate,
+        explorer_labels: &[],
+    },
+    DashboardPanelSpec {
+        metric: DashboardMetric::RpcErrorRate,
+        title: "RPC errors",
+        unit: "/s",
+        explorer_metric: "sinomo.daemon.service.requests",
+        explorer_transform: ExplorerTransform::Rate,
+        explorer_labels: &[("outcome", "error")],
+    },
+    DashboardPanelSpec {
+        metric: DashboardMetric::RpcP95Ms,
+        title: "RPC max-node p95",
+        unit: "ms",
+        explorer_metric: "sinomo.daemon.service.total.us",
+        explorer_transform: ExplorerTransform::P95,
+        explorer_labels: &[],
+    },
+    DashboardPanelSpec {
+        metric: DashboardMetric::KvP95Ms,
+        title: "KV max-node p95",
+        unit: "ms",
+        explorer_metric: "sinomo.kv.command.total.us",
+        explorer_transform: ExplorerTransform::P95,
+        explorer_labels: &[("outcome", "ok")],
+    },
+    DashboardPanelSpec {
+        metric: DashboardMetric::DfsBacklog,
+        title: "DFS backlog",
+        unit: "",
+        explorer_metric: "sinomo.dfs.pending_repairs",
+        explorer_transform: ExplorerTransform::Current,
+        explorer_labels: &[],
+    },
+    DashboardPanelSpec {
+        metric: DashboardMetric::AgentActiveTurns,
+        title: "Active agent turns",
+        unit: "",
+        explorer_metric: "sinomo.agent.active_turns",
+        explorer_transform: ExplorerTransform::Current,
+        explorer_labels: &[],
+    },
+];
+
+const DEFAULT_DASHBOARD: DashboardSpec = DashboardSpec {
+    title: "Live performance",
+    description: "Curated cluster signals with short in-memory history; explore any registered metric in Explore.",
+    panels: &DEFAULT_DASHBOARD_PANELS,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 struct DashboardPoint {
@@ -167,6 +400,7 @@ struct ClusterObservationState {
     >,
     targets: BTreeMap<String, TargetObservationSummary>,
     history: VecDeque<DashboardPoint>,
+    metrics: MetricStore,
     activity: VecDeque<ObservationActivity>,
     revision: u64,
 }
@@ -180,6 +414,7 @@ impl Default for ClusterObservationState {
             previous: BTreeMap::new(),
             targets: BTreeMap::new(),
             history: VecDeque::new(),
+            metrics: MetricStore::default(),
             activity: VecDeque::new(),
             revision: 0,
         }
@@ -200,6 +435,8 @@ pub struct ClusterState {
     pub refreshing: bool,
     refresh_rx: Option<Receiver<ClusterSnapshot>>,
     observation: ClusterObservationState,
+    explorer: MetricExplorerState,
+    explorer_navigation: MasterDetailState,
 }
 
 /// Cloneable UI projection shared by the Cluster tab's structural selectors.
@@ -241,7 +478,7 @@ impl ClusterStructureKey {
 
 impl ClusterState {
     pub fn new(backend: &Backend) -> Self {
-        Self {
+        let mut state = Self {
             snapshot: backend.cluster_startup_snapshot(),
             subview: ClusterSubview::Overview,
             selected: None,
@@ -249,7 +486,11 @@ impl ClusterState {
             refreshing: false,
             refresh_rx: None,
             observation: ClusterObservationState::default(),
-        }
+            explorer: MetricExplorerState::default(),
+            explorer_navigation: MasterDetailState::default(),
+        };
+        state.sync_explorer_history_scope();
+        state
     }
 
     pub fn begin_refresh(&mut self, backend: Backend, waker: Option<sui::UiHandle>) -> bool {
@@ -282,6 +523,110 @@ impl ClusterState {
         }
     }
 
+    fn touch_explorer(&mut self) {
+        self.observation.revision = self.observation.revision.wrapping_add(1);
+    }
+
+    fn set_explorer_search(&mut self, search: String) {
+        if self.explorer.search != search {
+            self.explorer.search = search;
+            self.touch_explorer();
+        }
+    }
+
+    fn set_explorer_kind_filter(&mut self, kind_filter: ExplorerKindFilter) {
+        if self.explorer.kind_filter != kind_filter {
+            self.explorer.kind_filter = kind_filter;
+            self.touch_explorer();
+        }
+    }
+
+    fn select_explorer_metric(&mut self, name: String) {
+        if self.explorer.selected_metric.as_deref() != Some(name.as_str()) {
+            self.explorer.selected_metric = Some(name);
+            self.explorer.label_filters.clear();
+            self.explorer.transform = ExplorerTransform::Auto;
+            self.touch_explorer();
+        }
+        self.sync_explorer_history_scope();
+        self.explorer_navigation.show_detail();
+    }
+
+    fn inspect_explorer_metric(
+        &mut self,
+        name: impl Into<String>,
+        transform: ExplorerTransform,
+        labels: impl IntoIterator<Item = (String, String)>,
+    ) {
+        self.explorer.selected_metric = Some(name.into());
+        self.explorer.selected_node = None;
+        self.explorer.label_filters = labels.into_iter().collect();
+        self.explorer.transform = transform;
+        self.subview = ClusterSubview::Explore;
+        self.sync_explorer_history_scope();
+        self.explorer_navigation.show_detail();
+        self.touch_explorer();
+    }
+
+    pub(crate) fn navigate_back(&mut self) -> bool {
+        if self.subview == ClusterSubview::Explore
+            && self.explorer_navigation.route() == sui::MasterDetailRoute::Detail
+        {
+            self.explorer_navigation.show_master();
+            self.touch_explorer();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_explorer_node(&mut self, node_id: Option<String>) {
+        if self.explorer.selected_node != node_id {
+            self.explorer.selected_node = node_id;
+            self.sync_explorer_history_scope();
+            self.touch_explorer();
+        }
+    }
+
+    fn set_explorer_label(&mut self, key: String, value: Option<String>) {
+        let changed = match value {
+            Some(value) => {
+                let changed = self.explorer.label_filters.get(&key) != Some(&value);
+                if changed {
+                    self.explorer.label_filters.insert(key, value);
+                }
+                changed
+            }
+            None => self.explorer.label_filters.remove(&key).is_some(),
+        };
+        if changed {
+            self.sync_explorer_history_scope();
+            self.touch_explorer();
+        }
+    }
+
+    fn set_explorer_transform(&mut self, transform: ExplorerTransform) {
+        if self.explorer.transform != transform {
+            self.explorer.transform = transform;
+            self.touch_explorer();
+        }
+    }
+
+    fn set_explorer_window(&mut self, window: ExplorerWindow) {
+        if self.explorer.window != window {
+            self.explorer.window = window;
+            self.touch_explorer();
+        }
+    }
+
+    fn sync_explorer_history_scope(&mut self) {
+        self.observation.metrics.set_history_scope(
+            self.explorer.selected_metric.clone(),
+            self.explorer.selected_node.clone(),
+            self.explorer.label_filters.clone(),
+        );
+    }
+
     /// Drop any result tied to the previous daemon identity and immediately refresh through the
     /// newly-bound backend. The last good topology remains visible while the replacement snapshot
     /// is loading.
@@ -296,6 +641,10 @@ impl ClusterState {
         self.observation.sample_rx = None;
         self.observation.in_flight = false;
         self.observation.previous.clear();
+        self.observation.metrics = MetricStore::default();
+        self.explorer = MetricExplorerState::default();
+        self.sync_explorer_history_scope();
+        self.explorer_navigation.show_master();
         self.observation.revision = self.observation.revision.wrapping_add(1);
         self.begin_refresh(backend, waker)
     }
@@ -425,13 +774,26 @@ pub fn pump_observation(shared: &Shared) -> bool {
     shared.cluster_mut().pump_observation()
 }
 
-pub fn overview_visible(shared: &Shared) -> bool {
+pub fn observation_visible(shared: &Shared) -> bool {
     shared.is_ready()
         && shared.active_tab() == Tab::Cluster
-        && shared.cluster().subview == ClusterSubview::Overview
+        && matches!(
+            shared.cluster().subview,
+            ClusterSubview::Overview | ClusterSubview::Explore
+        )
 }
 
 fn apply_observation_batch(state: &mut ClusterObservationState, batch: ObserveSampleBatch) {
+    state.metrics.ingest_batch(
+        batch.received_at,
+        batch.targets.iter().filter_map(|target| {
+            target
+                .response
+                .as_ref()
+                .ok()
+                .map(|response| (target.node_id.as_str(), response))
+        }),
+    );
     let sampled_nodes = batch
         .targets
         .iter()
@@ -492,25 +854,22 @@ fn apply_observation_batch(state: &mut ClusterObservationState, batch: ObserveSa
                 (Some(previous), Some(current)) if previous != current
             )
         });
-        let same_process = previous.is_some_and(|(previous, _)| {
-            previous.process_started_at.is_none()
-                || response.process_started_at.is_none()
-                || previous.process_started_at == response.process_started_at
+        let non_forward_same_process = previous.is_some_and(|(previous, received_at)| {
+            metric_process_identity_matches(
+                previous.process_started_at,
+                response.process_started_at,
+            ) && observed_at <= previous.observed_at.unwrap_or(*received_at)
         });
-        let elapsed_seconds = previous
-            .map(|(previous, received_at)| {
-                let previous_at = previous.observed_at.unwrap_or(*received_at);
-                (observed_at - previous_at).as_seconds_f64()
-            })
-            .filter(|elapsed| *elapsed > f64::EPSILON);
-        let interval = (same_process && elapsed_seconds.is_some()).then(|| {
-            sinomo_runtime::observe::observe_metrics_interval_delta(
-                &previous
-                    .expect("same process requires a previous response")
-                    .0,
+        let interval = previous.and_then(|(previous, previous_received_at)| {
+            strict_metrics_interval_delta(
+                previous,
+                *previous_received_at,
                 &response,
+                batch.received_at,
             )
         });
+        let elapsed_seconds = interval.as_ref().map(|(_, elapsed)| *elapsed);
+        let interval = interval.map(|(interval, _)| interval);
         let values = dashboard_values(&response, interval.as_ref(), elapsed_seconds);
         if process_restarted {
             push_observation_activity(
@@ -566,22 +925,38 @@ fn apply_observation_batch(state: &mut ClusterObservationState, batch: ObserveSa
                 rpc_rate: values[&DashboardMetric::RpcRate],
                 rpc_p95_ms: values[&DashboardMetric::RpcP95Ms],
                 kv_queue_depth: metric_value_sum(
-                    &response.metrics,
+                    &response,
                     "sinomo.kv.commit.queue_depth",
+                    ObserveMetricKind::Gauge,
+                    ObserveMetricUnit::Count,
                     |_| true,
                 ),
                 dfs_backlog: values[&DashboardMetric::DfsBacklog],
-                failed_tasks: metric_value_sum(&response.metrics, "sinomo.agent.tasks", |record| {
-                    matches!(
-                        record.labels.get("status").map(String::as_str),
-                        Some("failed" | "timed_out")
-                    )
-                }),
+                failed_tasks: metric_value_sum(
+                    &response,
+                    "sinomo.agent.tasks",
+                    ObserveMetricKind::Gauge,
+                    ObserveMetricUnit::Count,
+                    |record| {
+                        matches!(
+                            record.labels.get("status").map(String::as_str),
+                            Some("failed" | "timed_out")
+                        )
+                    },
+                ),
             },
         );
-        state
-            .previous
-            .insert(node_id, (response, batch.received_at));
+        if !non_forward_same_process {
+            state
+                .previous
+                .insert(node_id, (response, batch.received_at));
+        }
+    }
+
+    for metric in DashboardMetric::ALL {
+        if dashboard_metric_has_value_conflict(&state.metrics, metric) {
+            aggregate.insert(metric, None);
+        }
     }
 
     state.history.push_back(DashboardPoint {
@@ -606,8 +981,10 @@ fn dashboard_values(
         .zip(elapsed_seconds)
         .and_then(|(interval, elapsed)| {
             metric_value_sum(
-                &interval.metrics,
+                interval,
                 "sinomo.daemon.service.requests",
+                ObserveMetricKind::Counter,
+                ObserveMetricUnit::Count,
                 rpc_filter,
             )
             .map(|value| value / elapsed)
@@ -616,8 +993,10 @@ fn dashboard_values(
         .zip(elapsed_seconds)
         .and_then(|(interval, elapsed)| {
             metric_value_sum(
-                &interval.metrics,
+                interval,
                 "sinomo.daemon.service.requests",
+                ObserveMetricKind::Counter,
+                ObserveMetricUnit::Count,
                 |record| {
                     rpc_filter(record)
                         && record.labels.get("outcome").map(String::as_str) == Some("error")
@@ -627,8 +1006,9 @@ fn dashboard_values(
         });
     let rpc_p95_ms = interval.and_then(|interval| {
         metric_histogram_quantile_max(
-            &interval.metrics,
+            interval,
             "sinomo.daemon.service.total.us",
+            ObserveMetricUnit::Microseconds,
             0.95,
             rpc_filter,
         )
@@ -636,8 +1016,9 @@ fn dashboard_values(
     });
     let kv_p95_ms = interval.and_then(|interval| {
         metric_histogram_quantile_max(
-            &interval.metrics,
+            interval,
             "sinomo.kv.command.total.us",
+            ObserveMetricUnit::Microseconds,
             0.95,
             |record| record.labels.get("outcome").map(String::as_str) == Some("ok"),
         )
@@ -650,10 +1031,23 @@ fn dashboard_values(
         "sinomo.dfs.failed_namespace_jobs",
     ]
     .into_iter()
-    .filter_map(|name| metric_value_sum(&current.metrics, name, |_| true))
+    .filter_map(|name| {
+        metric_value_sum(
+            current,
+            name,
+            ObserveMetricKind::Gauge,
+            ObserveMetricUnit::Count,
+            |_| true,
+        )
+    })
     .reduce(|left, right| left + right);
-    let agent_active_turns =
-        metric_value_sum(&current.metrics, "sinomo.agent.active_turns", |_| true);
+    let agent_active_turns = metric_value_sum(
+        current,
+        "sinomo.agent.active_turns",
+        ObserveMetricKind::Gauge,
+        ObserveMetricUnit::Count,
+        |_| true,
+    );
 
     BTreeMap::from([
         (DashboardMetric::RpcRate, rpc_rate),
@@ -666,30 +1060,77 @@ fn dashboard_values(
 }
 
 fn metric_value_sum(
-    records: &[sinomo_runtime::observe::ObserveMetricRecord],
+    response: &ObserveMetricsResponse,
     name: &str,
+    kind: ObserveMetricKind,
+    unit: ObserveMetricUnit,
     include: impl Fn(&sinomo_runtime::observe::ObserveMetricRecord) -> bool,
 ) -> Option<f64> {
-    records
+    metric_family_compatible(response, name, kind, unit)?;
+    response
+        .metrics
         .iter()
-        .filter(|record| record.name == name && include(record))
+        .filter(|record| record.name == name && record.kind == kind && include(record))
         .filter_map(|record| record.value)
         .filter(|value| value.is_finite())
         .reduce(|left, right| left + right)
 }
 
 fn metric_histogram_quantile_max(
-    records: &[sinomo_runtime::observe::ObserveMetricRecord],
+    response: &ObserveMetricsResponse,
     name: &str,
+    unit: ObserveMetricUnit,
     quantile: f64,
     include: impl Fn(&sinomo_runtime::observe::ObserveMetricRecord) -> bool,
 ) -> Option<f64> {
-    records
+    metric_family_compatible(response, name, ObserveMetricKind::Histogram, unit)?;
+    response
+        .metrics
         .iter()
-        .filter(|record| record.name == name && include(record))
+        .filter(|record| {
+            record.name == name && record.kind == ObserveMetricKind::Histogram && include(record)
+        })
         .filter_map(|record| record.histogram_quantile(quantile))
         .filter(|value| value.is_finite())
         .reduce(f64::max)
+}
+
+fn metric_family_compatible(
+    response: &ObserveMetricsResponse,
+    name: &str,
+    kind: ObserveMetricKind,
+    unit: ObserveMetricUnit,
+) -> Option<()> {
+    response
+        .descriptors
+        .iter()
+        .filter(|descriptor| descriptor.name == name)
+        .all(|descriptor| {
+            descriptor.kind == kind && descriptor.unit.is_none_or(|actual| actual == unit)
+        })
+        .then_some(())
+}
+
+fn dashboard_metric_has_value_conflict(store: &MetricStore, metric: DashboardMetric) -> bool {
+    let names: &[&str] = match metric {
+        DashboardMetric::RpcRate | DashboardMetric::RpcErrorRate => {
+            &["sinomo.daemon.service.requests"]
+        }
+        DashboardMetric::RpcP95Ms => &["sinomo.daemon.service.total.us"],
+        DashboardMetric::KvP95Ms => &["sinomo.kv.command.total.us"],
+        DashboardMetric::DfsBacklog => &[
+            "sinomo.dfs.pending_repairs",
+            "sinomo.dfs.open_conflicts",
+            "sinomo.dfs.pending_writes",
+            "sinomo.dfs.failed_namespace_jobs",
+        ],
+        DashboardMetric::AgentActiveTurns => &["sinomo.agent.active_turns"],
+    };
+    names.iter().any(|name| {
+        store
+            .catalog_entry(name)
+            .is_some_and(|entry| entry.value_conflict)
+    })
 }
 
 fn push_observation_activity(
@@ -801,6 +1242,7 @@ pub fn view(shared: Shared) -> impl Widget {
     let body = SwitchView::new()
         .selected_from(section_source.clone())
         .with_child(cluster_overview_host(&shared, &reader))
+        .with_child(cluster_explorer_view(&shared, &reader))
         .with_child(ClusterView::new(shared.clone()))
         .with_child(cluster_activity_host(&shared, &reader));
     let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
@@ -816,6 +1258,7 @@ fn build_cluster_section_bar(
     let change_shared = shared.clone();
     let tabs = TabBar::new("cluster-sections")
         .tabs(ClusterSubview::ALL.into_iter().map(ClusterSubview::title))
+        .gap(0.0)
         .selected_from(selected)
         .theme_when(clone_reader(reader))
         .on_change(move |index, _label| {
@@ -826,7 +1269,7 @@ fn build_cluster_section_bar(
                 return;
             }
             change_shared.cluster_mut().subview = subview;
-            if subview == ClusterSubview::Overview {
+            if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
                 request_observation(&change_shared);
             }
         });
@@ -840,6 +1283,1075 @@ fn build_cluster_section_bar(
         })
         .fill()
         .theme_when(clone_reader(reader))
+}
+
+fn cluster_explorer_view(shared: &Shared, reader: &ThemeReader) -> MasterDetail {
+    let navigation = shared.cluster().explorer_navigation.clone();
+    MasterDetail::new(
+        cluster_metric_catalog(shared, reader),
+        cluster_metric_detail_host(shared, reader),
+    )
+    .state(navigation)
+    .split_state(SplitState::pixels(360.0))
+}
+
+fn cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> Surface {
+    let search = {
+        let search_shared = shared.clone();
+        let input = TextInput::new("Search registered metrics")
+            .value(shared.cluster().explorer.search.clone())
+            .placeholder("Search registered metrics")
+            .leading_icon(IconGlyph::Search)
+            .theme_when(clone_reader(reader))
+            .on_change_with_ctx(move |ctx, value| {
+                search_shared.cluster_mut().set_explorer_search(value);
+                request_metric_explorer_relayout(ctx);
+            });
+        let value_shared = shared.clone();
+        SyncedMetricSearch::new(input, move || {
+            value_shared.cluster().explorer.search.clone()
+        })
+    };
+    let selected_shared = shared.clone();
+    let kind_shared = shared.clone();
+    let kind_filter = SegmentedControl::new("Metric kind")
+        .segments(
+            ExplorerKindFilter::ALL
+                .into_iter()
+                .map(ExplorerKindFilter::label),
+        )
+        .selected_when(move || {
+            ExplorerKindFilter::ALL
+                .iter()
+                .position(|kind| *kind == selected_shared.cluster().explorer.kind_filter)
+        })
+        .theme_when(clone_reader(reader))
+        .on_change_with_ctx(move |index, _label, ctx| {
+            if let Some(kind) = ExplorerKindFilter::ALL.get(index).copied() {
+                kind_shared.cluster_mut().set_explorer_kind_filter(kind);
+                request_metric_explorer_relayout(ctx);
+            }
+        });
+    let controls = Surface::window(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(8.0)
+            .with_child(search)
+            .with_child(kind_filter),
+    )
+    .border(SurfaceBorder::Bottom)
+    .padding(Insets::all(12.0))
+    .fill()
+    .theme_when(clone_reader(reader));
+    Surface::window(
+        Dock::new(cluster_metric_catalog_host(shared, reader))
+            .top(EXPLORER_CATALOG_CONTROLS_H, controls),
+    )
+    .border(SurfaceBorder::Right)
+    .fill()
+    .theme_when(clone_reader(reader))
+}
+
+fn cluster_metric_catalog_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<ClusterObservationViewKey> {
+    let source = shared
+        .signals()
+        .cluster_structure
+        .select_named("cluster metric catalog", |key| ClusterObservationViewKey {
+            theme: key.theme,
+            snapshot: key.snapshot.clone(),
+            observation_revision: key.observation_revision,
+        });
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_metric_catalog(&build_shared, &reader)
+    })
+}
+
+fn build_cluster_metric_catalog(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let (entries, selected, total, matching_total, catalog_truncated) = {
+        let cluster = shared.cluster();
+        let total = cluster.observation.metrics.catalog().count();
+        let matching = cluster
+            .observation
+            .metrics
+            .search(&cluster.explorer.search)
+            .into_iter()
+            .filter(|entry| cluster.explorer.kind_filter.includes(entry.descriptor.kind))
+            .collect::<Vec<_>>();
+        let matching_total = matching.len();
+        let entries = matching
+            .into_iter()
+            .take(EXPLORER_CATALOG_RESULT_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        (
+            entries,
+            cluster.explorer.selected_metric.clone(),
+            total,
+            matching_total,
+            cluster.observation.metrics.catalog_truncated(),
+        )
+    };
+    if entries.is_empty() {
+        return WidgetPod::new(
+            EmptyState::new(
+                if total == 0 {
+                    "Waiting for registered metrics"
+                } else {
+                    "No matching metrics"
+                },
+                if total == 0 {
+                    "Refresh or wait for the first live observation sample"
+                } else {
+                    "Try another name, help phrase, domain, or metric kind"
+                },
+            )
+            .name("Metric catalog results")
+            .icon(IconGlyph::Search)
+            .transparent()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+
+    let mut groups = BTreeMap::<String, Vec<MetricCatalogEntry>>::new();
+    for entry in entries {
+        groups.entry(entry.domain()).or_default().push(entry);
+    }
+    let mut content = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(10.0)
+        .with_child(
+            Label::new(
+                if matching_total == total && matching_total <= EXPLORER_CATALOG_RESULT_LIMIT {
+                    format!(
+                        "{} registered metric{}{}",
+                        total,
+                        if total == 1 { "" } else { "s" },
+                        if catalog_truncated {
+                            " · collection capped for safety"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!(
+                        "{} shown of {} matching · {} registered{}",
+                        matching_total.min(EXPLORER_CATALOG_RESULT_LIMIT),
+                        matching_total,
+                        total,
+                        if matching_total > EXPLORER_CATALOG_RESULT_LIMIT {
+                            " · refine search"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            )
+            .style(pal.text_style(
+                &theme,
+                theme.text.sm.size,
+                FontWeight::MEDIUM,
+                pal.text_muted,
+            )),
+        );
+    for (domain, entries) in groups {
+        content.push(
+            Label::new(domain.to_ascii_uppercase()).style(pal.text_style(
+                &theme,
+                theme.text.xs.size,
+                FontWeight::SEMIBOLD,
+                pal.text_faint,
+            )),
+        );
+        for entry in entries {
+            let name = entry.descriptor.name.clone();
+            let row_shared = shared.clone();
+            let selected_row = selected.as_deref() == Some(name.as_str());
+            let detail = format!(
+                "{}{} · {} · {} live series · {}",
+                if selected_row { "Selected · " } else { "" },
+                metric_kind_label(entry.descriptor.kind),
+                metric_unit_label(entry.descriptor.unit),
+                entry.current_series,
+                entry.descriptor.help
+            );
+            content.push(
+                Flex::vertical()
+                    .align_items(Alignment::Stretch)
+                    .gap(2.0)
+                    .with_child(
+                        Button::new(short_metric_name(&name, &domain))
+                            .semantic_name(name.clone())
+                            .description(format!("{name}. {detail}"))
+                            .appearance(if selected_row {
+                                ButtonAppearance::Tonal
+                            } else {
+                                ButtonAppearance::Ghost
+                            })
+                            .tone(if selected_row {
+                                SemanticTone::Accent
+                            } else {
+                                SemanticTone::Neutral
+                            })
+                            .theme_when(clone_reader(reader))
+                            .on_press_with_ctx(move |ctx| {
+                                row_shared
+                                    .cluster_mut()
+                                    .select_explorer_metric(name.clone());
+                                request_metric_explorer_relayout(ctx);
+                            }),
+                    )
+                    .with_child(Label::new(detail).style(pal.text_style(
+                        &theme,
+                        theme.text.xs.size,
+                        FontWeight::NORMAL,
+                        pal.text_faint,
+                    ))),
+            );
+        }
+    }
+    WidgetPod::new(
+        ScrollView::vertical(
+            Surface::window(content)
+                .padding(Insets::all(12.0))
+                .fill()
+                .theme_when(clone_reader(reader)),
+        )
+        .name("Registered metric catalog")
+        .theme(theme)
+        .viewport_width_hint(true),
+    )
+}
+
+fn cluster_metric_detail_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+) -> RebuildOnChange<ClusterObservationViewKey> {
+    let source = shared
+        .signals()
+        .cluster_structure
+        .select_named("cluster metric detail", |key| ClusterObservationViewKey {
+            theme: key.theme,
+            snapshot: key.snapshot.clone(),
+            observation_revision: key.observation_revision,
+        });
+    let build_shared = shared.clone();
+    let reader = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        build_cluster_metric_detail(&build_shared, &reader)
+    })
+}
+
+fn build_cluster_metric_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let theme = shared.theme();
+    let (entry, explorer, query, in_flight) = {
+        let cluster = shared.cluster();
+        let explorer = cluster.explorer.clone();
+        let entry = explorer
+            .selected_metric
+            .as_deref()
+            .and_then(|name| cluster.observation.metrics.catalog_entry(name).cloned());
+        let query = entry.as_ref().map(|entry| {
+            let transform = metric_query_transform(explorer.transform, entry.descriptor.kind);
+            cluster.observation.metrics.query_window(
+                &MetricSelection {
+                    metric_name: entry.descriptor.name.clone(),
+                    node_id: explorer.selected_node.clone(),
+                    labels: explorer.label_filters.clone(),
+                    transform,
+                },
+                explorer.window.sample_limit(),
+                Some(OffsetDateTime::now_utc() - explorer.window.duration()),
+            )
+        });
+        (entry, explorer, query, cluster.observation.in_flight)
+    };
+    let Some(entry) = entry else {
+        return WidgetPod::new(
+            EmptyState::new(
+                "Select a metric",
+                "Search the registered catalog to inspect current values and short live history",
+            )
+            .name("Metric explorer detail")
+            .icon(IconGlyph::Search)
+            .transparent()
+            .theme_when(clone_reader(reader)),
+        );
+    };
+    let query = query.expect("catalog entry builds a query");
+    let effective_transform =
+        if ExplorerTransform::available(entry.descriptor.kind).contains(&explorer.transform) {
+            explorer.transform
+        } else {
+            ExplorerTransform::Auto
+        };
+
+    let title = ConstraintView::new(build_metric_detail_header(
+        shared, reader, &entry, in_flight, true,
+    ))
+    .when(
+        ConstraintQuery::new().min_width(600.0),
+        build_metric_detail_header(shared, reader, &entry, in_flight, false),
+    );
+
+    let mut badges = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .align_items(Alignment::Center)
+        .gap(6.0)
+        .with_child(
+            StatusBadge::new(metric_kind_label(entry.descriptor.kind))
+                .tone(SemanticTone::Neutral)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new(metric_unit_label(entry.descriptor.unit))
+                .tone(SemanticTone::Neutral)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new(format!("{} series", entry.current_series))
+                .tone(if entry.current_series > EXPLORER_CHART_SERIES_LIMIT {
+                    SemanticTone::Warning
+                } else {
+                    SemanticTone::Neutral
+                })
+                .theme_when(clone_reader(reader)),
+        );
+    if entry.descriptor_conflict {
+        badges.push(
+            StatusBadge::new("Descriptor conflict")
+                .tone(SemanticTone::Danger)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    if entry.label_keys_truncated || !entry.label_values_truncated.is_empty() {
+        badges.push(
+            StatusBadge::new("Dimensions capped")
+                .tone(SemanticTone::Warning)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+
+    let current = build_metric_current_summary(
+        shared,
+        reader,
+        &entry,
+        effective_transform,
+        &explorer,
+        &query,
+    );
+    let controls = build_metric_query_controls(shared, reader, &entry, &explorer);
+    let chart = build_metric_chart_panel(reader, &entry, &explorer, &query);
+    let series = build_metric_series_table(reader, &entry, effective_transform, &query);
+    let content = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(14.0)
+        .with_child(title)
+        .with_child(badges)
+        .with_child(current)
+        .with_child(controls)
+        .with_child(chart)
+        .with_child(series);
+    WidgetPod::new(
+        Surface::window(
+            ScrollView::vertical(WidgetPadding::new(
+                Insets {
+                    left: 0.0,
+                    right: SCROLLBAR_GUTTER,
+                    top: 0.0,
+                    bottom: 0.0,
+                },
+                content,
+            ))
+            .name("Metric explorer detail")
+            .theme(theme)
+            .viewport_width_hint(true),
+        )
+        .padding(Insets::all(PAD))
+        .fill()
+        .theme_when(clone_reader(reader)),
+    )
+}
+
+fn build_metric_detail_header(
+    shared: &Shared,
+    reader: &ThemeReader,
+    entry: &MetricCatalogEntry,
+    in_flight: bool,
+    compact: bool,
+) -> impl Widget + use<> {
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let back_navigation = shared.cluster().explorer_navigation.clone();
+    let back = Button::new("All metrics")
+        .icon(IconGlyph::ChevronLeft)
+        .appearance(ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            back_navigation.show_master();
+            request_metric_explorer_relayout(ctx);
+        });
+    let refresh_shared = shared.clone();
+    let refresh = Button::new(if in_flight { "Collecting" } else { "Refresh" })
+        .icon(IconGlyph::Redo)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .enabled(!in_flight)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            request_observation(&refresh_shared);
+            request_metric_explorer_relayout(ctx);
+        });
+    let title = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(3.0)
+        .with_child(
+            Label::new(entry.descriptor.name.clone()).style(pal.text_style(
+                &theme,
+                if compact {
+                    theme.text.base.size
+                } else {
+                    theme.text.lg.size
+                },
+                FontWeight::SEMIBOLD,
+                pal.text,
+            )),
+        )
+        .with_child(
+            Label::new(entry.descriptor.help.clone()).style(pal.text_style(
+                &theme,
+                theme.text.sm.size,
+                FontWeight::NORMAL,
+                pal.text_muted,
+            )),
+        );
+    if compact {
+        let actions = Flex::horizontal()
+            .gap(6.0)
+            .with_child(back)
+            .with_child(refresh);
+        return Surface::window(
+            Flex::vertical()
+                .align_items(Alignment::Stretch)
+                .gap(8.0)
+                .with_child(
+                    TrailingSlotRow::new(SizedBox::new(), actions)
+                        .trailing_width(220.0)
+                        .trailing_height(34.0),
+                )
+                .with_child(title),
+        )
+        .theme_when(clone_reader(reader));
+    }
+
+    Surface::window(
+        TrailingSlotRow::new(title, refresh)
+            .trailing_width(if shared.borrow().text_scale == AppTextScale::ExtraLarge {
+                150.0
+            } else {
+                120.0
+            })
+            .trailing_height(36.0)
+            .gap(12.0),
+    )
+    .theme_when(clone_reader(reader))
+}
+
+fn build_metric_current_summary(
+    shared: &Shared,
+    reader: &ThemeReader,
+    entry: &MetricCatalogEntry,
+    transform: ExplorerTransform,
+    explorer: &MetricExplorerState,
+    query: &MetricQueryResult,
+) -> Surface {
+    let theme = shared.theme();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let current_values = query
+        .series
+        .iter()
+        .filter_map(MetricSeries::latest)
+        .collect::<Vec<_>>();
+    let min = current_values.iter().copied().reduce(f64::min);
+    let max = current_values.iter().copied().reduce(f64::max);
+    let value = if query.value_conflict {
+        "Unavailable".to_string()
+    } else if current_values.len() == 1 {
+        format_metric_value(
+            current_values.first().copied(),
+            entry.descriptor.unit,
+            transform,
+            entry.descriptor.kind,
+        )
+    } else if let (Some(min), Some(max)) = (min, max) {
+        if (max - min).abs() <= f64::EPSILON {
+            format!(
+                "{} across {} series",
+                format_metric_value(
+                    Some(max),
+                    entry.descriptor.unit,
+                    transform,
+                    entry.descriptor.kind,
+                ),
+                current_values.len()
+            )
+        } else {
+            format!(
+                "{} – {}",
+                format_metric_value(
+                    Some(min),
+                    entry.descriptor.unit,
+                    transform,
+                    entry.descriptor.kind,
+                ),
+                format_metric_value(
+                    Some(max),
+                    entry.descriptor.unit,
+                    transform,
+                    entry.descriptor.kind,
+                )
+            )
+        }
+    } else {
+        "Awaiting a current sample".to_string()
+    };
+    let (reporting, total, partial, unavailable) = {
+        let cluster = shared.cluster();
+        let targets = explorer
+            .selected_node
+            .as_ref()
+            .map(|node| vec![node.clone()])
+            .unwrap_or_else(|| {
+                let mut nodes = cluster
+                    .observation
+                    .targets
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if nodes.is_empty() {
+                    nodes.extend(entry.node_ids.iter().cloned());
+                }
+                nodes
+            });
+        let reporting = targets
+            .iter()
+            .filter(|node| entry.node_ids.contains(*node))
+            .count();
+        let partial = targets
+            .iter()
+            .filter(|node| {
+                cluster
+                    .observation
+                    .targets
+                    .get(*node)
+                    .is_some_and(|target| target.partial && target.error.is_none())
+            })
+            .count();
+        let unavailable = targets.len().saturating_sub(reporting);
+        (reporting, targets.len(), partial, unavailable)
+    };
+    let updated = query
+        .newest_at()
+        .map(format_metric_sample_age)
+        .unwrap_or_else(|| "No matching sample yet".to_string());
+    let mut coverage = format!("{updated} · {reporting}/{total} nodes reporting");
+    if partial > 0 {
+        coverage.push_str(&format!(" · {partial} partial"));
+    }
+    if unavailable > 0 {
+        coverage.push_str(&format!(" · {unavailable} unavailable"));
+    }
+    Surface::panel(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(2.0)
+            .with_child(Label::new(value).style(pal.text_style(
+                &theme,
+                theme.text.lg.size,
+                FontWeight::SEMIBOLD,
+                pal.text,
+            )))
+            .with_child(Label::new(coverage).style(pal.text_style(
+                &theme,
+                theme.text.sm.size,
+                FontWeight::NORMAL,
+                pal.text_muted,
+            ))),
+    )
+    .appearance(SurfaceAppearance::Soft)
+    .padding(Insets {
+        left: 12.0,
+        right: 12.0,
+        top: 10.0,
+        bottom: 10.0,
+    })
+    .fill()
+    .theme_when(clone_reader(reader))
+}
+
+fn format_metric_sample_age(at: OffsetDateTime) -> String {
+    let seconds = (OffsetDateTime::now_utc() - at).whole_seconds().max(0);
+    if seconds < 5 {
+        "Updated now".to_string()
+    } else if seconds < 60 {
+        format!("Updated {seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("Updated {}m ago", seconds / 60)
+    } else {
+        format!("Updated {}h ago", seconds / 3_600)
+    }
+}
+
+fn format_metric_span(span: time::Duration) -> String {
+    let seconds = span.whole_seconds().max(0);
+    if seconds < 1 {
+        "one instant".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+fn build_metric_query_controls(
+    shared: &Shared,
+    reader: &ThemeReader,
+    entry: &MetricCatalogEntry,
+    explorer: &MetricExplorerState,
+) -> Flex {
+    let mut nodes = std::iter::once("All nodes".to_string())
+        .chain(entry.node_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    if let Some(selected) = explorer.selected_node.as_ref()
+        && !nodes.contains(selected)
+    {
+        nodes.push(selected.clone());
+    }
+    let selected_node = explorer
+        .selected_node
+        .as_ref()
+        .and_then(|node| nodes.iter().position(|candidate| candidate == node))
+        .unwrap_or(0);
+    let node_shared = shared.clone();
+    let node_options = nodes.clone();
+    let node = Select::new("Metric node scope")
+        .options(nodes)
+        .selected(selected_node)
+        .theme_when(clone_reader(reader))
+        .on_change_with_ctx(move |ctx, index, _label| {
+            let node_id = if index == 0 {
+                None
+            } else {
+                node_options.get(index).cloned()
+            };
+            node_shared.cluster_mut().set_explorer_node(node_id);
+            request_metric_explorer_relayout(ctx);
+        });
+
+    let transforms = ExplorerTransform::available(entry.descriptor.kind);
+    let selected_transform = transforms
+        .iter()
+        .position(|transform| *transform == explorer.transform)
+        .unwrap_or(0);
+    let transform_shared = shared.clone();
+    let transform_options = transforms.to_vec();
+    let transform = Select::new("Metric transform")
+        .options(transforms.iter().map(|transform| transform.label()))
+        .selected(selected_transform)
+        .theme_when(clone_reader(reader))
+        .on_change_with_ctx(move |ctx, index, _label| {
+            if let Some(transform) = transform_options.get(index).copied() {
+                transform_shared
+                    .cluster_mut()
+                    .set_explorer_transform(transform);
+                request_metric_explorer_relayout(ctx);
+            }
+        });
+
+    let window_shared = shared.clone();
+    let window = SegmentedControl::new("Metric time window")
+        .segments(ExplorerWindow::ALL.into_iter().map(ExplorerWindow::label))
+        .selected(
+            ExplorerWindow::ALL
+                .iter()
+                .position(|window| *window == explorer.window)
+                .unwrap_or(ExplorerWindow::ALL.len() - 1),
+        )
+        .theme_when(clone_reader(reader))
+        .on_change_with_ctx(move |index, _label, ctx| {
+            if let Some(window) = ExplorerWindow::ALL.get(index).copied() {
+                window_shared.cluster_mut().set_explorer_window(window);
+                request_metric_explorer_relayout(ctx);
+            }
+        });
+
+    let mut controls = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .align_items(Alignment::Start)
+        .gap(8.0);
+    controls.push_item(node, metric_query_control_item());
+    controls.push_item(transform, metric_query_control_item());
+    controls.push_item(window, metric_query_control_item());
+    let mut filter_keys = entry.label_keys.clone();
+    filter_keys.extend(explorer.label_filters.keys().cloned());
+    for key in &filter_keys {
+        let values = entry.label_values.get(key);
+        if values.is_none_or(BTreeSet::is_empty) && !explorer.label_filters.contains_key(key) {
+            continue;
+        }
+        let mut options = std::iter::once(format!("All {key}"))
+            .chain(values.into_iter().flat_map(|values| values.iter().cloned()))
+            .collect::<Vec<_>>();
+        if let Some(selected) = explorer.label_filters.get(key)
+            && !options.contains(selected)
+        {
+            options.push(selected.clone());
+        }
+        let selected = explorer
+            .label_filters
+            .get(key)
+            .and_then(|value| options.iter().position(|candidate| candidate == value))
+            .unwrap_or(0);
+        let filter_shared = shared.clone();
+        let filter_key = key.clone();
+        let filter_options = options.clone();
+        let select = Select::new(format!("Metric label {key}"))
+            .options(options)
+            .selected(selected)
+            .theme_when(clone_reader(reader))
+            .on_change_with_ctx(move |ctx, index, _label| {
+                let value = if index == 0 {
+                    None
+                } else {
+                    filter_options.get(index).cloned()
+                };
+                filter_shared
+                    .cluster_mut()
+                    .set_explorer_label(filter_key.clone(), value);
+                request_metric_explorer_relayout(ctx);
+            });
+        controls.push_item(select, metric_query_control_item());
+    }
+    controls
+}
+
+fn metric_query_control_item() -> FlexItem {
+    FlexItem::new()
+        .grow(1.0)
+        .basis_gap_aware_fraction(0.25)
+        .min_width(180.0)
+        .max_width(360.0)
+}
+
+fn sort_metric_series(series: &mut [MetricSeries]) {
+    series.sort_by(|left, right| {
+        right
+            .latest()
+            .partial_cmp(&left.latest())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+}
+
+fn build_metric_chart_panel(
+    reader: &ThemeReader,
+    entry: &MetricCatalogEntry,
+    explorer: &MetricExplorerState,
+    query: &MetricQueryResult,
+) -> Surface {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, theme.surfaces.dark);
+    let mut chart_series = query.series.clone();
+    sort_metric_series(&mut chart_series);
+    chart_series.truncate(EXPLORER_CHART_SERIES_LIMIT);
+    let sample_count = query
+        .series
+        .iter()
+        .map(|series| series.points.len())
+        .max()
+        .unwrap_or_default();
+    let observed_span = query
+        .oldest_at()
+        .zip(query.newest_at())
+        .map(|(oldest, newest)| format_metric_span(newest - oldest))
+        .unwrap_or_else(|| "no span yet".to_string());
+    let subtitle = format!(
+        "{} · {} · {} window · {} retained sample{} over {}",
+        explorer_transform_summary(explorer.transform, entry.descriptor.kind),
+        metric_unit_label(entry.descriptor.unit),
+        explorer.window.label(),
+        sample_count,
+        if sample_count == 1 { "" } else { "s" },
+        observed_span,
+    );
+    let mut body = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(6.0)
+        .with_child(Label::new("Live history").style(pal.text_style(
+            &theme,
+            theme.text.base.size,
+            FontWeight::SEMIBOLD,
+            pal.text,
+        )))
+        .with_child(Label::new(subtitle).style(pal.text_style(
+            &theme,
+            theme.text.sm.size,
+            FontWeight::NORMAL,
+            pal.text_muted,
+        )));
+    if !chart_series.is_empty() {
+        let mut legend = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .align_items(Alignment::Center)
+            .gap(8.0);
+        for (index, series) in chart_series.iter().enumerate() {
+            let label = format!(
+                "S{} {} · {}",
+                index + 1,
+                short(&series.key.display_name(), 30),
+                format_metric_value(
+                    series.latest(),
+                    entry.descriptor.unit,
+                    explorer.transform,
+                    entry.descriptor.kind,
+                )
+            );
+            legend.push(Label::new(label).style(pal.text_style(
+                &theme,
+                theme.text.xs.size,
+                FontWeight::MEDIUM,
+                pal.agent[index % pal.agent.len()],
+            )));
+        }
+        body.push(legend);
+    }
+    if query.value_conflict {
+        body.push(
+            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+                EmptyState::new(
+                    "Conflicting metric descriptors",
+                    "Nodes disagree on this metric's kind or unit, so Sinomo will not combine or transform its series",
+                )
+                .name("Metric chart descriptor conflict")
+                .icon(IconGlyph::Alert)
+                .transparent()
+                .theme_when(clone_reader(reader)),
+            ),
+        );
+    } else if chart_series.is_empty() {
+        body.push(
+            SizedBox::new().height(EXPLORER_CHART_H).with_child(
+                EmptyState::new(
+                    "Collecting live history",
+                    "The current value appears after a matching sample; rates and quantiles need two process-stable samples",
+                )
+                .name("Metric chart empty state")
+                .icon(IconGlyph::Redo)
+                .transparent()
+                .theme_when(clone_reader(reader)),
+            ),
+        );
+    } else {
+        body.push(
+            SizedBox::new()
+                .height(EXPLORER_CHART_H)
+                .with_child(MetricChart::new(
+                    entry.descriptor.name.clone(),
+                    chart_series,
+                    theme,
+                    pal.agent,
+                    entry.descriptor.unit,
+                    explorer.transform,
+                    entry.descriptor.kind,
+                )),
+        );
+    }
+    if !query.value_conflict
+        && (query.history_truncated || query.matching_series > EXPLORER_CHART_SERIES_LIMIT)
+    {
+        body.push(
+            StatusBadge::new(format!(
+                "Showing up to {} of {} matching series; filter by node or labels for a precise comparison",
+                EXPLORER_CHART_SERIES_LIMIT,
+                query.matching_series.max(query.series.len())
+            ))
+            .tone(SemanticTone::Warning)
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    Surface::panel(body)
+        .appearance(SurfaceAppearance::Raised)
+        .elevation(SurfaceElevation::Small)
+        .padding(Insets::all(14.0))
+        .fill()
+        .theme_when(clone_reader(reader))
+}
+
+fn build_metric_series_table(
+    reader: &ThemeReader,
+    entry: &MetricCatalogEntry,
+    transform: ExplorerTransform,
+    query: &MetricQueryResult,
+) -> PanelSection {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, theme.surfaces.dark);
+    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(6.0);
+    if query.value_conflict {
+        rows.push(
+            DetailRow::new(
+                "Series",
+                "Unavailable until every sampled node reports the same metric kind and unit",
+            )
+            .theme_when(clone_reader(reader)),
+        );
+    } else if query.series.is_empty() {
+        rows.push(
+            DetailRow::new("Series", "No matching retained series yet")
+                .theme_when(clone_reader(reader)),
+        );
+    } else {
+        let mut series = query.series.clone();
+        sort_metric_series(&mut series);
+        for (index, series) in series.iter().take(16).enumerate() {
+            let values = series.finite_values().collect::<Vec<_>>();
+            let latest = series.latest();
+            let min = values.iter().copied().reduce(f64::min);
+            let max = values.iter().copied().reduce(f64::max);
+            let identity = if index < EXPLORER_CHART_SERIES_LIMIT {
+                format!("S{} · {}", index + 1, series.key.display_name())
+            } else {
+                series.key.display_name()
+            };
+            let identity_color = if index < EXPLORER_CHART_SERIES_LIMIT {
+                pal.agent[index % pal.agent.len()]
+            } else {
+                pal.text
+            };
+            let value = format!(
+                "now {} · min {} · max {} · {} sample{}",
+                format_metric_value(
+                    latest,
+                    entry.descriptor.unit,
+                    transform,
+                    entry.descriptor.kind,
+                ),
+                format_metric_value(min, entry.descriptor.unit, transform, entry.descriptor.kind,),
+                format_metric_value(max, entry.descriptor.unit, transform, entry.descriptor.kind,),
+                values.len(),
+                if values.len() == 1 { "" } else { "s" }
+            );
+            rows.push(
+                Surface::window(
+                    Flex::vertical()
+                        .align_items(Alignment::Stretch)
+                        .gap(2.0)
+                        .with_child(Label::new(identity).style(pal.text_style(
+                            &theme,
+                            theme.text.sm.size,
+                            FontWeight::SEMIBOLD,
+                            identity_color,
+                        )))
+                        .with_child(Label::new(value).style(pal.text_style(
+                            &theme,
+                            theme.text.sm.size,
+                            FontWeight::NORMAL,
+                            pal.text_muted,
+                        ))),
+                )
+                .border(SurfaceBorder::Bottom)
+                .padding(Insets {
+                    left: 0.0,
+                    right: 0.0,
+                    top: 4.0,
+                    bottom: 6.0,
+                })
+                .fill()
+                .theme_when(clone_reader(reader)),
+            );
+        }
+    }
+    PanelSection::new("Matching series", rows).theme_when(clone_reader(reader))
+}
+
+fn request_metric_explorer_relayout(ctx: &mut EventCtx) {
+    ctx.request_measure();
+    ctx.request_arrange();
+    ctx.request_paint();
+    ctx.request_semantics();
+}
+
+fn metric_kind_label(kind: sinomo_runtime::observe::ObserveMetricKind) -> &'static str {
+    use sinomo_runtime::observe::ObserveMetricKind;
+    match kind {
+        ObserveMetricKind::Counter => "Counter",
+        ObserveMetricKind::Gauge => "Gauge",
+        ObserveMetricKind::Histogram => "Histogram",
+    }
+}
+
+fn metric_unit_label(unit: Option<sinomo_runtime::observe::ObserveMetricUnit>) -> &'static str {
+    use sinomo_runtime::observe::ObserveMetricUnit;
+    match unit {
+        Some(ObserveMetricUnit::Count) => "count",
+        Some(ObserveMetricUnit::Bytes) => "bytes",
+        Some(ObserveMetricUnit::Seconds) => "seconds",
+        Some(ObserveMetricUnit::Microseconds) => "microseconds",
+        Some(ObserveMetricUnit::Ratio) => "ratio",
+        None => "raw value",
+    }
+}
+
+fn metric_query_transform(
+    transform: ExplorerTransform,
+    kind: sinomo_runtime::observe::ObserveMetricKind,
+) -> MetricTransform {
+    use sinomo_runtime::observe::ObserveMetricKind;
+    match transform {
+        ExplorerTransform::Auto => match kind {
+            ObserveMetricKind::Counter => MetricTransform::Rate,
+            ObserveMetricKind::Gauge => MetricTransform::Current,
+            ObserveMetricKind::Histogram => MetricTransform::HistogramQuantile(95),
+        },
+        ExplorerTransform::Current => MetricTransform::Current,
+        ExplorerTransform::Rate => MetricTransform::Rate,
+        ExplorerTransform::Delta => MetricTransform::Delta,
+        ExplorerTransform::P50 => MetricTransform::HistogramQuantile(50),
+        ExplorerTransform::P95 => MetricTransform::HistogramQuantile(95),
+        ExplorerTransform::P99 => MetricTransform::HistogramQuantile(99),
+    }
+}
+
+fn explorer_transform_summary(
+    transform: ExplorerTransform,
+    kind: sinomo_runtime::observe::ObserveMetricKind,
+) -> &'static str {
+    match (transform, kind) {
+        (ExplorerTransform::Auto, sinomo_runtime::observe::ObserveMetricKind::Counter) => {
+            "Automatic rate"
+        }
+        (ExplorerTransform::Auto, sinomo_runtime::observe::ObserveMetricKind::Gauge) => {
+            "Automatic value"
+        }
+        (ExplorerTransform::Auto, sinomo_runtime::observe::ObserveMetricKind::Histogram) => {
+            "Automatic p95"
+        }
+        _ => transform.label(),
+    }
+}
+
+fn short_metric_name(name: &str, domain: &str) -> String {
+    name.strip_prefix(&format!("sinomo.{domain}."))
+        .unwrap_or(name)
+        .to_string()
 }
 
 struct ClusterView {
@@ -1190,11 +2702,17 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     };
     sort_target_summaries(&mut targets, local_node_id.as_deref());
     let latest = history.back();
+    let metric_card_height = match shared.borrow().text_scale {
+        AppTextScale::Standard => 156.0,
+        AppTextScale::Large => 170.0,
+        AppTextScale::ExtraLarge => 184.0,
+    };
     let mut cards = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .align_items(Alignment::Start)
         .gap(12.0);
-    for metric in DashboardMetric::ALL {
+    for panel in DEFAULT_DASHBOARD.panels {
+        let metric = panel.metric;
         let values = history
             .iter()
             .map(|point| point.values.get(&metric).copied().flatten())
@@ -1204,15 +2722,45 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             .copied()
             .flatten();
         let value_label = format_dashboard_value(metric, value);
-        let card = Flex::vertical()
-            .align_items(Alignment::Stretch)
-            .gap(4.0)
-            .with_child(Label::new(metric.title()).style(pal.text_style(
+        let inspect_shared = shared.clone();
+        let explorer_metric = panel.explorer_metric;
+        let explorer_transform = panel.explorer_transform;
+        let explorer_labels = panel.explorer_labels;
+        let inspect = Button::new("Inspect")
+            .icon(IconGlyph::ChevronRight)
+            .semantic_name(format!("Inspect {}", panel.title))
+            .description(format!("Inspect {} in the metric explorer", panel.title))
+            .appearance(ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
+            .min_height(26.0)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                inspect_shared.cluster_mut().inspect_explorer_metric(
+                    explorer_metric,
+                    explorer_transform,
+                    explorer_labels
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+                );
+                request_observation(&inspect_shared);
+                request_metric_explorer_relayout(ctx);
+            });
+        let title = TrailingSlotRow::new(
+            Label::new(panel.title).style(pal.text_style(
                 &theme,
                 theme.text.sm.size,
                 FontWeight::MEDIUM,
                 pal.text_muted,
-            )))
+            )),
+            inspect,
+        )
+        .trailing_width(112.0)
+        .trailing_height(34.0)
+        .gap(6.0);
+        let card = Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(4.0)
+            .with_child(title)
             .with_child(Label::new(value_label).style(pal.text_style(
                 &theme,
                 theme.text.xl.size,
@@ -1221,9 +2769,9 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             )))
             .with_child(Sparkline::new(metric, values, theme, pal.accent));
         cards.push_item(
-            SizedBox::new().height(142.0).with_child(
+            SizedBox::new().height(metric_card_height).with_child(
                 Surface::panel(card)
-                    .name(metric.title())
+                    .name(panel.title)
                     .appearance(SurfaceAppearance::Raised)
                     .elevation(SurfaceElevation::Small)
                     .padding(Insets::all(12.0))
@@ -1294,20 +2842,19 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         Flex::vertical()
             .align_items(Alignment::Stretch)
             .gap(2.0)
-            .with_child(Label::new("Live performance").style(pal.text_style(
+            .with_child(Label::new(DEFAULT_DASHBOARD.title).style(pal.text_style(
                 &theme,
                 theme.text.lg.size,
                 FontWeight::SEMIBOLD,
                 pal.text,
             )))
             .with_child(
-                Label::new("Short in-memory history; use Prometheus and Grafana for retention.")
-                    .style(pal.text_style(
-                        &theme,
-                        theme.text.sm.size,
-                        FontWeight::NORMAL,
-                        pal.text_muted,
-                    )),
+                Label::new(DEFAULT_DASHBOARD.description).style(pal.text_style(
+                    &theme,
+                    theme.text.sm.size,
+                    FontWeight::NORMAL,
+                    pal.text_muted,
+                )),
             ),
         refresh,
     )
@@ -1384,10 +2931,18 @@ fn build_cluster_overview(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         );
     WidgetPod::new(
         Surface::window(
-            ScrollView::vertical(content)
-                .name("Cluster performance overview")
-                .theme(theme)
-                .viewport_width_hint(true),
+            ScrollView::vertical(WidgetPadding::new(
+                Insets {
+                    left: 0.0,
+                    right: SCROLLBAR_GUTTER,
+                    top: 0.0,
+                    bottom: 0.0,
+                },
+                content,
+            ))
+            .name("Cluster performance overview")
+            .theme(theme)
+            .viewport_width_hint(true),
         )
         .padding(Insets::all(PAD))
         .fill()
@@ -1515,6 +3070,366 @@ fn format_optional(value: Option<f64>, suffix: &str) -> String {
         .filter(|value| value.is_finite())
         .map(|value| format!("{value:.1}{suffix}"))
         .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_metric_value(
+    value: Option<f64>,
+    unit: Option<sinomo_runtime::observe::ObserveMetricUnit>,
+    transform: ExplorerTransform,
+    kind: sinomo_runtime::observe::ObserveMetricKind,
+) -> String {
+    use sinomo_runtime::observe::ObserveMetricUnit;
+
+    let Some(value) = value.filter(|value| value.is_finite()) else {
+        return "—".to_string();
+    };
+    let rate = metric_query_transform(transform, kind) == MetricTransform::Rate;
+    match unit {
+        Some(ObserveMetricUnit::Bytes) => {
+            let (scaled, suffix) = if value.abs() >= 1024.0_f64.powi(3) {
+                (value / 1024.0_f64.powi(3), "GiB")
+            } else if value.abs() >= 1024.0_f64.powi(2) {
+                (value / 1024.0_f64.powi(2), "MiB")
+            } else if value.abs() >= 1024.0 {
+                (value / 1024.0, "KiB")
+            } else {
+                (value, "B")
+            };
+            format!("{scaled:.2} {suffix}{}", if rate { "/s" } else { "" })
+        }
+        Some(ObserveMetricUnit::Seconds) => {
+            if value.abs() < 1.0 {
+                format!("{:.2} ms{}", value * 1_000.0, if rate { "/s" } else { "" })
+            } else {
+                format!("{value:.2} s{}", if rate { "/s" } else { "" })
+            }
+        }
+        Some(ObserveMetricUnit::Microseconds) => {
+            if value.abs() >= 1_000_000.0 {
+                format!(
+                    "{:.2} s{}",
+                    value / 1_000_000.0,
+                    if rate { "/s" } else { "" }
+                )
+            } else if value.abs() >= 1_000.0 {
+                format!("{:.2} ms{}", value / 1_000.0, if rate { "/s" } else { "" })
+            } else {
+                format!("{value:.1} µs{}", if rate { "/s" } else { "" })
+            }
+        }
+        Some(ObserveMetricUnit::Ratio) => format!("{:.1}%", value * 100.0),
+        Some(ObserveMetricUnit::Count) => {
+            if rate {
+                format!("{value:.2}/s")
+            } else if value.abs() >= 100.0 || value.fract().abs() < f64::EPSILON {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.2}")
+            }
+        }
+        None => {
+            if rate {
+                format!("{value:.2}/s")
+            } else {
+                format!("{value:.3}")
+            }
+        }
+    }
+}
+
+struct SyncedMetricSearch {
+    inner: TextInput,
+    value_reader: Box<dyn Fn() -> String>,
+}
+
+impl SyncedMetricSearch {
+    fn new<F>(inner: TextInput, value_reader: F) -> Self
+    where
+        F: Fn() -> String + 'static,
+    {
+        Self {
+            inner,
+            value_reader: Box::new(value_reader),
+        }
+    }
+
+    fn sync_value(&mut self) {
+        let value = (self.value_reader)();
+        if self.inner.current_value() != value {
+            self.inner.set_value(value);
+        }
+    }
+}
+
+impl Widget for SyncedMetricSearch {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        self.inner.event(ctx, event);
+    }
+
+    fn command(&mut self, ctx: &mut EventCtx, command: &Command<'_>) {
+        self.inner.command(ctx, command);
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_value();
+        self.inner.measure(ctx, constraints)
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.inner.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.inner.semantics(ctx);
+    }
+
+    fn accepts_focus(&self) -> bool {
+        self.inner.accepts_focus()
+    }
+
+    fn focus_changed(&mut self, ctx: &mut EventCtx, focused: bool) {
+        self.inner.focus_changed(ctx, focused);
+    }
+}
+
+struct MetricChart {
+    name: String,
+    series: Vec<MetricSeries>,
+    theme: DefaultTheme,
+    colors: [Color; 6],
+    unit: Option<sinomo_runtime::observe::ObserveMetricUnit>,
+    transform: ExplorerTransform,
+    kind: sinomo_runtime::observe::ObserveMetricKind,
+}
+
+impl MetricChart {
+    fn new(
+        name: String,
+        series: Vec<MetricSeries>,
+        theme: DefaultTheme,
+        colors: [Color; 6],
+        unit: Option<sinomo_runtime::observe::ObserveMetricUnit>,
+        transform: ExplorerTransform,
+        kind: sinomo_runtime::observe::ObserveMetricKind,
+    ) -> Self {
+        Self {
+            name,
+            series,
+            theme,
+            colors,
+            unit,
+            transform,
+            kind,
+        }
+    }
+
+    fn finite_values(&self) -> impl Iterator<Item = f64> + '_ {
+        self.series.iter().flat_map(MetricSeries::finite_values)
+    }
+
+    fn description(&self) -> String {
+        let values = self.finite_values().collect::<Vec<_>>();
+        let min = values.iter().copied().reduce(f64::min);
+        let max = values.iter().copied().reduce(f64::max);
+        match (min, max) {
+            (Some(min), Some(max)) => {
+                let series = self
+                    .series
+                    .iter()
+                    .enumerate()
+                    .map(|(index, series)| {
+                        format!(
+                            "S{} {}, current {}",
+                            index + 1,
+                            series.key.display_name(),
+                            format_metric_value(
+                                series.latest(),
+                                self.unit,
+                                self.transform,
+                                self.kind,
+                            )
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "{} live chart with {} series and {} finite samples; minimum {}, maximum {}; {}",
+                    self.name,
+                    self.series.len(),
+                    values.len(),
+                    format_metric_value(Some(min), self.unit, self.transform, self.kind),
+                    format_metric_value(Some(max), self.unit, self.transform, self.kind),
+                    series,
+                )
+            }
+            _ => format!("{} live chart is collecting interval samples", self.name),
+        }
+    }
+}
+
+impl Widget for MetricChart {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            640.0
+        };
+        constraints.clamp(Size::new(width, EXPLORER_CHART_H))
+    }
+
+    fn arrange(&mut self, _ctx: &mut ArrangeCtx, _bounds: Rect) {}
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let bounds = ctx.bounds();
+        if bounds.is_empty() {
+            return;
+        }
+        let left_gutter = if bounds.width() < 420.0 { 66.0 } else { 86.0 };
+        let bottom_gutter = 24.0;
+        let chart = Rect::new(
+            bounds.x() + left_gutter,
+            bounds.y() + 6.0,
+            (bounds.width() - left_gutter - 6.0).max(0.0),
+            (bounds.height() - bottom_gutter - 8.0).max(0.0),
+        );
+        let values = self.finite_values().collect::<Vec<_>>();
+        let Some(mut min) = values.iter().copied().reduce(f64::min) else {
+            ctx.stroke_rect(chart, self.theme.palette.border, StrokeStyle::new(1.0));
+            return;
+        };
+        let mut max = values.iter().copied().reduce(f64::max).unwrap_or(min);
+        if (max - min).abs() <= f64::EPSILON {
+            let padding = max.abs().max(1.0) * 0.05;
+            min -= padding;
+            max += padding;
+        } else {
+            let padding = (max - min) * 0.05;
+            min -= padding;
+            max += padding;
+        }
+        if values.iter().all(|value| *value >= 0.0) {
+            min = min.max(0.0);
+        }
+        let pal = Palette::from_theme(&self.theme, self.theme.surfaces.dark);
+        let axis_style = pal.text_style(
+            &self.theme,
+            self.theme.text.xs.size,
+            FontWeight::NORMAL,
+            pal.text_faint,
+        );
+        for index in 0..=4 {
+            let fraction = index as f64 / 4.0;
+            let y = chart.y() + chart.height() * fraction as f32;
+            let mut guide = PathBuilder::new();
+            guide.move_to(Point::new(chart.x(), y));
+            guide.line_to(Point::new(chart.max_x(), y));
+            ctx.stroke(
+                guide.build(),
+                self.theme.palette.border.with_alpha(0.55),
+                StrokeStyle::new(1.0),
+            );
+            let value = max - (max - min) * fraction;
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    bounds.x(),
+                    y - axis_style.line_height * 0.5,
+                    left_gutter - 7.0,
+                    axis_style.line_height,
+                ),
+                &short(
+                    &format_metric_value(Some(value), self.unit, self.transform, self.kind),
+                    12,
+                ),
+                axis_style.clone(),
+            );
+        }
+        let first_at = self
+            .series
+            .iter()
+            .flat_map(|series| series.points.iter().map(|point| point.at))
+            .min();
+        let last_at = self
+            .series
+            .iter()
+            .flat_map(|series| series.points.iter().map(|point| point.at))
+            .max();
+        let time_span = first_at
+            .zip(last_at)
+            .map(|(first, last)| (last - first).as_seconds_f64())
+            .filter(|span| *span > f64::EPSILON);
+        if let (Some(first), Some(last)) = (first_at, last_at) {
+            let start = format!("-{}", format_metric_span(last - first));
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    chart.x(),
+                    chart.max_y() + 4.0,
+                    chart.width() * 0.5,
+                    axis_style.line_height,
+                ),
+                &start,
+                axis_style.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    (chart.max_x() - 44.0).max(chart.x()),
+                    chart.max_y() + 4.0,
+                    44.0,
+                    axis_style.line_height,
+                ),
+                "latest",
+                axis_style,
+            );
+        }
+
+        for (series_index, series) in self.series.iter().enumerate() {
+            let color = self.colors[series_index % self.colors.len()];
+            let denominator = series.points.len().saturating_sub(1).max(1) as f32;
+            let mut path = PathBuilder::new();
+            let mut drawing = false;
+            let mut terminal_point = None;
+            for (point_index, point) in series.points.iter().enumerate() {
+                let Some(value) = point.value.filter(|value| value.is_finite()) else {
+                    drawing = false;
+                    continue;
+                };
+                let x_fraction = time_span
+                    .zip(first_at)
+                    .map(|(span, first)| ((point.at - first).as_seconds_f64() / span) as f32)
+                    .unwrap_or(point_index as f32 / denominator)
+                    .clamp(0.0, 1.0);
+                let y_fraction = ((value - min) / (max - min)) as f32;
+                let point = Point::new(
+                    chart.x() + chart.width() * x_fraction,
+                    chart.max_y() - chart.height() * y_fraction,
+                );
+                if drawing {
+                    path.line_to(point);
+                } else {
+                    path.move_to(point);
+                    drawing = true;
+                }
+                if point_index + 1 == series.points.len() {
+                    terminal_point = Some(point);
+                }
+            }
+            ctx.stroke(path.build(), color, StrokeStyle::new(1.8));
+            if let Some(point) = terminal_point {
+                ctx.fill(Path::circle(point, 2.7), color);
+            }
+        }
+        ctx.stroke_rect(chart, self.theme.palette.border, StrokeStyle::new(1.0));
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Image, ctx.bounds());
+        node.name = Some(format!("{} live history", self.name));
+        node.description = Some(self.description());
+        node.value = Some(SemanticsValue::Text(self.description()));
+        ctx.push(node);
+    }
 }
 
 struct Sparkline {
@@ -3063,8 +4978,9 @@ mod tests {
     use crate::state::AppState;
     use crate::theme::{AppTextScale, AppThemeMode, resolve_theme, resolve_theme_with_preferences};
     use sinomo_runtime::observe::{
-        ObserveHistogramBucket, ObserveMetricExporterStatus, ObserveMetricKind,
-        ObserveMetricRecord, ObserveMetricsResponse,
+        ObserveHistogramBucket, ObserveMetricAggregation, ObserveMetricDescriptor,
+        ObserveMetricExporterStatus, ObserveMetricKind, ObserveMetricRecord,
+        ObserveMetricSemantics, ObserveMetricUnit, ObserveMetricsResponse,
     };
 
     fn node(id: &str) -> ClusterNodeInfo {
@@ -3320,7 +5236,146 @@ mod tests {
                 warning: true,
             },
         ]);
+        cluster.observation.metrics = seeded_metric_store(now);
         cluster.observation.revision = cluster.observation.revision.wrapping_add(1);
+    }
+
+    fn seeded_metric_store(now: OffsetDateTime) -> MetricStore {
+        let descriptor = |name, kind, unit, help: &str, domain: &str, labels: &[&str]| {
+            ObserveMetricDescriptor::new(name, kind, Some(unit), help).with_semantics(
+                ObserveMetricSemantics::new(
+                    domain,
+                    match kind {
+                        ObserveMetricKind::Counter => ObserveMetricAggregation::Sum,
+                        ObserveMetricKind::Histogram => ObserveMetricAggregation::MergeHistogram,
+                        ObserveMetricKind::Gauge => ObserveMetricAggregation::None,
+                    },
+                    labels.iter().copied(),
+                ),
+            )
+        };
+        let descriptors = vec![
+            descriptor(
+                "sinomo.daemon.service.requests",
+                ObserveMetricKind::Counter,
+                ObserveMetricUnit::Count,
+                "Daemon object RPC requests.",
+                "daemon",
+                &["route", "category", "outcome"],
+            ),
+            descriptor(
+                "sinomo.daemon.service.total.us",
+                ObserveMetricKind::Histogram,
+                ObserveMetricUnit::Microseconds,
+                "End-to-end daemon service request latency.",
+                "daemon",
+                &["route", "category", "outcome"],
+            ),
+            descriptor(
+                "sinomo.kv.commit.queue_depth",
+                ObserveMetricKind::Gauge,
+                ObserveMetricUnit::Count,
+                "Cluster KV commit queue depth.",
+                "kv",
+                &[],
+            ),
+            descriptor(
+                "sinomo.dfs.pending_repairs",
+                ObserveMetricKind::Gauge,
+                ObserveMetricUnit::Count,
+                "DFS repairs waiting for reconciliation.",
+                "dfs",
+                &[],
+            ),
+            descriptor(
+                "sinomo.agent.active_turns",
+                ObserveMetricKind::Gauge,
+                ObserveMetricUnit::Count,
+                "Agent turns currently active.",
+                "agent",
+                &[],
+            ),
+        ];
+        let process_started_at = now - time::Duration::minutes(10);
+        let mut store = MetricStore::default();
+        store.set_history_scope(
+            Some("sinomo.daemon.service.requests".to_string()),
+            None,
+            BTreeMap::new(),
+        );
+        for index in 0..18_u64 {
+            let at = now - time::Duration::seconds((17 - index as i64) * 5);
+            let make_response = |node_id: &str, base: u64, step: u64| {
+                let phase = if node_id == "node-compute-02" { 2 } else { 0 };
+                let request_total = (0..=index)
+                    .map(|sample| step + ((sample + phase) % 5) * 2)
+                    .sum::<u64>();
+                let error_total = (0..=index)
+                    .map(|sample| if (sample + phase) % 4 == 0 { 2 } else { 0 })
+                    .sum::<u64>();
+                ObserveMetricsResponse {
+                    observed_at: Some(at),
+                    process_started_at: Some(process_started_at),
+                    process_role: Some("daemon".to_string()),
+                    node_id: Some(node_id.to_string()),
+                    exporters: Vec::new(),
+                    partial: false,
+                    descriptors: descriptors.clone(),
+                    metrics: vec![
+                        metric_counter(
+                            "sinomo.daemon.service.requests",
+                            base + request_total,
+                            &[
+                                ("route", "/objects"),
+                                ("category", "object"),
+                                ("outcome", "ok"),
+                            ],
+                        ),
+                        metric_counter(
+                            "sinomo.daemon.service.requests",
+                            base / 20 + error_total,
+                            &[
+                                ("route", "/objects"),
+                                ("category", "object"),
+                                ("outcome", "error"),
+                            ],
+                        ),
+                        metric_histogram(
+                            "sinomo.daemon.service.total.us",
+                            100 + index * 10,
+                            50_000.0,
+                            &[
+                                ("route", "/objects"),
+                                ("category", "object"),
+                                ("outcome", "ok"),
+                            ],
+                        ),
+                        ObserveMetricRecord::gauge(
+                            "sinomo.kv.commit.queue_depth",
+                            BTreeMap::new(),
+                            (index % 5) as f64,
+                        ),
+                        ObserveMetricRecord::gauge(
+                            "sinomo.dfs.pending_repairs",
+                            BTreeMap::new(),
+                            (8_u64.saturating_sub(index / 3)) as f64,
+                        ),
+                        ObserveMetricRecord::gauge(
+                            "sinomo.agent.active_turns",
+                            BTreeMap::new(),
+                            2.0 + (index % 4) as f64,
+                        ),
+                    ],
+                }
+            };
+            let edge = make_response("node-edge-east", 1_000, 20);
+            let compute = make_response("node-compute-02", 500, 12);
+            store.ingest_batch(
+                at,
+                [("node-edge-east", &edge), ("node-compute-02", &compute)],
+            );
+        }
+        store
     }
 
     #[test]
@@ -3402,6 +5457,83 @@ mod tests {
                 && entry.detail == "process restarted; interval baseline reset"
                 && !entry.warning
         }));
+
+        apply_observation_batch(
+            &mut state,
+            sample_batch(
+                test_time(25),
+                "node-a",
+                Ok(metrics_response(
+                    test_time(25),
+                    test_time(19),
+                    vec![metric_counter("sinomo.daemon.service.requests", 2, &labels)],
+                )),
+            ),
+        );
+        assert_eq!(
+            state.history.back().unwrap().values[&DashboardMetric::RpcRate],
+            None,
+            "a same-process counter reset must produce a gap, not a cumulative spike"
+        );
+
+        let mut unknown_process = metrics_response(
+            test_time(30),
+            test_time(19),
+            vec![metric_counter(
+                "sinomo.daemon.service.requests",
+                20,
+                &labels,
+            )],
+        );
+        unknown_process.process_started_at = None;
+        apply_observation_batch(
+            &mut state,
+            sample_batch(test_time(30), "node-a", Ok(unknown_process)),
+        );
+        assert_eq!(
+            state.history.back().unwrap().values[&DashboardMetric::RpcRate],
+            None,
+            "a process-identity metadata transition must reset the interval baseline"
+        );
+    }
+
+    #[test]
+    fn overview_non_forward_sample_does_not_replace_the_rate_baseline() {
+        let process_started_at = test_time(1);
+        let labels = [
+            ("category", "object"),
+            ("route", "/objects"),
+            ("outcome", "ok"),
+        ];
+        let mut state = ClusterObservationState::default();
+        for (received, observed, value) in [(10, 10, 100), (15, 9, 150), (20, 20, 200)] {
+            apply_observation_batch(
+                &mut state,
+                sample_batch(
+                    test_time(received),
+                    "node-a",
+                    Ok(metrics_response(
+                        test_time(observed),
+                        process_started_at,
+                        vec![metric_counter(
+                            "sinomo.daemon.service.requests",
+                            value,
+                            &labels,
+                        )],
+                    )),
+                ),
+            );
+        }
+        assert_eq!(
+            state.history[state.history.len() - 2].values[&DashboardMetric::RpcRate],
+            None,
+            "a non-forward observation must create an interval gap"
+        );
+        assert_eq!(
+            state.history.back().unwrap().values[&DashboardMetric::RpcRate],
+            Some(10.0),
+            "the next interval must use the last forward baseline"
+        );
     }
 
     #[test]
@@ -3506,6 +5638,54 @@ mod tests {
         assert_eq!(values[&DashboardMetric::RpcRate], Some(5.0));
         assert_eq!(values[&DashboardMetric::RpcErrorRate], Some(1.0));
         assert_eq!(values[&DashboardMetric::RpcP95Ms], Some(1.0));
+    }
+
+    #[test]
+    fn dashboard_values_reject_incompatible_kinds_and_units() {
+        let labels = [
+            ("category", "object"),
+            ("route", "/objects"),
+            ("outcome", "ok"),
+        ];
+        let mut wrong_kind = metrics_response(
+            test_time(5),
+            test_time(0),
+            vec![ObserveMetricRecord::gauge(
+                "sinomo.daemon.service.requests",
+                metric_labels(&labels),
+                25.0,
+            )],
+        );
+        wrong_kind.descriptors.push(ObserveMetricDescriptor::new(
+            "sinomo.daemon.service.requests",
+            ObserveMetricKind::Gauge,
+            Some(ObserveMetricUnit::Count),
+            "Malformed request gauge.",
+        ));
+        assert_eq!(
+            dashboard_values(&wrong_kind, Some(&wrong_kind), Some(5.0))[&DashboardMetric::RpcRate],
+            None
+        );
+
+        let mut wrong_unit = metrics_response(
+            test_time(10),
+            test_time(0),
+            vec![metric_counter(
+                "sinomo.daemon.service.requests",
+                50,
+                &labels,
+            )],
+        );
+        wrong_unit.descriptors.push(ObserveMetricDescriptor::new(
+            "sinomo.daemon.service.requests",
+            ObserveMetricKind::Counter,
+            Some(ObserveMetricUnit::Bytes),
+            "Malformed request bytes.",
+        ));
+        assert_eq!(
+            dashboard_values(&wrong_unit, Some(&wrong_unit), Some(5.0))[&DashboardMetric::RpcRate],
+            None
+        );
     }
 
     #[test]
@@ -3651,6 +5831,182 @@ mod tests {
     }
 
     #[test]
+    fn metric_explorer_search_keeps_focus_and_filters_registered_catalog() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        seed_performance_dashboard(&shared);
+        shared.cluster_mut().subview = ClusterSubview::Explore;
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster metric search")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1280.0, 800.0,
+            ))))?;
+        app.run_until_idle()?;
+
+        let search = window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Search registered metrics");
+        search.focus()?;
+        search.fill("latency")?;
+        search.expect().to_be_focused()?;
+        search.expect().to_have_value("latency")?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("sinomo.daemon.service.total.us")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("sinomo.daemon.service.requests")
+            .expect()
+            .to_be_hidden()?;
+        assert_eq!(shared.cluster().explorer.search, "latency");
+        Ok(())
+    }
+
+    #[test]
+    fn compact_metric_explorer_drills_into_detail_and_back() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        seed_performance_dashboard(&shared);
+        shared.cluster_mut().subview = ClusterSubview::Explore;
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Compact metric explorer")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                390.0, 844.0,
+            ))))?;
+        app.run_until_idle()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("sinomo.daemon.service.requests")
+            .click()?;
+        app.run_until_idle()?;
+        assert_eq!(
+            shared.cluster().explorer_navigation.route(),
+            sui::MasterDetailRoute::Detail
+        );
+        window
+            .get_by_role(SemanticsRole::Image)
+            .with_name("sinomo.daemon.service.requests live history")
+            .expect()
+            .to_be_visible()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("All metrics")
+            .click()?;
+        app.run_until_idle()?;
+        assert_eq!(
+            shared.cluster().explorer_navigation.route(),
+            sui::MasterDetailRoute::Master
+        );
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Search registered metrics")
+            .expect()
+            .to_be_visible()?;
+        Ok(())
+    }
+
+    #[test]
+    fn metric_explorer_keeps_stale_node_and_label_filters_visible() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        seed_performance_dashboard(&shared);
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.inspect_explorer_metric(
+                "sinomo.daemon.service.requests",
+                ExplorerTransform::Rate,
+                [("outcome".to_string(), "stale-outcome".to_string())],
+            );
+            cluster.set_explorer_node(Some("node-stale".to_string()));
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Stale metric filters")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                390.0, 844.0,
+            ))))?;
+        app.run_until_idle()?;
+
+        window
+            .get_by_role(SemanticsRole::ComboBox)
+            .with_name("Metric node scope")
+            .expect()
+            .to_have_value("node-stale")?;
+        window
+            .get_by_role(SemanticsRole::ComboBox)
+            .with_name("Metric label outcome")
+            .expect()
+            .to_have_value("stale-outcome")?;
+        Ok(())
+    }
+
+    #[test]
+    fn curated_dashboard_panel_opens_matching_explorer_query() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        seed_performance_dashboard(&shared);
+
+        shared.cluster_mut().inspect_explorer_metric(
+            "sinomo.daemon.service.requests",
+            ExplorerTransform::Rate,
+            [("outcome".to_string(), "error".to_string())],
+        );
+
+        let cluster = shared.cluster();
+        assert_eq!(cluster.subview, ClusterSubview::Explore);
+        assert_eq!(
+            cluster.explorer.selected_metric.as_deref(),
+            Some("sinomo.daemon.service.requests")
+        );
+        assert_eq!(cluster.explorer.transform, ExplorerTransform::Rate);
+        assert_eq!(
+            cluster
+                .explorer
+                .label_filters
+                .get("outcome")
+                .map(String::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            cluster.explorer_navigation.route(),
+            sui::MasterDetailRoute::Detail
+        );
+        drop(cluster);
+        assert!(shared.cluster_mut().navigate_back());
+        assert_eq!(
+            shared.cluster().explorer_navigation.route(),
+            sui::MasterDetailRoute::Master
+        );
+        assert!(!shared.cluster_mut().navigate_back());
+    }
+
+    #[test]
     fn cluster_header_badge_uses_a_compact_single_line_health_summary() {
         let snapshot = ClusterSnapshot {
             nodes: vec![node("node-a"), node("node-b"), {
@@ -3770,6 +6126,36 @@ mod tests {
         app.run_until_idle()?;
         capture("sinomo-app-cluster-performance-wide.png");
 
+        shared.cluster_mut().inspect_explorer_metric(
+            "sinomo.daemon.service.requests",
+            ExplorerTransform::Rate,
+            std::iter::empty(),
+        );
+        app.run_until_idle()?;
+        app.advance_time(0.5)?;
+        capture("sinomo-app-cluster-explorer-wide.png");
+
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("Metric explorer detail")
+            .scroll_pixels(sui::Vector::new(0.0, -500.0))?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-explorer-wide-scrolled.png");
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("Metric explorer detail")
+            .scroll_pixels(sui::Vector::new(0.0, 500.0))?;
+        app.run_until_idle()?;
+
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Overview;
+            cluster.touch_explorer();
+        }
+        app.run_until_idle()?;
+        app.advance_time(0.5)?;
+        assert_eq!(shared.cluster().subview, ClusterSubview::Overview);
+
         shared.set_theme_mode(AppThemeMode::Light);
         app.run_until_idle()?;
         capture("sinomo-app-cluster-performance-wide-light.png");
@@ -3778,6 +6164,23 @@ mod tests {
         shared.set_text_scale(AppTextScale::ExtraLarge);
         app.run_until_idle()?;
         capture("sinomo-app-cluster-performance-wide-large-text.png");
+
+        shared.cluster_mut().inspect_explorer_metric(
+            "sinomo.daemon.service.requests",
+            ExplorerTransform::Rate,
+            std::iter::empty(),
+        );
+        app.run_until_idle()?;
+        app.advance_time(0.5)?;
+        capture("sinomo-app-cluster-explorer-wide-large-text.png");
+
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Overview;
+            cluster.touch_explorer();
+        }
+        app.run_until_idle()?;
+        app.advance_time(0.5)?;
 
         shared.set_text_scale(AppTextScale::Standard);
         app.run_until_idle()?;
@@ -3804,6 +6207,41 @@ mod tests {
         app.run_until_idle()?;
         capture("sinomo-app-cluster-performance-phone.png");
 
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.subview = ClusterSubview::Explore;
+            cluster.explorer_navigation.show_master();
+            cluster.touch_explorer();
+        }
+        app.run_until_idle()?;
+        app.advance_time(0.5)?;
+        capture("sinomo-app-cluster-explorer-phone-catalog.png");
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("sinomo.daemon.service.requests")
+            .click()?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-explorer-phone-detail.png");
+
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("Metric explorer detail")
+            .scroll_pixels(sui::Vector::new(0.0, -620.0))?;
+        app.run_until_idle()?;
+        capture("sinomo-app-cluster-explorer-phone-detail-scrolled.png");
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("Metric explorer detail")
+            .scroll_pixels(sui::Vector::new(0.0, 620.0))?;
+        app.run_until_idle()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("All metrics")
+            .click()?;
+        app.run_until_idle()?;
+
         let snapshot = window.snapshot()?;
         let sections = snapshot
             .accessibility
@@ -3816,7 +6254,7 @@ mod tests {
             .expect("cluster section tab bar semantics")
             .bounds;
         let point = Point::new(
-            sections.x() + sections.width() * (5.0 / 6.0),
+            sections.x() + sections.width() * (7.0 / 8.0),
             sections.y() + sections.height() * 0.5,
         );
         let root = window.root();
@@ -3832,13 +6270,14 @@ mod tests {
         up.button = Some(PointerButton::Primary);
         root.dispatch_event(Event::Pointer(up))?;
         app.run_until_idle()?;
+        app.advance_time(0.5)?;
 
         assert_eq!(shared.cluster().subview, ClusterSubview::Activity);
         capture("sinomo-app-cluster-performance-activity.png");
 
         let revision_before_overview = shared.cluster().observation.revision;
         let point = Point::new(
-            sections.x() + sections.width() * (1.0 / 6.0),
+            sections.x() + sections.width() * (1.0 / 8.0),
             sections.y() + sections.height() * 0.5,
         );
         root.dispatch_event(Event::Pointer(PointerEvent::new(
@@ -4263,6 +6702,8 @@ mod tests {
             refreshing: true,
             refresh_rx: Some(rx),
             observation: ClusterObservationState::default(),
+            explorer: MetricExplorerState::default(),
+            explorer_navigation: MasterDetailState::default(),
         };
         tx.send(ClusterSnapshot {
             nodes: vec![node("node-a")],

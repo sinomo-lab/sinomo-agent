@@ -52,16 +52,35 @@ authorized cluster members known to the local node and prints per-node results.
 The graphical app's Cluster surface is the built-in live console:
 
 - **Overview** samples up to 32 authorized nodes (local first) every five
-  seconds while that view is visible. It shows RPC throughput/errors/latency, KV latency and queue
-  pressure, DFS backlog, agent work, and per-node observation freshness.
+  seconds while the Overview or Explore view is visible. Its curated default
+  dashboard shows RPC throughput/errors/latency, KV latency and queue pressure,
+  DFS backlog, agent work, and per-node observation freshness. Every card can
+  open the underlying metric and query in Explore.
+- **Explore** is a generic live metric browser over the descriptors returned by
+  `/observe/metrics`. Operators can search and filter the registered catalog,
+  select nodes and bounded label values, apply kind-safe counter or histogram
+  transforms, compare live series, and inspect exact current/minimum/maximum
+  values. Its 1/5/15-minute selectors use local collection time, preserve
+  reset/offline gaps, and report the actual retained span. Descriptor conflicts
+  and high-cardinality results are surfaced in the UI instead of silently
+  aggregating incompatible series.
 - **Topology** retains the cluster graph and node inspector.
 - **Activity** combines topology warnings with recent observation failures,
   partial exporter results, and process restarts.
 
-Overview retains at most 180 derived samples (about 15 minutes) and 100 activity
-items in the app process. It never writes metric history to cluster KV or local
-storage. Health and observation freshness remain separate: an online node can
-have stale, partial, or unsupported metrics, and a failed observation does not
+Overview retains at most 180 derived samples (about 15 minutes). Explore keeps
+the latest catalog/current values bounded: collection reads at most 4,096
+records per node, retains at most 4,096 families/current series, and exposes at
+most 64 label keys and 64 current values per key. It retains at most 180 points
+for up to 96 series in the active query scope; changing metric, node, or label
+scope starts a fresh short history. Retained histogram samples are normalized
+and limited to 256 buckets so one registered observation cannot amplify into an
+unbounded history payload. The UI reports catalog, dimension, and series caps
+when they are reached. The app also keeps at most 100 activity items. It never
+writes metric history to cluster KV or local storage and is not a time-series
+database.
+Health and observation freshness remain separate: an online node can have
+stale, partial, or unsupported metrics, and a failed observation does not
 rewrite cluster health.
 
 For retention, dashboards, or alerting, run the companion Prometheus bridge:
@@ -97,10 +116,15 @@ may report exporter failures as `sinomo.observe.metric_exporter.errors`.
 
 Metric responses carry observation time, process incarnation, process role,
 node identity, partial/exporter status, and descriptors for the returned metric
-families. Descriptors define type, help text, and units across the RPC boundary;
-the OpenMetrics encoder therefore converts explicit microseconds to seconds
-without guessing from a metric name. Older responses remain readable because
-the added metadata is optional.
+families. Descriptors define type, help text, and units across the RPC boundary.
+They can also declare a presentation domain, a safe cross-series aggregation,
+and the bounded label keys intended for filtering. Those semantic hints are
+optional and additive: older responses remain readable, and unknown metrics
+remain explorable without guessing an unsafe aggregation. The OpenMetrics
+encoder converts explicit microseconds to seconds without guessing from a
+metric name. Conflicting kind or unit declarations fail closed in the app: the
+family remains discoverable with a visible conflict, but its series are not
+combined or transformed until sampled nodes agree.
 
 Runtime histograms retain bounded cumulative buckets in addition to count, sum,
 minimum, and maximum. This keeps recorder memory fixed and permits clients to

@@ -7,6 +7,7 @@
 //! desktop app surface so it stays daemon-backed during bootstrap.
 
 pub mod backend;
+pub mod metrics;
 mod mobile_runtime;
 mod native_picker;
 pub mod rendering;

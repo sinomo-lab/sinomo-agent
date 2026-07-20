@@ -21,6 +21,7 @@ use crate::backend::{Backend, Connection};
 const OBSERVE_DASHBOARD_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSERVE_DASHBOARD_MAX_WORKERS: usize = 8;
 const OBSERVE_DASHBOARD_MAX_TARGETS: usize = 32;
+const OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub struct ObserveTargetSample {
@@ -116,7 +117,7 @@ impl Backend {
             OBSERVE_RPC_CATEGORY,
             &ObserveMetricsRequest {
                 name_prefix: Some("sinomo.".to_string()),
-                limit: 0,
+                limit: OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET,
             },
         )
         .map_err(|error| error.to_string())?

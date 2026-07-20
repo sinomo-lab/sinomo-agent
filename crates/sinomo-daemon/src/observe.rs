@@ -32,15 +32,21 @@ pub(crate) fn register_observe_metric_exporters(
 }
 
 fn register_observe_metric_descriptors() {
-    use sinomo_observe::{ObserveMetricDescriptor, ObserveMetricKind, ObserveMetricUnit};
+    use sinomo_observe::{
+        ObserveMetricDescriptor, ObserveMetricKind, ObserveMetricSemantics, ObserveMetricUnit,
+    };
 
     let register = |name: &str, kind: ObserveMetricKind, unit: ObserveMetricUnit, help: &str| {
-        sinomo_observe::register_observe_metric_descriptor(ObserveMetricDescriptor {
-            name: name.to_string(),
-            kind,
-            unit: Some(unit),
-            help: help.to_string(),
-        });
+        let descriptor = ObserveMetricDescriptor::new(name, kind, Some(unit), help);
+        let descriptor = match observe_metric_domain(name) {
+            Some(domain) => descriptor.with_semantics(ObserveMetricSemantics::new(
+                domain,
+                observe_metric_aggregation(name, kind),
+                observe_metric_labels(name).iter().copied(),
+            )),
+            None => descriptor,
+        };
+        sinomo_observe::register_observe_metric_descriptor(descriptor);
     };
 
     for (name, help) in [
@@ -320,6 +326,120 @@ fn register_observe_metric_descriptors() {
             ObserveMetricUnit::Count,
             "Current daemon snapshot value.",
         );
+    }
+}
+
+fn observe_metric_domain(name: &str) -> Option<&'static str> {
+    if name.starts_with("sinomo.daemon.") {
+        Some("daemon")
+    } else if name.starts_with("sinomo.kv.") {
+        Some("kv")
+    } else if name.starts_with("sinomo.dfs.") {
+        Some("dfs")
+    } else if name.starts_with("sinomo.observe.") {
+        Some("observe")
+    } else {
+        None
+    }
+}
+
+fn observe_metric_aggregation(
+    name: &str,
+    kind: sinomo_observe::ObserveMetricKind,
+) -> sinomo_observe::ObserveMetricAggregation {
+    use sinomo_observe::{ObserveMetricAggregation, ObserveMetricKind};
+
+    match kind {
+        ObserveMetricKind::Counter => ObserveMetricAggregation::Sum,
+        ObserveMetricKind::Histogram => ObserveMetricAggregation::MergeHistogram,
+        ObserveMetricKind::Gauge => match name {
+            "sinomo.kv.commit.queue_depth"
+            | "sinomo.kv.commit.inflight"
+            | "sinomo.kv.fanout.pending"
+            | "sinomo.kv.fanout.active"
+            | "sinomo.observe.metric_exporter.errors"
+            | "sinomo.kv.wal.bytes"
+            | "sinomo.kv.raft_snapshot.bytes"
+            | "sinomo.kv.materialized_snapshot.bytes"
+            | "sinomo.kv.raft.is_leader" => ObserveMetricAggregation::Sum,
+            "sinomo.kv.peer.progress_known" => ObserveMetricAggregation::Min,
+            "sinomo.kv.peer.lag_entries" | "sinomo.kv.peer.progress_age.seconds" => {
+                ObserveMetricAggregation::Max
+            }
+            _ => ObserveMetricAggregation::None,
+        },
+    }
+}
+
+fn observe_metric_labels(name: &str) -> &'static [&'static str] {
+    match name {
+        "sinomo.daemon.service.requests"
+        | "sinomo.daemon.service.dispatch.us"
+        | "sinomo.daemon.service.total.us" => &["route", "category", "outcome"],
+        "sinomo.daemon.service.context.us" => &["route", "category"],
+        "sinomo.kv.reads" | "sinomo.kv.read.total.us" => &["authority", "source", "outcome"],
+        "sinomo.kv.commands" | "sinomo.kv.command.total.us" => &["command", "outcome"],
+        "sinomo.kv.storage.operations" => &["operation", "outcome"],
+        "sinomo.kv.compaction.runs"
+        | "sinomo.kv.wal.read.us"
+        | "sinomo.kv.wal.append.us"
+        | "sinomo.kv.wal.rewrite.us"
+        | "sinomo.kv.compaction.us"
+        | "sinomo.kv.raft.open.us"
+        | "sinomo.kv.apply.us"
+        | "sinomo.kv.snapshot.write.us"
+        | "sinomo.kv.snapshot.restore.us"
+        | "sinomo.kv.replication.target_results"
+        | "sinomo.kv.replication.target.us"
+        | "sinomo.kv.replication.catchup_attempts"
+        | "sinomo.kv.fanout.passes"
+        | "sinomo.kv.fanout.pass.us"
+        | "sinomo.kv.fanout.target_results"
+        | "sinomo.kv.fanout.target.us" => &["outcome"],
+        "sinomo.kv.replication.attempts" | "sinomo.kv.replication.entries" => &["payload"],
+        "sinomo.kv.command.phase.us" => &["phase"],
+        "sinomo.kv.quorum.acks" => &["kind"],
+        "sinomo.observe.metric_exporter.errors" => &["exporter", "reason"],
+        "sinomo.dfs.metadata_shard.journal_next_sequence"
+        | "sinomo.dfs.metadata_shard.journal_last_sequence"
+        | "sinomo.dfs.metadata_shard.replicas" => {
+            &["shard_id", "file_system_id", "primary_node_id"]
+        }
+        "sinomo.dfs.metadata_shard.replica_lag_entries"
+        | "sinomo.dfs.metadata_shard.replica_replicated_through_sequence" => &[
+            "shard_id",
+            "file_system_id",
+            "primary_node_id",
+            "target_node_id",
+        ],
+        "sinomo.dfs.metadata_shard.replay_replayed_through_sequence" => &[
+            "shard_id",
+            "file_system_id",
+            "primary_node_id",
+            "source_shard_id",
+        ],
+        "sinomo.kv.revision"
+        | "sinomo.kv.compacted_revision"
+        | "sinomo.kv.entries"
+        | "sinomo.kv.leases"
+        | "sinomo.kv.retained_events"
+        | "sinomo.kv.wal.bytes"
+        | "sinomo.kv.raft_snapshot.bytes"
+        | "sinomo.kv.materialized_snapshot.bytes"
+        | "sinomo.kv.raft.term"
+        | "sinomo.kv.raft.commit_index"
+        | "sinomo.kv.raft.applied_index"
+        | "sinomo.kv.raft.last_log_index"
+        | "sinomo.kv.raft.snapshot_index"
+        | "sinomo.kv.raft.uncommitted_entries"
+        | "sinomo.kv.raft.unsnapshotted_entries"
+        | "sinomo.kv.raft.retained_log_entries"
+        | "sinomo.kv.raft.is_leader" => &["node_id"],
+        "sinomo.kv.peer.progress_known"
+        | "sinomo.kv.peer.lag_entries"
+        | "sinomo.kv.peer.match_index"
+        | "sinomo.kv.peer.progress_age.seconds" => &["node_id", "peer_node_id"],
+        _ => &[],
     }
 }
 

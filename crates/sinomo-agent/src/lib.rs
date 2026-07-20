@@ -94,7 +94,10 @@ pub fn register_storage_paths(
 }
 
 pub fn register_observe_metric_exporters() {
-    use sinomo_runtime::observe::{ObserveMetricDescriptor, ObserveMetricKind, ObserveMetricUnit};
+    use sinomo_runtime::observe::{
+        ObserveMetricAggregation, ObserveMetricDescriptor, ObserveMetricKind,
+        ObserveMetricSemantics, ObserveMetricUnit,
+    };
 
     for (name, help) in [
         ("sinomo.agent.sessions", "Persisted agent sessions."),
@@ -124,12 +127,24 @@ pub fn register_observe_metric_exporters() {
             "Agent control snapshots that could not be read.",
         ),
     ] {
-        sinomo_runtime::observe::register_observe_metric_descriptor(ObserveMetricDescriptor {
-            name: name.to_string(),
-            kind: ObserveMetricKind::Gauge,
-            unit: Some(ObserveMetricUnit::Count),
-            help: help.to_string(),
-        });
+        let labels = if name == "sinomo.agent.tasks" {
+            vec!["status"]
+        } else {
+            Vec::new()
+        };
+        sinomo_runtime::observe::register_observe_metric_descriptor(
+            ObserveMetricDescriptor::new(
+                name,
+                ObserveMetricKind::Gauge,
+                Some(ObserveMetricUnit::Count),
+                help,
+            )
+            .with_semantics(ObserveMetricSemantics::new(
+                "agent",
+                ObserveMetricAggregation::None,
+                labels.iter().copied(),
+            )),
+        );
     }
     sinomo_runtime::observe::register_observe_metric_exporter_with_policy(
         "sinomo-agent",

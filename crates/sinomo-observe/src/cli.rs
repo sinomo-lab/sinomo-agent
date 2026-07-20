@@ -8,14 +8,14 @@ use crate::{
     OBSERVE_METRICS_ROUTE, OBSERVE_NETWORK_TIMELINE_ROUTE, OBSERVE_RPC_CATEGORY,
     OBSERVE_TRACES_ROUTE, ObserveControlRequest, ObserveControlResponse, ObserveCpuProfileAction,
     ObserveCpuProfileRequest, ObserveCpuProfileResponse, ObserveEventsRequest,
-    ObserveEventsResponse, ObserveLogsRequest, ObserveLogsResponse, ObserveMetricDescriptor,
-    ObserveMetricRecord, ObserveMetricUnit, ObserveMetricsRequest, ObserveMetricsResponse,
-    ObserveNetworkTimelineAction, ObserveNetworkTimelineRequest, ObserveNetworkTimelineResponse,
-    ObserveTracesRequest, ObserveTracesResponse, OperationalEventQuery, OperationalEventRecord,
-    OperationalLogQuery, OperationalLogRecord, handle_observe_cpu_profile,
-    handle_observe_network_timeline, observe_control_snapshot, observe_module_enabled,
-    read_observe_metrics, read_observe_traces, read_operational_events, read_operational_logs,
-    update_observe_control,
+    ObserveEventsResponse, ObserveLogsRequest, ObserveLogsResponse, ObserveMetricAggregation,
+    ObserveMetricDescriptor, ObserveMetricRecord, ObserveMetricSemantics, ObserveMetricUnit,
+    ObserveMetricsRequest, ObserveMetricsResponse, ObserveNetworkTimelineAction,
+    ObserveNetworkTimelineRequest, ObserveNetworkTimelineResponse, ObserveTracesRequest,
+    ObserveTracesResponse, OperationalEventQuery, OperationalEventRecord, OperationalLogQuery,
+    OperationalLogRecord, handle_observe_cpu_profile, handle_observe_network_timeline,
+    observe_control_snapshot, observe_module_enabled, read_observe_metrics, read_observe_traces,
+    read_operational_events, read_operational_logs, update_observe_control,
 };
 use sinomo_cli_registry::{
     CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue, CliCommand,
@@ -1423,7 +1423,7 @@ fn append_prometheus_target_metrics(
 ) -> Result<(), String> {
     for descriptor in response.descriptors {
         match descriptors
-            .iter()
+            .iter_mut()
             .find(|existing| existing.name == descriptor.name)
         {
             Some(existing)
@@ -1434,9 +1434,12 @@ fn append_prometheus_target_metrics(
                     descriptor.name
                 ));
             }
-            Some(_) => {
+            Some(existing) => {
                 // Help text may legitimately drift during a mixed-version
-                // rollout. Keep the first compatible descriptor.
+                // rollout. Semantic metadata was added later, so prefer it
+                // over an empty legacy block. Conflicting new metadata fails
+                // closed for aggregation while preserving known dimensions.
+                merge_prometheus_descriptor_semantics(existing, &descriptor);
             }
             None => descriptors.push(descriptor),
         }
@@ -1449,6 +1452,13 @@ fn append_prometheus_target_metrics(
         records.push(record);
     }
     Ok(())
+}
+
+fn merge_prometheus_descriptor_semantics(
+    existing: &mut ObserveMetricDescriptor,
+    incoming: &ObserveMetricDescriptor,
+) {
+    existing.semantics.merge_rolling(&incoming.semantics);
 }
 
 fn insert_prometheus_constant_label(
@@ -1481,20 +1491,28 @@ fn prometheus_target_up_record(target_node_id: &str, up: bool) -> ObserveMetricR
 
 fn prometheus_bridge_descriptors() -> [ObserveMetricDescriptor; 2] {
     [
-        ObserveMetricDescriptor {
-            name: "sinomo.observe.prometheus.collection_success".to_string(),
-            kind: crate::ObserveMetricKind::Gauge,
-            unit: Some(ObserveMetricUnit::Count),
-            help: "Whether the latest cached cluster observation collection completed without target errors."
-                .to_string(),
-        },
-        ObserveMetricDescriptor {
-            name: "sinomo.observe.prometheus.target_up".to_string(),
-            kind: crate::ObserveMetricKind::Gauge,
-            unit: Some(ObserveMetricUnit::Count),
-            help: "Whether the latest cached observation request reached and decoded the target node."
-                .to_string(),
-        },
+        ObserveMetricDescriptor::new(
+            "sinomo.observe.prometheus.collection_success",
+            crate::ObserveMetricKind::Gauge,
+            Some(ObserveMetricUnit::Count),
+            "Whether the latest cached cluster observation collection completed without target errors.",
+        )
+        .with_semantics(ObserveMetricSemantics::new(
+            "observe",
+            ObserveMetricAggregation::Min,
+            std::iter::empty::<&str>(),
+        )),
+        ObserveMetricDescriptor::new(
+            "sinomo.observe.prometheus.target_up",
+            crate::ObserveMetricKind::Gauge,
+            Some(ObserveMetricUnit::Count),
+            "Whether the latest cached observation request reached and decoded the target node.",
+        )
+        .with_semantics(ObserveMetricSemantics::new(
+            "observe",
+            ObserveMetricAggregation::Sum,
+            ["node_id"],
+        )),
     ]
 }
 
@@ -2924,12 +2942,12 @@ mod tests {
             response.node_id = Some(target_node_id.to_string());
             response.process_role = Some("main".to_string());
             response.partial = true;
-            response.descriptors = vec![ObserveMetricDescriptor {
-                name: "sinomo.test.load".to_string(),
-                kind: crate::ObserveMetricKind::Gauge,
-                unit: Some(ObserveMetricUnit::Ratio),
-                help: "Test load ratio.".to_string(),
-            }];
+            response.descriptors = vec![ObserveMetricDescriptor::new(
+                "sinomo.test.load",
+                crate::ObserveMetricKind::Gauge,
+                Some(ObserveMetricUnit::Ratio),
+                "Test load ratio.",
+            )];
             sinomo_core::network::ObjectRpcResponse::encode_body(OBSERVE_METRICS_ROUTE, &response)
                 .map_err(|error| error.to_string())
         });
@@ -3099,6 +3117,39 @@ mod tests {
         assert!(error.to_string().contains("node-a"));
         assert!(error.to_string().contains("dropped_records=3"));
         assert!(error.to_string().contains("node-b"));
+    }
+
+    #[test]
+    fn prometheus_descriptor_semantics_merge_rolling_versions_fail_closed() {
+        let mut existing = ObserveMetricDescriptor::new(
+            "sinomo.test.depth",
+            crate::ObserveMetricKind::Gauge,
+            Some(ObserveMetricUnit::Count),
+            "Depth.",
+        );
+        let incoming = existing.clone().with_semantics(ObserveMetricSemantics::new(
+            "test",
+            ObserveMetricAggregation::Sum,
+            ["queue"],
+        ));
+        merge_prometheus_descriptor_semantics(&mut existing, &incoming);
+        assert_eq!(existing.semantics, incoming.semantics);
+
+        let conflicting = existing.clone().with_semantics(ObserveMetricSemantics::new(
+            "other",
+            ObserveMetricAggregation::Max,
+            ["priority"],
+        ));
+        merge_prometheus_descriptor_semantics(&mut existing, &conflicting);
+        assert_eq!(existing.semantics.domain, None);
+        assert_eq!(
+            existing.effective_aggregation(),
+            ObserveMetricAggregation::None
+        );
+        assert_eq!(
+            existing.semantics.labels,
+            vec!["priority".to_string(), "queue".to_string()]
+        );
     }
 
     #[test]

@@ -257,6 +257,104 @@ pub enum ObserveMetricUnit {
     Ratio,
 }
 
+/// Safe cross-series reduction for a metric family. `None` is intentionally
+/// the default: an absent or older descriptor must never make a client guess
+/// that values from different nodes can be combined.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObserveMetricAggregation {
+    Sum,
+    Min,
+    Max,
+    Mean,
+    MergeHistogram,
+    /// Missing and future unknown reductions fail closed.
+    #[default]
+    #[serde(other)]
+    None,
+}
+
+impl ObserveMetricAggregation {
+    /// Whether this reduction is structurally compatible with the metric
+    /// record kind. Domain-level correctness still comes from the descriptor.
+    pub fn is_compatible_with(self, kind: ObserveMetricKind) -> bool {
+        match self {
+            Self::None => true,
+            Self::MergeHistogram => kind == ObserveMetricKind::Histogram,
+            Self::Sum | Self::Min | Self::Max | Self::Mean => kind != ObserveMetricKind::Histogram,
+        }
+    }
+}
+
+/// Optional operator-facing semantics. `labels` contains bounded dimension
+/// names, never observed label values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ObserveMetricSemantics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "ObserveMetricAggregation::is_none")]
+    pub aggregation: ObserveMetricAggregation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+impl ObserveMetricSemantics {
+    pub fn new(
+        domain: impl Into<String>,
+        aggregation: ObserveMetricAggregation,
+        labels: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let domain = domain.into();
+        let domain = domain.trim();
+        let mut labels = labels
+            .into_iter()
+            .map(Into::into)
+            .filter(|label: &String| !label.is_empty())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.dedup();
+        Self {
+            domain: (!domain.is_empty()).then(|| domain.to_string()),
+            aggregation,
+            labels,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.domain.is_none()
+            && self.aggregation == ObserveMetricAggregation::None
+            && self.labels.is_empty()
+    }
+
+    /// Merges metadata from a rolling-version peer. Missing legacy metadata is
+    /// neutral; conflicting new aggregation declarations fail closed.
+    pub fn merge_rolling(&mut self, incoming: &Self) {
+        if self.is_empty() {
+            *self = incoming.clone();
+            return;
+        }
+        if incoming.is_empty() || self == incoming {
+            return;
+        }
+        if self.domain != incoming.domain {
+            self.domain = None;
+            self.aggregation = ObserveMetricAggregation::None;
+        }
+        if self.aggregation != incoming.aggregation {
+            self.aggregation = ObserveMetricAggregation::None;
+        }
+        self.labels.extend(incoming.labels.iter().cloned());
+        self.labels.sort();
+        self.labels.dedup();
+    }
+}
+
+impl ObserveMetricAggregation {
+    fn is_none(value: &Self) -> bool {
+        *value == Self::None
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveMetricDescriptor {
     pub name: String,
@@ -264,6 +362,40 @@ pub struct ObserveMetricDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<ObserveMetricUnit>,
     pub help: String,
+    #[serde(default, skip_serializing_if = "ObserveMetricSemantics::is_empty")]
+    pub semantics: ObserveMetricSemantics,
+}
+
+impl ObserveMetricDescriptor {
+    pub fn new(
+        name: impl Into<String>,
+        kind: ObserveMetricKind,
+        unit: Option<ObserveMetricUnit>,
+        help: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            unit,
+            help: help.into(),
+            semantics: ObserveMetricSemantics::default(),
+        }
+    }
+
+    pub fn with_semantics(mut self, semantics: ObserveMetricSemantics) -> Self {
+        self.semantics = semantics;
+        self
+    }
+
+    /// Returns the declared aggregation when it is structurally safe for this
+    /// metric kind, otherwise the fail-closed `None` aggregation.
+    pub fn effective_aggregation(&self) -> ObserveMetricAggregation {
+        if self.semantics.aggregation.is_compatible_with(self.kind) {
+            self.semantics.aggregation
+        } else {
+            ObserveMetricAggregation::None
+        }
+    }
 }
 
 impl ObserveMetricKind {
@@ -571,11 +703,43 @@ pub fn register_observe_metric_exporter_with_policy(
         );
 }
 
-pub fn register_observe_metric_descriptor(descriptor: ObserveMetricDescriptor) {
-    observe_metric_descriptors_store()
+pub fn register_observe_metric_descriptor(mut descriptor: ObserveMetricDescriptor) {
+    descriptor
+        .semantics
+        .labels
+        .retain(|label| !label.is_empty());
+    descriptor.semantics.labels.sort();
+    descriptor.semantics.labels.dedup();
+    if descriptor
+        .semantics
+        .domain
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        descriptor.semantics.domain = None;
+    }
+    let mut descriptors = observe_metric_descriptors_store()
         .lock()
-        .expect("observe metric descriptors lock poisoned")
-        .insert(descriptor.name.clone(), descriptor);
+        .expect("observe metric descriptors lock poisoned");
+    if let Some(existing) = descriptors.get(&descriptor.name) {
+        let mut semantics = existing.semantics.clone();
+        semantics.merge_rolling(&descriptor.semantics);
+        descriptor.semantics = semantics;
+    }
+    if !descriptor
+        .semantics
+        .aggregation
+        .is_compatible_with(descriptor.kind)
+    {
+        tracing::warn!(
+            metric = %descriptor.name,
+            kind = ?descriptor.kind,
+            aggregation = ?descriptor.semantics.aggregation,
+            "ignoring incompatible observe metric aggregation metadata"
+        );
+        descriptor.semantics.aggregation = ObserveMetricAggregation::None;
+    }
+    descriptors.insert(descriptor.name.clone(), descriptor);
 }
 
 pub fn observe_metric_descriptors() -> Vec<ObserveMetricDescriptor> {
@@ -1542,12 +1706,12 @@ fn describe_observe_metric(
     unit: Option<Unit>,
     description: SharedString,
 ) {
-    register_observe_metric_descriptor(ObserveMetricDescriptor {
-        name: key.as_str().to_string(),
+    register_observe_metric_descriptor(ObserveMetricDescriptor::new(
+        key.as_str(),
         kind,
-        unit: unit.and_then(observe_metric_unit),
-        help: description.to_string(),
-    });
+        unit.and_then(observe_metric_unit),
+        description.to_string(),
+    ));
 }
 
 fn observe_metric_unit(unit: Unit) -> Option<ObserveMetricUnit> {
@@ -1804,6 +1968,100 @@ mod tests {
         assert!(response.exporters.is_empty());
         assert!(!response.partial);
         assert!(response.descriptors.is_empty());
+    }
+
+    #[test]
+    fn metric_descriptor_semantics_are_rolling_compatible() {
+        let legacy: ObserveMetricDescriptor = serde_json::from_str(
+            r#"{"name":"sinomo.test.load","kind":"gauge","unit":"ratio","help":"Load."}"#,
+        )
+        .expect("legacy descriptor");
+        assert_eq!(legacy.semantics, ObserveMetricSemantics::default());
+        assert_eq!(
+            legacy.effective_aggregation(),
+            ObserveMetricAggregation::None
+        );
+        assert!(
+            !serde_json::to_value(&legacy)
+                .expect("legacy descriptor JSON")
+                .as_object()
+                .expect("descriptor object")
+                .contains_key("semantics")
+        );
+        assert_eq!(
+            serde_json::from_str::<ObserveMetricAggregation>("\"future-reduction\"")
+                .expect("unknown aggregation fails closed"),
+            ObserveMetricAggregation::None
+        );
+
+        let descriptor = ObserveMetricDescriptor::new(
+            "sinomo.test.latency.us",
+            ObserveMetricKind::Histogram,
+            Some(ObserveMetricUnit::Microseconds),
+            "Latency.",
+        )
+        .with_semantics(ObserveMetricSemantics::new(
+            "test",
+            ObserveMetricAggregation::MergeHistogram,
+            ["outcome", "route", "outcome", ""],
+        ));
+        assert_eq!(
+            descriptor.semantics.labels,
+            vec!["outcome".to_string(), "route".to_string()]
+        );
+        assert_eq!(
+            descriptor.effective_aggregation(),
+            ObserveMetricAggregation::MergeHistogram
+        );
+        let encoded = serde_json::to_string(&descriptor).expect("semantic descriptor JSON");
+        assert!(encoded.contains("\"aggregation\":\"merge-histogram\""));
+        assert_eq!(
+            serde_json::from_str::<ObserveMetricDescriptor>(&encoded)
+                .expect("semantic descriptor round trip"),
+            descriptor
+        );
+    }
+
+    #[test]
+    fn incompatible_metric_aggregation_fails_closed() {
+        for aggregation in [
+            ObserveMetricAggregation::Sum,
+            ObserveMetricAggregation::Min,
+            ObserveMetricAggregation::Max,
+            ObserveMetricAggregation::Mean,
+        ] {
+            let descriptor = ObserveMetricDescriptor::new(
+                "sinomo.test.histogram",
+                ObserveMetricKind::Histogram,
+                None,
+                "Histogram.",
+            )
+            .with_semantics(ObserveMetricSemantics::new(
+                "test",
+                aggregation,
+                std::iter::empty::<&str>(),
+            ));
+            assert_eq!(
+                descriptor.effective_aggregation(),
+                ObserveMetricAggregation::None
+            );
+        }
+
+        let descriptor = ObserveMetricDescriptor::new(
+            "sinomo.test.gauge",
+            ObserveMetricKind::Gauge,
+            None,
+            "Gauge.",
+        )
+        .with_semantics(ObserveMetricSemantics::new(
+            "test",
+            ObserveMetricAggregation::MergeHistogram,
+            std::iter::empty::<&str>(),
+        ));
+        assert_eq!(
+            descriptor.effective_aggregation(),
+            ObserveMetricAggregation::None
+        );
     }
 
     #[test]

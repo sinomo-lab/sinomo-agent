@@ -310,7 +310,7 @@ impl Shell {
     fn schedule_cluster_observe_timer(&self, ctx: &mut EventCtx) {
         if !crate::mobile_runtime::interactive()
             || self.window_occluded.get()
-            || !cluster::overview_visible(&self.shared)
+            || !cluster::observation_visible(&self.shared)
             || self.cluster_observe_timer.get().is_some()
             || self.shared.borrow().waker.is_none()
         {
@@ -401,6 +401,7 @@ impl Shell {
             return false;
         }
         match self.shared.active_tab() {
+            Tab::Cluster => self.shared.cluster_mut().navigate_back(),
             Tab::Settings => self.shared.settings_mut().navigate_back(),
             Tab::Files => {
                 let waker = { self.shared.borrow().waker.clone() };
@@ -799,7 +800,7 @@ impl Widget for Shell {
         }
         if let Event::Window(WindowEvent::Occluded(occluded)) = event {
             self.window_occluded.set(*occluded);
-            if !occluded && cluster::overview_visible(&self.shared) {
+            if !occluded && cluster::observation_visible(&self.shared) {
                 cluster::request_observation(&self.shared);
                 self.schedule_cluster_observe_timer(ctx);
             }
@@ -843,7 +844,7 @@ impl Widget for Shell {
             self.cluster_observe_timer.set(None);
             if crate::mobile_runtime::interactive()
                 && !self.window_occluded.get()
-                && cluster::overview_visible(&self.shared)
+                && cluster::observation_visible(&self.shared)
                 && cluster::request_observation(&self.shared)
             {
                 ctx.request_semantics();

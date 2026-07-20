@@ -213,7 +213,11 @@ fn descriptor_index(
             Entry::Vacant(entry) => {
                 entry.insert(descriptor);
             }
-            Entry::Occupied(entry) if *entry.get() != descriptor => {
+            Entry::Occupied(entry)
+                if entry.get().kind != descriptor.kind
+                    || entry.get().unit != descriptor.unit
+                    || entry.get().help != descriptor.help =>
+            {
                 return Err(OpenMetricsEncodeError::ConflictingDescriptor {
                     name: descriptor.name.clone(),
                 });
@@ -704,12 +708,7 @@ mod tests {
         unit: Option<ObserveMetricUnit>,
         help: &str,
     ) -> ObserveMetricDescriptor {
-        ObserveMetricDescriptor {
-            name: name.to_string(),
-            kind,
-            unit,
-            help: help.to_string(),
-        }
+        ObserveMetricDescriptor::new(name, kind, unit, help)
     }
 
     #[test]
