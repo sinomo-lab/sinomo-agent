@@ -663,7 +663,7 @@ Each logical operation has a validated binding, not only a string name:
 ```text
 MemoryExtensionOperationBinding {
   logical_operation,
-  target,                 # native invoke, object-RPC route/op, or sandbox entry
+  target,                 # native invoke, object-RPC method/op, or sandbox entry
   request_schema_id,
   response_schema_id,
   max_request_bytes,

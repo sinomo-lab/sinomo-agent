@@ -1,15 +1,27 @@
 # Network Data-Path Reference
 
 This developer reference records the current private carrier mechanics behind
-Sinomo object RPC. The stable service, routing, retry, and authority contracts
-remain in the [network architecture](../network-architecture.md); the public
-binary object encoding is specified by the
+Sinomo object RPC at the start of the network-layer separation. It is an
+implementation reference, not the target interface. The normative direct-link,
+connectivity, routed-stream, object-RPC, retry, and authority contracts are in
+the [network architecture](../network-architecture.md); the migration and
+deletion gates are in the
+[network layer separation plan](../plans/network-layer-separation.md). The
+public binary object encoding is specified by the
 [Sinomo Object format](../sinomo-object-format.md).
 
-The constants and carrier version below describe the current v1 implementation,
-not a second application API. A wire change must update the implementation,
-tests, and architecture invariants together while retaining protocol version 1
-until an independently released protocol actually exists.
+The separation is internal to the existing `sinomo-network` crate. This
+reference and plan do not propose additional networking workspace crates.
+
+The constants and carrier version below describe the current consolidated v1
+implementation. That implementation still has both a canonical bulk session
+and a persistent multiplexed channel. These are migration inputs, not the
+future routed-session or object-RPC protocol versions. Do not copy their carrier
+selection or payload bounds into the new layer contracts.
+
+While this implementation remains in production, a wire change must update its
+code, tests, and this reference together. Refactoring implementation code alone
+does not justify incrementing protocol v1.
 
 ## Semantic Boundary
 
@@ -130,9 +142,12 @@ dialect or nested SOBJ Data representation.
 
 ## Maintaining This Reference
 
-When the carrier changes, update this page together with the owning source,
-protocol tests, the stable invariants in the
-[network architecture](../network-architecture.md), and any benchmark or
-experiment manifest that depends on the old constants. Performance claims must
-also follow the developer
+When the current carrier changes, update this page together with the owning
+source, protocol tests, and any benchmark or experiment manifest that depends
+on the old constants. When a carrier is deleted by the separation plan, delete
+its obsolete section here; do not relabel current mechanics as the new
+architecture. A change to the normative contracts requires a separate review of
+the [network architecture](../network-architecture.md).
+
+Performance claims must also follow the developer
 [experimental reproducibility guide](experimental-reproducibility.md).

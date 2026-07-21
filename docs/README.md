@@ -71,7 +71,7 @@ trust model, state ownership, execution model, and invariants.
 | Agent sessions, context, tools, evidence, compaction, and cancellation | [Agent system](agent-system-architecture.md) |
 | Cluster build scheduling, immutable artifacts, caches, and rollout handoff | [Build service](build-service-architecture.md) |
 | Cluster identity, membership, KV/Raft authority, and failure | [Clustering](clustering-architecture.md) |
-| Routing, endpoints, relays, transports, retry, and identity feedback | [Network](network-architecture.md) |
+| Direct links, connectivity, routed streams, relays, and object RPC | [Network](network-architecture.md) |
 | DFS metadata, content, placement, replication, repair, and POSIX semantics | [DFS](dfs-architecture.md) |
 | Indexed-file memory, retrieval, overlays, maintenance, and scope | [Memory](memory-architecture.md) |
 | Module identity, compatibility, activation, observation, and replacement | [Module lifecycle](module-lifecycle-architecture.md) |
@@ -89,8 +89,10 @@ The sandbox has its own [architecture document](../crates/sinomo-sandbox/docs/ar
 - [Storage architecture](storage-architecture.md) defines ownership and
   inspection of local data-directory paths.
 - [Network data-path reference](developer/network-data-path.md) records the
-  current private object-RPC carrier formats, flow-control bounds, and
-  compatibility sequence for developers.
+  current migration-state object-RPC carrier formats and flow-control bounds.
+- [Network layer separation](plans/network-layer-separation.md) tracks the
+  replacement of the combined carrier with layered contracts inside the single
+  `sinomo-network` crate.
 - [Cluster formal verification](formal/cluster-verification.md) documents the
   executable Quint specifications and their evidence boundaries.
 - Crate-specific operational or protocol references live with the owning crate,

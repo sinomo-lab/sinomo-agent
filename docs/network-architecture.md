@@ -1,330 +1,479 @@
 # Sinomo Network Architecture
 
-This document defines the communication boundary, routing model, and transport
-invariants owned by `sinomo-network`. It describes stable behavior rather than
-individual Rust APIs or migration state.
+This document defines the normative contracts between direct transports,
+connectivity tracking, node routing, and object RPC. These are separate layers
+with one-way dependencies, all implemented inside the single `sinomo-network`
+crate. The separation is architectural and internal; it does not create new
+workspace crates.
 
-This is a developer-facing architecture document. Start with the
-[developer guide](developer/README.md) for repository navigation. Exact private
-carrier formats and tuning bounds live in the
-[network data-path reference](developer/network-data-path.md).
+The current carrier formats and tuning bounds are recorded in the developer
+[network data-path reference](developer/network-data-path.md). The work required
+to replace that implementation without creating another parallel path is tracked
+in the [network layer separation plan](plans/network-layer-separation.md).
 
 ## Purpose
 
-`sinomo-network` is a pure networking library. Domain crates define typed
-requests, responses, events, streams, and target nodes. The network layer
-encodes those values, selects endpoints and transports, routes through relays
-when needed, and reports delivery outcomes.
+Sinomo networking has one fundamental responsibility: establish an
+authenticated communication path from one authorized node to another. Object
+RPC is a protocol that may use that path; it is not part of path discovery or
+relay routing.
 
-The network layer does not decide whether an operation is allowed, interpret KV
-or DFS semantics, or read cluster storage directly.
+The design separates five contracts:
 
-## Boundary
+1. direct link transports connect adjacent nodes;
+2. connectivity tracking records fresh, directed reachability evidence;
+3. node routing turns that evidence into target-bound duplex streams;
+4. object RPC exchanges SOBJ values over any authenticated duplex stream; and
+5. domain services own methods, authorization, idempotency, and side effects.
 
-| Layer | Owns |
-|---|---|
-| Domain service | Request and response types, route names, target selection, business authorization, and side effects. |
-| `sinomo-network` | Object RPC sessions, framing, route registration, endpoint selection, route graphs, retries, relays, transfer flow control, and connectivity feedback. |
-| `sinomo-cluster` | Authoritative member and endpoint projection, plus transport drivers for membership and Raft. |
-| Transport module | Dialing, listening, and advertising endpoints for one transport family. |
+Networking does not interpret KV, DFS, agent, or application semantics. It does
+not read cluster storage directly, grant membership, or turn reachability into
+authority.
 
-Cluster communication must not open ad hoc sockets or choose a private wire
-format in higher-level command handlers. The inverse also holds: networking
-cannot grant membership, mutate cluster state, or apply domain policy.
+## Layering and Dependency Direction
 
-## Wire and Service Model
+```text
+domain services and the service registry
+                  |
+                  v
+        SOBJ object-RPC protocol
+      one call per authenticated stream
+                  |
+                  v
+       routed connector and peer stream
+                  |
+       +----------+-----------+
+       |                      |
+       v                      v
+ pure route planner     routed-session executor
+       |                      |
+       v                      v
+ connectivity snapshot   direct authenticated links
+       ^                      ^
+       |                      |
+ cluster directory       transport modules
+```
 
-Internal request/response traffic uses one typed object-RPC model. Every call
-uses the same request and response interface on every transport, independent of
-payload size. The network incrementally carries each encoded value over the
-underlying duplex stream; object encoding, framing, flow control, retries, and
-transfer state remain inside the network boundary.
+| Layer | Owns | Must not own |
+|---|---|---|
+| Domain service | Target selection, typed request and response values, method semantics, authorization, operation identity, idempotency, and side effects. | Endpoint choice, relay paths, transport framing, or connectivity mutation. |
+| Object RPC | Method and request identifiers, SOBJ request and response framing, streamed bodies, application authentication context, and RPC failure classification. | Node path selection, endpoint dialing, relay forwarding, membership, or transport-specific limits. |
+| Node routing | Authorized path planning, routed-session establishment, relay execution, target identity, connection pooling, and stream lifecycle. | SOBJ, RPC methods, handler retries, service catalogs, or domain authorization. |
+| Connectivity | Directed observations, freshness, provenance, path metrics, immutable snapshots, watches, and derived reachability. | Membership authority, service dispatch, route execution, or application retries. |
+| Direct transport | Dialing, listening, adjacent-peer authentication, transport capabilities, and multiplexed direct streams. | Multi-hop route choice, cluster status, SOBJ, or RPC. |
+| `sinomo-cluster` | Authorized members, node identity keys, endpoint projection, and publication of source-owned connectivity evidence. | Private RPC framing or transport-specific application protocols. |
 
-The application-visible semantic model remains a SOBJ request head and SOBJ
-response head, with an optional streaming attachment in either direction.
-Ordinary RPC values are still presented as one SOBJ value even when the network
-temporarily carries a large encoded body out of line and restores it before
-dispatch. Attachments remain explicitly attached to that same call. The private
-carrier distinction between control and Data frames does not add a second RPC
-API, expose frame boundaries, or require callers to choose a transport shape.
+The daemon composes these layers. Higher-level crates use their public contracts
+and do not bypass them with ad hoc cluster sockets or private wire formats.
 
-Transfer chunk size and receive credit are independent negotiated values. The
-canonical bulk session derives bounded receive credit from measured path
-conditions. These values control incremental I/O and resource use; they are not
-aggregate message limits and are not visible as protocol choices. The network
-does not select a different API or wire protocol when a value crosses a byte
-threshold, and it has no payload-size enablement toggle.
+## Direct Link Contract
 
-`sinomo-network` exposes a transport-neutral, resource-bounded path estimator
-for reuse by other crates. Object RPC feeds it handshake and delivery progress
-and uses the result to tune admission without making observations a source of
-membership or routing authority. Credit is an admission bound, not a
-preallocated buffer; bounded queues and spill behavior separately control
-resident body memory.
+A direct transport connects adjacent nodes. TCP, Iroh, loopback, and future
+transport modules implement the same logical contract:
 
-Files, readers, generated data, and typed encoded values all use the same
-session machinery and are framed incrementally in both directions. Domain
-protocols may attach operation identities or domain-specific content
-identifiers, but do not define transport chunk sizes, per-chunk RPC routes, or
-separate small- and large-message calls.
+```rust,ignore
+trait LinkProvider {
+    async fn connect(&self, endpoint: &Endpoint) -> Result<AuthenticatedLink>;
+    async fn accept(&self) -> Result<AuthenticatedLink>;
+}
+```
 
-The persistent multiplexed channel carries control documents and body payloads
-on separate private representations while retaining the same object-RPC call
-interface. Per-call flow control and fair scheduling prevent one body from
-monopolizing a carrier. Peer-confirmed liveness isolates stalled calls, bounded
-reusable buffers limit resident memory, and relays forward ownership-bearing
-payloads without exposing carrier frame boundaries to applications. The local
-channel and cluster tunnel require the same exact protocol v1 shape.
+An `AuthenticatedLink` provides:
 
-Ordered bodies first use bounded in-memory delivery. A slow consumer can spill
-the unread suffix to temporary storage, while a deliberately dropped body is
-discarded under bounded transport credit so an early response can still
-complete. Normal completion and cancellation clean up spill state; orphan
-collection is not transfer resume and requires process-ownership evidence.
+- the verified local and adjacent-peer node identities;
+- a transport capability snapshot;
+- bounded, independently cancellable duplex streams;
+- transport-local liveness and close/reset reporting; and
+- observations such as handshake latency and delivered-byte progress.
 
-Each route belongs to a discoverable service category and declares its input,
-output, and observation metadata. This gives the daemon one router and one
-catalog for DFS, KV, cluster control, rollout, agent, and other internal
-protocols.
+The link authenticates only the adjacent peer. It does not assert that the peer
+is an authorized cluster member; the routing executor checks the current
+directory before using the link. A transport cannot promote a node into the
+cluster by completing a handshake.
 
-Plain-text framing is reserved for external systems that require it. New
-Sinomo-to-Sinomo protocols use the binary object boundary.
+Direct links may be pooled and multiplexed. Their stream and buffer bounds are
+resource limits, not aggregate application-message limits. A transport never
+selects another application protocol because a stream crosses a byte threshold.
 
-See [Sinomo Object format](sinomo-object-format.md) for the stable encoding and
-the developer [network data-path reference](developer/network-data-path.md) for
-the current private carrier formats, bounds, and v1 protocol contract.
+## Connectivity Contract
 
-## Canonical Routing
+Connectivity is a read model of evidence, not an authority source and not an
+active routing engine.
 
-Normal post-membership node-addressed traffic uses the target-node delivery
-algorithm. A direct send is a one-edge route; relay delivery is a route with
-additional edges. Loopback, LAN, roaming, browser, and relayed transports are
-edge types in the same graph rather than protocol-specific delivery systems.
-
-Bootstrap, join, direct probes, and transport-internal diagnostics may start
-from an explicit endpoint before a target-node route is available. Those are
-narrow lifecycle and diagnostic paths, not alternate domain routing systems.
-
-Routing proceeds in stages:
-
-1. Resolve the target node against the current authorized cluster directory.
-2. Reject local loops, exhausted explicit operation deadlines, exhausted hop
-   limits, and repeated nodes.
-3. Build a graph from authorized endpoints and current connectivity evidence.
-4. Rank usable paths deterministically for the request's purpose.
-5. Attempt the preferred next hop within its connect and no-progress health
-   limits.
-6. Record success or failure and invalidate the failed edge for this delivery.
-7. Retry through a bounded alternate endpoint or path.
-8. Deliver locally only after request authentication. A route that accepts
-   automatic retry also applies its own idempotency or replay checks.
-
-For normal node-addressed traffic, higher layers supply a target and may supply
-an operation deadline. They do not select LAN versus roaming, direct versus
-relay, transport chunks, retry windows, or one transport module over another.
-
-## Packet Invariants
-
-A routed packet carries:
+Every edge is directed. Evidence that A can reach B says nothing about B
+reaching A. An observation records at least:
 
 - source and target node identity;
-- a hop limit and visited-node history;
-- an authenticated caller identity and request context;
-- the protocol payload;
-- a cap for one downstream hop attempt.
+- endpoint identity and transport capability;
+- state and failure reason;
+- latency and, when measured, delivery-bandwidth estimates;
+- provenance and source-owned generation;
+- observation and expiry times; and
+- the directory generation against which the observation was valid.
 
-Within one relay attempt, forwarding preserves the origin-signed inner head and
-session descriptor. The final target authenticates the original caller, while
-each transport session authenticates the peer identity used for that route.
-Intermediate hops create fresh outer relay sessions and body-transfer
-descriptors.
+The public read boundary is an immutable, generation-stamped snapshot plus a
+watch for replacements:
 
-Canonical responses carry an Ed25519 identity proof bound to their logical
-session. Direct responses verify it against the expected target key, and a
-canonical relay preserves an available final-target proof unchanged. A pooled
-channel instead authenticates its peer once and carries the verified responder
-node id on each call. When a pooled final hop feeds an upstream canonical hop,
-the relay signs that canonical link and the receiver requires both the valid
-link proof and the exact expected final-target id. Relay-generated routing
-feedback is classified before it can be treated as target delivery. These
-proofs answer which authenticated nodes handled the response, not whether the
-response bytes were altered.
+```rust,ignore
+trait ConnectivityView {
+    fn snapshot(&self) -> Arc<ConnectivitySnapshot>;
+    fn subscribe(&self) -> watch::Receiver<Arc<ConnectivitySnapshot>>;
+}
+```
 
-Body framing enforces only protocol shape: transfer identity, ordered offsets,
-declared lengths, flow-control windows, and completion byte counts. It does not
-hash, sign, checksum, encrypt, or otherwise attest body bytes. Relays may
-re-frame trusted bytes for each transport hop without retaining end-to-end
-content proofs.
+Reads are observational. They never schedule probes, persist refreshes, or
+change a node's status. Probe owners and routed-session executors submit
+observations through an explicit sink. The tracker validates ownership,
+deduplicates updates, expires stale facts, and publishes a new snapshot.
 
-Retries may race, and transport behavior may duplicate delivery. Generic object
-RPC does not provide a universal response replay cache. Exact authentication
-nonce replay is rejected, while side-effecting routes must carry a stable
-operation or request identity and enforce idempotency at their domain boundary.
-Some DFS data-plane routes add a specialized response cache, but that stronger
-behavior is not a network-wide guarantee.
+### Membership, Presence, and Reachability
 
-## Route Graph and Cost
+The implementation must not collapse distributed state into one authoritative
+`online` boolean. These are distinct:
 
-The graph contains only authorized members and usable endpoints. Its inputs are:
+| State | Meaning |
+|---|---|
+| Authorized | The current cluster directory permits communication with the node. |
+| Present | A fresh, authenticated liveness statement exists. |
+| Directly reachable | A fresh usable edge exists from the observer to the node. |
+| Routed reachable | The current graph contains an authorized usable path. |
+| Connected | An authenticated direct or routed session is currently established. |
+| Unreachable | Fresh evidence excludes every currently authorized path from this observer. |
+| Unknown | Evidence is absent, expired, or insufficient. |
+| Departed | The authoritative directory no longer contains the node. |
 
-- member and endpoint records from the cluster directory;
-- the authoritative connectivity graph published through the control plane;
-- the current transport-module availability snapshot;
-- local observations for the current delivery;
-- purpose-specific constraints such as full-duplex stream support.
+Operator-facing `online`, `degraded`, or `offline` labels are timestamped
+projections of these facts. They are not stored as routing authority. In
+particular, one observer's failure cannot prove that a node is globally offline.
 
-Route cost prefers local and direct paths over more expensive or relayed ones,
-then incorporates observed health and latency. An unreachable or unauthorized
-edge is excluded rather than merely assigned a poor rank.
+### Cluster Directory
 
-Purpose-specific selectors may adjust ranking for Raft, rollout, status, or
-full-duplex stream requirements, but must preserve the shared safety rules:
-member authorization, target identity, endpoint scope, transport capability,
-local timeout, hop limit, and connectivity suppression.
-
-## Cluster Directory
-
-Networking must not read cluster KV. Stable facts arrive through a directory
-interface implemented by `sinomo-cluster`:
+Connectivity and routing do not read cluster KV. `sinomo-cluster` supplies a
+directory interface containing:
 
 - authorized members and identity keys;
-- advertised endpoints and node health;
-- configured network information;
-- the authoritative connectivity graph;
-- a monotonic version used to invalidate route caches.
+- advertised endpoints and endpoint generations;
+- endpoint scope and transport requirements;
+- source-owned connectivity facts accepted by the control plane; and
+- a monotonic generation for cache invalidation.
 
-The version follows the committed directory projection. A membership removal,
-endpoint generation change, identity mismatch, or graph update invalidates
-affected cached plans before they can authorize new work.
+Local observations may supplement route choice for their source node. They do
+not authorize an absent member, extend an expired remote observation, or
+override a newer non-empty authoritative projection.
 
-Local connectivity files are bootstrap caches only. They may help while the
-authoritative directory is unavailable or empty, and the local node may use its
-own fresh probe evidence during cold join. Observations attributed to other
-nodes cannot extend or override a non-empty authoritative graph.
+## Routing Contract
 
-When quorum is available, daemons publish their current source-owned
-observations through the cluster control plane so useful evidence becomes part
-of the shared directory rather than a second authority layer.
+The routing layer exposes node-addressed, authenticated, socket-like streams. A
+caller supplies a destination node and connection constraints; it never chooses
+LAN versus Iroh, direct versus relay, or a specific intermediate node.
 
-## Retry, Health, and Failure Semantics
+```rust,ignore
+trait RoutedConnector {
+    async fn connect(
+        &self,
+        destination: NodeId,
+        options: ConnectOptions,
+    ) -> Result<PeerStream, ConnectError>;
+}
 
-Object RPC has no end-to-end deadline by default. Connection establishment and
-each interval without validated network or transfer progress use the shared
-five-second health timeout. A progressing call may therefore run for an
-unbounded wall-clock duration. Callers that require strict end-to-end expiry
-provide an explicit operation deadline.
+struct PeerStream {
+    io: Box<dyn AsyncReadWrite>,
+    local: NodeId,
+    peer: NodeId,
+    session_id: SessionId,
+    channel_binding: [u8; 32],
+    route_trace: RouteTrace,
+}
+```
 
-Canonical calls use framed progress and the canonical health policy for every
-non-empty value, regardless of aggregate size.
+`route_trace` is diagnostic evidence. It cannot be used by an application to
+grant authority or select a different service behavior.
 
-Route discovery remains finite through its attempt count, hop limit, and
-per-attempt health limits. Relay envelopes carry a maximum per-hop timeout, not
-an implicit absolute end-to-end expiry. Progress includes advancing body
-offsets, cumulative acknowledgements, or control progress;
-merely waiting longer does not extend an explicit operation deadline.
+The connector may cache an authenticated routed connection and open cheap
+logical streams over it. Each returned `PeerStream` nevertheless has ordinary
+socket failure semantics: it is bound to one destination, never silently moves
+to another destination, and fails if its underlying routed session cannot
+continue.
 
-Replayable byte and file sources can retry on a fresh connection; the current
-engine safely restarts those attempts at offset zero. It does not claim durable
-partial-transfer resume: implementing that requires persisted receiver state,
-handler reattachment, and garbage collection as one atomic design. Generated
-one-pass bodies fail explicitly once safe replay is impossible; the network
-does not silently collect an unbounded producer into memory. Side-effecting
-routes still use stable operation identities so a lost completion reply cannot
-commit the domain operation twice.
+Transparent stream migration and durable partial-transfer resume are not part
+of this contract. They require separately specified sequence, acknowledgement,
+reattachment, and garbage-collection semantics.
 
-Failures are classified so route learning remains useful:
+### Pure Planning
 
-| Failure | Routing effect |
+Route planning is a pure operation over immutable inputs:
+
+```rust,ignore
+fn plan_routes(
+    directory: &DirectorySnapshot,
+    connectivity: &ConnectivitySnapshot,
+    source: NodeId,
+    destination: NodeId,
+    constraints: RouteConstraints,
+) -> Vec<CandidatePath>;
+```
+
+The planner performs no dialing, probing, persistence, retry, or RPC. Its graph
+contains only authorized nodes and usable directed edges. Every cached plan is
+keyed by all directory, connectivity, transport-capability, and constraint
+generations that affect validity.
+
+A direct connection is a one-edge path. A relay connection is the same path
+model with additional edges. Purpose constraints may require capabilities such
+as full duplex, privacy, maximum hops, or a connection deadline, but they do not
+change the routing safety rules.
+
+### Routed-Session Establishment
+
+For a path A to B to C:
+
+1. A selects the candidate path `[A, B, C]` from a current snapshot.
+2. A creates an origin-signed `OpenSession` binding A, destination C, a unique
+   session ID, the ordered path, hop limit, connection deadline, and end-to-end
+   key material.
+3. B verifies membership, signatures, path position, loop freedom, deadline,
+   and hop limit. It may reject the session but cannot change A, C, or the
+   session identity.
+4. B establishes or reuses a direct link to C and forwards the unchanged
+   end-to-end session descriptor.
+5. C accepts only when the destination equals its local identity and returns a
+   destination-signed acceptance bound to the same session.
+6. A and C derive end-to-end authenticated-encryption keys and a channel
+   binding. Only then may `connect` return a `PeerStream`.
+
+Intermediate relays forward opaque encrypted stream data. They may observe the
+path identities and bounded traffic metadata required for forwarding, but they
+cannot inspect RPC values, alter the destination, impersonate either endpoint,
+or produce a successful end-to-end acceptance.
+
+A routed A-to-C session is not inserted as a new direct connectivity edge.
+Connectivity may report it as an active routed session or use its measurements
+as evidence for the constituent directed edges.
+
+### Relay Backpressure
+
+Relays copy between bounded streams and stop reading when the next hop cannot
+accept data. Backpressure propagates through the path. Routing does not
+materialize complete application values and does not spill application bytes to
+disk. Durable transfer belongs to a domain content protocol such as SIFS, not to
+the generic routed-stream layer.
+
+Frame, queue, and stream-credit bounds protect resident resources. They never
+define a maximum logical stream length.
+
+### Connection Attempts and Failures
+
+The routing executor may try bounded alternative paths while establishing a
+session because no application stream has yet been returned. Once `connect`
+succeeds:
+
+- routing does not replay bytes on a new path;
+- a broken route closes or resets the stream;
+- the failure identifies whether establishment failed or an established stream
+  broke; and
+- observations are submitted to connectivity without changing membership.
+
+This boundary prevents carrier or relay failures from automatically replaying a
+possibly executed RPC operation.
+
+## Object-RPC Contract
+
+Object RPC is a transport-independent protocol over one authenticated duplex
+stream per call. It can run over a `PeerStream`, an authenticated direct stream,
+an in-memory duplex stream, or another adapter satisfying the same peer-context
+contract.
+
+Plain `AsyncRead + AsyncWrite` is insufficient for remote calls because it does
+not identify the peer. An RPC transport also supplies:
+
+- verified local and peer identities, or an explicit unauthenticated-local
+  classification;
+- a unique session or connection identifier;
+- a channel binding derived from the authenticated stream; and
+- the stream's close/reset result.
+
+The client writes one request direction and reads one response direction. The
+server may respond before consuming the complete request body. Independent
+calls use independent logical streams; object RPC does not implement another
+connection multiplexer.
+
+Object RPC owns:
+
+- protocol negotiation for the RPC contract only;
+- method and request identifiers;
+- bounded request and response heads;
+- incrementally encoded SOBJ values and optional attachments;
+- explicit body completion and cancellation;
+- application authentication and authorization context; and
+- failure classification needed for domain retry decisions.
+
+The service dispatch name is a `method` or `service method`, not a network
+`route`. The method catalog and handler registry have one owner in
+`sinomo-service`; object RPC transports calls to that registry but does not
+maintain a second service catalog.
+
+### Payload Invariants
+
+Every request and response uses the same RPC framing at every size:
+
+- request size cannot select the response carrier;
+- inline encoding is an optimization, not a protocol boundary;
+- heads have small explicit allocation limits;
+- bodies are processed incrementally under stream backpressure;
+- frame and buffer limits are not aggregate value limits;
+- known and unknown body lengths use the same call interface; and
+- a response may be larger or smaller than its request without changing
+  protocol or delivery semantics.
+
+RPC framing includes an end-to-end content length when known and a cryptographic
+content digest for transported SOBJ bytes. A one-pass body whose length or
+digest is not known at the start declares deferred completion; its
+origin-authenticated finish record supplies the final length and digest bound to
+the request and channel. The receiver computes both while consuming the stream
+and verifies completion before accepting the value. A handler may process
+streamed bytes speculatively, but it cannot commit an irreversible effect based
+on unverified content unless its domain protocol supplies an independently
+verified chunk or content contract.
+
+The routed stream's authenticated encryption protects bytes in transit. The
+content digest additionally binds application authentication and stable object
+identity independently of carrier framing. Responses apply the same rule with
+the target as the authenticated producer.
+
+### Authentication and Destination Binding
+
+An authenticated RPC request binds at least:
+
+- caller and intended peer identity;
+- channel binding and RPC request ID;
+- service method and operation identity;
+- request-head digest and body content descriptor;
+- freshness and replay data; and
+- relevant authorization context.
+
+Binding the intended peer prevents a valid request from being re-enveloped for
+another node. The target service verifies the request again at the final effect
+boundary. Transport authentication never replaces domain authorization or
+node-local consent.
+
+### Retry and Idempotency
+
+Object RPC does not choose another endpoint or route. If its stream fails, it
+returns one of the domain-relevant delivery states:
+
+| State | Meaning |
 |---|---|
-| Authentication or identity mismatch | Suppress the endpoint and report an authorization failure. |
-| Unsupported transport or stream capability | Exclude the endpoint for this request shape. |
-| Connect or no-progress timeout | Record degraded connectivity and try a bounded alternative only when replay semantics allow it. |
-| Explicit unreachable feedback | Exclude the edge until directory or probe evidence changes. |
-| No authorized route | Fail without exploratory delivery to an untrusted node. |
-| Explicit operation deadline or hop limit exhausted | Stop the current routing attempt and return the terminal delivery result. |
+| Not sent | The caller has definitive evidence that no request bytes crossed the authenticated stream boundary. |
+| Rejected | The peer returned a verified rejection before handler execution. |
+| Possibly applied | Request delivery or handler execution may have occurred, but no verified completion was received. |
+| Completed | A response and its integrity checks completed successfully. |
 
-Connectivity feedback changes route choice, not membership. A successful dial
-cannot promote a peer, and a failed dial cannot remove one.
+Only `Not sent` is generically safe to retry. Once any request byte is handed to
+an established stream, a failure is `Possibly applied` unless a verified peer
+rejection proves otherwise. A domain may retry `Possibly applied` only with a
+stable operation identity and an idempotency or outcome query contract.
+Networking does not provide a universal response replay cache.
+
+Explicit operation deadlines belong to the RPC/domain request. Connect and
+no-progress health limits are separate routing and stream-liveness controls and
+must not silently extend an operation deadline.
+
+## Protocol Names and Evolution
+
+There is no global "Sinomo network protocol version." Independently released
+contracts evolve independently:
+
+- each direct transport versions its own handshake and capabilities;
+- the routed-session and relay protocol uses its own namespace;
+- SOBJ object RPC uses its own namespace; and
+- the SOBJ binary encoding retains its own format version.
+
+Capabilities, limits, and optional fields are negotiated as capabilities when
+backward-compatible. A version changes only for an incompatible contract
+change, not for an implementation refactor or tuning adjustment. Compatibility
+adapters live at protocol boundaries and never cause routing to choose an RPC
+protocol based on payload shape.
+
+The current consolidated implementation protocol v1 described in the
+[data-path reference](developer/network-data-path.md) predates this separation.
+It is migration input, not the version number of every contract above.
 
 ## Transport Modules
 
-Transports are modules behind one lifecycle: describe capability, start, stop,
-open a full-duplex RPC stream, and expose local endpoints. Loopback and LAN
-transport are built in. Additional transports, including Iroh, are loaded
-through the module system.
+Transport modules describe capabilities, start and stop listeners, dial direct
+endpoints, accept adjacent links, and expose local endpoints. Disabling a module
+removes it from future link selection and stops it safely; loaded native code
+remains alive while a host reference exists.
 
-Dispatch is address-scheme and capability aware. An endpoint is not attempted
-when no enabled module can dial it or when the request requires a feature the
-module does not support. Disabling a module removes its transports from future
-selection and stops it safely; loaded native code remains alive while any host
-reference may still exist.
+The native module ABI may use SOBJ for descriptors and endpoint lists, but
+transport modules do not use object RPC internally unless they independently
+act as an RPC application. Core routing depends on transport-neutral link
+contracts and does not depend on a transport SDK.
 
-The native module ABI is versioned and uses SOBJ for descriptors and endpoint
-lists. The host validates the ABI and keeps unsafe library lifetime management
-inside the trusted module loader. See
-[module lifecycle architecture](module-lifecycle-architecture.md) for loading,
-activation, and replacement.
+## Single-Crate Module Boundaries
 
-The Iroh transport is an extracted native module. Core networking retains only
-transport-neutral endpoint contracts and selection rules; it does not depend on
-the Iroh SDK.
+The entire network implementation remains in `crates/sinomo-network`. Its
+internal modules enforce the architecture without changing the workspace crate
+graph:
 
-## Security
+| Module boundary | Responsibility |
+|---|---|
+| Direct link | Authenticated adjacent transports, listeners, connection pools, and streams. |
+| Connectivity | Evidence validation, immutable snapshots, watches, and derived status. |
+| Routing | Pure planning, routed sessions, relays, and `RoutedConnector`. |
+| Object RPC | SOBJ RPC over authenticated duplex streams. |
+| Public facade | Stable exports and composition types without a second implementation path. |
 
-`sinomo-network` assumes every selected transport medium is fully trusted. It
-does not provide confidentiality or defend against transport-layer attacks, and
-it does not add payload checksums, content digests, per-frame signatures, finish
-attestations, or encryption. Built-in LAN TCP accepts the transport's own error
-detection and delivers its payload as received. A transport module may have its
-own implementation properties, but object RPC neither requires nor duplicates
-them.
+The exact file layout may evolve while the migration is in progress, but the
+dependency direction is fixed. Object RPC cannot import routing or
+connectivity. Routing cannot import object RPC, SOBJ request types, or service
+catalogs. Connectivity cannot import route execution or RPC. Direct-link
+modules cannot import any higher network layer.
 
-Identity authentication remains in scope. Signed daemon requests establish the
-caller identity and request context, retain freshness and nonce replay checks,
-and response identity proofs plus exact pooled-channel responder attestations
-establish which target answered the logical session. These are authentication
-contracts, not content-integrity or channel-security guarantees. The target
-service still applies its own domain authorization.
+`sinomo-service` remains the single external owner of service-method catalogs,
+dispatch, authorization layers, and handlers. The daemon adapts its service
+registry to the object-RPC server contract; `sinomo-network` does not gain a
+dependency on `sinomo-service` or maintain a parallel catalog.
 
-Relays see only the authority required to forward a packet. They cannot convert
-reachability into membership or impersonate the original requester. Local
-loopback control uses the same authentication boundary for sensitive commands.
+Module-boundary tests inside `sinomo-network` enforce forbidden imports and
+public API direction. The workspace trust-ring boundary remains unchanged:
+`sinomo-network` is one R0 crate, networking and KV have no production
+dependency on one another, and `sinomo-cluster` is their only bridge.
 
 ## Architectural Invariants
 
-1. Domain protocols use the single typed object-RPC session and do not add
-   separate chunk-RPC paths or small- and large-message APIs.
-2. Frame, chunk, window, and buffer sizes are never aggregate message limits.
-   Canonical requests and responses have no payload-size threshold or
-   enablement toggle and retain the same interface at every size.
-   Chunk size is negotiated independently from receive credit, while measured
-   BDP may tune both within their bounded ranges.
-3. Network and KV have no production dependency on one another;
-   `sinomo-cluster` is their only R0 bridge.
-4. Directory membership and connectivity are inputs to routing, not outputs of
-   successful delivery.
-5. Caller and response-target identities are authenticated, while payload bytes
-   are trusted to the selected transport and are not authenticated, checksummed,
-   or encrypted by `sinomo-network`.
-6. Origin calls have no implicit whole-call deadline; explicit operation
-   deadlines are distinct from per-connect and per-progress health limits.
-7. Side-effecting routes that permit retry must provide operation-level
-   idempotency; networking does not promise universal response replay.
-8. Route caches are versioned by every input that affects validity.
-9. Disabled or incompatible transports cannot consume attempt budgets.
-10. Remote requests are authorized again by the target service.
-11. Higher-level crates never bypass the network layer for cluster traffic and
-    do not implement transport chunking, transfer retry, or resume protocols.
+1. Object RPC depends on an authenticated duplex-stream contract, never on node
+   routing, endpoint selection, connectivity stores, or a specific transport.
+2. Routing forwards opaque bytes and never imports SOBJ, RPC methods, service
+   catalogs, body modes, or domain retry policy.
+3. Connectivity publishes immutable directed evidence and never grants
+   membership, executes routes, or turns one observer's failure into global
+   offline authority.
+4. A routed stream is end-to-end bound to its source, destination, session, and
+   channel binding before application bytes are accepted.
+5. Relays cannot change the destination, authenticate as the origin or target,
+   or inspect or alter end-to-end protected application bytes.
+6. One RPC call uses one logical duplex stream and the same protocol at every
+   request and response size.
+7. Frame, queue, window, and buffer limits bound resident resources, not total
+   SOBJ or stream length.
+8. Routing may try alternatives only before returning a stream. It never
+   replays bytes after an established stream fails.
+9. Only a domain with a stable operation identity and idempotency or outcome
+   contract may retry a possibly applied call.
+10. The service-method registry has one owner in `sinomo-service`; node routes
+    and service methods are different concepts and use different names.
+11. Network and KV have no production dependency on one another;
+    `sinomo-cluster` is their only R0 bridge.
+12. Higher-level crates do not open ad hoc cluster sockets, select relay paths,
+    or create private chunk-transfer RPCs.
+13. Protocol versions identify independently released wire contracts, not
+    implementation milestones.
+14. Target services re-check domain authority and node-local consent at the
+    final effect boundary.
 
-Operation-level idempotency is a protocol requirement, not a universal current
-capability. Cluster KV now provides stable request IDs, exact committed-response
-replay while the bounded committed-request record is retained, and an
-authoritative request-outcome query that reports expiry explicitly after that
-retention window. Other side-effecting domain protocols must define their own
-operation identity and retry contract rather than relying on networking to
-replay responses.
-
-The [clustering architecture](clustering-architecture.md) defines the authority
-projected into the directory. Current verification coverage and future proof
-work are documented in the [formal verification guide](formal/cluster-verification.md)
-and [formal verification roadmap](plans/formal-verification-roadmap.md).
+The [clustering architecture](clustering-architecture.md) defines directory
+authority. The [Sinomo Object format](sinomo-object-format.md) defines the
+binary object representation. Current implementation gaps and deletion gates
+are tracked in the
+[network layer separation plan](plans/network-layer-separation.md).
