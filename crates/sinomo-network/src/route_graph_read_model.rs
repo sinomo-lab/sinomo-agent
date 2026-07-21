@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn route_graph_cache_tracks_route_stable_local_connectivity_refresh() {
+    fn route_graph_cache_ignores_latency_only_local_connectivity_refresh() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-cache-refresh");
         let data_dir = sinomo_local::SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
@@ -1554,9 +1554,9 @@ mod tests {
             cached_mark.local_connectivity,
             refreshed_mark.local_connectivity
         );
-        assert_ne!(
-            cached_mark.local_connectivity_generation,
-            refreshed_mark.local_connectivity_generation
+        assert_eq!(
+            cached_mark.local_connectivity_generation, refreshed_mark.local_connectivity_generation,
+            "latency-only evidence must not rebuild the route graph"
         );
 
         let refreshed_graph =
@@ -1564,6 +1564,10 @@ mod tests {
         let refreshed_endpoint = refreshed_graph
             .best_healthy_endpoint(&local, &target)
             .expect("refreshed healthy endpoint");
-        assert_eq!(refreshed_endpoint.last_observed_latency_ms, Some(19));
+        assert_eq!(
+            refreshed_endpoint.last_observed_latency_ms,
+            Some(7),
+            "the durable graph retains its published evidence while live path metrics own fresh samples"
+        );
     }
 }

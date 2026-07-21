@@ -1641,6 +1641,7 @@ mod authority_probe_tests {
             file_system_id: file_system_id.clone(),
             path: "/authority-probe.txt".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: primary.clone(),
             current_locations: vec![primary.clone()],
             content_hash: Some("blake3:authority-probe".to_string()),

@@ -255,6 +255,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: "/docs/deleted.md".to_string(),
             kind: DfsObjectKind::Tombstone,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: Vec::new(),
             content_hash: None,

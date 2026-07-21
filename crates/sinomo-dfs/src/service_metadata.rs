@@ -80,9 +80,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(kv) = self.control_plane.as_mut() {
             let file_system_config = DfsFileSystemConfig::from(&file_system);
             let mut store = DfsControlPlaneStore::new(kv.as_mut());
-            if store.get_file_system_config(&file_system.file_system_id)?
-                != Some(file_system_config.clone())
-            {
+            let current = store.get_file_system_config(&file_system.file_system_id)?;
+            if current.as_ref().is_none_or(|current| {
+                !crate::placement::dfs_file_system_config_semantically_eq(
+                    current,
+                    &file_system_config,
+                )
+            }) {
                 store.put_file_system_config(&file_system_config)?;
             }
         }

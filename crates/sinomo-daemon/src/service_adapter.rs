@@ -199,15 +199,7 @@ pub(crate) async fn forward_object_rpc_session_from_daemon_control(
     // finish proofs to the route signed on their next hop instead of carrying
     // the outer daemon-forward proof into the inner object-RPC call (or vice
     // versa).
-    let call = if request_body.is_empty() {
-        ObjectRpcSessionCall::value(payload.request)
-    } else {
-        let total_bytes = request_body.total_bytes();
-        ObjectRpcSessionCall::new(
-            payload.request,
-            ObjectRpcBodySource::async_reader(request_body, total_bytes),
-        )
-    };
+    let call = ObjectRpcSessionCall::from_relay_body(payload.request, request_body);
     match crate::client::send_object_rpc_session_to_target_async_with_daemon_paths_and_network_error(
         paths,
         &payload.target_node_id,
@@ -218,19 +210,27 @@ pub(crate) async fn forward_object_rpc_session_from_daemon_control(
     )
     .await
     {
-        Ok(result) => {
-            let (response, body) = result.into_parts();
-            let body = if body.is_empty() {
-                ObjectRpcBodySource::empty()
-            } else {
-                let total_bytes = body.total_bytes();
-                ObjectRpcBodySource::async_reader(body, total_bytes)
-            };
+        Ok(result) if result.body.is_empty() => {
+            // A received Value has already been materialized into the nested
+            // response head. Keep it there: moving its forwarding marker into
+            // the outer daemon response would relabel that nested value as an
+            // attachment of the proxy envelope.
+            let (response, _) = result.into_parts();
             Ok((
                 crate::DaemonObjectRpcForwardResponse::Success { response },
-                body,
+                ObjectRpcBodySource::empty(),
             ))
         }
+        Ok(result) => match result.into_relay_response() {
+            Ok(ObjectRpcSessionResponse { response, body }) => Ok((
+                crate::DaemonObjectRpcForwardResponse::Success { response },
+                body,
+            )),
+            Err(error) => Ok((
+                daemon_object_rpc_forward_network_error(error),
+                ObjectRpcBodySource::empty(),
+            )),
+        },
         Err(error) => Ok((
             daemon_object_rpc_forward_network_error(error),
             ObjectRpcBodySource::empty(),
@@ -537,6 +537,12 @@ fn network_module_service_route(route: &'static str) -> ServiceRoute {
             .into_iter()
             .map(|capability| capability.to_string()),
     )
+    .with_request_body_mode(native_module_body_mode_to_service(
+        descriptor.request_body_mode,
+    ))
+    .with_response_body_mode(native_module_body_mode_to_service(
+        descriptor.response_body_mode,
+    ))
 }
 
 fn rollout_daemon_service_route(route: &'static str) -> ServiceRoute {
@@ -1121,6 +1127,88 @@ fn read_bounded_cluster_connectivity_snapshot(
     Ok(records)
 }
 
+/// Handles both value-only and semantic-attachment forms of the daemon network ping.
+///
+/// Keeping this at the service boundary makes the typed SOBJ head and its optional body
+/// one operation regardless of whether control dispatch takes the core-route fast path or
+/// enters through the generic service registry.
+pub(crate) async fn handle_daemon_cluster_network_ping_session_request(
+    paths: &DaemonPaths,
+    data_dir: &SinomoDataDir,
+    request: ObjectRpcSessionRequest,
+) -> Result<ObjectRpcSessionResponse, ServiceError> {
+    let ObjectRpcSessionRequest {
+        request: request_head,
+        body: request_body,
+    } = request;
+    let ping_request =
+        sinomo_core::cluster::decode_cluster_network_ping_rpc_request(&request_head)?;
+
+    match ping_request.payload_mode {
+        sinomo_core::cluster::ClusterNetworkPingPayloadMode::EmbeddedSobj => {
+            if !request_body.is_empty() {
+                return Err(NetworkError::Serialization {
+                    detail: "embedded-SOBJ cluster network ping does not accept an attached body"
+                        .to_string(),
+                }
+                .into());
+            }
+            let responder_node_id = cached_cluster_network_ping_node_id(paths, data_dir)?;
+            let response = sinomo_core::cluster::handle_cluster_network_ping_rpc_request_for_node(
+                &responder_node_id,
+                request_head,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            Ok(ObjectRpcSessionResponse::value(response))
+        }
+        sinomo_core::cluster::ClusterNetworkPingPayloadMode::SemanticAttachment => {
+            sinomo_core::cluster::validate_cluster_network_ping_attachment_request(&ping_request)?;
+            let declared_body_bytes = request_body.total_bytes();
+            if declared_body_bytes != Some(ping_request.request_attachment_bytes)
+                && !(ping_request.request_attachment_bytes == 0 && request_body.is_empty())
+            {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "cluster network ping request attachment descriptor declares {declared_body_bytes:?} bytes, head declares {}",
+                        ping_request.request_attachment_bytes
+                    ),
+                }
+                .into());
+            }
+
+            // Consume ownership-bearing chunks directly. This keeps the benchmark on the
+            // canonical bounded network body path without an application AsyncRead copy loop.
+            let actual_request_attachment_bytes = request_body
+                .discard_owned_chunks()
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "drain cluster network ping request attachment".to_string(),
+                    detail: source.to_string(),
+                })?;
+            if actual_request_attachment_bytes != ping_request.request_attachment_bytes {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "cluster network ping request attachment delivered {actual_request_attachment_bytes} bytes, head declares {}",
+                        ping_request.request_attachment_bytes
+                    ),
+                }
+                .into());
+            }
+
+            let responder_node_id = cached_cluster_network_ping_node_id(paths, data_dir)?;
+            let response =
+                sinomo_core::cluster::cluster_network_ping_attachment_rpc_response_for_node(
+                    &responder_node_id,
+                    &ping_request,
+                    actual_request_attachment_bytes,
+                    time::OffsetDateTime::now_utc(),
+                )?;
+            let response_body = ObjectRpcBodySource::zeroes(ping_request.response_attachment_bytes);
+            Ok(ObjectRpcSessionResponse::new(response, response_body))
+        }
+    }
+}
+
 impl Service for ClusterHealthService {
     fn name(&self) -> &'static str {
         "cluster-network"
@@ -1144,16 +1232,14 @@ impl Service for ClusterHealthService {
         Box::pin(async move {
             let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
             if request.route == CLUSTER_NETWORK_PING_ROUTE {
-                let responder_node_id =
-                    cached_cluster_network_ping_node_id(&paths, ctx.data_dir.as_ref())?;
-                let response =
-                    sinomo_core::cluster::handle_cluster_network_ping_rpc_request_for_node(
-                        &responder_node_id,
-                        request,
-                        time::OffsetDateTime::now_utc(),
-                    )
-                    .map_err(ServiceError::from)?;
-                ctx.respond(response)?;
+                let request_body = ctx.take_request_body();
+                let response = handle_daemon_cluster_network_ping_session_request(
+                    &paths,
+                    ctx.data_dir.as_ref(),
+                    ObjectRpcSessionRequest::new(request, request_body),
+                )
+                .await?;
+                ctx.respond_with_body(response.response, response.body)?;
                 return Ok(ServiceDisposition::Continue);
             }
             if request.route == CLUSTER_NETWORK_CONNECTIVITY_ROUTE {
@@ -8689,6 +8775,73 @@ mod tests {
         annotate_daemon_service_request(request, &test_authenticated_command(signer));
     }
 
+    #[tokio::test]
+    async fn cluster_network_ping_attachment_dispatches_through_service_registry() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-daemon-network-ping-service-registry-attachment");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("daemon paths");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node =
+            sinomo_core::node::NodeId::from_legacy_named("network_ping_service_registry_local")
+                .expect("local node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(
+                "network_ping_service_registry_cluster",
+            )
+            .expect("cluster id"),
+            "network ping service registry",
+            local_node.clone(),
+            "local",
+            "local-public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let registry = ServiceRegistry::builder()
+            .register(ClusterHealthService {
+                paths: paths.clone(),
+                runtime: Some(tokio::runtime::Handle::current()),
+            })
+            .build();
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("service registry host");
+        let descriptor = host
+            .object_rpc_route_descriptor(CLUSTER_NETWORK_PING_ROUTE)
+            .expect("network ping descriptor");
+        assert_eq!(descriptor.request_body_mode, ServiceBodyMode::Optional);
+        assert_eq!(descriptor.response_body_mode, ServiceBodyMode::Optional);
+
+        let request_head = sinomo_core::cluster::cluster_network_ping_attachment_rpc_request(
+            "registry-attachment",
+            4096,
+            8192,
+        )
+        .expect("request head");
+        let request = ObjectRpcSessionRequest::new(
+            request_head,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(vec![0; 4096]),
+        );
+        let (response, stop) = dispatch_rpc_via_registry_to_session_response_async(
+            &host,
+            &test_authenticated_command(DaemonSignerAuthority::Local),
+            request,
+            Some(&paths),
+        )
+        .await
+        .expect("registry attachment response");
+
+        assert!(!stop);
+        let response_head: sinomo_core::cluster::ClusterNetworkPingResponse =
+            response.response.decode_body().expect("response head");
+        assert_eq!(response_head.responder_node_id, local_node);
+        assert_eq!(response_head.request_attachment_bytes, 4096);
+        assert_eq!(response_head.response_attachment_bytes, 8192);
+        assert_eq!(response.body.total_bytes(), Some(8192));
+    }
+
     #[test]
     fn daemon_service_registry_host_dispatches_registry_service_and_records_stop() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-router-adapter");
@@ -10887,6 +11040,16 @@ mod tests {
                 .map(|capability| capability.as_str().to_string())
                 .collect::<Vec<_>>()
         );
+        assert_eq!(ping.request_body_mode, ServiceBodyMode::Optional);
+        assert_eq!(ping.response_body_mode, ServiceBodyMode::Optional);
+        assert_eq!(
+            ping_module_route.request_body_mode,
+            sinomo_module_api::NativeModuleBodyMode::Optional
+        );
+        assert_eq!(
+            ping_module_route.response_body_mode,
+            sinomo_module_api::NativeModuleBodyMode::Optional
+        );
         let dfs_data_read = route_metadata
             .iter()
             .find(|route| route.route == sinomo_dfs::DFS_DATA_READ_ROUTE)
@@ -11128,6 +11291,11 @@ mod tests {
                     .await
                     .expect("target session");
                 assert_eq!(incoming.request.route, expected_route);
+                assert_eq!(
+                    incoming.body.total_bytes(),
+                    Some(expected_request.len() as u64),
+                    "the proxy must preserve the request attachment's declared length"
+                );
                 let mut actual_request = Vec::new();
                 incoming
                     .body
@@ -11244,6 +11412,11 @@ mod tests {
                 )
                 .await
                 .expect("outer forwarded session");
+            assert_eq!(
+                result.body.total_bytes(),
+                Some(expected_response.len() as u64),
+                "the proxy must preserve the response attachment's declared length"
+            );
             let envelope: crate::DaemonObjectRpcForwardResponse = result
                 .response
                 .decode_body()

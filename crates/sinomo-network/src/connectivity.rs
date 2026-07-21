@@ -32,6 +32,20 @@ pub fn cluster_network_record_live(expires_at: OffsetDateTime, now: OffsetDateTi
     expires_at > now
 }
 
+/// Whether durable connectivity evidence is close enough to expiry that an
+/// otherwise stable observation must renew it.
+///
+/// This deliberately matches the probe selection margin. A probe that renews
+/// the local source set must be publishable in the same generation; otherwise
+/// low-frequency mobile/sensor schedules could accept a fresh local expiry
+/// while letting the older cluster-KV evidence lapse before their next tick.
+pub fn cluster_connectivity_record_should_refresh(
+    expires_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    expires_at <= now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS)
+}
+
 pub fn cluster_connectivity_stable_eq(
     left: &ClusterConnectivityRecord,
     right: &ClusterConnectivityRecord,

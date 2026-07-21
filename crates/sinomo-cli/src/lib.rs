@@ -151,7 +151,6 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
-    send_object_rpc_to_target_with_timeouts as daemon_send_object_rpc_to_target_with_timeouts,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
     sign_daemon_rpc_request_for_local_node as daemon_sign_daemon_rpc_request_for_local_node,
@@ -294,7 +293,59 @@ use time::format_description::well_known::Rfc3339;
 pub use tui::*;
 pub(crate) use voice::*;
 
-struct CliClusterStateAuthorityReachabilityHost;
+trait CliDaemonTargetRpc {
+    fn object_rpc_to_target_with_deadline(
+        &self,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+    ) -> Result<network::ObjectRpcResponse, ()>;
+}
+
+impl CliDaemonTargetRpc for DaemonApiClient {
+    fn object_rpc_to_target_with_deadline(
+        &self,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+    ) -> Result<network::ObjectRpcResponse, ()> {
+        DaemonApiClient::object_rpc_to_target_with_deadline(
+            self,
+            target_node_id,
+            request,
+            connect_timeout,
+            overall_timeout,
+            observe_connectivity,
+        )
+        .map_err(|_| ())
+    }
+}
+
+struct CliClusterStateAuthorityReachabilityHost {
+    daemon: Option<Box<dyn CliDaemonTargetRpc>>,
+}
+
+impl CliClusterStateAuthorityReachabilityHost {
+    fn new(daemon: Option<&DaemonStatus>) -> Self {
+        Self {
+            daemon: daemon.map(|daemon| {
+                Box::new(DaemonApiClient::at_address(daemon.address.clone()))
+                    as Box<dyn CliDaemonTargetRpc>
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_daemon(daemon: impl CliDaemonTargetRpc + 'static) -> Self {
+        Self {
+            daemon: Some(Box::new(daemon)),
+        }
+    }
+}
 
 impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthorityReachabilityHost {
     fn probe_cluster_state_authority_node(
@@ -311,14 +362,25 @@ impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthority
             Ok(request) => request,
             Err(_) => return false,
         };
-        daemon_send_object_rpc_to_target_with_timeouts(
-            target_node_id,
-            &request,
-            network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            false,
-        )
-        .and_then(|response| response.error_detail().map_err(Into::into))
-        .is_ok()
+        let Some(daemon) = self.daemon.as_ref() else {
+            return false;
+        };
+        // A CLI process does not own cluster transports. Ask the already
+        // authenticated local daemon to route the read-only authority probe so
+        // admission reuses its persistent channels and transport lifecycle.
+        // The reachability scan supplies a total per-target budget; preserve it
+        // as an overall deadline instead of reinterpreting a no-progress limit
+        // as the operation deadline.
+        daemon
+            .object_rpc_to_target_with_deadline(
+                target_node_id,
+                &request,
+                timeout,
+                Some(timeout),
+                false,
+            )
+            .and_then(|response| response.error_detail().map_err(|_| ()))
+            .is_ok()
     }
 }
 
@@ -332,24 +394,31 @@ fn cli_cluster_state_authority_reachability_options()
     options
 }
 
-fn cluster_has_local_quorum(paths: &ClusterPaths, state: &ClusterBootstrapState) -> bool {
+fn cluster_has_local_quorum(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    daemon: Option<&DaemonStatus>,
+) -> bool {
+    let mut host = CliClusterStateAuthorityReachabilityHost::new(daemon);
     cluster::cluster_has_local_quorum_with_host(
         paths,
         state,
         cli_cluster_state_authority_reachability_options(),
-        &mut CliClusterStateAuthorityReachabilityHost,
+        &mut host,
     )
 }
 
-fn cluster_reachable_state_authority_count(
+fn cluster_state_authority_quorum_status(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-) -> usize {
-    cluster::cluster_reachable_state_authority_count_with_host(
+    daemon: Option<&DaemonStatus>,
+) -> Result<cluster::ClusterStateAuthorityQuorumStatus, network::NetworkError> {
+    let mut host = CliClusterStateAuthorityReachabilityHost::new(daemon);
+    cluster::cluster_state_authority_quorum_status_with_host(
         paths,
         state,
         cli_cluster_state_authority_reachability_options(),
-        &mut CliClusterStateAuthorityReachabilityHost,
+        &mut host,
     )
 }
 
@@ -1314,7 +1383,7 @@ fn cli_local_cluster_quorum_if_relevant(
     match read_cluster_state(&paths) {
         Ok(state) => Ok(Some(
             daemon.is_some_and(|daemon| local_daemon_matches_cluster_state(daemon, &state))
-                && cluster_has_local_quorum(&paths, &state),
+                && cluster_has_local_quorum(&paths, &state, daemon),
         )),
         Err(CliError::ClusterOrphan) => Ok(None),
         Err(error) => Err(error),

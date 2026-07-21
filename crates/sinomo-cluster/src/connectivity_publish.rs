@@ -20,13 +20,13 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::cluster_network_record_should_refresh;
 use sinomo_network::read_local_cluster_connectivity_records_for_source;
 use sinomo_network::write_local_cluster_connectivity_record_set;
 use sinomo_network::{CLUSTER_NETWORK_PUBLISH_INTERVAL, cluster_network_publish_interval_for_role};
 use sinomo_network::{
     ClusterConnectivityRecord, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
+    cluster_connectivity_record_should_refresh, cluster_connectivity_stable_eq,
+    validate_cluster_connectivity_records_for_source,
 };
 use sinomo_node::cluster_node_is_local_process;
 use std::collections::BTreeMap;
@@ -126,6 +126,11 @@ pub fn cluster_network_publish_interval_for_node(
         .unwrap_or(CLUSTER_NETWORK_PUBLISH_INTERVAL)
 }
 
+/// Publishes an authoritative current source-owned connectivity set.
+///
+/// Async observation producers must generation-fence the set in the network
+/// store before calling this function. The publisher re-reads that local set;
+/// it does not infer a source-set generation from endpoint timestamps.
 pub fn sync_cluster_connectivity_records_to_kv(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -187,6 +192,11 @@ fn read_cluster_kv_current_or_empty_snapshot_arc_for_source(
     .map_err(kv_err)
 }
 
+/// Publishes an authoritative current source-owned connectivity set to quorum.
+///
+/// Callers that assembled the set asynchronously must first use the network
+/// store's snapshot/conditional-commit boundary. This function owns
+/// publication, not stale-task arbitration.
 pub fn sync_cluster_connectivity_records_to_quorum_with_host<H>(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -261,6 +271,9 @@ where
     }
 }
 
+/// Async publisher for a source set already committed by its observation
+/// owner. A caller-produced async set must cross the generation-fenced local
+/// store boundary before publication.
 pub async fn sync_cluster_connectivity_records_to_quorum_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -282,6 +295,9 @@ where
     .await
 }
 
+/// Async publisher for a source set already committed by its observation
+/// owner. A caller-produced async set must cross the generation-fenced local
+/// store boundary before publication.
 pub async fn sync_cluster_connectivity_records_to_quorum_async_with_state_and_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -512,7 +528,10 @@ pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
                 .is_ok_and(|existing| {
                     existing == **record
                         || (cluster_connectivity_stable_eq(&existing, record)
-                            && !cluster_network_record_should_refresh(existing.expires_at, now))
+                            && !cluster_connectivity_record_should_refresh(
+                                existing.expires_at,
+                                now,
+                            ))
                 })
         });
         if stable {
@@ -716,7 +735,7 @@ pub fn cluster_connectivity_publish_record_matches(
     now: OffsetDateTime,
 ) -> bool {
     cluster_connectivity_stable_eq(known, record)
-        && !cluster_network_record_should_refresh(known.expires_at, now)
+        && !cluster_connectivity_record_should_refresh(known.expires_at, now)
 }
 
 #[cfg(any(test, feature = "test-support"))]

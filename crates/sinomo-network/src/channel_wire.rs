@@ -9,9 +9,10 @@ use crate::channel::{OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES, OBJECT_RPC_CHANNEL_MA
 use crate::object::write_all_vectored_async_frame;
 use crate::{
     MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, NetworkError, OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES,
-    ObjectFrameIoOptions, ObjectFrameWriteTiming, ObjectRpcChannelBodyDirection,
-    ObjectRpcChannelCallId, ObjectRpcChannelWireFrame, read_object_frame_async_with_max_bytes,
-    write_object_frame_async, write_object_frame_async_timed,
+    ObjectFrameIoOptions, ObjectFrameReadTiming, ObjectFrameWriteTiming,
+    ObjectRpcChannelBodyDirection, ObjectRpcChannelCallId, ObjectRpcChannelWireFrame,
+    read_object_frame_async_with_max_bytes, write_object_frame_async,
+    write_object_frame_async_timed,
 };
 use bytes::{Bytes, BytesMut};
 use std::io::Cursor;
@@ -317,6 +318,63 @@ where
     R: AsyncRead + Unpin,
     F: FnOnce(&ObjectRpcChannelDataHeader) -> Result<(), NetworkError>,
 {
+    read_object_rpc_channel_transport_frame_async_inner(
+        reader,
+        options,
+        receive_pool,
+        validate_data_header,
+        false,
+    )
+    .await
+    .map(|(frame, _timing)| frame)
+}
+
+/// Timed mixed-frame reader used by persistent carriers during a bounded
+/// network timeline capture. Control frames deliberately retain their
+/// existing reader and timing behavior; only fixed SCDF Data returns timing.
+pub async fn read_object_rpc_channel_transport_frame_async_timed<R, F>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    receive_pool: &Arc<ObjectRpcChannelReceiveBufferPool>,
+    validate_data_header: F,
+) -> Result<
+    (
+        ObjectRpcChannelTransportFrame,
+        Option<ObjectFrameReadTiming>,
+    ),
+    NetworkError,
+>
+where
+    R: AsyncRead + Unpin,
+    F: FnOnce(&ObjectRpcChannelDataHeader) -> Result<(), NetworkError>,
+{
+    read_object_rpc_channel_transport_frame_async_inner(
+        reader,
+        options,
+        receive_pool,
+        validate_data_header,
+        true,
+    )
+    .await
+}
+
+async fn read_object_rpc_channel_transport_frame_async_inner<R, F>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    receive_pool: &Arc<ObjectRpcChannelReceiveBufferPool>,
+    validate_data_header: F,
+    time_fixed_data: bool,
+) -> Result<
+    (
+        ObjectRpcChannelTransportFrame,
+        Option<ObjectFrameReadTiming>,
+    ),
+    NetworkError,
+>
+where
+    R: AsyncRead + Unpin,
+    F: FnOnce(&ObjectRpcChannelDataHeader) -> Result<(), NetworkError>,
+{
     let prefix = read_frame_magic(reader, options.idle_timeout).await?;
     if prefix == OBJECT_FRAME_MAGIC {
         let prefix = Cursor::new(prefix);
@@ -332,7 +390,7 @@ where
                 "channel Data must use the fixed SCDF representation",
             ));
         }
-        return Ok(ObjectRpcChannelTransportFrame::Control(frame));
+        return Ok((ObjectRpcChannelTransportFrame::Control(frame), None));
     }
     if prefix != OBJECT_RPC_CHANNEL_DATA_MAGIC {
         return Err(invalid_data_header(format!(
@@ -341,6 +399,14 @@ where
         )));
     }
 
+    let capture_generation = if time_fixed_data {
+        crate::timeline::network_timeline_capture_generation()
+    } else {
+        0
+    };
+    let first_read_monotonic_ns = (capture_generation != 0)
+        .then(crate::network_timeline_monotonic_ns)
+        .unwrap_or(0);
     let mut encoded = [0_u8; OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES];
     encoded[..4].copy_from_slice(&prefix);
     read_exact_with_idle(
@@ -368,11 +434,34 @@ where
             u64::try_from(OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES + buffer.len()).unwrap_or(u64::MAX),
         );
     }
+    let body_read_completed_monotonic_ns = (capture_generation != 0)
+        .then(crate::network_timeline_monotonic_ns)
+        .unwrap_or(0);
+    let decode_started_monotonic_ns = body_read_completed_monotonic_ns;
     let frame = ObjectRpcChannelDataFrame {
         header,
         bytes: receive_pool.into_bytes(buffer, permit),
     };
-    Ok(ObjectRpcChannelTransportFrame::Data(frame))
+    // This final validation is allocation-free and keeps FRAME_DECODE ordered
+    // after the complete payload read. Header structure and call/window state
+    // were already validated before the receive pool was acquired.
+    frame.validate()?;
+    let decoded_monotonic_ns = (capture_generation != 0)
+        .then(crate::network_timeline_monotonic_ns)
+        .unwrap_or(0);
+    let timing = (capture_generation != 0).then_some(ObjectFrameReadTiming {
+        capture_generation,
+        ready_monotonic_ns: 0,
+        read_poll_monotonic_ns: 0,
+        first_read_monotonic_ns,
+        body_read_completed_monotonic_ns,
+        decode_started_monotonic_ns,
+        decoded_monotonic_ns,
+        wire_bytes: u32::try_from(OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES + frame.bytes.len())
+            .unwrap_or(u32::MAX),
+        first_read_bytes: u32::try_from(OBJECT_RPC_CHANNEL_DATA_MAGIC.len()).unwrap_or(u32::MAX),
+    });
+    Ok((ObjectRpcChannelTransportFrame::Data(frame), timing))
 }
 
 /// Writes one mixed carrier frame. SCDF Data uses one partial-write-safe

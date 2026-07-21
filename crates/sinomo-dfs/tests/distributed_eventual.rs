@@ -24,6 +24,7 @@ fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() 
         file_system_id: file_system_id.clone(),
         path: "artifacts/build.log".to_string(),
         kind: DfsObjectKind::Artifact,
+        tombstone_provenance: None,
         owner_node_id: node_a.clone(),
         current_locations: vec![node_a.clone()],
         content_hash: Some("blake3:old".to_string()),

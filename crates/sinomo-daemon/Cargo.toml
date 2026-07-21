@@ -50,4 +50,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support"] }
+sinomo-dfs = { path = "../sinomo-dfs", features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

@@ -3,7 +3,7 @@ use sinomo_core::cluster::{read_cluster_state_cached_shared, read_cluster_state_
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::__channel_carrier::{
     OBJECT_RPC_CHANNEL_DATA_MAGIC, ObjectRpcChannelDataFrame, ObjectRpcChannelReceiveBufferPool,
-    ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
+    ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async_timed,
     write_object_rpc_channel_transport_frame_async,
     write_object_rpc_channel_transport_frame_async_timed,
 };
@@ -2838,7 +2838,7 @@ where
         let ingress = channel_ingress.ok_or_else(|| NetworkError::Serialization {
             detail: "peer sent fixed channel Data without an active object RPC channel".to_string(),
         })?;
-        let frame = read_object_rpc_channel_transport_frame_async(
+        let (frame, timing) = read_object_rpc_channel_transport_frame_async_timed(
             &mut replay,
             options,
             receive_pool,
@@ -2847,7 +2847,7 @@ where
         .await?;
         return match frame {
             ObjectRpcChannelTransportFrame::Data(frame) => {
-                Ok((TcpTunnelInboundFrame::FixedChannelData(frame), None))
+                Ok((TcpTunnelInboundFrame::FixedChannelData(frame), timing))
             }
             ObjectRpcChannelTransportFrame::Control(_) => Err(NetworkError::Serialization {
                 detail: "SCDF tunnel reader decoded an unexpected control frame".to_string(),
@@ -3051,6 +3051,13 @@ async fn tcp_tunnel_reader_loop(
         };
         match frame {
             TcpTunnelInboundFrame::FixedChannelData(frame) => {
+                if let Some(ingress) = handle.object_rpc_channel_ingress.as_ref() {
+                    ingress.record_data_frame_read_timeline(
+                        &frame.header,
+                        read_timing,
+                        network_timeline_flag::TUNNEL_CARRIER,
+                    );
+                }
                 let receive = handle
                     .object_rpc_channel_ingress
                     .as_ref()
@@ -3259,6 +3266,8 @@ mod tests {
     use super::*;
     use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource};
 
+    static TIMELINE_CAPTURE_TEST: Mutex<()> = Mutex::new(());
+
     fn test_tunnel_handle(
         node_name: &str,
         tx: mpsc::Sender<ClusterTcpTunnelFrame>,
@@ -3368,6 +3377,13 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_v4_mixed_reader_validates_and_delivers_fixed_channel_data() {
+        let _capture_guard = TIMELINE_CAPTURE_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sinomo_core::network::network_timeline_capture_is_active() {
+            let _ = sinomo_core::network::stop_network_timeline_capture();
+        }
+        sinomo_core::network::start_network_timeline_capture(64).expect("start capture");
         let ObjectRpcChannelEndpoint {
             client: _client,
             mut server,
@@ -3381,7 +3397,9 @@ mod tests {
         let call_id = sinomo_core::network::ObjectRpcChannelCallId(1);
         let payload = vec![0x73; 64 * 1024];
         let request = ObjectRpcRequest::encode_body("/test/tunnel-v4/fixed-data", "test", &"head")
-            .expect("request head");
+            .expect("request head")
+            .with_traceparent("00-51515151515151515151515151515151-5252525252525252-01")
+            .with_observe_sampled(true);
         ingress
             .receive_control(ObjectRpcChannelWireFrame::Request {
                 call_id,
@@ -3421,10 +3439,18 @@ mod tests {
         )
         .await
         .expect("read mixed tunnel frame");
-        assert!(timing.is_none(), "fixed Data bypasses SOBJ decode timing");
+        let timing = timing.expect("fixed Data read timing");
+        assert_ne!(timing.capture_generation, 0);
+        assert!(timing.body_read_completed_monotonic_ns >= timing.first_read_monotonic_ns);
+        assert!(timing.decoded_monotonic_ns >= timing.decode_started_monotonic_ns);
         let TcpTunnelInboundFrame::FixedChannelData(frame) = frame else {
             panic!("expected fixed tunnel Data");
         };
+        ingress.record_data_frame_read_timeline(
+            &frame.header,
+            Some(timing),
+            network_timeline_flag::TUNNEL_CARRIER,
+        );
         ingress.receive_data(frame).expect("deliver fixed Data");
         ingress
             .receive_control(ObjectRpcChannelWireFrame::BodyEnd {
@@ -3442,6 +3468,19 @@ mod tests {
             .await
             .expect("collect fixed Data");
         assert_eq!(received, payload);
+        let snapshot = sinomo_core::network::stop_network_timeline_capture().expect("stop capture");
+        for stage in [
+            sinomo_core::network::network_timeline_stage::FRAME_FIRST_READ,
+            sinomo_core::network::network_timeline_stage::FRAME_READ,
+            sinomo_core::network::network_timeline_stage::FRAME_DECODE,
+        ] {
+            assert!(snapshot.events.iter().any(|event| {
+                event.call_id == call_id.0
+                    && event.stage == stage
+                    && event.flags & network_timeline_flag::DATA_FRAME != 0
+                    && event.flags & network_timeline_flag::TUNNEL_CARRIER != 0
+            }));
+        }
     }
 
     #[test]

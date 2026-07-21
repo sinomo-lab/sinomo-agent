@@ -217,18 +217,46 @@ that compose project down after collecting the evidence, then form a fresh clust
 Resetting only the reachable main-daemon filters is not equivalent because the shadow
 supervisors are separate processes.
 
-Before each no-load realtime network leg, the benchmark requires 30 consecutive one-second
-samples in which every one of the six service containers is at or below 10 percent CPU. It
-searches for that sustained window for up to 120 seconds. Docker's aggregate container CPU is
-the authority, so main daemons, shadow supervisors, entrypoint helpers, and any short-lived
-process inside the container are all charged to the gate. The harness snapshots the exact
-main/shadow PID plus process start tick before and after the candidate window; any replacement
-invalidates the complete window. It writes every per-container sample and timestamp to
+After transport readiness and DFS metadata-shard placement have converged, and before each
+no-load realtime network leg, the benchmark requires one uninterrupted 30-second monotonic
+interval in which every one of the six service containers remains at or below 10 percent CPU.
+DFS convergence is deliberately outside the Docker-only ten-second cluster-formation gate,
+but it is a prerequisite for quietness: otherwise final shard handoff commits can race the
+idle-load measurement. The harness searches for the sustained quiet interval for at most 120
+seconds. One continuous `docker stats` stream supplies cumulative per-container CPU intervals; the harness consumes
+every interval rather than treating time between polls as quiet. A busy interval, malformed or
+missing row, stream exit, or five-second stream stall resets the full duration. Docker's
+aggregate container CPU is the authority, so main daemons, shadow supervisors, entrypoint
+helpers, and any short-lived process inside the container are all charged to the gate. The
+harness snapshots the exact main/shadow PID plus process start tick before and after the
+candidate interval; any unavailable or changed generation resets the complete duration. The
+stats stream remains active during the final generation scan, and the gate cannot pass until a
+quiet cumulative interval for every container covers through the end of that scan. It writes
+every per-container interval, wall-clock timestamp, and monotonic coverage boundary to
 `network-quiet-<leg>.samples.tsv`, the generation evidence to
 `network-quiet-<leg>.generations.tsv`, and the pass/fail decision to
 `network-quiet-<leg>.summary.txt` under the run artifact directory. In-process pprof captures
 and their flamegraphs cover only the daemon process that serves the observe RPC; they do not
 cover shadow or helper processes and are never substituted for the aggregate quiet gate.
+
+The network baseline keeps embedded-SOBJ payload throughput and semantic-attachment
+throughput as separate measurements. The attachment leg uses small request/response SOBJ
+heads plus streamed 8 MiB attachments in each direction, four calls at a time by default.
+It validates the signed head and the declared and delivered byte counts without adding a
+content hash or transport-integrity layer. Tune it with the
+`SINOMO_TEST_NETWORK_ATTACHMENT_*` variables documented at the top of
+`docker/test-cluster.sh`; each direction is capped at 64 MiB by the benchmark route.
+
+For a durable saturation run, set `SINOMO_TEST_NETWORK_SATURATION=1`. This optional
+profile is off by default and runs from one origin (`node1`) to all five peers with
+64 MiB in each direction, 128 measured requests per target, and concurrency 8. That is
+80 GiB of measured aggregate duplex logical traffic: 40 GiB per direction, or
+about 3.4 seconds of ideal 100 Gb/s occupancy per direction (about 6.9 seconds
+if the directions serialize), rather than reporting a short burst. The
+`SINOMO_TEST_NETWORK_SATURATION_ORIGIN`, `_REQUESTS_PER_TARGET`,
+`_WARMUP_REQUESTS_PER_TARGET`, `_CONCURRENCY`, `_TIMEOUT_MS`, `_REQUEST_BYTES`, and
+`_RESPONSE_BYTES` variables tune the profile while retaining the 64 MiB route cap.
+The ordinary all-node 8 MiB attachment leg remains the default acceptance smoke.
 
 Scenarios: per-node DFS invariants, read-your-write roundtrips (both segments),
 cross-segment write→read in both directions plus a routed delete, a

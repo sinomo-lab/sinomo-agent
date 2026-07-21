@@ -64,6 +64,14 @@ use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
 
+fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
+    object.kind == DfsObjectKind::Tombstone
+        && matches!(
+            object.tombstone_provenance.as_ref(),
+            Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
+        )
+}
+
 /// Local sharded metadata router.
 ///
 /// This backend multiplexes multiple `LocalSobjMetadataBackend` shards using
@@ -175,6 +183,19 @@ impl LocalShardedMetadataBackend {
 
     pub(crate) fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
         self.shards.keys().cloned().collect()
+    }
+
+    /// Consume this router without reopening its shard-local backends.
+    ///
+    /// Some control-plane operations bind write authority to the exact
+    /// in-memory backend instance that validated a completed handoff. Moving
+    /// those instances into a bounded multi-shard operation preserves that
+    /// capability; reopening the same durable paths would intentionally
+    /// produce unbound, fenced instances instead.
+    pub(crate) fn into_shard_backends(
+        self,
+    ) -> BTreeMap<DfsMetadataShardId, LocalSobjMetadataBackend> {
+        self.shards
     }
 
     #[cfg(test)]
@@ -330,6 +351,9 @@ impl LocalShardedMetadataBackend {
         let Some(object) = self.shard_backend(&index.shard_id)?.get_object(object_id)? else {
             return Ok(false);
         };
+        if is_source_eviction_tombstone(&object) {
+            return Ok(false);
+        }
         Ok(object.file_system_id == index.file_system_id
             && normalize_path(&object.path) == index.path
             && self
@@ -433,6 +457,12 @@ impl LocalShardedMetadataBackend {
             let Some(object) = backend.get_object(object_id)? else {
                 continue;
             };
+            // A source-eviction marker is physical cleanup evidence, never a
+            // namespace deletion. This remains true if a later topology
+            // generation routes the path back through the old source shard.
+            if is_source_eviction_tombstone(&object) {
+                continue;
+            }
             let routed_here = self
                 .select_shard_id_for_path(&object.file_system_id, &object.path)
                 .is_ok_and(|selected| selected == *shard_id);
@@ -513,6 +543,9 @@ impl LocalShardedMetadataBackend {
         object: &DfsObjectMetadata,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
+        if is_source_eviction_tombstone(object) {
+            return Ok(false);
+        }
         let selected_shard_id =
             self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
         if selected_shard_id == *shard_id {
@@ -541,7 +574,7 @@ impl LocalShardedMetadataBackend {
         if self
             .shard_backend(&selected_shard_id)?
             .get_object_by_path(&object.file_system_id, &object.path)?
-            .is_some()
+            .is_some_and(|selected| !is_source_eviction_tombstone(&selected))
         {
             return Ok(false);
         }
@@ -714,7 +747,13 @@ impl LocalShardedMetadataBackend {
         let mut written = 0usize;
         for shard_id in shard_ids {
             let backend = self.shard_backend_mut(&shard_id)?;
-            if backend.get_file_system(&file_system.file_system_id)? == Some(file_system.clone()) {
+            if backend
+                .get_file_system(&file_system.file_system_id)?
+                .as_ref()
+                .is_some_and(|current| {
+                    crate::placement::dfs_file_system_semantically_eq(current, file_system)
+                })
+            {
                 continue;
             }
             backend.put_file_system(file_system)?;
@@ -864,6 +903,7 @@ impl LocalShardedMetadataBackend {
             source_shard_id,
             target_shard_id,
         )
+        .map(|_| ())
     }
 
     fn put_object_routed(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry> {
@@ -908,7 +948,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             if backend
                 .get_file_system(&file_system.file_system_id)?
                 .as_ref()
-                == Some(file_system)
+                .is_some_and(|current| {
+                    crate::placement::dfs_file_system_semantically_eq(current, file_system)
+                })
             {
                 continue;
             }
@@ -1038,13 +1080,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let object = self
             .shard_backend(&shard_id)?
             .get_object_by_path(file_system_id, path)?;
-        if let Some(object) = object.as_ref()
-            && !self.object_is_visible_from_shard(object, &shard_id)?
-        {
-            return Ok(None);
-        }
-        if object.is_some() {
-            return Ok(object);
+        if let Some(object) = object {
+            if self.object_is_visible_from_shard(&object, &shard_id)? {
+                return Ok(Some(object));
+            }
+            // A non-authoritative physical row on the currently selected
+            // shard does not suppress a live fallback. In particular, a
+            // source-eviction marker may become path-selected after a later
+            // topology change, but it remains storage-only evidence.
         }
         for (fallback_shard_id, backend) in &self.shards {
             if fallback_shard_id == &shard_id {

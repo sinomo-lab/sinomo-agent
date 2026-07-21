@@ -4,10 +4,11 @@ use super::{
     AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT, CLUSTER_HEALTH_PROBE_TIMEOUT, CliClusterMemberMutationHost,
-    CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions,
-    ClusterInviteChannelOutput, ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand,
-    ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions,
-    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
+    CliClusterStateAuthorityReachabilityHost, CliCommand, CliDaemonTargetRpc, CliError,
+    CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions, ClusterInviteChannelOutput,
+    ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions,
+    ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions,
+    ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
     DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
@@ -24,11 +25,12 @@ use super::{
     SkillActivateOptions, SkillCliCommand, SkillExportOptions, SkillImportOptions,
     SkillListOptions, SkillShowOptions, TestCliCommand, UninstallOptions,
     authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_is_help, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_has_remote_usable_introducer,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
-    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cli_cluster_state_authority_reachability_options, cli_command_is_help,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
+    cluster_invite_has_remote_usable_introducer, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave,
+    cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
@@ -6977,12 +6979,21 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
         last_failure_at: None,
         failure_reason: None,
         observed_at: now - time::Duration::seconds(60),
-        expires_at: now + time::Duration::seconds(120),
+        // Keep the durable record outside the connectivity renewal margin.
+        // An unchanged source set inside that margin is intentionally a
+        // refresh and therefore requires the cluster mutation path.
+        expires_at: now
+            + time::Duration::seconds(
+                sinomo_runtime::network::CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS + 60,
+            ),
     };
     let mut incoming = stored.clone();
     incoming.latency_ms = Some(18);
     incoming.observed_at = now;
-    incoming.expires_at = now + time::Duration::seconds(180);
+    incoming.expires_at = now
+        + time::Duration::seconds(
+            sinomo_runtime::network::CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS + 120,
+        );
 
     let key = cluster_connectivity_key(
         &stored.source_node_id,
@@ -7593,7 +7604,8 @@ fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
     .expect("cluster init");
     assert!(cluster_has_local_quorum(
         &paths,
-        &read_cluster_state(&paths).expect("cluster state")
+        &read_cluster_state(&paths).expect("cluster state"),
+        None,
     ));
 
     let error = require_cluster_runtime_quorum_with_paths_and_daemon(&paths, None)
@@ -7647,6 +7659,108 @@ fn cluster_runtime_quorum_admission_uses_read_only_daemon_identity() {
     let error = require_cluster_runtime_quorum_with_paths_and_daemon(&paths, Some(&daemon))
         .expect_err("mismatched daemon identity");
     assert!(matches!(error, CliError::ClusterReadOnly { .. }));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedCliStateAuthorityProbe {
+    target_node_id: NodeId,
+    route: String,
+    connect_timeout: Duration,
+    overall_timeout: Option<Duration>,
+    observe_connectivity: bool,
+}
+
+struct RecordingCliDaemonTargetRpc {
+    probes: Arc<Mutex<Vec<RecordedCliStateAuthorityProbe>>>,
+    reachable: bool,
+}
+
+impl CliDaemonTargetRpc for RecordingCliDaemonTargetRpc {
+    fn object_rpc_to_target_with_deadline(
+        &self,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+    ) -> Result<network::ObjectRpcResponse, ()> {
+        self.probes
+            .lock()
+            .expect("record CLI state-authority probe")
+            .push(RecordedCliStateAuthorityProbe {
+                target_node_id: target_node_id.clone(),
+                route: request.route.clone(),
+                connect_timeout,
+                overall_timeout,
+                observe_connectivity,
+            });
+        self.reachable
+            .then(|| network::ObjectRpcResponse::from_encoded_body(request.route.clone(), vec![]))
+            .ok_or(())
+    }
+}
+
+#[test]
+fn replica_quorum_admission_probes_remote_voter_through_local_daemon_with_total_budget() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-replica-quorum-daemon-probe");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("replica_quorum_daemon_probe").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("replica_quorum_daemon_probe_local").expect("local node");
+    let remote_node_id =
+        NodeId::from_legacy_named("replica_quorum_daemon_probe_remote").expect("remote node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "replica quorum daemon probe",
+        local_node_id,
+        "local replica",
+        "local-public-key",
+        now,
+    );
+    apply_cluster_raft_role(&mut state.members[0], ClusterMemberRole::NonVoting, now);
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote authority",
+        "remote-public-key",
+        now,
+    );
+    remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &remote_node_id,
+        "192.0.2.41:21353".to_string(),
+        0,
+    )];
+    state.members.push(remote);
+
+    for reachable in [true, false] {
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let mut host =
+            CliClusterStateAuthorityReachabilityHost::with_daemon(RecordingCliDaemonTargetRpc {
+                probes: Arc::clone(&probes),
+                reachable,
+            });
+        let status = sinomo_runtime::cluster::cluster_state_authority_quorum_status_with_host(
+            &paths,
+            &state,
+            cli_cluster_state_authority_reachability_options(),
+            &mut host,
+        )
+        .expect("project committed quorum state");
+
+        assert_eq!(status.required, 1);
+        assert_eq!(status.reachable, usize::from(reachable));
+        assert_eq!(status.has_quorum(), reachable);
+        let probes = probes.lock().expect("read recorded probes");
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].target_node_id, remote_node_id);
+        assert_eq!(probes[0].route, sinomo_runtime::daemon::DAEMON_STATUS_ROUTE);
+        assert_eq!(probes[0].overall_timeout, Some(probes[0].connect_timeout));
+        assert!(!probes[0].observe_connectivity);
+    }
 }
 
 fn signed_test_invite_uri(
@@ -11594,7 +11708,7 @@ fn single_node_cluster_has_local_quorum() {
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
 
-    assert!(cluster_has_local_quorum(&paths, &state));
+    assert!(cluster_has_local_quorum(&paths, &state, None));
 }
 
 #[test]

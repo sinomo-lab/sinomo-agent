@@ -577,6 +577,7 @@ mod tests {
             file_system_id: sifs_file_system_id(),
             path: "/lock-authority.txt".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: primary.clone(),
             current_locations: vec![primary.clone()],
             content_hash: Some("blake3:lock-authority".to_string()),

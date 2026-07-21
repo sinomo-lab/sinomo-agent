@@ -46,6 +46,10 @@ const CLUSTER_HEALTH_DIRECT_PROBE_HEDGE_DELAY: std::time::Duration =
 const CLUSTER_HEALTH_LIVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 const CLUSTER_HEALTH_LIVE_PROBES_METADATA_KEY: &str = "sinomo-health-live-probes";
 const CLUSTER_HEALTH_LIVE_PROBES_METADATA_VALUE: &str = "true";
+/// Per-direction semantic-attachment bound for the network benchmark route.
+/// Transport flow control remains independently bounded; this prevents a
+/// benchmark request head from declaring an unbounded logical stream.
+pub const CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ClusterHealthTraceStats {
@@ -320,6 +324,29 @@ pub struct ClusterNetworkPingRequest {
     pub payload: Vec<u8>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub response_payload_bytes: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "ClusterNetworkPingPayloadMode::is_embedded_sobj"
+    )]
+    pub payload_mode: ClusterNetworkPingPayloadMode,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub request_attachment_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub response_attachment_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterNetworkPingPayloadMode {
+    #[default]
+    EmbeddedSobj,
+    SemanticAttachment,
+}
+
+impl ClusterNetworkPingPayloadMode {
+    fn is_embedded_sobj(&self) -> bool {
+        *self == Self::EmbeddedSobj
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -334,6 +361,15 @@ pub struct ClusterNetworkPingResponse {
         deserialize_with = "sinomo_network::deserialize_bytes"
     )]
     pub response_payload: Vec<u8>,
+    #[serde(
+        default,
+        skip_serializing_if = "ClusterNetworkPingPayloadMode::is_embedded_sobj"
+    )]
+    pub payload_mode: ClusterNetworkPingPayloadMode,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub request_attachment_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub response_attachment_bytes: u64,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
 }
@@ -385,9 +421,64 @@ pub fn cluster_network_ping_rpc_request_with_response_payload(
             nonce: nonce.into(),
             payload: sinomo_network::try_zeroed_vec(payload_bytes, "cluster network ping payload")?,
             response_payload_bytes,
+            payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
+            request_attachment_bytes: 0,
+            response_attachment_bytes: 0,
         },
     )
     .map(ObjectRpcRequest::with_response_retry_safe)
+}
+
+/// Builds the small SOBJ request head for a ping whose bulk bytes travel as a
+/// semantic attachment. The caller supplies the attachment separately through
+/// [`sinomo_network::ObjectRpcSessionCall`].
+pub fn cluster_network_ping_attachment_rpc_request(
+    nonce: impl Into<String>,
+    request_attachment_bytes: u64,
+    response_attachment_bytes: u64,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    let request = ClusterNetworkPingRequest {
+        nonce: nonce.into(),
+        payload: Vec::new(),
+        response_payload_bytes: 0,
+        payload_mode: ClusterNetworkPingPayloadMode::SemanticAttachment,
+        request_attachment_bytes,
+        response_attachment_bytes,
+    };
+    validate_cluster_network_ping_attachment_request(&request)?;
+    ObjectRpcRequest::encode_body(
+        CLUSTER_NETWORK_PING_ROUTE,
+        CLUSTER_NETWORK_RPC_CATEGORY,
+        &request,
+    )
+    .map(ObjectRpcRequest::with_response_retry_safe)
+}
+
+pub fn validate_cluster_network_ping_attachment_request(
+    request: &ClusterNetworkPingRequest,
+) -> Result<(), NetworkError> {
+    if request.payload_mode != ClusterNetworkPingPayloadMode::SemanticAttachment
+        || !request.payload.is_empty()
+        || request.response_payload_bytes != 0
+    {
+        return Err(NetworkError::Serialization {
+            detail:
+                "cluster network ping attachment head mixes embedded and attachment payload modes"
+                    .to_string(),
+        });
+    }
+    for bytes in [
+        request.request_attachment_bytes,
+        request.response_attachment_bytes,
+    ] {
+        if bytes > CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+                max_bytes: CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES as usize,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn cluster_local_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
@@ -430,6 +521,12 @@ pub fn decode_cluster_network_ping_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<ClusterNetworkPingResponse, NetworkError> {
     response.decode_body()
+}
+
+pub fn decode_cluster_network_ping_rpc_request(
+    request: &ObjectRpcRequest,
+) -> Result<ClusterNetworkPingRequest, NetworkError> {
+    request.decode_body()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -726,6 +823,15 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
     match request.route.as_str() {
         CLUSTER_NETWORK_PING_ROUTE => {
             let request: ClusterNetworkPingRequest = request.decode_body()?;
+            if request.payload_mode != ClusterNetworkPingPayloadMode::EmbeddedSobj
+                || request.request_attachment_bytes != 0
+                || request.response_attachment_bytes != 0
+            {
+                return Err(NetworkError::Serialization {
+                    detail: "cluster network ping semantic attachments require the session handler"
+                        .to_string(),
+                });
+            }
             let response = ClusterNetworkPingResponse {
                 nonce: request.nonce,
                 responder_node_id: responder_node_id.clone(),
@@ -734,6 +840,9 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
                     request.response_payload_bytes,
                     "cluster network ping response payload",
                 )?,
+                payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
+                request_attachment_bytes: 0,
+                response_attachment_bytes: 0,
                 observed_at,
             };
             ObjectRpcResponse::encode_body(CLUSTER_NETWORK_PING_ROUTE, &response)
@@ -744,7 +853,41 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
     }
 }
 
+pub fn cluster_network_ping_attachment_rpc_response_for_node(
+    responder_node_id: &NodeId,
+    request: &ClusterNetworkPingRequest,
+    actual_request_attachment_bytes: u64,
+    observed_at: OffsetDateTime,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    validate_cluster_network_ping_attachment_request(request)?;
+    if actual_request_attachment_bytes != request.request_attachment_bytes {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "cluster network ping request attachment delivered {actual_request_attachment_bytes} bytes, expected {}",
+                request.request_attachment_bytes
+            ),
+        });
+    }
+    ObjectRpcResponse::encode_body(
+        CLUSTER_NETWORK_PING_ROUTE,
+        &ClusterNetworkPingResponse {
+            nonce: request.nonce.clone(),
+            responder_node_id: responder_node_id.clone(),
+            payload_bytes: 0,
+            response_payload: Vec::new(),
+            payload_mode: ClusterNetworkPingPayloadMode::SemanticAttachment,
+            request_attachment_bytes: actual_request_attachment_bytes,
+            response_attachment_bytes: request.response_attachment_bytes,
+            observed_at,
+        },
+    )
+}
+
 fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -2011,6 +2154,9 @@ mod tests {
                 nonce: "nonce".to_string(),
                 payload: payload.clone(),
                 response_payload_bytes: payload.len(),
+                payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
+                request_attachment_bytes: 0,
+                response_attachment_bytes: 0,
             },
             "payload",
         );
@@ -2020,6 +2166,9 @@ mod tests {
                 responder_node_id: NodeId::from_legacy_named("node").expect("node id"),
                 payload_bytes: payload.len(),
                 response_payload: payload,
+                payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
+                request_attachment_bytes: 0,
+                response_attachment_bytes: 0,
                 observed_at: OffsetDateTime::UNIX_EPOCH,
             },
             "response_payload",
@@ -2034,6 +2183,60 @@ mod tests {
             request.is_response_retry_safe(),
             "a read-only nonce ping can safely retry after an ambiguous response timeout"
         );
+    }
+
+    #[test]
+    fn cluster_network_ping_attachment_heads_remain_small_and_size_only() {
+        let request = cluster_network_ping_attachment_rpc_request(
+            "attachment",
+            8 * 1024 * 1024,
+            8 * 1024 * 1024,
+        )
+        .expect("attachment request head");
+        assert!(request.is_response_retry_safe());
+        let decoded = decode_cluster_network_ping_rpc_request(&request).expect("request head");
+
+        assert_eq!(
+            decoded.payload_mode,
+            ClusterNetworkPingPayloadMode::SemanticAttachment
+        );
+        assert!(decoded.payload.is_empty());
+        assert_eq!(decoded.request_attachment_bytes, 8 * 1024 * 1024);
+        assert_eq!(decoded.response_attachment_bytes, 8 * 1024 * 1024);
+        assert!(
+            request.body.len() < 1024,
+            "attachment bytes must not be embedded into the SOBJ head"
+        );
+
+        let responder = NodeId::from_legacy_named("attachment-responder").expect("node id");
+        let response = cluster_network_ping_attachment_rpc_response_for_node(
+            &responder,
+            &decoded,
+            decoded.request_attachment_bytes,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("attachment response head");
+        let decoded_response =
+            decode_cluster_network_ping_rpc_response(&response).expect("response head");
+        assert_eq!(
+            decoded_response.payload_mode,
+            ClusterNetworkPingPayloadMode::SemanticAttachment
+        );
+        assert!(decoded_response.response_payload.is_empty());
+        assert_eq!(decoded_response.response_attachment_bytes, 8 * 1024 * 1024);
+        assert!(
+            response.body.len() < 1024,
+            "response attachment bytes must not be embedded into the SOBJ head"
+        );
+
+        assert!(matches!(
+            cluster_network_ping_attachment_rpc_request(
+                "too-large",
+                CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES + 1,
+                0,
+            ),
+            Err(NetworkError::FrameTooLarge { .. })
+        ));
     }
 
     fn health_test_member(

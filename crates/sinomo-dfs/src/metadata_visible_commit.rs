@@ -248,6 +248,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: "/docs/visible.md".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_a")],
             content_hash: Some("blake3:visible".to_string()),

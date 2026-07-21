@@ -266,6 +266,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: target.file_system_id.clone(),
             path: link_path.clone(),
             kind: DfsObjectKind::Hardlink,
+            tombstone_provenance: None,
             owner_node_id: self.node_id.clone(),
             current_locations: target.current_locations.clone(),
             content_hash: target.content_hash.clone(),

@@ -300,6 +300,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: path.to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_owner")],
             content_hash: Some("blake3:index".to_string()),

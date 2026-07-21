@@ -73,6 +73,8 @@ impl NetworkPathEstimate {
 
     /// Like [`Self::recommended_window_bytes`], but permits a conservative RTT
     /// until an active probe or transfer handshake produces the first sample.
+    /// If the bounds are equal or reversed, the maximum remains authoritative
+    /// as the caller's resource cap.
     pub fn recommended_window_bytes_with_default_rtt(
         self,
         multiplier: u32,
@@ -81,7 +83,7 @@ impl NetworkPathEstimate {
         default_round_trip_time: Option<Duration>,
     ) -> u64 {
         if maximum_bytes <= minimum_bytes {
-            return minimum_bytes;
+            return maximum_bytes;
         }
         let bdp = self.bandwidth_delay_product_bytes.or_else(|| {
             let bandwidth = self.bandwidth_bytes_per_second?;
@@ -402,7 +404,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn estimator_reports_smoothed_bdp_and_bounded_window() {
+    fn recommended_window_uses_measured_bdp() {
         let estimator = NetworkPathEstimator::new();
         estimator.record_round_trip_time(Duration::from_millis(2));
         estimator.record_bandwidth_bytes_per_second(10_000_000_000);
@@ -412,6 +414,41 @@ mod tests {
         assert_eq!(
             estimate.recommended_window_bytes(2, 16 * 1024 * 1024, 64 * 1024 * 1024),
             40_000_000
+        );
+    }
+
+    #[test]
+    fn recommended_window_honors_maximum_when_bounds_are_reversed() {
+        let estimate = NetworkPathEstimate {
+            bandwidth_delay_product_bytes: Some(32 * 1024 * 1024),
+            ..NetworkPathEstimate::default()
+        };
+
+        assert_eq!(
+            estimate.recommended_window_bytes(2, 64 * 1024 * 1024, 16 * 1024 * 1024),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            estimate.recommended_window_bytes_with_default_rtt(
+                2,
+                64 * 1024 * 1024,
+                16 * 1024 * 1024,
+                Some(Duration::from_millis(2)),
+            ),
+            16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn recommended_window_returns_equal_bound() {
+        let estimate = NetworkPathEstimate {
+            bandwidth_delay_product_bytes: Some(32 * 1024 * 1024),
+            ..NetworkPathEstimate::default()
+        };
+
+        assert_eq!(
+            estimate.recommended_window_bytes(2, 8 * 1024 * 1024, 8 * 1024 * 1024),
+            8 * 1024 * 1024
         );
     }
 
@@ -434,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn estimator_uses_the_minimum_before_any_path_measurement() {
+    fn recommended_window_uses_minimum_without_an_estimate() {
         let estimate = NetworkPathEstimator::new().snapshot();
 
         assert_eq!(

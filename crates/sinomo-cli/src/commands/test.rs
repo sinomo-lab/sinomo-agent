@@ -749,6 +749,7 @@ mod tests {
             .collect();
         for id in [
             "cluster.network.ping-benchmark",
+            "cluster.network.semantic-attachment-benchmark",
             "cluster.network.arbitrary-message",
             "cluster.network.hygiene",
             "cluster.network.hygiene-dirty-fixture",

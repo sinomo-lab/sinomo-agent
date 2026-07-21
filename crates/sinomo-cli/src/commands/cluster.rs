@@ -951,14 +951,20 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
                 .to_string(),
         });
     }
-    if cluster_has_local_quorum(&paths, &state) {
+    let quorum = cluster_state_authority_quorum_status(paths, &state, Some(daemon)).map_err(
+        |error| CliError::ClusterReadOnly {
+            detail: format!(
+                "cannot project committed cluster voter configuration for quorum admission: {error}"
+            ),
+        },
+    )?;
+    if quorum.has_quorum() {
         Ok(())
     } else {
         Err(CliError::ClusterReadOnly {
             detail: format!(
                 "quorum unavailable; cluster-dependent operations are paused ({} reachable cluster state authorities, {} required)",
-                cluster_reachable_state_authority_count(&paths, &state),
-                sinomo_runtime::kv::cluster_kv_raft_quorum_size_for_state(&state)
+                quorum.reachable, quorum.required
             ),
         })
     }

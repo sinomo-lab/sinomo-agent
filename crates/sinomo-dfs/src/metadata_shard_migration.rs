@@ -13,7 +13,7 @@ use crate::metadata_records::{
     DfsConflictRecord, DfsMetadataShardId, DfsNamespaceTransaction, DfsObjectVersionRecord,
     DfsReplicaReceiptRecord, DfsWriteIntentRecord,
 };
-use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata};
+use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsTombstoneProvenance};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DfsObjectShardMigrationBundle {
@@ -115,7 +115,9 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
     page_size: usize,
 ) -> Result<()> {
     match target.get_file_system(&file_system.file_system_id)? {
-        Some(existing) if existing != *file_system => {
+        Some(existing)
+            if !crate::placement::dfs_file_system_semantically_eq(&existing, file_system) =>
+        {
             return Err(MetadataBackendError::Serde(format!(
                 "target metadata shard {} has conflicting filesystem {} during migration",
                 target_shard_id.0, file_system.file_system_id
@@ -191,7 +193,10 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
         }
     }
     match target.get_object(&bundle.object.object_id)? {
-        Some(existing) if existing != bundle.object => {
+        Some(existing)
+            if existing != bundle.object
+                && !migration_object_generation_supersedes(&bundle.object, &existing) =>
+        {
             return Err(MetadataBackendError::Serde(format!(
                 "target metadata shard {} has conflicting object {} during migration",
                 target_shard_id.0, bundle.object.object_id
@@ -222,24 +227,56 @@ pub(crate) fn install_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
     Ok(())
 }
 
+fn migration_object_generation_supersedes(
+    incoming: &DfsObjectMetadata,
+    existing: &DfsObjectMetadata,
+) -> bool {
+    let incoming_generation = (incoming.changed_at_unix_nanos, &incoming.version);
+    let existing_generation = (existing.changed_at_unix_nanos, &existing.version);
+    incoming.file_system_id == existing.file_system_id
+        && (incoming_generation > existing_generation
+            || (incoming_generation == existing_generation
+                && incoming.kind != DfsObjectKind::Tombstone
+                && existing.kind == DfsObjectKind::Tombstone))
+}
+
 pub(crate) fn put_cross_shard_tombstone<B: DfsMetadataBackend + ?Sized>(
     source: &mut B,
     object: &DfsObjectMetadata,
     source_shard_id: &DfsMetadataShardId,
     target_shard_id: &DfsMetadataShardId,
-) -> Result<()> {
+) -> Result<bool> {
     if source_shard_id == target_shard_id {
-        return Ok(());
+        return Ok(false);
     }
     let Some(previous) = source.get_object(&object.object_id)? else {
-        return Ok(());
+        return Ok(false);
     };
-    if previous.kind == DfsObjectKind::Tombstone {
-        return Ok(());
+    let Some(tombstone) =
+        cross_shard_eviction_tombstone(&previous, object, source_shard_id, target_shard_id)
+    else {
+        return Ok(false);
+    };
+    source.put_object(&tombstone)?;
+    Ok(true)
+}
+
+pub(crate) fn cross_shard_eviction_tombstone(
+    previous: &DfsObjectMetadata,
+    object: &DfsObjectMetadata,
+    source_shard_id: &DfsMetadataShardId,
+    target_shard_id: &DfsMetadataShardId,
+) -> Option<DfsObjectMetadata> {
+    if source_shard_id == target_shard_id || previous.kind == DfsObjectKind::Tombstone {
+        return None;
     }
     let previous_changed_at = previous.changed_at_unix_nanos;
-    let mut tombstone = previous;
+    let mut tombstone = previous.clone();
     tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.tombstone_provenance = Some(DfsTombstoneProvenance::SourceEviction {
+        source_shard_id: source_shard_id.clone(),
+        target_shard_id: target_shard_id.clone(),
+    });
     tombstone.version = object.version.clone();
     // The source record must be later than the live record it replaces and at
     // least as new as the destination frame that triggered the eviction. A
@@ -250,16 +287,66 @@ pub(crate) fn put_cross_shard_tombstone<B: DfsMetadataBackend + ?Sized>(
         .saturating_add(1)
         .max(object.changed_at_unix_nanos);
     tombstone.last_modified_by_event_id = object.last_modified_by_event_id.clone();
-    source.put_object(&tombstone)?;
-    Ok(())
+    Some(tombstone)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::namespace::{directory_object, distributed_sifs};
-    use crate::{DfsMetadataBackend, LocalSobjMetadataBackend};
+    use crate::{DfsMetadataBackend, DfsMetadataMutation, LocalSobjMetadataBackend};
     use sinomo_core::node::NodeId;
+
+    #[test]
+    fn migration_accepts_reordered_semantically_equal_filesystem_without_rejournaling_it() {
+        let root = sinomo_testdir::TestDir::new("dfs-migration-policy-order-noop");
+        let target_shard_id = DfsMetadataShardId::new("target");
+        let node = NodeId::from_legacy_named("node_migration_policy_order_noop").expect("node");
+        let file_system = distributed_sifs(node.clone());
+        let mut reordered = file_system.clone();
+        reordered.subtree_policies.reverse();
+        let object = directory_object("/users/migrated", node);
+        let bundle = DfsObjectShardMigrationBundle {
+            object,
+            versions: Vec::new(),
+            receipts: Vec::new(),
+            intents: Vec::new(),
+            conflicts: Vec::new(),
+            advisory_lock_state: None,
+        };
+        let mut target =
+            LocalSobjMetadataBackend::new(target_shard_id.clone(), root.path()).expect("target");
+        let initial_sequence = target
+            .put_file_system(&file_system)
+            .expect("seed filesystem")
+            .sequence;
+
+        install_object_shard_migration_bundle(
+            &mut target,
+            &reordered,
+            &bundle,
+            &target_shard_id,
+            32,
+        )
+        .expect("semantic filesystem match");
+
+        let entries = target
+            .journal_since_limited(initial_sequence, 32)
+            .expect("migration journal");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !matches!(&entry.mutation, DfsMetadataMutation::PutFileSystem { .. })),
+            "migration may author object state but must not rewrite an equivalent filesystem"
+        );
+        assert_eq!(
+            target
+                .get_file_system(&file_system.file_system_id)
+                .expect("filesystem lookup"),
+            Some(file_system),
+            "semantic conflict checks must not rewrite the target's durable representation"
+        );
+    }
 
     #[test]
     fn source_eviction_tombstone_survives_namespace_recovery_with_stale_move_generation() {

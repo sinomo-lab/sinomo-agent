@@ -1,7 +1,7 @@
 //! Networked DFS service state, outcome, event, and pending-state types.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,8 @@ pub struct NetworkedDfsService<T> {
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,
+    pub(crate) message_committed_work: DfsMessageCommittedWork,
+    pub(crate) committed_work_tracker: Option<DfsCommittedWorkTracker>,
     pub(crate) transport: T,
     pub(crate) repair_retry_tick: u64,
     pub(crate) next_frame_id: u64,
@@ -161,6 +163,90 @@ pub struct DfsMessageProcessResult {
     pub response: DfsMessageResponse,
     pub attachment: Option<DfsOutboundAttachment>,
     pub events: Vec<NetworkedDfsServiceEvent>,
+}
+
+/// Durable work created while processing a DFS mutation scope.
+///
+/// This receipt is intentionally separate from response/observation events:
+/// metadata may already be committed when response journal construction or
+/// delivery fails. The daemon consumes these coalesced bits before unwrapping
+/// an operation outcome, so every durable edge retains an owner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DfsCommittedWork {
+    pub publish_metadata: bool,
+    pub repair_maintenance: bool,
+    pub namespace_maintenance: bool,
+    pub metadata_replica_progress: bool,
+}
+
+impl DfsCommittedWork {
+    pub(crate) fn merge(&mut self, work: Self) {
+        self.publish_metadata |= work.publish_metadata;
+        self.repair_maintenance |= work.repair_maintenance;
+        self.namespace_maintenance |= work.namespace_maintenance;
+        self.metadata_replica_progress |= work.metadata_replica_progress;
+    }
+}
+
+/// Backwards-compatible name for committed work produced by a served message.
+pub type DfsMessageCommittedWork = DfsCommittedWork;
+
+const DFS_COMMITTED_WORK_PUBLISH_METADATA: u8 = 1 << 0;
+const DFS_COMMITTED_WORK_REPAIR_MAINTENANCE: u8 = 1 << 1;
+const DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE: u8 = 1 << 2;
+const DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS: u8 = 1 << 3;
+
+/// Caller-retained committed-work receipt for cancellable DFS operations.
+///
+/// A maintenance future may be dropped after a synchronous backend mutation
+/// reaches durability but before the future returns. Recording each edge in
+/// this shared tracker at the mutation boundary lets the caller transfer the
+/// exact coalesced work after the backend-bearing service generation is gone.
+#[derive(Clone, Debug, Default)]
+pub struct DfsCommittedWorkTracker {
+    bits: Arc<AtomicU8>,
+}
+
+impl DfsCommittedWorkTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn record(&self, work: DfsCommittedWork) {
+        let mut bits = 0;
+        if work.publish_metadata {
+            bits |= DFS_COMMITTED_WORK_PUBLISH_METADATA;
+        }
+        if work.repair_maintenance {
+            bits |= DFS_COMMITTED_WORK_REPAIR_MAINTENANCE;
+        }
+        if work.namespace_maintenance {
+            bits |= DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE;
+        }
+        if work.metadata_replica_progress {
+            bits |= DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS;
+        }
+        if bits != 0 {
+            self.bits.fetch_or(bits, Ordering::Release);
+        }
+    }
+
+    pub fn take(&self) -> DfsCommittedWork {
+        let bits = self.bits.swap(0, Ordering::AcqRel);
+        DfsCommittedWork {
+            publish_metadata: bits & DFS_COMMITTED_WORK_PUBLISH_METADATA != 0,
+            repair_maintenance: bits & DFS_COMMITTED_WORK_REPAIR_MAINTENANCE != 0,
+            namespace_maintenance: bits & DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE != 0,
+            metadata_replica_progress: bits & DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS != 0,
+        }
+    }
+}
+
+/// Outcome plus the durable-work receipt for one served DFS message.
+#[derive(Debug)]
+pub struct DfsMessageProcessReport {
+    pub outcome: Result<DfsMessageProcessResult, DfsError>,
+    pub committed_work: DfsMessageCommittedWork,
 }
 
 /// Result of a networked DFS write after the service has applied routing,

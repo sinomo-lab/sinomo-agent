@@ -182,7 +182,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         file_system: &DfsFileSystem,
     ) -> Result<Option<DfsMetadataJournalEntry>> {
-        if self.get_file_system(&file_system.file_system_id)?.as_ref() == Some(file_system) {
+        if self
+            .get_file_system(&file_system.file_system_id)?
+            .as_ref()
+            .is_some_and(|current| {
+                crate::placement::dfs_file_system_semantically_eq(current, file_system)
+            })
+        {
             return Ok(None);
         }
         self.put_file_system(file_system).map(Some)

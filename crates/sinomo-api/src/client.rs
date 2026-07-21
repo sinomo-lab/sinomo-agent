@@ -203,8 +203,10 @@ impl DaemonApiClient {
     }
 
     /// Sends an object-RPC through the running local daemon with an explicit
-    /// route-wide semantic deadline. The loopback session remains healthy via
-    /// authenticated progress while the daemon waits for the terminal response.
+    /// route-wide semantic deadline. The same wall-clock budget bounds both
+    /// the daemon's forwarded request and the caller's enclosing loopback
+    /// session; authenticated keepalives remain transport-health signals and
+    /// cannot extend that budget.
     pub fn object_rpc_to_target_with_deadline(
         &self,
         target_node_id: &NodeId,
@@ -703,6 +705,34 @@ async fn call_loopback_daemon_session_async(
     call_daemon_address_session_async(data_dir, address, call, options, runtime).await
 }
 
+async fn call_loopback_daemon_session_with_overall_deadline_async(
+    data_dir: SinomoDataDir,
+    address: &str,
+    call: ObjectRpcSessionCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    overall_deadline: Option<(tokio::time::Instant, Duration)>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    let pending = call_loopback_daemon_session_async(data_dir, address, call, options, runtime);
+    let Some((deadline_at, timeout)) = overall_deadline else {
+        return pending.await;
+    };
+    tokio::pin!(pending);
+    let deadline = tokio::time::sleep_until(deadline_at);
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        _ = &mut deadline => Err(sinomo_core::network::NetworkError::timeout(
+            "daemon-mediated object RPC outer session",
+            sinomo_core::network::NetworkTimeoutPhase::Overall,
+            timeout,
+            // The local daemon may already have dispatched the inner request.
+            sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        ).into()),
+        result = &mut pending => result,
+    }
+}
+
 async fn call_daemon_address_session_async(
     data_dir: SinomoDataDir,
     address: &str,
@@ -749,17 +779,26 @@ async fn send_daemon_object_rpc_session_async(
     known_local_node_id: Option<&NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcSessionResult, DaemonApiError> {
+    let overall_deadline =
+        overall_timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout));
     let target_is_local = match known_local_node_id {
         Some(local_node_id) => target_node_id == local_node_id,
         None => target_node_id == &cached_daemon_api_local_node_id(&data_dir)?,
     };
+    let mut outer_options = sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts);
+    if let Some(overall_timeout) = overall_timeout {
+        outer_options = outer_options.with_overall_timeout(overall_timeout);
+    }
     if target_is_local {
-        let mut local_options = sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts);
-        if let Some(overall_timeout) = overall_timeout {
-            local_options = local_options.with_overall_timeout(overall_timeout);
-        }
-        return call_loopback_daemon_session_async(data_dir, address, call, local_options, runtime)
-            .await;
+        return call_loopback_daemon_session_with_overall_deadline_async(
+            data_dir,
+            address,
+            call,
+            outer_options,
+            overall_deadline,
+            runtime,
+        )
+        .await;
     }
     let forward_request = object_rpc_forward_request(
         DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -775,11 +814,12 @@ async fn send_daemon_object_rpc_session_async(
     } else {
         ObjectRpcSessionCall::new(forward_request, call.body)
     };
-    call_loopback_daemon_session_async(
+    call_loopback_daemon_session_with_overall_deadline_async(
         data_dir,
         address,
         outer,
-        sinomo_core::network::ClusterObjectRpcOptions::new(outer_timeouts),
+        outer_options,
+        overall_deadline,
         runtime,
     )
     .await
@@ -3286,6 +3326,100 @@ mod tests {
         remove_test_channel_pool_entry(&data_dir, &address, &runtime);
 
         assert_eq!(response.body, response_body);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_rpc_outer_deadline_is_not_extended_by_loopback_keepalives() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-forward-outer-deadline");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main node identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_forward_deadline_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_api_forward_deadline_target").expect("target node");
+        write_test_cluster_state(
+            &data_dir,
+            "forward_outer_deadline",
+            local_node,
+            identity.public_key,
+        );
+
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let runtime = tokio::runtime::Handle::current();
+        mark_test_channel_unsupported(&data_dir, &address, &runtime);
+        let server_data_dir = data_dir.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept loopback session");
+            let (incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
+                Box::new(stream.into_inner()),
+                server_data_dir,
+                sinomo_core::network::NetworkCallPolicy::default(),
+                |_request, _node_id, _public_key| Ok(()),
+            )
+            .await
+            .expect("accept object RPC session");
+            assert_eq!(incoming.request.route, DAEMON_OBJECT_RPC_FORWARD_ROUTE);
+            let payload: DaemonObjectRpcForwardRequest = incoming
+                .request
+                .decode_body()
+                .expect("forward request payload");
+            assert_eq!(payload.overall_timeout_millis, Some(5_000));
+
+            // Holding the responder keeps authenticated health pings flowing.
+            // Those pings must preserve transport health without refreshing
+            // the caller's operation-wide deadline.
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            drop(responder);
+        });
+        let request =
+            ObjectRpcRequest::encode_body("/test/forward-outer-deadline", "test", &"request")
+                .expect("inner request");
+        let overall_timeout = Duration::from_secs(5);
+        let started_at = tokio::time::Instant::now();
+
+        let error = send_daemon_object_rpc_session_async(
+            data_dir.clone(),
+            &address,
+            &target_node,
+            ObjectRpcSessionCall::value(request),
+            Duration::from_secs(2),
+            None,
+            Some(overall_timeout),
+            false,
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
+            None,
+            &runtime,
+        )
+        .await
+        .expect_err("outer loopback session must honor the caller deadline");
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            overall_timeout
+        );
+        assert!(
+            matches!(
+                &error,
+                DaemonApiError::NetworkDelivery {
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    ..
+                }
+            ),
+            "unexpected forwarded deadline error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Overall"),
+            "forwarded deadline must remain an overall timeout: {error}"
+        );
+
+        server.await.expect("server task");
+        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        remove_test_local_node_id_cache(&data_dir);
     }
 
     /// Opt-in loopback probe for TCP connect plus the ordinary canonical

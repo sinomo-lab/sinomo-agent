@@ -11085,6 +11085,170 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
 }
 
 #[test]
+fn cluster_voter_quorum_status_uses_one_committed_config_for_count_and_threshold() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-voter-quorum-status-config");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_voter_quorum_status_config").expect("cluster");
+    let local = NodeId::from_legacy_named("node_voter_quorum_status_config_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_voter_quorum_status_config_remote").expect("remote");
+    let mut committed = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "quorum status config",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    committed.members[0].capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    committed.members[0].allowed_capabilities = committed.members[0].capabilities.clone();
+    let mut remote_member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    remote_member.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote_member.allowed_capabilities = remote_member.capabilities.clone();
+    remote_member.endpoints = vec![daemon_lan_endpoint(
+        &remote,
+        "10.49.0.4:21353".to_string(),
+        10,
+    )];
+    committed.members.push(remote_member);
+    write_cluster_state(&paths, &committed).expect("write committed topology");
+    let seeded = sync_cluster_state_to_local_raft_unchecked(&paths, &committed)
+        .expect("seed committed raft state");
+    let mut config: ClusterKvRaftConfigRecord = seeded
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .expect("raft config")
+        .decode()
+        .expect("decode raft config");
+    config.voters = vec![local.clone(), remote.clone()];
+    config.non_voting.clear();
+    config.updated_at = now + time::Duration::seconds(1);
+    append_cluster_raft_command(
+        &paths,
+        &local,
+        KvCommand::Op(
+            KvOp::put_serde(sinomo_kv::cluster_kv_raft_config_key(), &config, None)
+                .expect("config put"),
+        ),
+    )
+    .expect("commit two-voter config");
+
+    let mut stale_bootstrap = committed.clone();
+    let stale_remote = stale_bootstrap
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == remote)
+        .expect("remote member");
+    apply_cluster_raft_role(stale_remote, ClusterMemberRole::NonVoting, now);
+    let mut host = RecordingStateAuthorityReachabilityHost {
+        reachable: BTreeSet::from([remote.clone()]),
+        ..Default::default()
+    };
+
+    let status = cluster_state_authority_quorum_status_with_host(
+        &paths,
+        &stale_bootstrap,
+        voter_reachability_test_options(),
+        &mut host,
+    )
+    .expect("project one committed voter config");
+
+    assert_eq!(status.required, 2);
+    assert_eq!(status.reachable, 2);
+    assert!(status.has_quorum());
+    assert_eq!(host.probes, vec![(remote, Duration::from_secs(4))]);
+}
+
+#[test]
+fn cluster_voter_quorum_status_async_uses_one_committed_config_for_count_and_threshold() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-voter-quorum-status-async-config");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_voter_quorum_status_async_config").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_voter_quorum_status_async_config_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_voter_quorum_status_async_config_remote").expect("remote");
+    let mut committed = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "async quorum status config",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    committed.members[0].capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    committed.members[0].allowed_capabilities = committed.members[0].capabilities.clone();
+    let mut remote_member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    remote_member.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote_member.allowed_capabilities = remote_member.capabilities.clone();
+    remote_member.endpoints = vec![daemon_lan_endpoint(
+        &remote,
+        "10.49.0.5:21353".to_string(),
+        10,
+    )];
+    committed.members.push(remote_member);
+    write_cluster_state(&paths, &committed).expect("write committed topology");
+    let seeded = sync_cluster_state_to_local_raft_unchecked(&paths, &committed)
+        .expect("seed committed raft state");
+    let mut config: ClusterKvRaftConfigRecord = seeded
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .expect("raft config")
+        .decode()
+        .expect("decode raft config");
+    config.voters = vec![local.clone(), remote.clone()];
+    config.non_voting.clear();
+    config.updated_at = now + time::Duration::seconds(1);
+    append_cluster_raft_command(
+        &paths,
+        &local,
+        KvCommand::Op(
+            KvOp::put_serde(sinomo_kv::cluster_kv_raft_config_key(), &config, None)
+                .expect("config put"),
+        ),
+    )
+    .expect("commit two-voter config");
+
+    let mut stale_bootstrap = committed.clone();
+    let stale_remote = stale_bootstrap
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == remote)
+        .expect("remote member");
+    apply_cluster_raft_role(stale_remote, ClusterMemberRole::NonVoting, now);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut host = RecordingStateAuthorityReachabilityHost {
+        reachable: BTreeSet::from([remote.clone()]),
+        ..Default::default()
+    };
+
+    let status = runtime
+        .block_on(cluster_state_authority_quorum_status_async_with_host(
+            &paths,
+            &stale_bootstrap,
+            voter_reachability_test_options(),
+            &mut host,
+        ))
+        .expect("project one committed voter config asynchronously");
+
+    assert_eq!(status.required, 2);
+    assert_eq!(status.reachable, 2);
+    assert!(status.has_quorum());
+    assert_eq!(host.probes, vec![(remote, Duration::from_secs(4))]);
+}
+
+#[test]
 fn cluster_voter_reachability_preserves_node_route_recovery_budget() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-relay");
     let data_dir = SinomoDataDir::new(&root);
@@ -25392,7 +25556,11 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         last_failure_at: None,
         failure_reason: None,
         observed_at: now - time::Duration::seconds(300),
-        expires_at: now + time::Duration::seconds(30),
+        // Inside the connectivity probe margin but outside the generic
+        // network-info margin. Local renewal and KV renewal must stay one
+        // generation so low-frequency node roles cannot let the older KV row
+        // lapse before their next scheduled tick.
+        expires_at: now + time::Duration::seconds(90),
     };
     let mut incoming = stored.clone();
     incoming.latency_ms = Some(18);
@@ -37475,7 +37643,7 @@ mod route_cache_tests {
     }
 
     #[test]
-    fn stable_connectivity_refresh_bumps_route_generation() {
+    fn stable_connectivity_refresh_preserves_route_generation() {
         let (_root, paths) = test_paths("sinomo-network-stable-connectivity-generation");
         let cluster_id = cid("cluster_stable_connectivity_generation");
         let local = nid("node_stable_connectivity_generation_local");
@@ -37523,9 +37691,10 @@ mod route_cache_tests {
         )
         .expect("write stable connectivity refresh");
 
-        assert_ne!(
+        assert_eq!(
             sinomo_network::local_cluster_connectivity_content_generation(&paths),
-            generation_after_first
+            generation_after_first,
+            "timestamp and latency samples are not connectivity generations"
         );
     }
 }

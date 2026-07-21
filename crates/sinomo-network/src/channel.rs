@@ -989,8 +989,55 @@ impl ObjectRpcChannelIngress {
         };
         let flags =
             channel_frame_timeline_flags(frame) | carrier_flag | network_timeline_flag::SUCCESS;
-        let call_id = frame.call_id();
-        let frame_id = channel_frame_timeline_id(frame);
+        self.record_decoded_frame_read_timeline(
+            trace,
+            frame.call_id(),
+            channel_frame_timeline_id(frame),
+            flags,
+            timing,
+        );
+    }
+
+    /// Records one fixed SCDF Data receive directly from its allocation-free
+    /// header. This intentionally avoids rebuilding a logical Data frame (and
+    /// therefore cannot copy its ownership-bearing `Bytes` payload to `Vec`).
+    pub fn record_data_frame_read_timeline(
+        &self,
+        header: &ObjectRpcChannelDataHeader,
+        timing: Option<ObjectFrameReadTiming>,
+        carrier_flag: u16,
+    ) {
+        let Some(timing) = timing else {
+            return;
+        };
+        if timing.capture_generation != 0
+            && crate::timeline::network_timeline_capture_generation() != timing.capture_generation
+        {
+            return;
+        }
+        let Some(trace) = self.shared.call_timeline(header.call_id) else {
+            return;
+        };
+        let flags = channel_data_timeline_flags(header.direction)
+            | carrier_flag
+            | network_timeline_flag::SUCCESS;
+        self.record_decoded_frame_read_timeline(
+            trace,
+            header.call_id,
+            channel_data_timeline_id(header),
+            flags,
+            timing,
+        );
+    }
+
+    fn record_decoded_frame_read_timeline(
+        &self,
+        trace: NetworkTimelineTraceContext,
+        call_id: ObjectRpcChannelCallId,
+        frame_id: u64,
+        flags: u16,
+        timing: ObjectFrameReadTiming,
+    ) {
         if timing.ready_monotonic_ns != 0
             && timing.read_poll_monotonic_ns >= timing.ready_monotonic_ns
         {
@@ -3171,9 +3218,8 @@ async fn run_outgoing_body(
     // A request-side producer is not even opened until RequestAccepted grants
     // the first credit. This is important for one-pass readers: a rejected
     // request must remain completely unconsumed.
-    let mut producer: Option<BodyProducer> =
-        Some(source.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?);
-    drop(source);
+    let mut source = Some(source);
+    let mut producer: Option<BodyProducer> = None;
     let mut offset = 0_u64;
     let write_tracker = Arc::new(BodyWriteTracker::new());
     let mut written = write_tracker.subscribe();
@@ -3187,6 +3233,12 @@ async fn run_outgoing_body(
             && !producer_finished
         {
             let available = window.wait_available().await?;
+            if producer.is_none() {
+                let body = source
+                    .take()
+                    .expect("body source is present until its producer opens");
+                producer = Some(body.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?);
+            }
             let next = if let Some(bytes) = pending_bytes.take() {
                 Some(bytes)
             } else if batch.is_empty() {
@@ -4072,6 +4124,111 @@ mod tests {
     use std::time::Duration;
     use tokio::io::ReadBuf;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn fixed_data_receive_timeline_uses_header_and_preserves_bytes_owner() {
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(64).expect("start capture");
+
+        let ObjectRpcChannelEndpoint {
+            client: _,
+            mut server,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let call_id = ObjectRpcChannelCallId(1);
+        let payload = Bytes::from_static(b"ownership-bearing-scdf");
+        let payload_pointer = payload.as_ptr();
+        let request = request("/channel/data-read-timeline", Vec::new())
+            .with_traceparent("00-41414141414141414141414141414141-4242424242424242-01")
+            .with_observe_sampled(true);
+        ingress
+            .receive_control(ObjectRpcChannelWireFrame::Request {
+                call_id,
+                request,
+                body: Some(ObjectRpcChannelBodyDescriptor {
+                    kind: ObjectRpcChannelBodyKind::Attachment,
+                    total_bytes: Some(payload.len() as u64),
+                }),
+            })
+            .expect("request head");
+        assert!(matches!(
+            egress.next_frame().await,
+            Some(ObjectRpcChannelWireFrame::RequestAccepted { .. })
+        ));
+        let incoming = server.accept().await.expect("incoming request");
+        let frame = ObjectRpcChannelDataFrame::new(
+            call_id,
+            ObjectRpcChannelBodyDirection::Request,
+            0,
+            payload,
+        )
+        .expect("data frame");
+        let now = crate::network_timeline_monotonic_ns();
+        ingress.record_data_frame_read_timeline(
+            &frame.header,
+            Some(ObjectFrameReadTiming {
+                capture_generation: 0,
+                ready_monotonic_ns: 0,
+                read_poll_monotonic_ns: 0,
+                first_read_monotonic_ns: now,
+                body_read_completed_monotonic_ns: now.saturating_add(1),
+                decode_started_monotonic_ns: now.saturating_add(1),
+                decoded_monotonic_ns: now.saturating_add(2),
+                wire_bytes: u32::try_from(
+                    crate::channel_wire::OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES + frame.bytes.len(),
+                )
+                .unwrap_or(u32::MAX),
+                first_read_bytes: 4,
+            }),
+            network_timeline_flag::LOCAL_CARRIER,
+        );
+        assert_eq!(frame.bytes.as_ptr(), payload_pointer);
+        ingress.receive_data(frame).expect("data ingress");
+        ingress
+            .receive_control(ObjectRpcChannelWireFrame::BodyEnd {
+                call_id,
+                direction: ObjectRpcChannelBodyDirection::Request,
+                total_bytes: b"ownership-bearing-scdf".len() as u64,
+            })
+            .expect("body end");
+        let received = incoming
+            .request
+            .body
+            .collect_to_vec(1024)
+            .await
+            .expect("body payload");
+        assert_eq!(received, b"ownership-bearing-scdf");
+
+        let snapshot = crate::stop_network_timeline_capture().expect("stop capture");
+        let stages = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.call_id == call_id.0
+                    && event.flags & network_timeline_flag::DATA_FRAME != 0
+                    && event.flags & network_timeline_flag::LOCAL_CARRIER != 0
+            })
+            .map(|event| event.stage)
+            .collect::<HashSet<_>>();
+        for stage in [
+            network_timeline_stage::FRAME_FIRST_READ,
+            network_timeline_stage::FRAME_READ,
+            network_timeline_stage::FRAME_DECODE,
+        ] {
+            assert!(
+                stages.contains(&stage),
+                "missing Data receive stage {stage}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn streamed_data_and_body_end_retain_exact_write_timeline_ids() {
@@ -5212,6 +5369,67 @@ mod tests {
             Some(expected.len() as u64),
         );
         assert_short_reader_transfers_exactly(source, expected).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_request_without_credit_does_not_consume_one_pass_reader() {
+        struct CountingReader {
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Release);
+                if let Some(first) = buffer.first_mut() {
+                    *first = 0x5a;
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let pending = client
+            .call(ObjectRpcSessionCall::new(
+                request("/channel/rejected-reader", Vec::new()),
+                ObjectRpcBodySource::from_reader(
+                    CountingReader {
+                        reads: Arc::clone(&reads),
+                    },
+                    Some(1),
+                ),
+            ))
+            .await
+            .expect("queue request");
+        let call_id = match egress.next_frame().await.expect("request head") {
+            ObjectRpcChannelWireFrame::Request { call_id, .. } => call_id,
+            frame => panic!("expected request head, got {frame:?}"),
+        };
+
+        // Completing the head write starts the body task, but without
+        // RequestAccepted there is no credit and therefore no producer open.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(reads.load(Ordering::Acquire), 0);
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Reset {
+                call_id,
+                reason: "request rejected".to_string(),
+            })
+            .expect("reject request");
+        assert!(pending.result().await.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

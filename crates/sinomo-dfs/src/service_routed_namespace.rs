@@ -519,6 +519,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         };
+        let mutates_metadata = !matches!(
+            &command.operation,
+            DfsNamespaceOperation::LookupPath { .. }
+                | DfsNamespaceOperation::LookupPaths { .. }
+                | DfsNamespaceOperation::SyncPath { .. }
+                | DfsNamespaceOperation::AdvisoryLock { .. }
+                | DfsNamespaceOperation::FileSync { .. }
+                | DfsNamespaceOperation::DirectorySync { .. }
+        );
+        if mutates_metadata && matches!(result, DfsNamespaceResult::Applied) {
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                repair_maintenance: false,
+                namespace_maintenance: false,
+                metadata_replica_progress: false,
+            });
+        }
         let journal_started = Instant::now();
         let metadata_journal_batches = if command.include_metadata_journal_batches
             && matches!(result, DfsNamespaceResult::Applied)
@@ -607,15 +624,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_send_ms,
             trace_started.elapsed().as_millis()
         ));
-        let mutates_metadata = !matches!(
-            command.operation,
-            DfsNamespaceOperation::LookupPath { .. }
-                | DfsNamespaceOperation::LookupPaths { .. }
-                | DfsNamespaceOperation::SyncPath { .. }
-                | DfsNamespaceOperation::AdvisoryLock { .. }
-                | DfsNamespaceOperation::FileSync { .. }
-                | DfsNamespaceOperation::DirectorySync { .. }
-        );
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
             request_id,
             requester_node_id,

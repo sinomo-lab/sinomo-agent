@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use time::OffsetDateTime;
 
 use crate::control_plane::topology_preserving_metadata_shard_replicas;
+#[cfg(test)]
+use crate::metadata_replication::materialize_default_sifs_metadata_on_active_primary_shards;
 use crate::service_sync::rebind_completed_metadata_shard_membership_handoff;
 use crate::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
@@ -31,8 +33,10 @@ use crate::{
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, local_dfs_metadata_shard_path, materialize_default_sifs_metadata,
-    materialize_default_sifs_metadata_on_shards,
-    metadata_replication::materialize_default_sifs_metadata_on_shards_with_report,
+    metadata_replication::{
+        default_sifs_migration_has_backend_continuation,
+        materialize_default_sifs_metadata_on_bound_primary_shards,
+    },
     metadata_service_key, metadata_shard_head_watermark_key, metadata_shard_key,
     metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
     open_cluster_aware_dfs_metadata_backend, open_local_metadata_shard_backend,
@@ -69,13 +73,37 @@ type DfsDefaultMaterializationHandoffEvidence = Vec<(
     Option<DfsMetadataShardMembershipHandoffProof>,
 )>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct DfsDefaultMaterializationSignature {
     file_system: DfsFileSystem,
     shards: Vec<DfsMetadataShardConfig>,
     bootstrap_owner_node_ids: Vec<NodeId>,
     fallback_owner_node_id: NodeId,
     handoff_evidence: DfsDefaultMaterializationHandoffEvidence,
+    // Replica certification for cross-primary legacy migration consumes the
+    // exact committed head generation. Omitting it would let a pass that ran
+    // between batch apply and watermark commit cache a stale negative result.
+    head_watermarks: BTreeMap<DfsMetadataShardId, DfsMetadataShardHeadWatermark>,
+}
+
+impl PartialEq for DfsDefaultMaterializationSignature {
+    fn eq(&self, other: &Self) -> bool {
+        crate::placement::dfs_file_system_semantically_eq(&self.file_system, &other.file_system)
+            && self.shards == other.shards
+            && self.bootstrap_owner_node_ids == other.bootstrap_owner_node_ids
+            && self.fallback_owner_node_id == other.fallback_owner_node_id
+            && self.handoff_evidence == other.handoff_evidence
+            && self.head_watermarks == other.head_watermarks
+    }
+}
+
+impl Eq for DfsDefaultMaterializationSignature {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsDefaultMaterializationCacheEntry {
+    signature: DfsDefaultMaterializationSignature,
+    awaiting_replica_progress: bool,
+    invalidated_for_replica_progress: bool,
 }
 
 // Process-local successful-pass cache. The daemon's per-data-dir lifecycle gate
@@ -84,8 +112,10 @@ struct DfsDefaultMaterializationSignature {
 // redundant idempotent pass. We record only a fully scanned successful pass;
 // process restart/crash clears the cache and forces recovery validation again.
 static DFS_DEFAULT_MATERIALIZATION_SIGNATURES: OnceLock<
-    Mutex<BTreeMap<PathBuf, DfsDefaultMaterializationSignature>>,
+    Mutex<BTreeMap<PathBuf, DfsDefaultMaterializationCacheEntry>>,
 > = OnceLock::new();
+static DFS_DEFAULT_MATERIALIZATION_IMMEDIATE_RETRIES: OnceLock<Mutex<BTreeSet<PathBuf>>> =
+    OnceLock::new();
 
 fn default_materialization_is_current(
     data_root: &Path,
@@ -94,19 +124,145 @@ fn default_materialization_is_current(
     DFS_DEFAULT_MATERIALIZATION_SIGNATURES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
-        .is_ok_and(|signatures| signatures.get(data_root) == Some(signature))
+        .is_ok_and(|signatures| {
+            signatures.get(data_root).is_some_and(|cached| {
+                cached.signature == *signature && !cached.invalidated_for_replica_progress
+            })
+        })
 }
 
 fn record_default_materialization(
     data_root: PathBuf,
     signature: DfsDefaultMaterializationSignature,
+    awaiting_replica_progress: bool,
 ) {
+    let mut establish_replica_subscription = false;
     if let Ok(mut signatures) = DFS_DEFAULT_MATERIALIZATION_SIGNATURES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
-        signatures.insert(data_root, signature);
+        establish_replica_subscription = awaiting_replica_progress
+            && signatures
+                .get(&data_root)
+                .is_none_or(|cached| !cached.awaiting_replica_progress);
+        signatures.insert(
+            data_root.clone(),
+            DfsDefaultMaterializationCacheEntry {
+                signature,
+                awaiting_replica_progress,
+                invalidated_for_replica_progress: false,
+            },
+        );
     }
+    if let Ok(mut retries) = DFS_DEFAULT_MATERIALIZATION_IMMEDIATE_RETRIES
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        if establish_replica_subscription {
+            // Establishing a dynamic watermark dependency needs one reactive
+            // verification generation. A watermark can commit after this pass
+            // sampled the old value but before the cache publishes
+            // `awaiting_replica_progress`; the committed-snapshot observer
+            // correctly ignored it while unsubscribed. The immediate pass
+            // resamples the resident snapshot after the subscription bit is
+            // visible, closing that false-to-true handoff without a polling
+            // timer. Subsequent waiting passes remain subscribed and do not
+            // self-wake.
+            retries.insert(data_root);
+        } else {
+            retries.remove(&data_root);
+        }
+    }
+}
+
+fn request_default_materialization_immediate_retry(data_root: PathBuf) {
+    if let Ok(mut retries) = DFS_DEFAULT_MATERIALIZATION_IMMEDIATE_RETRIES
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        retries.insert(data_root);
+    }
+}
+
+/// Consume an edge requesting one immediate materialization generation.
+///
+/// The edge is emitted when a bounded pass stops at its mutation cap or when
+/// a pass first establishes a dynamic replica-progress dependency. The
+/// daemon's sole reconciliation owner uses it to continue bounded work or
+/// verify the new subscription against the resident snapshot without a
+/// polling timer.
+pub fn take_default_cluster_dfs_materialization_immediate_retry(data_dir: &SinomoDataDir) -> bool {
+    DFS_DEFAULT_MATERIALIZATION_IMMEDIATE_RETRIES
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .is_ok_and(|mut retries| retries.remove(&data_dir.root()))
+}
+
+/// Invalidate a settled materialization pass only when it is waiting for an
+/// exact replica generation to finish an authority-scoped shard migration.
+/// Ordinary metadata replication therefore does not wake default-cluster
+/// reconciliation in steady state.
+pub fn invalidate_default_cluster_dfs_materialization_for_replica_progress(
+    data_dir: &SinomoDataDir,
+) -> bool {
+    let Ok(mut signatures) = DFS_DEFAULT_MATERIALIZATION_SIGNATURES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    else {
+        return false;
+    };
+    let data_root = data_dir.root();
+    let Some(cached) = signatures.get_mut(&data_root) else {
+        return false;
+    };
+    if !cached.awaiting_replica_progress || cached.invalidated_for_replica_progress {
+        return false;
+    }
+    // Preserve the subscription bit while forcing the signature miss. A head
+    // watermark can commit between the local batch wake and the next pass; if
+    // invalidation removed this entry, that ordering would lose the watermark
+    // edge and park migration indefinitely.
+    cached.invalidated_for_replica_progress = true;
+    true
+}
+
+/// Whether the settled/default materializer currently consumes exact replica
+/// head generations. Daemon projection observers use this to subscribe to
+/// watermark commits only while an actual cross-shard migration is blocked.
+pub fn default_cluster_dfs_materialization_awaits_replica_progress(
+    data_dir: &SinomoDataDir,
+) -> bool {
+    DFS_DEFAULT_MATERIALIZATION_SIGNATURES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .is_ok_and(|signatures| {
+            signatures
+                .get(&data_dir.root())
+                .is_some_and(|cached| cached.awaiting_replica_progress)
+        })
+}
+
+/// Prime the real process-local subscription state for cross-crate reactor
+/// tests. This is compiled only when a consumer explicitly enables the
+/// `test-support` feature; production callers establish the same state solely
+/// through a completed materialization pass.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_establish_default_cluster_dfs_replica_progress_subscription(data_dir: &SinomoDataDir) {
+    let local_node_id =
+        NodeId::from_legacy_named("node_dfs_test_replica_subscription").expect("test node id");
+    record_default_materialization(
+        data_dir.root(),
+        DfsDefaultMaterializationSignature {
+            file_system: distributed_sifs(local_node_id.clone()),
+            shards: Vec::new(),
+            bootstrap_owner_node_ids: vec![local_node_id.clone()],
+            fallback_owner_node_id: local_node_id,
+            handoff_evidence: Vec::new(),
+            head_watermarks: BTreeMap::new(),
+        },
+        true,
+    );
 }
 
 #[cfg(test)]
@@ -332,18 +488,23 @@ impl DfsControlPlaneDefaultClusterBootstrapHost {
         }
         if let Some(current) = current.as_ref() {
             let pending = control.begin_metadata_shard_membership_handoff(current, desired)?;
+            if let Some(pending) = pending.or(control.get_metadata_shard_membership_handoff(
+                &current.file_system_id,
+                &current.shard_id,
+            )?) {
+                return Err(DfsError::MetadataShardMembershipHandoffParked {
+                    file_system_id: pending.retiring_shard.file_system_id.clone(),
+                    shard_id: pending.retiring_shard.shard_id.clone(),
+                    handoff_id: pending.handoff_id,
+                    retiring_epoch: pending.retiring_shard.epoch,
+                    desired_epoch: pending.desired_shard.epoch,
+                });
+            }
             return Err(DfsError::Distributed {
-                message: if pending.is_some() {
-                    format!(
-                        "metadata shard {} membership or primary-role change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
-                        desired.shard_id, current.epoch, desired.epoch
-                    )
-                } else {
-                    format!(
-                        "metadata shard {} changed concurrently while beginning its membership handoff; retry",
-                        desired.shard_id
-                    )
-                },
+                message: format!(
+                    "metadata shard {} changed concurrently while beginning its membership handoff; retry",
+                    desired.shard_id
+                ),
             });
         }
         if !control.compare_and_put_metadata_shard(current.as_ref(), desired)? {
@@ -417,18 +578,32 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             let pending = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
                 .begin_metadata_shard_membership_handoff(current, desired)
                 .await?;
+            let pending = match pending {
+                Some(pending) => Some(pending),
+                None => self
+                    .control_plane
+                    .get_async(&metadata_shard_membership_handoff_key(
+                        &current.file_system_id,
+                        &current.shard_id,
+                    ))
+                    .await?
+                    .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
+                    .transpose()?,
+            };
+            if let Some(pending) = pending {
+                return Err(DfsError::MetadataShardMembershipHandoffParked {
+                    file_system_id: pending.retiring_shard.file_system_id.clone(),
+                    shard_id: pending.retiring_shard.shard_id.clone(),
+                    handoff_id: pending.handoff_id,
+                    retiring_epoch: pending.retiring_shard.epoch,
+                    desired_epoch: pending.desired_shard.epoch,
+                });
+            }
             return Err(DfsError::Distributed {
-                message: if pending.is_some() {
-                    format!(
-                        "metadata shard {} membership or primary-role change from epoch {} to {} is fenced and parked pending exact DFS catch-up of every retiring and desired member",
-                        desired.shard_id, current.epoch, desired.epoch
-                    )
-                } else {
-                    format!(
-                        "metadata shard {} changed concurrently while beginning its membership handoff; retry",
-                        desired.shard_id
-                    )
-                },
+                message: format!(
+                    "metadata shard {} changed concurrently while beginning its membership handoff; retry",
+                    desired.shard_id
+                ),
             });
         }
         if !DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
@@ -571,10 +746,10 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         bootstrap_owner_node_ids: Vec<NodeId>,
         fallback_owner_node_id: NodeId,
     ) -> Result<(), DfsError> {
-        let mut backend = open_local_sharded_metadata_backend(
-            default_dfs_metadata_shards_root(&self.data_dir),
-            shards.clone(),
-        )?;
+        let mut active_primary_shard_ids = BTreeSet::new();
+        let mut head_watermarks = BTreeMap::new();
+        let mut completion_evidence = Vec::with_capacity(shards.len());
+        let mut active_primary_shards = Vec::new();
         for active in &shards {
             let store = DfsControlPlaneStore::new(self.control_plane.as_mut());
             let pending = store
@@ -583,21 +758,62 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
                 &active.file_system_id,
                 &active.shard_id,
             )?;
-            rebind_completed_metadata_shard_membership_handoff(
-                &mut backend,
-                &self.local_node_id,
-                active,
-                pending.as_ref(),
-                proof.as_ref(),
-            )?;
+            if let Some(watermark) =
+                store.get_metadata_shard_head_watermark(&active.file_system_id, &active.shard_id)?
+            {
+                head_watermarks.insert(DfsMetadataShardId::new(active.shard_id.clone()), watermark);
+            }
+            if active.primary_node_id == self.local_node_id && pending.is_none() {
+                active_primary_shards.push(active.clone());
+                active_primary_shard_ids.insert(DfsMetadataShardId::new(active.shard_id.clone()));
+            }
+            completion_evidence.push((pending, proof));
         }
-        materialize_default_sifs_metadata_on_shards(
-            &mut backend,
+        let metadata_root = default_dfs_metadata_shards_root(&self.data_dir);
+        let has_continuation = default_sifs_migration_has_backend_continuation(
+            &metadata_root,
+            &file_system.file_system_id,
+            &self.local_node_id,
+            &shards,
+            &head_watermarks,
+            &active_primary_shard_ids,
+        );
+        let mut bound_primary_backend = if active_primary_shards.is_empty() || has_continuation {
+            None
+        } else {
+            Some(open_local_sharded_metadata_backend(
+                metadata_root.clone(),
+                active_primary_shards,
+            )?)
+        };
+        if let Some(backend) = bound_primary_backend.as_mut() {
+            for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
+                if active_primary_shard_ids
+                    .contains(&DfsMetadataShardId::new(active.shard_id.clone()))
+                {
+                    rebind_completed_metadata_shard_membership_handoff(
+                        backend,
+                        &self.local_node_id,
+                        active,
+                        pending.as_ref(),
+                        proof.as_ref(),
+                    )?;
+                }
+            }
+        }
+        materialize_default_sifs_metadata_on_bound_primary_shards(
+            metadata_root,
+            bound_primary_backend,
             file_system,
+            &shards,
+            &head_watermarks,
+            &active_primary_shard_ids,
+            &self.local_node_id,
             bootstrap_owner_node_ids,
             fallback_owner_node_id,
             OffsetDateTime::now_utc(),
-        )
+        )?;
+        Ok(())
     }
 }
 
@@ -756,6 +972,7 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
         Box::pin(async move {
             let mut completion_evidence = Vec::with_capacity(shards.len());
+            let mut head_watermarks = BTreeMap::new();
             for active in &shards {
                 let pending = self
                     .control_plane
@@ -775,6 +992,19 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     .await?
                     .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoffProof>())
                     .transpose()?;
+                if let Some(watermark) = self
+                    .control_plane
+                    .get_async(&metadata_shard_head_watermark_key(
+                        &active.file_system_id,
+                        &active.shard_id,
+                    ))
+                    .await?
+                    .map(|entry| entry.decode::<DfsMetadataShardHeadWatermark>())
+                    .transpose()?
+                {
+                    head_watermarks
+                        .insert(DfsMetadataShardId::new(active.shard_id.clone()), watermark);
+                }
                 completion_evidence.push((pending, proof));
             }
             bootstrap_owner_node_ids.sort();
@@ -785,6 +1015,7 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                 bootstrap_owner_node_ids: bootstrap_owner_node_ids.clone(),
                 fallback_owner_node_id: fallback_owner_node_id.clone(),
                 handoff_evidence: completion_evidence.clone(),
+                head_watermarks: head_watermarks.clone(),
             };
             let data_root = self.data_dir.root();
             if default_materialization_is_current(&data_root, &signature) {
@@ -792,28 +1023,73 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
             }
             #[cfg(test)]
             record_default_materialization_run(&data_root);
-            let mut backend = open_local_sharded_metadata_backend(
-                default_dfs_metadata_shards_root(&self.data_dir),
-                shards.clone(),
-            )?;
-            for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
-                rebind_completed_metadata_shard_membership_handoff(
-                    &mut backend,
-                    &self.local_node_id,
-                    active,
-                    pending.as_ref(),
-                    proof.as_ref(),
-                )?;
+            let mut active_primary_shard_ids = BTreeSet::new();
+            let active_primary_shards = shards
+                .iter()
+                .zip(&completion_evidence)
+                .filter_map(|(active, (pending, _))| {
+                    (active.primary_node_id == self.local_node_id && pending.is_none())
+                        .then_some(active.clone())
+                })
+                .collect::<Vec<_>>();
+            active_primary_shard_ids.extend(
+                active_primary_shards
+                    .iter()
+                    .map(|active| DfsMetadataShardId::new(active.shard_id.clone())),
+            );
+            let metadata_root = default_dfs_metadata_shards_root(&self.data_dir);
+            let has_continuation = default_sifs_migration_has_backend_continuation(
+                &metadata_root,
+                &file_system.file_system_id,
+                &self.local_node_id,
+                &shards,
+                &head_watermarks,
+                &active_primary_shard_ids,
+            );
+            let mut bound_primary_backend = if active_primary_shards.is_empty() || has_continuation
+            {
+                None
+            } else {
+                Some(open_local_sharded_metadata_backend(
+                    metadata_root.clone(),
+                    active_primary_shards,
+                )?)
+            };
+            if let Some(backend) = bound_primary_backend.as_mut() {
+                for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
+                    if active_primary_shard_ids
+                        .contains(&DfsMetadataShardId::new(active.shard_id.clone()))
+                    {
+                        rebind_completed_metadata_shard_membership_handoff(
+                            backend,
+                            &self.local_node_id,
+                            active,
+                            pending.as_ref(),
+                            proof.as_ref(),
+                        )?;
+                    }
+                }
             }
-            let migration = materialize_default_sifs_metadata_on_shards_with_report(
-                &mut backend,
+            let materialization = materialize_default_sifs_metadata_on_bound_primary_shards(
+                metadata_root,
+                bound_primary_backend,
                 &file_system,
+                &shards,
+                &head_watermarks,
+                &active_primary_shard_ids,
+                &self.local_node_id,
                 bootstrap_owner_node_ids,
                 fallback_owner_node_id,
                 OffsetDateTime::now_utc(),
             )?;
-            if !migration.reached_limit {
-                record_default_materialization(data_root, signature);
+            if !materialization.migration.reached_limit {
+                record_default_materialization(
+                    data_root,
+                    signature,
+                    materialization.awaiting_replica_progress,
+                );
+            } else {
+                request_default_materialization_immediate_retry(data_root);
             }
             Ok(())
         })
@@ -1911,6 +2187,47 @@ mod tests {
     };
     use sinomo_core::node::ClusterId;
 
+    fn split_default_metadata_shards(
+        file_system_id: &DfsFileSystemId,
+        root_primary: NodeId,
+        services_primary: NodeId,
+        users_primary: NodeId,
+    ) -> Vec<DfsMetadataShardConfig> {
+        vec![
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: root_primary,
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: services_primary,
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: SIFS_SERVICES_PATH.to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "users".to_string(),
+                primary_node_id: users_primary,
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: SIFS_USERS_PATH.to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ]
+    }
+
     #[derive(Debug)]
     struct TestDefaultClusterBootstrapHost {
         current_shard: Option<DfsMetadataShardConfig>,
@@ -2050,10 +2367,13 @@ mod tests {
         };
         assert!(matches!(
             host.put_metadata_shard(&next_epoch),
-            Err(DfsError::Distributed { message })
-                if message.contains("membership or primary-role change")
-                    && message.contains("fenced and parked")
-                    && message.contains("exact DFS catch-up")
+            Err(DfsError::MetadataShardMembershipHandoffParked {
+                file_system_id: parked_file_system_id,
+                shard_id,
+                retiring_epoch: 1,
+                desired_epoch: 2,
+                ..
+            }) if parked_file_system_id == file_system_id && shard_id == "root"
         ));
         assert_eq!(
             host.current_metadata_shard(&file_system_id, "root")
@@ -2102,13 +2422,29 @@ mod tests {
         );
         host.put_metadata_shard(&initial).expect("create shard");
 
-        assert!(matches!(
-            host.put_metadata_shard(&desired),
-            Err(DfsError::Distributed { message })
-                if message.contains("membership or primary-role change")
-                    && message.contains("fenced and parked")
-                    && message.contains("exact DFS catch-up")
-        ));
+        let first_handoff_id = match host.put_metadata_shard(&desired) {
+            Err(DfsError::MetadataShardMembershipHandoffParked {
+                file_system_id: parked_file_system_id,
+                shard_id,
+                handoff_id,
+                retiring_epoch: 1,
+                desired_epoch: 2,
+            }) if parked_file_system_id == file_system_id && shard_id == "root" => handoff_id,
+            other => panic!("expected typed parked handoff, got {other:?}"),
+        };
+        let existing_handoff_id = match host.put_metadata_shard(&desired) {
+            Err(DfsError::MetadataShardMembershipHandoffParked {
+                handoff_id,
+                retiring_epoch: 1,
+                desired_epoch: 2,
+                ..
+            }) => handoff_id,
+            other => panic!("expected existing typed parked handoff, got {other:?}"),
+        };
+        assert_eq!(
+            existing_handoff_id, first_handoff_id,
+            "revisiting a durable exact handoff must park on the same generation instead of becoming a generic concurrent failure"
+        );
         assert_eq!(
             host.current_metadata_shard(&file_system_id, "root")
                 .expect("read retiring shard"),
@@ -2185,10 +2521,13 @@ mod tests {
         };
         assert!(matches!(
             host.put_metadata_shard_async(next_epoch.clone()).await,
-            Err(DfsError::Distributed { message })
-                if message.contains("membership or primary-role change")
-                    && message.contains("fenced and parked")
-                    && message.contains("exact DFS catch-up")
+            Err(DfsError::MetadataShardMembershipHandoffParked {
+                file_system_id: parked_file_system_id,
+                shard_id,
+                retiring_epoch: 1,
+                desired_epoch: 2,
+                ..
+            }) if parked_file_system_id == file_system_id && shard_id == "root"
         ));
         assert_eq!(
             host.current_metadata_shard_async(file_system_id.clone(), "root".to_string())
@@ -2202,6 +2541,94 @@ mod tests {
             .expect("read async primary-role handoff")
             .expect("async primary-role handoff parked");
         assert_eq!(pending.desired_shard, next_epoch);
+    }
+
+    #[test]
+    fn materialization_signature_ignores_distinct_policy_discovery_order() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-policy-order-signature");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let local = NodeId::from_legacy_named("node_dfs_policy_order_signature").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let signature = DfsDefaultMaterializationSignature {
+            file_system: file_system.clone(),
+            shards: Vec::new(),
+            bootstrap_owner_node_ids: vec![local.clone()],
+            fallback_owner_node_id: local.clone(),
+            handoff_evidence: Vec::new(),
+            head_watermarks: BTreeMap::new(),
+        };
+        record_default_materialization(data_dir.root(), signature, false);
+
+        let mut reordered = file_system;
+        reordered.subtree_policies.reverse();
+        assert!(default_materialization_is_current(
+            &data_dir.root(),
+            &DfsDefaultMaterializationSignature {
+                file_system: reordered,
+                shards: Vec::new(),
+                bootstrap_owner_node_ids: vec![local.clone()],
+                fallback_owner_node_id: local,
+                handoff_evidence: Vec::new(),
+                head_watermarks: BTreeMap::new(),
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn replica_progress_invalidation_preserves_subscription_until_settled_pass() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-replica-subscription-cache");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let local = NodeId::from_legacy_named("node_dfs_replica_subscription").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let signature = DfsDefaultMaterializationSignature {
+            file_system,
+            shards: Vec::new(),
+            bootstrap_owner_node_ids: vec![local.clone()],
+            fallback_owner_node_id: local,
+            handoff_evidence: Vec::new(),
+            head_watermarks: BTreeMap::new(),
+        };
+        record_default_materialization(data_dir.root(), signature.clone(), true);
+        assert!(
+            take_default_cluster_dfs_materialization_immediate_retry(&data_dir),
+            "first entering a dynamic replica dependency must schedule one verification generation"
+        );
+        record_default_materialization(data_dir.root(), signature.clone(), true);
+        assert!(
+            !take_default_cluster_dfs_materialization_immediate_retry(&data_dir),
+            "a settled waiting subscription must not self-wake repeatedly"
+        );
+        assert!(default_materialization_is_current(
+            &data_dir.root(),
+            &signature
+        ));
+        assert!(default_cluster_dfs_materialization_awaits_replica_progress(
+            &data_dir
+        ));
+
+        assert!(invalidate_default_cluster_dfs_materialization_for_replica_progress(&data_dir));
+        assert!(
+            !default_materialization_is_current(&data_dir.root(), &signature),
+            "replica progress must force the next materialization pass"
+        );
+        assert!(
+            default_cluster_dfs_materialization_awaits_replica_progress(&data_dir),
+            "the watermark subscription must survive invalidation to cover the commit race"
+        );
+        assert!(
+            !invalidate_default_cluster_dfs_materialization_for_replica_progress(&data_dir),
+            "one replica generation is consumed once"
+        );
+
+        record_default_materialization(data_dir.root(), signature.clone(), false);
+        assert!(default_materialization_is_current(
+            &data_dir.root(),
+            &signature
+        ));
+        assert!(
+            !default_cluster_dfs_materialization_awaits_replica_progress(&data_dir),
+            "a settled pass must unsubscribe ordinary watermark traffic"
+        );
     }
 
     #[tokio::test]
@@ -2244,14 +2671,1198 @@ mod tests {
         assert!(first.local_has_primary_metadata_shards);
         assert_eq!(default_materialization_run_count(&data_dir.root()), 1);
 
-        let second = ensure_default_distributed_dfs_with_async_host(&state, &mut host, options)
-            .await
-            .expect("stable default DFS publication");
+        let second =
+            ensure_default_distributed_dfs_with_async_host(&state, &mut host, options.clone())
+                .await
+                .expect("stable default DFS publication");
         assert_eq!(second.metadata_shards, first.metadata_shards);
         assert_eq!(
             default_materialization_run_count(&data_dir.root()),
             1,
             "an unchanged publication must not reopen every shard and rescan the object catalog"
+        );
+
+        let root_shard = first
+            .metadata_shards
+            .iter()
+            .find(|shard| shard.shard_id == "root")
+            .expect("root shard")
+            .clone();
+        DfsControlPlaneAsyncStore::new(host.control_plane.as_mut())
+            .publish_metadata_shard_head_watermark(
+                &root_shard,
+                &DfsMetadataShardHeadWatermark {
+                    file_system_id: root_shard.file_system_id.clone(),
+                    shard_id: root_shard.shard_id.clone(),
+                    primary_node_id: root_shard.primary_node_id.clone(),
+                    epoch: root_shard.epoch,
+                    journal_sequence: 1,
+                    state_fingerprint: "blake3:materialization-signature-head".to_string(),
+                    acknowledged_node_ids: vec![state.local_node_id.clone()],
+                },
+            )
+            .await
+            .expect("publish consulted head generation");
+        ensure_default_distributed_dfs_with_async_host(&state, &mut host, options)
+            .await
+            .expect("head-aware default DFS publication");
+        assert_eq!(
+            default_materialization_run_count(&data_dir.root()),
+            2,
+            "a consulted head generation must invalidate the materialization cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_handoff_materializes_through_exact_bound_backend_once() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-bound-handoff-materialization");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_dfs_bound_handoff_local").expect("local node");
+        let root_primary =
+            NodeId::from_legacy_named("node_dfs_bound_handoff_root").expect("root primary");
+        let users_primary =
+            NodeId::from_legacy_named("node_dfs_bound_handoff_users").expect("users primary");
+        let file_system = distributed_sifs(local.clone());
+        let mut shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            root_primary,
+            local.clone(),
+            users_primary,
+        );
+        let services_index = shards
+            .iter()
+            .position(|shard| shard.shard_id == "services")
+            .expect("services shard");
+        let retiring_services = shards[services_index].clone();
+        shards[services_index].epoch = retiring_services.epoch.saturating_add(1);
+        let active_services = shards[services_index].clone();
+        let services_shard_id = DfsMetadataShardId::new("services");
+        let handoff_id = "handoff-bound-default-materialization";
+
+        let mut retiring_backend =
+            open_local_metadata_shard_backend(&data_dir, services_shard_id.clone())
+                .expect("retiring services backend");
+        retiring_backend
+            .put_file_system(&file_system)
+            .expect("retiring filesystem");
+        let freeze = retiring_backend
+            .freeze_metadata_shard_for_membership_handoff(
+                &services_shard_id,
+                handoff_id,
+                retiring_services.epoch,
+            )
+            .expect("freeze retiring services authority")
+            .expect("local services shard");
+        drop(retiring_backend);
+
+        // This independently opened lane observes the marker but has not
+        // validated the completed control-plane generation. It must remain
+        // fenced even after another instance binds that generation.
+        let mut stale_separate_backend =
+            open_local_metadata_shard_backend(&data_dir, services_shard_id.clone())
+                .expect("stale separate services backend");
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff_id.to_string(),
+            retiring_shard: retiring_services,
+            desired_shard: active_services.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint,
+            acknowledged_node_ids: vec![local.clone()],
+        };
+        let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new(
+            data_dir.clone(),
+            cluster_paths,
+            local.clone(),
+            Box::new(sinomo_core::kv::InProcessKvStore::new()),
+        );
+        for shard in &shards {
+            host.put_serde_if_changed(
+                metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                shard,
+            )
+            .await
+            .expect("publish active shard");
+        }
+        host.put_serde_if_changed(
+            metadata_shard_membership_handoff_proof_key(
+                &active_services.file_system_id,
+                &active_services.shard_id,
+            ),
+            &proof,
+        )
+        .await
+        .expect("publish completed handoff proof");
+
+        host.materialize_default_sifs_metadata_on_shards_async(
+            file_system.clone(),
+            shards.clone(),
+            vec![local.clone()],
+            local.clone(),
+        )
+        .await
+        .expect("the proof-bound backend materializes default metadata");
+        assert_eq!(default_materialization_run_count(&data_dir.root()), 1);
+
+        let materialized_backend = LocalSobjMetadataBackend::open_for_inspection(
+            services_shard_id.clone(),
+            local_dfs_metadata_shard_path(&data_dir, &services_shard_id),
+        )
+        .expect("inspect materialized services authority");
+        let services_object = materialized_backend
+            .get_object_by_path(&file_system.file_system_id, SIFS_SERVICES_PATH)
+            .expect("read materialized services object")
+            .expect("services object was materialized");
+        let materialized_head = materialized_backend.journal_last_sequence();
+        assert!(materialized_head > freeze.journal_sequence);
+
+        let mut rejected_object = services_object;
+        rejected_object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_bound_handoff_stale_writer")
+                .expect("object id");
+        rejected_object.path = "/services/stale-writer".to_string();
+        rejected_object.version =
+            crate::DfsVersion::from_legacy_named("version_bound_handoff_stale_writer")
+                .expect("version");
+        assert!(matches!(
+            stale_separate_backend.put_object(&rejected_object),
+            Err(crate::MetadataBackendError::MembershipHandoffFrozen {
+                ref handoff_id,
+                ..
+            }) if handoff_id == "handoff-bound-default-materialization"
+        ));
+        let mut fresh_separate_backend =
+            open_local_metadata_shard_backend(&data_dir, services_shard_id.clone())
+                .expect("fresh separate services backend");
+        assert_eq!(
+            fresh_separate_backend
+                .metadata_shard_write_freeze(&services_shard_id)
+                .expect("read durable completed marker")
+                .and_then(|marker| marker.activated_epoch),
+            Some(active_services.epoch),
+            "durable activation is evidence, not authority for a separately opened instance"
+        );
+        assert!(matches!(
+            fresh_separate_backend.put_object(&rejected_object),
+            Err(crate::MetadataBackendError::MembershipHandoffFrozen {
+                ref handoff_id,
+                ..
+            }) if handoff_id == "handoff-bound-default-materialization"
+        ));
+
+        host.materialize_default_sifs_metadata_on_shards_async(
+            file_system,
+            shards,
+            vec![local.clone()],
+            local,
+        )
+        .await
+        .expect("settled materialization rerun");
+        assert_eq!(
+            default_materialization_run_count(&data_dir.root()),
+            1,
+            "an unchanged completed handoff must remain idle"
+        );
+        assert_eq!(
+            LocalSobjMetadataBackend::open_for_inspection(
+                DfsMetadataShardId::new("services"),
+                local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("services"),),
+            )
+            .expect("inspect settled services authority")
+            .journal_last_sequence(),
+            materialized_head,
+            "the no-work rerun must not append metadata"
+        );
+    }
+
+    #[test]
+    fn default_materialization_writes_only_locally_active_primary_shards() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-local-primary-materialization");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_materialize_services").expect("local node");
+        let root_primary =
+            NodeId::from_legacy_named("node_dfs_materialize_root").expect("root primary");
+        let users_primary =
+            NodeId::from_legacy_named("node_dfs_materialize_users").expect("users primary");
+        let file_system = distributed_sifs(local.clone());
+        let shards = vec![
+            DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: root_primary,
+                replica_node_ids: vec![local.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: local.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: SIFS_SERVICES_PATH.to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "users".to_string(),
+                primary_node_id: users_primary,
+                replica_node_ids: vec![local.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: SIFS_USERS_PATH.to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ];
+        let active_primary_shard_ids = BTreeSet::from([DfsMetadataShardId::new("services")]);
+
+        materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &active_primary_shard_ids,
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("materialize local services authority");
+
+        assert!(
+            !local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("root")).exists(),
+            "a replica must not append bootstrap records to the remote root primary's journal"
+        );
+        assert!(
+            !local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("users")).exists(),
+            "a replica must not append bootstrap records to the remote users primary's journal"
+        );
+        let services_path =
+            local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("services"));
+        assert!(services_path.exists());
+        let backend =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("open materialized services shard");
+        assert!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, SIFS_SERVICES_PATH)
+                .expect("read services object")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn default_materialization_skips_a_local_primary_parked_for_handoff() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-pending-handoff-materialization");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_materialize_pending").expect("local node");
+        let file_system = distributed_sifs(local.clone());
+        let services = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_SERVICES_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+
+        materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &[services],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("skip parked local authority");
+
+        assert!(
+            !local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("services"))
+                .exists(),
+            "a pending handoff generation must stay frozen until activation"
+        );
+    }
+
+    #[test]
+    fn split_primary_migration_mutates_only_the_local_authority() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-split-primary-migration");
+        let root_primary =
+            NodeId::from_legacy_named("node_dfs_split_migration_root").expect("root primary");
+        let services_primary = NodeId::from_legacy_named("node_dfs_split_migration_services")
+            .expect("services primary");
+        let users_primary =
+            NodeId::from_legacy_named("node_dfs_split_migration_users").expect("users primary");
+        let file_system = distributed_sifs(root_primary.clone());
+        let mut shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            root_primary.clone(),
+            services_primary.clone(),
+            users_primary,
+        );
+        shards[0].replica_node_ids.push(services_primary.clone());
+        let mut legacy_object = crate::distributed_sifs_bootstrap_objects(root_primary.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        legacy_object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_split_primary_legacy_services")
+                .expect("legacy object id");
+        legacy_object.path = "/services/legacy.txt".to_string();
+
+        // The services primary may adopt a misplaced object only from an exact
+        // certified root replica. Its local root journal remains a replica and
+        // must not receive the source tombstone.
+        let target_data_dir = SinomoDataDir::new(root.join("target-data"));
+        target_data_dir
+            .ensure_root_layout()
+            .expect("target data dir");
+        let mut certified_root =
+            open_local_metadata_shard_backend(&target_data_dir, DfsMetadataShardId::new("root"))
+                .expect("target root replica");
+        certified_root
+            .put_file_system(&file_system)
+            .expect("root replica filesystem");
+        certified_root
+            .put_object(&legacy_object)
+            .expect("root replica legacy object");
+        let target_root_sequence = certified_root.journal_last_sequence();
+        certified_root
+            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+                shard_id: DfsMetadataShardId::new("root"),
+                journal_sequence: target_root_sequence,
+                state_fingerprint: "blake3:split-root-certified".to_string(),
+            })
+            .expect("certify root replica");
+        drop(certified_root);
+        let target_watermarks = BTreeMap::from([(
+            DfsMetadataShardId::new("root"),
+            DfsMetadataShardHeadWatermark {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: root_primary.clone(),
+                epoch: 1,
+                journal_sequence: target_root_sequence,
+                state_fingerprint: "blake3:split-root-certified".to_string(),
+                acknowledged_node_ids: vec![root_primary.clone(), services_primary.clone()],
+            },
+        )]);
+        let mut stale_target_watermarks = target_watermarks.clone();
+        let stale_root_watermark = stale_target_watermarks
+            .get_mut(&DfsMetadataShardId::new("root"))
+            .expect("stale root watermark");
+        stale_root_watermark.journal_sequence = target_root_sequence.saturating_sub(1);
+        stale_root_watermark.state_fingerprint = "blake3:stale-root-watermark".to_string();
+        let stale_report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&target_data_dir),
+            &file_system,
+            &shards,
+            &stale_target_watermarks,
+            &BTreeSet::from([DfsMetadataShardId::new("services")]),
+            &services_primary,
+            vec![root_primary.clone()],
+            root_primary.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("defer stale certified root replica");
+        assert_eq!(stale_report.migration.migrated_objects, 0);
+        assert!(stale_report.awaiting_replica_progress);
+        assert!(
+            open_local_metadata_shard_backend(
+                &target_data_dir,
+                DfsMetadataShardId::new("services"),
+            )
+            .expect("services authority before current watermark")
+            .get_object(&legacy_object.object_id)
+            .expect("legacy object before current watermark")
+            .is_none(),
+            "a stale locally certified prefix must not seed the current target authority"
+        );
+
+        let target_report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&target_data_dir),
+            &file_system,
+            &shards,
+            &target_watermarks,
+            &BTreeSet::from([DfsMetadataShardId::new("services")]),
+            &services_primary,
+            vec![root_primary.clone()],
+            root_primary.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("adopt legacy object on services authority");
+        assert_eq!(target_report.migration.migrated_objects, 1);
+        let target_services = open_local_metadata_shard_backend(
+            &target_data_dir,
+            DfsMetadataShardId::new("services"),
+        )
+        .expect("target services authority");
+        assert_eq!(
+            target_services
+                .get_object(&legacy_object.object_id)
+                .expect("target services object"),
+            Some(legacy_object.clone())
+        );
+        let target_root = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new("root"),
+            local_dfs_metadata_shard_path(&target_data_dir, &DfsMetadataShardId::new("root")),
+        )
+        .expect("inspect target root replica");
+        assert_eq!(target_root.journal_last_sequence(), target_root_sequence);
+        assert_eq!(
+            target_root
+                .get_object(&legacy_object.object_id)
+                .expect("source replica object"),
+            Some(legacy_object.clone())
+        );
+
+        // Once the root primary has an exact services replica containing the
+        // adopted object, it may tombstone its own source journal. The remote
+        // services replica remains read-only throughout this pass.
+        let source_data_dir = SinomoDataDir::new(root.join("source-data"));
+        source_data_dir
+            .ensure_root_layout()
+            .expect("source data dir");
+        let mut source_root =
+            open_local_metadata_shard_backend(&source_data_dir, DfsMetadataShardId::new("root"))
+                .expect("source root authority");
+        source_root
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source_root
+            .put_object(&legacy_object)
+            .expect("source legacy object");
+        drop(source_root);
+        let mut certified_services = open_local_metadata_shard_backend(
+            &source_data_dir,
+            DfsMetadataShardId::new("services"),
+        )
+        .expect("source services replica");
+        certified_services
+            .put_file_system(&file_system)
+            .expect("services replica filesystem");
+        certified_services
+            .put_object(&legacy_object)
+            .expect("services replica adopted object");
+        let services_replica_sequence = certified_services.journal_last_sequence();
+        certified_services
+            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+                shard_id: DfsMetadataShardId::new("services"),
+                journal_sequence: services_replica_sequence,
+                state_fingerprint: "blake3:split-services-certified".to_string(),
+            })
+            .expect("certify services replica");
+        drop(certified_services);
+        let source_watermarks = BTreeMap::from([(
+            DfsMetadataShardId::new("services"),
+            DfsMetadataShardHeadWatermark {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: services_primary.clone(),
+                epoch: 1,
+                journal_sequence: services_replica_sequence,
+                state_fingerprint: "blake3:split-services-certified".to_string(),
+                acknowledged_node_ids: vec![services_primary.clone(), root_primary.clone()],
+            },
+        )]);
+
+        let source_report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&source_data_dir),
+            &file_system,
+            &shards,
+            &source_watermarks,
+            &BTreeSet::from([DfsMetadataShardId::new("root")]),
+            &root_primary,
+            vec![root_primary.clone()],
+            root_primary.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("retire legacy object on root authority");
+        assert_eq!(source_report.migration.migrated_objects, 1);
+        let source_root =
+            open_local_metadata_shard_backend(&source_data_dir, DfsMetadataShardId::new("root"))
+                .expect("reopen source root authority");
+        assert_eq!(
+            source_root
+                .get_object(&legacy_object.object_id)
+                .expect("source tombstone")
+                .map(|object| object.kind),
+            Some(crate::DfsObjectKind::Tombstone)
+        );
+        let services_replica = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new("services"),
+            local_dfs_metadata_shard_path(&source_data_dir, &DfsMetadataShardId::new("services")),
+        )
+        .expect("inspect services replica");
+        assert_eq!(
+            services_replica.journal_last_sequence(),
+            services_replica_sequence,
+            "source cleanup must not append to the remote services primary's replica journal"
+        );
+    }
+
+    #[test]
+    fn split_primary_migration_rejects_same_id_on_wrong_target_path() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-split-migration-wrong-target");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let root_primary =
+            NodeId::from_legacy_named("node_dfs_wrong_target_root").expect("root primary");
+        let services_primary =
+            NodeId::from_legacy_named("node_dfs_wrong_target_services").expect("services primary");
+        let users_primary =
+            NodeId::from_legacy_named("node_dfs_wrong_target_users").expect("users primary");
+        let file_system = distributed_sifs(root_primary.clone());
+        let mut shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            root_primary.clone(),
+            services_primary,
+            users_primary,
+        );
+        shards[1].replica_node_ids.push(root_primary.clone());
+        let mut source_object = crate::distributed_sifs_bootstrap_objects(root_primary.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        source_object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_split_wrong_target_path")
+                .expect("object id");
+        source_object.path = "/services/source.txt".to_string();
+        let mut wrong_target = source_object.clone();
+        wrong_target.path = "/users/wrong-target.txt".to_string();
+
+        let mut source =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("root authority");
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source
+            .put_object(&source_object)
+            .expect("misplaced source object");
+        drop(source);
+        let mut target =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("services replica");
+        target
+            .put_file_system(&file_system)
+            .expect("target filesystem");
+        target
+            .put_object(&wrong_target)
+            .expect("same-id wrong target object");
+        let target_sequence = target.journal_last_sequence();
+        target
+            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+                shard_id: DfsMetadataShardId::new("services"),
+                journal_sequence: target_sequence,
+                state_fingerprint: "blake3:wrong-target-certified".to_string(),
+            })
+            .expect("certify wrong target replica");
+        drop(target);
+        let watermarks = BTreeMap::from([(
+            DfsMetadataShardId::new("services"),
+            DfsMetadataShardHeadWatermark {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: shards[1].primary_node_id.clone(),
+                epoch: 1,
+                journal_sequence: target_sequence,
+                state_fingerprint: "blake3:wrong-target-certified".to_string(),
+                acknowledged_node_ids: vec![root_primary.clone()],
+            },
+        )]);
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &watermarks,
+            &BTreeSet::from([DfsMetadataShardId::new("root")]),
+            &root_primary,
+            vec![root_primary.clone()],
+            root_primary.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("defer wrong-routed target");
+
+        assert_eq!(report.migration.migrated_objects, 0);
+        assert!(report.awaiting_replica_progress);
+        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+            .expect("reopen root authority");
+        assert_eq!(
+            source
+                .get_object(&source_object.object_id)
+                .expect("source object")
+                .map(|object| object.kind),
+            Some(source_object.kind)
+        );
+        let target = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new("services"),
+            local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("services")),
+        )
+        .expect("inspect services replica");
+        assert_eq!(target.journal_last_sequence(), target_sequence);
+    }
+
+    #[test]
+    fn authority_migration_selects_newest_duplicate_before_installing() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-migration-newest-duplicate");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_migration_newest").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            local.clone(),
+            local.clone(),
+        );
+        let mut older = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        older.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_migration_duplicate").expect("object id");
+        older.path = "/services/canonical-newest.txt".to_string();
+        older.version =
+            crate::DfsVersion::from_legacy_named("version_migration_old").expect("old version");
+        older.changed_at_unix_nanos = 10;
+        let mut newest = older.clone();
+        newest.version =
+            crate::DfsVersion::from_legacy_named("version_migration_new").expect("new version");
+        newest.changed_at_unix_nanos = 30;
+        newest.last_modified_by_event_id =
+            Some(sinomo_core::Id::from_legacy_named("event-migration-newest").expect("event id"));
+        let mut old_target = older.clone();
+        old_target.changed_at_unix_nanos = 20;
+
+        for (shard_id, object) in [
+            (DfsMetadataShardId::new("root"), older),
+            (DfsMetadataShardId::new("services"), old_target),
+            (DfsMetadataShardId::new("users"), newest.clone()),
+        ] {
+            let mut backend =
+                open_local_metadata_shard_backend(&data_dir, shard_id).expect("metadata shard");
+            backend.put_file_system(&file_system).expect("filesystem");
+            backend.put_object(&object).expect("duplicate object");
+        }
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                DfsMetadataShardId::new("services"),
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("migrate newest duplicate");
+        assert_eq!(report.migration.migrated_objects, 1);
+
+        let target =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("target shard")
+                .get_object(&newest.object_id)
+                .expect("target lookup")
+                .expect("target object");
+        assert_eq!(target.version, newest.version);
+        assert_eq!(target.changed_at_unix_nanos, newest.changed_at_unix_nanos);
+        assert_eq!(
+            target.last_modified_by_event_id,
+            newest.last_modified_by_event_id
+        );
+        for source_shard in ["root", "users"] {
+            let tombstone =
+                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new(source_shard))
+                    .expect("source shard")
+                    .get_object(&newest.object_id)
+                    .expect("source lookup")
+                    .expect("source tombstone");
+            assert_eq!(tombstone.kind, crate::DfsObjectKind::Tombstone);
+            assert_eq!(tombstone.version, newest.version);
+            assert_eq!(
+                tombstone.last_modified_by_event_id,
+                newest.last_modified_by_event_id
+            );
+        }
+        let index = crate::metadata_shard_index::read_object_shard_index(
+            &default_dfs_metadata_shards_root(&data_dir),
+            &newest.object_id,
+        )
+        .expect("index lookup")
+        .expect("target index");
+        assert_eq!(index.shard_id, DfsMetadataShardId::new("services"));
+        assert_eq!(index.path, "services/canonical-newest.txt");
+    }
+
+    #[test]
+    fn authority_migration_preserves_newer_target_tombstone_over_stale_live_source() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-migration-target-tombstone");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_migration_target_tombstone").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            local.clone(),
+            local.clone(),
+        );
+        let mut stale_live = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        stale_live.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_migration_deleted_duplicate")
+                .expect("object id");
+        stale_live.path = "/services/deleted-duplicate.txt".to_string();
+        stale_live.version =
+            crate::DfsVersion::from_legacy_named("version_before_delete").expect("version");
+        stale_live.changed_at_unix_nanos = 10;
+        let mut deleted = stale_live.clone();
+        deleted.kind = crate::DfsObjectKind::Tombstone;
+        deleted.version =
+            crate::DfsVersion::from_legacy_named("version_authoritative_delete").expect("version");
+        deleted.changed_at_unix_nanos = 30;
+        deleted.last_modified_by_event_id = Some(
+            sinomo_core::Id::from_legacy_named("event-authoritative-delete").expect("event id"),
+        );
+
+        let mut source =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("stale source shard");
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source.put_object(&stale_live).expect("stale live source");
+        drop(source);
+        let mut target =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("target shard");
+        target
+            .put_file_system(&file_system)
+            .expect("target filesystem");
+        target.put_object(&deleted).expect("target deletion");
+        drop(target);
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                DfsMetadataShardId::new("services"),
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("reconcile interrupted delete cleanup");
+        assert_eq!(report.migration.migrated_objects, 1);
+
+        let target =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("reopen target")
+                .get_object(&deleted.object_id)
+                .expect("target lookup")
+                .expect("target tombstone");
+        assert_eq!(target, deleted, "a stale source must not revive the object");
+        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+            .expect("reopen source")
+            .get_object(&stale_live.object_id)
+            .expect("source lookup")
+            .expect("source tombstone");
+        assert_eq!(source.kind, crate::DfsObjectKind::Tombstone);
+        assert_eq!(source.version, deleted.version);
+
+        let settled = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                DfsMetadataShardId::new("services"),
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("settled reconciliation");
+        assert_eq!(
+            settled.migration.migrated_objects, 0,
+            "the recovered deletion must not leave an infinite retry"
+        );
+    }
+
+    #[test]
+    fn authority_migration_uses_certified_compacted_tombstone_by_object_id() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-migration-certified-compacted-tombstone");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_migration_compacted_local").expect("node");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_migration_compacted_remote").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let mut shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            remote.clone(),
+            local.clone(),
+        );
+        shards[1].replica_node_ids.push(local.clone());
+
+        let mut stale_live = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        stale_live.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_migration_compacted_deleted_duplicate")
+                .expect("object id");
+        stale_live.path = "/services/pre-rename-name.txt".to_string();
+        stale_live.version =
+            crate::DfsVersion::from_legacy_named("version_compacted_before_delete")
+                .expect("version");
+        stale_live.changed_at_unix_nanos = 10;
+        let mut deleted = stale_live.clone();
+        deleted.path = "/services/post-rename-name.txt".to_string();
+        deleted.kind = crate::DfsObjectKind::Tombstone;
+        deleted.version =
+            crate::DfsVersion::from_legacy_named("version_compacted_authoritative_delete")
+                .expect("version");
+        deleted.changed_at_unix_nanos = 30;
+
+        let mut source =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("stale writable source");
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source.put_object(&stale_live).expect("stale source object");
+        drop(source);
+
+        let services_shard_id = DfsMetadataShardId::new("services");
+        let mut target = open_local_metadata_shard_backend(&data_dir, services_shard_id.clone())
+            .expect("certified target replica");
+        target
+            .put_file_system(&file_system)
+            .expect("target filesystem");
+        target.put_object(&deleted).expect("target deletion");
+        let compaction = target
+            .compact_tombstones(
+                crate::DfsTombstoneCompactionOptions::compact_eligible(
+                    std::time::Duration::from_nanos(50),
+                )
+                .with_now_unix_nanos(100),
+            )
+            .expect("compact target tombstone");
+        assert_eq!(compaction.compacted_tombstone_count, 1);
+        assert!(
+            target
+                .get_object(&deleted.object_id)
+                .expect("ordinary target lookup")
+                .is_none(),
+            "ordinary object paging must continue to hide compacted tombstones"
+        );
+        let target_sequence = target.journal_last_sequence();
+        let target_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+            &target,
+            &services_shard_id,
+            target_sequence,
+        )
+        .expect("certified target fingerprint");
+        target
+            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+                shard_id: services_shard_id.clone(),
+                journal_sequence: target_sequence,
+                state_fingerprint: target_fingerprint.clone(),
+            })
+            .expect("certify compacted target");
+        drop(target);
+        let head_watermarks = BTreeMap::from([(
+            services_shard_id.clone(),
+            DfsMetadataShardHeadWatermark {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: remote,
+                epoch: shards[1].epoch,
+                journal_sequence: target_sequence,
+                state_fingerprint: target_fingerprint,
+                acknowledged_node_ids: vec![local.clone()],
+            },
+        )]);
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &head_watermarks,
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("reconcile compacted deletion evidence");
+        assert_eq!(report.migration.migrated_objects, 1);
+        assert!(
+            !report.awaiting_replica_progress,
+            "an exactly certified compacted deletion is already complete replica evidence"
+        );
+        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+            .expect("reopen source")
+            .get_object(&stale_live.object_id)
+            .expect("source lookup")
+            .expect("source tombstone");
+        assert_eq!(source.kind, crate::DfsObjectKind::Tombstone);
+        assert_eq!(source.version, deleted.version);
+
+        let settled = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &head_watermarks,
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("settled compacted deletion reconciliation");
+        assert_eq!(settled.migration.migrated_objects, 0);
+        assert!(!settled.awaiting_replica_progress);
+    }
+
+    #[test]
+    fn authority_migration_repairs_index_pointing_at_missing_target() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-migration-stale-index");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_migration_stale_index").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            local.clone(),
+            local.clone(),
+        );
+        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_migration_stale_index").expect("object id");
+        object.path = "/services/stale-index.txt".to_string();
+        let mut source =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("source shard");
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source.put_object(&object).expect("source object");
+        drop(source);
+        crate::metadata_shard_index::write_object_shard_index(
+            &default_dfs_metadata_shards_root(&data_dir),
+            &object,
+            &DfsMetadataShardId::new("services"),
+        )
+        .expect("stale crash-residue index");
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                DfsMetadataShardId::new("services"),
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("repair stale index");
+        assert_eq!(report.migration.migrated_objects, 1);
+        assert!(
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"),)
+                .expect("target shard")
+                .get_object(&object.object_id)
+                .expect("target lookup")
+                .is_some(),
+            "the derived index must not suppress the only durable source"
+        );
+    }
+
+    #[test]
+    fn unassigned_default_shards_do_not_create_impossible_replica_waits() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-unassigned-shard-wait");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_unassigned_local").expect("node");
+        let services = NodeId::from_legacy_named("node_dfs_unassigned_services").expect("node");
+        let users = NodeId::from_legacy_named("node_dfs_unassigned_users").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            services,
+            users,
+        );
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([DfsMetadataShardId::new("root")]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("materialize local authority");
+        assert!(
+            !report.awaiting_replica_progress,
+            "a node outside the replication factor cannot wait for evidence it will never receive"
+        );
+    }
+
+    #[test]
+    fn lagging_assigned_replica_without_misplaced_objects_does_not_subscribe_reconciliation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-lagging-assigned-replica");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_lagging_replica_local").expect("node");
+        let services_primary =
+            NodeId::from_legacy_named("node_dfs_lagging_replica_services").expect("node");
+        let users_primary =
+            NodeId::from_legacy_named("node_dfs_lagging_replica_users").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let mut shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            services_primary,
+            users_primary,
+        );
+        shards[1].replica_node_ids.push(local.clone());
+
+        let mut correctly_routed = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        correctly_routed.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_lagging_services_replica")
+                .expect("object id");
+        correctly_routed.path = "/services/already-routed.txt".to_string();
+        let mut services_replica =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("services replica");
+        services_replica
+            .put_file_system(&file_system)
+            .expect("filesystem");
+        services_replica
+            .put_object(&correctly_routed)
+            .expect("correctly routed replica object");
+
+        let report = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([DfsMetadataShardId::new("root")]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("inspect lagging assigned replica");
+        assert!(
+            !report.awaiting_replica_progress,
+            "ordinary lag on a correctly routed replica is not migration work"
+        );
+    }
+
+    #[test]
+    fn materialization_write_boundary_rejects_stale_authority_after_planning() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-materialization-authority-fence");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_materialization_fence").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = split_default_metadata_shards(
+            &file_system.file_system_id,
+            local.clone(),
+            local.clone(),
+            local.clone(),
+        );
+        let services_shard_id = DfsMetadataShardId::new("services");
+        let mut services = open_local_metadata_shard_backend(&data_dir, services_shard_id.clone())
+            .expect("services shard");
+        services
+            .put_file_system(&file_system)
+            .expect("services filesystem");
+        services
+            .freeze_metadata_shard_for_membership_handoff(
+                &services_shard_id,
+                "handoff-materialization-race",
+                1,
+            )
+            .expect("install authority fence")
+            .expect("local services shard");
+        drop(services);
+
+        let error = materialize_default_sifs_metadata_on_active_primary_shards(
+            default_dfs_metadata_shards_root(&data_dir),
+            &file_system,
+            &shards,
+            &BTreeMap::new(),
+            &BTreeSet::from([
+                DfsMetadataShardId::new("root"),
+                services_shard_id,
+                DfsMetadataShardId::new("users"),
+            ]),
+            &local,
+            vec![local.clone()],
+            local.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a stale planned primary must be fenced at the journal write boundary");
+        assert!(
+            error.to_string().contains("membership handoff"),
+            "unexpected authority fence error: {error}"
         );
     }
 

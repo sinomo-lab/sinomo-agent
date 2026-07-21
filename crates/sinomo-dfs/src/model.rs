@@ -102,6 +102,16 @@ pub struct DfsObjectMetadata {
     pub file_system_id: DfsFileSystemId,
     pub path: String,
     pub kind: DfsObjectKind,
+    /// Storage-level provenance for a tombstone that only evicts a physical
+    /// source-shard copy after a cross-shard move. `None` is the backwards
+    /// compatible representation of an authoritative namespace deletion.
+    ///
+    /// This distinction is part of durable metadata, rather than an inference
+    /// from timestamps or paths: a source eviction is intentionally newer than
+    /// the source live record, but it must never delete the live object already
+    /// installed on `target_shard_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_provenance: Option<DfsTombstoneProvenance>,
     pub owner_node_id: NodeId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_locations: Vec<NodeId>,
@@ -152,6 +162,20 @@ pub enum DfsObjectKind {
     Artifact,
     Mount,
     Tombstone,
+}
+
+/// Why a durable DFS tombstone exists.
+///
+/// Ordinary namespace deletes keep the legacy `None` representation on
+/// [`DfsObjectMetadata::tombstone_provenance`]. Only physical source eviction
+/// needs an explicit marker because it is not authoritative deletion evidence.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsTombstoneProvenance {
+    SourceEviction {
+        source_shard_id: crate::DfsMetadataShardId,
+        target_shard_id: crate::DfsMetadataShardId,
+    },
 }
 
 /// In-memory record of a write that must be completed or reconciled.

@@ -34,7 +34,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -1016,10 +1016,7 @@ async fn receive_sender_feedback(
         .run("wait for object RPC transfer acknowledgement", async {
             match tokio::time::timeout(policy.health.no_progress_timeout, receiver.recv()).await {
                 Ok(Some(feedback)) => Ok(feedback),
-                Ok(None) => Err(NetworkError::Io {
-                    operation: "wait for object RPC transfer acknowledgement".to_string(),
-                    detail: "session reader stopped before transfer acknowledgement".to_string(),
-                }),
+                Ok(None) => Err(session_reader_stopped_before_transfer_acknowledgement()),
                 Err(_) => Err(NetworkError::timeout(
                     "wait for object RPC transfer acknowledgement",
                     NetworkTimeoutPhase::Idle,
@@ -1029,6 +1026,13 @@ async fn receive_sender_feedback(
             }
         })
         .await
+}
+
+fn session_reader_stopped_before_transfer_acknowledgement() -> NetworkError {
+    NetworkError::Io {
+        operation: "wait for object RPC transfer acknowledgement".to_string(),
+        detail: "session reader stopped before transfer acknowledgement".to_string(),
+    }
 }
 
 fn apply_measured_transfer_ack(
@@ -1047,6 +1051,33 @@ fn apply_measured_transfer_ack(
                 .max_in_flight_bytes,
         )
         .map_err(session_transfer_error)
+}
+
+fn apply_outgoing_transfer_feedback(
+    control: TransferControl,
+    transfer_id: &TransferId,
+    state: &mut TransferSenderState,
+    measurement: &mut OutgoingTransferMeasurement,
+    operation: &'static str,
+) -> Result<(), NetworkError> {
+    match control {
+        TransferControl::Ack(ack) if ack.transfer_id == *transfer_id => {
+            apply_measured_transfer_ack(state, measurement, &ack)
+        }
+        TransferControl::Cancel {
+            transfer_id: cancelled,
+            reason,
+        }
+        | TransferControl::Reset {
+            transfer_id: cancelled,
+            reason,
+        } if cancelled == *transfer_id => Err(NetworkError::delivery_failed(
+            operation,
+            NetworkDeliveryState::PossiblyApplied,
+            reason,
+        )),
+        _ => Ok(()),
+    }
 }
 
 async fn pump_outgoing_body(
@@ -1107,31 +1138,45 @@ async fn pump_outgoing_body(
     let mut pending = None;
     let mut source_finished = false;
     while !source_finished || pending.is_some() {
-        while let Ok(control) = feedback.try_recv() {
-            match control {
-                TransferControl::Ack(ack) if ack.transfer_id == open.transfer_id => {
-                    apply_measured_transfer_ack(&mut state, &mut measurement, &ack)?;
+        loop {
+            match feedback.try_recv() {
+                Ok(control) => apply_outgoing_transfer_feedback(
+                    control,
+                    &open.transfer_id,
+                    &mut state,
+                    &mut measurement,
+                    "send object RPC transfer",
+                )?,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(session_reader_stopped_before_transfer_acknowledgement());
                 }
-                TransferControl::Cancel {
-                    transfer_id,
-                    reason,
-                }
-                | TransferControl::Reset {
-                    transfer_id,
-                    reason,
-                } if transfer_id == open.transfer_id => {
-                    return Err(NetworkError::delivery_failed(
-                        "send object RPC transfer",
-                        NetworkDeliveryState::PossiblyApplied,
-                        reason,
-                    ));
-                }
-                _ => {}
             }
         }
         if pending.is_none() && !source_finished {
+            let produced = producer.next();
+            tokio::pin!(produced);
             pending = deadline
-                .run("produce object RPC request/response body", producer.next())
+                .run("produce object RPC request/response body", async {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            control = feedback.recv() => {
+                                let control = control.ok_or_else(
+                                    session_reader_stopped_before_transfer_acknowledgement,
+                                )?;
+                                apply_outgoing_transfer_feedback(
+                                    control,
+                                    &open.transfer_id,
+                                    &mut state,
+                                    &mut measurement,
+                                    "send object RPC transfer",
+                                )?;
+                            }
+                            produced = &mut produced => return produced,
+                        }
+                    }
+                })
                 .await?;
             source_finished = pending.is_none();
         }
@@ -1142,26 +1187,14 @@ async fn pump_outgoing_body(
             Ok(frame) => frame,
             Err(crate::transfer::TransferError::FlowControlBlocked { .. }) => {
                 pending = Some(bytes);
-                match receive_sender_feedback(&mut feedback, policy, deadline).await? {
-                    TransferControl::Ack(ack) if ack.transfer_id == open.transfer_id => {
-                        apply_measured_transfer_ack(&mut state, &mut measurement, &ack)?;
-                    }
-                    TransferControl::Cancel {
-                        transfer_id,
-                        reason,
-                    }
-                    | TransferControl::Reset {
-                        transfer_id,
-                        reason,
-                    } if transfer_id == open.transfer_id => {
-                        return Err(NetworkError::delivery_failed(
-                            "send flow-controlled object RPC transfer",
-                            NetworkDeliveryState::PossiblyApplied,
-                            reason,
-                        ));
-                    }
-                    _ => {}
-                }
+                let control = receive_sender_feedback(&mut feedback, policy, deadline).await?;
+                apply_outgoing_transfer_feedback(
+                    control,
+                    &open.transfer_id,
+                    &mut state,
+                    &mut measurement,
+                    "send flow-controlled object RPC transfer",
+                )?;
                 continue;
             }
             Err(error) => return Err(session_transfer_error(error)),
@@ -1840,10 +1873,36 @@ pub(crate) async fn start_object_rpc_client_session(
         ClientSessionWait::Head((&mut head_rx).await)
     };
     let head = match first {
-        ClientSessionWait::Head(head) => head.map_err(|_| NetworkError::Io {
-            operation: "receive object RPC response session head".to_string(),
-            detail: "session reader stopped before the response head".to_string(),
-        })?,
+        ClientSessionWait::Head(Ok(head)) => head,
+        ClientSessionWait::Head(Err(_)) => {
+            // The session reader forwards transfer feedback before dropping
+            // its response-head sender. If the peer terminates immediately
+            // after a matching Cancel/Reset, both the closed head channel and
+            // the outgoing task become ready together. Join the outgoing task
+            // so its exact terminal transfer reason wins over the secondary
+            // reader-EOF symptom, independent of select scheduling order.
+            if let Some(task) = tasks.outgoing.take() {
+                match task.await {
+                    Ok(Err(error)) => {
+                        body_tx.fail(error.to_string());
+                        return Err(error);
+                    }
+                    Err(source) => {
+                        let error = NetworkError::Io {
+                            operation: "send object RPC request body".to_string(),
+                            detail: format!("request body task failed: {source}"),
+                        };
+                        body_tx.fail(error.to_string());
+                        return Err(error);
+                    }
+                    Ok(Ok(())) => {}
+                }
+            }
+            return Err(NetworkError::Io {
+                operation: "receive object RPC response session head".to_string(),
+                detail: "session reader stopped before the response head".to_string(),
+            });
+        }
         ClientSessionWait::Outgoing(outgoing) => {
             tasks.outgoing.take();
             match outgoing {
@@ -2248,6 +2307,12 @@ struct ReplayableBytes {
 }
 
 #[derive(Clone, Debug)]
+struct ReplayableRepeatedBytes {
+    pattern: Bytes,
+    total_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
 struct ReplayableFile {
     path: PathBuf,
     total_bytes: u64,
@@ -2293,6 +2358,7 @@ impl fmt::Debug for OnePassReader {
 enum ObjectRpcBodySourceKind {
     Empty,
     Bytes(ReplayableBytes),
+    RepeatedBytes(ReplayableRepeatedBytes),
     File(ReplayableFile),
     Reader(Mutex<OnePassReader>),
     AsyncReader(Mutex<OnePassAsyncReader>),
@@ -2359,6 +2425,31 @@ impl ObjectRpcBodySource {
         Self {
             kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
                 bytes: Bytes::from(bytes),
+            }),
+            role: ObjectRpcSessionBodyRole::Attachment,
+            materialized_value_forward: false,
+            lifetime_guards: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Builds a replayable, bounded-memory zero-filled attachment source.
+    ///
+    /// Every producer shares one immutable transfer-sized backing buffer and
+    /// emits zero-copy `Bytes` slices from it until `total_bytes` is reached.
+    /// This is useful for generated payloads and benchmarks that must measure
+    /// transport work rather than an `AsyncRead` fill loop.
+    pub fn zeroes(total_bytes: u64) -> Self {
+        if total_bytes == 0 {
+            return Self::empty();
+        }
+        static ZERO_PATTERN: OnceLock<Bytes> = OnceLock::new();
+        let pattern = ZERO_PATTERN
+            .get_or_init(|| Bytes::from(vec![0_u8; DEFAULT_TRANSFER_FRAME_BYTES as usize]))
+            .clone();
+        Self {
+            kind: ObjectRpcBodySourceKind::RepeatedBytes(ReplayableRepeatedBytes {
+                pattern,
+                total_bytes,
             }),
             role: ObjectRpcSessionBodyRole::Attachment,
             materialized_value_forward: false,
@@ -2510,6 +2601,8 @@ impl ObjectRpcBodySource {
     pub fn is_empty(&self) -> bool {
         matches!(self.kind, ObjectRpcBodySourceKind::Empty)
             || matches!(&self.kind, ObjectRpcBodySourceKind::Bytes(source) if source.bytes.is_empty())
+            || matches!(&self.kind, ObjectRpcBodySourceKind::RepeatedBytes(source)
+                if source.total_bytes == 0)
             || matches!(&self.kind, ObjectRpcBodySourceKind::File(source) if source.total_bytes == 0)
             || matches!(&self.kind, ObjectRpcBodySourceKind::Reader(source)
                 if source.lock().ok().and_then(|source| source.total_bytes) == Some(0))
@@ -2523,6 +2616,7 @@ impl ObjectRpcBodySource {
         match &self.kind {
             ObjectRpcBodySourceKind::Empty => Some(0),
             ObjectRpcBodySourceKind::Bytes(source) => u64::try_from(source.bytes.len()).ok(),
+            ObjectRpcBodySourceKind::RepeatedBytes(source) => Some(source.total_bytes),
             ObjectRpcBodySourceKind::File(source) => Some(source.total_bytes),
             ObjectRpcBodySourceKind::Reader(source) => {
                 source.lock().ok().and_then(|source| source.total_bytes)
@@ -2575,6 +2669,9 @@ impl ObjectRpcBodySource {
             ObjectRpcBodySourceKind::Bytes(source) => {
                 Ok(Box::new(BytesReader::new(source.bytes.clone())))
             }
+            ObjectRpcBodySourceKind::RepeatedBytes(source) => Ok(Box::new(
+                RepeatedBytesReader::new(source.pattern.clone(), source.total_bytes),
+            )),
             ObjectRpcBodySourceKind::File(source) => {
                 let file = File::open(&source.path).map_err(|error| NetworkError::Io {
                     operation: format!("open object RPC body file {}", source.path.display()),
@@ -2655,6 +2752,15 @@ impl ObjectRpcBodySource {
                 _lifetime_guards: Arc::clone(&self.lifetime_guards),
             }));
         }
+        if let ObjectRpcBodySourceKind::RepeatedBytes(source) = &self.kind {
+            return Ok(BodyProducer::RepeatedBytes(RepeatedBytesBodyProducer {
+                pattern: source.pattern.clone(),
+                pattern_offset: 0,
+                remaining_bytes: source.total_bytes,
+                chunk_bytes: max_chunk_bytes.max(1),
+                _lifetime_guards: Arc::clone(&self.lifetime_guards),
+            }));
+        }
         if let ObjectRpcBodySourceKind::AsyncReader(source) = &self.kind {
             let reader = source
                 .lock()
@@ -2698,6 +2804,9 @@ impl ObjectRpcBodySource {
             ObjectRpcBodySourceKind::Bytes(source) => {
                 ObjectRpcBodySourceKind::Bytes(source.clone())
             }
+            ObjectRpcBodySourceKind::RepeatedBytes(source) => {
+                ObjectRpcBodySourceKind::RepeatedBytes(source.clone())
+            }
             ObjectRpcBodySourceKind::File(source) => ObjectRpcBodySourceKind::File(source.clone()),
             ObjectRpcBodySourceKind::Reader(_)
             | ObjectRpcBodySourceKind::AsyncReader(_)
@@ -2726,6 +2835,49 @@ fn body_replay_error(detail: &str) -> NetworkError {
 struct BytesReader {
     bytes: Bytes,
     offset: usize,
+}
+
+#[derive(Debug)]
+struct RepeatedBytesReader {
+    pattern: Bytes,
+    pattern_offset: usize,
+    remaining_bytes: u64,
+}
+
+impl RepeatedBytesReader {
+    fn new(pattern: Bytes, total_bytes: u64) -> Self {
+        debug_assert!(!pattern.is_empty());
+        Self {
+            pattern,
+            pattern_offset: 0,
+            remaining_bytes: total_bytes,
+        }
+    }
+}
+
+impl Read for RepeatedBytesReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.remaining_bytes == 0 {
+            return Ok(0);
+        }
+        let wanted = output
+            .len()
+            .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
+        let mut written = 0;
+        while written < wanted {
+            let available = self.pattern.len() - self.pattern_offset;
+            let copied = available.min(wanted - written);
+            output[written..written + copied]
+                .copy_from_slice(&self.pattern[self.pattern_offset..self.pattern_offset + copied]);
+            written += copied;
+            self.pattern_offset += copied;
+            if self.pattern_offset == self.pattern.len() {
+                self.pattern_offset = 0;
+            }
+        }
+        self.remaining_bytes -= written as u64;
+        Ok(written)
+    }
 }
 
 impl BytesReader {
@@ -3109,6 +3261,44 @@ impl ObjectRpcIncomingBody {
                     requested_bytes: next,
                 })?;
             output.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    /// Consumes and counts an incoming body without copying its chunks through
+    /// the public `AsyncRead` adapter.
+    ///
+    /// This is an internal relay/control-plane escape hatch. Natural EOF still
+    /// performs the same terminal validation and completion-task detachment as
+    /// the application reader, while a transport failure remains an error.
+    #[doc(hidden)]
+    pub async fn discard_owned_chunks(self) -> Result<u64, NetworkError> {
+        const OPERATION: &str = "discard object RPC incoming body";
+
+        let mut stream = self.into_chunk_stream();
+        let mut discarded_bytes = 0_u64;
+        loop {
+            let Some(bytes) =
+                stream
+                    .next_chunk(usize::MAX)
+                    .await
+                    .map_err(|source| NetworkError::Io {
+                        operation: OPERATION.to_string(),
+                        detail: source.to_string(),
+                    })?
+            else {
+                return Ok(discarded_bytes);
+            };
+            let chunk_bytes =
+                u64::try_from(bytes.len()).map_err(|_| NetworkError::Serialization {
+                    detail: "object RPC incoming body byte count overflow while discarding"
+                        .to_string(),
+                })?;
+            discarded_bytes = discarded_bytes.checked_add(chunk_bytes).ok_or_else(|| {
+                NetworkError::Serialization {
+                    detail: "object RPC incoming body byte count overflow while discarding"
+                        .to_string(),
+                }
+            })?;
         }
     }
 
@@ -3726,6 +3916,25 @@ impl ObjectRpcSessionCall {
         }
     }
 
+    /// Rebinds a received request body for a trusted internal proxy hop.
+    ///
+    /// Non-empty attachment chunks retain ownership as they enter the outgoing
+    /// producer. Empty bodies retain ordinary value semantics so large typed
+    /// request values can still be moved out of the head during preparation.
+    /// The prior hop's signed transfer descriptor is not reused: normal call
+    /// preparation creates and signs a fresh descriptor for the next hop.
+    #[doc(hidden)]
+    pub fn from_relay_body(request: crate::ObjectRpcRequest, body: ObjectRpcIncomingBody) -> Self {
+        if body.is_empty() {
+            Self::value(request)
+        } else {
+            Self {
+                request,
+                body: ObjectRpcBodySource::from_incoming_chunk_stream(body),
+            }
+        }
+    }
+
     pub(crate) fn try_clone_replayable(&self) -> Option<Self> {
         Some(Self {
             request: self.request.clone(),
@@ -3823,6 +4032,18 @@ pub(crate) struct PreparedSessionCall {
     pub(crate) body: ObjectRpcBodySource,
     descriptor: ObjectRpcSessionDescriptor,
     response_proof_session_id: TransferId,
+}
+
+impl PreparedSessionCall {
+    /// Returns the still-unopened body after a prepared canonical dial fails.
+    ///
+    /// Route selection may prepare and sign a one-pass body before dialing so
+    /// a stalled signer cannot leave an idle peer connection behind. A failed
+    /// dial has not consumed the producer; the route layer combines this body
+    /// with the logical request head it retained before route-specific wrapping.
+    pub(crate) fn into_body_source(self) -> ObjectRpcBodySource {
+        self.body
+    }
 }
 
 fn session_descriptor_from_request(
@@ -4086,6 +4307,7 @@ impl ObjectRpcSessionResult {
 
 pub(crate) enum BodyProducer {
     Bytes(BytesBodyProducer),
+    RepeatedBytes(RepeatedBytesBodyProducer),
     Sync(SyncBodyProducer),
     Async(AsyncBodyProducer),
     Incoming(IncomingBodyProducer),
@@ -4095,6 +4317,7 @@ impl BodyProducer {
     pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
         match self {
             Self::Bytes(producer) => producer.next(),
+            Self::RepeatedBytes(producer) => producer.next(),
             Self::Sync(producer) => producer.next().await,
             Self::Async(producer) => producer.next().await,
             Self::Incoming(producer) => producer.next().await,
@@ -4104,6 +4327,7 @@ impl BodyProducer {
     pub(crate) async fn finish(self) -> Result<(), NetworkError> {
         match self {
             Self::Bytes(_) => Ok(()),
+            Self::RepeatedBytes(_) => Ok(()),
             Self::Sync(producer) => producer.finish().await,
             Self::Async(_) => Ok(()),
             Self::Incoming(_) => Ok(()),
@@ -4130,6 +4354,36 @@ impl BytesBodyProducer {
         let bytes = self.bytes.slice(self.offset..end);
         self.offset = end;
         Ok(Some(bytes))
+    }
+}
+
+pub(crate) struct RepeatedBytesBodyProducer {
+    pattern: Bytes,
+    pattern_offset: usize,
+    remaining_bytes: u64,
+    chunk_bytes: usize,
+    _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
+}
+
+impl RepeatedBytesBodyProducer {
+    fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
+        if self.remaining_bytes == 0 {
+            return Ok(None);
+        }
+        let available = self.pattern.len() - self.pattern_offset;
+        let bytes = self
+            .chunk_bytes
+            .min(available)
+            .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
+        let chunk = self
+            .pattern
+            .slice(self.pattern_offset..self.pattern_offset + bytes);
+        self.pattern_offset += bytes;
+        if self.pattern_offset == self.pattern.len() {
+            self.pattern_offset = 0;
+        }
+        self.remaining_bytes -= bytes as u64;
+        Ok(Some(chunk))
     }
 }
 
@@ -4368,6 +4622,32 @@ mod body_tests {
         }
     }
 
+    struct PendingAsyncReader {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for PendingAsyncReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _output: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingAsyncReader {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
     #[test]
     fn session_wire_prefix_recognizes_partial_v2_magic_only() {
         assert!(!object_rpc_session_wire_prefix_matches(b""));
@@ -4423,6 +4703,36 @@ mod body_tests {
     }
 
     #[tokio::test]
+    async fn zero_body_source_replays_shared_bytes_without_async_reader_fills() {
+        let source = ObjectRpcBodySource::zeroes(5);
+        assert_eq!(source.total_bytes(), Some(5));
+        assert!(source.is_replayable());
+
+        let replay = source
+            .try_clone_replayable()
+            .expect("replayable zero source");
+        for source in [&source, &replay] {
+            let mut producer = source.producer(2).expect("zero producer");
+            assert!(matches!(&producer, BodyProducer::RepeatedBytes(_)));
+            assert_eq!(
+                producer.next().await.expect("first zero chunk"),
+                Some(Bytes::from_static(&[0, 0]))
+            );
+            assert_eq!(
+                producer.next().await.expect("second zero chunk"),
+                Some(Bytes::from_static(&[0, 0]))
+            );
+            assert_eq!(
+                producer.next().await.expect("last zero chunk"),
+                Some(Bytes::from_static(&[0]))
+            );
+            assert_eq!(producer.next().await.expect("zero EOF"), None);
+        }
+
+        assert!(ObjectRpcBodySource::zeroes(0).is_empty());
+    }
+
+    #[tokio::test]
     async fn incoming_chunk_producer_moves_received_bytes_without_copying() {
         let (mut sender, incoming) = ObjectRpcIncomingBody::multiplexed_channel(Some(5));
         let received = Bytes::from(vec![10_u8, 20, 30, 40, 50]);
@@ -4465,6 +4775,99 @@ mod body_tests {
         assert_eq!(third.as_ptr(), received_pointer.wrapping_add(4));
         assert_eq!(producer.next().await.expect("incoming EOF"), None);
         producer.finish().await.expect("finish incoming producer");
+    }
+
+    #[tokio::test]
+    async fn relay_call_moves_received_bytes_without_async_read_copying() {
+        let (mut sender, incoming) = ObjectRpcIncomingBody::multiplexed_channel(Some(5));
+        let received = Bytes::from(vec![10_u8, 20, 30, 40, 50]);
+        let received_pointer = received.as_ptr();
+        sender.send(received).await.expect("queue incoming chunk");
+        sender.finish(5).await.expect("finish incoming body");
+
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/relay-request-zero-copy",
+            "test",
+            &"request head",
+        )
+        .expect("request head");
+        let forwarded = ObjectRpcSessionCall::from_relay_body(request, incoming);
+        assert_eq!(forwarded.body.role(), ObjectRpcSessionBodyRole::Attachment);
+        assert_eq!(forwarded.body.total_bytes(), Some(5));
+        assert!(!forwarded.body.is_replayable());
+        let mut producer = forwarded.body.producer(2).expect("incoming chunk producer");
+        assert!(matches!(&producer, BodyProducer::Incoming(_)));
+
+        for (expected, offset) in [(&[10_u8, 20][..], 0), (&[30, 40][..], 2), (&[50][..], 4)] {
+            let chunk = producer
+                .next()
+                .await
+                .expect("relay request chunk")
+                .expect("relay request bytes");
+            assert_eq!(chunk.as_ref(), expected);
+            assert_eq!(chunk.as_ptr(), received_pointer.wrapping_add(offset));
+        }
+        assert_eq!(producer.next().await.expect("incoming EOF"), None);
+        producer.finish().await.expect("finish incoming producer");
+
+        let value_request = crate::ObjectRpcRequest::encode_body(
+            "/test/relay-request-value",
+            "test",
+            &"typed value",
+        )
+        .expect("value request");
+        let value_body = value_request.body.clone();
+        let forwarded =
+            ObjectRpcSessionCall::from_relay_body(value_request, ObjectRpcIncomingBody::empty());
+        assert!(forwarded.body.has_value_intent());
+        assert_eq!(forwarded.request.body, value_body);
+    }
+
+    #[tokio::test]
+    async fn discard_owned_chunks_counts_and_preserves_stream_completion() {
+        let (mut sender, mut body) = ObjectRpcIncomingBody::multiplexed_channel(Some(7));
+        let completion_release = Arc::new(tokio::sync::Notify::new());
+        let (completion_finished_tx, completion_finished_rx) = tokio::sync::oneshot::channel();
+        let task_release = Arc::clone(&completion_release);
+        body.hold_completion_task(tokio::spawn(async move {
+            task_release.notified().await;
+            let _ = completion_finished_tx.send(());
+        }));
+        let delivery = tokio::spawn(async move {
+            sender
+                .send(Bytes::from_static(b"abc"))
+                .await
+                .expect("first body chunk");
+            sender
+                .send(Bytes::from_static(b"defg"))
+                .await
+                .expect("second body chunk");
+            sender.finish(7).await.expect("body completion");
+        });
+
+        assert_eq!(body.discard_owned_chunks().await.expect("discard body"), 7);
+        delivery.await.expect("body delivery");
+        completion_release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completion_finished_rx)
+            .await
+            .expect("natural EOF must detach the completion task")
+            .expect("detached completion task must remain alive");
+
+        let (mut sender, body) = ObjectRpcIncomingBody::multiplexed_channel(Some(3));
+        let delivery = tokio::spawn(async move {
+            sender
+                .send(Bytes::from_static(b"abc"))
+                .await
+                .expect("body bytes before failure");
+            sender.fail("forced discard terminal error");
+        });
+        let error = body
+            .discard_owned_chunks()
+            .await
+            .expect_err("terminal failure must propagate");
+        delivery.await.expect("failed body delivery");
+        assert!(matches!(error, NetworkError::Io { .. }));
+        assert!(error.to_string().contains("forced discard terminal error"));
     }
 
     #[tokio::test]
@@ -6341,6 +6744,202 @@ mod body_tests {
         })
         .await
         .expect("cancelled session must promptly close its transport");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_fin_after_response_head_interrupts_blocked_request_producer() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-peer-fin-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-peer-fin-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let (source_entered_tx, source_entered_rx) = tokio::sync::oneshot::channel();
+        let (source_dropped_tx, source_dropped_rx) = tokio::sync::oneshot::channel();
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/peer-fin-after-response-head",
+            "test",
+            &"request-head",
+        )
+        .expect("request head");
+        let prepared = ObjectRpcSessionCall::new(
+            request,
+            ObjectRpcBodySource::async_reader(
+                PendingAsyncReader {
+                    entered: Some(source_entered_tx),
+                    dropped: Some(source_dropped_tx),
+                },
+                Some(1),
+            ),
+        )
+        .prepare_for_signing()
+        .expect("prepare session call");
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (_request, mut responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+
+            // Wait until OpenAck has reached the client and its one-pass body
+            // producer is genuinely blocked. This is the lifecycle state that
+            // used to ignore a later reader EOF while awaiting producer.next().
+            source_entered_rx
+                .await
+                .expect("request body producer was polled");
+            let mut response = crate::ObjectRpcResponse::encode_body(
+                "/test/session/peer-fin-after-response-head",
+                &"accepted",
+            )
+            .expect("response head");
+            responder
+                .writer
+                .ensure_response_identity_proof(&responder.session_id, &mut response)
+                .expect("response identity proof");
+            responder
+                .writer
+                .send(SessionWirePayload::ResponseHead {
+                    response,
+                    body_role: ObjectRpcSessionBodyRole::None,
+                    body: None,
+                })
+                .await
+                .expect("write response head");
+
+            // Model an authenticated peer that retires this route attempt
+            // immediately after its response head. Aborting both server-side
+            // session tasks drops every remaining writer handle and produces
+            // a zero-byte FIN at the client reader.
+            if let Some(task) = responder.reader_task.take() {
+                task.abort();
+            }
+            if let Some(task) = responder.keepalive_task.take() {
+                task.abort();
+            }
+        });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            start_object_rpc_client_session(
+                Box::new(client_stream),
+                prepared,
+                request_auth,
+                client_data_dir,
+                server_public_key.clone(),
+                server_public_key,
+                NetworkCallPolicy::default(),
+            ),
+        )
+        .await
+        .expect("peer FIN must retire the pending client session")
+        .expect_err("an incomplete request body cannot become a successful call");
+        assert!(
+            error
+                .to_string()
+                .contains("session reader stopped before transfer acknowledgement"),
+            "unexpected peer-FIN error: {error}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), source_dropped_rx)
+            .await
+            .expect("peer FIN must cancel the blocked request producer")
+            .expect("blocked request producer drop signal");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn matching_transfer_cancel_interrupts_blocked_request_producer() {
+        let client_root = sinomo_testdir::TestDir::new("sinomo-session-transfer-cancel-client");
+        let server_root = sinomo_testdir::TestDir::new("sinomo-session-transfer-cancel-server");
+        let client_data_dir = SinomoDataDir::new(client_root.path());
+        let server_data_dir = SinomoDataDir::new(server_root.path());
+        let server_public_key = proof_public_key(&server_data_dir);
+        let (source_entered_tx, source_entered_rx) = tokio::sync::oneshot::channel();
+        let (source_dropped_tx, source_dropped_rx) = tokio::sync::oneshot::channel();
+        let request = crate::ObjectRpcRequest::encode_body(
+            "/test/session/matching-transfer-cancel",
+            "test",
+            &"request-head",
+        )
+        .expect("request head");
+        let prepared = ObjectRpcSessionCall::new(
+            request,
+            ObjectRpcBodySource::async_reader(
+                PendingAsyncReader {
+                    entered: Some(source_entered_tx),
+                    dropped: Some(source_dropped_tx),
+                },
+                Some(1),
+            ),
+        )
+        .prepare_for_signing()
+        .expect("prepare session call");
+        let request_transfer_id = prepared
+            .descriptor
+            .request_body
+            .as_ref()
+            .expect("request transfer descriptor")
+            .transfer_id
+            .clone();
+        let request_auth =
+            sign_daemon_rpc_request_from_data_dir(&client_data_dir, &prepared.request)
+                .expect("request auth");
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let cancel_reason = "peer cancelled blocked request body";
+        let server = tokio::spawn(async move {
+            let (_request, responder) = accept_object_rpc_server_session(
+                Box::new(server_stream),
+                server_data_dir,
+                NetworkCallPolicy::default(),
+                authenticate_test_request,
+            )
+            .await
+            .expect("accept session");
+
+            // OpenAck must reach the client before its producer is polled.
+            // Cancel the exact transfer while producer.next() is pending.
+            source_entered_rx
+                .await
+                .expect("request body producer was polled");
+            responder
+                .writer
+                .send(SessionWirePayload::Transfer(TransferControl::Cancel {
+                    transfer_id: request_transfer_id,
+                    reason: cancel_reason.to_string(),
+                }))
+                .await
+                .expect("send matching transfer cancellation");
+        });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            start_object_rpc_client_session(
+                Box::new(client_stream),
+                prepared,
+                request_auth,
+                client_data_dir,
+                server_public_key.clone(),
+                server_public_key,
+                NetworkCallPolicy::default(),
+            ),
+        )
+        .await
+        .expect("matching transfer cancellation must retire the pending client session")
+        .expect_err("a cancelled request body cannot become a successful call");
+        assert!(
+            error.to_string().contains(cancel_reason),
+            "unexpected transfer-cancel error: {error}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), source_dropped_rx)
+            .await
+            .expect("matching transfer cancellation must cancel the blocked producer")
+            .expect("blocked request producer drop signal");
+        server.await.expect("server task");
     }
 
     #[tokio::test(start_paused = true)]

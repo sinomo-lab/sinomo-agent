@@ -44,9 +44,9 @@ Receivers return cumulative credit after 8--16 MiB of progress, or when the
 every chunk. Completion flushes the final progress. Active receive credit is
 bounded to 64 MiB per transfer and 256 MiB in aggregate per immediate peer.
 Credit is an admission bound rather than a preallocated buffer. The bounded
-reader queue and spill path separately control resident body memory. The pooled
-channel remains the small-message latency path; bulk and unknown-length
-attachments enter this BDP-tuned session.
+reader queue and spill path separately control resident body memory. Unknown-
+length attachments and compatibility fallbacks enter this BDP-tuned session;
+known-size attachments use the persistent channel described below.
 
 ## Persistent Multiplexed Channel
 
@@ -65,9 +65,15 @@ over the header and payload.
 
 ### Flow Control and Fairness
 
-The channel frame quantum and per-call flow window are independent. The current
-starting point is a 256 KiB maximum Data frame and an 8 MiB per-call window. A
-receiver advertises the cumulative received offset after at least 1 MiB of
+The channel frame quantum and per-call flow window are independent. Protocol
+version 4 uses a 256 KiB maximum Data frame and a fixed 8 MiB per-call window.
+Eight concurrent body-bearing calls therefore expose 64 MiB of aggregate
+flight, but one call does not yet derive its window from the shared BDP
+estimate. Adaptive per-call credit needs a later protocol version in which the
+receiver grants both request and response credit; relaxing the version 4
+checks would let a response sender exceed receiver-owned memory policy.
+
+A receiver advertises the cumulative received offset after at least 1 MiB of
 additional progress or after 2 ms with unreported progress; it does not send
 one credit message per frame.
 
@@ -86,11 +92,14 @@ carrier is still detected within the configured idle interval.
 
 ### Memory Ownership and Relay Forwarding
 
-Each physical carrier owns an 8 MiB bounded pool of reusable 256 KiB `BytesMut`
-receive slabs. An ownership-bearing received `Bytes` keeps both its slab and
-the pool permit alive through clones and zero-copy slices, so the slab cannot be
-reused while a downstream consumer still references it. File, reader, and
-other non-contiguous producers read through bounded reusable buffers.
+Each physical carrier owns a bounded pool of reusable 256 KiB `BytesMut`
+receive slabs. With 64 admitted calls, the active bound is 32.25 MiB: two
+retained slabs per call plus one slab for the physical reader. Released slabs
+have a separate 16 MiB idle-cache bound. An ownership-bearing received `Bytes`
+keeps both its slab and the pool permit alive through clones and zero-copy
+slices, so the slab cannot be reused while a downstream consumer still
+references it. File, reader, and other non-contiguous producers read through
+bounded reusable buffers.
 Contiguous producers retain their data as `Bytes` and emit slices without
 allocating a `Vec` for each frame.
 

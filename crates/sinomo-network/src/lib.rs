@@ -74,8 +74,25 @@ pub mod __channel_carrier {
         OBJECT_RPC_CHANNEL_DATA_VERSION, OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_BYTES,
         ObjectRpcChannelDataFrame, ObjectRpcChannelDataHeader, ObjectRpcChannelReceiveBufferPool,
         ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
+        read_object_rpc_channel_transport_frame_async_timed,
         write_object_rpc_channel_data_frame_async, write_object_rpc_channel_transport_frame_async,
         write_object_rpc_channel_transport_frame_async_timed,
+    };
+}
+/// Internal generation-fenced local connectivity-store boundary used by the
+/// daemon's reactive projection owner.
+#[doc(hidden)]
+pub mod __connectivity_store {
+    pub use super::connectivity_store::{
+        ClusterConnectivityRoutingProjection,
+        LocalClusterConnectivityRoutingGenerationSubscription,
+        LocalClusterConnectivitySourceSetCommit, LocalClusterConnectivityStoreSnapshot,
+        capture_local_cluster_connectivity_store_snapshot, cluster_connectivity_routing_projection,
+        commit_local_cluster_connectivity_source_set_if_snapshot,
+        commit_local_cluster_connectivity_source_set_if_snapshot_async,
+        local_cluster_connectivity_content_generation,
+        record_daemon_owned_local_cluster_endpoint_command_connectivity,
+        subscribe_local_cluster_connectivity_routing_generation,
     };
 }
 pub use connectivity::cluster_network_record_live;
@@ -99,7 +116,8 @@ pub use connectivity::{
     cluster_connectivity_record_for_startup_probe_failure,
 };
 pub use connectivity::{
-    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
+    cluster_connectivity_record_should_refresh, cluster_connectivity_stable_eq,
+    validate_cluster_connectivity_records_for_source,
 };
 pub use connectivity_store::{
     invalidate_local_cluster_connectivity_cache,
@@ -390,6 +408,8 @@ pub struct NetworkObjectRpcToolSurface {
     pub category: &'static str,
     pub operation: &'static str,
     pub auth: NetworkModuleRouteAuth,
+    pub request_body_mode: ObjectRpcBodyMode,
+    pub response_body_mode: ObjectRpcBodyMode,
 }
 
 pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] = &[
@@ -398,18 +418,24 @@ pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] = &[
         category: CLUSTER_HEALTH_RPC_CATEGORY,
         operation: CLUSTER_HEALTH_READ_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+        request_body_mode: ObjectRpcBodyMode::None,
+        response_body_mode: ObjectRpcBodyMode::None,
     },
     NetworkObjectRpcToolSurface {
         route: CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
         category: CLUSTER_NETWORK_RPC_CATEGORY,
         operation: CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+        request_body_mode: ObjectRpcBodyMode::None,
+        response_body_mode: ObjectRpcBodyMode::None,
     },
     NetworkObjectRpcToolSurface {
         route: CLUSTER_NETWORK_PING_ROUTE,
         category: CLUSTER_NETWORK_RPC_CATEGORY,
         operation: CLUSTER_NETWORK_PING_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+        request_body_mode: ObjectRpcBodyMode::Optional,
+        response_body_mode: ObjectRpcBodyMode::Optional,
     },
 ];
 
