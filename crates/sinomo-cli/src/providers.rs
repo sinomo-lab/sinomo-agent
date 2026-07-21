@@ -1,4 +1,8 @@
 use super::*;
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteChoice, CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec,
+    CliParseError, CliPositionalSpec, CliValueSpec,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProviderName {
@@ -14,7 +18,6 @@ pub(super) enum ProviderName {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ProviderCliCommand {
-    Help,
     Auth(ProviderCommandOptions),
     Test(ProviderCommandOptions),
 }
@@ -25,24 +28,53 @@ pub(super) struct ProviderCommandOptions {
     pub(super) account: String,
 }
 
-pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliCommand, CliError> {
-    match args {
-        [] => return Ok(ProviderCliCommand::Help),
-        [command] if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            return Ok(ProviderCliCommand::Help);
-        }
-        _ => {}
-    }
+pub(super) fn providers_cli_command_handler() -> DeclarativeCommandHandler<ProviderCliCommand> {
+    DeclarativeCommandHandler::new(
+        "providers",
+        CliCommandPolicy::local_capable(),
+        providers_cli_spec,
+        parse_provider_matches,
+        run_provider_command,
+    )
+}
 
-    let [action, provider, rest @ ..] = args else {
-        return Err(CliError::Usage);
+fn provider_value() -> CliValueSpec {
+    CliValueSpec::new("provider", "provider id")
+        .with_choices([
+            CliAutocompleteChoice::new("github-copilot", "GitHub Copilot provider"),
+            CliAutocompleteChoice::new("codex", "Codex CLI provider"),
+            CliAutocompleteChoice::new("claude", "Claude CLI provider"),
+            CliAutocompleteChoice::new("anthropic", "Anthropic API provider"),
+            CliAutocompleteChoice::new("openai", "OpenAI API provider"),
+            CliAutocompleteChoice::new("deepseek", "DeepSeek API provider"),
+            CliAutocompleteChoice::new("gemini", "Gemini API provider"),
+            CliAutocompleteChoice::new("nvidia", "NVIDIA API provider"),
+        ])
+        .restricted()
+}
+
+fn providers_cli_spec() -> CliCommandSpec {
+    let action = |name: &'static str, about: &'static str| {
+        CliCommandSpec::new(name, about)
+            .with_options([CliOptionSpec::value(
+                "--account",
+                "provider account",
+                CliValueSpec::new("account", "provider account"),
+            )])
+            .with_positionals([CliPositionalSpec::required(provider_value())])
     };
+    CliCommandSpec::new("providers", "manage model provider credentials")
+        .help_on_empty()
+        .with_children([
+            action("auth", "store or refresh provider credentials"),
+            action("test", "test configured provider credentials"),
+        ])
+}
 
-    if !matches!(action.as_str(), "auth" | "test") {
-        return Err(CliError::Usage);
-    }
-
-    let provider = match provider.as_str() {
+fn parse_provider_matches(
+    matches: &CliCommandMatches,
+) -> Result<ProviderCliCommand, CliParseError> {
+    let provider = match required_positional(matches, 0)? {
         "github-copilot" => ProviderName::GitHubCopilot,
         "codex" => ProviderName::Codex,
         "claude" => ProviderName::Claude,
@@ -51,33 +83,32 @@ pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliComma
         "deepseek" => ProviderName::DeepSeek,
         "gemini" => ProviderName::Gemini,
         "nvidia" => ProviderName::Nvidia,
-        _ => {
-            return Err(CliError::Parse {
-                detail: format!("unknown provider `{provider}`"),
+        value => {
+            return Err(CliParseError::Parse {
+                detail: format!("unknown provider `{value}`"),
             });
         }
     };
-
-    let account = match rest {
-        [] => normalize_provider_account_name(None),
-        [flag, account] if flag == "--account" => normalize_provider_account_name(Some(account)),
-        _ => return Err(CliError::Usage),
-    };
+    let account = normalize_provider_account_name(matches.value("--account"));
     let options = ProviderCommandOptions { provider, account };
-
-    match action.as_str() {
+    match matches.command_name() {
         "auth" => Ok(ProviderCliCommand::Auth(options)),
         "test" => Ok(ProviderCliCommand::Test(options)),
-        _ => unreachable!("provider action was checked before provider parsing"),
+        _ => Err(CliParseError::Parse {
+            detail: "providers requires a subcommand".to_string(),
+        }),
     }
+}
+
+#[cfg(test)]
+pub(super) fn parse_provider_schema_for_test(
+    args: &[String],
+) -> Result<ProviderCliCommand, CliError> {
+    parse_schema_command_for_test(providers_cli_spec(), args, parse_provider_matches)
 }
 
 pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {
     match command {
-        ProviderCliCommand::Help => {
-            print_providers_help();
-            Ok(())
-        }
         ProviderCliCommand::Auth(options) => match options.provider {
             ProviderName::GitHubCopilot => auth_github_copilot(),
             ProviderName::Codex => auth_codex(),

@@ -1,6 +1,10 @@
 use super::*;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteChoice, CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec,
+    CliParseError, CliPositionalSpec, CliValueSpec,
+};
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
@@ -12,7 +16,6 @@ const DFS_PLACEMENT_AUTHORITY_ADMIN_RPC_TIMEOUT: std::time::Duration =
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {
-    Help,
     Status(DfsCommonOptions),
     FileSystem {
         file_system_id: DfsFileSystemId,
@@ -301,970 +304,657 @@ pub(crate) struct DfsExposeRemoveOptions {
     pub(crate) id: String,
 }
 
-pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(DfsCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(DfsCliCommand::Help)
-        }
-        Some((command, rest)) if command == "status" => {
-            Ok(DfsCliCommand::Status(parse_dfs_common_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "filesystem" | "fs") => {
-            let (id, rest) = rest.split_first().ok_or(CliError::Usage)?;
-            Ok(DfsCliCommand::FileSystem {
-                file_system_id: parse_dfs_file_system_id(id)?,
-                options: parse_dfs_common_options(rest)?,
-            })
-        }
-        Some((command, rest)) if command == "path" => parse_dfs_path_command(rest),
-        Some((command, rest)) if command == "object" => {
-            let (id, rest) = rest.split_first().ok_or(CliError::Usage)?;
-            Ok(DfsCliCommand::Object {
-                object_id: parse_dfs_object_id(id)?,
-                options: parse_dfs_common_options(rest)?,
-            })
-        }
-        Some((command, rest)) if command == "conflicts" => parse_dfs_conflicts_command(rest),
-        Some((command, rest)) if command == "repair" => {
-            Ok(DfsCliCommand::Repair(parse_dfs_filter_options(rest)?))
-        }
-        Some((command, rest)) if command == "smoke" => parse_dfs_smoke_command(rest),
-        Some((command, rest)) if command == "services" => parse_dfs_services_command(rest),
-        Some((command, rest)) if command == "metadata" => parse_dfs_metadata_command(rest),
-        Some((command, rest)) if command == "placement-authority" => Ok(
-            DfsCliCommand::PlacementAuthority(parse_dfs_placement_authority_command(rest)?),
-        ),
-        Some((command, rest)) if command == "mount" => {
-            Ok(DfsCliCommand::Mount(parse_dfs_mount_options(rest)?))
-        }
-        Some((command, rest)) if command == "pin" => {
-            Ok(DfsCliCommand::Pin(parse_dfs_pin_command(rest)?))
-        }
-        Some((command, rest)) if command == "expose" => {
-            Ok(DfsCliCommand::Expose(parse_dfs_expose_command(rest)?))
-        }
-        _ => Err(CliError::Usage),
-    }
+pub(crate) fn dfs_cli_command_handler() -> DeclarativeCommandHandler<DfsCliCommand> {
+    DeclarativeCommandHandler::new(
+        "dfs",
+        CliCommandPolicy::local_capable(),
+        dfs_cli_spec,
+        parse_dfs_matches,
+        run_dfs_cli_command,
+    )
+    .with_parsed_policy(dfs_cli_policy)
 }
 
-pub(crate) fn parse_dfs_placement_authority_command(
-    args: &[String],
-) -> Result<DfsPlacementAuthorityCliCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "inspect" => {
-            Ok(DfsPlacementAuthorityCliCommand::Inspect(
-                parse_dfs_placement_authority_inspect_options(rest)?,
-            ))
-        }
-        Some((command, rest)) if command == "clear" => Ok(DfsPlacementAuthorityCliCommand::Clear(
-            parse_dfs_placement_authority_clear_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
-}
-
-fn parse_dfs_placement_authority_inspect_options(
-    args: &[String],
-) -> Result<DfsPlacementAuthorityInspectOptions, CliError> {
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut filesystem_seen = false;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--filesystem" => {
-                if filesystem_seen {
-                    return Err(CliError::Usage);
-                }
-                index += 1;
-                file_system_id = parse_dfs_file_system_id(args.get(index).ok_or(CliError::Usage)?)?;
-                filesystem_seen = true;
-            }
-            "--json" if !json => json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(DfsPlacementAuthorityInspectOptions {
-        file_system_id,
-        json,
-    })
-}
-
-fn parse_dfs_placement_authority_clear_options(
-    args: &[String],
-) -> Result<DfsPlacementAuthorityClearOptions, CliError> {
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut filesystem_seen = false;
-    let mut expected_recovery_token = None;
-    let mut acknowledge_owner_stopped = false;
-    let mut break_glass_acknowledgement = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--filesystem" => {
-                if filesystem_seen {
-                    return Err(CliError::Usage);
-                }
-                index += 1;
-                file_system_id = parse_dfs_file_system_id(args.get(index).ok_or(CliError::Usage)?)?;
-                filesystem_seen = true;
-            }
-            "--expected-token" => {
-                if expected_recovery_token.is_some() {
-                    return Err(CliError::Usage);
-                }
-                index += 1;
-                let token = args.get(index).ok_or(CliError::Usage)?;
-                if token.trim().is_empty() || token.trim() != token {
-                    return Err(CliError::Usage);
-                }
-                expected_recovery_token = Some(token.clone());
-            }
-            "--acknowledge-owner-stopped" if !acknowledge_owner_stopped => {
-                acknowledge_owner_stopped = true;
-            }
-            "--break-glass-acknowledgement" => {
-                if break_glass_acknowledgement.is_some() {
-                    return Err(CliError::Usage);
-                }
-                index += 1;
-                break_glass_acknowledgement = Some(args.get(index).ok_or(CliError::Usage)?.clone());
-            }
-            "--json" if !json => json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-
-    let recovery = match (acknowledge_owner_stopped, break_glass_acknowledgement) {
-        (true, None) => DfsPlacementAuthorityRecovery::RemovedNode,
-        (false, Some(acknowledgement))
-            if acknowledgement
-                == sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT =>
-        {
-            DfsPlacementAuthorityRecovery::BreakGlass { acknowledgement }
-        }
-        _ => return Err(CliError::Usage),
+fn dfs_cli_spec() -> CliCommandSpec {
+    let option = |name: &'static str, help: &'static str, value: &'static str| {
+        CliOptionSpec::value(name, help, CliValueSpec::new(value, help))
     };
-    Ok(DfsPlacementAuthorityClearOptions {
-        file_system_id,
-        expected_recovery_token: expected_recovery_token.ok_or(CliError::Usage)?,
-        recovery,
-        json,
-    })
-}
-
-pub(crate) fn parse_dfs_common_options(args: &[String]) -> Result<DfsCommonOptions, CliError> {
-    let mut options = DfsCommonOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--metadata-root" => {
-                index += 1;
-                let Some(path) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.metadata_root = Some(PathBuf::from(path));
-            }
-            "--cluster" => options.cluster = true,
-            "--json" => options.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-pub(crate) fn parse_dfs_path_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    let (path, rest) = args.split_first().ok_or(CliError::Usage)?;
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut common_args = Vec::new();
-    let mut index = 0;
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "--filesystem" | "--fs" => {
-                index += 1;
-                let Some(value) = rest.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                file_system_id = parse_dfs_file_system_id(value)?;
-            }
-            "--metadata-root" => {
-                common_args.push(rest[index].clone());
-                index += 1;
-                let Some(value) = rest.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                common_args.push(value.clone());
-            }
-            "--json" => common_args.push(rest[index].clone()),
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(DfsCliCommand::Path {
-        path: path.clone(),
-        file_system_id,
-        options: parse_dfs_common_options(&common_args)?,
-    })
-}
-
-pub(crate) fn parse_dfs_conflicts_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "resolve" => Ok(DfsCliCommand::ResolveConflicts(
-            parse_dfs_conflict_resolve_options(rest)?,
-        )),
-        Some((command, rest)) if command == "versions" => Ok(DfsCliCommand::ConflictVersions(
-            parse_dfs_conflict_versions_options(rest)?,
-        )),
-        Some((command, rest)) if command == "use-version" => Ok(DfsCliCommand::UseConflictVersion(
-            parse_dfs_conflict_use_version_options(rest)?,
-        )),
-        Some((command, rest)) if command == "save-version" => Ok(
-            DfsCliCommand::SaveConflictVersion(parse_dfs_conflict_save_version_options(rest)?),
-        ),
-        _ => Ok(DfsCliCommand::Conflicts(parse_dfs_filter_options(args)?)),
-    }
-}
-
-pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptions, CliError> {
-    let mut options = DfsFilterOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--metadata-root" => {
-                index += 1;
-                let Some(path) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.common.metadata_root = Some(PathBuf::from(path));
-            }
-            "--filesystem" | "--fs" => {
-                index += 1;
-                let Some(file_system_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.file_system_id = Some(parse_dfs_file_system_id(file_system_id)?);
-            }
-            "--object" => {
-                index += 1;
-                let Some(object_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.object_id = Some(parse_dfs_object_id(object_id)?);
-            }
-            "--limit" => {
-                index += 1;
-                let Some(limit) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.limit = Some(limit.parse::<usize>().map_err(|source| CliError::Parse {
-                    detail: format!("invalid DFS inspection limit {limit}: {source}"),
-                })?);
-            }
-            "--cursor" => {
-                index += 1;
-                let Some(cursor) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.cursor = Some(decode_dfs_inspection_cursor(cursor)?);
-            }
-            "--json" => options.common.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-pub(crate) fn parse_dfs_conflict_resolve_options(
-    args: &[String],
-) -> Result<DfsConflictResolveOptions, CliError> {
-    let mut common = DfsCommonOptions::default();
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut path = None;
-    let mut object_id = None;
-    let mut conflict_ids = Vec::new();
-    let mut delete_file = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--metadata-root" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                common.metadata_root = Some(PathBuf::from(value));
-            }
-            "--filesystem" | "--fs" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                file_system_id = parse_dfs_file_system_id(value)?;
-            }
-            "--path" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                path = Some(non_empty_string(value, "path")?);
-            }
-            "--object" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                object_id = Some(parse_dfs_object_id(value)?);
-            }
-            "--id" | "--conflict" | "--conflict-id" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                conflict_ids.push(non_empty_string(value, "conflict id")?);
-            }
-            "--delete-file" => delete_file = true,
-            "--json" => common.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    if path.is_none() && object_id.is_none() {
-        return Err(CliError::Usage);
-    }
-    Ok(DfsConflictResolveOptions {
-        common,
-        file_system_id,
-        path,
-        object_id,
-        conflict_ids,
-        delete_file,
-    })
-}
-
-pub(crate) fn parse_dfs_conflict_versions_options(
-    args: &[String],
-) -> Result<DfsConflictVersionsOptions, CliError> {
-    let mut common = DfsCommonOptions::default();
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut path = None;
-    let mut object_id = None;
-    let mut conflict_ids = Vec::new();
-    parse_dfs_conflict_target_options(
-        args,
-        &mut common,
-        &mut file_system_id,
-        &mut path,
-        &mut object_id,
-        &mut conflict_ids,
-        None,
-    )?;
-    if path.is_none() && object_id.is_none() {
-        return Err(CliError::Usage);
-    }
-    Ok(DfsConflictVersionsOptions {
-        common,
-        file_system_id,
-        path,
-        object_id,
-        conflict_ids,
-    })
-}
-
-pub(crate) fn parse_dfs_conflict_use_version_options(
-    args: &[String],
-) -> Result<DfsConflictUseVersionOptions, CliError> {
-    let mut common = DfsCommonOptions::default();
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut path = None;
-    let mut object_id = None;
-    let mut conflict_ids = Vec::new();
-    let mut version = None;
-    parse_dfs_conflict_target_options(
-        args,
-        &mut common,
-        &mut file_system_id,
-        &mut path,
-        &mut object_id,
-        &mut conflict_ids,
-        Some(&mut version),
-    )?;
-    if path.is_none() && object_id.is_none() {
-        return Err(CliError::Usage);
-    }
-    Ok(DfsConflictUseVersionOptions {
-        common,
-        file_system_id,
-        path,
-        object_id,
-        version: version.ok_or(CliError::Usage)?,
-        conflict_ids,
-    })
-}
-
-pub(crate) fn parse_dfs_conflict_save_version_options(
-    args: &[String],
-) -> Result<DfsConflictSaveVersionOptions, CliError> {
-    let mut common = DfsCommonOptions::default();
-    let mut file_system_id = default_dfs_file_system_id();
-    let mut path = None;
-    let mut object_id = None;
-    let mut conflict_ids = Vec::new();
-    let mut version = None;
-    let mut destination_path = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--to" | "--destination" | "--dest" => {
-                index += 1;
-                destination_path = Some(non_empty_string(
-                    args.get(index).ok_or(CliError::Usage)?,
-                    "destination path",
-                )?);
-            }
-            _ => {
-                parse_one_dfs_conflict_target_option(
-                    args,
-                    &mut index,
-                    &mut common,
-                    &mut file_system_id,
-                    &mut path,
-                    &mut object_id,
-                    &mut conflict_ids,
-                    Some(&mut version),
-                )?;
-            }
-        }
-        index += 1;
-    }
-    if path.is_none() && object_id.is_none() {
-        return Err(CliError::Usage);
-    }
-    Ok(DfsConflictSaveVersionOptions {
-        common,
-        file_system_id,
-        path,
-        object_id,
-        version: version.ok_or(CliError::Usage)?,
-        conflict_ids,
-        destination_path: destination_path.ok_or(CliError::Usage)?,
-    })
-}
-
-fn parse_dfs_conflict_target_options(
-    args: &[String],
-    common: &mut DfsCommonOptions,
-    file_system_id: &mut DfsFileSystemId,
-    path: &mut Option<String>,
-    object_id: &mut Option<DfsObjectId>,
-    conflict_ids: &mut Vec<String>,
-    mut version: Option<&mut Option<DfsVersion>>,
-) -> Result<(), CliError> {
-    let mut index = 0;
-    while index < args.len() {
-        parse_one_dfs_conflict_target_option(
-            args,
-            &mut index,
-            common,
-            file_system_id,
-            path,
-            object_id,
-            conflict_ids,
-            version.as_deref_mut(),
-        )?;
-        index += 1;
-    }
-    Ok(())
-}
-
-fn parse_one_dfs_conflict_target_option(
-    args: &[String],
-    index: &mut usize,
-    common: &mut DfsCommonOptions,
-    file_system_id: &mut DfsFileSystemId,
-    path: &mut Option<String>,
-    object_id: &mut Option<DfsObjectId>,
-    conflict_ids: &mut Vec<String>,
-    version: Option<&mut Option<DfsVersion>>,
-) -> Result<(), CliError> {
-    match args[*index].as_str() {
-        "--metadata-root" => {
-            *index += 1;
-            let Some(value) = args.get(*index) else {
-                return Err(CliError::Usage);
-            };
-            common.metadata_root = Some(PathBuf::from(value));
-        }
-        "--filesystem" | "--fs" => {
-            *index += 1;
-            let Some(value) = args.get(*index) else {
-                return Err(CliError::Usage);
-            };
-            *file_system_id = parse_dfs_file_system_id(value)?;
-        }
-        "--path" => {
-            *index += 1;
-            let Some(value) = args.get(*index) else {
-                return Err(CliError::Usage);
-            };
-            *path = Some(non_empty_string(value, "path")?);
-        }
-        "--object" => {
-            *index += 1;
-            let Some(value) = args.get(*index) else {
-                return Err(CliError::Usage);
-            };
-            *object_id = Some(parse_dfs_object_id(value)?);
-        }
-        "--id" | "--conflict" | "--conflict-id" => {
-            *index += 1;
-            let Some(value) = args.get(*index) else {
-                return Err(CliError::Usage);
-            };
-            conflict_ids.push(non_empty_string(value, "conflict id")?);
-        }
-        "--version" => {
-            let Some(version) = version else {
-                return Err(CliError::Usage);
-            };
-            *index += 1;
-            let Some(value) = args.get(*index) else {
-                return Err(CliError::Usage);
-            };
-            *version = Some(parse_dfs_version(value)?);
-        }
-        "--json" => common.json = true,
-        _ => return Err(CliError::Usage),
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_dfs_services_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            _ => return Err(CliError::Usage),
-        }
-    }
-    Ok(DfsCliCommand::Services { json })
-}
-
-pub(crate) fn parse_dfs_smoke_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            _ => return Err(CliError::Usage),
-        }
-    }
-    Ok(DfsCliCommand::Smoke { json })
-}
-
-pub(crate) fn parse_dfs_metadata_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "publish" => {
-            let mut json = false;
-            for arg in rest {
-                match arg.as_str() {
-                    "--json" => json = true,
-                    _ => return Err(CliError::Usage),
-                }
-            }
-            Ok(DfsCliCommand::MetadataPublish { json })
-        }
-        Some((command, rest)) if command == "shard" => parse_dfs_metadata_shard_command(rest),
-        _ => Err(CliError::Usage),
-    }
-}
-
-pub(crate) fn parse_dfs_metadata_shard_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
-    let (command, rest) = args.split_first().ok_or(CliError::Usage)?;
-    match command.as_str() {
-        "transfer-primary" => {
-            let mut file_system_id = default_dfs_file_system_id();
-            let mut shard_id = None;
-            let mut new_primary_node_id = None;
-            let mut expected_epoch = None;
-            let mut json = false;
-            let mut index = 0;
-            while index < rest.len() {
-                match rest[index].as_str() {
-                    "--filesystem" | "--fs" => {
-                        index += 1;
-                        file_system_id =
-                            parse_dfs_file_system_id(rest.get(index).ok_or(CliError::Usage)?)?;
-                    }
-                    "--shard" => {
-                        index += 1;
-                        shard_id = Some(non_empty_string(
-                            rest.get(index).ok_or(CliError::Usage)?,
+    let json = || CliOptionSpec::flag("--json", "print JSON output");
+    let filesystem =
+        || option("--filesystem", "DFS filesystem id", "file-system-id").with_aliases(["--fs"]);
+    let metadata_root = || option("--metadata-root", "metadata root override", "path");
+    let common = || {
+        [
+            metadata_root(),
+            CliOptionSpec::flag("--cluster", "query cluster state"),
+            json(),
+        ]
+    };
+    let filter = || {
+        [
+            metadata_root(),
+            filesystem(),
+            option("--object", "DFS object id", "object-id"),
+            option("--limit", "maximum results", "count"),
+            option("--cursor", "inspection cursor", "cursor"),
+            json(),
+        ]
+    };
+    let conflict_target = || {
+        [
+            metadata_root(),
+            filesystem(),
+            option("--path", "DFS path", "path"),
+            option("--object", "DFS object id", "object-id"),
+            option("--id", "conflict id", "conflict-id")
+                .with_aliases(["--conflict", "--conflict-id"])
+                .repeatable(),
+            json(),
+        ]
+    };
+    let expose_common = || {
+        [
+            option("--config", "exposure configuration path", "path"),
+            json(),
+        ]
+    };
+    let conflicts = {
+        let mut resolve = conflict_target().to_vec();
+        resolve.push(CliOptionSpec::flag(
+            "--delete-file",
+            "unlink the conflicted file",
+        ));
+        let versions = conflict_target();
+        let mut use_version = conflict_target().to_vec();
+        use_version.push(option("--version", "stored DFS version", "version").required());
+        let mut save_version = use_version.clone();
+        save_version.push(
+            option("--to", "destination DFS path", "path")
+                .with_aliases(["--destination", "--dest"])
+                .required(),
+        );
+        CliCommandSpec::new("conflicts", "inspect and resolve DFS conflicts")
+            .with_options(filter())
+            .with_children([
+                CliCommandSpec::new("resolve", "remove matching conflict records")
+                    .with_options(resolve),
+                CliCommandSpec::new("versions", "show stored conflicting versions")
+                    .with_options(versions),
+                CliCommandSpec::new("use-version", "make one conflict version visible")
+                    .with_options(use_version),
+                CliCommandSpec::new("save-version", "copy a conflict version for manual merge")
+                    .with_options(save_version),
+            ])
+    };
+    let pin_mode = || {
+        CliValueSpec::new("metadata|content", "pin mode")
+            .with_choices([
+                CliAutocompleteChoice::new("metadata", "pin metadata only"),
+                CliAutocompleteChoice::new("content", "pin content"),
+            ])
+            .restricted()
+    };
+    CliCommandSpec::new("dfs", "inspect and manage SIFS and DFS state")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("status", "summarize DFS metadata and repair state")
+                .with_options(common()),
+            CliCommandSpec::new("filesystem", "inspect one filesystem")
+                .with_aliases(["fs"])
+                .with_options(common())
+                .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                    "file-system-id",
+                    "DFS filesystem id",
+                ))]),
+            CliCommandSpec::new("path", "inspect an object by filesystem path")
+                .with_options([filesystem(), metadata_root(), json()])
+                .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                    "path", "DFS path",
+                ))]),
+            CliCommandSpec::new("object", "inspect one DFS object")
+                .with_options(common())
+                .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                    "object-id",
+                    "DFS object id",
+                ))]),
+            conflicts,
+            CliCommandSpec::new("repair", "list inferred replica repairs").with_options(filter()),
+            CliCommandSpec::new("services", "list DFS service advertisements")
+                .with_options([json()]),
+            CliCommandSpec::new("smoke", "write a small replicated SIFS smoke file")
+                .with_options([json()]),
+            CliCommandSpec::new("metadata", "maintain DFS metadata").with_children([
+                CliCommandSpec::new("publish", "publish the primary metadata shard journal")
+                    .with_options([json()]),
+                CliCommandSpec::new("shard", "manage metadata shards").with_children([
+                    CliCommandSpec::new("transfer-primary", "transfer a metadata shard primary")
+                        .with_options([
+                            filesystem(),
+                            option("--shard", "metadata shard id", "shard-id"),
+                            option("--to", "new primary node", "node-id")
+                                .with_aliases(["--node", "--primary"])
+                                .required(),
+                            option("--expected-epoch", "expected shard epoch", "epoch")
+                                .with_aliases(["--epoch"]),
+                            json(),
+                        ])
+                        .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                            "shard-id",
                             "metadata shard id",
-                        )?);
-                    }
-                    "--to" | "--node" | "--primary" => {
-                        index += 1;
-                        new_primary_node_id =
-                            Some(parse_node_id(rest.get(index).ok_or(CliError::Usage)?)?);
-                    }
-                    "--expected-epoch" | "--epoch" => {
-                        index += 1;
-                        let value = rest.get(index).ok_or(CliError::Usage)?;
-                        expected_epoch =
-                            Some(value.parse::<u64>().map_err(|source| CliError::Parse {
-                                detail: format!(
-                                    "invalid DFS metadata shard epoch `{value}`: {source}"
-                                ),
-                            })?);
-                    }
-                    "--json" => json = true,
-                    value if !value.starts_with('-') && shard_id.is_none() => {
-                        shard_id = Some(non_empty_string(value, "metadata shard id")?);
-                    }
-                    _ => return Err(CliError::Usage),
-                }
-                index += 1;
-            }
-            Ok(DfsCliCommand::MetadataShardTransferPrimary(
-                DfsMetadataShardTransferPrimaryOptions {
-                    file_system_id,
-                    shard_id: shard_id.ok_or(CliError::Usage)?,
-                    new_primary_node_id: new_primary_node_id.ok_or(CliError::Usage)?,
-                    expected_epoch,
-                    json,
+                        ))]),
+                ]),
+            ]),
+            CliCommandSpec::new(
+                "placement-authority",
+                "inspect or recover placement authority",
+            )
+            .with_children([
+                CliCommandSpec::new("inspect", "inspect the placement mutation permit")
+                    .with_options([filesystem(), json()]),
+                CliCommandSpec::new(
+                    "clear",
+                    format!(
+                        "clear a fenced placement mutation permit; break-glass requires `{}`",
+                        sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT
+                    ),
+                )
+                    .with_options([
+                        filesystem(),
+                        option("--expected-token", "expected recovery token", "token").required(),
+                        CliOptionSpec::flag(
+                            "--acknowledge-owner-stopped",
+                            "confirm the removed owner is stopped",
+                        ),
+                        CliOptionSpec::value(
+                            "--break-glass-acknowledgement",
+                            format!(
+                                "exact break-glass acknowledgement: {}",
+                                sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT
+                            ),
+                            CliValueSpec::new("text", "exact break-glass acknowledgement"),
+                        ),
+                        json(),
+                    ]),
+            ]),
+            CliCommandSpec::new("mount", "expose SIFS locally")
+                .with_options([
+                    option("--root", "SIFS root path", "path").with_aliases(["--path"]),
+                    option("--data-dir", "Sinomo data directory", "path"),
+                    CliOptionSpec::flag("--read-only", "mount read-only").with_aliases(["--ro"]),
+                    CliOptionSpec::flag("--allow-other", "allow other local users"),
+                    CliOptionSpec::flag("--foreground", "stay in the foreground"),
+                    CliOptionSpec::flag("--background", "run mount in the background"),
+                    CliOptionSpec::flag("--sync-local-changes", "sync local mount changes"),
+                    CliOptionSpec::flag(
+                        "--no-sync-local-changes",
+                        "disable local change synchronization",
+                    ),
+                ])
+                .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                    "mount-point",
+                    "local mount directory",
+                ))]),
+            CliCommandSpec::new("pin", "manage local DFS pins").with_children([
+                CliCommandSpec::new("list", "list local DFS pins").with_options([
+                    filesystem(),
+                    option("--pin-root", "pin store root", "path"),
+                    json(),
+                ]),
+                CliCommandSpec::new("add", "add a local DFS pin").with_options([
+                    option("--path", "DFS path", "path").required(),
+                    filesystem(),
+                    option("--object", "DFS object id", "object-id"),
+                    option("--node", "target node id", "node-id"),
+                    CliOptionSpec::value("--mode", "pin mode", pin_mode()),
+                    option("--pin-root", "pin store root", "path"),
+                    json(),
+                ]),
+                CliCommandSpec::new("remove", "remove a local DFS pin").with_options([
+                    option("--path", "DFS path", "path").required(),
+                    filesystem(),
+                    option("--node", "target node id", "node-id"),
+                    CliOptionSpec::value("--mode", "pin mode", pin_mode()),
+                    option("--pin-root", "pin store root", "path"),
+                    json(),
+                ]),
+            ]),
+            CliCommandSpec::new("expose", "manage local SIFS exposure").with_children([
+                CliCommandSpec::new("init", "ensure the default exposure configuration")
+                    .with_options(expose_common()),
+                CliCommandSpec::new("list", "list exposure configuration")
+                    .with_options(expose_common()),
+                CliCommandSpec::new("add", "add a local exposure entry").with_options([
+                    option("--source", "local source path", "path").required(),
+                    option("--dfs-path", "destination DFS path", "path")
+                        .with_aliases(["--path"])
+                        .required(),
+                    option("--id", "exposure id", "id"),
+                    filesystem(),
+                    option("--node", "owning node id", "node-id"),
+                    CliOptionSpec::flag("--read-only", "expose read-only"),
+                    CliOptionSpec::flag("--follow-symlinks", "follow source symlinks"),
+                    option("--config", "exposure configuration path", "path"),
+                    json(),
+                ]),
+                CliCommandSpec::new("remove", "remove a local exposure entry").with_options([
+                    option("--id", "exposure id", "id").required(),
+                    option("--config", "exposure configuration path", "path"),
+                    json(),
+                ]),
+            ]),
+        ])
+}
+
+fn dfs_common_from_matches(matches: &CliCommandMatches) -> DfsCommonOptions {
+    DfsCommonOptions {
+        metadata_root: matches.value("--metadata-root").map(PathBuf::from),
+        cluster: matches.contains("--cluster"),
+        json: matches.contains("--json"),
+    }
+}
+
+fn dfs_filter_from_matches(matches: &CliCommandMatches) -> Result<DfsFilterOptions, CliParseError> {
+    Ok(DfsFilterOptions {
+        common: dfs_common_from_matches(matches),
+        file_system_id: matches
+            .value("--filesystem")
+            .map(parse_dfs_file_system_id)
+            .transpose()
+            .map_err(semantic_parse_error)?,
+        object_id: matches
+            .value("--object")
+            .map(parse_dfs_object_id)
+            .transpose()
+            .map_err(semantic_parse_error)?,
+        limit: matches
+            .value("--limit")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|source| CliParseError::Parse {
+                        detail: format!("invalid DFS inspection limit {value}: {source}"),
+                    })
+            })
+            .transpose()?,
+        cursor: matches
+            .value("--cursor")
+            .map(decode_dfs_inspection_cursor)
+            .transpose()
+            .map_err(semantic_parse_error)?,
+    })
+}
+
+struct DfsConflictTargetMatches {
+    common: DfsCommonOptions,
+    file_system_id: DfsFileSystemId,
+    path: Option<String>,
+    object_id: Option<DfsObjectId>,
+    conflict_ids: Vec<String>,
+}
+
+fn dfs_conflict_target_from_matches(
+    matches: &CliCommandMatches,
+) -> Result<DfsConflictTargetMatches, CliParseError> {
+    let path = matches
+        .value("--path")
+        .map(|value| non_empty_string(value, "path"))
+        .transpose()
+        .map_err(semantic_parse_error)?;
+    let object_id = matches
+        .value("--object")
+        .map(parse_dfs_object_id)
+        .transpose()
+        .map_err(semantic_parse_error)?;
+    if path.is_none() && object_id.is_none() {
+        return Err(CliParseError::Parse {
+            detail: "DFS conflict command requires --path or --object".to_string(),
+        });
+    }
+    Ok(DfsConflictTargetMatches {
+        common: dfs_common_from_matches(matches),
+        file_system_id: matches
+            .value("--filesystem")
+            .map(parse_dfs_file_system_id)
+            .transpose()
+            .map_err(semantic_parse_error)?
+            .unwrap_or_else(default_dfs_file_system_id),
+        path,
+        object_id,
+        conflict_ids: matches
+            .values("--id")
+            .map(|value| non_empty_string(value, "conflict id").map_err(semantic_parse_error))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_dfs_matches(matches: &CliCommandMatches) -> Result<DfsCliCommand, CliParseError> {
+    let path = matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match path.as_slice() {
+        ["dfs", "status"] => Ok(DfsCliCommand::Status(dfs_common_from_matches(matches))),
+        ["dfs", "filesystem"] => Ok(DfsCliCommand::FileSystem {
+            file_system_id: parse_dfs_file_system_id(required_positional(matches, 0)?)
+                .map_err(semantic_parse_error)?,
+            options: dfs_common_from_matches(matches),
+        }),
+        ["dfs", "path"] => Ok(DfsCliCommand::Path {
+            path: required_positional(matches, 0)?.to_string(),
+            file_system_id: matches
+                .value("--filesystem")
+                .map(parse_dfs_file_system_id)
+                .transpose()
+                .map_err(semantic_parse_error)?
+                .unwrap_or_else(default_dfs_file_system_id),
+            options: dfs_common_from_matches(matches),
+        }),
+        ["dfs", "object"] => Ok(DfsCliCommand::Object {
+            object_id: parse_dfs_object_id(required_positional(matches, 0)?)
+                .map_err(semantic_parse_error)?,
+            options: dfs_common_from_matches(matches),
+        }),
+        ["dfs", "conflicts"] => dfs_filter_from_matches(matches).map(DfsCliCommand::Conflicts),
+        ["dfs", "conflicts", "resolve"] => {
+            let target = dfs_conflict_target_from_matches(matches)?;
+            Ok(DfsCliCommand::ResolveConflicts(DfsConflictResolveOptions {
+                common: target.common,
+                file_system_id: target.file_system_id,
+                path: target.path,
+                object_id: target.object_id,
+                conflict_ids: target.conflict_ids,
+                delete_file: matches.contains("--delete-file"),
+            }))
+        }
+        ["dfs", "conflicts", "versions"] => {
+            let target = dfs_conflict_target_from_matches(matches)?;
+            Ok(DfsCliCommand::ConflictVersions(
+                DfsConflictVersionsOptions {
+                    common: target.common,
+                    file_system_id: target.file_system_id,
+                    path: target.path,
+                    object_id: target.object_id,
+                    conflict_ids: target.conflict_ids,
                 },
             ))
         }
-        _ => Err(CliError::Usage),
+        ["dfs", "conflicts", "use-version"] => {
+            let target = dfs_conflict_target_from_matches(matches)?;
+            Ok(DfsCliCommand::UseConflictVersion(
+                DfsConflictUseVersionOptions {
+                    common: target.common,
+                    file_system_id: target.file_system_id,
+                    path: target.path,
+                    object_id: target.object_id,
+                    version: parse_dfs_version(required_option(matches, "--version")?)
+                        .map_err(semantic_parse_error)?,
+                    conflict_ids: target.conflict_ids,
+                },
+            ))
+        }
+        ["dfs", "conflicts", "save-version"] => {
+            let target = dfs_conflict_target_from_matches(matches)?;
+            Ok(DfsCliCommand::SaveConflictVersion(
+                DfsConflictSaveVersionOptions {
+                    common: target.common,
+                    file_system_id: target.file_system_id,
+                    path: target.path,
+                    object_id: target.object_id,
+                    version: parse_dfs_version(required_option(matches, "--version")?)
+                        .map_err(semantic_parse_error)?,
+                    conflict_ids: target.conflict_ids,
+                    destination_path: non_empty_string(
+                        required_option(matches, "--to")?,
+                        "destination path",
+                    )
+                    .map_err(semantic_parse_error)?,
+                },
+            ))
+        }
+        ["dfs", "repair"] => dfs_filter_from_matches(matches).map(DfsCliCommand::Repair),
+        ["dfs", "services"] => Ok(DfsCliCommand::Services {
+            json: matches.contains("--json"),
+        }),
+        ["dfs", "smoke"] => Ok(DfsCliCommand::Smoke {
+            json: matches.contains("--json"),
+        }),
+        ["dfs", "metadata", "publish"] => Ok(DfsCliCommand::MetadataPublish {
+            json: matches.contains("--json"),
+        }),
+        ["dfs", "metadata", "shard", "transfer-primary"] => {
+            let shard_id = matches
+                .value("--shard")
+                .or_else(|| matches.positionals().first().map(String::as_str))
+                .ok_or_else(|| CliParseError::Parse {
+                    detail: "metadata shard transfer requires a shard id".to_string(),
+                })?;
+            Ok(DfsCliCommand::MetadataShardTransferPrimary(
+                DfsMetadataShardTransferPrimaryOptions {
+                    file_system_id: matches
+                        .value("--filesystem")
+                        .map(parse_dfs_file_system_id)
+                        .transpose()
+                        .map_err(semantic_parse_error)?
+                        .unwrap_or_else(default_dfs_file_system_id),
+                    shard_id: non_empty_string(shard_id, "metadata shard id")
+                        .map_err(semantic_parse_error)?,
+                    new_primary_node_id: parse_node_id(required_option(matches, "--to")?)
+                        .map_err(semantic_parse_error)?,
+                    expected_epoch: matches
+                        .value("--expected-epoch")
+                        .map(|value| {
+                            value.parse::<u64>().map_err(|source| CliParseError::Parse {
+                                detail: format!(
+                                    "invalid DFS metadata shard epoch `{value}`: {source}"
+                                ),
+                            })
+                        })
+                        .transpose()?,
+                    json: matches.contains("--json"),
+                },
+            ))
+        }
+        ["dfs", "placement-authority", "inspect"] => Ok(DfsCliCommand::PlacementAuthority(
+            DfsPlacementAuthorityCliCommand::Inspect(DfsPlacementAuthorityInspectOptions {
+                file_system_id: matches
+                    .value("--filesystem")
+                    .map(parse_dfs_file_system_id)
+                    .transpose()
+                    .map_err(semantic_parse_error)?
+                    .unwrap_or_else(default_dfs_file_system_id),
+                json: matches.contains("--json"),
+            }),
+        )),
+        ["dfs", "placement-authority", "clear"] => {
+            let removed = matches.contains("--acknowledge-owner-stopped");
+            let break_glass = matches.value("--break-glass-acknowledgement");
+            let recovery = match (removed, break_glass) {
+                (true, None) => DfsPlacementAuthorityRecovery::RemovedNode,
+                (false, Some(acknowledgement))
+                    if acknowledgement
+                        == sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT =>
+                {
+                    DfsPlacementAuthorityRecovery::BreakGlass {
+                        acknowledgement: acknowledgement.to_string(),
+                    }
+                }
+                _ => return Err(CliParseError::Parse {
+                    detail: "placement-authority clear requires exactly one valid recovery acknowledgement".to_string(),
+                }),
+            };
+            let token = required_option(matches, "--expected-token")?;
+            if token.trim().is_empty() || token.trim() != token {
+                return Err(CliParseError::Parse {
+                    detail: "--expected-token must be non-empty without surrounding whitespace"
+                        .to_string(),
+                });
+            }
+            Ok(DfsCliCommand::PlacementAuthority(
+                DfsPlacementAuthorityCliCommand::Clear(DfsPlacementAuthorityClearOptions {
+                    file_system_id: matches
+                        .value("--filesystem")
+                        .map(parse_dfs_file_system_id)
+                        .transpose()
+                        .map_err(semantic_parse_error)?
+                        .unwrap_or_else(default_dfs_file_system_id),
+                    expected_recovery_token: token.to_string(),
+                    recovery,
+                    json: matches.contains("--json"),
+                }),
+            ))
+        }
+        ["dfs", "mount"] => parse_dfs_mount_matches(matches).map(DfsCliCommand::Mount),
+        ["dfs", "pin", command] => parse_dfs_pin_matches(command, matches).map(DfsCliCommand::Pin),
+        ["dfs", "expose", command] => {
+            parse_dfs_expose_matches(command, matches).map(DfsCliCommand::Expose)
+        }
+        _ => Err(CliParseError::Parse {
+            detail: "dfs requires a subcommand".to_string(),
+        }),
     }
 }
 
-pub(crate) fn parse_dfs_mount_options(args: &[String]) -> Result<DfsMountOptions, CliError> {
-    let mut mount_point = None;
-    let mut root_path = "/".to_string();
-    let mut data_dir = None;
-    let mut read_only = false;
-    let mut allow_other = false;
-    let mut foreground = true;
-    let mut sync_local_changes = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--root" | "--path" => {
-                index += 1;
-                root_path = non_empty_string(args.get(index).ok_or(CliError::Usage)?, "root")?;
-            }
-            "--data-dir" => {
-                index += 1;
-                data_dir = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--read-only" | "--ro" => read_only = true,
-            "--allow-other" => allow_other = true,
-            "--foreground" => foreground = true,
-            "--background" => foreground = false,
-            "--sync-local-changes" => sync_local_changes = true,
-            "--no-sync-local-changes" => sync_local_changes = false,
-            value if value.starts_with('-') => return Err(CliError::Usage),
-            value => {
-                if mount_point.is_some() {
-                    return Err(CliError::Usage);
-                }
-                mount_point = Some(PathBuf::from(value));
-            }
-        }
-        index += 1;
+#[cfg(test)]
+pub(crate) fn parse_dfs_schema_for_test(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    parse_schema_command_for_test(dfs_cli_spec(), args, parse_dfs_matches)
+}
+
+fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOptions, CliParseError> {
+    if matches.contains("--foreground") && matches.contains("--background") {
+        return Err(CliParseError::Parse {
+            detail: "dfs mount cannot combine --foreground and --background".to_string(),
+        });
+    }
+    if matches.contains("--sync-local-changes") && matches.contains("--no-sync-local-changes") {
+        return Err(CliParseError::Parse {
+            detail: "dfs mount cannot combine --sync-local-changes and --no-sync-local-changes"
+                .to_string(),
+        });
     }
     Ok(DfsMountOptions {
-        mount_point: mount_point.ok_or(CliError::Usage)?,
-        root_path,
-        data_dir,
-        read_only,
-        allow_other,
-        foreground,
-        sync_local_changes,
+        mount_point: PathBuf::from(required_positional(matches, 0)?),
+        root_path: matches.value("--root").unwrap_or("/").to_string(),
+        data_dir: matches.value("--data-dir").map(PathBuf::from),
+        read_only: matches.contains("--read-only"),
+        allow_other: matches.contains("--allow-other"),
+        foreground: !matches.contains("--background"),
+        sync_local_changes: matches.contains("--sync-local-changes"),
     })
 }
 
-pub(crate) fn parse_dfs_pin_command(args: &[String]) -> Result<DfsPinCliCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "list" => {
-            Ok(DfsPinCliCommand::List(parse_dfs_pin_list_options(rest)?))
-        }
-        Some((command, rest)) if command == "add" => {
-            Ok(DfsPinCliCommand::Add(parse_dfs_pin_add_options(rest)?))
-        }
-        Some((command, rest)) if command == "remove" => Ok(DfsPinCliCommand::Remove(
-            parse_dfs_pin_remove_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
+fn parse_dfs_pin_matches(
+    command: &str,
+    matches: &CliCommandMatches,
+) -> Result<DfsPinCliCommand, CliParseError> {
+    let filesystem = || {
+        matches
+            .value("--filesystem")
+            .map(parse_dfs_file_system_id)
+            .transpose()
+            .map_err(semantic_parse_error)
+    };
+    let node = || {
+        matches
+            .value("--node")
+            .map(parse_node_id)
+            .transpose()
+            .map_err(semantic_parse_error)
+    };
+    let mode = || {
+        matches
+            .value("--mode")
+            .map(parse_dfs_pin_mode)
+            .transpose()
+            .map_err(semantic_parse_error)
+    };
+    match command {
+        "list" => Ok(DfsPinCliCommand::List(DfsPinListOptions {
+            pin_root: matches.value("--pin-root").map(PathBuf::from),
+            file_system_id: filesystem()?,
+            json: matches.contains("--json"),
+        })),
+        "add" => Ok(DfsPinCliCommand::Add(DfsPinAddOptions {
+            pin_root: matches.value("--pin-root").map(PathBuf::from),
+            file_system_id: filesystem()?.unwrap_or_else(default_dfs_file_system_id),
+            path: non_empty_string(required_option(matches, "--path")?, "path")
+                .map_err(semantic_parse_error)?,
+            object_id: matches
+                .value("--object")
+                .map(parse_dfs_object_id)
+                .transpose()
+                .map_err(semantic_parse_error)?,
+            node_id: node()?,
+            mode: mode()?.unwrap_or(DfsPinMode::Content),
+            json: matches.contains("--json"),
+        })),
+        "remove" => Ok(DfsPinCliCommand::Remove(DfsPinRemoveOptions {
+            pin_root: matches.value("--pin-root").map(PathBuf::from),
+            file_system_id: filesystem()?.unwrap_or_else(default_dfs_file_system_id),
+            path: non_empty_string(required_option(matches, "--path")?, "path")
+                .map_err(semantic_parse_error)?,
+            node_id: node()?,
+            mode: mode()?,
+            json: matches.contains("--json"),
+        })),
+        _ => Err(CliParseError::Parse {
+            detail: format!("unknown dfs pin command `{command}`"),
+        }),
     }
 }
 
-pub(crate) fn parse_dfs_pin_list_options(args: &[String]) -> Result<DfsPinListOptions, CliError> {
-    let mut options = DfsPinListOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--pin-root" => {
-                index += 1;
-                let Some(path) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.pin_root = Some(PathBuf::from(path));
-            }
-            "--filesystem" | "--fs" => {
-                index += 1;
-                let Some(file_system_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.file_system_id = Some(parse_dfs_file_system_id(file_system_id)?);
-            }
-            "--json" => options.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-pub(crate) fn parse_dfs_pin_add_options(args: &[String]) -> Result<DfsPinAddOptions, CliError> {
-    let mut pin_root = None;
-    let mut file_system_id = None;
-    let mut path = None;
-    let mut object_id = None;
-    let mut node_id = None;
-    let mut mode = DfsPinMode::Content;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--pin-root" => {
-                index += 1;
-                pin_root = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--filesystem" | "--fs" => {
-                index += 1;
-                file_system_id = Some(parse_dfs_file_system_id(
-                    args.get(index).ok_or(CliError::Usage)?,
-                )?);
-            }
-            "--path" => {
-                index += 1;
-                path = Some(non_empty_string(
-                    args.get(index).ok_or(CliError::Usage)?,
-                    "path",
-                )?);
-            }
-            "--object" => {
-                index += 1;
-                object_id = Some(parse_dfs_object_id(
-                    args.get(index).ok_or(CliError::Usage)?,
-                )?);
-            }
-            "--node" => {
-                index += 1;
-                node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
-            }
-            "--mode" => {
-                index += 1;
-                mode = parse_dfs_pin_mode(args.get(index).ok_or(CliError::Usage)?)?;
-            }
-            "--json" => json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(DfsPinAddOptions {
-        pin_root,
-        file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
-        path: path.ok_or(CliError::Usage)?,
-        object_id,
-        node_id,
-        mode,
-        json,
-    })
-}
-
-pub(crate) fn parse_dfs_pin_remove_options(
-    args: &[String],
-) -> Result<DfsPinRemoveOptions, CliError> {
-    let mut pin_root = None;
-    let mut file_system_id = None;
-    let mut path = None;
-    let mut node_id = None;
-    let mut mode = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--pin-root" => {
-                index += 1;
-                pin_root = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--filesystem" | "--fs" => {
-                index += 1;
-                file_system_id = Some(parse_dfs_file_system_id(
-                    args.get(index).ok_or(CliError::Usage)?,
-                )?);
-            }
-            "--path" => {
-                index += 1;
-                path = Some(non_empty_string(
-                    args.get(index).ok_or(CliError::Usage)?,
-                    "path",
-                )?);
-            }
-            "--node" => {
-                index += 1;
-                node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
-            }
-            "--mode" => {
-                index += 1;
-                mode = Some(parse_dfs_pin_mode(args.get(index).ok_or(CliError::Usage)?)?);
-            }
-            "--json" => json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(DfsPinRemoveOptions {
-        pin_root,
-        file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
-        path: path.ok_or(CliError::Usage)?,
-        node_id,
-        mode,
-        json,
-    })
-}
-
-pub(crate) fn parse_dfs_expose_command(args: &[String]) -> Result<DfsExposeCliCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "init" => {
-            Ok(DfsExposeCliCommand::Init(parse_dfs_expose_common(rest)?))
-        }
-        Some((command, rest)) if command == "list" => {
-            Ok(DfsExposeCliCommand::List(parse_dfs_expose_common(rest)?))
-        }
-        Some((command, rest)) if command == "add" => {
-            Ok(DfsExposeCliCommand::Add(parse_dfs_expose_add(rest)?))
-        }
-        Some((command, rest)) if command == "remove" => {
-            Ok(DfsExposeCliCommand::Remove(parse_dfs_expose_remove(rest)?))
-        }
-        _ => Err(CliError::Usage),
+fn parse_dfs_expose_matches(
+    command: &str,
+    matches: &CliCommandMatches,
+) -> Result<DfsExposeCliCommand, CliParseError> {
+    let common = || DfsExposeCommonOptions {
+        config: matches.value("--config").map(PathBuf::from),
+        json: matches.contains("--json"),
+    };
+    match command {
+        "init" => Ok(DfsExposeCliCommand::Init(common())),
+        "list" => Ok(DfsExposeCliCommand::List(common())),
+        "add" => Ok(DfsExposeCliCommand::Add(DfsExposeAddOptions {
+            common: common(),
+            id: matches
+                .value("--id")
+                .map(|value| non_empty_string(value, "id"))
+                .transpose()
+                .map_err(semantic_parse_error)?,
+            source: PathBuf::from(required_option(matches, "--source")?),
+            dfs_path: non_empty_string(required_option(matches, "--dfs-path")?, "dfs path")
+                .map_err(semantic_parse_error)?,
+            file_system_id: matches
+                .value("--filesystem")
+                .map(parse_dfs_file_system_id)
+                .transpose()
+                .map_err(semantic_parse_error)?
+                .unwrap_or_else(default_dfs_file_system_id),
+            node_id: matches
+                .value("--node")
+                .map(parse_node_id)
+                .transpose()
+                .map_err(semantic_parse_error)?,
+            writable: !matches.contains("--read-only"),
+            follow_symlinks: matches.contains("--follow-symlinks"),
+        })),
+        "remove" => Ok(DfsExposeCliCommand::Remove(DfsExposeRemoveOptions {
+            common: common(),
+            id: non_empty_string(required_option(matches, "--id")?, "id")
+                .map_err(semantic_parse_error)?,
+        })),
+        _ => Err(CliParseError::Parse {
+            detail: format!("unknown dfs expose command `{command}`"),
+        }),
     }
 }
 
-pub(crate) fn parse_dfs_expose_common(args: &[String]) -> Result<DfsExposeCommonOptions, CliError> {
-    let mut options = DfsExposeCommonOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--config" => {
-                index += 1;
-                options.config = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--json" => options.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
+fn dfs_cli_policy(command: &DfsCliCommand) -> CliCommandPolicy {
+    if dfs_command_requires_cluster_state(command) {
+        CliCommandPolicy::cluster_required()
+    } else {
+        CliCommandPolicy::local_capable()
     }
-    Ok(options)
-}
-
-pub(crate) fn parse_dfs_expose_add(args: &[String]) -> Result<DfsExposeAddOptions, CliError> {
-    let mut common = DfsExposeCommonOptions::default();
-    let mut id = None;
-    let mut source = None;
-    let mut dfs_path = None;
-    let mut file_system_id = None;
-    let mut node_id = None;
-    let mut writable = true;
-    let mut follow_symlinks = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--config" => {
-                index += 1;
-                common.config = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--id" => {
-                index += 1;
-                id = Some(non_empty_string(
-                    args.get(index).ok_or(CliError::Usage)?,
-                    "id",
-                )?);
-            }
-            "--source" => {
-                index += 1;
-                source = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--dfs-path" | "--path" => {
-                index += 1;
-                dfs_path = Some(non_empty_string(
-                    args.get(index).ok_or(CliError::Usage)?,
-                    "dfs path",
-                )?);
-            }
-            "--filesystem" | "--fs" => {
-                index += 1;
-                file_system_id = Some(parse_dfs_file_system_id(
-                    args.get(index).ok_or(CliError::Usage)?,
-                )?);
-            }
-            "--node" => {
-                index += 1;
-                node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
-            }
-            "--read-only" => writable = false,
-            "--follow-symlinks" => follow_symlinks = true,
-            "--json" => common.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(DfsExposeAddOptions {
-        common,
-        id,
-        source: source.ok_or(CliError::Usage)?,
-        dfs_path: dfs_path.ok_or(CliError::Usage)?,
-        file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
-        node_id,
-        writable,
-        follow_symlinks,
-    })
-}
-
-pub(crate) fn parse_dfs_expose_remove(args: &[String]) -> Result<DfsExposeRemoveOptions, CliError> {
-    let mut common = DfsExposeCommonOptions::default();
-    let mut id = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--config" => {
-                index += 1;
-                common.config = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
-            }
-            "--id" => {
-                index += 1;
-                id = Some(non_empty_string(
-                    args.get(index).ok_or(CliError::Usage)?,
-                    "id",
-                )?);
-            }
-            "--json" => common.json = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(DfsExposeRemoveOptions {
-        common,
-        id: id.ok_or(CliError::Usage)?,
-    })
 }
 
 fn run_dfs_inspection(
@@ -1401,10 +1091,6 @@ fn run_dfs_inspection_against_metadata_root(
 
 pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError> {
     match command {
-        DfsCliCommand::Help => {
-            print_dfs_help();
-            Ok(())
-        }
         DfsCliCommand::Status(options) => {
             if options.cluster && options.metadata_root.is_some() {
                 return Err(CliError::Usage);

@@ -1,8 +1,10 @@
 use super::*;
+use sinomo_runtime::cli_registry::{
+    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliPositionalSpec, CliValueSpec,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DebugCliCommand {
-    Help,
     Sobj(DebugSobjOptions),
 }
 
@@ -11,34 +13,47 @@ pub(crate) struct DebugSobjOptions {
     pub(crate) path: PathBuf,
 }
 
-pub(crate) fn parse_debug_command(args: &[String]) -> Result<DebugCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(DebugCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(DebugCliCommand::Help)
-        }
-        Some((command, rest)) if command == "sobj" => {
-            Ok(DebugCliCommand::Sobj(parse_debug_sobj_options(rest)?))
-        }
-        _ => Err(CliError::Usage),
-    }
+pub(crate) fn debug_cli_command_handler() -> DeclarativeCommandHandler<DebugCliCommand> {
+    DeclarativeCommandHandler::new(
+        "debug",
+        CliCommandPolicy::default(),
+        debug_cli_spec,
+        parse_debug_matches,
+        run_debug_cli_command,
+    )
 }
 
-fn parse_debug_sobj_options(args: &[String]) -> Result<DebugSobjOptions, CliError> {
-    match args {
-        [path] => Ok(DebugSobjOptions {
-            path: PathBuf::from(path),
+fn debug_cli_spec() -> CliCommandSpec {
+    CliCommandSpec::new("debug", "inspect low-level Sinomo data")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("sobj", "decode and print a SOBJ document").with_positionals([
+                CliPositionalSpec::required(CliValueSpec::new("path", "SOBJ file path")),
+            ]),
+        ])
+}
+
+fn parse_debug_matches(
+    matches: &CliCommandMatches,
+) -> Result<DebugCliCommand, sinomo_runtime::cli_registry::CliParseError> {
+    match matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["debug", "sobj"] => Ok(DebugCliCommand::Sobj(DebugSobjOptions {
+            path: PathBuf::from(required_positional(matches, 0)?),
+        })),
+        _ => Err(sinomo_runtime::cli_registry::CliParseError::Parse {
+            detail: "debug requires a subcommand".to_string(),
         }),
-        _ => Err(CliError::Usage),
     }
 }
 
 pub(crate) fn run_debug_cli_command(command: DebugCliCommand) -> Result<(), CliError> {
     match command {
-        DebugCliCommand::Help => {
-            print_debug_help();
-            Ok(())
-        }
         DebugCliCommand::Sobj(options) => debug_print_sobj(options),
     }
 }

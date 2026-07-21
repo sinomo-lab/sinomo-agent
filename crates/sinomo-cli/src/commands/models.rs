@@ -585,45 +585,43 @@ fn trimmed_match_value(matches: &CliCommandMatches, option: &str) -> Option<Stri
 pub(crate) struct UsageOptions {
     pub(crate) provider: Option<String>,
     pub(crate) json: bool,
-    pub(crate) help: bool,
 }
 
-pub(crate) fn parse_usage_options(args: &[String]) -> Result<UsageOptions, CliError> {
-    let mut provider = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "help" | "--help" | "-h" => {
-                return Ok(UsageOptions {
-                    provider: None,
-                    json: false,
-                    help: true,
-                });
-            }
-            "--json" => {
-                json = true;
-                index += 1;
-            }
-            "--provider" => {
-                let value = args.get(index + 1).ok_or_else(|| CliError::Parse {
-                    detail: "--provider requires a provider id".to_string(),
-                })?;
-                provider = Some(value.clone());
-                index += 2;
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unknown usage option `{value}`"),
-                });
-            }
-        }
-    }
+pub(crate) fn usage_cli_command_handler() -> DeclarativeCommandHandler<UsageOptions> {
+    DeclarativeCommandHandler::new(
+        "usage",
+        CliCommandPolicy::local_capable(),
+        usage_cli_spec,
+        parse_usage_matches,
+        usage,
+    )
+}
+
+fn usage_cli_spec() -> CliCommandSpec {
+    CliCommandSpec::new("usage", "show provider subscription usage").with_options([
+        CliOptionSpec::value(
+            "--provider",
+            "provider id",
+            CliValueSpec::new("provider", "provider id").with_choices(
+                subscription_usage_provider_ids()
+                    .iter()
+                    .map(|provider| CliAutocompleteChoice::new(*provider, "usage provider")),
+            ),
+        ),
+        CliOptionSpec::flag("--json", "print JSON output"),
+    ])
+}
+
+fn parse_usage_matches(matches: &CliCommandMatches) -> Result<UsageOptions, CliParseError> {
     Ok(UsageOptions {
-        provider,
-        json,
-        help: false,
+        provider: matches.value("--provider").map(str::to_string),
+        json: matches.contains("--json"),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn parse_usage_schema_for_test(args: &[String]) -> Result<UsageOptions, CliError> {
+    parse_schema_command_for_test(usage_cli_spec(), args, parse_usage_matches)
 }
 
 pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
@@ -1316,10 +1314,6 @@ fn non_empty_option(value: String) -> Option<String> {
 }
 
 pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
-    if options.help {
-        print_usage_help();
-        return Ok(());
-    }
     let explicit_provider = options.provider.is_some();
     let providers = match options.provider {
         Some(provider) => {

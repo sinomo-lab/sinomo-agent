@@ -1,8 +1,8 @@
 //! Extensible parser and runner registry for Sinomo CLI commands.
 //!
 //! This crate deliberately owns only the command-registration seam. Concrete
-//! command crates depend on it to expose parser/runner hooks, while `sinomo-cli`
-//! composes the registry with its legacy in-crate commands.
+//! command crates depend on it to expose declarative parser/runner hooks, while
+//! `sinomo-cli` composes one command registry for parsing, help, and completion.
 
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -396,6 +396,8 @@ pub struct CliCommandSpec {
     pub options: Vec<CliOptionSpec>,
     pub positionals: Vec<CliPositionalSpec>,
     pub after_help: Vec<String>,
+    pub hidden: bool,
+    pub help_on_empty: bool,
 }
 
 impl CliCommandSpec {
@@ -409,6 +411,8 @@ impl CliCommandSpec {
             options: Vec::new(),
             positionals: Vec::new(),
             after_help: Vec::new(),
+            hidden: false,
+            help_on_empty: false,
         }
     }
 
@@ -445,6 +449,16 @@ impl CliCommandSpec {
         self
     }
 
+    pub fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    pub fn help_on_empty(mut self) -> Self {
+        self.help_on_empty = true;
+        self
+    }
+
     pub fn metadata(&self, policy: CliCommandPolicy) -> CliCommandMetadata {
         CliCommandMetadata::from_owned(
             &self.name,
@@ -457,7 +471,12 @@ impl CliCommandSpec {
     pub fn autocomplete(&self) -> CliAutocompleteSpec {
         CliAutocompleteSpec::new(&self.name, &self.about)
             .with_aliases(self.aliases.iter().cloned())
-            .with_children(self.children.iter().map(Self::autocomplete))
+            .with_children(
+                self.children
+                    .iter()
+                    .filter(|child| !child.hidden)
+                    .map(Self::autocomplete),
+            )
             .with_options(self.options.iter().flat_map(CliOptionSpec::autocomplete))
             .with_values(
                 self.positionals
@@ -492,6 +511,10 @@ impl CliCommandSpec {
             node = child;
             path.push(child.name.clone());
             index += 1;
+        }
+
+        if index == args.len() && node.help_on_empty {
+            return Ok(CliCommandParseOutcome::Help(node.help_at(node, &path)));
         }
 
         let mut options = BTreeMap::<String, Vec<String>>::new();
@@ -835,6 +858,9 @@ fn append_help_lines(node: &CliCommandSpec, path: &[String], lines: &mut Vec<Str
         lines.push(format!("      {}", node.about));
     }
     for child in &node.children {
+        if child.hidden {
+            continue;
+        }
         let mut child_path = path.to_vec();
         child_path.push(child.name.clone());
         append_help_lines(child, &child_path, lines);
@@ -911,6 +937,9 @@ pub trait CliCommand: Send {
     fn is_help(&self) -> bool {
         false
     }
+    fn requires_rollout_admission(&self) -> bool {
+        false
+    }
     fn help(&self) -> CliCommandHelp {
         CliCommandHelp::new(self.name(), std::iter::empty::<String>())
     }
@@ -939,6 +968,10 @@ impl RegisteredCliCommand {
 
     pub fn is_help(&self) -> bool {
         self.inner.is_help()
+    }
+
+    pub fn requires_rollout_admission(&self) -> bool {
+        self.inner.requires_rollout_admission()
     }
 
     pub fn help(&self) -> CliCommandHelp {
@@ -1379,6 +1412,38 @@ mod tests {
                 .children
                 .iter()
                 .any(|child| child.word == "set")
+        );
+    }
+
+    #[test]
+    fn declarative_spec_supports_help_on_empty_and_hidden_commands() {
+        let spec = CliCommandSpec::new("daemon", "manage the daemon")
+            .help_on_empty()
+            .with_children([
+                CliCommandSpec::new("status", "show daemon status"),
+                CliCommandSpec::new("__complete", "internal completion hook").hidden(),
+            ]);
+
+        assert!(matches!(
+            spec.parse(&[]).expect("empty command"),
+            CliCommandParseOutcome::Help(_)
+        ));
+        let CliCommandParseOutcome::Matches(matches) = spec
+            .parse(&["__complete".to_string()])
+            .expect("hidden command remains parseable")
+        else {
+            panic!("expected hidden command matches");
+        };
+        assert_eq!(matches.path(), ["daemon", "__complete"]);
+
+        let help = spec.help();
+        assert!(help.lines.iter().any(|line| line.contains("daemon status")));
+        assert!(!help.lines.iter().any(|line| line.contains("__complete")));
+        assert!(
+            spec.autocomplete()
+                .children
+                .iter()
+                .all(|child| child.word != "__complete")
         );
     }
 
