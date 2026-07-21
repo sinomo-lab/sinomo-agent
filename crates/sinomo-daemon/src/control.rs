@@ -2780,6 +2780,16 @@ pub(crate) async fn handle_daemon_connection_async(
     service_runtime: tokio::runtime::Handle,
     stream_address: String,
 ) -> Result<bool, DaemonError> {
+    if daemon_control_stream_uses_authenticated_transport_prelude(&stream).await? {
+        return handle_daemon_authenticated_transport_stream_async(
+            stream,
+            paths,
+            service_host,
+            service_runtime,
+            stream_address,
+        )
+        .await;
+    }
     if daemon_control_stream_uses_local_object_rpc_channel(&stream).await? {
         let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
         let accepted =
@@ -2938,6 +2948,201 @@ pub(crate) async fn handle_daemon_connection_async(
     )
     .await?;
     Ok(false)
+}
+
+async fn daemon_control_stream_uses_authenticated_transport_prelude(
+    stream: &sinomo_core::network::AsyncDaemonControlStream,
+) -> Result<bool, DaemonError> {
+    let mut prefix = [0_u8; 4];
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let available = tokio::time::timeout_at(deadline, stream.peek_prefix(&mut prefix))
+            .await
+            .map_err(|_| {
+                DaemonError::from(sinomo_core::network::NetworkError::timeout(
+                    "peek authenticated transport prelude",
+                    sinomo_core::network::NetworkTimeoutPhase::Idle,
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                ))
+            })??;
+        if available == 0 {
+            return Ok(false);
+        }
+        if available >= prefix.len() {
+            return Ok(
+                sinomo_core::network::authenticated_transport_prelude_prefix_matches(&prefix),
+            );
+        }
+        if !sinomo_core::network::authenticated_transport_prelude_prefix_matches(
+            &prefix[..available],
+        ) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+fn resolve_authenticated_transport_peer(
+    paths: &DaemonPaths,
+    metadata: &sinomo_core::network::AuthenticatedTransportMetadata,
+) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot), DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let directory = sinomo_core::network::cluster_directory_for(&cluster_paths).snapshot()?;
+    let mut matching_nodes = BTreeSet::new();
+    for node in directory.nodes().values() {
+        if node.endpoints.iter().any(|endpoint| {
+            sinomo_core::network::authenticated_transport_metadata_matches_endpoint(
+                metadata, endpoint,
+            )
+        }) {
+            matching_nodes.insert(node.node_id.clone());
+        }
+    }
+    if matching_nodes.len() != 1 {
+        tracing::warn!(
+            transport = ?metadata.transport,
+            matching_nodes = matching_nodes.len(),
+            "authenticated transport principal did not resolve to exactly one authorized node"
+        );
+        return Err(DaemonError::AuthDenied);
+    }
+    Ok((
+        matching_nodes
+            .into_iter()
+            .next()
+            .expect("one authenticated transport node"),
+        directory,
+    ))
+}
+
+struct DaemonRoutedConnectivityFailureSink<'a> {
+    cluster_paths: &'a sinomo_core::network::ClusterPaths,
+    state: &'a sinomo_core::ClusterBootstrapState,
+    directory: &'a sinomo_core::network::DirectorySnapshot,
+}
+
+impl sinomo_core::network::ConnectivityFailureSink for DaemonRoutedConnectivityFailureSink<'_> {
+    fn submit_edge_failure(
+        &self,
+        evidence: sinomo_core::network::DirectConnectivityFailureEvidence,
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        if evidence.source_node_id != self.state.local_node_id
+            || evidence.observer_node_id != self.state.local_node_id
+        {
+            return Err(sinomo_core::network::NetworkError::AuthDenied);
+        }
+        let endpoint = self
+            .directory
+            .node(&evidence.target_node_id)
+            .and_then(|node| {
+                node.endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.endpoint_id == evidence.endpoint_id)
+            })
+            .ok_or(sinomo_core::network::NetworkError::AuthDenied)?;
+        tracing::warn!(
+            source_node_id = %evidence.source_node_id,
+            target_node_id = %evidence.target_node_id,
+            endpoint_id = %evidence.endpoint_id,
+            reason = %evidence.reason,
+            "routed-session realization rejected a direct edge"
+        );
+        sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
+            self.cluster_paths,
+            self.state,
+            endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            None,
+            false,
+        )?;
+        Ok(())
+    }
+}
+
+async fn handle_daemon_authenticated_transport_stream_async(
+    stream: sinomo_core::network::AsyncDaemonControlStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    stream_address: String,
+) -> Result<bool, DaemonError> {
+    let mut stream = stream.into_inner();
+    let metadata = sinomo_core::network::read_authenticated_transport_prelude(&mut stream).await?;
+    let (peer_node_id, directory) = resolve_authenticated_transport_peer(&paths, &metadata)?;
+    let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let local_node_id = state.local_node_id.clone();
+    let mut link_identity = Vec::new();
+    link_identity.extend_from_slice(local_node_id.as_str().as_bytes());
+    link_identity.push(0);
+    link_identity.extend_from_slice(peer_node_id.as_str().as_bytes());
+    link_identity.push(0);
+    link_identity.extend_from_slice(&metadata.channel_binding);
+    let link_id = sinomo_core::Id::derived(
+        "sinomo.network.accepted-module-authenticated-link",
+        &link_identity,
+    );
+    let direct_stream = sinomo_core::network::AuthenticatedDirectStream::accepted(
+        Box::new(stream),
+        local_node_id.clone(),
+        peer_node_id.clone(),
+        link_id,
+        metadata.channel_binding,
+        metadata.capabilities,
+    )?;
+    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
+    let identity = sinomo_core::network::DaemonRoutedSessionIdentity::new(local_node_id, data_dir)?;
+    let link_provider = sinomo_core::network::RegisteredNetworkModuleLinkProvider::new(
+        sinomo_core::network::NetworkHealthPolicy::default(),
+    );
+    let failure_sink = DaemonRoutedConnectivityFailureSink {
+        cluster_paths: &cluster_paths,
+        state: &state,
+        directory: &directory,
+    };
+    match sinomo_core::network::accept_or_relay_routed_session(
+        direct_stream,
+        &directory,
+        &identity,
+        &link_provider,
+        Some(&failure_sink),
+    )
+    .await?
+    {
+        sinomo_core::network::RoutedSessionDisposition::Destination(stream) => {
+            let routed_peer_node_id = stream.peer_node_id.clone();
+            tracing::debug!(
+                adjacent_peer_node_id = %peer_node_id,
+                %routed_peer_node_id,
+                transport = ?metadata.transport,
+                %stream_address,
+                "accepted authenticated routed-session destination stream"
+            );
+            handle_daemon_object_rpc_stream_for_authenticated_peer_async(
+                Box::new(stream),
+                paths,
+                service_host,
+                service_runtime,
+                Some(routed_peer_node_id),
+            )
+            .await
+        }
+        sinomo_core::network::RoutedSessionDisposition::Relayed(report) => {
+            tracing::debug!(
+                session_id = %report.session_id,
+                source_node_id = %report.source_node_id,
+                destination_node_id = %report.destination_node_id,
+                relay_node_id = %report.relay_node_id,
+                next_node_id = %report.next_node_id,
+                bytes_toward_destination = report.bytes_toward_destination,
+                bytes_toward_source = report.bytes_toward_source,
+                %stream_address,
+                "completed opaque routed-session relay"
+            );
+            Ok(false)
+        }
+    }
 }
 
 async fn daemon_control_stream_uses_local_object_rpc_channel(
@@ -3612,6 +3817,23 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
 ) -> Result<bool, DaemonError> {
+    handle_daemon_object_rpc_stream_for_authenticated_peer_async(
+        stream,
+        paths,
+        service_host,
+        service_runtime,
+        None,
+    )
+    .await
+}
+
+async fn handle_daemon_object_rpc_stream_for_authenticated_peer_async(
+    stream: Box<dyn sinomo_core::network::NetworkDuplexStream>,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    expected_transport_peer: Option<NodeId>,
+) -> Result<bool, DaemonError> {
     let perf_enabled = crate::tcp_tunnel::network_perf_trace_enabled();
     let accept_started = perf_enabled.then(Instant::now);
     let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
@@ -3652,6 +3874,20 @@ pub(crate) async fn handle_daemon_object_rpc_stream_async(
                     command.signer
                 ));
             })?;
+            if expected_transport_peer
+                .as_ref()
+                .is_some_and(|expected| expected.as_str() != claimed_link_node_id)
+            {
+                crate::cluster_join_trace(format_args!(
+                    "session transport peer mismatch route={} claimed_link_node={} transport_peer={}",
+                    request.route,
+                    claimed_link_node_id,
+                    expected_transport_peer
+                        .as_ref()
+                        .expect("checked authenticated transport peer")
+                ));
+                return Err(sinomo_core::network::NetworkError::AuthDenied);
+            }
             *authenticated_slot
                 .lock()
                 .map_err(|_| sinomo_core::network::NetworkError::Io {
@@ -8840,6 +9076,46 @@ mod tests {
                 .expect("target dispatcher"),
             "target channel remains non-stopping"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_transport_prelude_is_detected_without_consumption() {
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let metadata = sinomo_core::network::AuthenticatedTransportMetadata::try_new(
+            ClusterTransportKind::Iroh,
+            "test-transport-principal",
+            *blake3::hash(b"daemon authenticated prelude detector").as_bytes(),
+            b"test-transport-proof".to_vec(),
+            sinomo_core::network::DirectStreamCapabilities::multiplexed_full_duplex(8),
+        )
+        .expect("metadata");
+        let expected = metadata.clone();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            sinomo_core::network::write_authenticated_transport_prelude(&mut stream, &metadata)
+                .await
+                .expect("write prelude");
+        });
+        let stream = listener.accept().await.expect("accept");
+
+        assert!(
+            daemon_control_stream_uses_authenticated_transport_prelude(&stream)
+                .await
+                .expect("detect prelude")
+        );
+        let mut raw = stream.into_inner();
+        assert_eq!(
+            sinomo_core::network::read_authenticated_transport_prelude(&mut raw)
+                .await
+                .expect("read unconsumed prelude"),
+            expected
+        );
+        client.await.expect("client task");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

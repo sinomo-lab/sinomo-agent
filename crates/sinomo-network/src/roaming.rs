@@ -1,4 +1,4 @@
-//! Roaming transport support and transport-neutral RPC stream dialing.
+//! Built-in loopback/LAN transport support and endpoint parsing.
 //!
 //! Built-in loopback/LAN-TCP paths stay in this crate. Additional transports
 //! are loaded at runtime through the network-module registry and are dialed by
@@ -229,17 +229,13 @@ pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
             .await?;
             Ok(Box::new(stream.into_inner()))
         }
-        ref transport => {
-            let module = crate::network_module::registered_network_module_for_transport(transport)
-                .ok_or_else(|| NetworkError::Io {
-                    operation: format!("open object RPC session to {}", endpoint.address),
-                    detail: format!(
-                        "unsupported object RPC session transport {:?}",
-                        endpoint.transport
-                    ),
-                })?;
-            module.open_rpc_stream(endpoint, health).await
-        }
+        _ => Err(NetworkError::Io {
+            operation: format!("open object RPC session to {}", endpoint.address),
+            detail: format!(
+                "transport {:?} requires the node-addressed routed connector",
+                endpoint.transport
+            ),
+        }),
     }
 }
 

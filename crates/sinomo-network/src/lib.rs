@@ -16,8 +16,10 @@ mod channel;
 mod channel_transport;
 mod channel_wire;
 mod connectivity;
+mod connectivity_snapshot;
 mod connectivity_store;
 mod daemon_auth;
+mod direct_link;
 mod directory;
 mod endpoint_advertisement;
 mod endpoint_records;
@@ -33,12 +35,15 @@ mod network_module;
 pub mod network_module_abi;
 mod object;
 mod object_file_store;
+mod object_rpc_stream;
 mod path_metrics;
 mod paths;
 mod peer;
 mod roaming;
 mod route;
 mod route_graph_read_model;
+mod routed_identity;
+mod routing;
 mod rpc;
 mod rpc_future;
 mod session;
@@ -46,6 +51,8 @@ mod tcp_tunnel;
 mod timeline;
 // Framing and transfer state stay private beneath the canonical session API so
 // higher-level crates cannot assemble protocol frames themselves.
+#[cfg(test)]
+mod layer_boundary_tests;
 mod transfer;
 
 pub use channel::{
@@ -119,6 +126,12 @@ pub use connectivity::{
     cluster_connectivity_record_should_refresh, cluster_connectivity_stable_eq,
     validate_cluster_connectivity_records_for_source,
 };
+pub use connectivity_snapshot::{
+    ConnectivityFailureSink, ConnectivityGeneration, ConnectivityObservationSink,
+    ConnectivitySnapshot, ConnectivityTracker, ConnectivityView, DirectConnectivityFailureEvidence,
+    DirectConnectivityObservation, DirectConnectivityState, DirectConnectivityStatus,
+    MAX_CONNECTIVITY_FAILURE_REASON_BYTES, MAX_CONNECTIVITY_SNAPSHOT_EDGES,
+};
 pub use connectivity_store::{
     invalidate_local_cluster_connectivity_cache,
     prune_local_cluster_connectivity_records_for_state,
@@ -141,9 +154,17 @@ pub use daemon_auth::{
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
     try_sign_daemon_rpc_request_digest_from_cached_data_dir,
 };
+pub use direct_link::{
+    AUTHENTICATED_TRANSPORT_PRELUDE_PREFIX, AuthenticatedDirectStream, AuthenticatedLink,
+    AuthenticatedTransportMetadata, BoxedNetworkStream, DirectLinkFuture, DirectStreamCapabilities,
+    LinkProvider, MAX_AUTHENTICATED_TRANSPORT_IDENTITY_BYTES,
+    MAX_AUTHENTICATED_TRANSPORT_PROOF_BYTES, NetworkDuplexStream,
+    authenticated_transport_prelude_prefix_matches, read_authenticated_transport_prelude,
+    write_authenticated_transport_prelude,
+};
 pub use directory::{
-    ClusterDirectory, ClusterDirectoryFactory, DirectoryVersion, EmptyClusterDirectory,
-    cluster_directory_for, set_cluster_directory_provider,
+    ClusterDirectory, ClusterDirectoryFactory, DirectoryNode, DirectorySnapshot, DirectoryVersion,
+    EmptyClusterDirectory, cluster_directory_for, set_cluster_directory_provider,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use endpoint_advertisement::{
@@ -225,7 +246,8 @@ pub use network_module::{
     NETWORK_MODULES_SET_ENABLED_ROUTE, NetworkFuture, NetworkModule, NetworkModuleContext,
     NetworkModuleDescriptor, NetworkModuleEndpointRole, NetworkModuleListResponse,
     NetworkModuleRegistry, NetworkModuleRoutePolicy, NetworkModuleSetEnabledRequest,
-    NetworkModuleSetEnabledResponse, NetworkModuleStatus, network_module_registry,
+    NetworkModuleSetEnabledResponse, NetworkModuleStatus, RegisteredNetworkModuleLinkProvider,
+    authenticated_transport_metadata_matches_endpoint, network_module_registry,
     network_modules_rpc_route_policy, set_network_module_registry,
 };
 pub use network_module_abi::FfiNetworkModule;
@@ -245,6 +267,14 @@ pub use route::invalidate_cluster_delivery_routing_table_cache;
 pub use route_graph_read_model::invalidate_cluster_route_graph_cache;
 pub use route_graph_read_model::{
     read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
+};
+pub use routed_identity::DaemonRoutedSessionIdentity;
+pub use routing::{
+    CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
+    MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop, RouteTrace,
+    RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
+    RoutedSessionDisposition, RoutedSessionIdentity, accept_direct_routed_session,
+    accept_or_relay_routed_session, connect_direct_routed_endpoint, plan_routes,
 };
 pub use rpc::{
     CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,
@@ -268,6 +298,20 @@ pub use object::{
 pub use object::{write_object_frame_async, write_object_frame_async_timed};
 // Unconditional since stage C: see read_object_frame_async above.
 pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
+/// Pre-production stream-native object-RPC contract and conformance entry points.
+/// Production delivery must not call these until the matching legacy carrier
+/// is deleted in the same bounded migration slice.
+#[doc(hidden)]
+pub mod __object_rpc_stream_contract {
+    pub use super::object_rpc_stream::{
+        OBJECT_RPC_STREAM_INLINE_BODY_BYTES, OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES,
+        OBJECT_RPC_STREAM_MAX_HEAD_BYTES, OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES,
+        ObjectRpcBodyVerification, ObjectRpcStreamBody, ObjectRpcStreamBodyVerifier,
+        ObjectRpcStreamCall, ObjectRpcStreamIncomingBody, ObjectRpcStreamIncomingCall,
+        ObjectRpcStreamReply, ObjectRpcStreamResponse, RpcDeliveryOutcome, RpcPeerContext,
+        RpcPeerIdentity, call_object_rpc_stream, serve_object_rpc_stream,
+    };
+}
 pub use paths::ClusterPaths;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
@@ -298,10 +342,9 @@ pub use rpc::{
 };
 pub use rpc_future::ClusterMembershipRpcFuture;
 pub use session::{
-    NetworkDuplexStream, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcSessionCall,
-    ObjectRpcSessionRequest, ObjectRpcSessionResponder, ObjectRpcSessionResponse,
-    ObjectRpcSessionResult, accept_object_rpc_server_session,
-    object_rpc_session_wire_prefix_matches,
+    ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcSessionCall, ObjectRpcSessionRequest,
+    ObjectRpcSessionResponder, ObjectRpcSessionResponse, ObjectRpcSessionResult,
+    accept_object_rpc_server_session, object_rpc_session_wire_prefix_matches,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;

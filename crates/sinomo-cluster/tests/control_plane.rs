@@ -368,24 +368,39 @@ impl NetworkModule for TestIrohNetworkModule {
         Ok(())
     }
 
-    fn open_rpc_stream(
+    fn connect_link(
         &self,
-        _endpoint: &ClusterEndpointRecord,
+        endpoint: &ClusterEndpointRecord,
         _health: NetworkHealthPolicy,
-    ) -> NetworkFuture<Box<dyn NetworkDuplexStream>> {
+    ) -> NetworkFuture<AuthenticatedLink> {
+        let peer_node_id = endpoint.node_id.clone();
+        let link_id = endpoint.endpoint_id.clone();
         Box::pin(async move {
-            let (client, mut server) = tokio::io::duplex(64 * 1024);
-            tokio::spawn(async move {
-                let mut buffer = [0_u8; 8192];
-                loop {
-                    let read = tokio::io::AsyncReadExt::read(&mut server, &mut buffer).await?;
-                    if read == 0 {
-                        return Ok::<(), std::io::Error>(());
-                    }
-                    tokio::io::AsyncWriteExt::write_all(&mut server, &buffer[..read]).await?;
-                }
-            });
-            Ok(Box::new(client) as Box<dyn NetworkDuplexStream>)
+            AuthenticatedLink::new(
+                NodeId::generate(),
+                peer_node_id,
+                link_id,
+                [7; 32],
+                DirectStreamCapabilities::multiplexed_full_duplex(8),
+                || {
+                    Box::pin(async move {
+                        let (client, mut server) = tokio::io::duplex(64 * 1024);
+                        tokio::spawn(async move {
+                            let mut buffer = [0_u8; 8192];
+                            loop {
+                                let read =
+                                    tokio::io::AsyncReadExt::read(&mut server, &mut buffer).await?;
+                                if read == 0 {
+                                    return Ok::<(), std::io::Error>(());
+                                }
+                                tokio::io::AsyncWriteExt::write_all(&mut server, &buffer[..read])
+                                    .await?;
+                            }
+                        });
+                        Ok(Box::new(client) as BoxedNetworkStream)
+                    })
+                },
+            )
         })
     }
 

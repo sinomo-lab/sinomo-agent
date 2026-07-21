@@ -1,10 +1,12 @@
-//! Iroh dial client for raw, full-duplex daemon RPC streams.
+//! Iroh dial client for authenticated, full-duplex transport streams.
 //!
 //! Connection establishment is retried within one aggregate connect budget.
 //! No object-RPC or transfer bytes are interpreted in this module.
 
 use crate::endpoint::{IrohEndpointRecord, iroh_endpoint_record_from_address};
-use crate::proxy::{IROH_ROAMING_PROTOCOL, sinomo_iroh_endpoint_builder};
+use crate::proxy::{
+    IROH_AUTHENTICATED_LINK_EXPORTER_LABEL, IROH_ROAMING_PROTOCOL, sinomo_iroh_endpoint_builder,
+};
 use sinomo_core::network::{
     DaemonRpcTimeouts, NetworkDeliveryState, NetworkError, NetworkTimeoutPhase,
 };
@@ -12,24 +14,36 @@ use sinomo_core::node::{ClusterId, NodeId};
 use std::collections::HashMap;
 use std::time::Duration;
 
-const IROH_DAEMON_RPC_MAX_ATTEMPTS: usize = 3;
-const IROH_DAEMON_RPC_RETRY_INITIAL: Duration = Duration::from_millis(40);
-const IROH_DAEMON_RPC_RETRY_MAX: Duration = Duration::from_millis(250);
+const IROH_DAEMON_STREAM_MAX_ATTEMPTS: usize = 3;
+const IROH_DAEMON_STREAM_RETRY_INITIAL: Duration = Duration::from_millis(40);
+const IROH_DAEMON_STREAM_RETRY_MAX: Duration = Duration::from_millis(250);
 
 /// Long-lived client side of the Iroh daemon transport.
 ///
 /// One module instance owns one Iroh endpoint and one cached connection per
-/// remote endpoint public key. Each daemon RPC gets its own bidirectional
+/// remote endpoint public key. Each opened link gets one bidirectional
 /// stream on the cached connection; broken connections are evicted so normal
 /// retry/recovery can reconnect.
 #[derive(Default)]
 pub struct IrohDaemonDialer {
     endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
+    shared_endpoint:
+        tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<Option<iroh::Endpoint>>>>,
     connections: tokio::sync::Mutex<HashMap<String, CachedIrohConnection>>,
 }
 
+#[derive(Clone)]
 struct CachedIrohConnection {
     connection: iroh::endpoint::Connection,
+    local_endpoint: iroh::Endpoint,
+}
+
+pub struct OpenedIrohDaemonStream {
+    pub send: iroh::endpoint::SendStream,
+    pub recv: iroh::endpoint::RecvStream,
+    pub peer_transport_identity: String,
+    pub channel_binding: [u8; 32],
+    pub transport_proof: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +86,7 @@ impl IrohDaemonDialer {
         &self,
         address: &str,
         timeouts: DaemonRpcTimeouts,
-    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), NetworkError> {
+    ) -> Result<OpenedIrohDaemonStream, NetworkError> {
         let record = iroh_endpoint_record_from_address(
             address,
             &ClusterId::from_legacy_named("cluster_iroh_dial_placeholder")
@@ -100,17 +114,28 @@ impl IrohDaemonDialer {
                         error,
                         NetworkDeliveryState::DefinitelyNotSent,
                     );
-                    if attempt >= IROH_DAEMON_RPC_MAX_ATTEMPTS {
+                    if attempt >= IROH_DAEMON_STREAM_MAX_ATTEMPTS {
                         return Err(error);
                     }
                     let remaining = connect_deadline.remaining()?;
-                    let Some(delay) = iroh_daemon_rpc_retry_delay_with_budget(attempt, remaining)
+                    let Some(delay) =
+                        iroh_daemon_stream_retry_delay_with_budget(attempt, remaining)
                     else {
                         return Err(error);
                     };
                     tokio::time::sleep(delay).await;
                 }
             }
+        }
+    }
+
+    pub async fn use_shared_endpoint(
+        &self,
+        endpoint: tokio::sync::watch::Receiver<Option<iroh::Endpoint>>,
+    ) {
+        *self.shared_endpoint.lock().await = Some(endpoint);
+        if let Some(owned) = self.endpoint.lock().await.take() {
+            owned.close().await;
         }
     }
 
@@ -125,12 +150,24 @@ impl IrohDaemonDialer {
         if let Some(endpoint) = self.endpoint.lock().await.take() {
             endpoint.close().await;
         }
+        self.shared_endpoint.lock().await.take();
     }
 
     async fn endpoint(
         &self,
         deadline: IrohConnectDeadline,
     ) -> Result<iroh::Endpoint, NetworkError> {
+        if let Some(shared) = self.shared_endpoint.lock().await.as_ref() {
+            return shared
+                .borrow()
+                .as_ref()
+                .filter(|endpoint| !endpoint.is_closed())
+                .cloned()
+                .ok_or_else(|| NetworkError::Io {
+                    operation: "use shared iroh endpoint".to_string(),
+                    detail: "the advertised iroh endpoint is restarting".to_string(),
+                });
+        }
         let mut guard = iroh_mutex_lock_before_connect_deadline(&self.endpoint, deadline).await?;
         if let Some(endpoint) = guard.as_ref()
             && !endpoint.is_closed()
@@ -180,12 +217,12 @@ impl IrohDaemonDialer {
         _address: &str,
         remote_addr: iroh::EndpointAddr,
         deadline: IrohConnectDeadline,
-    ) -> Result<iroh::endpoint::Connection, NetworkError> {
+    ) -> Result<CachedIrohConnection, NetworkError> {
         {
             let connections =
                 iroh_mutex_lock_before_connect_deadline(&self.connections, deadline).await?;
             if let Some(cached) = connections.get(cache_key) {
-                return Ok(cached.connection.clone());
+                return Ok(cached.clone());
             }
         }
 
@@ -218,15 +255,14 @@ impl IrohDaemonDialer {
         if let Some(cached) = connections.get(cache_key) {
             // Another request connected while this one was in flight. Reuse
             // the installed connection and let the duplicate close on drop.
-            return Ok(cached.connection.clone());
+            return Ok(cached.clone());
         }
-        connections.insert(
-            cache_key.to_string(),
-            CachedIrohConnection {
-                connection: connection.clone(),
-            },
-        );
-        Ok(connection)
+        let cached = CachedIrohConnection {
+            connection,
+            local_endpoint: endpoint,
+        };
+        connections.insert(cache_key.to_string(), cached.clone());
+        Ok(cached)
     }
 
     async fn evict_connection(&self, cache_key: &str, reason: &'static [u8]) {
@@ -243,14 +279,57 @@ async fn open_iroh_daemon_stream_attempt_async(
     address: &str,
     remote_addr: iroh::EndpointAddr,
     connect_deadline: IrohConnectDeadline,
-) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), NetworkError> {
-    let connection = dialer
+) -> Result<OpenedIrohDaemonStream, NetworkError> {
+    let cached = dialer
         .connection(cache_key, address, remote_addr, connect_deadline)
         .await?;
-    let open = connection.open_bi();
+    let connection = &cached.connection;
+    let peer_transport_identity = connection.remote_id().to_string();
+    if peer_transport_identity != cache_key {
+        dialer
+            .evict_connection(cache_key, b"remote endpoint identity mismatch")
+            .await;
+        return Err(NetworkError::AuthDenied);
+    }
+    let mut channel_binding = [0_u8; 32];
+    connection
+        .export_keying_material(
+            &mut channel_binding,
+            IROH_AUTHENTICATED_LINK_EXPORTER_LABEL,
+            b"",
+        )
+        .map_err(|source| NetworkError::Io {
+            operation: "export iroh authenticated-link binding".to_string(),
+            detail: format!("{source:?}"),
+        })?;
+    let open = async {
+        let (mut send, mut recv) =
+            connection
+                .open_bi()
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "open iroh daemon stream".to_string(),
+                    detail: source.to_string(),
+                })?;
+        let transport_proof = crate::auth::authenticate_outbound_stream(
+            &cached.local_endpoint,
+            &connection.remote_id(),
+            &channel_binding,
+            &mut send,
+            &mut recv,
+        )
+        .await?;
+        Ok::<_, NetworkError>(OpenedIrohDaemonStream {
+            send,
+            recv,
+            peer_transport_identity: peer_transport_identity.clone(),
+            channel_binding,
+            transport_proof,
+        })
+    };
     if let Some(connect_timeout) = connect_deadline.remaining()? {
         match tokio::time::timeout(connect_timeout, open).await {
-            Ok(Ok(streams)) => Ok(streams),
+            Ok(Ok(opened)) => Ok(opened),
             Ok(Err(source)) => {
                 dialer
                     .evict_connection(cache_key, b"open stream failed")
@@ -269,7 +348,7 @@ async fn open_iroh_daemon_stream_attempt_async(
         }
     } else {
         match open.await {
-            Ok(streams) => Ok(streams),
+            Ok(opened) => Ok(opened),
             Err(source) => {
                 dialer
                     .evict_connection(cache_key, b"open stream failed")
@@ -317,19 +396,19 @@ fn iroh_error_with_delivery_state(
     }
 }
 
-fn iroh_daemon_rpc_retry_delay_with_budget(
+fn iroh_daemon_stream_retry_delay_with_budget(
     attempt: usize,
     remaining: Option<Duration>,
 ) -> Option<Duration> {
-    if attempt >= IROH_DAEMON_RPC_MAX_ATTEMPTS
+    if attempt >= IROH_DAEMON_STREAM_MAX_ATTEMPTS
         || remaining.is_some_and(|remaining| remaining <= Duration::from_millis(5))
     {
         return None;
     }
     let shift = attempt.saturating_sub(1).min(5);
-    let delay = IROH_DAEMON_RPC_RETRY_INITIAL
+    let delay = IROH_DAEMON_STREAM_RETRY_INITIAL
         .saturating_mul(2_u32.saturating_pow(u32::try_from(shift).unwrap_or(5)))
-        .min(IROH_DAEMON_RPC_RETRY_MAX);
+        .min(IROH_DAEMON_STREAM_RETRY_MAX);
     Some(match remaining {
         Some(remaining) => delay.min(remaining.saturating_sub(Duration::from_millis(1))),
         None => delay,
@@ -444,25 +523,25 @@ mod tests {
     }
 
     #[test]
-    fn rpc_retry_delay_is_bounded_by_attempts_and_deadline() {
+    fn stream_retry_delay_is_bounded_by_attempts_and_deadline() {
         assert_eq!(
-            iroh_daemon_rpc_retry_delay_with_budget(1, Some(Duration::from_secs(5))),
+            iroh_daemon_stream_retry_delay_with_budget(1, Some(Duration::from_secs(5))),
             Some(Duration::from_millis(40))
         );
         assert_eq!(
-            iroh_daemon_rpc_retry_delay_with_budget(2, Some(Duration::from_secs(5))),
+            iroh_daemon_stream_retry_delay_with_budget(2, Some(Duration::from_secs(5))),
             Some(Duration::from_millis(80))
         );
         assert_eq!(
-            iroh_daemon_rpc_retry_delay_with_budget(1, Some(Duration::from_millis(10))),
+            iroh_daemon_stream_retry_delay_with_budget(1, Some(Duration::from_millis(10))),
             Some(Duration::from_millis(9))
         );
         assert_eq!(
-            iroh_daemon_rpc_retry_delay_with_budget(3, Some(Duration::from_secs(5))),
+            iroh_daemon_stream_retry_delay_with_budget(3, Some(Duration::from_secs(5))),
             None
         );
         assert_eq!(
-            iroh_daemon_rpc_retry_delay_with_budget(1, Some(Duration::from_millis(5))),
+            iroh_daemon_stream_retry_delay_with_budget(1, Some(Duration::from_millis(5))),
             None
         );
     }
