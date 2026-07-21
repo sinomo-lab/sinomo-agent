@@ -152,6 +152,12 @@ any authenticated duplex stream and does not know endpoints or node paths.
 Domain crates own target selection, typed values, service methods, authorization,
 idempotency, and side effects.
 
+Connectivity contains direct observed edges only. Routing owns transitive
+reachability and must realize an authorized graph path as an authenticated
+direct or relayed stream; graph reachability is not a substitute for a usable
+data path. Every authorized node pair in the same current routable connected
+component must be able to communicate through routing.
+
 Direct-link, connectivity, routing, and object-RPC mechanisms remain internal
 layers of the single R0 `sinomo-network` crate. Their separation does not change
 the workspace crate structure.

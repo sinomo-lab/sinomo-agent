@@ -11,6 +11,12 @@ the [network architecture](../network-architecture.md): direct authenticated
 links, connectivity snapshots, node-addressed routed streams, and object RPC
 over an arbitrary authenticated duplex stream.
 
+The central acceptance property is component-wide path realization: every pair
+of authorized nodes in the same current routable connected component must be
+able to establish an authenticated direct or relayed session. Connectivity
+records direct edges; routing derives component membership, owns every
+transitive relationship, and makes those relationships usable.
+
 All of these layers remain internal modules of the existing `sinomo-network`
 crate. Creating `sinomo-link`, `sinomo-connectivity`, `sinomo-routing`, or
 `sinomo-object-rpc` workspace crates is explicitly out of scope.
@@ -81,7 +87,8 @@ Define the transport-neutral types without changing production delivery:
 - `AuthenticatedLink` and direct-stream capability metadata;
 - immutable `ConnectivitySnapshot` and `ConnectivityView`;
 - pure `plan_routes` inputs and outputs;
-- `RoutedConnector`, `PeerStream`, and channel-binding metadata;
+- `RoutedConnector`, routed availability, `PeerStream`, and channel-binding
+  metadata;
 - one-call-per-stream object-RPC client and server functions; and
 - explicit RPC delivery outcomes: not sent, rejected, possibly applied, and
   completed.
@@ -107,9 +114,11 @@ Keep these facts separate:
 - authoritative membership;
 - fresh presence;
 - direct reachability;
-- routed reachability;
-- active connection state; and
-- unknown or expired evidence.
+- direct unreachability; and
+- unknown or expired direct-edge evidence.
+
+Connectivity does not derive or publish multi-hop reachability. Routing owns
+candidate paths, active direct and relayed sessions, and routed availability.
 
 The current cluster control plane remains responsible for publishing
 source-owned observations. `sinomo-cluster` adapts its committed projection into
@@ -145,10 +154,12 @@ Exit criteria:
 - direct stream throughput is measured against the underlying transport
   baseline.
 
-## Stage D: Multi-hop Routed Sessions
+## Stage D: Component-wide Routed Sessions
 
-Implement fixed-path session establishment and opaque stream forwarding for
-A-to-B-to-C paths.
+Implement multi-hop session establishment and opaque stream forwarding for all
+node pairs in a routable connected component. This stage absorbs transitive
+connectivity establishment entirely into routing: a component is useful only
+when the routing executor can realize its eligible paths as endpoint sessions.
 
 The signed session descriptor binds source, destination, session ID, ordered
 path, hop limit, deadline, and end-to-end key material. The destination returns
@@ -161,10 +172,16 @@ semantics without changing the `PeerStream` destination contract.
 
 Exit criteria:
 
-- A can establish a target-bound stream to C when only A-to-B and B-to-C direct
-  edges exist;
-- B cannot retarget the session, impersonate C, alter protected bytes, or create
-  a successful acceptance without C;
+- every ordered node pair in connected line, ring, star, and mesh conformance
+  topologies can establish a target-bound stream when the required direct edges
+  remain valid;
+- every path emitted from a bounded conformance graph is either realized by the
+  routing executor or fails with a specific edge rejection that updates the
+  next connectivity snapshot;
+- connectivity never stores synthetic transitive edges, derives component
+  membership, or reports routed sessions as its own state;
+- an intermediate relay cannot retarget a session, impersonate an endpoint,
+  alter protected bytes, or create a successful destination acceptance;
 - loops, repeated nodes, expired deadlines, and exhausted hop limits fail
   before stream acceptance;
 - relay memory remains bounded under a stalled next hop; and
@@ -263,9 +280,9 @@ The migration is not complete without all of the following:
 | Surface | Required evidence |
 |---|---|
 | Dependency boundaries | Existing workspace trust-ring checks plus `sinomo-network` module forbidden-dependency tests. |
-| Connectivity | Directed-edge, expiry, provenance, generation, and status-projection tests. |
-| Planning | Deterministic direct, relay, no-route, stale-input, capability, and loop tests. |
-| Routing | Real three-node A-to-B-to-C establishment, identity, tamper, backpressure, and failure tests. |
+| Connectivity | Directed direct-edge, expiry, provenance, generation, and direct-status tests with no synthetic transitive edges. |
+| Planning | Deterministic direct, relay, no-route, stale-input, capability, and loop tests whose paths are accepted by the executor. |
+| Routing | Real multi-node connected-component establishment plus bounded-graph all-pairs path realization, identity, tamper, backpressure, and failed-edge feedback tests. |
 | Object RPC | In-memory conformance tests plus the complete request/response payload matrix. |
 | Retry safety | Not-sent versus possibly-applied fault injection around every request phase. |
 | Performance | Raw direct-link baseline, direct routed stream, relayed stream, and object-RPC measurements by target. |
