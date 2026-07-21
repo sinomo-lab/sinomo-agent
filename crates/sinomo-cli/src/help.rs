@@ -10,8 +10,6 @@ pub(crate) const BUILTIN_TOP_LEVEL_USAGE_COMMANDS: &[&str] = &[
     "rollout",
     "dfs",
     "memory",
-    "models",
-    "model",
     "usage",
     "providers",
     "voice",
@@ -27,7 +25,7 @@ pub fn print_usage() {
         println!("  sinomo {command}");
     }
     for command in cli_command_registry().metadata() {
-        if !BUILTIN_TOP_LEVEL_USAGE_COMMANDS.contains(&command.name) {
+        if !BUILTIN_TOP_LEVEL_USAGE_COMMANDS.contains(&command.name.as_str()) {
             println!("  sinomo {}", command.name);
         }
     }
@@ -447,41 +445,6 @@ pub(super) fn print_dfs_help() {
         "  sinomo dfs expose add --source <path> --dfs-path <path> [--id <id>] [--filesystem <file_system_id>] [--node <node_id>] [--read-only] [--follow-symlinks] [--config <path>] [--json]"
     );
     println!("  sinomo dfs expose remove --id <id> [--config <path>] [--json]");
-}
-
-pub(super) fn print_models_help() {
-    println!("Models:");
-    println!("  sinomo models");
-    println!("      Show the current default model and this help.");
-    println!("  sinomo model");
-    println!("      Alias for `sinomo models`.");
-    println!("  sinomo models list [--provider <provider>]");
-    println!("      List available or known models.");
-    println!("  sinomo models default --provider <provider> --model <model>");
-    println!("      Set the default model for TUI and model-backed commands.");
-    println!(
-        "  sinomo models options [show] [--provider <provider>] [--account <account>] [--model <model>]"
-    );
-    println!("      Show provider-specific account or model options.");
-    println!(
-        "  sinomo models options set --provider <provider> [--account <account>] [--model <model>] [--reasoning-effort none|minimal|low|medium|high|xhigh|max|clear] [--reasoning-budget-tokens <n|clear>] [--text-verbosity low|medium|high|clear] [--vendor-option <key=value>] [--clear-vendor-option <key>]"
-    );
-    println!("      Update provider-specific account or model options.");
-    println!(
-        "  sinomo models options clear --provider <provider> [--account <account>] [--model <model>]"
-    );
-    println!("      Clear provider-specific options for an account or one model override.");
-    println!("  sinomo models runtime [show]");
-    println!("      Show cluster-scoped native model runtime settings.");
-    println!(
-        "  sinomo models runtime set [--native-models-cache-dir <path>] [--minicpm-v46-model-dir <path>] [--minicpm-v46-max-input-tokens <n>] [--minicpm-v46-max-output-tokens <n>] [--pytorch-endpoint <url>] [--pytorch-python <path>] [--pytorch-device auto|cpu|cuda] [--pytorch-timeout-seconds <n>] [--pytorch-mock true|false]"
-    );
-    println!("      Update cluster-scoped native model runtime settings.");
-    println!();
-    println!("Providers:");
-    for provider in default_model_provider_ids() {
-        println!("  {provider}");
-    }
 }
 
 pub(super) fn print_usage_help() {

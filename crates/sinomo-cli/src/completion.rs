@@ -99,65 +99,6 @@ const BOOLEAN_CHOICES: &[ValueChoice] = &[
     },
 ];
 
-const REASONING_EFFORT_CHOICES: &[ValueChoice] = &[
-    ValueChoice {
-        value: Cow::Borrowed("none"),
-        detail: Cow::Borrowed("explicitly disable reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("minimal"),
-        detail: Cow::Borrowed("minimal reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("low"),
-        detail: Cow::Borrowed("low reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("medium"),
-        detail: Cow::Borrowed("medium reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("high"),
-        detail: Cow::Borrowed("high reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("xhigh"),
-        detail: Cow::Borrowed("extra-high reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("max"),
-        detail: Cow::Borrowed("maximum vendor-supported reasoning effort"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("clear"),
-        detail: Cow::Borrowed("remove this configured override"),
-    },
-];
-
-const TEXT_VERBOSITY_CHOICES: &[ValueChoice] = &[
-    ValueChoice {
-        value: Cow::Borrowed("low"),
-        detail: Cow::Borrowed("low response verbosity"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("medium"),
-        detail: Cow::Borrowed("medium response verbosity"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("high"),
-        detail: Cow::Borrowed("high response verbosity"),
-    },
-    ValueChoice {
-        value: Cow::Borrowed("clear"),
-        detail: Cow::Borrowed("remove this configured override"),
-    },
-];
-
-const CLEAR_VALUE_CHOICES: &[ValueChoice] = &[ValueChoice {
-    value: Cow::Borrowed("clear"),
-    detail: Cow::Borrowed("remove this configured override"),
-}];
-
 const TUI_FILE_TARGET_CHOICES: &[ValueChoice] = &[
     ValueChoice {
         value: Cow::Borrowed("sifs:/"),
@@ -1240,20 +1181,6 @@ fn slash_command_registry() -> CommandSpec {
                 vec![],
             ),
             cmd(
-                "models",
-                "configure language model defaults and runtime",
-                models_children(),
-                vec![],
-                vec![],
-            ),
-            cmd(
-                "model",
-                "alias for models",
-                models_children(),
-                vec![],
-                vec![],
-            ),
-            cmd(
                 "providers",
                 "manage provider credentials",
                 providers_children(),
@@ -1606,121 +1533,6 @@ fn dfs_children() -> Vec<CommandSpec> {
             ],
             vec![],
             vec![],
-        ),
-    ]
-}
-
-fn models_children() -> Vec<CommandSpec> {
-    vec![
-        cmd(
-            "list",
-            "list known models",
-            vec![],
-            opts(&["--provider"]),
-            vec![],
-        ),
-        cmd(
-            "default",
-            "set default provider/model",
-            vec![],
-            opts(&["--provider", "--model", "--account"]),
-            vec![],
-        ),
-        cmd(
-            "options",
-            "inspect or update provider/model options",
-            vec![
-                cmd(
-                    "show",
-                    "show provider/model options",
-                    vec![],
-                    opts(&["--provider", "--account", "--model"]),
-                    vec![],
-                ),
-                cmd(
-                    "set",
-                    "set provider/model options",
-                    vec![],
-                    model_options_set_opts(),
-                    vec![],
-                ),
-                cmd(
-                    "clear",
-                    "clear provider/model options",
-                    vec![],
-                    opts(&["--provider", "--account", "--model"]),
-                    vec![],
-                ),
-            ],
-            opts(&["--provider", "--account", "--model"]),
-            vec![],
-        ),
-        cmd(
-            "runtime",
-            "inspect or update local model runtime",
-            vec![
-                cmd("show", "show runtime config", vec![], vec![], vec![]),
-                cmd(
-                    "set",
-                    "set runtime config",
-                    vec![],
-                    opts(&[
-                        "--minicpm-endpoint",
-                        "--minicpm-model-dir",
-                        "--native-models-cache-dir",
-                        "--max-input-tokens",
-                        "--max-output-tokens",
-                        "--python",
-                        "--device",
-                        "--timeout-seconds",
-                        "--mock",
-                    ]),
-                    vec![],
-                ),
-            ],
-            vec![],
-            vec![],
-        ),
-    ]
-}
-
-fn model_options_set_opts() -> Vec<OptionSpec> {
-    vec![
-        option_for_name("--provider"),
-        option_for_name("--account"),
-        option_for_name("--model"),
-        option(
-            "--reasoning-effort",
-            "reasoning effort",
-            Some(value(
-                "effort",
-                "reasoning effort",
-                REASONING_EFFORT_CHOICES,
-            )),
-        ),
-        option(
-            "--reasoning-budget-tokens",
-            "reasoning budget tokens",
-            Some(value(
-                "n|clear",
-                "token budget or clear",
-                CLEAR_VALUE_CHOICES,
-            )),
-        ),
-        option(
-            "--text-verbosity",
-            "text verbosity",
-            Some(value("verbosity", "text verbosity", TEXT_VERBOSITY_CHOICES)),
-        ),
-        option(
-            "--vendor-option",
-            "vendor option key=value",
-            Some(value("key=value", "vendor option key=value", &[])),
-        ),
-        option(
-            "--clear-vendor-option",
-            "clear vendor option",
-            Some(value("key", "vendor option key", &[])),
         ),
     ]
 }
@@ -2199,6 +2011,33 @@ mod tests {
         assert!(channel_output.items.iter().any(|item| {
             item.kind == SlashCompletionKind::Hint && item.label == "introducer=path"
         }));
+    }
+
+    #[test]
+    fn slash_completion_uses_declarative_models_schema() {
+        let runtime = slash_completions("/models runtime set --p", "/models runtime set --p".len())
+            .expect("runtime options");
+        for expected in [
+            "--pytorch-endpoint",
+            "--pytorch-python",
+            "--pytorch-device",
+            "--pytorch-timeout-seconds",
+            "--pytorch-mock",
+        ] {
+            assert!(
+                runtime.items.iter().any(|item| item.label == expected),
+                "missing completion {expected}"
+            );
+        }
+        assert!(!runtime.items.iter().any(|item| item.label == "--python"));
+
+        let effort = slash_completions(
+            "/model options set --reasoning-effort ",
+            "/model options set --reasoning-effort ".len(),
+        )
+        .expect("reasoning values");
+        assert!(effort.items.iter().any(|item| item.label == "high"));
+        assert!(effort.items.iter().any(|item| item.label == "clear"));
     }
 
     #[test]

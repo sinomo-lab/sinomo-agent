@@ -294,6 +294,9 @@ impl From<CliParseError> for CliError {
         match error {
             CliParseError::Usage => Self::Usage,
             CliParseError::Parse { detail } => Self::Parse { detail },
+            error @ CliParseError::InvalidUsage { .. } => Self::Parse {
+                detail: error.to_string(),
+            },
         }
     }
 }

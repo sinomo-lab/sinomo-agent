@@ -45,10 +45,9 @@ use super::{
     models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
-    parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_rollout_status,
+    parse_dfs_command, parse_install_options, parse_models_command, parse_provider_command,
+    parse_rollout_command, parse_slash_command, parse_test_command, parse_uninstall_options,
+    parse_usage_options, read_cluster_rollout_status,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
     rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_missing_status_grace,
     rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
@@ -793,7 +792,7 @@ fn top_level_cli_parser_routes_subcommands() {
     ));
     assert!(matches!(
         parse_cli_command(&["models".to_string(), "list".to_string()]).expect("models"),
-        CliCommand::Models(ModelsCliCommand::List(_))
+        CliCommand::Registered(command) if command.name() == "models"
     ));
     assert!(matches!(
         parse_cli_command(&["test".to_string(), "list".to_string()]).expect("test list"),
@@ -814,16 +813,17 @@ fn top_level_cli_parser_routes_subcommands() {
                 && options.require_cluster
     ));
     assert!(matches!(
-        parse_cli_command(&["models".to_string()]).expect("models help"),
-        CliCommand::Models(ModelsCliCommand::Help)
+        parse_cli_command(&["models".to_string()]).expect("models overview"),
+        CliCommand::Registered(command) if command.name() == "models" && !command.is_help()
     ));
     assert!(matches!(
-        parse_cli_command(&["model".to_string()]).expect("model alias help"),
-        CliCommand::Models(ModelsCliCommand::Help)
+        parse_cli_command(&["model".to_string(), "--help".to_string()])
+            .expect("model alias help"),
+        CliCommand::Registered(command) if command.name() == "models" && command.is_help()
     ));
     assert!(matches!(
         parse_cli_command(&["model".to_string(), "list".to_string()]).expect("model alias"),
-        CliCommand::Models(ModelsCliCommand::List(_))
+        CliCommand::Registered(command) if command.name() == "models"
     ));
     assert!(matches!(
         parse_cli_command(&[
@@ -1014,6 +1014,62 @@ fn top_level_cli_parser_routes_subcommands() {
             })
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn models_registry_uses_schema_for_alias_help_and_errors() {
+    let alias = parse_cli_command(&[
+        "model".to_string(),
+        "list".to_string(),
+        "--provider=codex".to_string(),
+    ])
+    .expect("models alias");
+    assert!(matches!(alias, CliCommand::Registered(command) if command.name() == "models"));
+
+    let help = parse_cli_command(&[
+        "models".to_string(),
+        "options".to_string(),
+        "--help".to_string(),
+    ])
+    .expect("nested models help");
+    assert!(cli_command_is_help(&help));
+
+    let missing = parse_cli_command(&[
+        "models".to_string(),
+        "default".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+    ])
+    .expect_err("missing provider");
+    assert!(matches!(missing, CliError::Parse { ref detail }
+        if detail.contains("required option `--provider`")
+            && detail.contains("Usage: sinomo models default")));
+
+    let duplicate = parse_cli_command(&[
+        "models".to_string(),
+        "list".to_string(),
+        "--provider".to_string(),
+        "codex".to_string(),
+        "--provider".to_string(),
+        "openai".to_string(),
+    ])
+    .expect_err("duplicate provider");
+    assert!(matches!(duplicate, CliError::Parse { ref detail }
+        if detail.contains("may only be provided once")));
+}
+
+#[test]
+fn models_nested_help_does_not_execute_the_show_command() {
+    let execution = super::run_cli_command_with_capture(&[
+        "models".to_string(),
+        "options".to_string(),
+        "--help".to_string(),
+    ]);
+    execution.result.expect("models options help");
+    let output = String::from_utf8(execution.output.stdout).expect("utf8 help");
+    assert!(output.contains("sinomo models options"));
+    assert!(!output.contains("model provider options:"));
+    assert!(!output.contains("config:"));
 }
 
 #[test]
@@ -7494,12 +7550,10 @@ fn cluster_state_guard_applies_to_distributed_runtime_commands() {
             json: false,
         })
     )));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
-        ModelsCliCommand::Help
-    )));
-    assert!(cli_command_is_help(&CliCommand::Models(
-        ModelsCliCommand::Help
-    )));
+    let models_help =
+        parse_cli_command(&["models".to_string(), "--help".to_string()]).expect("models help");
+    assert!(!cli_command_requires_cluster_state(&models_help));
+    assert!(cli_command_is_help(&models_help));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
         ProviderCliCommand::Help
     )));
@@ -7512,7 +7566,8 @@ fn cluster_state_guard_applies_to_distributed_runtime_commands() {
 
 #[test]
 fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
-    let models = CliCommand::Models(ModelsCliCommand::Help);
+    let models =
+        parse_cli_command(&["models".to_string(), "list".to_string()]).expect("models list");
     assert!(cli_command_supports_degraded_local_mode(&models));
     assert!(cli_invocation_force_local_mode(
         CliRuntimeOptions::default(),
@@ -15293,22 +15348,30 @@ fn main_agent_fixture_response(
     }
 }
 
+fn parse_models_args(args: &[&str]) -> Result<ModelsCliCommand, CliParseError> {
+    parse_models_command(
+        &args
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[test]
 fn model_list_parser_accepts_optional_provider() {
     assert_eq!(
-        parse_models_list_options(&[]).expect("empty args"),
-        super::ModelListOptions { provider: None }
+        parse_models_args(&["list"]).expect("empty args"),
+        ModelsCliCommand::List(super::ModelListOptions { provider: None })
     );
     assert_eq!(
-        parse_models_list_options(&["--provider".to_string(), "github-copilot".to_string()])
-            .expect("provider"),
-        super::ModelListOptions {
+        parse_models_args(&["list", "--provider", "github-copilot"]).expect("provider"),
+        ModelsCliCommand::List(super::ModelListOptions {
             provider: Some("github-copilot".to_string())
-        }
+        })
     );
     assert!(matches!(
-        parse_models_list_options(&["github-copilot".to_string()]),
-        Err(CliError::Usage)
+        parse_models_args(&["list", "github-copilot"]),
+        Err(CliParseError::InvalidUsage { .. })
     ));
 }
 
@@ -15328,13 +15391,12 @@ fn usage_parser_accepts_provider_and_json() {
 
 #[test]
 fn model_default_parser_accepts_provider_model() {
-    let options = parse_model_default_options(&[
-        "--provider".to_string(),
-        "openai-api".to_string(),
-        "--model".to_string(),
-        "gpt-5.5".to_string(),
-    ])
-    .expect("options");
+    let ModelsCliCommand::Default(options) =
+        parse_models_args(&["default", "--provider", "openai-api", "--model", "gpt-5.5"])
+            .expect("options")
+    else {
+        panic!("expected models default");
+    };
 
     assert_eq!(options.provider, "openai");
     assert_eq!(options.model, "gpt-5.5");
@@ -15342,13 +15404,16 @@ fn model_default_parser_accepts_provider_model() {
 
 #[test]
 fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
-    let options = parse_model_default_options(&[
-        "--provider".to_string(),
-        "nvidia".to_string(),
-        "--model".to_string(),
-        "nvidia/nvidia/nemotron-3-super-120b-a12b".to_string(),
+    let ModelsCliCommand::Default(options) = parse_models_args(&[
+        "default",
+        "--provider",
+        "nvidia",
+        "--model",
+        "nvidia/nvidia/nemotron-3-super-120b-a12b",
     ])
-    .expect("options");
+    .expect("options") else {
+        panic!("expected models default");
+    };
 
     assert_eq!(options.provider, "nvidia");
     assert_eq!(options.model, "nvidia/nemotron-3-super-120b-a12b");
@@ -15356,24 +15421,27 @@ fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
 
 #[test]
 fn model_options_parser_accepts_reasoning_and_vendor_options() {
-    let command = parse_model_options_command(&[
-        "set".to_string(),
-        "--provider".to_string(),
-        "openai-api".to_string(),
-        "--account".to_string(),
-        "team-a".to_string(),
-        "--model".to_string(),
-        "gpt-5.5".to_string(),
-        "--reasoning-effort".to_string(),
-        "none".to_string(),
-        "--reasoning-budget-tokens".to_string(),
-        "4096".to_string(),
-        "--text-verbosity".to_string(),
-        "low".to_string(),
-        "--vendor-option".to_string(),
-        "reasoning.summary=auto".to_string(),
+    let ModelsCliCommand::Options(command) = parse_models_args(&[
+        "options",
+        "set",
+        "--provider",
+        "openai-api",
+        "--account",
+        "team-a",
+        "--model",
+        "gpt-5.5",
+        "--reasoning-effort",
+        "none",
+        "--reasoning-budget-tokens",
+        "4096",
+        "--text-verbosity",
+        "low",
+        "--vendor-option",
+        "reasoning.summary=auto",
     ])
-    .expect("model options");
+    .expect("model options") else {
+        panic!("expected models options");
+    };
 
     assert_eq!(
         command,
@@ -15394,16 +15462,19 @@ fn model_options_parser_accepts_reasoning_and_vendor_options() {
 
 #[test]
 fn model_options_parser_distinguishes_clear_from_none() {
-    let command = parse_model_options_command(&[
-        "set".to_string(),
-        "--provider".to_string(),
-        "anthropic".to_string(),
-        "--reasoning-effort".to_string(),
-        "clear".to_string(),
-        "--text-verbosity".to_string(),
-        "clear".to_string(),
+    let ModelsCliCommand::Options(command) = parse_models_args(&[
+        "options",
+        "set",
+        "--provider",
+        "anthropic",
+        "--reasoning-effort",
+        "clear",
+        "--text-verbosity",
+        "clear",
     ])
-    .expect("model options");
+    .expect("model options") else {
+        panic!("expected models options");
+    };
 
     assert_eq!(
         command,
@@ -16140,11 +16211,17 @@ fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
     .expect("cluster init");
     assert!(model_config_uses_cluster(&data_dir));
 
-    let command = CliCommand::Models(ModelsCliCommand::Default(super::ModelDefaultOptions {
-        provider: "openai".to_string(),
-        account: "local".to_string(),
-        model: "gpt-5.5".to_string(),
-    }));
+    let command = parse_cli_command(&[
+        "models".to_string(),
+        "default".to_string(),
+        "--provider".to_string(),
+        "openai".to_string(),
+        "--account".to_string(),
+        "local".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+    ])
+    .expect("models default command");
     let force_local =
         cli_invocation_force_local_mode(CliRuntimeOptions::default(), &command, false, None);
     assert!(force_local);
@@ -16409,28 +16486,31 @@ fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
 
 #[test]
 fn models_runtime_parser_accepts_cluster_runtime_settings() {
-    let command = parse_models_runtime_command(&[
-        "set".to_string(),
-        "--native-models-cache-dir".to_string(),
-        "/cluster/models".to_string(),
-        "--minicpm-v46-model-dir".to_string(),
-        "/cluster/models/minicpm-v46".to_string(),
-        "--minicpm-v46-max-input-tokens".to_string(),
-        "32768".to_string(),
-        "--minicpm-v46-max-output-tokens".to_string(),
-        "4096".to_string(),
-        "--pytorch-endpoint".to_string(),
-        "https://runtime.example.invalid/api".to_string(),
-        "--pytorch-python".to_string(),
-        "/cluster/bin/python".to_string(),
-        "--pytorch-device".to_string(),
-        "cuda".to_string(),
-        "--pytorch-timeout-seconds".to_string(),
-        "60".to_string(),
-        "--pytorch-mock".to_string(),
-        "false".to_string(),
+    let ModelsCliCommand::Runtime(command) = parse_models_args(&[
+        "runtime",
+        "set",
+        "--native-models-cache-dir",
+        "/cluster/models",
+        "--minicpm-v46-model-dir",
+        "/cluster/models/minicpm-v46",
+        "--minicpm-v46-max-input-tokens",
+        "32768",
+        "--minicpm-v46-max-output-tokens",
+        "4096",
+        "--pytorch-endpoint",
+        "https://runtime.example.invalid/api",
+        "--pytorch-python",
+        "/cluster/bin/python",
+        "--pytorch-device",
+        "cuda",
+        "--pytorch-timeout-seconds",
+        "60",
+        "--pytorch-mock",
+        "false",
     ])
-    .expect("runtime command");
+    .expect("runtime command") else {
+        panic!("expected models runtime");
+    };
 
     assert_eq!(
         command,
@@ -16450,15 +16530,10 @@ fn models_runtime_parser_accepts_cluster_runtime_settings() {
 
 #[test]
 fn model_default_parser_requires_known_provider() {
-    let error = parse_model_default_options(&[
-        "--provider".to_string(),
-        "unknown".to_string(),
-        "--model".to_string(),
-        "model".to_string(),
-    ])
-    .expect_err("unknown provider rejected");
+    let error = parse_models_args(&["default", "--provider", "unknown", "--model", "model"])
+        .expect_err("unknown provider rejected");
 
-    assert!(matches!(error, CliError::Parse { .. }));
+    assert!(matches!(error, CliParseError::Parse { .. }));
 }
 
 #[test]

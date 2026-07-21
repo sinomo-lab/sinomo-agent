@@ -1313,7 +1313,6 @@ pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
 pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> bool {
     match command {
         CliCommand::Tui
-        | CliCommand::Models(_)
         | CliCommand::Providers(_)
         | CliCommand::Agent(_)
         | CliCommand::Skill(_) => true,
@@ -1335,7 +1334,6 @@ pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
         | CliCommand::Rollout(RolloutCliCommand::Help)
         | CliCommand::Dfs(DfsCliCommand::Help)
         | CliCommand::Memory(MemoryCliCommand::Help)
-        | CliCommand::Models(ModelsCliCommand::Help)
         | CliCommand::Providers(ProviderCliCommand::Help)
         | CliCommand::Voice(VoiceCliCommand::Help)
         | CliCommand::Test(TestCliCommand::Help)
@@ -1450,7 +1448,6 @@ pub(crate) enum CliCommand {
     Rollout(RolloutCliCommand),
     Dfs(DfsCliCommand),
     Memory(MemoryCliCommand),
-    Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Voice(VoiceCliCommand),
     Test(TestCliCommand),
@@ -1484,6 +1481,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         })
         .unwrap_or(module_config);
     let mut registry = CliCommandRegistry::new()
+        .register(models_cli_command_handler())
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,
         ))
@@ -1506,6 +1504,9 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
             sinomo_runtime::remote_management::node_permissions_cli_command_handler(data_dir),
         );
     }
+    registry
+        .validate_reserved_names(BUILTIN_TOP_LEVEL_USAGE_COMMANDS)
+        .expect("registered CLI commands must not conflict with built-in commands");
     registry
 }
 
@@ -1710,9 +1711,6 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
         Some((command, rest)) if command == "memory" => {
             Ok(CliCommand::Memory(parse_memory_command(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "models" | "model") => {
-            Ok(CliCommand::Models(parse_models_command(rest)?))
         }
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
@@ -5686,7 +5684,6 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Memory(command) => run_memory_cli_command(command),
-        CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Voice(command) => run_voice_command(command),
         CliCommand::Test(command) => run_test_command(command),
