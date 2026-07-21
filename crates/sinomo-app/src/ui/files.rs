@@ -33,14 +33,14 @@ use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
     CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView, Constraints,
-    ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase,
-    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState,
-    Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, NumberInput, Observable,
-    PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment,
-    RadioButton, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size,
-    SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
+    ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, Flex,
+    FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label,
+    LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, NumberInput, Observable, PaintCtx,
+    PanelSection, PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment, RadioButton,
+    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl,
+    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx,
+    SemanticsNode, SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size, SizedBox,
+    SplitView, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
     SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, ToggleState,
     Tooltip, TooltipPlacement, TrailingSlotRow, VirtualCollectionModel, VirtualList,
     VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
@@ -78,6 +78,7 @@ use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot}
 /// The wide branch reserves enough room for Places, the inspector, and the compact file table so
 /// the Placement column never disappears behind horizontal overflow.
 const WIDE_THRESHOLD: f32 = 880.0;
+#[cfg(test)]
 const INSPECTOR_W: f32 = 340.0;
 const ROW_THUMBNAIL_SIDE: f32 = 20.0;
 /// At narrower list widths Details yields to Placement, which is required for every file row.
@@ -96,7 +97,11 @@ const FILES_TASK_BADGE_W: f32 = 210.0;
 const FILES_TASK_POPOVER_W: f32 = 420.0;
 const FILES_TASK_ROW_H: f32 = 44.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
-const PLACES_W: f32 = 208.0;
+const PLACES_SIDEBAR_INITIAL_RATIO: f32 = 0.24;
+const PLACES_SIDEBAR_MIN_W: f32 = 168.0;
+const FILE_LIST_MIN_W: f32 = 360.0;
+const INSPECTOR_SIDEBAR_INITIAL_RATIO: f32 = 0.28;
+const INSPECTOR_SIDEBAR_MIN_W: f32 = 280.0;
 const PLACE_ROW_H: f32 = 46.0;
 const PLACES_HEADER_H: f32 = 42.0;
 const PLACE_SECTION_HEADER_H: f32 = 28.0;
@@ -1068,6 +1073,10 @@ pub struct FilesState {
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
     pub scroll: f32,
+    /// Retained first-pane ratio for the desktop Locations splitter.
+    places_sidebar_ratio: f32,
+    /// Retained second-pane ratio for the desktop Inspector splitter.
+    inspector_sidebar_ratio: f32,
     pub inspector_details_open: bool,
     compact_overlay: Option<CompactFilesOverlay>,
     worker_tx: Option<Sender<FilesWorkerCommand>>,
@@ -1505,6 +1514,8 @@ impl FilesState {
             tasks: Vec::new(),
             pending_select_path: None,
             scroll: 0.0,
+            places_sidebar_ratio: PLACES_SIDEBAR_INITIAL_RATIO,
+            inspector_sidebar_ratio: INSPECTOR_SIDEBAR_INITIAL_RATIO,
             inspector_details_open: false,
             compact_overlay: None,
             worker_tx: None,
@@ -1557,6 +1568,14 @@ impl FilesState {
             placement_activity_in_flight_generation: Arc::new(AtomicU64::new(0)),
             placement_activity_refresh_dirty: false,
         }
+    }
+
+    fn set_places_sidebar_ratio(&mut self, ratio: f32) {
+        self.places_sidebar_ratio = ratio.clamp(0.0, 1.0);
+    }
+
+    fn set_inspector_sidebar_ratio(&mut self, ratio: f32) {
+        self.inspector_sidebar_ratio = ratio.clamp(0.0, 1.0);
     }
 
     pub(crate) fn connection_attention_detail(&self) -> Option<String> {
@@ -13763,12 +13782,9 @@ fn list_column(
     RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss))
 }
 
-/// Wide split: header docked on top, body fills with [ list (flex) | vertical separator |
-/// inspector (340) ]. We use the `Dock` helper so the body actually *fills* the remaining vertical
-/// space (a bare vertical `Stack` only sizes children to their natural height, which would collapse
-/// the list/inspector to the listing's content height); and a small [`Split`] so the inspector
-/// keeps its fixed 340px while the list takes the rest (a horizontal `Stack` would let the list
-/// greedily consume the full width before the inspector is measured).
+/// Wide split: header docked on top, with independently resizable Locations and Inspector
+/// sidebars around the file list. The native splitters retain their ratios in [`FilesState`] so a
+/// theme/scale rebuild does not discard the operator's preferred widths.
 fn wide_pod(
     shared: &Shared,
     reader: &ThemeReader,
@@ -13782,20 +13798,35 @@ fn wide_pod(
         let s = shared.clone();
         move || palette(&s).sidebar
     });
-    let list_with_places = FixedPaneSplit::horizontal(
-        places,
-        Separator::vertical().theme_when(clone_reader(reader)),
-        list_column(shared, reader, scroll_state),
-    )
-    .fixed_first(PLACES_W)
-    .divider_extent(1.0);
-    let body = FixedPaneSplit::horizontal(
+    let places_ratio = shared.files().places_sidebar_ratio;
+    let places_ratio_shared = shared.clone();
+    let list_with_places = SplitView::horizontal(places, list_column(shared, reader, scroll_state))
+        .name("File locations sidebar")
+        .ratio(places_ratio)
+        .min_first(PLACES_SIDEBAR_MIN_W)
+        .min_second(FILE_LIST_MIN_W)
+        .theme(reader())
+        .on_change(move |ratio| {
+            places_ratio_shared
+                .files_mut()
+                .set_places_sidebar_ratio(ratio)
+        });
+    let inspector_ratio = shared.files().inspector_sidebar_ratio;
+    let inspector_ratio_shared = shared.clone();
+    let body = SplitView::horizontal(
         list_with_places,
-        Separator::vertical().theme_when(clone_reader(reader)),
         inspector(shared, reader, inspector_scroll_state),
     )
-    .fixed_second(INSPECTOR_W)
-    .divider_extent(1.0);
+    .name("File inspector sidebar")
+    .ratio(1.0 - inspector_ratio)
+    .min_first(PLACES_SIDEBAR_MIN_W + FILE_LIST_MIN_W)
+    .min_second(INSPECTOR_SIDEBAR_MIN_W)
+    .theme(reader())
+    .on_change(move |ratio| {
+        inspector_ratio_shared
+            .files_mut()
+            .set_inspector_sidebar_ratio(1.0 - ratio)
+    });
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(
@@ -20460,6 +20491,125 @@ mod tests {
         let files = shared.files();
         assert_eq!(files.source, FilesSourceKind::Sifs);
         assert_eq!(files.path, "/services");
+
+        Ok(())
+    }
+
+    #[test]
+    fn wide_files_sidebars_are_independently_resizable() -> sui::Result<()> {
+        use sui::{Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Resizable Files sidebars")
+                    .root(
+                        SizedBox::new()
+                            .width(1_200.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let before = window.snapshot()?;
+
+        let locations_divider = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Splitter
+                    && node.name.as_deref() == Some("File locations sidebar")
+            })
+            .expect("Locations should expose a native splitter")
+            .bounds;
+        let inspector_divider = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Splitter
+                    && node.name.as_deref() == Some("File inspector sidebar")
+            })
+            .expect("Inspector should expose a native splitter")
+            .bounds;
+        let initial_places_ratio = shared.files().places_sidebar_ratio;
+        let initial_inspector_ratio = shared.files().inspector_sidebar_ratio;
+        let divider = shared.theme().metrics.split_view_divider_thickness.max(1.0);
+
+        let drag_splitter = |from: Point, to: Point| -> sui::Result<()> {
+            let root = window.root();
+            root.dispatch_event(Event::Pointer(PointerEvent::new(
+                PointerEventKind::Move,
+                from,
+            )))?;
+            let mut down = PointerEvent::new(PointerEventKind::Down, from);
+            down.pointer_id = 1;
+            down.button = Some(PointerButton::Primary);
+            down.buttons = PointerButtons::new(1);
+            root.dispatch_event(Event::Pointer(down))?;
+            let mut moved = PointerEvent::new(PointerEventKind::Move, to);
+            moved.pointer_id = 1;
+            moved.buttons = PointerButtons::new(1);
+            root.dispatch_event(Event::Pointer(moved))?;
+            let mut up = PointerEvent::new(PointerEventKind::Up, to);
+            up.pointer_id = 1;
+            up.button = Some(PointerButton::Primary);
+            root.dispatch_event(Event::Pointer(up))?;
+            window.run_until_idle()?;
+            Ok(())
+        };
+
+        let locations_start = Point::new(
+            locations_divider.x()
+                + (locations_divider.width() - divider) * initial_places_ratio
+                + divider * 0.5,
+            locations_divider.y() + locations_divider.height() * 0.5,
+        );
+        drag_splitter(
+            locations_start,
+            Point::new(locations_start.x + 90.0, locations_start.y),
+        )?;
+        let places_after_drag = shared.files().places_sidebar_ratio;
+        assert!(
+            places_after_drag > initial_places_ratio + 0.05,
+            "dragging the Locations divider should retain its wider ratio: before={initial_places_ratio}, after={places_after_drag}"
+        );
+        assert!(
+            (shared.files().inspector_sidebar_ratio - initial_inspector_ratio).abs() < 0.001,
+            "resizing Locations must not change the Inspector width"
+        );
+
+        let inspector_start = Point::new(
+            inspector_divider.x()
+                + (inspector_divider.width() - divider) * (1.0 - initial_inspector_ratio)
+                + divider * 0.5,
+            inspector_divider.y() + inspector_divider.height() * 0.5,
+        );
+        drag_splitter(
+            inspector_start,
+            Point::new(inspector_start.x - 100.0, inspector_start.y),
+        )?;
+        assert!(
+            shared.files().inspector_sidebar_ratio > initial_inspector_ratio + 0.05,
+            "dragging the Inspector divider should retain its wider ratio"
+        );
+        assert!(
+            (shared.files().places_sidebar_ratio - places_after_drag).abs() < 0.001,
+            "resizing Inspector must not change the Locations width"
+        );
 
         Ok(())
     }
