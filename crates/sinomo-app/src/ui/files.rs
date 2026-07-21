@@ -8880,11 +8880,7 @@ struct FileRowPlacementBadge {
     replicas: Option<(usize, usize)>,
 }
 
-fn file_row_placement_badge(
-    entry: &SifsEntry,
-    files: &FilesState,
-    row_index: usize,
-) -> FileRowPlacementBadge {
+fn file_row_placement_badge(entry: &SifsEntry, files: &FilesState) -> FileRowPlacementBadge {
     if files.source == FilesSourceKind::Local {
         return FileRowPlacementBadge {
             label: "this device".to_string(),
@@ -8892,28 +8888,6 @@ fn file_row_placement_badge(
             icon: IconGlyph::Storage,
             replicas: None,
         };
-    }
-
-    let active = files.selected == Some(row_index);
-    if active && files.details_loading {
-        return FileRowPlacementBadge {
-            label: "syncing".to_string(),
-            tone: SemanticTone::Accent,
-            icon: IconGlyph::Redo,
-            replicas: None,
-        };
-    }
-    if active && files.details_error.is_some() {
-        return FileRowPlacementBadge {
-            label: "failed".to_string(),
-            tone: SemanticTone::Danger,
-            icon: IconGlyph::Alert,
-            replicas: None,
-        };
-    }
-
-    if active && let Some(details) = files.selected_details.as_ref() {
-        return sifs_details_placement_badge(details);
     }
 
     if let Some(metadata) = files.entry_metadata.get(&entry.path) {
@@ -8947,6 +8921,51 @@ fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementB
     }
 
     let count = metadata.current_locations.len();
+    if metadata.policy.starts_with("replicated")
+        && let Some(placement) = metadata.placement.as_ref()
+    {
+        let desired = placement.desired_replicas.max(count).max(1);
+        let replicas = Some((count, desired));
+        return match placement.agent_state.as_str() {
+            "conflicted" => FileRowPlacementBadge {
+                label: "conflict".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Alert,
+                replicas,
+            },
+            "pending-write" => FileRowPlacementBadge {
+                label: "syncing".to_string(),
+                tone: SemanticTone::Accent,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            "pending-repair" if count > 0 => FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            _ if count == 0 => FileRowPlacementBadge {
+                label: "placing".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            _ if count < desired => FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            _ => FileRowPlacementBadge {
+                label: "synced".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas,
+            },
+        };
+    }
+
     if count == 0 {
         return FileRowPlacementBadge {
             label: "placing".to_string(),
@@ -8966,76 +8985,6 @@ fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementB
         icon: IconGlyph::Storage,
         replicas: None,
     }
-}
-
-fn sifs_details_placement_badge(details: &SifsObjectDetails) -> FileRowPlacementBadge {
-    let replicas = sifs_details_replica_dots(details);
-    if let Some(health) = details.health.as_ref() {
-        if health.open_conflict_count > 0 {
-            return FileRowPlacementBadge {
-                label: "conflict".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Alert,
-                replicas,
-            };
-        }
-        if sifs_repair_backlog_count(health) > 0 {
-            return FileRowPlacementBadge {
-                label: "repair".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Redo,
-                replicas,
-            };
-        }
-    }
-
-    if details.policy == "local-owned" || details.policy == "ephemeral-local" {
-        return FileRowPlacementBadge {
-            label: "this device".to_string(),
-            tone: SemanticTone::Neutral,
-            icon: IconGlyph::Storage,
-            replicas: None,
-        };
-    }
-
-    if details.current_locations.is_empty() {
-        return FileRowPlacementBadge {
-            label: "queued".to_string(),
-            tone: SemanticTone::Neutral,
-            icon: IconGlyph::Storage,
-            replicas,
-        };
-    }
-
-    let (label, tone) = if details.policy.starts_with("replicated") {
-        if details
-            .health
-            .as_ref()
-            .is_some_and(|health| sifs_agent_state_is_current(&health.agent_state))
-        {
-            ("synced", SemanticTone::Success)
-        } else {
-            ("on mesh", SemanticTone::Info)
-        }
-    } else {
-        ("on mesh", SemanticTone::Info)
-    };
-
-    FileRowPlacementBadge {
-        label: label.to_string(),
-        tone,
-        icon: IconGlyph::Storage,
-        replicas,
-    }
-}
-
-fn sifs_details_replica_dots(details: &SifsObjectDetails) -> Option<(usize, usize)> {
-    if !(details.policy.starts_with("replicated")) {
-        return None;
-    }
-    let current = details.current_locations.len();
-    let desired = sifs_replica_desired_count(details).max(current);
-    (desired > 0).then_some((current, desired))
 }
 
 fn sort_file_entries_by(entries: &mut [SifsEntry], sort_mode: FileSortMode) {
@@ -10845,18 +10794,11 @@ fn files_list_body_table(
                     description.push_str(". Single click selects; double click opens the folder");
                 }
                 if files.source == FilesSourceKind::Sifs {
-                    let placement = file_row_placement_badge(entry, &files, index);
+                    let placement = file_row_placement_badge(entry, &files);
                     description.push_str(". Placement: ");
                     description.push_str(&placement.label);
-                    if files.selected == Some(index) {
-                        description.push_str("; ");
-                        description.push_str(&sifs_compact_header_line(
-                            entry,
-                            files.selected_details.as_ref(),
-                            files.clustered,
-                            files.details_loading,
-                            files.details_error.as_deref(),
-                        ));
+                    if let Some((current, desired)) = placement.replicas {
+                        description.push_str(&format!("; {current}/{desired} replicas"));
                     }
                     description.push_str(". Details: ");
                     description.push_str(&entry_row_meta(
@@ -10971,7 +10913,7 @@ fn paint_file_table_row(
     }
 
     if let Some(placement_cell) = row.column_rects.get(2).copied() {
-        let placement = file_row_placement_badge(entry, &files, row.row_index);
+        let placement = file_row_placement_badge(entry, &files);
         // The compact badge has a fixed maximum width. Keep the full local-placement label
         // visible by yielding its redundant storage icon instead of truncating "this device".
         let placement_icon = (placement.label.as_str() != "this device").then_some(placement.icon);
@@ -17374,7 +17316,7 @@ mod tests {
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
-    use sinomo_cli::app_api::SifsPinDetails;
+    use sinomo_cli::app_api::{SifsEntryPlacement, SifsPinDetails};
 
     fn files_test_temp_dir(name: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -21792,6 +21734,7 @@ mod tests {
                 modified_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                placement: None,
             },
         );
 
@@ -21801,12 +21744,63 @@ mod tests {
 
         state.selected = None;
         assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
+            file_row_placement_badge(&entry, &state),
             FileRowPlacementBadge {
                 label: "2 copies".to_string(),
                 tone: SemanticTone::Success,
                 icon: IconGlyph::Storage,
                 replicas: None,
+            }
+        );
+    }
+
+    #[test]
+    fn sifs_entry_placement_badge_maps_refreshed_live_state() {
+        let mut metadata = SifsEntryMetadata {
+            path: "/artifact.txt".to_string(),
+            object_id: "object-artifact".to_string(),
+            version: "version-1".to_string(),
+            modified_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+            placement: Some(SifsEntryPlacement {
+                agent_state: "current".to_string(),
+                desired_replicas: 1,
+            }),
+        };
+
+        assert_eq!(
+            sifs_entry_placement_badge(&metadata),
+            FileRowPlacementBadge {
+                label: "synced".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas: Some((1, 1)),
+            }
+        );
+
+        metadata.placement = Some(SifsEntryPlacement {
+            agent_state: "pending-repair".to_string(),
+            desired_replicas: 2,
+        });
+        assert_eq!(
+            sifs_entry_placement_badge(&metadata),
+            FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas: Some((1, 2)),
+            }
+        );
+
+        metadata.placement.as_mut().unwrap().agent_state = "conflicted".to_string();
+        assert_eq!(
+            sifs_entry_placement_badge(&metadata),
+            FileRowPlacementBadge {
+                label: "conflict".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Alert,
+                replicas: Some((1, 2)),
             }
         );
     }
@@ -21861,14 +21855,14 @@ mod tests {
     }
 
     #[test]
-    fn file_row_placement_badge_maps_sifs_sync_truth() {
+    fn file_row_placement_badge_is_stable_across_selection_details() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.source = FilesSourceKind::Sifs;
         state.clustered = true;
         state.details_loading = false;
         state.details_error = None;
-        state.selected = Some(0);
+        state.selected = None;
         state.entries = vec![SifsEntry {
             name: "artifact.txt".to_string(),
             path: "/artifact.txt".to_string(),
@@ -21876,7 +21870,30 @@ mod tests {
             is_link: false,
             size: Some(5),
         }];
+        state.entry_metadata.insert(
+            "/artifact.txt".to_string(),
+            SifsEntryMetadata {
+                path: "/artifact.txt".to_string(),
+                object_id: "object-artifact".to_string(),
+                version: "version-1".to_string(),
+                modified_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string()],
+                placement: Some(SifsEntryPlacement {
+                    agent_state: "current".to_string(),
+                    desired_replicas: 1,
+                }),
+            },
+        );
         let entry = state.entries[0].clone();
+        let expected = FileRowPlacementBadge {
+            label: "synced".to_string(),
+            tone: SemanticTone::Success,
+            icon: IconGlyph::Storage,
+            replicas: Some((1, 1)),
+        };
+
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
 
         let mut details = test_sifs_details(Vec::new());
         details.current_locations = vec!["node-a".to_string(), "node-b".to_string()];
@@ -21890,15 +21907,8 @@ mod tests {
             missing_replica_nodes: Vec::new(),
         });
         state.selected_details = Some(details.clone());
-        assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
-            FileRowPlacementBadge {
-                label: "synced".to_string(),
-                tone: SemanticTone::Success,
-                icon: IconGlyph::Storage,
-                replicas: Some((2, 2)),
-            }
-        );
+        state.selected = Some(0);
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
 
         details.health = Some(SifsObjectHealth {
             agent_state: "pending-repair".to_string(),
@@ -21910,26 +21920,12 @@ mod tests {
             missing_replica_nodes: vec!["node-c".to_string()],
         });
         state.selected_details = Some(details);
-        assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
-            FileRowPlacementBadge {
-                label: "repair".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Redo,
-                replicas: Some((2, 3)),
-            }
-        );
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
 
+        state.details_loading = true;
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
         state.details_error = Some("metadata failed".to_string());
-        assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
-            FileRowPlacementBadge {
-                label: "failed".to_string(),
-                tone: SemanticTone::Danger,
-                icon: IconGlyph::Alert,
-                replicas: None,
-            }
-        );
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
     }
 
     #[test]
@@ -24066,6 +24062,10 @@ mod tests {
                     modified_at_unix_nanos: 0,
                     policy: "replicated-eventual".to_string(),
                     current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                    placement: Some(SifsEntryPlacement {
+                        agent_state: "current".to_string(),
+                        desired_replicas: 2,
+                    }),
                 },
             );
             files.selected = None;
@@ -24076,7 +24076,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files compact placement")
-                    .root(view(shared)),
+                    .root(view(shared.clone())),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -24125,16 +24125,38 @@ mod tests {
         assert!(
             row.description
                 .as_deref()
-                .is_some_and(|description| description.contains("Placement: 2 copies")),
+                .is_some_and(|description| description.contains("Placement: synced; 2/2 replicas")),
             "unselected row should expose placement metadata, got {:?}",
             row.description
+        );
+        let unselected_description = row.description.clone();
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("artifact.txt")
+            .click()?;
+        app.run_until_idle()?;
+        let selected_description = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("artifact.txt")
+            })
+            .expect("selected artifact row semantics")
+            .description;
+        assert_eq!(
+            selected_description, unselected_description,
+            "selection should not change placement presentation in the file list"
         );
 
         Ok(())
     }
 
     #[test]
-    fn files_toolbar_repairs_replicas_and_row_semantics_show_placement() -> sui::Result<()> {
+    fn files_toolbar_repairs_replicas_while_row_placement_stays_stable() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24152,6 +24174,21 @@ mod tests {
                 is_link: false,
                 size: Some(5),
             }];
+            files.entry_metadata.insert(
+                "/artifact.txt".to_string(),
+                SifsEntryMetadata {
+                    path: "/artifact.txt".to_string(),
+                    object_id: "object-artifact".to_string(),
+                    version: "version-1".to_string(),
+                    modified_at_unix_nanos: 0,
+                    policy: "replicated-eventual".to_string(),
+                    current_locations: vec!["node-a".to_string()],
+                    placement: Some(SifsEntryPlacement {
+                        agent_state: "current".to_string(),
+                        desired_replicas: 1,
+                    }),
+                },
+            );
             files.selected = Some(0);
             let mut details = test_sifs_details(Vec::new());
             details.health = Some(SifsObjectHealth {
@@ -24193,11 +24230,10 @@ mod tests {
             })
             .expect("artifact row semantics");
         assert!(
-            row.description
-                .as_deref()
-                .is_some_and(|description| description
-                    .contains("Placement: repair; 5 B · 1/2 replicas · 1 repair")),
-            "selected SIFS row should expose compact placement metadata, got {:?}",
+            row.description.as_deref().is_some_and(|description| {
+                description.contains("Placement: synced; 1/1 replicas. Details: 5 B")
+            }),
+            "selected SIFS row should keep page-level placement metadata, got {:?}",
             row.description
         );
 

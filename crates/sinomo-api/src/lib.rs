@@ -316,6 +316,17 @@ pub struct DaemonDfsBrowserEntryMetadata {
     pub policy: sinomo_core::DfsObjectPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_locations: Vec<String>,
+    /// Live placement state captured by the same directory refresh that returned this row.
+    /// Older daemons omit it, in which case clients fall back to the copy locations above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<DaemonDfsBrowserEntryPlacement>,
+}
+
+/// Compact placement facts needed to render one directory row without a follow-up stat request.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserEntryPlacement {
+    pub agent_state: sinomo_dfs::DfsAgentObjectState,
+    pub desired_replicas: usize,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -744,6 +755,19 @@ mod tests {
         }))
         .expect("decode legacy list request");
         assert!(!request.include_metadata);
+    }
+
+    #[test]
+    fn older_browser_entry_metadata_defaults_live_placement_to_none() {
+        let metadata: DaemonDfsBrowserEntryMetadata = serde_json::from_value(serde_json::json!({
+            "object_id": "object-report",
+            "version": "version-1",
+            "modified_at_unix_nanos": 0,
+            "policy": "replicated-eventual",
+            "current_locations": ["node-a"]
+        }))
+        .expect("decode legacy entry metadata");
+        assert!(metadata.placement.is_none());
     }
 
     #[test]
