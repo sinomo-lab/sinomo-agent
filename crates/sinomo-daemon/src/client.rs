@@ -3558,39 +3558,56 @@ mod tests {
         let server_data_dir = data_dir.clone();
         let expected = bytes.clone();
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept loopback session");
-            let (mut incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                Box::new(stream.into_inner()),
-                server_data_dir,
-                sinomo_core::network::NetworkCallPolicy::default(),
-                |_request, _node_id, _public_key| Ok(()),
+            let mut stream = listener
+                .accept()
+                .await
+                .expect("accept loopback stream")
+                .into_inner();
+            let context = sinomo_core::network::__object_rpc_stream_contract::read_local_object_rpc_stream_prelude(
+                &mut stream,
             )
             .await
-            .expect("accept object RPC session");
-            let mut received = Vec::new();
-            incoming
-                .body
-                .read_to_end(&mut received)
-                .await
-                .expect("read rollout body");
-            assert_eq!(received, expected);
-            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
-                sinomo_rollout::ROLLOUT_BINARY_ROUTE,
-                &sinomo_rollout::ClusterRolloutBinaryResponse {
-                    status: "staged".to_string(),
-                    detail: "received loopback body".to_string(),
-                    main_binary: "main".into(),
-                    shadow_binary: "shadow".into(),
-                    source_head: None,
+            .expect("local stream prelude");
+            sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+                stream,
+                &context,
+                sinomo_core::network::ObjectFrameIoOptions::default(),
+                move |mut incoming, peer| async move {
+                    assert!(matches!(
+                        peer.identity,
+                        sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::UnauthenticatedLocal
+                    ));
+                    let authenticated = crate::authenticate_daemon_control_request(
+                        &crate::DaemonPaths::new(&server_data_dir),
+                        &incoming.request,
+                    )
+                    .expect("local rollout signer");
+                    assert_eq!(authenticated.signer, crate::DaemonSignerAuthority::Local);
+                    let mut received = Vec::new();
+                    incoming
+                        .body
+                        .read_to_end(&mut received)
+                        .await
+                        .expect("read rollout body");
+                    assert_eq!(received, expected);
+                    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+                        sinomo_rollout::ROLLOUT_BINARY_ROUTE,
+                        &sinomo_rollout::ClusterRolloutBinaryResponse {
+                            status: "staged".to_string(),
+                            detail: "received loopback body".to_string(),
+                            main_binary: "main".into(),
+                            shadow_binary: "shadow".into(),
+                            source_head: None,
+                        },
+                    )
+                    .expect("response head");
+                    Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
+                        response,
+                    ))
                 },
             )
-            .expect("response head");
-            responder
-                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
-                    response,
-                ))
-                .await
-                .expect("respond");
+            .await
+            .expect("serve stream-native rollout RPC");
         });
 
         let response = super::send_daemon_rollout_binary_to_address_async(
@@ -4351,7 +4368,11 @@ mod tests {
             ));
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-
+        let target_cluster_paths = sinomo_core::network::ClusterPaths::new(&target_data_dir);
+        let mut target_state = state.clone();
+        target_state.local_node_id = target_node.clone();
+        sinomo_core::cluster::write_cluster_state(&target_cluster_paths, &target_state)
+            .expect("target cluster state");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4364,45 +4385,6 @@ mod tests {
                 .await
                 .expect("listener");
             let address = listener.local_addr_string().expect("listener address");
-            let server = tokio::spawn(async move {
-                let stream = listener.accept().await.expect("accept");
-                let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                    Box::new(stream.into_inner()),
-                    target_data_dir,
-                    sinomo_core::network::NetworkCallPolicy::default(),
-                    |_request, _node_id, _public_key| Ok(()),
-                )
-                .await
-                .expect("request session");
-                let auth: sinomo_core::network::SignedDaemonCommand =
-                    sinomo_core::network::SinomoObjectCodec::default()
-                        .decode(request.request.auth.as_deref().expect("signed request"))
-                        .expect("auth envelope");
-                let expected_digest =
-                    sinomo_core::network::daemon_rpc_body_sha256(&request.request);
-                assert_eq!(
-                    auth.rpc_body_sha256.as_deref(),
-                    Some(expected_digest.as_slice())
-                );
-                let response = sinomo_core::network::ObjectRpcResponse::encode_error(
-                    request.request.route,
-                    "network authorization was denied",
-                )
-                .expect("auth denied response");
-                responder
-                    .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
-                        response,
-                    ))
-                    .await
-                    .expect("response");
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                        .await
-                        .is_err(),
-                    "ordinary endpoint RPC must not retry after authorization denial"
-                );
-            });
-
             let endpoint = sinomo_core::ClusterEndpointRecord {
                 endpoint_id: endpoint_id.clone(),
                 node_id: target_node.clone(),
@@ -4413,6 +4395,113 @@ mod tests {
                 priority: 0,
                 last_observed_latency_ms: None,
             };
+            let directory = sinomo_core::network::DirectorySnapshot::try_from_records(
+                sinomo_core::network::DirectoryVersion(1),
+                state.members.clone(),
+                std::iter::once(endpoint.clone()),
+            )
+            .expect("directory");
+            let target_routed_identity = std::sync::Arc::new(
+                sinomo_core::network::DaemonRoutedSessionIdentity::new(
+                    target_node.clone(),
+                    target_data_dir,
+                )
+                .expect("target routed identity"),
+            );
+            let target_link_provider = sinomo_core::network::ClusterLinkProvider::new(
+                target_node.clone(),
+                target_routed_identity.clone(),
+                sinomo_core::network::NetworkHealthPolicy::default(),
+            )
+            .expect("target link provider");
+            let server_target_node = target_node.clone();
+            let server_local_node = local_node.clone();
+            let server = tokio::spawn(async move {
+                let mut stream = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                    .await
+                    .expect("client dialed authenticated endpoint")
+                    .expect("accept")
+                    .into_inner();
+                let metadata =
+                    sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                        .await
+                        .expect("authenticated transport prelude");
+                let source_node =
+                    sinomo_core::network::verify_builtin_authenticated_transport_metadata(
+                        &metadata,
+                        &server_target_node,
+                        &directory,
+                        target_routed_identity.as_ref(),
+                    )
+                    .expect("source transport identity");
+                let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
+                    Box::new(stream),
+                    server_target_node.clone(),
+                    source_node,
+                    sinomo_core::Id::generate(),
+                    metadata.channel_binding,
+                    metadata.capabilities,
+                )
+                .expect("accepted direct stream");
+                let routed = match sinomo_core::network::accept_or_relay_routed_session(
+                    direct,
+                    &directory,
+                    target_routed_identity.as_ref(),
+                    &target_link_provider,
+                    None,
+                )
+                .await
+                .expect("routed session")
+                {
+                    sinomo_core::network::RoutedSessionDisposition::Destination(stream) => stream,
+                    sinomo_core::network::RoutedSessionDisposition::Relayed(_) => {
+                        panic!("two-node route terminated as relay")
+                    }
+                };
+                let context = sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
+                    routed.local_node_id.clone(),
+                    routed.peer_node_id.clone(),
+                    routed.session_id.clone(),
+                    routed.channel_binding,
+                )
+                .expect("service peer context");
+                sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+                    routed,
+                    &context,
+                    sinomo_core::network::ObjectFrameIoOptions::default(),
+                    move |request, peer| async move {
+                        assert_eq!(
+                            peer.identity,
+                            sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::Authenticated {
+                                local_node_id: server_target_node,
+                                peer_node_id: server_local_node,
+                            }
+                        );
+                        let auth: sinomo_core::network::SignedDaemonCommand =
+                            sinomo_core::network::SinomoObjectCodec::default()
+                                .decode(request.request.auth.as_deref().expect("signed request"))
+                                .expect("auth envelope");
+                        let expected_digest =
+                            sinomo_core::network::daemon_rpc_body_sha256(&request.request);
+                        assert_eq!(
+                            auth.rpc_body_sha256.as_deref(),
+                            Some(expected_digest.as_slice())
+                        );
+                        Err::<sinomo_core::network::ObjectRpcSessionResponse, _>(
+                            sinomo_core::network::NetworkError::AuthDenied,
+                        )
+                    },
+                )
+                    .await
+                    .expect("send final service authorization denial");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "ordinary endpoint RPC must not retry after authorization denial"
+                );
+            });
+
             let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true)
                 .with_paths(&daemon_paths);
             // Bind request authentication and canonical session proofs to the same
@@ -4426,8 +4515,9 @@ mod tests {
             let request = ObjectRpcRequest::encode_body("/test/auth-denied", "test", &())
                 .expect("request")
                 .with_metadata("sender-controlled", "must-stay-bound");
-            let result = client
-                .call_endpoint(
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.call_endpoint(
                     &state,
                     &endpoint,
                     sinomo_core::network::ObjectRpcSessionCall::value(request),
@@ -4436,8 +4526,10 @@ mod tests {
                             Duration::from_secs(1),
                         ),
                     ),
-                )
-                .await;
+                ),
+            )
+            .await
+            .expect("stream-native endpoint RPC completed before timeout");
             server.await.expect("server");
             result
         });

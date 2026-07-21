@@ -29,8 +29,6 @@ use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterNodeRole,
     ClusterTransportKind,
 };
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::{self, Cursor};
@@ -70,13 +68,6 @@ enum TcpTunnelDirection {
 }
 
 static TCP_TUNNELS: LazyLock<TcpTunnelRegistry> = LazyLock::new(TcpTunnelRegistry::default);
-// A few cross-layer tests need an authenticated logical channel without a
-// process-global physical tunnel. Keep those explicit clients outside the
-// production registry so concurrent maintenance tests cannot retire another
-// fixture's channel based on their unrelated cluster snapshot.
-#[cfg(test)]
-static ISOLATED_TEST_OBJECT_RPC_CHANNELS: LazyLock<Mutex<HashMap<NodeId, ObjectRpcChannelClient>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 static TCP_TUNNEL_MAINTENANCE_SOURCES: LazyLock<TcpTunnelMaintenanceSources> =
     LazyLock::new(TcpTunnelMaintenanceSources::default);
 #[cfg(test)]
@@ -428,38 +419,10 @@ pub(crate) fn remove_test_tcp_tunnel(node_id: &NodeId) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn insert_isolated_test_object_rpc_channel_client(
-    node_id: NodeId,
-    client: ObjectRpcChannelClient,
-) {
-    ISOLATED_TEST_OBJECT_RPC_CHANNELS
-        .lock()
-        .expect("isolated test object RPC channel registry")
-        .insert(node_id, client);
-}
-
-#[cfg(test)]
-pub(crate) fn remove_isolated_test_object_rpc_channel_client(node_id: &NodeId) {
-    ISOLATED_TEST_OBJECT_RPC_CHANNELS
-        .lock()
-        .expect("isolated test object RPC channel registry")
-        .remove(node_id);
-}
-
 /// Returns the cloneable logical channel carried by the peer's v1 tunnel.
 pub(crate) fn tcp_tunnel_object_rpc_channel_client(
     peer_node_id: &NodeId,
 ) -> Option<ObjectRpcChannelClient> {
-    #[cfg(test)]
-    if let Some(client) = ISOLATED_TEST_OBJECT_RPC_CHANNELS
-        .lock()
-        .ok()
-        .and_then(|channels| channels.get(peer_node_id).cloned())
-        .filter(|client| !client.is_closed())
-    {
-        return Some(client);
-    }
     TCP_TUNNELS.get(peer_node_id).and_then(|handle| {
         (!handle.closing.load(Ordering::Acquire))
             .then(|| handle.object_rpc_channel_client.clone())

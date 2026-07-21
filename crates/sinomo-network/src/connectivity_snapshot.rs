@@ -6,6 +6,7 @@
 
 use crate::direct_link::DirectStreamCapabilities;
 use crate::error::NetworkError;
+use crate::{ClusterConnectivityRecord, ClusterConnectivityState, DirectorySnapshot};
 use arc_swap::ArcSwap;
 use sinomo_base::{ClusterEndpointRecord, Id};
 use sinomo_node::NodeId;
@@ -269,6 +270,83 @@ impl ConnectivitySnapshot {
             DirectConnectivityStatus::Unknown
         }
     }
+}
+
+/// Projects the durable directory connectivity contract into the immutable
+/// direct-edge view consumed by Stage-D route planning. Records that no
+/// longer name an authorized endpoint are omitted; no transitive edges are
+/// synthesized.
+pub fn connectivity_snapshot_from_directory_records(
+    directory: &DirectorySnapshot,
+    records: impl IntoIterator<Item = ClusterConnectivityRecord>,
+    published_at: OffsetDateTime,
+) -> Result<ConnectivitySnapshot, NetworkError> {
+    let directory_generation = directory.version().0;
+    let mut observations = Vec::new();
+    for record in records {
+        let Some(source) = directory.node(&record.source_node_id) else {
+            continue;
+        };
+        let Some(target) = directory.node(&record.target_node_id) else {
+            continue;
+        };
+        let Some(endpoint) = target
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == record.endpoint_id)
+            .cloned()
+        else {
+            continue;
+        };
+        if source.node_id == target.node_id
+            || endpoint.transport != record.transport
+            || endpoint.address != record.address
+        {
+            continue;
+        }
+        let confidential = matches!(
+            endpoint.transport,
+            sinomo_base::ClusterTransportKind::LanQuic
+                | sinomo_base::ClusterTransportKind::Iroh
+                | sinomo_base::ClusterTransportKind::WebRtc
+                | sinomo_base::ClusterTransportKind::TurnRelay
+                | sinomo_base::ClusterTransportKind::HttpsRelay
+        );
+        observations.push(DirectConnectivityObservation {
+            observer_node_id: record.source_node_id.clone(),
+            source_node_id: record.source_node_id,
+            target_node_id: record.target_node_id,
+            endpoint,
+            capabilities: DirectStreamCapabilities {
+                full_duplex: true,
+                relay_forwarding: true,
+                confidential,
+                max_concurrent_streams: 1,
+            },
+            state: match record.state {
+                ClusterConnectivityState::Healthy | ClusterConnectivityState::Degraded => {
+                    DirectConnectivityState::Reachable
+                }
+                ClusterConnectivityState::Unreachable => DirectConnectivityState::Unreachable,
+            },
+            failure_reason: record.failure_reason.map(|reason| format!("{reason:?}")),
+            latency_micros: record
+                .latency_ms
+                .and_then(|millis| millis.checked_mul(1_000)),
+            delivered_bytes_per_second: None,
+            provenance: "cluster-directory-connectivity".to_string(),
+            source_generation: directory_generation,
+            directory_generation,
+            observed_at: record.observed_at,
+            expires_at: record.expires_at,
+        });
+    }
+    ConnectivitySnapshot::try_new(
+        ConnectivityGeneration(directory_generation),
+        directory_generation,
+        published_at,
+        observations,
+    )
 }
 
 /// Side-effect-free read boundary for immutable connectivity snapshots.

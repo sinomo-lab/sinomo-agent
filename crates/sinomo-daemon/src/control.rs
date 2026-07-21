@@ -2986,9 +2986,24 @@ async fn daemon_control_stream_uses_authenticated_transport_prelude(
 fn resolve_authenticated_transport_peer(
     paths: &DaemonPaths,
     metadata: &sinomo_core::network::AuthenticatedTransportMetadata,
+    local_node_id: &NodeId,
+    identity: &dyn sinomo_core::network::RoutedSessionIdentity,
 ) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let directory = sinomo_core::network::cluster_directory_for(&cluster_paths).snapshot()?;
+    if matches!(
+        metadata.transport,
+        sinomo_core::base::ClusterTransportKind::Loopback
+            | sinomo_core::base::ClusterTransportKind::LanTcp
+    ) {
+        let peer_node_id = sinomo_core::network::verify_builtin_authenticated_transport_metadata(
+            metadata,
+            local_node_id,
+            &directory,
+            identity,
+        )?;
+        return Ok((peer_node_id, directory));
+    }
     let mut matching_nodes = BTreeSet::new();
     for node in directory.nodes().values() {
         if node.endpoints.iter().any(|endpoint| {
@@ -3069,10 +3084,16 @@ async fn handle_daemon_authenticated_transport_stream_async(
 ) -> Result<bool, DaemonError> {
     let mut stream = stream.into_inner();
     let metadata = sinomo_core::network::read_authenticated_transport_prelude(&mut stream).await?;
-    let (peer_node_id, directory) = resolve_authenticated_transport_peer(&paths, &metadata)?;
     let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let local_node_id = state.local_node_id.clone();
+    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
+    let identity = Arc::new(sinomo_core::network::DaemonRoutedSessionIdentity::new(
+        local_node_id.clone(),
+        data_dir,
+    )?);
+    let (peer_node_id, directory) =
+        resolve_authenticated_transport_peer(&paths, &metadata, &local_node_id, identity.as_ref())?;
     let mut link_identity = Vec::new();
     link_identity.extend_from_slice(local_node_id.as_str().as_bytes());
     link_identity.push(0);
@@ -3091,11 +3112,11 @@ async fn handle_daemon_authenticated_transport_stream_async(
         metadata.channel_binding,
         metadata.capabilities,
     )?;
-    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
-    let identity = sinomo_core::network::DaemonRoutedSessionIdentity::new(local_node_id, data_dir)?;
-    let link_provider = sinomo_core::network::RegisteredNetworkModuleLinkProvider::new(
+    let link_provider = sinomo_core::network::ClusterLinkProvider::new(
+        local_node_id,
+        identity.clone(),
         sinomo_core::network::NetworkHealthPolicy::default(),
-    );
+    )?;
     let failure_sink = DaemonRoutedConnectivityFailureSink {
         cluster_paths: &cluster_paths,
         state: &state,
@@ -3104,7 +3125,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
     match sinomo_core::network::accept_or_relay_routed_session(
         direct_stream,
         &directory,
-        &identity,
+        identity.as_ref(),
         &link_provider,
         Some(&failure_sink),
     )
@@ -3119,12 +3140,11 @@ async fn handle_daemon_authenticated_transport_stream_async(
                 %stream_address,
                 "accepted authenticated routed-session destination stream"
             );
-            handle_daemon_object_rpc_stream_for_authenticated_peer_async(
-                Box::new(stream),
+            handle_daemon_stream_native_service_rpc_async(
+                stream,
                 paths,
                 service_host,
                 service_runtime,
-                Some(routed_peer_node_id),
             )
             .await
         }
@@ -3195,11 +3215,14 @@ async fn daemon_control_stream_uses_object_rpc_session(
             return Ok(false);
         }
         if available >= prefix.len() {
-            return Ok(sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix));
+            return Ok(sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix)
+                || sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(&prefix));
         }
         // Wait only while the bytes received so far can still be the canonical
         // session prefix. Any mismatch is a direct object frame.
-        if !sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix[..available]) {
+        if !sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix[..available])
+            && !sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(&prefix[..available])
+        {
             return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -3211,8 +3234,22 @@ async fn handle_daemon_object_rpc_session_async(
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
-    _stream_address: String,
+    stream_address: String,
 ) -> Result<bool, DaemonError> {
+    let mut prefix = [0_u8; 4];
+    let available = stream.peek_prefix(&mut prefix).await?;
+    if available == prefix.len()
+        && sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(&prefix)
+    {
+        return handle_daemon_local_stream_native_service_rpc_async(
+            stream.into_inner(),
+            paths,
+            service_host,
+            service_runtime,
+            stream_address,
+        )
+        .await;
+    }
     handle_daemon_object_rpc_stream_async(
         Box::new(stream.into_inner()),
         paths,
@@ -3806,6 +3843,214 @@ async fn daemon_object_rpc_channel_cancellation(
             Err(_) => return,
         }
     }
+}
+
+async fn handle_daemon_local_stream_native_service_rpc_async(
+    mut stream: tokio::net::TcpStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    _stream_address: String,
+) -> Result<bool, DaemonError> {
+    if !stream
+        .peer_addr()
+        .is_ok_and(|address| address.ip().is_loopback())
+    {
+        return Err(DaemonError::AuthDenied);
+    }
+    let context =
+        sinomo_core::network::__object_rpc_stream_contract::read_local_object_rpc_stream_prelude(
+            &mut stream,
+        )
+        .await?;
+    let (local_principal, responder_node_id) =
+        daemon_object_rpc_channel_principal(&paths, &DaemonObjectRpcChannelPeer::Loopback)?;
+    let local_node_id = responder_node_id
+        .as_deref()
+        .unwrap_or(&local_principal.signer_node_id)
+        .to_string();
+    let completion = Arc::new(Mutex::new(("<unavailable>".to_string(), false)));
+    let handler_completion = Arc::clone(&completion);
+    let handler_paths = paths.clone();
+    let handler_host = service_host.clone();
+    let handler_runtime = service_runtime.clone();
+    let result =
+        sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+            stream,
+            &context,
+            sinomo_core::network::ObjectFrameIoOptions::default(),
+            move |request, peer| async move {
+                if !matches!(
+                    peer.identity,
+                    sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::UnauthenticatedLocal
+                ) {
+                    return Err(sinomo_core::network::NetworkError::AuthDenied);
+                }
+                let authenticated = crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                    &handler_paths,
+                    &request.request,
+                    &handler_host,
+                )
+                .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
+                if authenticated.signer != DaemonSignerAuthority::Local
+                    || authenticated.signer_public_key != local_principal.signer_public_key
+                    || responder_node_id.as_deref().is_some_and(|node_id| {
+                        authenticated.signer_node_id.as_str() != node_id
+                    })
+                {
+                    return Err(sinomo_core::network::NetworkError::AuthDenied);
+                }
+                let route = request.request.route.clone();
+                let dispatch = dispatch_daemon_object_rpc_session_request_async(
+                    &handler_paths,
+                    &handler_host,
+                    &handler_runtime,
+                    &authenticated,
+                    request,
+                )
+                .await;
+                let (mut response, stop, effective_route) = match dispatch {
+                    Ok(response) => response,
+                    Err(error) => (
+                        sinomo_core::network::ObjectRpcSessionResponse::value(
+                            sinomo_core::network::ObjectRpcResponse::encode_error(
+                                &route,
+                                error.to_string(),
+                            )?,
+                        ),
+                        false,
+                        route,
+                    ),
+                };
+                response
+                    .response
+                    .mark_responder_node_id(local_node_id);
+                *handler_completion.lock().map_err(|_| {
+                    sinomo_core::network::NetworkError::Io {
+                        operation: "record local stream-native service completion".to_string(),
+                        detail: "service completion lock poisoned".to_string(),
+                    }
+                })? = (effective_route, stop);
+                Ok(response)
+            },
+        )
+        .await
+        .map_err(DaemonError::from);
+    let (effective_route, stop) = completion
+        .lock()
+        .map_err(|_| DaemonError::Parse {
+            detail: "local stream-native service completion lock poisoned".to_string(),
+        })?
+        .clone();
+    finish_daemon_object_rpc_stream_response(&effective_route, stop, &paths, result)
+}
+
+/// Final service boundary for one authenticated routed stream. Routing has
+/// already proven the end-to-end source and destination identities; this
+/// layer independently verifies that the typed request is signed by that
+/// source before consulting the service registry.
+async fn handle_daemon_stream_native_service_rpc_async(
+    stream: sinomo_core::network::PeerStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
+    let peer_node_id = stream.peer_node_id.clone();
+    let local_node_id = stream.local_node_id.clone();
+    let context =
+        sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
+            local_node_id.clone(),
+            peer_node_id.clone(),
+            stream.session_id.clone(),
+            stream.channel_binding,
+        )?;
+    let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+    let directory = sinomo_core::network::cluster_directory_for(&cluster_paths).snapshot()?;
+    let peer_public_key = directory
+        .node(&peer_node_id)
+        .ok_or_else(|| sinomo_core::network::NetworkError::UnauthorizedNode {
+            node_id: peer_node_id.clone(),
+        })
+        .and_then(|node| sinomo_core::network::daemon_auth_decode_public_key(&node.public_key))?;
+    let completion = Arc::new(Mutex::new(("<unavailable>".to_string(), false)));
+    let handler_completion = Arc::clone(&completion);
+    let handler_paths = paths.clone();
+    let handler_host = service_host.clone();
+    let handler_runtime = service_runtime.clone();
+    let handler_peer_node_id = peer_node_id.clone();
+    let result =
+        sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+            stream,
+            &context,
+            sinomo_core::network::ObjectFrameIoOptions::default(),
+            move |request, peer| async move {
+                let authenticated = crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                    &handler_paths,
+                    &request.request,
+                    &handler_host,
+                )
+                .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
+                let context_peer = match peer.identity {
+                    sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::Authenticated {
+                        peer_node_id,
+                        ..
+                    } => peer_node_id,
+                    sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::UnauthenticatedLocal => {
+                        return Err(sinomo_core::network::NetworkError::AuthDenied);
+                    }
+                };
+                let signer_public_key = sinomo_core::network::daemon_auth_decode_public_key(
+                    &authenticated.signer_public_key,
+                )?;
+                if context_peer != handler_peer_node_id
+                    || authenticated.signer_node_id != context_peer.as_str()
+                    || signer_public_key != peer_public_key
+                {
+                    return Err(sinomo_core::network::NetworkError::AuthDenied);
+                }
+                let route = request.request.route.clone();
+                let dispatch = dispatch_daemon_object_rpc_session_request_async(
+                    &handler_paths,
+                    &handler_host,
+                    &handler_runtime,
+                    &authenticated,
+                    request,
+                )
+                .await;
+                let (mut response, stop, effective_route) = match dispatch {
+                    Ok(response) => response,
+                    Err(error) => (
+                        sinomo_core::network::ObjectRpcSessionResponse::value(
+                            sinomo_core::network::ObjectRpcResponse::encode_error(
+                                &route,
+                                error.to_string(),
+                            )?,
+                        ),
+                        false,
+                        route,
+                    ),
+                };
+                response
+                    .response
+                    .mark_responder_node_id(local_node_id.to_string());
+                *handler_completion.lock().map_err(|_| {
+                    sinomo_core::network::NetworkError::Io {
+                        operation: "record stream-native service completion".to_string(),
+                        detail: "service completion lock poisoned".to_string(),
+                    }
+                })? = (effective_route, stop);
+                Ok(response)
+            },
+        )
+        .await
+        .map_err(DaemonError::from);
+    let (effective_route, stop) = completion
+        .lock()
+        .map_err(|_| DaemonError::Parse {
+            detail: "stream-native service completion lock poisoned".to_string(),
+        })?
+        .clone();
+    finish_daemon_object_rpc_stream_response(&effective_route, stop, &paths, result)
 }
 
 /// Runs one transport-neutral canonical object-RPC session through the same
@@ -8681,403 +8926,6 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Copy)]
-    enum RelayAttestationOriginTransport {
-        Channel,
-        Canonical,
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn multiplexed_ping_response_carries_target_attestation_through_relay() {
-        assert_relay_preserves_multiplexed_target_attestation(
-            "all_channel",
-            RelayAttestationOriginTransport::Channel,
-        )
-        .await;
-        assert_relay_preserves_multiplexed_target_attestation(
-            "canonical_channel",
-            RelayAttestationOriginTransport::Canonical,
-        )
-        .await;
-    }
-
-    async fn assert_relay_preserves_multiplexed_target_attestation(
-        case: &str,
-        origin_transport: RelayAttestationOriginTransport,
-    ) {
-        let origin_root = sinomo_testdir::TestDir::new(&format!(
-            "sinomo-daemon-channel-relay-attestation-{case}-origin"
-        ));
-        let relay_root = sinomo_testdir::TestDir::new(&format!(
-            "sinomo-daemon-channel-relay-attestation-{case}-relay"
-        ));
-        let target_root = sinomo_testdir::TestDir::new(&format!(
-            "sinomo-daemon-channel-relay-attestation-{case}-target"
-        ));
-        let origin_data_dir = SinomoDataDir::new(&origin_root);
-        let relay_data_dir = SinomoDataDir::new(&relay_root);
-        let target_data_dir = SinomoDataDir::new(&target_root);
-        for data_dir in [&origin_data_dir, &relay_data_dir, &target_data_dir] {
-            data_dir.ensure_root_layout().expect("node layout");
-        }
-        let origin_identity =
-            sinomo_core::node::load_or_create_main_node_identity(&origin_data_dir.root())
-                .expect("origin identity");
-        let relay_identity =
-            sinomo_core::node::load_or_create_main_node_identity(&relay_data_dir.root())
-                .expect("relay identity");
-        let target_identity =
-            sinomo_core::node::load_or_create_main_node_identity(&target_data_dir.root())
-                .expect("target identity");
-        let origin_node =
-            NodeId::from_legacy_named(format!("channel_relay_attestation_{case}_origin"))
-                .expect("origin node");
-        let relay_node =
-            NodeId::from_legacy_named(format!("channel_relay_attestation_{case}_relay"))
-                .expect("relay node");
-        let target_node =
-            NodeId::from_legacy_named(format!("channel_relay_attestation_{case}_target"))
-                .expect("target node");
-        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(format!(
-            "channel_relay_attestation_{case}_cluster"
-        ))
-        .expect("cluster id");
-        let now = time::OffsetDateTime::now_utc();
-        let relay_listener = match origin_transport {
-            RelayAttestationOriginTransport::Channel => None,
-            RelayAttestationOriginTransport::Canonical => Some(
-                sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("relay canonical listener"),
-            ),
-        };
-        let relay_endpoint = sinomo_core::network::daemon_lan_endpoint(
-            &relay_node,
-            match relay_listener.as_ref() {
-                Some(listener) => listener
-                    .local_addr_string()
-                    .expect("relay canonical address"),
-                None => "127.0.0.1:40101".to_string(),
-            },
-            0,
-        );
-        let target_endpoint = sinomo_core::network::daemon_lan_endpoint(
-            &target_node,
-            "127.0.0.1:40102".to_string(),
-            0,
-        );
-        let member = |node: &NodeId,
-                      name: &str,
-                      public_key: &str,
-                      endpoints: Vec<sinomo_core::ClusterEndpointRecord>| {
-            let mut member = sinomo_core::ClusterMemberRecord::local_voter(
-                cluster_id.clone(),
-                node.clone(),
-                name,
-                public_key,
-                now,
-            );
-            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
-            member.allowed_capabilities = member.capabilities.clone();
-            member.endpoints = endpoints;
-            member
-        };
-
-        let mut origin_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "channel relay attestation",
-            origin_node.clone(),
-            "origin",
-            origin_identity.public_key.clone(),
-            now,
-        );
-        origin_state.members.push(member(
-            &relay_node,
-            "relay",
-            &relay_identity.public_key,
-            vec![relay_endpoint.clone()],
-        ));
-        origin_state.members.push(member(
-            &target_node,
-            "target",
-            &target_identity.public_key,
-            vec![target_endpoint.clone()],
-        ));
-
-        let mut relay_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "channel relay attestation",
-            relay_node.clone(),
-            "relay",
-            relay_identity.public_key.clone(),
-            now,
-        );
-        relay_state.members.push(member(
-            &origin_node,
-            "origin",
-            &origin_identity.public_key,
-            Vec::new(),
-        ));
-        relay_state.members.push(member(
-            &target_node,
-            "target",
-            &target_identity.public_key,
-            vec![target_endpoint.clone()],
-        ));
-
-        let mut target_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "channel relay attestation",
-            target_node.clone(),
-            "target",
-            target_identity.public_key.clone(),
-            now,
-        );
-        target_state.members.push(member(
-            &origin_node,
-            "origin",
-            &origin_identity.public_key,
-            Vec::new(),
-        ));
-        target_state.members.push(member(
-            &relay_node,
-            "relay",
-            &relay_identity.public_key,
-            vec![relay_endpoint.clone()],
-        ));
-
-        let origin_cluster_paths = sinomo_core::network::ClusterPaths::new(&origin_data_dir);
-        let relay_cluster_paths = sinomo_core::network::ClusterPaths::new(&relay_data_dir);
-        let target_cluster_paths = sinomo_core::network::ClusterPaths::new(&target_data_dir);
-        sinomo_core::cluster::write_cluster_state(&origin_cluster_paths, &origin_state)
-            .expect("origin cluster state");
-        sinomo_core::cluster::write_cluster_state(&relay_cluster_paths, &relay_state)
-            .expect("relay cluster state");
-        sinomo_core::cluster::write_cluster_state(&target_cluster_paths, &target_state)
-            .expect("target cluster state");
-        sinomo_core::network::write_local_cluster_connectivity_records(
-            &origin_cluster_paths,
-            &origin_node,
-            &[
-                sinomo_core::network::cluster_connectivity_record(
-                    &origin_state,
-                    &relay_endpoint,
-                    sinomo_core::network::ClusterConnectivityState::Healthy,
-                    Some(1),
-                    0,
-                    Some(now.to_string()),
-                    None,
-                    now,
-                    60,
-                ),
-                sinomo_core::network::cluster_connectivity_record(
-                    &origin_state,
-                    &target_endpoint,
-                    sinomo_core::network::ClusterConnectivityState::Unreachable,
-                    None,
-                    sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
-                    None,
-                    Some(now.to_string()),
-                    now,
-                    60,
-                ),
-            ],
-        )
-        .expect("origin connectivity");
-        sinomo_core::network::write_local_cluster_connectivity_record_set(
-            &origin_cluster_paths,
-            &relay_node,
-            &[sinomo_core::network::cluster_connectivity_record(
-                &relay_state,
-                &target_endpoint,
-                sinomo_core::network::ClusterConnectivityState::Healthy,
-                Some(1),
-                0,
-                Some(now.to_string()),
-                None,
-                now,
-                60,
-            )],
-        )
-        .expect("relay connectivity projected at origin");
-        sinomo_core::network::write_local_cluster_connectivity_records(
-            &relay_cluster_paths,
-            &relay_node,
-            &[sinomo_core::network::cluster_connectivity_record(
-                &relay_state,
-                &target_endpoint,
-                sinomo_core::network::ClusterConnectivityState::Healthy,
-                Some(1),
-                0,
-                Some(now.to_string()),
-                None,
-                now,
-                60,
-            )],
-        )
-        .expect("relay local connectivity");
-
-        let origin_paths = DaemonPaths::new(&origin_data_dir);
-        let relay_paths = DaemonPaths::new(&relay_data_dir);
-        let target_paths = DaemonPaths::new(&target_data_dir);
-        for paths in [&origin_paths, &relay_paths, &target_paths] {
-            paths.ensure().expect("daemon paths");
-        }
-        let service_runtime = tokio::runtime::Handle::current();
-        let relay_service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
-            relay_paths.clone(),
-            service_runtime.clone(),
-        )
-        .await
-        .expect("relay service host");
-        // Deliberately omit the ping service at the target. Final relay delivery
-        // must re-enter the daemon's common core-route dispatcher; routing the
-        // authenticated inner request only through the service registry would
-        // fail this request as unknown.
-        let target_service_host =
-            crate::service_adapter::DaemonServiceRegistryHost::from_registry_for_test(
-                sinomo_core::service::ServiceRegistry::builder().build(),
-                &target_paths,
-            )
-            .expect("target service host without ping registry route");
-        assert!(
-            target_service_host
-                .object_rpc_route_descriptor(sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE)
-                .is_none(),
-            "target test host must not install a registry ping route"
-        );
-
-        let mut origin_to_relay =
-            matches!(origin_transport, RelayAttestationOriginTransport::Channel)
-                .then(LinkedDaemonObjectRpcChannel::new);
-        if let Some(origin_to_relay) = origin_to_relay.as_ref() {
-            crate::tcp_tunnel::insert_isolated_test_object_rpc_channel_client(
-                relay_node.clone(),
-                origin_to_relay.client.clone(),
-            );
-        }
-        let mut relay_to_target = LinkedDaemonObjectRpcChannel::new();
-        crate::tcp_tunnel::insert_isolated_test_object_rpc_channel_client(
-            target_node.clone(),
-            relay_to_target.client.clone(),
-        );
-        let relay_server_paths = relay_paths.clone();
-        let relay_runtime = service_runtime.clone();
-        let relay_dispatch = if let Some(relay_server) = origin_to_relay
-            .as_mut()
-            .map(LinkedDaemonObjectRpcChannel::take_server)
-        {
-            let relay_peer = origin_node.clone();
-            tokio::spawn(async move {
-                handle_daemon_object_rpc_channel_async(
-                    relay_server,
-                    relay_server_paths,
-                    relay_service_host,
-                    relay_runtime,
-                    DaemonObjectRpcChannelPeer::ClusterNode(relay_peer),
-                )
-                .await
-            })
-        } else {
-            let relay_listener = relay_listener.expect("canonical relay listener");
-            tokio::spawn(async move {
-                let stream = relay_listener
-                    .accept()
-                    .await
-                    .expect("accept relay canonical session");
-                handle_daemon_object_rpc_stream_async(
-                    Box::new(stream.into_inner()),
-                    relay_server_paths,
-                    relay_service_host,
-                    relay_runtime,
-                )
-                .await
-            })
-        };
-        let target_server = relay_to_target.take_server();
-        let target_runtime = service_runtime.clone();
-        let target_peer = relay_node.clone();
-        let (target_principal, target_responder_node_id) = daemon_object_rpc_channel_principal(
-            &target_paths,
-            &DaemonObjectRpcChannelPeer::ClusterNode(target_peer),
-        )
-        .expect("authenticated target channel principal");
-        let target_dispatch = tokio::spawn(async move {
-            drive_daemon_object_rpc_channel_async(
-                target_server,
-                target_paths,
-                target_service_host,
-                target_runtime,
-                target_principal,
-                target_responder_node_id,
-            )
-            .await
-        });
-
-        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
-            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-            &sinomo_core::cluster::ClusterNetworkPingRequest {
-                nonce: "relay-attestation".to_string(),
-                payload: Vec::new(),
-                response_payload_bytes: 0,
-                payload_mode: sinomo_core::cluster::ClusterNetworkPingPayloadMode::EmbeddedSobj,
-                request_attachment_bytes: 0,
-                response_attachment_bytes: 0,
-            },
-        )
-        .expect("ping request");
-        let mut host = crate::client::DaemonSignedObjectRpcAsyncHost::new(&service_runtime, true)
-            .with_paths(&origin_paths);
-        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
-            &mut host,
-            &service_runtime,
-            &origin_cluster_paths,
-        );
-        let result = client
-            .call_target(
-                &origin_state,
-                &target_node,
-                sinomo_core::network::ObjectRpcSessionCall::value(request),
-                sinomo_core::network::ClusterObjectRpcOptions::default(),
-            )
-            .await
-            .expect("relayed multiplexed final-hop response");
-        assert_eq!(
-            result.response.responder_node_id(),
-            Some(target_node.as_str()),
-            "the relay channel must preserve the final target attestation"
-        );
-        let decoded: sinomo_core::cluster::ClusterNetworkPingResponse = result
-            .response
-            .decode_body()
-            .expect("relayed ping response");
-        assert_eq!(decoded.responder_node_id, target_node);
-
-        if let Some(origin_to_relay) = origin_to_relay.as_ref() {
-            crate::tcp_tunnel::remove_isolated_test_object_rpc_channel_client(&relay_node);
-            origin_to_relay.close("test complete");
-        }
-        crate::tcp_tunnel::remove_isolated_test_object_rpc_channel_client(&target_node);
-        relay_to_target.close("test complete");
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), relay_dispatch)
-                .await
-                .expect("relay dispatcher stops")
-                .expect("relay dispatcher task")
-                .expect("relay dispatcher"),
-            "relay channel remains non-stopping"
-        );
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), target_dispatch)
-                .await
-                .expect("target dispatcher stops")
-                .expect("target dispatcher task")
-                .expect("target dispatcher"),
-            "target channel remains non-stopping"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_transport_prelude_is_detected_without_consumption() {
         let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
@@ -9471,7 +9319,7 @@ mod tests {
             let runtime =
                 crate::build_daemon_async_runtime("daemon-permission-error-test").expect("runtime");
             let service_runtime = runtime.handle().clone();
-            let error = runtime
+            let stop = runtime
                 .block_on(async move {
                     let listener =
                         sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
@@ -9500,8 +9348,8 @@ mod tests {
                     )
                     .await
                 })
-                .expect_err("node-local permission must reject the session");
-            assert!(matches!(error, DaemonError::AuthDenied));
+                .expect("node-local permission rejection is returned to the client");
+            assert!(!stop, "permission rejection must not stop the daemon");
         });
 
         let address = address_rx.recv().expect("listener address");
@@ -10496,12 +10344,17 @@ mod tests {
             move || run_daemon_control_loop(options, paths, "daemon-test", None)
         });
         let start = Instant::now();
-        while send_test_status_request(&data_dir, &address, Duration::from_millis(200)).is_err() {
-            assert!(
-                start.elapsed() < Duration::from_secs(3),
-                "daemon did not become ready"
-            );
-            thread::sleep(Duration::from_millis(20));
+        loop {
+            match send_test_status_request(&data_dir, &address, Duration::from_millis(200)) {
+                Ok(_) => break,
+                Err(error) => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(3),
+                        "daemon did not become ready: {error:?}"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
 
         let idle_probe = TcpStream::connect(&address).expect("connect idle probe");

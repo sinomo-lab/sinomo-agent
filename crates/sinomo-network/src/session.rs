@@ -91,7 +91,7 @@ struct ObjectRpcSessionDescriptor {
 /// not infer protocol behavior from the number of bytes on the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum ObjectRpcSessionBodyRole {
+pub(crate) enum ObjectRpcSessionBodyRole {
     None,
     Value,
     Attachment,
@@ -3929,11 +3929,34 @@ impl ObjectRpcSessionCall {
         }
     }
 
-    pub(crate) fn try_clone_replayable(&self) -> Option<Self> {
-        Some(Self {
-            request: self.request.clone(),
-            body: self.body.try_clone_replayable()?,
-        })
+    /// Splits the service head from the one stream-native body without adding
+    /// the superseded session descriptor. Value calls move their encoded SOBJ
+    /// value out of the application head at every size; attachment calls keep
+    /// the typed head intact.
+    pub(crate) fn into_stream_native_parts(
+        mut self,
+    ) -> (
+        crate::ObjectRpcRequest,
+        ObjectRpcSessionBodyRole,
+        ObjectRpcBodySource,
+    ) {
+        if self.body.has_value_intent() {
+            let value = std::mem::take(&mut self.request.body);
+            if value.is_empty() {
+                return (
+                    self.request,
+                    ObjectRpcSessionBodyRole::None,
+                    ObjectRpcBodySource::empty(),
+                );
+            }
+            return (
+                self.request,
+                ObjectRpcSessionBodyRole::Value,
+                ObjectRpcBodySource::bytes(value).with_role(ObjectRpcSessionBodyRole::Value),
+            );
+        }
+        let role = self.body.role();
+        (self.request, role, self.body)
     }
 
     /// Inserts the session descriptor into the request before daemon-auth
@@ -4198,6 +4221,32 @@ impl ObjectRpcSessionResponse {
             response,
             body: ObjectRpcBodySource::value_intent(),
         }
+    }
+
+    pub(crate) fn into_stream_native_parts(
+        mut self,
+    ) -> (
+        crate::ObjectRpcResponse,
+        ObjectRpcSessionBodyRole,
+        ObjectRpcBodySource,
+    ) {
+        if self.body.has_value_intent() {
+            let value = std::mem::take(&mut self.response.body);
+            if value.is_empty() {
+                return (
+                    self.response,
+                    ObjectRpcSessionBodyRole::None,
+                    ObjectRpcBodySource::empty(),
+                );
+            }
+            return (
+                self.response,
+                ObjectRpcSessionBodyRole::Value,
+                ObjectRpcBodySource::bytes(value).with_role(ObjectRpcSessionBodyRole::Value),
+            );
+        }
+        let role = self.body.role();
+        (self.response, role, self.body)
     }
 }
 

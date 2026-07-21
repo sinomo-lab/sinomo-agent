@@ -11,6 +11,7 @@ use crate::error::NetworkError;
 use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
 use crate::session::ObjectRpcBodySource;
 use bytes::Bytes;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sinomo_base::Id;
 use sinomo_node::NodeId;
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -30,6 +32,8 @@ pub const OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES: usize = 256 * 1024;
 
 const OBJECT_RPC_STREAM_PROTOCOL: &str = "sinomo.object-rpc.stream.v1";
 const OBJECT_RPC_STREAM_WIRE_MAGIC: [u8; 4] = *b"SOR1";
+const LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC: [u8; 4] = *b"SOL1";
+const LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES: usize = 128;
 const OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES: usize = 9;
 const OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES: usize = 16 * 1024;
 const OBJECT_RPC_STREAM_BODY_CHANNEL_DEPTH: usize =
@@ -113,6 +117,114 @@ impl RpcPeerContext {
             RpcPeerIdentity::UnauthenticatedLocal => (None, None),
         }
     }
+}
+
+pub fn local_object_rpc_stream_prelude_prefix_matches(prefix: &[u8]) -> bool {
+    prefix.len() <= LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC.len()
+        && LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC.starts_with(prefix)
+}
+
+/// Starts the explicit loopback-only Stage-F shortcut. The daemon listener
+/// must independently prove socket locality and authorize the signed service
+/// request; this prelude only supplies a unique transcript binding shared by
+/// the two protocol endpoints.
+pub async fn write_local_object_rpc_stream_prelude<S>(
+    stream: &mut S,
+) -> Result<RpcPeerContext, NetworkError>
+where
+    S: AsyncWrite + Unpin + ?Sized,
+{
+    let session_id = Id::generate();
+    let session_id_bytes = session_id.as_str().as_bytes();
+    let session_id_len =
+        u16::try_from(session_id_bytes.len()).map_err(|_| NetworkError::FrameTooLarge {
+            actual_bytes: session_id_bytes.len(),
+            max_bytes: LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES,
+        })?;
+    if session_id_bytes.len() > LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: session_id_bytes.len(),
+            max_bytes: LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES,
+        });
+    }
+    let mut channel_binding = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut channel_binding)
+        .map_err(|_| delivery_error("generate local RPC stream binding", "system random failed"))?;
+    stream
+        .write_all(&LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC)
+        .await
+        .map_err(|error| delivery_error("write local RPC stream prelude", error.to_string()))?;
+    stream
+        .write_all(&channel_binding)
+        .await
+        .map_err(|error| delivery_error("write local RPC stream binding", error.to_string()))?;
+    stream
+        .write_all(&session_id_len.to_be_bytes())
+        .await
+        .map_err(|error| {
+            delivery_error("write local RPC stream session length", error.to_string())
+        })?;
+    stream
+        .write_all(session_id_bytes)
+        .await
+        .map_err(|error| delivery_error("write local RPC stream session", error.to_string()))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| delivery_error("flush local RPC stream prelude", error.to_string()))?;
+    Ok(RpcPeerContext::unauthenticated_local(
+        session_id,
+        channel_binding,
+    ))
+}
+
+pub async fn read_local_object_rpc_stream_prelude<S>(
+    stream: &mut S,
+) -> Result<RpcPeerContext, NetworkError>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    let mut magic = [0_u8; 4];
+    stream
+        .read_exact(&mut magic)
+        .await
+        .map_err(|error| delivery_error("read local RPC stream prelude", error.to_string()))?;
+    if magic != LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC {
+        return Err(NetworkError::AuthDenied);
+    }
+    let mut channel_binding = [0_u8; 32];
+    stream
+        .read_exact(&mut channel_binding)
+        .await
+        .map_err(|error| delivery_error("read local RPC stream binding", error.to_string()))?;
+    if channel_binding == [0; 32] {
+        return Err(NetworkError::AuthDenied);
+    }
+    let session_id_len = stream
+        .read_u16()
+        .await
+        .map_err(|error| delivery_error("read local RPC session length", error.to_string()))?
+        as usize;
+    if session_id_len == 0 || session_id_len > LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: session_id_len,
+            max_bytes: LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES,
+        });
+    }
+    let mut session_id = vec![0_u8; session_id_len];
+    stream
+        .read_exact(&mut session_id)
+        .await
+        .map_err(|error| delivery_error("read local RPC session", error.to_string()))?;
+    let session_id = std::str::from_utf8(&session_id)
+        .ok()
+        .and_then(|value| Id::from_str(value).ok())
+        .ok_or(NetworkError::AuthDenied)?;
+    Ok(RpcPeerContext::unauthenticated_local(
+        session_id,
+        channel_binding,
+    ))
 }
 
 /// A request or response body supplied through the same API whether its final
@@ -210,6 +322,11 @@ pub struct ObjectRpcStreamCall {
     pub method: String,
     pub operation_id: Option<String>,
     pub metadata: BTreeMap<String, String>,
+    /// Opaque, bounded service head authenticated with the RPC head.
+    ///
+    /// Object RPC does not interpret this value. Service adapters use it for
+    /// their typed request head while the body remains incrementally framed.
+    pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamBody,
 }
 
@@ -220,6 +337,7 @@ impl ObjectRpcStreamCall {
             method: method.into(),
             operation_id: None,
             metadata: BTreeMap::new(),
+            application_head: Vec::new(),
             body,
         }
     }
@@ -234,6 +352,7 @@ impl ObjectRpcStreamCall {
             method: method.into(),
             operation_id,
             metadata: BTreeMap::new(),
+            application_head: Vec::new(),
             body: ObjectRpcStreamBody::bytes(SinomoObjectCodec::network_frame().encode(body)?),
         })
     }
@@ -255,6 +374,7 @@ pub struct ObjectRpcStreamIncomingCall {
     pub method: String,
     pub operation_id: Option<String>,
     pub metadata: BTreeMap<String, String>,
+    pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamIncomingBody,
 }
 
@@ -273,6 +393,7 @@ impl ObjectRpcStreamIncomingCall {
 pub struct ObjectRpcStreamReply {
     pub request_id: Id,
     pub metadata: BTreeMap<String, String>,
+    pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamBody,
 }
 
@@ -281,6 +402,7 @@ impl ObjectRpcStreamReply {
         Self {
             request_id,
             metadata: BTreeMap::new(),
+            application_head: Vec::new(),
             body,
         }
     }
@@ -301,6 +423,7 @@ impl ObjectRpcStreamReply {
 pub struct ObjectRpcStreamResponse {
     pub request_id: Id,
     pub metadata: BTreeMap<String, String>,
+    pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamIncomingBody,
 }
 
@@ -349,6 +472,8 @@ struct RequestHeadUnsigned {
     method: String,
     operation_id: Option<String>,
     metadata: BTreeMap<String, String>,
+    #[serde(with = "serde_bytes")]
+    application_head: Vec<u8>,
     issued_at_unix_millis: u64,
     descriptor: BodyDescriptor,
     inline_body: Option<InlineBody>,
@@ -364,6 +489,8 @@ struct RequestHead {
 enum ResponseDisposition {
     Accepted {
         metadata: BTreeMap<String, String>,
+        #[serde(with = "serde_bytes")]
+        application_head: Vec<u8>,
         descriptor: BodyDescriptor,
         inline_body: Option<InlineBody>,
     },
@@ -1145,6 +1272,7 @@ fn request_head(
     method: String,
     operation_id: Option<String>,
     metadata: BTreeMap<String, String>,
+    application_head: Vec<u8>,
     body: &PreparedOutgoingBody,
 ) -> Result<(RequestHead, Vec<u8>), NetworkError> {
     let (origin_node_id, destination_node_id) = context.wire_endpoints();
@@ -1158,6 +1286,7 @@ fn request_head(
         method,
         operation_id,
         metadata,
+        application_head,
         issued_at_unix_millis: now_unix_millis()?,
         descriptor: body.descriptor,
         inline_body: body.inline_body.clone(),
@@ -1345,6 +1474,7 @@ where
         method,
         operation_id,
         metadata,
+        application_head,
         body,
     } = call;
     let body = match prepare_outgoing_body(body).await {
@@ -1357,6 +1487,7 @@ where
         method,
         operation_id,
         metadata,
+        application_head,
         &body,
     ) {
         Ok(head) => head,
@@ -1425,17 +1556,19 @@ where
         return RpcDeliveryOutcome::PossiblyApplied { error };
     }
     let response_head_digest = *blake3::hash(&response_frame.1).as_bytes();
-    let (metadata, descriptor, inline_body) = match response_head.unsigned.disposition {
-        ResponseDisposition::Accepted {
-            metadata,
-            descriptor,
-            inline_body,
-        } => (metadata, descriptor, inline_body),
-        ResponseDisposition::Rejected { detail } => {
-            send_task.abort();
-            return RpcDeliveryOutcome::Rejected { detail };
-        }
-    };
+    let (metadata, application_head, descriptor, inline_body) =
+        match response_head.unsigned.disposition {
+            ResponseDisposition::Accepted {
+                metadata,
+                application_head,
+                descriptor,
+                inline_body,
+            } => (metadata, application_head, descriptor, inline_body),
+            ResponseDisposition::Rejected { detail } => {
+                send_task.abort();
+                return RpcDeliveryOutcome::Rejected { detail };
+            }
+        };
     let (body, _verifier, receive_task) = make_incoming_body(
         reader,
         options,
@@ -1451,6 +1584,7 @@ where
     let consumer_result = response_consumer(ObjectRpcStreamResponse {
         request_id,
         metadata,
+        application_head,
         body,
     })
     .await;
@@ -1556,6 +1690,7 @@ where
         method: head.unsigned.method,
         operation_id: head.unsigned.operation_id,
         metadata: head.unsigned.metadata,
+        application_head: head.unsigned.application_head,
         body,
     };
     let reply = match handler(incoming, context.clone()).await {
@@ -1603,6 +1738,7 @@ where
         request_head_digest,
         ResponseDisposition::Accepted {
             metadata: reply.metadata,
+            application_head: reply.application_head,
             descriptor: response_body.descriptor,
             inline_body: response_body.inline_body.clone(),
         },
@@ -1824,6 +1960,7 @@ mod tests {
             "test.stale".to_string(),
             None,
             BTreeMap::new(),
+            Vec::new(),
             &body,
         )
         .expect("head");

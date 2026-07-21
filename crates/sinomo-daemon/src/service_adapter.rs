@@ -11188,6 +11188,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn daemon_generic_dfs_and_membership_forward_across_two_authenticated_hops() {
+        crate::cluster::ensure_cluster_directory_installed();
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-session-forward-bodies");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -11251,8 +11252,38 @@ mod tests {
                 priority: 0,
                 last_observed_latency_ms: None,
             });
+        let target_endpoint = target_member.endpoints[0].clone();
         state.members.push(target_member);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("cluster directory state");
+        let directory = sinomo_core::network::cluster_directory_for(&cluster_paths)
+            .snapshot()
+            .expect("cluster directory snapshot");
+        assert!(directory.is_authorized(&local_node));
+        assert!(directory.is_authorized(&target_node));
+        let connectivity = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &target_endpoint,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_records(
+            &cluster_paths,
+            &local_node,
+            std::slice::from_ref(&connectivity),
+        )
+        .expect("local target connectivity");
+        let target_cluster_paths = ClusterPaths::new(&target_data_dir);
+        let mut target_state = state.clone();
+        target_state.local_node_id = target_node.clone();
+        sinomo_core::cluster::write_cluster_state(&target_cluster_paths, &target_state)
+            .expect("target cluster state");
 
         // Case zero exercises bodies in both directions. Case one proves that
         // a head-only DFS request still receives a streamed response. Case two
@@ -11272,6 +11303,26 @@ mod tests {
         let target_routes = inner_routes.clone();
         let target_expected_requests = request_bodies.clone();
         let target_responses = response_bodies.clone();
+        let target_directory = sinomo_core::network::DirectorySnapshot::try_from_records(
+            sinomo_core::network::DirectoryVersion(1),
+            target_state.members.clone(),
+            std::iter::once(target_endpoint),
+        )
+        .expect("target directory");
+        let target_routed_identity = Arc::new(
+            sinomo_core::network::DaemonRoutedSessionIdentity::new(
+                target_node.clone(),
+                target_data_dir,
+            )
+            .expect("target routed identity"),
+        );
+        let target_link_provider = sinomo_core::network::ClusterLinkProvider::new(
+            target_node.clone(),
+            target_routed_identity.clone(),
+            sinomo_core::network::NetworkHealthPolicy::default(),
+        )
+        .expect("target link provider");
+        let server_target_node = target_node.clone();
         let target_server = tokio::spawn(async move {
             for (index, ((expected_route, expected_request), response_body)) in target_routes
                 .into_iter()
@@ -11279,40 +11330,91 @@ mod tests {
                 .zip(target_responses)
                 .enumerate()
             {
-                let stream = target_listener.accept().await.expect("target accept");
-                let (mut incoming, responder) =
-                    sinomo_core::network::accept_object_rpc_server_session(
-                        Box::new(stream.into_inner()),
-                        target_data_dir.clone(),
-                        sinomo_core::network::NetworkCallPolicy::default(),
-                        |_request, _node_id, _public_key| Ok(()),
+                let mut stream = target_listener
+                    .accept()
+                    .await
+                    .expect("target accept")
+                    .into_inner();
+                let metadata =
+                    sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                        .await
+                        .expect("target authenticated transport prelude");
+                let source_node =
+                    sinomo_core::network::verify_builtin_authenticated_transport_metadata(
+                        &metadata,
+                        &server_target_node,
+                        &target_directory,
+                        target_routed_identity.as_ref(),
                     )
-                    .await
-                    .expect("target session");
-                assert_eq!(incoming.request.route, expected_route);
-                assert_eq!(
-                    incoming.body.total_bytes(),
-                    Some(expected_request.len() as u64),
-                    "the proxy must preserve the request attachment's declared length"
-                );
-                let mut actual_request = Vec::new();
-                incoming
-                    .body
-                    .read_to_end(&mut actual_request)
-                    .await
-                    .expect("target request body");
-                assert_eq!(actual_request, expected_request);
-                responder
-                    .respond(ObjectRpcSessionResponse {
-                        response: ObjectRpcResponse::encode_body(
+                    .expect("target adjacent source");
+                let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
+                    Box::new(stream),
+                    server_target_node.clone(),
+                    source_node,
+                    sinomo_core::Id::generate(),
+                    metadata.channel_binding,
+                    metadata.capabilities,
+                )
+                .expect("target direct stream");
+                let routed = match sinomo_core::network::accept_or_relay_routed_session(
+                    direct,
+                    &target_directory,
+                    target_routed_identity.as_ref(),
+                    &target_link_provider,
+                    None,
+                )
+                .await
+                .expect("target routed session")
+                {
+                    sinomo_core::network::RoutedSessionDisposition::Destination(stream) => stream,
+                    sinomo_core::network::RoutedSessionDisposition::Relayed(_) => {
+                        panic!("two-node forwarding target terminated as relay")
+                    }
+                };
+                let context = sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
+                    routed.local_node_id.clone(),
+                    routed.peer_node_id.clone(),
+                    routed.session_id.clone(),
+                    routed.channel_binding,
+                )
+                .expect("target service context");
+                let response_node = server_target_node.clone();
+                sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+                    routed,
+                    &context,
+                    sinomo_core::network::ObjectFrameIoOptions::default(),
+                    move |mut incoming, _peer| async move {
+                        assert_eq!(incoming.request.route, expected_route);
+                        assert!(
+                            incoming.body.total_bytes().is_none_or(|total| {
+                                total == expected_request.len() as u64
+                            }),
+                            "the proxy must preserve a known length or use the authenticated deferred-body contract"
+                        );
+                        let mut actual_request = Vec::new();
+                        incoming
+                            .body
+                            .read_to_end(&mut actual_request)
+                            .await
+                            .expect("target request body");
+                        assert_eq!(actual_request, expected_request);
+                        let mut response = ObjectRpcResponse::encode_body(
                             incoming.request.route,
                             &format!("response-{index}"),
                         )
-                        .expect("target response head"),
-                        body: ObjectRpcBodySource::bytes(response_body),
-                    })
+                        .expect("target response head");
+                        response.mark_responder_node_id(response_node.to_string());
+                        let response_bytes = response_body.len() as u64;
+                        assert!(index != 0 || response_bytes > 0);
+                        let body = ObjectRpcBodySource::bytes(response_body);
+                        assert_eq!(body.total_bytes(), Some(response_bytes));
+                        let outgoing = ObjectRpcSessionResponse::new(response, body);
+                        assert_eq!(outgoing.body.total_bytes(), Some(response_bytes));
+                        Ok(outgoing)
+                    },
+                )
                     .await
-                    .expect("target response");
+                    .expect("target stream-native service response");
             }
         });
 
@@ -11323,7 +11425,6 @@ mod tests {
             .local_addr_string()
             .expect("outer listener address");
         let outer_paths = paths.clone();
-        let outer_data_dir = data_dir.clone();
         let outer_runtime = tokio::runtime::Handle::current();
         let forward_routes = [
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -11332,34 +11433,49 @@ mod tests {
         ];
         let outer_server = tokio::spawn(async move {
             for forward_route in forward_routes {
-                let stream = outer_listener.accept().await.expect("outer accept");
-                let (incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                    Box::new(stream.into_inner()),
-                    outer_data_dir.clone(),
-                    sinomo_core::network::NetworkCallPolicy::default(),
-                    |_request, _node_id, _public_key| Ok(()),
-                )
-                .await
-                .expect("outer session");
-                assert_eq!(incoming.request.route, forward_route);
-                let payload: crate::DaemonObjectRpcForwardRequest =
-                    incoming.request.decode_body().expect("forward payload");
-                let (response, body) = forward_object_rpc_session_from_daemon_control(
-                    &outer_paths,
-                    payload,
-                    incoming.body,
-                    &outer_runtime,
-                )
-                .await
-                .expect("forward session");
-                responder
-                    .respond(ObjectRpcSessionResponse {
-                        response: ObjectRpcResponse::encode_body(forward_route, &response)
-                            .expect("forward response head"),
-                        body,
-                    })
+                let mut stream = outer_listener
+                    .accept()
                     .await
-                    .expect("forward response");
+                    .expect("outer accept")
+                    .into_inner();
+                let context = sinomo_core::network::__object_rpc_stream_contract::read_local_object_rpc_stream_prelude(
+                    &mut stream,
+                )
+                .await
+                .expect("outer local stream prelude");
+                let handler_paths = outer_paths.clone();
+                let handler_runtime = outer_runtime.clone();
+                sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+                    stream,
+                    &context,
+                    sinomo_core::network::ObjectFrameIoOptions::default(),
+                    move |incoming, _peer| async move {
+                        assert_eq!(incoming.request.route, forward_route);
+                        let authenticated = crate::authenticate_daemon_control_request(
+                            &handler_paths,
+                            &incoming.request,
+                        )
+                        .expect("outer local forward signer");
+                        assert_eq!(authenticated.signer, crate::DaemonSignerAuthority::Local);
+                        let payload: crate::DaemonObjectRpcForwardRequest =
+                            incoming.request.decode_body().expect("forward payload");
+                        let (response, body) = forward_object_rpc_session_from_daemon_control(
+                            &handler_paths,
+                            payload,
+                            incoming.body,
+                            &handler_runtime,
+                        )
+                        .await
+                        .expect("forward session");
+                        Ok(ObjectRpcSessionResponse::new(
+                            ObjectRpcResponse::encode_body(forward_route, &response)
+                                .expect("forward response head"),
+                            body,
+                        ))
+                    },
+                )
+                .await
+                .expect("outer stream-native forward response");
             }
         });
 
@@ -11411,18 +11527,22 @@ mod tests {
                 )
                 .await
                 .expect("outer forwarded session");
-            assert_eq!(
-                result.body.total_bytes(),
-                Some(expected_response.len() as u64),
-                "the proxy must preserve the response attachment's declared length"
-            );
             let envelope: crate::DaemonObjectRpcForwardResponse = result
                 .response
                 .decode_body()
                 .expect("forward response envelope");
             let crate::DaemonObjectRpcForwardResponse::Success { response } = envelope else {
-                panic!("forward returned a network error: {envelope:?}");
+                panic!(
+                    "forward returned a network error: {envelope:?}; local={local_node} target={target_node}"
+                );
             };
+            assert!(
+                result
+                    .body
+                    .total_bytes()
+                    .is_none_or(|total| total == expected_response.len() as u64),
+                "the proxy must preserve a known length or use the authenticated deferred-body contract"
+            );
             assert_eq!(
                 response.responder_node_id(),
                 Some(target_node.as_str()),

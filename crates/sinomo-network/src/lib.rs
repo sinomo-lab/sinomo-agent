@@ -12,6 +12,7 @@
 //! host filesystem and transport adapters while cluster-aware validation remains
 //! here.
 
+mod builtin_link;
 mod channel;
 mod channel_transport;
 mod channel_wire;
@@ -46,6 +47,7 @@ mod routed_identity;
 mod routing;
 mod rpc;
 mod rpc_future;
+mod service_rpc_stream;
 mod session;
 mod tcp_tunnel;
 mod timeline;
@@ -55,6 +57,9 @@ mod timeline;
 mod layer_boundary_tests;
 mod transfer;
 
+pub use builtin_link::{
+    BuiltinTcpLinkProvider, ClusterLinkProvider, verify_builtin_authenticated_transport_metadata,
+};
 pub use channel::{
     OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES, OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES,
     OBJECT_RPC_CHANNEL_MAX_CALLS, OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES,
@@ -131,6 +136,7 @@ pub use connectivity_snapshot::{
     ConnectivitySnapshot, ConnectivityTracker, ConnectivityView, DirectConnectivityFailureEvidence,
     DirectConnectivityObservation, DirectConnectivityState, DirectConnectivityStatus,
     MAX_CONNECTIVITY_FAILURE_REASON_BYTES, MAX_CONNECTIVITY_SNAPSHOT_EDGES,
+    connectivity_snapshot_from_directory_records,
 };
 pub use connectivity_store::{
     invalidate_local_cluster_connectivity_cache,
@@ -298,9 +304,8 @@ pub use object::{
 pub use object::{write_object_frame_async, write_object_frame_async_timed};
 // Unconditional since stage C: see read_object_frame_async above.
 pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
-/// Pre-production stream-native object-RPC contract and conformance entry points.
-/// Production delivery must not call these until the matching legacy carrier
-/// is deleted in the same bounded migration slice.
+/// Stream-native object-RPC contract and the temporary service-catalog adapter
+/// used during bounded Stage-F migration.
 #[doc(hidden)]
 pub mod __object_rpc_stream_contract {
     pub use super::object_rpc_stream::{
@@ -309,8 +314,11 @@ pub mod __object_rpc_stream_contract {
         ObjectRpcBodyVerification, ObjectRpcStreamBody, ObjectRpcStreamBodyVerifier,
         ObjectRpcStreamCall, ObjectRpcStreamIncomingBody, ObjectRpcStreamIncomingCall,
         ObjectRpcStreamReply, ObjectRpcStreamResponse, RpcDeliveryOutcome, RpcPeerContext,
-        RpcPeerIdentity, call_object_rpc_stream, serve_object_rpc_stream,
+        RpcPeerIdentity, call_object_rpc_stream, local_object_rpc_stream_prelude_prefix_matches,
+        read_local_object_rpc_stream_prelude, serve_object_rpc_stream,
+        write_local_object_rpc_stream_prelude,
     };
+    pub use super::service_rpc_stream::{call_service_rpc_stream, serve_service_rpc_stream};
 }
 pub use paths::ClusterPaths;
 pub use peer::{
