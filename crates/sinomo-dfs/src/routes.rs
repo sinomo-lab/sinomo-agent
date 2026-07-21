@@ -14,7 +14,6 @@ pub const DFS_RPC_CATEGORY: &str = "dfs";
 pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
 pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
 pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
-pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
@@ -70,7 +69,6 @@ pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
 ];
 pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE,
     DFS_INSPECTION_ROUTE,
     DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
@@ -107,7 +105,6 @@ pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
 pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE,
     DFS_INSPECTION_ROUTE,
     DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,

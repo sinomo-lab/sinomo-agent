@@ -1,12 +1,12 @@
 //! Node-local DFS state access.
 //!
-//! This module owns filesystem paths under [`SinomoDataDir`], local expose/pin
+//! This module owns filesystem paths under [`SinomoDataDir`], local pin
 //! store wrappers, metadata backend openers, and operator inspection entry
 //! points. The networked service loop remains in the root module for now.
 
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use sinomo_core::local::{LocalDataError, SinomoDataDir};
 use sinomo_core::network::ClusterPaths;
@@ -14,12 +14,11 @@ use sinomo_core::node::NodeId;
 
 use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsError,
-    DfsExposeAddRequest, DfsExposeConfig, DfsExposeStore, DfsExposeStoreError, DfsFileSystemId,
-    DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId, DfsObjectId,
+    DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId, DfsObjectId,
     DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
     DfsOperatorStatus, DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError,
     LocalDfsPinStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
-    default_dfs_repair_attempt_snapshot_path, fallback_dfs_node_id, metadata_shards_prefix,
+    default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix,
     read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
     use_dfs_conflict_version,
 };
@@ -107,57 +106,6 @@ pub fn resolve_dfs_pin_root(explicit: Option<PathBuf>) -> Result<PathBuf, LocalD
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     Ok(default_dfs_pin_root(&data_dir))
-}
-
-pub fn default_dfs_expose_config_path(data_dir: &SinomoDataDir) -> PathBuf {
-    data_dir.dfs_expose_config_file()
-}
-
-pub fn dfs_expose_config_path(explicit: Option<PathBuf>, data_dir: &SinomoDataDir) -> PathBuf {
-    explicit.unwrap_or_else(|| default_dfs_expose_config_path(data_dir))
-}
-
-pub fn ensure_default_dfs_expose_config(
-    config_path: impl AsRef<Path>,
-    data_dir: impl AsRef<Path>,
-    node_id: NodeId,
-) -> Result<DfsExposeConfig, DfsExposeStoreError> {
-    DfsExposeStore::new(config_path.as_ref().to_path_buf())
-        .ensure_default(data_dir.as_ref(), node_id)
-}
-
-pub fn ensure_default_cluster_aware_dfs_expose_config(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-) -> Result<DfsExposeConfig, DfsExposeStoreError> {
-    let node_id = if cluster_paths.state.exists() {
-        sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
-            .map(|state| state.local_node_id)
-            .unwrap_or_else(|_| fallback_dfs_node_id())
-    } else {
-        fallback_dfs_node_id()
-    };
-    ensure_default_dfs_expose_config(data_dir.dfs_expose_config_file(), data_dir.root(), node_id)
-}
-
-pub fn load_dfs_expose_config(
-    config_path: impl AsRef<Path>,
-) -> Result<DfsExposeConfig, DfsExposeStoreError> {
-    DfsExposeStore::new(config_path.as_ref().to_path_buf()).load()
-}
-
-pub fn add_dfs_expose_entry(
-    config_path: impl AsRef<Path>,
-    request: DfsExposeAddRequest,
-) -> Result<DfsExposeConfig, DfsExposeStoreError> {
-    DfsExposeStore::new(config_path.as_ref().to_path_buf()).add_entry(request)
-}
-
-pub fn remove_dfs_expose_entry(
-    config_path: impl AsRef<Path>,
-    id: &str,
-) -> Result<(DfsExposeConfig, bool), DfsExposeStoreError> {
-    DfsExposeStore::new(config_path.as_ref().to_path_buf()).remove_entry(id)
 }
 
 pub fn list_local_dfs_pins(

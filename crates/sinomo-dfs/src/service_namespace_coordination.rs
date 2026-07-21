@@ -152,7 +152,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => {}
         }
-        if let DfsNamespaceOperation::ApplyTransaction { transaction } = operation {
+        if let DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } = operation {
             return self.affected_namespace_transaction_shards(file_system_id, transaction);
         }
         let candidates =

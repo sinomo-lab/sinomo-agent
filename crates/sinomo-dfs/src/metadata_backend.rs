@@ -228,6 +228,7 @@ fn namespace_prepare_payload_matches(
         && left.operation_digest == right.operation_digest
         && left.expected_object_versions == right.expected_object_versions
         && left.expected_path_occupants == right.expected_path_occupants
+        && left.content_receipts == right.content_receipts
         && left.transaction == right.transaction
 }
 
@@ -240,6 +241,7 @@ fn namespace_prepare_rebind_payload_matches(
         && left.shard_id == right.shard_id
         && left.expected_object_versions == right.expected_object_versions
         && left.expected_path_occupants == right.expected_path_occupants
+        && left.content_receipts == right.content_receipts
         && left.transaction == right.transaction
         && left.status == DfsNamespacePrepareStatus::Prepared
         && right.status == DfsNamespacePrepareStatus::Prepared
@@ -322,6 +324,10 @@ fn validate_namespace_prepare_shape(
             .advisory_lock_states
             .iter()
             .any(|state| state.file_system_id != prepare.file_system_id)
+        || prepare
+            .content_receipts
+            .iter()
+            .any(|receipt| receipt.receipt.file_system_id != prepare.file_system_id)
     {
         return Err(MetadataBackendError::Serde(format!(
             "namespace prepare {} contains records outside filesystem {}",
@@ -390,6 +396,81 @@ fn validate_namespace_prepare_shape(
             prepare.operation_id, path
         )));
     }
+    let transaction_objects = prepare
+        .transaction
+        .objects
+        .iter()
+        .map(|object| (object.object_id.clone(), object))
+        .collect::<BTreeMap<_, _>>();
+    let transaction_versions = prepare
+        .transaction
+        .versions
+        .iter()
+        .map(|version| {
+            (
+                (version.object_id.clone(), version.version.clone()),
+                version,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut receipt_keys = BTreeSet::new();
+    for receipt in &prepare.content_receipts {
+        let key = (
+            receipt.receipt.object_id.clone(),
+            receipt.receipt.committed_version.clone(),
+            receipt.replica_node_id.clone(),
+        );
+        if !receipt_keys.insert(key) {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} repeats a durable content receipt for object {} version {} replica {}",
+                prepare.operation_id,
+                receipt.receipt.object_id,
+                receipt.receipt.committed_version,
+                receipt.replica_node_id
+            )));
+        }
+        let Some(object) = transaction_objects.get(&receipt.receipt.object_id) else {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} has a content receipt for object {} outside its transaction",
+                prepare.operation_id, receipt.receipt.object_id
+            )));
+        };
+        let version_key = (
+            receipt.receipt.object_id.clone(),
+            receipt.receipt.committed_version.clone(),
+        );
+        let Some(version) = transaction_versions.get(&version_key) else {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} has a content receipt without a matching visible version for object {}",
+                prepare.operation_id, receipt.receipt.object_id
+            )));
+        };
+        if object.version != receipt.receipt.committed_version
+            || object.content_hash != receipt.content_hash
+            || version.content_hash != receipt.content_hash
+            || !object.current_locations.contains(&receipt.replica_node_id)
+            || !version.locations.contains(&receipt.replica_node_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} content receipt does not match visible object {}",
+                prepare.operation_id, receipt.receipt.object_id
+            )));
+        }
+        if let Some(existing) = tables.receipts.get(&(
+            receipt.receipt.object_id.clone(),
+            receipt.receipt.committed_version.clone(),
+            receipt.replica_node_id.clone(),
+        )) && !replay_receipt_matches_existing(existing, receipt)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} conflicts with the durable content receipt for object {} version {} replica {}",
+                prepare.operation_id,
+                receipt.receipt.object_id,
+                receipt.receipt.committed_version,
+                receipt.replica_node_id
+            )));
+        }
+    }
     if let Some(existing) = tables
         .namespace_transactions
         .get(&prepare.transaction.transaction_id)
@@ -401,6 +482,44 @@ fn validate_namespace_prepare_shape(
         )));
     }
     Ok(())
+}
+
+fn namespace_prepare_content_receipts_are_complete(
+    tables: &DfsMetadataTables,
+    prepare: &DfsNamespacePrepareRecord,
+) -> bool {
+    prepare.content_receipts.iter().all(|receipt| {
+        tables
+            .receipts
+            .get(&(
+                receipt.receipt.object_id.clone(),
+                receipt.receipt.committed_version.clone(),
+                receipt.replica_node_id.clone(),
+            ))
+            .is_some_and(|existing| replay_receipt_matches_existing(existing, receipt))
+    })
+}
+
+fn missing_namespace_prepare_content_receipt_ops(
+    tables: &DfsMetadataTables,
+    prepare: &DfsNamespacePrepareRecord,
+) -> Vec<DfsMetadataTableOp> {
+    prepare
+        .content_receipts
+        .iter()
+        .filter(|receipt| {
+            !tables
+                .receipts
+                .get(&(
+                    receipt.receipt.object_id.clone(),
+                    receipt.receipt.committed_version.clone(),
+                    receipt.replica_node_id.clone(),
+                ))
+                .is_some_and(|existing| replay_receipt_matches_existing(existing, receipt))
+        })
+        .cloned()
+        .map(|receipt| DfsMetadataTableOp::PutReceipt { receipt })
+        .collect()
 }
 
 fn validate_namespace_prepare_expectations(
@@ -542,11 +661,16 @@ fn namespace_prepare_table_ops_for_record(
             if existing.status == DfsNamespacePrepareStatus::Committed
                 && existing == prepare
                 && namespace_transaction_recovery_is_complete(tables, &prepare.transaction)
+                && namespace_prepare_content_receipts_are_complete(tables, prepare)
             {
                 return Ok(Vec::new());
             }
-            let mut ops = if existing.status == DfsNamespacePrepareStatus::Committed {
-                plan_namespace_transaction_recovery_table_ops(tables, &prepare.transaction)
+            let mut ops = missing_namespace_prepare_content_receipt_ops(tables, prepare);
+            if existing.status == DfsNamespacePrepareStatus::Committed {
+                ops.extend(plan_namespace_transaction_recovery_table_ops(
+                    tables,
+                    &prepare.transaction,
+                ));
             } else {
                 validate_namespace_prepare_expectations(tables, prepare)?;
                 validate_namespace_prepare_does_not_overlap(tables, prepare)?;
@@ -557,8 +681,11 @@ fn namespace_prepare_table_ops_for_record(
                         .get()
                         .saturating_add(1),
                 );
-                namespace_transaction_table_ops(tables, &prepare.transaction)
-            };
+                ops.extend(namespace_transaction_table_ops(
+                    tables,
+                    &prepare.transaction,
+                ));
+            }
             ops.push(DfsMetadataTableOp::PutNamespacePrepare {
                 prepare: prepare.clone(),
             });
@@ -2008,6 +2135,32 @@ impl LocalSobjMetadataBackend {
                 );
                 Ok(true)
             }
+            DfsMetadataMutation::PutNamespaceRequest {
+                requester_node_id,
+                request_id,
+                request,
+                ..
+            } => {
+                if request.requester_node_id != *requester_node_id
+                    || request.request_id != *request_id
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace request key {requester_node_id}/{request_id} does not match its payload"
+                    )));
+                }
+                let key = (requester_node_id.clone(), request_id.clone());
+                if self.tables.namespace_requests.get(&key) == Some(request) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutNamespaceRequest {
+                        request: request.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
         }
     }
 
@@ -2492,6 +2645,11 @@ impl LocalSobjMetadataBackend {
                     return Ok(());
                 };
                 vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }]
+            }
+            DfsMetadataMutation::PutNamespaceRequest { request, .. } => {
+                vec![DfsMetadataTableOp::PutNamespaceRequest {
+                    request: request.clone(),
+                }]
             }
         };
         self.append_and_apply_table_ops(entry.sequence, table_ops)
@@ -4483,6 +4641,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             && existing.status == DfsNamespacePrepareStatus::Committed
             && namespace_prepare_payload_matches(&existing, &prepare)
             && namespace_transaction_recovery_is_complete(&self.tables, &existing.transaction)
+            && namespace_prepare_content_receipts_are_complete(&self.tables, &existing)
         {
             // A lost response may retry the exact prepared operation after its
             // visible transaction already committed. Replicate the durable
@@ -4626,6 +4785,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 self.write_journal_unlocked(DfsMetadataMutation::put_namespace_prepare(&prepare))?;
             let mut table_ops = Vec::new();
             let mut rollback = DfsMetadataTableRollback::default();
+            for receipt in &prepare.content_receipts {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutReceipt {
+                        receipt: receipt.clone(),
+                    },
+                    &mut table_ops,
+                    &mut rollback,
+                );
+            }
             if let Err(error) = self.plan_namespace_transaction_table_ops(
                 &prepare.transaction,
                 &mut table_ops,
@@ -4698,6 +4866,76 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }],
         )
         .map(drop)
+    }
+
+    fn put_namespace_request_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        request: &DfsNamespaceRequestRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace request shard {} does not match backend shard {}",
+                shard_id.0, self.shard_id.0
+            )));
+        }
+        let pending_shape = request.status == DfsNamespaceRequestStatus::Pending
+            && request.result.is_none()
+            && request.posix_coordination_result.is_none();
+        let completed_shape =
+            request.status == DfsNamespaceRequestStatus::Completed && request.result.is_some();
+        if !pending_shape && !completed_shape {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace request {}/{} has an invalid {:?} payload",
+                request.requester_node_id, request.request_id, request.status
+            )));
+        }
+        let _lock = self.begin_metadata_write()?;
+        let key = (
+            request.requester_node_id.clone(),
+            request.request_id.clone(),
+        );
+        if let Some(existing) = self.tables.namespace_requests.get(&key) {
+            let immutable_matches = existing.file_system_id == request.file_system_id
+                && existing.requester_node_id == request.requester_node_id
+                && existing.request_id == request.request_id
+                && existing.command_digest == request.command_digest
+                && existing.created_at == request.created_at;
+            let transition_is_valid = match (&existing.status, &request.status) {
+                (DfsNamespaceRequestStatus::Pending, DfsNamespaceRequestStatus::Pending) => {
+                    existing == request
+                }
+                (DfsNamespaceRequestStatus::Pending, DfsNamespaceRequestStatus::Completed) => true,
+                (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Completed) => {
+                    existing == request
+                }
+                (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Pending) => false,
+            };
+            if !immutable_matches || !transition_is_valid {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace request id {}/{} was reused with a different payload or invalid status transition",
+                    request.requester_node_id, request.request_id
+                )));
+            }
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_namespace_request(request),
+            vec![DfsMetadataTableOp::PutNamespaceRequest {
+                request: request.clone(),
+            }],
+        )
+    }
+
+    fn get_namespace_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespaceRequestRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .namespace_requests
+            .get(&(requester_node_id.clone(), request_id.to_string()))
+            .cloned())
     }
 
     fn get_namespace_transaction(
@@ -5391,6 +5629,7 @@ mod tests {
                 path: current.path.clone(),
                 expected_object_id: Some(current.object_id.clone()),
             }],
+            content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
                 transaction_id: format!("transaction:{operation_id}"),
                 file_system_id: current.file_system_id.clone(),

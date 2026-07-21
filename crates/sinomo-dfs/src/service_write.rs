@@ -225,9 +225,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object = self.current_object_for_write(&request.object_id)?;
         if let Some(shard) = self.select_metadata_shard_for_object(&object)? {
             if shard.primary_node_id != self.node_id {
-                if !detach_request {
-                    self.content.flush_deferred_durable_dirs()?;
-                }
                 return self.route_distributed_manifest_write_to_metadata_primary(
                     request,
                     expected_base_version,
@@ -243,9 +240,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replay_response_journal,
                 );
             }
-        }
-        if !detach_request {
-            self.content.flush_deferred_durable_dirs()?;
         }
         self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
             request,

@@ -347,14 +347,6 @@ impl LocalContentStore {
         self.write_packed_blobs_unlocked_with_sync(index, blobs, true)
     }
 
-    pub(super) fn write_packed_blobs_unlocked_relaxed(
-        &self,
-        index: &mut PackedBlobIndex,
-        blobs: &[(String, &[u8])],
-    ) -> Result<ContentStoreStatsDelta> {
-        self.write_packed_blobs_unlocked_with_sync(index, blobs, false)
-    }
-
     fn write_packed_blobs_unlocked_with_sync(
         &self,
         index: &mut PackedBlobIndex,

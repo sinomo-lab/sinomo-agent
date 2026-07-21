@@ -2376,6 +2376,34 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend_mut(&shard_id)?.put_namespace_job(job)
     }
 
+    fn put_namespace_request_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        request: &DfsNamespaceRequestRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.shard_backend_mut(shard_id)?
+            .put_namespace_request_on_shard(shard_id, request)
+    }
+
+    fn get_namespace_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespaceRequestRecord>> {
+        let mut found = None;
+        for backend in self.shards.values() {
+            if let Some(request) = backend.get_namespace_request(requester_node_id, request_id)? {
+                if found.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace request {requester_node_id}/{request_id} exists on multiple local shards"
+                    )));
+                }
+                found = Some(request);
+            }
+        }
+        Ok(found)
+    }
+
     fn get_namespace_transaction(
         &self,
         transaction_id: &str,

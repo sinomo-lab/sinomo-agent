@@ -16,8 +16,9 @@ use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::{
-    DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, normalize_current_locations,
+    DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceResult, DfsObjectId,
+    DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult, DfsReplicationPolicy, DfsVersion,
+    normalize_current_locations,
 };
 
 /// Stable identifier for a DFS metadata shard.
@@ -471,12 +472,20 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<DfsNamespaceJobRecord>,
     },
+    PutNamespaceRequest {
+        file_system_id: DfsFileSystemId,
+        requester_node_id: NodeId,
+        request_id: String,
+        request: DfsNamespaceRequestRecord,
+    },
 }
 
 impl DfsMetadataMutation {
     fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {
         match self {
-            Self::PutFileSystem { .. } | Self::PutNamespaceJob { .. } => {}
+            Self::PutFileSystem { .. }
+            | Self::PutNamespaceJob { .. }
+            | Self::PutNamespaceRequest { .. } => {}
             Self::PutObject { object_id, .. }
             | Self::PutVersion { object_id, .. }
             | Self::PutReceipt { object_id, .. }
@@ -630,6 +639,15 @@ impl DfsMetadataMutation {
         }
     }
 
+    pub(crate) fn put_namespace_request(request: &DfsNamespaceRequestRecord) -> Self {
+        Self::PutNamespaceRequest {
+            file_system_id: request.file_system_id.clone(),
+            requester_node_id: request.requester_node_id.clone(),
+            request_id: request.request_id.clone(),
+            request: request.clone(),
+        }
+    }
+
     pub(crate) fn put_namespace_prepare(prepare: &DfsNamespacePrepareRecord) -> Self {
         Self::PutNamespacePrepare {
             file_system_id: prepare.file_system_id.clone(),
@@ -737,8 +755,40 @@ pub struct DfsNamespacePrepareRecord {
     pub expected_object_versions: Vec<DfsNamespaceObjectVersionExpectation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_path_occupants: Vec<DfsNamespacePathOccupantExpectation>,
+    /// Authenticated durable-content receipts materialized atomically with the
+    /// visible namespace transaction. Namespace-only operations leave this
+    /// empty; typed content commits must provide one receipt per visible file
+    /// version before the prepare can commit.
+    pub content_receipts: Vec<DfsReplicaReceiptRecord>,
     pub transaction: DfsNamespaceTransaction,
     pub status: DfsNamespacePrepareStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespaceRequestStatus {
+    Pending,
+    Completed,
+}
+
+/// Durable at-most-once admission record for one routed namespace mutation.
+///
+/// `Pending` is journaled before execution. A restart may report an
+/// indeterminate outcome for such a record, but must never blindly execute it
+/// again. `Completed` carries the canonical result returned on exact retries.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceRequestRecord {
+    pub file_system_id: DfsFileSystemId,
+    pub requester_node_id: NodeId,
+    pub request_id: String,
+    pub command_digest: String,
+    pub status: DfsNamespaceRequestStatus,
+    pub result: Option<DfsNamespaceResult>,
+    pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1291,6 +1341,7 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     pub(crate) namespace_prepares: Vec<DfsNamespacePrepareRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_jobs: Vec<DfsNamespaceJobRecord>,
+    pub(crate) namespace_requests: Vec<DfsNamespaceRequestRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1413,6 +1464,9 @@ pub(crate) enum DfsMetadataTableOp {
     PutNamespaceJob {
         job: DfsNamespaceJobRecord,
     },
+    PutNamespaceRequest {
+        request: DfsNamespaceRequestRecord,
+    },
 }
 
 impl DfsTombstoneCompactionReport {
@@ -1490,7 +1544,8 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
             | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
             | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. } => {
+            | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. } => {
                 Some(file_system_id.clone())
             }
         })
@@ -1573,6 +1628,18 @@ pub(crate) fn normalized_namespace_prepare(
     }
     prepare.expected_object_versions.sort();
     prepare.expected_path_occupants.sort();
+    prepare.content_receipts.sort_by(|left, right| {
+        (
+            &left.receipt.object_id,
+            &left.receipt.committed_version,
+            &left.replica_node_id,
+        )
+            .cmp(&(
+                &right.receipt.object_id,
+                &right.receipt.committed_version,
+                &right.replica_node_id,
+            ))
+    });
     prepare
 }
 

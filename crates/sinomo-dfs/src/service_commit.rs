@@ -1593,6 +1593,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     operation_digest: String::new(),
                     expected_object_versions,
                     expected_path_occupants,
+                    content_receipts: Vec::new(),
                     transaction: transaction.clone(),
                     status: DfsNamespacePrepareStatus::Prepared,
                 };

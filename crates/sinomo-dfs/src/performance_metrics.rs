@@ -44,7 +44,6 @@ impl Drop for DfsOperationMetricGuard {
 fn dfs_operation_for_route(route: &str) -> &'static str {
     match route {
         crate::DFS_STATUS_ROUTE => "status",
-        crate::DFS_EXPOSE_CONFIG_ROUTE => "expose_config",
         crate::DFS_INSPECTION_ROUTE => "inspection",
         crate::DFS_SMOKE_ROUTE => "smoke",
         crate::DFS_DIRECT_READ_ROUTE | crate::DFS_DATA_READ_ROUTE => "read",

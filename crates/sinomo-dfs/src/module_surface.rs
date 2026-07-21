@@ -1,9 +1,9 @@
 //! DFS module registration, route surface metadata, and storage layout contract.
 
 use crate::{
-    DFS_DIRECT_READ_ROUTE, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
-    DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
+    DFS_DIRECT_READ_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_RPC_CATEGORY,
+    DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
 };
 use sinomo_core::{
     CapabilityName, FileSystemAccess, ModuleCapabilities, ModuleResourceLimits, NetworkAccess,
@@ -107,12 +107,6 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalOrClusterMember,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_EXPOSE_CONFIG_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.expose.configure",
-            ModuleRouteAuth::LocalCommand,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_INSPECTION_ROUTE,
             DFS_RPC_CATEGORY,
             "dfs.inspection.read",
@@ -152,12 +146,6 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalOrClusterMember,
         ));
     }
-    surfaces = surfaces
-        .with_config_definition(
-            crate::dfs_expose_config_definition()
-                .expect("DFS exposure config definition must be valid"),
-        )
-        .expect("DFS settings surface must be valid");
     surfaces.capabilities = dfs_module_capabilities();
     surfaces
 }
@@ -193,7 +181,6 @@ pub fn dfs_module_capabilities() -> ModuleCapabilities {
         exports: vec![
             dfs_capability("dfs.status.read"),
             dfs_capability("dfs.inspection.read"),
-            dfs_capability("dfs.expose.configure"),
             dfs_capability("dfs.metadata.replicate"),
             dfs_capability("dfs.metadata.repair"),
             dfs_capability("dfs.smoke.run"),

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use sinomo_core::node::NodeId;
 
-use crate::service_state::{DFS_SERVED_NAMESPACE_REPLAY_LIMIT, ServedNamespaceReplay};
 use crate::*;
 use crate::{posix_model, posix_path};
 
@@ -90,7 +89,126 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
     )
 }
 
+fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOperation) -> bool {
+    !namespace_operation_requires_fresh_authority(operation)
+        && !matches!(
+            operation,
+            DfsNamespaceOperation::LookupPath { .. }
+                | DfsNamespaceOperation::LookupPaths { .. }
+                | DfsNamespaceOperation::SyncPath { .. }
+        )
+}
+
+fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
+    let encoded = serde_json::to_vec(command).map_err(|source| DfsError::Distributed {
+        message: format!("failed to encode namespace command digest: {source}"),
+    })?;
+    Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+}
+
+enum DurableNamespaceRequestAdmission {
+    Execute {
+        shard_id: DfsMetadataShardId,
+        record: DfsNamespaceRequestRecord,
+    },
+    Replay {
+        result: DfsNamespaceResult,
+        posix_coordination_result: Option<DfsPosixCoordinationResult>,
+    },
+    Reject {
+        reason: String,
+    },
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn admit_durable_namespace_request(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsNamespaceCommand,
+        shard_id: DfsMetadataShardId,
+    ) -> Result<DurableNamespaceRequestAdmission, DfsError> {
+        let digest = namespace_command_digest(command)?;
+        let backend = self
+            .metadata_backend
+            .as_mut()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "routed namespace mutation requires durable request admission".to_string(),
+            })?;
+        if let Some(existing) =
+            backend.get_namespace_request(requester_node_id, &command.request_id)?
+        {
+            if existing.file_system_id != command.file_system_id
+                || existing.command_digest != digest
+            {
+                return Ok(DurableNamespaceRequestAdmission::Reject {
+                    reason: format!(
+                        "namespace request id {}/{} was already used for a different command",
+                        requester_node_id, command.request_id
+                    ),
+                });
+            }
+            return match existing.status {
+                DfsNamespaceRequestStatus::Completed => {
+                    let Some(result) = existing.result else {
+                        return Err(DfsError::Metadata {
+                            message: format!(
+                                "completed namespace request {}/{} has no durable result",
+                                requester_node_id, command.request_id
+                            ),
+                        });
+                    };
+                    Ok(DurableNamespaceRequestAdmission::Replay {
+                        result,
+                        posix_coordination_result: existing.posix_coordination_result,
+                    })
+                }
+                DfsNamespaceRequestStatus::Pending => {
+                    Ok(DurableNamespaceRequestAdmission::Reject {
+                        reason: format!(
+                            "namespace request {}/{} has an indeterminate durable outcome after interrupted execution; inspect its affected paths before issuing a new request id",
+                            requester_node_id, command.request_id
+                        ),
+                    })
+                }
+            };
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+        let record = DfsNamespaceRequestRecord {
+            file_system_id: command.file_system_id.clone(),
+            requester_node_id: requester_node_id.clone(),
+            request_id: command.request_id.clone(),
+            command_digest: digest,
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            created_at: now,
+            updated_at: now,
+        };
+        backend.put_namespace_request_on_shard(&shard_id, &record)?;
+        Ok(DurableNamespaceRequestAdmission::Execute { shard_id, record })
+    }
+
+    fn complete_durable_namespace_request(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        mut record: DfsNamespaceRequestRecord,
+        result: DfsNamespaceResult,
+        posix_coordination_result: Option<DfsPosixCoordinationResult>,
+    ) -> Result<(), DfsError> {
+        record.status = DfsNamespaceRequestStatus::Completed;
+        record.result = Some(result);
+        record.posix_coordination_result = posix_coordination_result;
+        record.updated_at = time::OffsetDateTime::now_utc();
+        self.metadata_backend
+            .as_mut()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "routed namespace mutation lost its durable request backend".to_string(),
+            })?
+            .put_namespace_request_on_shard(shard_id, &record)?;
+        Ok(())
+    }
+
     fn synced_namespace_object_for_operation(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -293,33 +411,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsNamespaceCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
-        // Command equality includes the authority stamp. Returning the cached
-        // response for an exact completed retry is safe across later topology
-        // changes because this branch never executes or journals the mutation
-        // a second time.
-        if !namespace_operation_requires_fresh_authority(&command.operation)
-            && let Some(replay) = self
-                .served_namespace_replays
-                .iter()
-                .find(|replay| {
-                    replay.requester_node_id == requester_node_id && replay.command == command
-                })
-                .cloned()
-        {
-            self.send_dfs_message_if_routable(
-                &requester_node_id,
-                DfsNetworkMessage::NamespaceResponse(replay.response.clone()),
-            )?;
-            return Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                request_id,
-                requester_node_id,
-                result: replay.response.result,
-                // The original request may have mutated metadata; replaying
-                // its completed response does not and must not schedule a
-                // second publish/maintenance cycle.
-                mutates_metadata: false,
-            });
-        }
         let trace_started = Instant::now();
         let trace_operation = dfs_namespace_operation_trace_label(&command.operation);
         let trace_involved_paths = command.operation.involved_paths().len();
@@ -330,6 +421,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // The authority the requester should retry against when this node is
         // not the shard primary (the requester routed on a stale shard view).
         let mut authority_redirect: Option<NodeId> = None;
+        let mut durable_replay = false;
         let mut posix_coordination_result = None;
         let result = if requester_node_id != command.requesting_node_id {
             DfsNamespaceResult::Rejected {
@@ -427,107 +519,160 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .iter()
                             .find(|shard| shard.primary_node_id != self.node_id)
                             .cloned();
-                        let execute_started = Instant::now();
-                        let outcome = match (&foreign_shard, &command.operation) {
-                            (None, DfsNamespaceOperation::ApplyTransaction { transaction }) => {
-                                if !transaction.advisory_lock_states.is_empty() {
-                                    let message = "generic namespace transactions may not install advisory-lock state; use the typed migration protocol"
-                                        .to_string();
-                                    Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
-                                        message,
-                                    }))
-                                } else if self.control_plane.is_some() && shards.len() != 1 {
-                                    let shard_ids = shards
-                                        .iter()
-                                        .map(|shard| shard.shard_id.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
-                                        message: format!(
-                                            "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
-                                            transaction.transaction_id, shard_ids
-                                        ),
-                                    }))
-                                } else {
-                                    self.apply_namespace_transaction_with_selected_shard(
-                                        transaction.clone(),
-                                        shards.first().cloned(),
-                                    )
-                                    .map(|()| None)
-                                    .map_err(posix_model::DfsPosixError::from)
+                        let durable_admission =
+                            if namespace_operation_uses_durable_request_admission(
+                                &command.operation,
+                            ) && !affected_shard_ids.is_empty()
+                            {
+                                let shard_id = affected_shard_ids
+                                    .iter()
+                                    .min()
+                                    .expect("non-empty affected shard ids")
+                                    .clone();
+                                Some(self.admit_durable_namespace_request(
+                                    &requester_node_id,
+                                    &command,
+                                    shard_id,
+                                )?)
+                            } else {
+                                None
+                            };
+                        match durable_admission {
+                            Some(DurableNamespaceRequestAdmission::Replay {
+                                result,
+                                posix_coordination_result: replayed_coordination_result,
+                            }) => {
+                                durable_replay = true;
+                                posix_coordination_result = replayed_coordination_result;
+                                result
+                            }
+                            Some(DurableNamespaceRequestAdmission::Reject { reason }) => {
+                                durable_replay = true;
+                                DfsNamespaceResult::Rejected {
+                                    reason,
+                                    posix_error: None,
+                                    current_primary_node_id: None,
                                 }
                             }
-                            (None, _) => {
-                                self.execute_posix_coordination_operation_local(&command.operation)
-                            }
-                            // Operations spanning another primary's shard run
-                            // through the cross-shard coordinator when this node
-                            // owns the source side.
-                            (Some(_), DfsNamespaceOperation::Rename { from, to }) => {
-                                let from = from.clone();
-                                let to = to.clone();
-                                self.namespace_coordinator_dispatch_rename(
-                                    &command.file_system_id,
-                                    &from,
-                                    &to,
-                                )
-                                .map(|()| None)
-                            }
-                            (
-                                Some(_),
-                                DfsNamespaceOperation::Hardlink {
-                                    existing_path,
-                                    link_path,
-                                },
-                            ) => {
-                                let existing_path = existing_path.clone();
-                                let link_path = link_path.clone();
-                                self.namespace_coordinator_dispatch_hardlink(
-                                    &command.file_system_id,
-                                    &existing_path,
-                                    &link_path,
-                                )
-                                .map(|()| None)
-                            }
-                            (Some(shard), _) => {
-                                authority_redirect = Some(shard.primary_node_id.clone());
-                                Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
-                                    message: format!(
-                                        "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
-                                        self.node_id,
-                                        shard.shard_id,
-                                        shard.primary_node_id,
-                                        shard.epoch
+                            durable_execute => {
+                                let execute_started = Instant::now();
+                                let outcome = match (&foreign_shard, &command.operation) {
+                                    (
+                                        None,
+                                        DfsNamespaceOperation::CommitLocalEventualBatch {
+                                            transaction,
+                                            writes,
+                                        },
+                                    ) => {
+                                        if self.control_plane.is_some() && shards.len() != 1 {
+                                            let shard_ids = shards
+                                                .iter()
+                                                .map(|shard| shard.shard_id.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            Err(posix_model::DfsPosixError::Dfs(
+                                                DfsError::Distributed {
+                                                    message: format!(
+                                                        "clustered local-eventual batch {} must resolve to exactly one metadata shard, found [{}]",
+                                                        transaction.transaction_id, shard_ids
+                                                    ),
+                                                },
+                                            ))
+                                        } else {
+                                            self.apply_local_eventual_batch_commit(
+                                                &requester_node_id,
+                                                transaction.clone(),
+                                                writes,
+                                                shards.first().cloned(),
+                                            )
+                                            .map(|mutated| {
+                                                durable_replay = !mutated;
+                                                None
+                                            })
+                                            .map_err(posix_model::DfsPosixError::from)
+                                        }
+                                    }
+                                    (None, _) => self.execute_posix_coordination_operation_local(
+                                        &command.operation,
                                     ),
-                                }))
+                                    (Some(_), DfsNamespaceOperation::Rename { from, to }) => self
+                                        .namespace_coordinator_dispatch_rename(
+                                            &command.file_system_id,
+                                            from,
+                                            to,
+                                        )
+                                        .map(|()| None),
+                                    (
+                                        Some(_),
+                                        DfsNamespaceOperation::Hardlink {
+                                            existing_path,
+                                            link_path,
+                                        },
+                                    ) => self
+                                        .namespace_coordinator_dispatch_hardlink(
+                                            &command.file_system_id,
+                                            existing_path,
+                                            link_path,
+                                        )
+                                        .map(|()| None),
+                                    (Some(shard), _) => {
+                                        authority_redirect = Some(shard.primary_node_id.clone());
+                                        Err(posix_model::DfsPosixError::Dfs(
+                                            DfsError::Distributed {
+                                                message: format!(
+                                                    "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
+                                                    self.node_id,
+                                                    shard.shard_id,
+                                                    shard.primary_node_id,
+                                                    shard.epoch
+                                                ),
+                                            },
+                                        ))
+                                    }
+                                };
+                                trace_execute_ms = execute_started.elapsed().as_millis();
+                                let operation_result = match outcome {
+                                    Ok(coordination_result) => {
+                                        posix_coordination_result = coordination_result;
+                                        DfsNamespaceResult::Applied
+                                    }
+                                    Err(error) => DfsNamespaceResult::Rejected {
+                                        current_primary_node_id: authority_redirect.or_else(|| {
+                                            namespace_rejection_current_primary(&error)
+                                        }),
+                                        posix_error: posix_model::namespace_posix_error_for(&error),
+                                        reason: error.to_string(),
+                                    },
+                                };
+                                if let Some(DurableNamespaceRequestAdmission::Execute {
+                                    shard_id,
+                                    record,
+                                }) = durable_execute
+                                {
+                                    self.complete_durable_namespace_request(
+                                        &shard_id,
+                                        record,
+                                        operation_result.clone(),
+                                        posix_coordination_result.clone(),
+                                    )?;
+                                }
+                                operation_result
                             }
-                        };
-                        trace_execute_ms = execute_started.elapsed().as_millis();
-                        match outcome {
-                            Ok(coordination_result) => {
-                                posix_coordination_result = coordination_result;
-                                DfsNamespaceResult::Applied
-                            }
-                            Err(error) => DfsNamespaceResult::Rejected {
-                                current_primary_node_id: authority_redirect
-                                    .or_else(|| namespace_rejection_current_primary(&error)),
-                                posix_error: posix_model::namespace_posix_error_for(&error),
-                                reason: error.to_string(),
-                            },
                         }
                     }
                 }
             }
         };
-        let mutates_metadata = !matches!(
-            &command.operation,
-            DfsNamespaceOperation::LookupPath { .. }
-                | DfsNamespaceOperation::LookupPaths { .. }
-                | DfsNamespaceOperation::SyncPath { .. }
-                | DfsNamespaceOperation::AdvisoryLock { .. }
-                | DfsNamespaceOperation::FileSync { .. }
-                | DfsNamespaceOperation::DirectorySync { .. }
-        );
+        let mutates_metadata = !durable_replay
+            && !matches!(
+                &command.operation,
+                DfsNamespaceOperation::LookupPath { .. }
+                    | DfsNamespaceOperation::LookupPaths { .. }
+                    | DfsNamespaceOperation::SyncPath { .. }
+                    | DfsNamespaceOperation::AdvisoryLock { .. }
+                    | DfsNamespaceOperation::FileSync { .. }
+                    | DfsNamespaceOperation::DirectorySync { .. }
+            );
         if mutates_metadata && matches!(result, DfsNamespaceResult::Applied) {
             self.record_message_committed_work(DfsMessageCommittedWork {
                 publish_metadata: true,
@@ -589,15 +734,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_journal_batches,
             posix_coordination_result,
         };
-        if self.served_namespace_replays.len() >= DFS_SERVED_NAMESPACE_REPLAY_LIMIT {
-            self.served_namespace_replays.pop_front();
-        }
-        self.served_namespace_replays
-            .push_back(ServedNamespaceReplay {
-                requester_node_id: requester_node_id.clone(),
-                command: command.clone(),
-                response: response.clone(),
-            });
         self.send_dfs_message_if_routable(
             &requester_node_id,
             DfsNetworkMessage::NamespaceResponse(response),

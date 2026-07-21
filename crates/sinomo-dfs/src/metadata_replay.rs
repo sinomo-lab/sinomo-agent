@@ -44,6 +44,7 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
         DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => prepare.is_some(),
         DfsMetadataMutation::PutNamespaceJob { job, .. } => job.is_some(),
+        DfsMetadataMutation::PutNamespaceRequest { .. } => true,
     }
 }
 
@@ -97,6 +98,7 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
         DfsMetadataMutation::PutNamespaceJob { job, .. } => {
             required_replay_payload(entry, "put-namespace-job", job.as_ref())?;
         }
+        DfsMetadataMutation::PutNamespaceRequest { .. } => {}
     }
     Ok(())
 }
@@ -172,7 +174,8 @@ pub(crate) fn require_replica_journal_entry_file_system(
         | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
         | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
         | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. } => file_system_id,
+        | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
+        | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. } => file_system_id,
     };
     require_replica_record_file_system(entry, "outer mutation", outer_file_system_id, expected)?;
 
@@ -299,6 +302,14 @@ pub(crate) fn require_replica_journal_entry_file_system(
                 entry,
                 "namespace job",
                 &job.file_system_id,
+                expected,
+            )
+        }
+        DfsMetadataMutation::PutNamespaceRequest { request, .. } => {
+            require_replica_record_file_system(
+                entry,
+                "namespace request",
+                &request.file_system_id,
                 expected,
             )
         }

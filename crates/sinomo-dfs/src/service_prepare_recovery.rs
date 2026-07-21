@@ -412,6 +412,7 @@ mod tests {
                 path: current.path.clone(),
                 expected_object_id: Some(current.object_id.clone()),
             }],
+            content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
                 transaction_id: "transaction:prepare-recovery".to_string(),
                 file_system_id: current.file_system_id.clone(),
@@ -703,6 +704,7 @@ mod tests {
                     expected_object_id: Some(parent.object_id.clone()),
                 },
             ],
+            content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
                 transaction_id: namespace_transaction_id_for_object(
                     "create-visible-batched",

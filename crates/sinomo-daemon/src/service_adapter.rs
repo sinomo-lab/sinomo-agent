@@ -3458,12 +3458,7 @@ impl DaemonDfsBrowserBackend {
         &self,
         service: &mut sinomo_dfs::MountedSifsService,
     ) -> Result<(), ServiceError> {
-        // The namespace mutation has already committed by the time this
-        // helper runs, even if a follow-up durability/maintenance step fails.
         self.invalidate_stat_cache();
-        service
-            .flush_deferred_content_durability()
-            .map_err(dfs_browser_service_error)?;
         service
             .flush_detached_transport_sends()
             .map_err(dfs_browser_service_error)?;
@@ -10575,15 +10570,6 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
         let registry = daemon_config_registry(&paths, &[]);
-
-        let dfs = registry
-            .get(sinomo_dfs::DFS_EXPOSE_CONFIG_KEY)
-            .expect("DFS module settings");
-        assert_eq!(
-            dfs.module_id.as_deref(),
-            Some(sinomo_dfs::dfs_module_id().as_str())
-        );
-        assert!(dfs.schema.is_some());
 
         let rollout = registry
             .get(sinomo_rollout::ROLLOUT_TELEMETRY_GATE_CONFIG_KEY)

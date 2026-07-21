@@ -18,7 +18,6 @@ mod distributed;
 mod error;
 mod identity;
 mod intent;
-mod local_owned;
 mod local_service;
 mod local_state;
 mod maintenance;
@@ -201,28 +200,21 @@ pub(crate) use intent::{
     routed_write_command_content_hash, write_intent_record,
     write_intent_record_matches_routed_write_command, write_intent_status_requires_hydrate_restore,
 };
-pub use local_owned::{
-    DFS_EXPOSE_CONFIG_KEY, DfsExposeAddRequest, DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo,
-    DfsExposeStore, DfsExposeStoreError, DfsExposedDirectory, LocalOwnedDfsError,
-    dfs_expose_config_definition, register_config_definitions as register_dfs_config_definitions,
-};
 pub use local_service::LocalOwnedDfsService;
 pub(crate) use local_state::dfs_path_safe_segment;
 pub use local_state::{
-    DFS_IMPORTS_NAMESPACE_ROOT, add_dfs_expose_entry, add_local_dfs_pin,
-    cluster_dfs_metadata_shards, default_dfs_expose_config_path, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, default_dfs_pin_root, dfs_expose_config_path,
+    DFS_IMPORTS_NAMESPACE_ROOT, add_local_dfs_pin, cluster_dfs_metadata_shards,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
     dfs_import_metadata_root, dfs_import_namespace_root, dfs_import_root,
-    ensure_default_cluster_aware_dfs_expose_config, ensure_default_dfs_expose_config,
     inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status, inspect_dfs_conflicts,
     inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path, inspect_dfs_repairs,
-    inspect_dfs_status, list_local_dfs_pins, load_dfs_expose_config, local_dfs_metadata_shard_path,
+    inspect_dfs_status, list_local_dfs_pins, local_dfs_metadata_shard_path,
     open_cluster_aware_dfs_metadata_backend,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_sharded_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, open_local_sharded_metadata_backend_for_replica_repair,
-    open_root_local_metadata_backend, remove_dfs_expose_entry, remove_local_dfs_pin,
-    resolve_dfs_metadata_root, resolve_dfs_pin_root,
+    open_root_local_metadata_backend, remove_local_dfs_pin, resolve_dfs_metadata_root,
+    resolve_dfs_pin_root,
 };
 pub(crate) use maintenance::record_anti_entropy_issue;
 pub use maintenance::{
@@ -286,8 +278,9 @@ pub use metadata_records::{
     DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame, DfsNamespaceJobKind,
     DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
     DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
-    DfsNamespacePrepareRecord, DfsNamespacePrepareStatus, DfsNamespaceTransaction, DfsObjectPage,
-    DfsObjectPageCursor, DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
+    DfsNamespacePrepareRecord, DfsNamespacePrepareStatus, DfsNamespaceRequestRecord,
+    DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor,
+    DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
     DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage,
     DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
     DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
@@ -439,10 +432,10 @@ pub use protocol::{
     DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,
     DfsCommitVersionResponse, DfsDirectReadRequest, DfsDistributedWriteCommand,
     DfsDistributedWriteResponse, DfsDistributedWriteResult, DfsFetchBlobCommand,
-    DfsFetchBlobResponse, DfsFetchBlobResult, DfsMessageCommand, DfsMessageResponse,
-    DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof, DfsMessageCommand,
+    DfsMessageResponse, DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
     DfsMetadataSnapshotInstallResult, DfsNamespaceCommand, DfsNamespaceOperation,
     DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
     DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest,
@@ -473,11 +466,11 @@ pub use routes::{
     DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE,
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE,
     DFS_DATA_WRITE_RESPONSE_ROUTE, DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES,
-    DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DfsMessageExecutionScope,
-    decode_dfs_inspection_rpc_response, decode_dfs_message_rpc_request,
-    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
+    DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
+    DFS_STATUS_ROUTE, DfsMessageExecutionScope, decode_dfs_inspection_rpc_response,
+    decode_dfs_message_rpc_request, decode_dfs_message_rpc_response,
+    decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response, decode_dfs_smoke_rpc_response,
     decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
     dfs_message_allows_write_repair_progress, dfs_message_execution_scope,

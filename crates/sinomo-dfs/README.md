@@ -28,7 +28,8 @@ DFS metadata records the stable identity and visible state of filesystem objects
 - current replica locations,
 - policy,
 - future split-cluster conflict records,
-- write intents and receipts.
+- write intents and receipts,
+- durable namespace-request admission and terminal results.
 
 Object identity is stable across path moves. Path operations update namespace metadata, not content identity.
 
@@ -65,9 +66,16 @@ Object versions can be represented as manifests over extents. Full-object writes
 - replica receipts,
 - future split-cluster conflict records,
 - namespace transactions,
+- namespace-request admission records,
 - recoverable visible-version commits.
 
 Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation without duplicating already-materialized table batches.
+
+Mutating namespace RPCs first persist a request record keyed by authenticated
+requester and request id with the exact command digest. A completed record
+replays its terminal result across restart. Reuse with a different command is
+rejected, and a request left `Pending` by interruption is reported as
+indeterminate rather than executed again.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
@@ -192,7 +200,7 @@ dfs/pins
 files
 ```
 
-The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly. Local DFS exposure config defaults to `$SINOMO_DATA_DIR/configs/dfs/expose.json` as a shared `sinomo-config` document; legacy `$SINOMO_DATA_DIR/config/dfs-expose.sobj` and `dfs-expose.json` are read for migration, and explicit `.sobj` or `.json` config paths remain supported for compatibility.
+The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly.
 
 ## Usage Examples
 

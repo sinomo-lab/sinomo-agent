@@ -808,15 +808,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::SyncPath { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
-            DfsNamespaceOperation::ApplyTransaction { transaction } => {
-                if !transaction.advisory_lock_states.is_empty() {
-                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
-                        message: "generic namespace transactions may not install advisory-lock state; use the typed migration protocol"
-                            .to_string(),
-                    }));
-                }
-                self.apply_namespace_transaction(transaction.clone())
-                    .map_err(DfsPosixError::from)
+            DfsNamespaceOperation::CommitLocalEventualBatch { .. } => {
+                Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: "local-eventual batches require authenticated routed handling"
+                        .to_string(),
+                }))
             }
             DfsNamespaceOperation::ReconcilePlacement {
                 job_id,

@@ -200,12 +200,11 @@ use sinomo_runtime::dfs::{
     LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
-    DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_expose_config_path,
-    dfs_import_metadata_root, dfs_import_namespace_root, ensure_default_dfs_expose_config,
-    fallback_dfs_node_id, list_local_dfs_pins, load_dfs_expose_config, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_dfs_expose_entry,
-    remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
+    DfsPinAddRequest, DfsPinMode, add_local_dfs_pin, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, dfs_import_metadata_root, dfs_import_namespace_root,
+    fallback_dfs_node_id, list_local_dfs_pins, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_local_dfs_pin,
+    resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
 };
 use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
@@ -5406,7 +5405,6 @@ fn unsafe_coding_workspace_error(workspace_root: &Path) -> CliError {
 
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
-    let builder = sinomo_runtime::dfs::register_dfs_config_definitions(builder)?;
     let builder = sinomo_runtime::module::register_config_definitions(builder)
         .map_err(|detail| CliError::Parse { detail })?;
     let builder =

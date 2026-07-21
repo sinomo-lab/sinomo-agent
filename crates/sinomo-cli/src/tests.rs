@@ -11,15 +11,15 @@ use super::{
     ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
     DfsConflictResolveOptions, DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions,
-    DfsConflictVersionsOptions, DfsExposeCliCommand, DfsFilterOptions,
-    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
-    DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
-    DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
-    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
-    ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand,
-    ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutAdvanceOptions,
-    RolloutCliCommand, RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    DfsConflictVersionsOptions, DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions,
+    DfsMountOptions, DfsPinCliCommand, DfsPlacementAuthorityClearOptions,
+    DfsPlacementAuthorityCliCommand, DfsPlacementAuthorityInspectOptions,
+    DfsPlacementAuthorityRecovery, InstallLayout, InstallOptions, InteractionModel,
+    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
     RolloutProgressExpectation, RolloutProgressTiming, RolloutTarget,
     RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
     SkillActivateOptions, SkillExportOptions, SkillImportOptions, SkillListOptions,
@@ -7916,25 +7916,6 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             if options.mode == Some(sinomo_runtime::dfs::DfsPinMode::Metadata)
                 && options.path == "src/lib.rs"
     ));
-    assert!(matches!(
-        parse_dfs_schema_for_test(&[
-            "expose".to_string(),
-            "add".to_string(),
-            "--source".to_string(),
-            "/tmp/shared".to_string(),
-            "--dfs-path".to_string(),
-            "/sinomo/nodes/node_alpha/files/shared".to_string(),
-            "--node".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d5".to_string(),
-            "--read-only".to_string(),
-        ])
-        .expect("dfs expose add"),
-        DfsCliCommand::Expose(DfsExposeCliCommand::Add(options))
-            if options.source == PathBuf::from("/tmp/shared")
-                && options.dfs_path == "/sinomo/nodes/node_alpha/files/shared"
-                && options.node_id == Some(NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node"))
-                && !options.writable
-    ));
 }
 
 #[test]
@@ -9449,24 +9430,6 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             super::DaemonSignerAuthority::JoinCandidate,
             "node_join",
             "pk_join"
-        ))
-        .is_ok()
-    );
-    assert!(
-        super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE,
-            super::DaemonSignerAuthority::Member,
-            "node_member",
-            "pk_member"
-        ))
-        .is_err()
-    );
-    assert!(
-        super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE,
-            super::DaemonSignerAuthority::Local,
-            "node_local",
-            "pk_local"
         ))
         .is_ok()
     );
@@ -15351,7 +15314,6 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
         .filter_map(|definition| definition.get("key").and_then(serde_json::Value::as_str))
         .collect();
     for expected in [
-        "dfs.expose",
         "rollout.telemetry.gates",
         "sandbox.policy",
         "lm.providers",

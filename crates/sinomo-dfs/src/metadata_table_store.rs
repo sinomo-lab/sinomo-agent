@@ -463,6 +463,7 @@ pub(crate) fn metadata_tables_snapshot(
         namespace_transactions: tables.namespace_transactions.values().cloned().collect(),
         namespace_prepares: tables.namespace_prepares.values().cloned().collect(),
         namespace_jobs: tables.namespace_jobs.values().cloned().collect(),
+        namespace_requests: tables.namespace_requests.values().cloned().collect(),
     }
 }
 
@@ -529,6 +530,9 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     }
     for job in snapshot.namespace_jobs {
         tables.apply(DfsMetadataTableOp::PutNamespaceJob { job });
+    }
+    for request in snapshot.namespace_requests {
+        tables.apply(DfsMetadataTableOp::PutNamespaceRequest { request });
     }
     tables
 }
@@ -714,6 +718,13 @@ pub(crate) fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<Dfs
             .values()
             .cloned()
             .map(|job| DfsMetadataTableOp::PutNamespaceJob { job }),
+    );
+    ops.extend(
+        tables
+            .namespace_requests
+            .values()
+            .cloned()
+            .map(|request| DfsMetadataTableOp::PutNamespaceRequest { request }),
     );
     ops
 }
