@@ -58,8 +58,8 @@ domain services and the service registry
 |---|---|---|
 | Domain service | Target selection, typed request and response values, method semantics, authorization, operation identity, idempotency, and side effects. | Endpoint choice, relay paths, transport framing, or connectivity mutation. |
 | Object RPC | Method and request identifiers, SOBJ request and response framing, streamed bodies, application authentication context, and RPC failure classification. | Node path selection, endpoint dialing, relay forwarding, membership, or transport-specific limits. |
-| Node routing | Authorized path planning, routed-session establishment, relay execution, target identity, connection pooling, and stream lifecycle. | SOBJ, RPC methods, handler retries, service catalogs, or domain authorization. |
-| Connectivity | Directed observations, freshness, provenance, path metrics, immutable snapshots, watches, and derived reachability. | Membership authority, service dispatch, route execution, or application retries. |
+| Node routing | Transitive reachability, authorized path planning, path realization, routed-session establishment, relay execution, target identity, connection pooling, and stream lifecycle. | SOBJ, RPC methods, handler retries, service catalogs, or domain authorization. |
+| Connectivity | Direct-edge observations, freshness, provenance, path metrics, immutable snapshots, and watches. | Transitive reachability, membership authority, service dispatch, route execution, or application retries. |
 | Direct transport | Dialing, listening, adjacent-peer authentication, transport capabilities, and multiplexed direct streams. | Multi-hop route choice, cluster status, SOBJ, or RPC. |
 | `sinomo-cluster` | Authorized members, node identity keys, endpoint projection, and publication of source-owned connectivity evidence. | Private RPC framing or transport-specific application protocols. |
 
@@ -97,11 +97,14 @@ selects another application protocol because a stream crosses a byte threshold.
 
 ## Connectivity Contract
 
-Connectivity is a read model of evidence, not an authority source and not an
-active routing engine.
+Connectivity is a read model of direct-edge evidence, not an authority source
+and not an active routing engine. It never establishes a relayed relationship or
+publishes a synthetic transitive edge.
 
-Every edge is directed. Evidence that A can reach B says nothing about B
-reaching A. An observation records at least:
+Every connectivity-graph edge describes an observed adjacent-node relationship
+that the direct-link layer can attempt. Every edge is directed: evidence that A
+can directly reach B says nothing about B reaching A. An observation records at
+least:
 
 - source and target node identity;
 - endpoint identity and transport capability;
@@ -126,7 +129,7 @@ change a node's status. Probe owners and routed-session executors submit
 observations through an explicit sink. The tracker validates ownership,
 deduplicates updates, expires stale facts, and publishes a new snapshot.
 
-### Membership, Presence, and Reachability
+### Membership, Presence, and Direct Connectivity
 
 The implementation must not collapse distributed state into one authoritative
 `online` boolean. These are distinct:
@@ -136,15 +139,15 @@ The implementation must not collapse distributed state into one authoritative
 | Authorized | The current cluster directory permits communication with the node. |
 | Present | A fresh, authenticated liveness statement exists. |
 | Directly reachable | A fresh usable edge exists from the observer to the node. |
-| Routed reachable | The current graph contains an authorized usable path. |
-| Connected | An authenticated direct or routed session is currently established. |
-| Unreachable | Fresh evidence excludes every currently authorized path from this observer. |
-| Unknown | Evidence is absent, expired, or insufficient. |
+| Directly unreachable | Fresh evidence excludes a direct edge from this observer. |
+| Direct connectivity unknown | Direct evidence is absent, expired, or insufficient. |
 | Departed | The authoritative directory no longer contains the node. |
 
 Operator-facing `online`, `degraded`, or `offline` labels are timestamped
-projections of these facts. They are not stored as routing authority. In
-particular, one observer's failure cannot prove that a node is globally offline.
+projections composed from these facts and routing-owned session state. They are
+not stored as routing authority. In particular, one observer's failure cannot
+prove that a node is globally offline, and connectivity cannot claim multi-hop
+reachability merely because graph traversal finds a path.
 
 ### Cluster Directory
 
@@ -163,9 +166,16 @@ override a newer non-empty authoritative projection.
 
 ## Routing Contract
 
-The routing layer exposes node-addressed, authenticated, socket-like streams. A
-caller supplies a destination node and connection constraints; it never chooses
-LAN versus Iroh, direct versus relay, or a specific intermediate node.
+The routing layer is the sole owner of transitive reachability. It turns paths
+through the direct connectivity graph into actual node-addressed,
+authenticated, socket-like streams. A caller supplies a destination node and
+connection constraints; it never chooses LAN versus Iroh, direct versus relay,
+or a specific intermediate node.
+
+The primary routing liveness goal is component-wide communication: every pair
+of authorized nodes in the same current routable connected component can obtain
+an authenticated duplex stream, regardless of the number or arrangement of
+intermediate relays.
 
 ```rust,ignore
 trait RoutedConnector {
@@ -199,6 +209,40 @@ Transparent stream migration and durable partial-transfer resume are not part
 of this contract. They require separately specified sequence, acknowledgement,
 reattachment, and garbage-collection semantics.
 
+### Routed Availability
+
+Routing, not connectivity, owns the distinction between a graph path and a
+usable relationship:
+
+| State | Meaning |
+|---|---|
+| Candidate path | The current authorized snapshots contain at least one directed path that routing can attempt. |
+| Connected | Routing established an authenticated direct or relayed session and can open streams to the destination. |
+| No path | The current snapshots contain no authorized candidate path. |
+| Unknown | Directory or direct-edge evidence is absent, expired, or changing. |
+
+A candidate path is not itself a connection and must not be exposed as a live
+socket or successful delivery. An operator-facing `routed reachable` state is
+backed by a current established routed session; otherwise the state is
+`candidate`, `unknown`, or `unreachable` with its observation time.
+
+### Routable Connected Components
+
+Routing derives connected components from the authorized directory, current
+direct-edge snapshot, transport capabilities, and connection constraints. It
+does not persist component membership in connectivity.
+
+Because direct-edge observations are directed, a routable connected component
+uses mutual path reachability for the required duplex-stream capabilities, not
+weak undirected connectivity. Component membership may therefore change with
+endpoint availability, transport capabilities, privacy constraints, deadlines,
+or fresh failed-edge evidence.
+
+For every ordered source and destination pair in one current component, routing
+must be able to realize at least one eligible path as a usable session under the
+path-realization assumptions below. Intermediate topology is private to routing
+and is not part of the application contract.
+
 ### Pure Planning
 
 Route planning is a pure operation over immutable inputs:
@@ -223,32 +267,58 @@ model with additional edges. Purpose constraints may require capabilities such
 as full duplex, privacy, maximum hops, or a connection deadline, but they do not
 change the routing safety rules.
 
+### Path Realization Guarantee
+
+A path returned by the planner is an executable routing plan, not advisory
+topology metadata. The routed-session executor understands every edge and relay
+step that the planner may emit.
+
+If the directory and connectivity snapshot remain valid for the duration of an
+attempt, every edge continues to satisfy its advertised direct-link contract,
+and each relay cooperates, then `connect(source, destination)` must establish an
+authenticated session for every node pair in the same current component.
+Routing cannot report `No path` or leave the relationship as graph-only state
+without attempting an eligible candidate.
+
+When a path cannot be realized, routing returns a structured establishment
+failure identifying the rejected or failed edge, submits that evidence to
+connectivity, and tries a bounded eligible alternative within the connection
+deadline. This closes the loop between the control-plane graph and the data
+plane: stale graph reachability is corrected rather than repeatedly advertised
+as usable.
+
 ### Routed-Session Establishment
 
-For a path A to B to C:
+For any source and destination in one routable component, all transitive
+establishment is performed by the routing system:
 
-1. A selects the candidate path `[A, B, C]` from a current snapshot.
-2. A creates an origin-signed `OpenSession` binding A, destination C, a unique
-   session ID, the ordered path, hop limit, connection deadline, and end-to-end
-   key material.
-3. B verifies membership, signatures, path position, loop freedom, deadline,
-   and hop limit. It may reject the session but cannot change A, C, or the
-   session identity.
-4. B establishes or reuses a direct link to C and forwards the unchanged
-   end-to-end session descriptor.
-5. C accepts only when the destination equals its local identity and returns a
-   destination-signed acceptance bound to the same session.
-6. A and C derive end-to-end authenticated-encryption keys and a channel
+1. The source selects an ordered candidate path from a current snapshot.
+2. The source creates an origin-signed `OpenSession` binding the source,
+   destination, unique session ID, ordered path, hop limit, connection deadline,
+   and end-to-end key material.
+3. Every intermediate relay verifies membership, signatures, path position,
+   loop freedom, deadline, and hop limit. It may reject the session but cannot
+   change either endpoint or the session identity.
+4. Each relay establishes or reuses the next direct link and forwards the
+   unchanged end-to-end session descriptor.
+5. The destination accepts only when the descriptor targets its local identity
+   and returns a destination-signed acceptance bound to the same session.
+6. The endpoints derive end-to-end authenticated-encryption keys and a channel
    binding. Only then may `connect` return a `PeerStream`.
+
+The accepted endpoint relationship lives in routing's session pool. Routing can
+open additional logical streams over it without asking connectivity to create
+or persist a synthetic endpoint edge.
 
 Intermediate relays forward opaque encrypted stream data. They may observe the
 path identities and bounded traffic metadata required for forwarding, but they
 cannot inspect RPC values, alter the destination, impersonate either endpoint,
 or produce a successful end-to-end acceptance.
 
-A routed A-to-C session is not inserted as a new direct connectivity edge.
-Connectivity may report it as an active routed session or use its measurements
-as evidence for the constituent directed edges.
+A routed session is not inserted as a new direct connectivity edge. Routing
+reports its active session state. Measurements from establishment and delivery
+may be submitted as evidence for the constituent direct edges, but connectivity
+never owns the transitive relationship or component membership.
 
 ### Relay Backpressure
 
@@ -390,9 +460,11 @@ contracts evolve independently:
 
 Capabilities, limits, and optional fields are negotiated as capabilities when
 backward-compatible. A version changes only for an incompatible contract
-change, not for an implementation refactor or tuning adjustment. Compatibility
-adapters live at protocol boundaries and never cause routing to choose an RPC
-protocol based on payload shape.
+change, not for an implementation refactor or tuning adjustment. This
+replacement retains no adapter between superseded internal protocols. A wire
+contract change migrates every producer and consumer as one coordinated change,
+then deletes the old parser, negotiation branch, framing, tests, and
+documentation. Routing never chooses an RPC protocol based on payload shape.
 
 The current consolidated implementation protocol v1 described in the
 [data-path reference](developer/network-data-path.md) predates this separation.
@@ -419,7 +491,7 @@ graph:
 | Module boundary | Responsibility |
 |---|---|
 | Direct link | Authenticated adjacent transports, listeners, connection pools, and streams. |
-| Connectivity | Evidence validation, immutable snapshots, watches, and derived status. |
+| Connectivity | Direct-edge evidence validation, immutable snapshots, watches, and direct status. |
 | Routing | Pure planning, routed sessions, relays, and `RoutedConnector`. |
 | Object RPC | SOBJ RPC over authenticated duplex streams. |
 | Public facade | Stable exports and composition types without a second implementation path. |
@@ -446,31 +518,40 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
    routing, endpoint selection, connectivity stores, or a specific transport.
 2. Routing forwards opaque bytes and never imports SOBJ, RPC methods, service
    catalogs, body modes, or domain retry policy.
-3. Connectivity publishes immutable directed evidence and never grants
-   membership, executes routes, or turns one observer's failure into global
-   offline authority.
-4. A routed stream is end-to-end bound to its source, destination, session, and
+3. Connectivity publishes immutable directed direct-edge evidence and never
+   grants membership, derives transitive reachability, executes routes, or turns
+   one observer's failure into global offline authority.
+4. Every path emitted by the planner is executable by the routed-session
+   executor under the same directory, edge-capability, and relay assumptions.
+   Graph reachability that fails realization produces specific edge feedback.
+5. Every authorized node pair in the same current routable connected component
+   can establish an authenticated direct or relayed duplex stream under stable
+   path-realization assumptions.
+6. A routed stream is end-to-end bound to its source, destination, session, and
    channel binding before application bytes are accepted.
-5. Relays cannot change the destination, authenticate as the origin or target,
+7. Relays cannot change the destination, authenticate as the origin or target,
    or inspect or alter end-to-end protected application bytes.
-6. One RPC call uses one logical duplex stream and the same protocol at every
+8. One RPC call uses one logical duplex stream and the same protocol at every
    request and response size.
-7. Frame, queue, window, and buffer limits bound resident resources, not total
+9. Frame, queue, window, and buffer limits bound resident resources, not total
    SOBJ or stream length.
-8. Routing may try alternatives only before returning a stream. It never
+10. Routing may try alternatives only before returning a stream. It never
    replays bytes after an established stream fails.
-9. Only a domain with a stable operation identity and idempotency or outcome
+11. Only a domain with a stable operation identity and idempotency or outcome
    contract may retry a possibly applied call.
-10. The service-method registry has one owner in `sinomo-service`; node routes
+12. The service-method registry has one owner in `sinomo-service`; node routes
     and service methods are different concepts and use different names.
-11. Network and KV have no production dependency on one another;
+13. Network and KV have no production dependency on one another;
     `sinomo-cluster` is their only R0 bridge.
-12. Higher-level crates do not open ad hoc cluster sockets, select relay paths,
+14. Higher-level crates do not open ad hoc cluster sockets, select relay paths,
     or create private chunk-transfer RPCs.
-13. Protocol versions identify independently released wire contracts, not
+15. Protocol versions identify independently released wire contracts, not
     implementation milestones.
-14. Target services re-check domain authority and node-local consent at the
+16. Target services re-check domain authority and node-local consent at the
     final effect boundary.
+17. No superseded internal protocol, compatibility shim, legacy adapter,
+    deprecated alias, fallback selector, unused export, dead test, fixture,
+    configuration, or documentation remains after its final caller migrates.
 
 The [clustering architecture](clustering-architecture.md) defines directory
 authority. The [Sinomo Object format](sinomo-object-format.md) defines the
