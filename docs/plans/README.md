@@ -8,6 +8,7 @@ tests for that.
 
 | Plan | Status |
 |---|---|
+| [Network layer separation](network-layer-separation.md) | Active internal separation of the single `sinomo-network` crate into direct-link, connectivity, routed-stream, and stream-native object-RPC contracts. |
 | [R0/R1 crate boundary refactor](r0-r1-crate-boundary-refactor.md) | Completed implementation record. |
 | [Reactive cluster KV/Raft improvements](reactive-cluster-kv-raft-improvement-plan.md) | First implementation slice completed; retained P1-P3 follow-up work is classified in the plan. |
 | [DFS policy and authority hardening](dfs-policy-and-authority-hardening.md) | Proposed follow-up work. |

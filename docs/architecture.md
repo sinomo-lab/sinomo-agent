@@ -143,9 +143,18 @@ consensus, identity, and failure semantics.
 
 ### Network Boundary
 
-`sinomo-network` owns communication mechanisms: typed object RPC, framing,
-endpoint selection, routing, retries, relays, and transport modules. Domain
-crates own request types, routes, and business rules.
+Cluster communication is composed from independent contracts. Direct transports
+connect authenticated adjacent peers. Connectivity tracking publishes fresh,
+directed evidence without granting membership. Routing uses the authorized
+directory and connectivity snapshots to establish target-bound duplex streams,
+including through relays. Object RPC carries SOBJ requests and responses over
+any authenticated duplex stream and does not know endpoints or node paths.
+Domain crates own target selection, typed values, service methods, authorization,
+idempotency, and side effects.
+
+Direct-link, connectivity, routing, and object-RPC mechanisms remain internal
+layers of the single R0 `sinomo-network` crate. Their separation does not change
+the workspace crate structure.
 
 The network and KV cores have no production dependency on one another.
 `sinomo-cluster` bridges them by moving consensus and membership traffic over
@@ -153,9 +162,10 @@ network-selected routes and by projecting committed cluster facts through the
 network directory interface. This separation is enforced by workspace boundary
 tests.
 
-See [network architecture](network-architecture.md) for routing guarantees and
-transport behavior, and [Sinomo Object format](sinomo-object-format.md) for the
-binary wire representation.
+See [network architecture](network-architecture.md) for the layer contracts,
+routed-stream guarantees, and transport behavior, and
+[Sinomo Object format](sinomo-object-format.md) for the binary wire
+representation.
 
 ### Filesystem and Content
 

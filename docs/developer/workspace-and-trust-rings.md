@@ -53,10 +53,15 @@ sinomo-network       sinomo-kv
             sinomo-core
 ```
 
-`sinomo-network` owns transport, framing, endpoint selection, routing, retry,
-relay, and module mechanisms. `sinomo-kv` owns keyspace, transactions, watch,
-lease, snapshot, request outcome, and Raft state-machine semantics without
-network policy. `sinomo-cluster` is the only production bridge.
+`sinomo-network` remains one R0 crate and internally follows independent
+direct-link, connectivity, routing, and object-RPC contracts. The internal
+layers cannot depend on one another in reverse. Object RPC consumes an
+authenticated duplex stream and does not know node routes. Routing consumes
+direct links and connectivity snapshots and does not know SOBJ or service
+methods. This internal separation does not change the workspace crate graph.
+`sinomo-kv` owns keyspace, transactions, watch, lease, snapshot, request
+outcome, and Raft state-machine semantics without network policy.
+`sinomo-cluster` is the only production bridge between networking and KV.
 
 R0 changes deserve special scrutiny because every higher layer consumes their
 contracts. Keep them small, deterministic, and independent from agents,

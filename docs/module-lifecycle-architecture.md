@@ -127,7 +127,7 @@ limited to trusted code and gated like other host-process code.
 The dynamic boundary should stay small and stable: a versioned C-compatible
 loader ABI, byte buffers, status codes, host callback tables, descriptors, and
 SOBJ request and response envelopes. Native descriptors may declare object-RPC
-routes and embedded declarative resources so the host can expose a module at
+methods and embedded declarative resources so the host can expose a module at
 runtime without linking module-specific crates into the main binary.
 
 Unloading native dynamic libraries is best effort. The lifecycle transition can
@@ -220,7 +220,7 @@ compatibility, policy, and loader or rollout state.
 
 Module catalog registration is pure data. It records the manifest, backend
 descriptor, declared capabilities, and public surfaces exposed by the module.
-Public surfaces include object-RPC routes, event kinds, capability imports and
+Public surfaces include object-RPC methods, event kinds, capability imports and
 exports, settings definitions, and storage contract owners. This data is
 serializable, inspectable, comparable across nodes, and safe to place in
 registry or cluster desired state.
@@ -256,19 +256,21 @@ This split keeps module activation auditable:
 - the loader says which catalog entry is active on this node,
 - the runtime binding says how this binary materializes that active entry.
 
-For example, `sinomo-dfs` publishes the DFS object-RPC routes, DFS/SIFS
+For example, `sinomo-dfs` publishes the DFS object-RPC methods, DFS/SIFS
 capabilities, DFS event families, and the `sinomo-dfs` storage ownership through
 its module surfaces. Its storage path registration is a native runtime binding.
-`sinomo-network` owns generic object-RPC framing and transport mechanics; it
-does not own DFS route names. The daemon may enforce local authentication and
-drive the service event loop, but the route catalog belongs to the module that
-implements the behavior.
+The object-RPC layer owns generic request and response framing over an
+authenticated duplex stream. Direct-link and routing layers establish that
+stream without knowing its methods. The daemon may enforce local authentication
+and drive the service event loop, but the single service-method catalog is
+assembled by `sinomo-service` from declarations belonging to the modules that
+implement the behavior.
 
 ### Host Event Loop
 
 The daemon should trend toward a generic service/event loop that reads module
 catalog surfaces and asks active module bindings to register their runtime
-handlers. Daemon-owned foundational routes, such as process status, shutdown,
+handlers. Daemon-owned foundational methods, such as process status, shutdown,
 and cluster transport, can remain host services. Domain behavior such as DFS
 metadata repair, object transfer, and operator inspection should live in the
 domain module crate or in a module-owned service binding.
@@ -519,13 +521,14 @@ The crate boundary follows the trust-ring architecture:
   must not own policy decisions, rollout admission, rollout transition state,
   or self-evolution scoring.
 - `sinomo-module-api` owns the stable native dynamic-library ABI surface,
-  including generic descriptor fields for self-described object-RPC routes,
+  including generic descriptor fields for self-described object-RPC methods,
   embedded declarative resources, and declared network transports.
-- `sinomo-network` owns the network-module registry, descriptors, and the
-  network-module dylib vtable that transport modules implement.
+- The direct-link layer inside `sinomo-network` owns the network-transport
+  registry, descriptors, and network-module dylib vtable that transport modules
+  implement.
 - `sinomo-daemon` owns the runtime registry that assembles the module table:
   internal native-rust registrations and bindings, dylib loader adaptation,
-  module-to-route conversion, and the composed storage layout.
+  module-to-method conversion, and the composed storage layout.
   `sinomo-runtime` re-exports that machinery as
   `sinomo_runtime::{modules, storage}` without adding behavior.
 - `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
@@ -543,7 +546,7 @@ The crate boundary follows the trust-ring architecture:
 - `sinomo-evolution` owns candidate generation, evidence assembly, evidence
   interpretation, self-evolution scorecard adapters, and promotion requests; it
   consumes module lifecycle contracts but does not define R1 module primitives.
-- Domain module crates own their domain route names, event kinds, storage roots,
+- Domain module crates own their domain method names, event kinds, storage roots,
   and host-service binding helpers. Generic infrastructure crates own framing,
   dispatch, storage verification, and daemon event-loop mechanics.
 
