@@ -1266,6 +1266,8 @@ mod windows_file {
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::FromRawHandle as _;
     use std::ptr;
+    use std::sync::{Arc, LazyLock, Weak};
+    use std::time::{Duration, Instant};
 
     const CREATE_NEW: u32 = 1;
     const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
@@ -1273,6 +1275,9 @@ mod windows_file {
     const ERROR_FILE_EXISTS: i32 = 80;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_ALREADY_EXISTS: i32 = 183;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -1280,7 +1285,14 @@ mod windows_file {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    const REPLACE_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(2);
+    const REPLACE_RETRY_MAX_DELAY: Duration = Duration::from_millis(40);
+    const REPLACE_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
     const SDDL_REVISION_1: u32 = 1;
+    const WINDOWS_REPLACE_LOCK_CAPACITY: usize = 4096;
+
+    static WINDOWS_REPLACE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     #[repr(C)]
     struct SecurityAttributes {
@@ -1401,10 +1413,59 @@ mod windows_file {
     }
 
     pub(super) fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+        // ReplaceFileW is not safe against simultaneous calls for one target:
+        // competing replacements can partially rename the target and return
+        // ERROR_UNABLE_TO_{REMOVE,MOVE}_REPLACEMENT. Serialize same-process
+        // calls per path; cross-process storage owners retain their sidecar lock.
+        let replace_lock = windows_replace_lock(path);
+        let _replace_guard = replace_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_path_wide = wide_path(temp_path)?;
         let path_wide = wide_path(path)?;
+        let started = Instant::now();
+        let mut delay = REPLACE_RETRY_INITIAL_DELAY;
 
-        match replace_existing(&temp_path_wide, &path_wide) {
+        loop {
+            match replace_file_once(&temp_path_wide, &path_wide, path) {
+                Ok(()) => return Ok(()),
+                Err(source) if replace_should_retry(&source) => {
+                    let Some(remaining) = REPLACE_RETRY_TIMEOUT.checked_sub(started.elapsed())
+                    else {
+                        return Err(source);
+                    };
+                    if remaining.is_zero() {
+                        return Err(source);
+                    }
+                    // Antivirus, indexers, older processes, and simultaneous
+                    // ReplaceFileW calls can briefly prevent removal of the old
+                    // target. These errors leave both names unchanged, so retry
+                    // without weakening the atomic replacement contract.
+                    std::thread::sleep(delay.min(remaining));
+                    delay = (delay * 2).min(REPLACE_RETRY_MAX_DELAY);
+                }
+                Err(source) => return Err(source),
+            }
+        }
+    }
+
+    fn windows_replace_lock(path: &Path) -> Arc<Mutex<()>> {
+        let mut locks = WINDOWS_REPLACE_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if locks.len() >= WINDOWS_REPLACE_LOCK_CAPACITY {
+            locks.retain(|_, lock| lock.strong_count() != 0);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn replace_file_once(temp_path_wide: &[u16], path_wide: &[u16], path: &Path) -> io::Result<()> {
+        match replace_existing(temp_path_wide, path_wide) {
             Ok(()) => return Ok(()),
             Err(source) if source.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => {}
             Err(source) => return Err(source),
@@ -1432,9 +1493,18 @@ mod windows_file {
             Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS)
         ) || (source.raw_os_error() == Some(ERROR_ACCESS_DENIED) && destination_now_exists)
         {
-            return replace_existing(&temp_path_wide, &path_wide);
+            return replace_existing(temp_path_wide, path_wide);
         }
         Err(source)
+    }
+
+    fn replace_should_retry(source: &io::Error) -> bool {
+        matches!(
+            source.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION)
+                | Some(ERROR_LOCK_VIOLATION)
+                | Some(ERROR_UNABLE_TO_REMOVE_REPLACED)
+        )
     }
 
     fn replace_existing(temp_path: &[u16], path: &[u16]) -> io::Result<()> {
@@ -1694,6 +1764,43 @@ mod tests {
             0o600,
             "replacement must not widen destination permissions"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_retries_a_transient_destination_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+        let root = sinomo_testdir::TestDir::new("storage-replace-sharing-violation");
+        let destination = root.join("destination.bin");
+        let staged = root.join(".destination.staged");
+        fs::write(&destination, b"old content").expect("write destination");
+        fs::write(&staged, b"new content").expect("write stage");
+
+        // Deliberately omit FILE_SHARE_DELETE to reproduce ERROR_SHARING_VIOLATION
+        // from ReplaceFileW while an external reader briefly holds the target.
+        let destination_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&destination)
+            .expect("open destination without delete sharing");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(destination_handle);
+        });
+
+        let result = replace_file(&staged, &destination);
+        release.join().expect("release destination handle");
+        result.expect("replace after transient sharing violation");
+
+        assert_eq!(
+            fs::read(&destination).expect("read replaced destination"),
+            b"new content"
+        );
+        assert!(!staged.exists(), "successful replace consumes staged name");
     }
 
     #[cfg(unix)]

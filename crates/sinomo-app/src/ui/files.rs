@@ -75,9 +75,15 @@ use crate::ui::settings::SettingsSection;
 use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
 
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
-const WIDE_THRESHOLD: f32 = 640.0;
+/// The wide branch reserves enough room for Places, the inspector, and the compact file table so
+/// the Placement column never disappears behind horizontal overflow.
+const WIDE_THRESHOLD: f32 = 880.0;
 const INSPECTOR_W: f32 = 340.0;
 const ROW_THUMBNAIL_SIDE: f32 = 20.0;
+/// At narrower list widths Details yields to Placement, which is required for every file row.
+const COMPLETE_FILE_TABLE_MIN_W: f32 = 560.0;
+const COMPACT_FILE_NAME_MIN_W: f32 = 120.0;
+const COMPACT_FILE_PLACEMENT_W: f32 = 144.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 44.0;
 const HEADER_COMMAND_GAP: f32 = 4.0;
@@ -9525,7 +9531,7 @@ fn unselected_inspector_status(source: FilesSourceKind, entries_empty: bool) -> 
         return "No entries in this directory";
     }
     match source {
-        FilesSourceKind::Sifs => "Select an object to inspect placement",
+        FilesSourceKind::Sifs => "Placement is shown for every object",
         FilesSourceKind::Local => "Select an object to inspect metadata",
     }
 }
@@ -10756,30 +10762,45 @@ fn files_list_body_table(
         ));
     }
 
-    let row_entries = entries.clone();
-    let paint_shared = shared.clone();
-    let name_entries = entries.clone();
-    let description_entries = entries.clone();
-    let table = {
+    let build_table = |show_details: bool| {
+        let row_entries = entries.clone();
+        let paint_shared = shared.clone();
+        let name_entries = entries.clone();
+        let description_entries = entries.clone();
         let s = shared.clone();
         let cell_s = shared.clone();
         let header_s = shared.clone();
         let page_s = shared.clone();
         let description_s = shared.clone();
-        VirtualTable::new("files-listing")
-            .state(table_state.clone())
-            .columns([
-                VirtualTableColumn::new("").key(1).width(36.0),
-                VirtualTableColumn::new("Name")
-                    .key(2)
-                    .min_width(180.0)
-                    .sort_direction(sort_mode.name_sort_direction()),
-                VirtualTableColumn::new("Placement").key(3).width(156.0),
+        let mut columns = vec![
+            VirtualTableColumn::new("").key(1).width(36.0),
+            VirtualTableColumn::new("Name")
+                .key(2)
+                .min_width(if show_details {
+                    180.0
+                } else {
+                    COMPACT_FILE_NAME_MIN_W
+                })
+                .sort_direction(sort_mode.name_sort_direction()),
+            VirtualTableColumn::new("Placement")
+                .key(3)
+                .width(if show_details {
+                    156.0
+                } else {
+                    COMPACT_FILE_PLACEMENT_W
+                }),
+        ];
+        if show_details {
+            columns.push(
                 VirtualTableColumn::new("Details")
                     .key(4)
                     .width(156.0)
                     .sort_direction(sort_mode.meta_sort_direction()),
-            ])
+            );
+        }
+        VirtualTable::new("files-listing")
+            .state(table_state.clone())
+            .columns(columns)
             .collection_window(CollectionWindow::loaded(
                 0..entries.len(),
                 Some(total_count),
@@ -10876,7 +10897,12 @@ fn files_list_body_table(
             })
     };
 
-    WidgetPod::new(table)
+    let compact_table = build_table(false);
+    let complete_table = build_table(true);
+    WidgetPod::new(ConstraintView::new(compact_table).when(
+        ConstraintQuery::new().min_width(COMPLETE_FILE_TABLE_MIN_W),
+        complete_table,
+    ))
 }
 
 fn file_entry_key(entry: &SifsEntry) -> u64 {
@@ -10946,12 +10972,15 @@ fn paint_file_table_row(
 
     if let Some(placement_cell) = row.column_rects.get(2).copied() {
         let placement = file_row_placement_badge(entry, &files, row.row_index);
+        // The compact badge has a fixed maximum width. Keep the full local-placement label
+        // visible by yielding its redundant storage icon instead of truncating "this device".
+        let placement_icon = (placement.label.as_str() != "this device").then_some(placement.icon);
         paint_placement_badge_with(
             ctx,
             &theme,
             placement_cell,
             &placement.label,
-            Some(placement.icon),
+            placement_icon,
             placement.tone,
             placement.replicas,
             PlacementBadgePaint::new().padding(8.0, 5.0, 8.0, 5.0),
@@ -19925,9 +19954,13 @@ mod tests {
                 .with_name("More file commands")
         };
 
+        let compact_width = WIDE_THRESHOLD - 1.0;
         window
             .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(639.0, 720.0))))?;
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                compact_width,
+                720.0,
+            ))))?;
         app.run_until_idle()?;
         more().expect().to_be_visible()?;
         let compact_id = window
@@ -19944,7 +19977,10 @@ mod tests {
 
         window
             .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(640.0, 720.0))))?;
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                WIDE_THRESHOLD,
+                720.0,
+            ))))?;
         app.run_until_idle()?;
         let wide_id = window
             .snapshot()?
@@ -19964,7 +20000,10 @@ mod tests {
 
         window
             .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(639.0, 720.0))))?;
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                compact_width,
+                720.0,
+            ))))?;
         app.run_until_idle()?;
         more().expect().to_be_visible()?;
         let restored_id = window
@@ -21150,7 +21189,7 @@ mod tests {
         );
         assert_eq!(
             unselected_inspector_status(FilesSourceKind::Sifs, false),
-            "Select an object to inspect placement"
+            "Placement is shown for every object"
         );
         assert_eq!(
             unselected_inspector_title(FilesSourceKind::Local),
@@ -24000,6 +24039,101 @@ mod tests {
     }
 
     #[test]
+    fn compact_file_table_keeps_unselected_placement_visible() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Sifs;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.clustered = true;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.entry_metadata.insert(
+                "/artifact.txt".to_string(),
+                SifsEntryMetadata {
+                    path: "/artifact.txt".to_string(),
+                    object_id: "object-artifact".to_string(),
+                    version: "version-1".to_string(),
+                    modified_at_unix_nanos: 0,
+                    policy: "replicated-eventual".to_string(),
+                    current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                },
+            );
+            files.selected = None;
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files compact placement")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(360.0, 640.0))))?;
+        app.run_until_idle()?;
+
+        let snapshot = window.snapshot()?;
+        let table = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Table
+                    && node.name.as_deref() == Some("files-listing")
+            })
+            .expect("compact files table semantics");
+        assert!(
+            table
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Columns: Name, Placement;")),
+            "compact table should retain Placement, got {:?}",
+            table.description
+        );
+        assert!(
+            !table
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Details")),
+            "Details should yield before Placement in the compact table, got {:?}",
+            table.description
+        );
+
+        let row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("artifact.txt")
+            })
+            .expect("unselected artifact row semantics");
+        assert!(
+            row.description
+                .as_deref()
+                .is_some_and(|description| description.contains("Placement: 2 copies")),
+            "unselected row should expose placement metadata, got {:?}",
+            row.description
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn files_toolbar_repairs_replicas_and_row_semantics_show_placement() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -25819,7 +25953,7 @@ mod tests {
             .join("files-workflow-layout");
         fs::create_dir_all(&artifact_dir).expect("create visual artifact directory");
 
-        for width in [560.0_f32, 760.0_f32] {
+        for width in [560.0_f32, WIDE_THRESHOLD] {
             let shared = prepared_shared(false);
             let runtime = sui::Application::new()
                 .window(
