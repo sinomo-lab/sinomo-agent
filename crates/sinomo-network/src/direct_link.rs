@@ -391,6 +391,7 @@ impl AuthenticatedLink {
             self.peer_node_id.clone(),
             self.link_id.clone(),
             self.channel_binding,
+            self.capabilities,
         )
     }
 }
@@ -404,12 +405,12 @@ pub struct AuthenticatedDirectStream {
     pub stream_id: Id,
     /// Transport exporter shared by both ends of the authenticated link.
     ///
-    /// Routed-session establishment combines this with its signed transcript
-    /// to derive the end-to-end stream binding. `channel_binding` below is the
-    /// transport-local logical-stream binding and need not be exchanged on
-    /// the routing wire.
+    /// Routing uses this to identify the authenticated adjacent carrier.
+    /// End-to-end routed-session key agreement and bindings remain independent
+    /// so intermediate links cannot derive endpoint stream keys.
     pub link_channel_binding: [u8; 32],
     pub channel_binding: [u8; 32],
+    pub capabilities: DirectStreamCapabilities,
 }
 
 impl AuthenticatedDirectStream {
@@ -421,8 +422,12 @@ impl AuthenticatedDirectStream {
         peer_node_id: NodeId,
         link_id: Id,
         link_channel_binding: [u8; 32],
+        capabilities: DirectStreamCapabilities,
     ) -> Result<Self, NetworkError> {
-        if local_node_id == peer_node_id || link_channel_binding == [0; 32] {
+        if local_node_id == peer_node_id
+            || link_channel_binding == [0; 32]
+            || capabilities.validate().is_err()
+        {
             return Err(NetworkError::AuthDenied);
         }
         let stream_id = Id::generate();
@@ -438,6 +443,7 @@ impl AuthenticatedDirectStream {
             stream_id,
             link_channel_binding,
             channel_binding,
+            capabilities,
         })
     }
 }

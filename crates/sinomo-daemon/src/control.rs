@@ -3016,6 +3016,50 @@ fn resolve_authenticated_transport_peer(
     ))
 }
 
+struct DaemonRoutedConnectivityFailureSink<'a> {
+    cluster_paths: &'a sinomo_core::network::ClusterPaths,
+    state: &'a sinomo_core::ClusterBootstrapState,
+    directory: &'a sinomo_core::network::DirectorySnapshot,
+}
+
+impl sinomo_core::network::ConnectivityFailureSink for DaemonRoutedConnectivityFailureSink<'_> {
+    fn submit_edge_failure(
+        &self,
+        evidence: sinomo_core::network::DirectConnectivityFailureEvidence,
+    ) -> Result<(), sinomo_core::network::NetworkError> {
+        if evidence.source_node_id != self.state.local_node_id
+            || evidence.observer_node_id != self.state.local_node_id
+        {
+            return Err(sinomo_core::network::NetworkError::AuthDenied);
+        }
+        let endpoint = self
+            .directory
+            .node(&evidence.target_node_id)
+            .and_then(|node| {
+                node.endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.endpoint_id == evidence.endpoint_id)
+            })
+            .ok_or(sinomo_core::network::NetworkError::AuthDenied)?;
+        tracing::warn!(
+            source_node_id = %evidence.source_node_id,
+            target_node_id = %evidence.target_node_id,
+            endpoint_id = %evidence.endpoint_id,
+            reason = %evidence.reason,
+            "routed-session realization rejected a direct edge"
+        );
+        sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
+            self.cluster_paths,
+            self.state,
+            endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            None,
+            false,
+        )?;
+        Ok(())
+    }
+}
+
 async fn handle_daemon_authenticated_transport_stream_async(
     stream: sinomo_core::network::AsyncDaemonControlStream,
     paths: DaemonPaths,
@@ -3028,7 +3072,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
     let (peer_node_id, directory) = resolve_authenticated_transport_peer(&paths, &metadata)?;
     let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let local_node_id = state.local_node_id;
+    let local_node_id = state.local_node_id.clone();
     let mut link_identity = Vec::new();
     link_identity.extend_from_slice(local_node_id.as_str().as_bytes());
     link_identity.push(0);
@@ -3045,26 +3089,60 @@ async fn handle_daemon_authenticated_transport_stream_async(
         peer_node_id.clone(),
         link_id,
         metadata.channel_binding,
+        metadata.capabilities,
     )?;
     let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
     let identity = sinomo_core::network::DaemonRoutedSessionIdentity::new(local_node_id, data_dir)?;
-    let stream =
-        sinomo_core::network::accept_direct_routed_session(direct_stream, &directory, &identity)
-            .await?;
-    tracing::debug!(
-        %peer_node_id,
-        transport = ?metadata.transport,
-        %stream_address,
-        "accepted authenticated network-module stream"
+    let link_provider = sinomo_core::network::RegisteredNetworkModuleLinkProvider::new(
+        sinomo_core::network::NetworkHealthPolicy::default(),
     );
-    handle_daemon_object_rpc_stream_for_authenticated_peer_async(
-        Box::new(stream),
-        paths,
-        service_host,
-        service_runtime,
-        Some(peer_node_id),
+    let failure_sink = DaemonRoutedConnectivityFailureSink {
+        cluster_paths: &cluster_paths,
+        state: &state,
+        directory: &directory,
+    };
+    match sinomo_core::network::accept_or_relay_routed_session(
+        direct_stream,
+        &directory,
+        &identity,
+        &link_provider,
+        Some(&failure_sink),
     )
-    .await
+    .await?
+    {
+        sinomo_core::network::RoutedSessionDisposition::Destination(stream) => {
+            let routed_peer_node_id = stream.peer_node_id.clone();
+            tracing::debug!(
+                adjacent_peer_node_id = %peer_node_id,
+                %routed_peer_node_id,
+                transport = ?metadata.transport,
+                %stream_address,
+                "accepted authenticated routed-session destination stream"
+            );
+            handle_daemon_object_rpc_stream_for_authenticated_peer_async(
+                Box::new(stream),
+                paths,
+                service_host,
+                service_runtime,
+                Some(routed_peer_node_id),
+            )
+            .await
+        }
+        sinomo_core::network::RoutedSessionDisposition::Relayed(report) => {
+            tracing::debug!(
+                session_id = %report.session_id,
+                source_node_id = %report.source_node_id,
+                destination_node_id = %report.destination_node_id,
+                relay_node_id = %report.relay_node_id,
+                next_node_id = %report.next_node_id,
+                bytes_toward_destination = report.bytes_toward_destination,
+                bytes_toward_source = report.bytes_toward_source,
+                %stream_address,
+                "completed opaque routed-session relay"
+            );
+            Ok(false)
+        }
+    }
 }
 
 async fn daemon_control_stream_uses_local_object_rpc_channel(

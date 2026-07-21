@@ -15,6 +15,7 @@ use time::OffsetDateTime;
 use tokio::sync::watch;
 
 pub const MAX_CONNECTIVITY_SNAPSHOT_EDGES: usize = 4096;
+pub const MAX_CONNECTIVITY_FAILURE_REASON_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ConnectivityGeneration(pub u64);
@@ -99,6 +100,37 @@ impl DirectConnectivityObservation {
             return Err(NetworkError::Serialization {
                 detail: "reachable connectivity evidence lacks a usable duplex-stream capability"
                     .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Structured, source-owned evidence emitted when route realization rejects
+/// or loses one specific direct edge.
+///
+/// The tracker may only update an edge already present in the current direct
+/// snapshot. Routing therefore cannot create synthetic connectivity or alter
+/// cluster membership while closing the plan/execution feedback loop.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectConnectivityFailureEvidence {
+    pub observer_node_id: NodeId,
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub endpoint_id: Id,
+    pub reason: String,
+    pub observed_at: OffsetDateTime,
+}
+
+impl DirectConnectivityFailureEvidence {
+    fn validate(&self) -> Result<(), NetworkError> {
+        if self.observer_node_id != self.source_node_id
+            || self.source_node_id == self.target_node_id
+            || self.reason.trim().is_empty()
+            || self.reason.len() > MAX_CONNECTIVITY_FAILURE_REASON_BYTES
+        {
+            return Err(NetworkError::Serialization {
+                detail: "invalid source-owned direct-connectivity failure evidence".to_string(),
             });
         }
         Ok(())
@@ -245,8 +277,18 @@ pub trait ConnectivityView: Send + Sync {
     fn subscribe(&self) -> watch::Receiver<Arc<ConnectivitySnapshot>>;
 }
 
-/// Explicit write boundary used by probe and routed-session owners.
-pub trait ConnectivityObservationSink: Send + Sync {
+/// Narrow write boundary used by route realization to reject one stale edge.
+pub trait ConnectivityFailureSink: Send + Sync {
+    /// Marks one current direct edge unreachable while preserving every other
+    /// edge in the source's latest complete set.
+    fn submit_edge_failure(
+        &self,
+        evidence: DirectConnectivityFailureEvidence,
+    ) -> Result<(), NetworkError>;
+}
+
+/// Explicit source-set write boundary used by connectivity probe owners.
+pub trait ConnectivityObservationSink: ConnectivityFailureSink {
     /// Atomically replaces one source node's complete observation set.
     ///
     /// Empty sets are meaningful and still advance the source watermark, so a
@@ -437,6 +479,68 @@ impl ConnectivityObservationSink for ConnectivityTracker {
         state
             .source_generations
             .insert(source_node_id, source_generation);
+        self.publish(snapshot);
+        Ok(())
+    }
+}
+
+impl ConnectivityFailureSink for ConnectivityTracker {
+    fn submit_edge_failure(
+        &self,
+        evidence: DirectConnectivityFailureEvidence,
+    ) -> Result<(), NetworkError> {
+        evidence.validate()?;
+        let mut state = self.state();
+        let current = self.active.load_full();
+        if evidence.observed_at < current.published_at() {
+            return Err(NetworkError::Serialization {
+                detail: "connectivity failure evidence predates the current snapshot".to_string(),
+            });
+        }
+        let source_generation = state
+            .source_generations
+            .get(&evidence.source_node_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut matched = false;
+        let mut observations = Vec::with_capacity(current.edges().len());
+        for observation in current.edges() {
+            let mut observation = observation.clone();
+            if observation.source_node_id == evidence.source_node_id {
+                observation.source_generation = source_generation;
+                if observation.target_node_id == evidence.target_node_id
+                    && observation.endpoint.endpoint_id == evidence.endpoint_id
+                {
+                    matched = true;
+                    observation.observed_at = evidence.observed_at;
+                    observation.expires_at = evidence.observed_at + time::Duration::seconds(60);
+                    observation.state = DirectConnectivityState::Unreachable;
+                    observation.failure_reason = Some(evidence.reason.clone());
+                    observation.latency_micros = None;
+                    observation.delivered_bytes_per_second = None;
+                    observation.provenance = "routed-session-edge-failure".to_string();
+                }
+            }
+            observations.push(observation);
+        }
+        if !matched {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "route failure referenced unknown direct edge {} -> {} endpoint {}",
+                    evidence.source_node_id, evidence.target_node_id, evidence.endpoint_id
+                ),
+            });
+        }
+        let snapshot = ConnectivitySnapshot::try_new(
+            ConnectivityGeneration(current.generation().0.saturating_add(1)),
+            current.directory_generation(),
+            evidence.observed_at,
+            observations,
+        )?;
+        state
+            .source_generations
+            .insert(evidence.source_node_id, source_generation);
         self.publish(snapshot);
         Ok(())
     }
@@ -667,5 +771,46 @@ mod tests {
         assert_eq!(tracker.snapshot().edges().len(), 1);
         assert!(tracker.expire(expires_at).expect("expire snapshot"));
         assert!(tracker.snapshot().edges().is_empty());
+    }
+
+    #[test]
+    fn edge_failure_cannot_create_synthetic_connectivity() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+        let a = node("node_connectivity_failure_a");
+        let b = node("node_connectivity_failure_b");
+        let c = node("node_connectivity_failure_c");
+        let initial = ConnectivitySnapshot::try_new(
+            ConnectivityGeneration(7),
+            11,
+            now,
+            [observation(
+                &a,
+                &b,
+                "endpoint_connectivity_failure_known",
+                DirectConnectivityState::Reachable,
+                1,
+                11,
+                now - Duration::seconds(1),
+            )],
+        )
+        .expect("initial connectivity");
+        let tracker = ConnectivityTracker::new(initial);
+        let before = tracker.snapshot();
+
+        let error = tracker
+            .submit_edge_failure(DirectConnectivityFailureEvidence {
+                observer_node_id: a.clone(),
+                source_node_id: a,
+                target_node_id: c,
+                endpoint_id: Id::generate(),
+                reason: "route realization rejected unknown edge".to_string(),
+                observed_at: now + Duration::seconds(1),
+            })
+            .expect_err("unknown edge rejection");
+
+        assert!(error.to_string().contains("unknown direct edge"));
+        let after = tracker.snapshot();
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.edges(), before.edges());
     }
 }

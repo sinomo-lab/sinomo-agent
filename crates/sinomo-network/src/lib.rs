@@ -127,9 +127,10 @@ pub use connectivity::{
     validate_cluster_connectivity_records_for_source,
 };
 pub use connectivity_snapshot::{
-    ConnectivityGeneration, ConnectivityObservationSink, ConnectivitySnapshot, ConnectivityTracker,
-    ConnectivityView, DirectConnectivityObservation, DirectConnectivityState,
-    DirectConnectivityStatus, MAX_CONNECTIVITY_SNAPSHOT_EDGES,
+    ConnectivityFailureSink, ConnectivityGeneration, ConnectivityObservationSink,
+    ConnectivitySnapshot, ConnectivityTracker, ConnectivityView, DirectConnectivityFailureEvidence,
+    DirectConnectivityObservation, DirectConnectivityState, DirectConnectivityStatus,
+    MAX_CONNECTIVITY_FAILURE_REASON_BYTES, MAX_CONNECTIVITY_SNAPSHOT_EDGES,
 };
 pub use connectivity_store::{
     invalidate_local_cluster_connectivity_cache,
@@ -269,10 +270,11 @@ pub use route_graph_read_model::{
 };
 pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routing::{
-    CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES, PeerStream,
-    RouteConstraints, RouteHop, RouteTrace, RoutedAvailability, RoutedConnectFuture,
-    RoutedConnector, RoutedSessionIdentity, accept_direct_routed_session,
-    connect_direct_routed_endpoint, plan_routes,
+    CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
+    MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop, RouteTrace,
+    RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
+    RoutedSessionDisposition, RoutedSessionIdentity, accept_direct_routed_session,
+    accept_or_relay_routed_session, connect_direct_routed_endpoint, plan_routes,
 };
 pub use rpc::{
     CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,
