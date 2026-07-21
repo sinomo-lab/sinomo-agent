@@ -2,7 +2,7 @@
 //! docs/plans/r0-r1-crate-boundary-refactor.md).
 //!
 //! A network module owns one or more non-built-in cluster transports behind
-//! the [`NetworkModule`] trait: it can open daemon RPC byte streams to a
+//! the [`NetworkModule`] trait: it can establish authenticated links to a
 //! [`ClusterEndpointRecord`], optionally run a listener/proxy, advertise the
 //! endpoints it currently serves, and classify protocol-specific endpoint
 //! roles. Modules are registered in a [`NetworkModuleRegistry`]; routing code
@@ -14,8 +14,10 @@
 //! [`set_network_module_registry`] (same pattern as the cluster directory
 //! provider in `directory.rs`).
 
+use crate::direct_link::{
+    AuthenticatedLink, AuthenticatedTransportMetadata, DirectLinkFuture, LinkProvider,
+};
 use crate::error::NetworkError;
-use crate::session::NetworkDuplexStream;
 use crate::transfer::NetworkHealthPolicy;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -96,7 +98,7 @@ pub struct NetworkModuleDescriptor {
     /// can ride on endpoint records with a different transport kind.
     #[serde(default)]
     pub address_schemes: Vec<String>,
-    /// Whether the module can dial outbound daemon RPCs.
+    /// Whether the module can establish outbound authenticated links.
     pub dialer: bool,
     /// Whether the module runs an inbound listener/proxy when started.
     pub listener: bool,
@@ -147,23 +149,22 @@ pub trait NetworkModule: Send + Sync {
     /// may be started again (runtime toggle).
     fn stop(&self) -> Result<(), NetworkError>;
 
-    /// Opens one raw, full-duplex byte stream to the daemon endpoint.
+    /// Establishes one authenticated adjacent-peer link.
     ///
-    /// Object-RPC/session framing, authentication, transfer progress, and
-    /// retries live above this transport seam. Implementations must therefore
-    /// preserve byte order and half-close semantics without interpreting or
-    /// collecting the stream. Dial-only test modules use the default, which
-    /// reports the missing capability explicitly at runtime.
-    fn open_rpc_stream(
+    /// RPC/session framing and route retries live above this transport seam.
+    /// Implementations authenticate the endpoint's transport principal and
+    /// expose independently cancellable byte streams plus a TLS/exporter
+    /// binding without interpreting application bytes.
+    fn connect_link(
         &self,
         endpoint: &ClusterEndpointRecord,
         _health: NetworkHealthPolicy,
-    ) -> NetworkFuture<Box<dyn NetworkDuplexStream>> {
+    ) -> NetworkFuture<AuthenticatedLink> {
         let module_id = self.descriptor().id;
         let endpoint = endpoint.address.clone();
         Box::pin(async move {
             Err(NetworkError::Io {
-                operation: "open network module RPC stream".to_string(),
+                operation: "connect network module authenticated link".to_string(),
                 detail: format!(
                     "network module `{module_id}` does not support full-duplex streams for `{endpoint}`"
                 ),
@@ -179,6 +180,76 @@ pub trait NetworkModule: Send + Sync {
     /// modules do not need to implement classification.
     fn endpoint_role(&self, _endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
         NetworkModuleEndpointRole::Unknown
+    }
+
+    /// Stable transport principal authenticated when connecting to
+    /// `endpoint` (for example the Iroh endpoint public key).
+    ///
+    /// This is deliberately transport-specific and separate from `NodeId`.
+    /// The daemon compares it with inbound authenticated metadata and only
+    /// then maps the endpoint back to the current cluster directory.
+    fn endpoint_transport_identity(&self, _endpoint: &ClusterEndpointRecord) -> Option<String> {
+        None
+    }
+
+    /// Validates the module-owned proof carried beside an authenticated
+    /// transport principal and channel binding. Generic routing never parses
+    /// protocol-specific proof bytes; an absent verifier fails closed.
+    fn verify_authenticated_transport_metadata(
+        &self,
+        _metadata: &AuthenticatedTransportMetadata,
+    ) -> bool {
+        false
+    }
+}
+
+/// Direct-link provider backed by the enabled runtime module registry.
+///
+/// Transport selection and address parsing remain module-owned. This adapter
+/// only exposes the common authenticated-link contract to node routing.
+pub struct RegisteredNetworkModuleLinkProvider {
+    health: NetworkHealthPolicy,
+}
+
+impl RegisteredNetworkModuleLinkProvider {
+    pub fn new(health: NetworkHealthPolicy) -> Self {
+        Self { health }
+    }
+}
+
+impl LinkProvider for RegisteredNetworkModuleLinkProvider {
+    fn connect<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+    ) -> DirectLinkFuture<'a, AuthenticatedLink> {
+        let module =
+            network_module_registry().and_then(|registry| registry.module_for_endpoint(endpoint));
+        let endpoint = endpoint.clone();
+        let health = self.health;
+        Box::pin(async move {
+            let module = module.ok_or_else(|| NetworkError::Io {
+                operation: "connect authenticated network-module link".to_string(),
+                detail: format!(
+                    "no enabled network module serves transport {:?}",
+                    endpoint.transport
+                ),
+            })?;
+            let link = module.connect_link(&endpoint, health).await?;
+            if link.peer_node_id() != &endpoint.node_id {
+                return Err(NetworkError::AuthDenied);
+            }
+            Ok(link)
+        })
+    }
+
+    fn accept(&self) -> DirectLinkFuture<'_, AuthenticatedLink> {
+        Box::pin(async {
+            Err(NetworkError::Io {
+                operation: "accept authenticated network-module link".to_string(),
+                detail: "native module listeners deliver accepted streams through the daemon composition boundary"
+                    .to_string(),
+            })
+        })
     }
 }
 
@@ -447,6 +518,19 @@ impl NetworkModuleRegistry {
         })
     }
 
+    /// Enabled dialer module claiming this endpoint by transport or address
+    /// scheme. Scheme dispatch remains useful for module-defined carriers
+    /// represented by a generic transport kind.
+    pub fn module_for_endpoint(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Option<Arc<dyn NetworkModule>> {
+        self.module_for_transport(&endpoint.transport).or_else(|| {
+            endpoint_address_scheme(&endpoint.address)
+                .and_then(|scheme| self.module_for_address_scheme(scheme))
+        })
+    }
+
     /// Role classification for `endpoint`, when a registered module claims
     /// either its transport kind or its address scheme.
     pub fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
@@ -472,6 +556,26 @@ impl NetworkModuleRegistry {
                 }
             })
             .unwrap_or(NetworkModuleEndpointRole::Unknown)
+    }
+
+    /// Returns the transport principal expected for a claimed endpoint.
+    pub fn endpoint_transport_identity(&self, endpoint: &ClusterEndpointRecord) -> Option<String> {
+        self.entries.load().values().find_map(|entry| {
+            if !entry.enabled || !entry.started {
+                return None;
+            }
+            let claims_transport = entry.descriptor.transports.contains(&endpoint.transport);
+            let claims_scheme = endpoint_address_scheme(&endpoint.address).is_some_and(|scheme| {
+                entry
+                    .descriptor
+                    .address_schemes
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(scheme))
+            });
+            (claims_transport || claims_scheme)
+                .then(|| entry.module.endpoint_transport_identity(endpoint))
+                .flatten()
+        })
     }
 
     /// The module registered under `id`, regardless of enabled state (for
@@ -542,11 +646,26 @@ pub fn network_module_registry() -> Option<Arc<NetworkModuleRegistry>> {
     NETWORK_MODULE_REGISTRY.load().as_ref().clone()
 }
 
-/// Enabled dialer module for `kind` from the process-wide registry, if any.
-pub(crate) fn registered_network_module_for_transport(
-    kind: &ClusterTransportKind,
-) -> Option<Arc<dyn NetworkModule>> {
-    network_module_registry()?.module_for_transport(kind)
+/// Checks transport-authenticated ingress metadata and its module-owned proof
+/// against one advertised endpoint without teaching generic routing how to
+/// parse module-owned addresses or credentials.
+pub fn authenticated_transport_metadata_matches_endpoint(
+    metadata: &AuthenticatedTransportMetadata,
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    if metadata.transport != endpoint.transport {
+        return false;
+    }
+    network_module_registry()
+        .and_then(|registry| registry.module_for_endpoint(endpoint))
+        .is_some_and(|module| {
+            module
+                .endpoint_transport_identity(endpoint)
+                .is_some_and(|identity| {
+                    identity == metadata.peer_transport_identity
+                        && module.verify_authenticated_transport_metadata(metadata)
+                })
+        })
 }
 
 /// Returns the scheme of an address like `scheme://rest`. Scheme validation is
@@ -622,6 +741,20 @@ mod tests {
             } else {
                 NetworkModuleEndpointRole::MainDaemon
             }
+        }
+
+        fn endpoint_transport_identity(&self, endpoint: &ClusterEndpointRecord) -> Option<String> {
+            endpoint
+                .address
+                .split_once("://")
+                .map(|(_, identity)| identity.to_string())
+        }
+
+        fn verify_authenticated_transport_metadata(
+            &self,
+            metadata: &AuthenticatedTransportMetadata,
+        ) -> bool {
+            metadata.transport_proof == b"test-transport-proof"
         }
     }
 
@@ -807,6 +940,37 @@ mod tests {
         assert_eq!(
             registry.endpoint_role(&shadow),
             NetworkModuleEndpointRole::ShadowDaemon
+        );
+    }
+
+    #[test]
+    fn registry_keeps_transport_identity_parsing_inside_the_claiming_module() {
+        let registry = NetworkModuleRegistry::new();
+        registry.register(
+            Arc::new(TestModule::new(
+                "mesh",
+                vec![ClusterTransportKind::WebRtc],
+                vec!["mesh"],
+            )),
+            Some(test_context()),
+            true,
+            true,
+        );
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_base::Id::generate(),
+            node_id: NodeId::from_legacy_named("node_network_module_identity_test")
+                .expect("node id"),
+            transport: ClusterTransportKind::WebRtc,
+            address: "mesh://authenticated-principal".to_string(),
+            source: sinomo_base::ClusterEndpointSource::Rendezvous,
+            privacy: sinomo_base::ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+
+        assert_eq!(
+            registry.endpoint_transport_identity(&endpoint).as_deref(),
+            Some("authenticated-principal")
         );
     }
 }

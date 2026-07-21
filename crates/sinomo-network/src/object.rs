@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const SINOMO_NETWORK_OBJECT_VERSION: u16 = 1;
 const OBJECT_FRAME_WIRE_MAGIC: [u8; 4] = *b"SOF2";
-const OBJECT_FRAME_WIRE_PREFIX_BYTES: usize = 12;
+pub(crate) const OBJECT_FRAME_WIRE_PREFIX_BYTES: usize = 12;
 /// Default limit for establishing a network path and for each period without
 /// stream I/O progress. This is a per-phase/per-progress limit, not a total
 /// operation deadline.

@@ -8,9 +8,11 @@
 
 use crate::endpoint::{IrohEndpointRecord, IrohRelayMode, iroh_endpoint_dir};
 use fs2::FileExt;
+use sinomo_core::ClusterTransportKind;
 use sinomo_core::network::{
-    ClusterPaths, DEFAULT_NETWORK_TIMEOUT, NetworkError, read_object_file,
-    read_optional_object_file, write_object_file_create_new_serialized,
+    AuthenticatedTransportMetadata, ClusterPaths, DEFAULT_NETWORK_TIMEOUT,
+    DirectStreamCapabilities, NetworkError, read_object_file, read_optional_object_file,
+    write_authenticated_transport_prelude, write_object_file_create_new_serialized,
 };
 use sinomo_core::node::{ClusterId, NodeId};
 #[cfg(test)]
@@ -23,6 +25,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
+pub const IROH_AUTHENTICATED_LINK_EXPORTER_LABEL: &[u8] =
+    b"EXPORTER-sinomo-iroh-authenticated-link-v1";
 const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
 const IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -34,7 +38,7 @@ const IROH_SECRET_KEY_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 64;
 const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 128;
 // This is a lifecycle timeout for an otherwise healthy pooled Iroh
-// connection, not a no-progress timeout for an active RPC stream.
+// connection, not a no-progress timeout for an active transport stream.
 const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
@@ -331,15 +335,16 @@ async fn abort_and_drain_iroh_daemon_proxy_tasks(
 /// Bridges one native QUIC bidirectional stream to the local daemon without
 /// looking at object-RPC or transfer frames. Backpressure and half-close are
 /// preserved in both directions, so large bodies remain streaming end to end.
-async fn bridge_iroh_rpc_stream_to_daemon(
+async fn bridge_iroh_stream_to_daemon(
     address: &str,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
+    metadata: &AuthenticatedTransportMetadata,
 ) -> Result<(), NetworkError> {
     use tokio::io::AsyncWriteExt;
 
     let connect = tokio::net::TcpStream::connect(address);
-    let stream = tokio::time::timeout(DEFAULT_NETWORK_TIMEOUT, connect)
+    let mut stream = tokio::time::timeout(DEFAULT_NETWORK_TIMEOUT, connect)
         .await
         .map_err(|_| {
             NetworkError::timeout(
@@ -353,20 +358,21 @@ async fn bridge_iroh_rpc_stream_to_daemon(
             operation: format!("connect daemon control address {address}"),
             detail: source.to_string(),
         })?;
+    write_authenticated_transport_prelude(&mut stream, metadata).await?;
     let (mut daemon_read, mut daemon_write) = stream.into_split();
 
     let request = async {
         tokio::io::copy(&mut recv, &mut daemon_write)
             .await
             .map_err(|source| NetworkError::Io {
-                operation: "forward iroh RPC request stream".to_string(),
+                operation: "forward iroh stream request stream".to_string(),
                 detail: source.to_string(),
             })?;
         daemon_write
             .shutdown()
             .await
             .map_err(|source| NetworkError::Io {
-                operation: "finish forwarded iroh RPC request stream".to_string(),
+                operation: "finish forwarded iroh stream request stream".to_string(),
                 detail: source.to_string(),
             })?;
         Ok::<(), NetworkError>(())
@@ -375,11 +381,11 @@ async fn bridge_iroh_rpc_stream_to_daemon(
         tokio::io::copy(&mut daemon_read, &mut send)
             .await
             .map_err(|source| NetworkError::Io {
-                operation: "forward daemon RPC response stream".to_string(),
+                operation: "forward daemon response stream".to_string(),
                 detail: source.to_string(),
             })?;
         send.finish().map_err(|source| NetworkError::Io {
-            operation: "finish forwarded daemon RPC response stream".to_string(),
+            operation: "finish forwarded daemon response stream".to_string(),
             detail: source.to_string(),
         })?;
         Ok::<(), NetworkError>(())
@@ -451,6 +457,7 @@ pub struct IrohProxyConfig {
 /// supervisor task (which restarts the proxy with backoff on failure).
 pub struct IrohDaemonProxy {
     record: IrohEndpointRecord,
+    endpoint: tokio::sync::watch::Receiver<Option<iroh::Endpoint>>,
     shutdown: tokio::sync::watch::Sender<bool>,
     supervisor: tokio::task::JoinHandle<()>,
 }
@@ -458,6 +465,10 @@ pub struct IrohDaemonProxy {
 impl IrohDaemonProxy {
     pub fn record(&self) -> &IrohEndpointRecord {
         &self.record
+    }
+
+    pub fn endpoint_receiver(&self) -> tokio::sync::watch::Receiver<Option<iroh::Endpoint>> {
+        self.endpoint.clone()
     }
 
     /// Signals shutdown and waits (bounded) for the supervisor to stop,
@@ -506,11 +517,13 @@ pub async fn start_iroh_daemon_proxy(
 ) -> Result<IrohDaemonProxy, NetworkError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (endpoint_tx, endpoint_rx) = tokio::sync::watch::channel(None);
     let supervisor_runtime = runtime.clone();
     let task = runtime.spawn(run_iroh_daemon_proxy_supervisor(
         supervisor_runtime,
         config,
         Some(IrohDaemonProxyReady::Async(tx)),
+        endpoint_tx,
         shutdown_rx,
     ));
     let record = match rx.await {
@@ -531,6 +544,7 @@ pub async fn start_iroh_daemon_proxy(
     };
     Ok(IrohDaemonProxy {
         record,
+        endpoint: endpoint_rx,
         shutdown: shutdown_tx,
         supervisor: task,
     })
@@ -557,6 +571,7 @@ async fn run_iroh_daemon_proxy_supervisor(
     runtime: tokio::runtime::Handle,
     config: IrohProxyConfig,
     mut first_ready: Option<IrohDaemonProxyReady>,
+    endpoint: tokio::sync::watch::Sender<Option<iroh::Endpoint>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut restart_failures = 0_u32;
@@ -600,6 +615,7 @@ async fn run_iroh_daemon_proxy_supervisor(
             config.clone(),
             secret_key,
             first_ready.take(),
+            endpoint.clone(),
             shutdown.clone(),
         )
         .await;
@@ -632,8 +648,10 @@ async fn run_iroh_daemon_proxy(
     config: IrohProxyConfig,
     secret_key: iroh::SecretKey,
     mut ready: Option<IrohDaemonProxyReady>,
+    published_endpoint: tokio::sync::watch::Sender<Option<iroh::Endpoint>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), NetworkError> {
+    let endpoint_secret_key = secret_key.clone();
     let builder = match sinomo_iroh_endpoint_builder() {
         Ok(builder) => builder,
         Err(error) => {
@@ -680,6 +698,14 @@ async fn run_iroh_daemon_proxy(
     if let Err(error) = persist_result {
         eprintln!("sinomo iroh daemon endpoint record write failed: {error}");
     }
+    published_endpoint.send_replace(Some(endpoint.endpoint().clone()));
+    struct PublishedEndpointGuard(tokio::sync::watch::Sender<Option<iroh::Endpoint>>);
+    impl Drop for PublishedEndpointGuard {
+        fn drop(&mut self) {
+            self.0.send_replace(None);
+        }
+    }
+    let _published_endpoint_guard = PublishedEndpointGuard(published_endpoint);
     send_iroh_daemon_proxy_ready(&mut ready, Ok(record));
 
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(
@@ -721,12 +747,25 @@ async fn run_iroh_daemon_proxy(
         };
         let daemon_address = daemon_address.clone();
         let command_limiter = command_limiter.clone();
+        let local_secret_key = endpoint_secret_key.clone();
         let mut connection_shutdown = shutdown.clone();
         connection_tasks.spawn(async move {
             let _connection_permit = connection_permit;
             let Ok(connection) = connecting.await else {
                 return;
             };
+            let peer_transport_identity = connection.remote_id().to_string();
+            let peer_transport_key = connection.remote_id();
+            let mut channel_binding = [0_u8; 32];
+            if let Err(error) = connection.export_keying_material(
+                &mut channel_binding,
+                IROH_AUTHENTICATED_LINK_EXPORTER_LABEL,
+                &[],
+            ) {
+                tracing::debug!(?error, "iroh daemon proxy could not derive channel binding");
+                connection.close(0_u8.into(), b"missing channel binding");
+                return;
+            }
             let mut command_tasks = tokio::task::JoinSet::new();
             loop {
                 let accepted = tokio::select! {
@@ -780,10 +819,45 @@ async fn run_iroh_daemon_proxy(
                     continue;
                 };
                 let daemon_address = daemon_address.clone();
+                let peer_transport_identity = peer_transport_identity.clone();
+                let local_secret_key = local_secret_key.clone();
                 command_tasks.spawn(async move {
                     let _command_permit = command_permit;
+                    let mut send = send;
+                    let mut recv = recv;
+                    let transport_proof = match crate::auth::authenticate_inbound_stream(
+                        &local_secret_key,
+                        &peer_transport_key,
+                        &channel_binding,
+                        &mut send,
+                        &mut recv,
+                    )
+                    .await
+                    {
+                        Ok(proof) => proof,
+                        Err(error) => {
+                            tracing::debug!(%error, "iroh daemon stream authentication failed");
+                            return;
+                        }
+                    };
+                    let metadata = match AuthenticatedTransportMetadata::try_new(
+                        ClusterTransportKind::Iroh,
+                        peer_transport_identity,
+                        channel_binding,
+                        transport_proof,
+                        DirectStreamCapabilities::multiplexed_full_duplex(
+                            IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS as u32,
+                        ),
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            tracing::debug!(%error, "iroh daemon proxy rejected authenticated metadata");
+                            return;
+                        }
+                    };
                     if let Err(error) =
-                        bridge_iroh_rpc_stream_to_daemon(&daemon_address, send, recv).await
+                        bridge_iroh_stream_to_daemon(&daemon_address, send, recv, &metadata)
+                            .await
                     {
                         tracing::debug!(%error, "iroh daemon stream bridge stopped");
                     }
@@ -1088,7 +1162,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn iroh_daemon_proxy_preserves_raw_full_duplex_bytes() {
+    async fn iroh_daemon_proxy_preserves_full_duplex_bytes_after_authenticated_prelude() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1100,6 +1174,9 @@ mod tests {
             .to_string();
         let fixture = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept daemon fixture");
+            let metadata = sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                .await
+                .expect("authenticated transport prelude");
             let mut request = Vec::new();
             stream
                 .read_to_end(&mut request)
@@ -1110,6 +1187,7 @@ mod tests {
                 .write_all(b"raw response bytes")
                 .await
                 .expect("write daemon fixture response");
+            metadata
         });
 
         let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-proxy");
@@ -1128,13 +1206,16 @@ mod tests {
         .expect("start iroh proxy");
 
         let dialer = crate::dial::IrohDaemonDialer::new();
-        let (mut send, mut recv) = dialer
+        let opened = dialer
             .open_daemon_stream_async(
                 &proxy.record().endpoint().address,
                 DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
             )
             .await
-            .expect("open raw iroh daemon stream");
+            .expect("open authenticated iroh daemon stream");
+        let channel_binding = opened.channel_binding;
+        let mut send = opened.send;
+        let mut recv = opened.recv;
         tokio::io::AsyncWriteExt::write_all(&mut send, b"raw request bytes")
             .await
             .expect("write raw request");
@@ -1147,6 +1228,124 @@ mod tests {
         assert_eq!(response, b"raw response bytes");
         dialer.shutdown().await;
         proxy.shutdown().await;
-        fixture.await.expect("daemon fixture");
+        let metadata = fixture.await.expect("daemon fixture");
+        assert_eq!(metadata.transport, ClusterTransportKind::Iroh);
+        assert_eq!(metadata.channel_binding, channel_binding);
+        assert!(!metadata.peer_transport_identity.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_advertised_endpoints_prove_stable_peer_identities_and_same_exporter() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let source_forward = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused source forward fixture");
+        let source_forward_address = source_forward
+            .local_addr()
+            .expect("source forward address")
+            .to_string();
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target daemon fixture");
+        let target_address = target_listener
+            .local_addr()
+            .expect("target daemon fixture address")
+            .to_string();
+        let target_fixture = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.expect("accept target");
+            let metadata = sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                .await
+                .expect("target authenticated prelude");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.expect("read target");
+            assert_eq!(request, b"stable-identity-proof");
+            stream.write_all(b"accepted").await.expect("write target");
+            metadata
+        });
+
+        let source_root =
+            sinomo_testdir::TestDir::new("sinomo-network-iroh-shared-source-endpoint");
+        let source_paths = ClusterPaths::new(&SinomoDataDir::new(&source_root));
+        source_paths.ensure().expect("source cluster paths");
+        let target_root =
+            sinomo_testdir::TestDir::new("sinomo-network-iroh-shared-target-endpoint");
+        let target_paths = ClusterPaths::new(&SinomoDataDir::new(&target_root));
+        target_paths.ensure().expect("target cluster paths");
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_iroh_shared_identity").expect("cluster");
+        let source = start_iroh_daemon_proxy(
+            tokio::runtime::Handle::current(),
+            IrohProxyConfig {
+                paths: source_paths,
+                cluster_id: cluster_id.clone(),
+                node_id: NodeId::from_legacy_named("node_iroh_shared_identity_source")
+                    .expect("source node"),
+                daemon_forward_address: source_forward_address,
+            },
+        )
+        .await
+        .expect("start source proxy");
+        let target = start_iroh_daemon_proxy(
+            tokio::runtime::Handle::current(),
+            IrohProxyConfig {
+                paths: target_paths,
+                cluster_id,
+                node_id: NodeId::from_legacy_named("node_iroh_shared_identity_target")
+                    .expect("target node"),
+                daemon_forward_address: target_address,
+            },
+        )
+        .await
+        .expect("start target proxy");
+        let source_transport_identity = source.record().endpoint_public_key.clone();
+        let target_transport_identity = target.record().endpoint_public_key.clone();
+
+        let dialer = crate::dial::IrohDaemonDialer::new();
+        dialer.use_shared_endpoint(source.endpoint_receiver()).await;
+        let opened = dialer
+            .open_daemon_stream_async(
+                &target.record().endpoint().address,
+                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+            )
+            .await
+            .expect("connect source advertised endpoint to target");
+        assert_eq!(opened.peer_transport_identity, target_transport_identity);
+        let channel_binding = opened.channel_binding;
+        let outbound_metadata = AuthenticatedTransportMetadata::try_new(
+            ClusterTransportKind::Iroh,
+            opened.peer_transport_identity.clone(),
+            channel_binding,
+            opened.transport_proof.clone(),
+            DirectStreamCapabilities::multiplexed_full_duplex(1),
+        )
+        .expect("outbound authenticated metadata");
+        assert!(crate::auth::verify_transport_metadata(
+            &source_transport_identity,
+            &outbound_metadata
+        ));
+        let mut send = opened.send;
+        let mut recv = opened.recv;
+        send.write_all(b"stable-identity-proof")
+            .await
+            .expect("write proof");
+        send.finish().expect("finish proof");
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut response)
+            .await
+            .expect("read response");
+        assert_eq!(response, b"accepted");
+
+        let inbound = target_fixture.await.expect("target fixture");
+        assert_eq!(inbound.peer_transport_identity, source_transport_identity);
+        assert_eq!(inbound.channel_binding, channel_binding);
+        assert!(crate::auth::verify_transport_metadata(
+            &target_transport_identity,
+            &inbound
+        ));
+        dialer.shutdown().await;
+        source.shutdown().await;
+        target.shutdown().await;
+        drop(source_forward);
     }
 }

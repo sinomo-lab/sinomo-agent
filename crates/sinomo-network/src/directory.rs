@@ -26,6 +26,131 @@ use std::sync::{Arc, LazyLock};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DirectoryVersion(pub u64);
 
+/// Authorized routing identity and endpoints for one directory member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryNode {
+    pub node_id: NodeId,
+    pub public_key: String,
+    pub endpoints: Vec<ClusterEndpointRecord>,
+}
+
+impl DirectoryNode {
+    pub fn try_new(
+        node_id: NodeId,
+        public_key: impl Into<String>,
+        endpoints: Vec<ClusterEndpointRecord>,
+    ) -> Result<Self, NetworkError> {
+        if let Some(endpoint) = endpoints
+            .iter()
+            .find(|endpoint| endpoint.node_id != node_id)
+        {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "directory endpoint {} belongs to {}, not member {}",
+                    endpoint.endpoint_id, endpoint.node_id, node_id
+                ),
+            });
+        }
+        Ok(Self {
+            node_id,
+            public_key: public_key.into(),
+            endpoints,
+        })
+    }
+}
+
+/// Immutable authorized directory input consumed by pure route planning.
+#[derive(Clone, Debug)]
+pub struct DirectorySnapshot {
+    version: DirectoryVersion,
+    nodes: Arc<BTreeMap<NodeId, DirectoryNode>>,
+}
+
+impl DirectorySnapshot {
+    pub fn try_new(
+        version: DirectoryVersion,
+        nodes: impl IntoIterator<Item = DirectoryNode>,
+    ) -> Result<Self, NetworkError> {
+        let mut indexed = BTreeMap::new();
+        for node in nodes {
+            if indexed.insert(node.node_id.clone(), node).is_some() {
+                return Err(NetworkError::Serialization {
+                    detail: "directory snapshot contains a duplicate node".to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            version,
+            nodes: Arc::new(indexed),
+        })
+    }
+
+    pub fn try_from_members(
+        version: DirectoryVersion,
+        members: impl IntoIterator<Item = ClusterMemberRecord>,
+    ) -> Result<Self, NetworkError> {
+        Self::try_from_records(version, members, std::iter::empty())
+    }
+
+    pub fn try_from_records(
+        version: DirectoryVersion,
+        members: impl IntoIterator<Item = ClusterMemberRecord>,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    ) -> Result<Self, NetworkError> {
+        let mut nodes = BTreeMap::<NodeId, DirectoryNode>::new();
+        for member in members {
+            if !member.state.is_authorized() {
+                continue;
+            }
+            let node =
+                DirectoryNode::try_new(member.node_id, member.node_public_key, member.endpoints)?;
+            if nodes.insert(node.node_id.clone(), node).is_some() {
+                return Err(NetworkError::Serialization {
+                    detail: "directory records contain a duplicate authorized member".to_string(),
+                });
+            }
+        }
+        for endpoint in endpoints {
+            let Some(node) = nodes.get_mut(&endpoint.node_id) else {
+                continue;
+            };
+            if let Some(existing) = node
+                .endpoints
+                .iter_mut()
+                .find(|existing| existing.endpoint_id == endpoint.endpoint_id)
+            {
+                *existing = endpoint;
+            } else {
+                node.endpoints.push(endpoint);
+            }
+        }
+        for node in nodes.values_mut() {
+            node.endpoints.sort_by(|left, right| {
+                left.endpoint_id
+                    .cmp(&right.endpoint_id)
+                    .then_with(|| left.address.cmp(&right.address))
+            });
+        }
+        Self::try_new(version, nodes.into_values())
+    }
+
+    pub fn version(&self) -> DirectoryVersion {
+        self.version
+    }
+
+    pub fn nodes(&self) -> &BTreeMap<NodeId, DirectoryNode> {
+        &self.nodes
+    }
+
+    pub fn node(&self, node_id: &NodeId) -> Option<&DirectoryNode> {
+        self.nodes.get(node_id)
+    }
+
+    pub fn is_authorized(&self, node_id: &NodeId) -> bool {
+        self.nodes.contains_key(node_id)
+    }
+}
+
 /// Read-only view of cluster state as the network layer consumes it.
 ///
 /// Implementations wrap whatever store owns cluster state; errors are
@@ -54,6 +179,28 @@ pub trait ClusterDirectory: Send + Sync {
     /// Monotonic stamp of the backing store used for routing-cache
     /// invalidation.
     fn version(&self) -> Result<DirectoryVersion, NetworkError>;
+
+    /// Captures one immutable authorized routing view.
+    ///
+    /// Providers with transactional snapshot support may override this to
+    /// guarantee all fields came from one backing revision. The default keeps
+    /// existing providers source-compatible while still validating and
+    /// normalizing their public records at the new boundary.
+    fn snapshot(&self) -> Result<DirectorySnapshot, NetworkError> {
+        let before = self.version()?;
+        let members = self.members()?;
+        let endpoints = self.endpoints()?;
+        let after = self.version()?;
+        if before != after {
+            return Err(NetworkError::Directory {
+                detail: format!(
+                    "directory changed while capturing routing snapshot: {} -> {}",
+                    before.0, after.0
+                ),
+            });
+        }
+        DirectorySnapshot::try_from_records(after, members, endpoints)
+    }
 }
 
 /// Directory with no cluster state: empty results and version 0.

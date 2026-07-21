@@ -1296,6 +1296,11 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         Box<dyn sinomo_core::network::NetworkDuplexStream>,
     > {
         let use_tcp_tunnel = daemon_endpoint_is_tcp_tunnel(endpoint);
+        let module_backed = sinomo_core::network::network_module_registry()
+            .and_then(|registry| registry.module_for_endpoint(endpoint))
+            .is_some();
+        let routed_data_dir = module_backed.then(|| self.signing_data_dir());
+        let endpoint = endpoint.clone();
         Box::pin(async move {
             if use_tcp_tunnel {
                 return Err(sinomo_core::network::NetworkError::delivery_failed(
@@ -1304,8 +1309,35 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
                     "the v1 TCP tunnel carries object RPC channels only",
                 ));
             }
-            sinomo_core::network::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health)
-                .await
+            if let Some(data_dir) = routed_data_dir {
+                let data_dir = data_dir?;
+                let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+                let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+                let directory =
+                    sinomo_core::network::cluster_directory_for(&cluster_paths).snapshot()?;
+                let identity = sinomo_core::network::DaemonRoutedSessionIdentity::new(
+                    state.local_node_id,
+                    data_dir,
+                )?;
+                let provider =
+                    sinomo_core::network::RegisteredNetworkModuleLinkProvider::new(health);
+                let stream = sinomo_core::network::connect_direct_routed_endpoint(
+                    &directory,
+                    &endpoint,
+                    &provider,
+                    &identity,
+                    sinomo_core::network::ConnectOptions {
+                        timeout: health.connect_timeout,
+                        ..sinomo_core::network::ConnectOptions::default()
+                    },
+                )
+                .await?;
+                return Ok(Box::new(stream) as Box<dyn sinomo_core::network::NetworkDuplexStream>);
+            }
+            sinomo_core::network::open_daemon_rpc_stream_to_cluster_endpoint_async(
+                &endpoint, health,
+            )
+            .await
         })
     }
 }

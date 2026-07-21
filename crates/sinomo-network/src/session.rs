@@ -21,7 +21,7 @@ use crate::transfer::{
     read_transfer_data_payload, read_transfer_encoded_frame_header, shared_transfer_buffer_pool,
     write_transfer_data_frame, write_transfer_encoded_control_frame,
 };
-use crate::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
+use crate::{NetworkDeliveryState, NetworkDuplexStream, NetworkError, NetworkTimeoutPhase};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -73,12 +73,6 @@ pub(crate) const OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY: &str =
 pub fn object_rpc_session_wire_prefix_matches(prefix: &[u8]) -> bool {
     !prefix.is_empty() && prefix[..prefix.len().min(4)] == b"SXF2"[..prefix.len().min(4)]
 }
-
-/// A transport-owned bidirectional byte stream. The canonical RPC session
-/// engine owns every byte written after the transport opens this stream.
-pub trait NetworkDuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> NetworkDuplexStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ObjectRpcSessionDescriptor {
