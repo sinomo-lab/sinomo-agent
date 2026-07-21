@@ -7,9 +7,9 @@
 //! mirror `sinomo-module-api` (0 ok, 1 invalid argument, 2 unsupported ABI,
 //! 3 runtime error).
 //!
-//! Contract (v2):
+//! Contract (v1):
 //! - The dylib exports [`SINOMO_NETWORK_MODULE_ENTRY_SYMBOL`] with signature
-//!   `extern "C" fn(*mut *mut c_void, *mut SinomoNetworkModuleVtableV2) -> i32`,
+//!   `extern "C" fn(*mut *mut c_void, *mut SinomoNetworkModuleVtableV1) -> i32`,
 //!   creating a module instance and filling the vtable.
 //! - All vtable functions must be callable from any thread; the instance is
 //!   shared across threads by the host.
@@ -17,18 +17,14 @@
 //!   `local_endpoints`) are allocated by the module and must be released
 //!   through the module's own `free_buffer` — allocators may differ across the
 //!   dylib boundary.
-//! - On a non-OK stream status the module SHOULD fill the error buffer
-//!   with a name-keyed SOBJ [`NetworkModuleRpcErrorV1`]. The host retains a
-//!   legacy UTF-8 fallback for older modules. Other functions MAY fill the
+//! - On a non-OK stream status the module fills the error buffer with a
+//!   name-keyed SOBJ [`NetworkModuleRpcErrorV1`]. Other functions may fill the
 //!   output buffer with UTF-8 error detail.
 //! - Descriptor/endpoint payloads are name-keyed SOBJ documents encoded with
 //!   [`encode_network_module_sobj`] (`SINOMO_NETWORK_MODULE_OBJECT_VERSION`).
 //! - Timeouts are milliseconds; `0` means "no timeout".
 //!
-//! The entry symbol deliberately names the stream-shaped ABI. The earlier
-//! response-buffer vtable also called itself v1, but had a different size and
-//! field layout; resolving it as this table would turn stale module state into
-//! function-pointer memory corruption. The table is therefore self-describing
+//! The entry symbol names the stream-shaped ABI. The table is self-describing,
 //! and every callback slot is nullable until the host validates it.
 
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
@@ -51,17 +47,14 @@ use std::thread;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// ABI discriminator filled into [`SinomoNetworkModuleVtableV2::abi_magic`].
-pub const SINOMO_NETWORK_MODULE_ABI_MAGIC: u64 = u64::from_le_bytes(*b"SNMSTRM2");
-/// ABI version filled into [`SinomoNetworkModuleVtableV2::abi_version`].
-pub const SINOMO_NETWORK_MODULE_ABI_VERSION: u32 = 2;
+/// ABI discriminator filled into [`SinomoNetworkModuleVtableV1::abi_magic`].
+pub const SINOMO_NETWORK_MODULE_ABI_MAGIC: u64 = u64::from_le_bytes(*b"SNMSTRM1");
+/// ABI version filled into [`SinomoNetworkModuleVtableV1::abi_version`].
+pub const SINOMO_NETWORK_MODULE_ABI_VERSION: u32 = 1;
 /// Exported entry symbol creating the instance and filling the vtable.
 /// Not NUL-terminated; append `\0` (or let the loader do so) when resolving.
 ///
-/// This is intentionally incompatible with the old response-buffer entry
-/// symbol. A stale dylib must fail symbol resolution before the host calls into
-/// a table with a different layout.
-pub const SINOMO_NETWORK_MODULE_ENTRY_SYMBOL: &[u8] = b"sinomo_network_module_create_v2";
+pub const SINOMO_NETWORK_MODULE_ENTRY_SYMBOL: &[u8] = b"sinomo_network_module_create_v1";
 /// SOBJ document version for descriptor/endpoint payloads crossing this ABI.
 pub const SINOMO_NETWORK_MODULE_OBJECT_VERSION: u16 = 1;
 
@@ -150,7 +143,7 @@ impl SinomoNetworkByteBuffer {
     }
 }
 
-/// Start configuration passed to [`SinomoNetworkModuleVtableV2::start`].
+/// Start configuration passed to [`SinomoNetworkModuleVtableV1::start`].
 /// All fields are UTF-8 byte views owned by the host for the call duration.
 #[repr(C)]
 pub struct SinomoNetworkModuleConfigV1 {
@@ -240,16 +233,16 @@ pub type SinomoNetworkModuleEndpointRoleFn = unsafe extern "C" fn(
 pub type SinomoNetworkModuleFreeBufferFn = unsafe extern "C" fn(SinomoNetworkByteBuffer);
 pub type SinomoNetworkModuleDestroyFn = unsafe extern "C" fn(*mut c_void);
 
-/// The pinned v2 stream table a network module fills in its entry function.
+/// The pinned v1 stream table a network module fills in its entry function.
 ///
 /// Callback slots are `Option<fn>` so an all-zero/empty table is a valid Rust
 /// value. The host starts from [`Self::empty`] and validates the discriminator,
 /// exact structural size, and every required callback before constructing the
-/// internal callable table. A module that only writes an obsolete prefix can
-/// therefore be rejected without reading uninitialized memory.
+/// internal callable table. A module that writes only a short prefix can be
+/// rejected without reading uninitialized memory.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct SinomoNetworkModuleVtableV2 {
+pub struct SinomoNetworkModuleVtableV1 {
     pub abi_magic: u64,
     pub abi_version: u32,
     pub struct_size: u32,
@@ -279,7 +272,7 @@ pub struct SinomoNetworkModuleVtableV2 {
     pub destroy: Option<SinomoNetworkModuleDestroyFn>,
 }
 
-impl SinomoNetworkModuleVtableV2 {
+impl SinomoNetworkModuleVtableV1 {
     pub const fn empty() -> Self {
         Self {
             abi_magic: 0,
@@ -307,9 +300,9 @@ impl SinomoNetworkModuleVtableV2 {
 
 /// Signature of the exported [`SINOMO_NETWORK_MODULE_ENTRY_SYMBOL`]: creates
 /// the instance (`*mut *mut c_void` out) and fills the vtable.
-pub type SinomoNetworkModuleCreateV2Fn = unsafe extern "C" fn(
+pub type SinomoNetworkModuleCreateV1Fn = unsafe extern "C" fn(
     *mut *mut c_void,
-    *mut SinomoNetworkModuleVtableV2,
+    *mut SinomoNetworkModuleVtableV1,
 ) -> SinomoNetworkModuleStatusCode;
 
 /// Encodes an ABI payload (descriptor, endpoint list) as the name-keyed SOBJ
@@ -485,10 +478,10 @@ struct ValidatedNetworkModuleVtable {
     destroy: SinomoNetworkModuleDestroyFn,
 }
 
-impl TryFrom<SinomoNetworkModuleVtableV2> for ValidatedNetworkModuleVtable {
+impl TryFrom<SinomoNetworkModuleVtableV1> for ValidatedNetworkModuleVtable {
     type Error = NetworkError;
 
-    fn try_from(vtable: SinomoNetworkModuleVtableV2) -> Result<Self, Self::Error> {
+    fn try_from(vtable: SinomoNetworkModuleVtableV1) -> Result<Self, Self::Error> {
         let invalid = |detail: String| NetworkError::Io {
             operation: "load network module".to_string(),
             detail,
@@ -505,7 +498,7 @@ impl TryFrom<SinomoNetworkModuleVtableV2> for ValidatedNetworkModuleVtable {
                 vtable.abi_version, SINOMO_NETWORK_MODULE_ABI_VERSION
             )));
         }
-        let expected_size = SinomoNetworkModuleVtableV2::expected_struct_size();
+        let expected_size = SinomoNetworkModuleVtableV1::expected_struct_size();
         if vtable.struct_size != expected_size {
             return Err(invalid(format!(
                 "unsupported network module vtable size {} (host expects {expected_size})",
@@ -624,7 +617,7 @@ impl FfiNetworkModule {
     ///   `keep_alive` because no destructor can be trusted.
     pub unsafe fn from_entry_parts(
         instance: *mut c_void,
-        vtable: SinomoNetworkModuleVtableV2,
+        vtable: SinomoNetworkModuleVtableV1,
         keep_alive: Box<dyn Any + Send + Sync>,
     ) -> Result<Self, NetworkError> {
         let vtable = match ValidatedNetworkModuleVtable::try_from(vtable) {
@@ -1039,10 +1032,15 @@ fn network_module_rpc_status_error(
     status: SinomoNetworkModuleStatusCode,
     detail_bytes: &[u8],
 ) -> NetworkError {
-    if let Ok(error) = decode_network_module_sobj::<NetworkModuleRpcErrorV1>(detail_bytes) {
-        return error.into_network_error(operation);
+    match decode_network_module_sobj::<NetworkModuleRpcErrorV1>(detail_bytes) {
+        Ok(error) => error.into_network_error(operation),
+        Err(error) => NetworkError::Io {
+            operation: operation.to_string(),
+            detail: format!(
+                "network module status {status} returned an invalid v1 RPC error: {error}"
+            ),
+        },
     }
-    network_module_status_error(operation, status, detail_bytes)
 }
 
 /// Builds the host-side error for a non-OK module status; `detail_bytes` is
@@ -1117,34 +1115,34 @@ mod tests {
     }
 
     #[test]
-    fn network_module_v2_rejects_zero_initialized_and_partial_tables() {
-        let empty = SinomoNetworkModuleVtableV2::empty();
+    fn network_module_v1_rejects_zero_initialized_and_partial_tables() {
+        let empty = SinomoNetworkModuleVtableV1::empty();
         let empty_error = ValidatedNetworkModuleVtable::try_from(empty)
             .expect_err("zero-initialized table must not be callable");
         assert!(empty_error.to_string().contains("ABI discriminator"));
 
-        let mut partial = SinomoNetworkModuleVtableV2::empty();
+        let mut partial = SinomoNetworkModuleVtableV1::empty();
         partial.abi_magic = SINOMO_NETWORK_MODULE_ABI_MAGIC;
         partial.abi_version = SINOMO_NETWORK_MODULE_ABI_VERSION;
-        partial.struct_size = SinomoNetworkModuleVtableV2::expected_struct_size();
+        partial.struct_size = SinomoNetworkModuleVtableV1::expected_struct_size();
         let partial_error = ValidatedNetworkModuleVtable::try_from(partial)
             .expect_err("matching header without callbacks must be rejected");
         assert!(partial_error.to_string().contains("`descriptor`"));
     }
 
     #[test]
-    fn network_module_v2_rejects_obsolete_table_size_before_callbacks() {
-        let mut obsolete = SinomoNetworkModuleVtableV2::empty();
-        obsolete.abi_magic = SINOMO_NETWORK_MODULE_ABI_MAGIC;
-        obsolete.abi_version = SINOMO_NETWORK_MODULE_ABI_VERSION;
-        obsolete.struct_size = SinomoNetworkModuleVtableV2::expected_struct_size() - 1;
+    fn network_module_v1_rejects_undersized_table_before_callbacks() {
+        let mut undersized = SinomoNetworkModuleVtableV1::empty();
+        undersized.abi_magic = SINOMO_NETWORK_MODULE_ABI_MAGIC;
+        undersized.abi_version = SINOMO_NETWORK_MODULE_ABI_VERSION;
+        undersized.struct_size = SinomoNetworkModuleVtableV1::expected_struct_size() - 1;
 
-        let error = ValidatedNetworkModuleVtable::try_from(obsolete)
-            .expect_err("obsolete table shape must be rejected");
+        let error = ValidatedNetworkModuleVtable::try_from(undersized)
+            .expect_err("undersized table shape must be rejected");
         assert!(error.to_string().contains("vtable size"));
         assert_eq!(
             SINOMO_NETWORK_MODULE_ENTRY_SYMBOL,
-            b"sinomo_network_module_create_v2"
+            b"sinomo_network_module_create_v1"
         );
     }
 
@@ -1158,7 +1156,7 @@ mod tests {
         let error = unsafe {
             FfiNetworkModule::from_entry_parts(
                 instance,
-                SinomoNetworkModuleVtableV2::empty(),
+                SinomoNetworkModuleVtableV1::empty(),
                 Box::new(KeepAliveDropProbe(Arc::clone(&dropped))),
             )
         }
@@ -1186,7 +1184,7 @@ mod tests {
         let error = unsafe {
             FfiNetworkModule::from_entry_parts(
                 ptr::null_mut(),
-                SinomoNetworkModuleVtableV2::empty(),
+                SinomoNetworkModuleVtableV1::empty(),
                 Box::new(KeepAliveDropProbe(Arc::clone(&dropped))),
             )
         }
@@ -1252,20 +1250,21 @@ mod tests {
     }
 
     #[test]
-    fn network_module_rpc_error_keeps_legacy_utf8_fallback() {
+    fn network_module_rpc_error_rejects_non_sobj_detail() {
         let decoded = network_module_rpc_status_error(
             "dial network module rpc",
             SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR,
-            b"legacy module failure",
+            b"plain text module failure",
         );
 
-        assert_eq!(
+        assert!(matches!(
             decoded,
-            NetworkError::Io {
-                operation: "dial network module rpc".to_string(),
-                detail: "network module status 3 (runtime error): legacy module failure"
-                    .to_string(),
-            }
-        );
+            NetworkError::Io { operation, detail }
+                if operation == "dial network module rpc"
+                    && detail.starts_with(
+                        "network module status 3 returned an invalid v1 RPC error:"
+                    )
+                    && !detail.contains("plain text module failure")
+        ));
     }
 }

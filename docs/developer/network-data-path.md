@@ -6,9 +6,10 @@ remain in the [network architecture](../network-architecture.md); the public
 binary object encoding is specified by the
 [Sinomo Object format](../sinomo-object-format.md).
 
-The constants and carrier versions below describe the current implementation,
-not a second application API. They may change with the corresponding protocol
-negotiation, compatibility paths, tests, and architecture invariants.
+The constants and carrier version below describe the current v1 implementation,
+not a second application API. A wire change must update the implementation,
+tests, and architecture invariants together while retaining protocol version 1
+until an independently released protocol actually exists.
 
 ## Semantic Boundary
 
@@ -20,8 +21,7 @@ call. The private distinction between control and Data frames does not expose
 frame boundaries or require callers to choose a transport shape.
 
 Object-frame heads use one `SOF2` prefix with an unsigned 64-bit length for
-every frame. There is no compact form, extended-length sentinel, or legacy
-prefix negotiation.
+every frame. Compact forms and extended-length sentinels are not part of v1.
 
 ## Canonical Bulk Session
 
@@ -44,9 +44,9 @@ Receivers return cumulative credit after 8--16 MiB of progress, or when the
 every chunk. Completion flushes the final progress. Active receive credit is
 bounded to 64 MiB per transfer and 256 MiB in aggregate per immediate peer.
 Credit is an admission bound rather than a preallocated buffer. The bounded
-reader queue and spill path separately control resident body memory. Unknown-
-length attachments and compatibility fallbacks enter this BDP-tuned session;
-known-size attachments use the persistent channel described below.
+reader queue and spill path separately control resident body memory.
+Unknown-length attachments enter this BDP-tuned session; known-size attachments
+use the persistent channel described below.
 
 ## Persistent Multiplexed Channel
 
@@ -66,12 +66,12 @@ over the header and payload.
 ### Flow Control and Fairness
 
 The channel frame quantum and per-call flow window are independent. Protocol
-version 4 uses a 256 KiB maximum Data frame and a fixed 8 MiB per-call window.
+version 1 uses a 256 KiB maximum Data frame and a fixed 8 MiB per-call window.
 Eight concurrent body-bearing calls therefore expose 64 MiB of aggregate
 flight, but one call does not yet derive its window from the shared BDP
-estimate. Adaptive per-call credit needs a later protocol version in which the
-receiver grants both request and response credit; relaxing the version 4
-checks would let a response sender exceed receiver-owned memory policy.
+estimate. Any future adaptive per-call credit must keep both request and
+response credit receiver-owned; relaxing the v1 checks would let a response
+sender exceed receiver-owned memory policy.
 
 A receiver advertises the cumulative received offset after at least 1 MiB of
 additional progress or after 2 ms with unreported progress; it does not send
@@ -121,23 +121,17 @@ Normal completion and cancellation remove spill files. Crash-orphan collection
 is not transfer resume state and must use process-ownership proof rather than
 deleting files by age.
 
-## Compatibility
+## Protocol v1
 
-Local persistent channels negotiate protocol version 4 for the mixed
-SOBJ-control/SCDF-Data dialect. Cluster TCP tunnel version 4 uses the same mixed
-representation. A tunnel peer that rejects version 4 is retried with version 3
-and then version 1. Both older versions retain the legacy authenticated
-one-session-per-stream path rather than interpreting cumulative channel credit
-with an older Data dialect.
-
-An incompatible local channel similarly falls back to the canonical session
-path. These compatibility choices are carrier details and do not change the
-object-RPC call interface.
+Local persistent channels and cluster TCP tunnels require protocol version 1.
+Both use SOBJ control frames and fixed `SCDF` body-data frames. Negotiation is
+exact: any other version is rejected, and there is no alternate tunnel stream
+dialect or nested SOBJ Data representation.
 
 ## Maintaining This Reference
 
 When the carrier changes, update this page together with the owning source,
-protocol compatibility tests, the stable invariants in the
+protocol tests, the stable invariants in the
 [network architecture](../network-architecture.md), and any benchmark or
 experiment manifest that depends on the old constants. Performance claims must
 also follow the developer

@@ -159,8 +159,8 @@ pub fn authenticate_daemon_control_request(
     authenticate_daemon_control_request_inner(paths, request, true, true)
 }
 
-/// Authenticates the signed request and its signer without applying the legacy
-/// static route allowlist.
+/// Authenticates the signed request and its signer without applying the static
+/// route allowlist.
 ///
 /// Dynamic routes must use this only when their live catalog descriptor is
 /// authorized separately. Keeping this entry point crate-private prevents a
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_authentication_separates_signature_from_legacy_route_authority() {
+    fn catalog_authentication_separates_signature_from_static_route_authority() {
         let data_root = unique_auth_test_root("sinomo-daemon-auth-dynamic-route");
         let data_dir = SinomoDataDir::new(&data_root);
         let paths = DaemonPaths::new(&data_dir);
@@ -1346,13 +1346,13 @@ mod tests {
         )
         .expect("dynamic module request");
 
-        let mut legacy_request = unsigned.clone();
-        legacy_request.auth = Some(
-            sign_daemon_rpc_request_from_data_dir(&data_dir, &legacy_request)
-                .expect("sign legacy request"),
+        let mut static_route_request = unsigned.clone();
+        static_route_request.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &static_route_request)
+                .expect("sign static-route request"),
         );
         assert!(matches!(
-            authenticate_daemon_control_request(&paths, &legacy_request),
+            authenticate_daemon_control_request(&paths, &static_route_request),
             Err(DaemonError::AuthDenied)
         ));
 

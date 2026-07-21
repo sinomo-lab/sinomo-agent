@@ -1,4 +1,3 @@
-use crate::peer::RouteDeliveryId;
 use crate::prelude::*;
 
 pub(crate) const NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX: &str =
@@ -72,17 +71,6 @@ pub enum NetworkError {
         requested_target_node_id: NodeId,
         frame_target_node_id: NodeId,
     },
-    #[error("unknown delivery: {delivery_id:?}")]
-    UnknownDelivery { delivery_id: RouteDeliveryId },
-    #[error("delivery ledger is full: max {max_records} records")]
-    DeliveryLedgerFull { max_records: usize },
-    #[error(
-        "network service command queue is full during {operation}: max {max_commands} commands"
-    )]
-    NetworkServiceCommandQueueFull {
-        operation: String,
-        max_commands: usize,
-    },
     #[error("in-process mailbox for {node_id} is full: max {max_frames} frames")]
     MailboxFull { node_id: NodeId, max_frames: usize },
     #[error(
@@ -99,20 +87,6 @@ pub enum NetworkError {
     ObjectRpcRouteSaturated {
         route: String,
         concurrency_limit: usize,
-    },
-    #[error(
-        "delivery {delivery_id:?} acked by {acking_node_id}, expected {expected_target_node_id}"
-    )]
-    AckTargetMismatch {
-        delivery_id: RouteDeliveryId,
-        expected_target_node_id: NodeId,
-        acking_node_id: NodeId,
-    },
-    #[error("delivery {delivery_id:?} acked event {acking_event_id}, expected {expected_event_id}")]
-    AckEventMismatch {
-        delivery_id: RouteDeliveryId,
-        expected_event_id: EventId,
-        acking_event_id: EventId,
     },
     #[error("cluster mismatch: expected {expected}, got {actual}")]
     ClusterMismatch {

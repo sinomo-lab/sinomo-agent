@@ -51,9 +51,9 @@ mod transfer;
 pub use channel::{
     OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES, OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES,
     OBJECT_RPC_CHANNEL_MAX_CALLS, OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES,
-    OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES, OBJECT_RPC_CHANNEL_MAX_QUEUED_DATA_BYTES,
-    ObjectRpcChannelBodyDescriptor, ObjectRpcChannelBodyDirection, ObjectRpcChannelBodyKind,
-    ObjectRpcChannelCallId, ObjectRpcChannelClient, ObjectRpcChannelConfig, ObjectRpcChannelEgress,
+    OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES, ObjectRpcChannelBodyDescriptor,
+    ObjectRpcChannelBodyDirection, ObjectRpcChannelBodyKind, ObjectRpcChannelCallId,
+    ObjectRpcChannelClient, ObjectRpcChannelConfig, ObjectRpcChannelEgress,
     ObjectRpcChannelEndpoint, ObjectRpcChannelInboundRequest, ObjectRpcChannelIngress,
     ObjectRpcChannelPendingCall, ObjectRpcChannelQueueSnapshot, ObjectRpcChannelResponder,
     ObjectRpcChannelRole, ObjectRpcChannelServer, ObjectRpcChannelWireFrame,
@@ -306,16 +306,12 @@ pub use session::{
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
 pub use tcp_tunnel::{
-    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
-    CLUSTER_TCP_TUNNEL_FIXED_CHANNEL_DATA_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL,
-    CLUSTER_TCP_TUNNEL_MIN_PROTOCOL_VERSION,
-    CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
-    CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame,
-    ClusterTcpTunnelHandshakeProof, ClusterTcpTunnelHandshakeTranscript,
-    ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
-    cluster_tcp_tunnel_protocol_supports_fixed_channel_data,
-    cluster_tcp_tunnel_protocol_supports_object_rpc_channel, negotiate_cluster_tcp_tunnel_protocol,
-    sign_cluster_tcp_tunnel_handshake_from_data_dir, verify_cluster_tcp_tunnel_handshake,
+    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL,
+    CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame, ClusterTcpTunnelHandshakeProof,
+    ClusterTcpTunnelHandshakeTranscript, ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
+    negotiate_cluster_tcp_tunnel_protocol, sign_cluster_tcp_tunnel_handshake_from_data_dir,
+    verify_cluster_tcp_tunnel_handshake,
 };
 pub use timeline::{
     NETWORK_TIMELINE_DEFAULT_MAX_EVENTS, NETWORK_TIMELINE_EVENT_BYTES,
@@ -334,7 +330,7 @@ pub use timeline::{
 pub type ClusterEndpointId = sinomo_base::Id;
 
 pub const NETWORK_PROTOCOL: &str = "sinomo.network.v1";
-pub const SINOMO_NETWORK_MODULE_LEGACY_ID: &str = "module.network";
+pub const SINOMO_NETWORK_MODULE_ID: &str = "module.network";
 pub const SINOMO_NETWORK_MODULE_OWNER: &str = "sinomo-network";
 pub const SINOMO_NETWORK_NATIVE_REGISTRATION_KEY: &str = "sinomo-network";
 pub const NETWORK_OBJECT_RPC_ROUTES: &[&str] = &[
@@ -513,30 +509,18 @@ pub(crate) mod prelude {
     pub(crate) use serde::{Deserialize, Serialize};
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_base::ClusterCertificate;
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) use sinomo_base::EventEnvelope;
     pub(crate) use sinomo_base::{
         ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
         ClusterEndpointSource, ClusterMemberRecord, ClusterMemberRole, ClusterNodeRole,
         ClusterTransportKind,
     };
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) use sinomo_base::{LatencyClass, RoutingScope};
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) use sinomo_events::EventStore;
-    pub(crate) use sinomo_events::{EventId, EventStoreError};
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
+    pub(crate) use sinomo_events::EventStoreError;
     #[cfg(test)]
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::ClusterId;
     pub(crate) use sinomo_node::NodeId;
     #[cfg(test)]
     pub(crate) use sinomo_node::main_daemon_capabilities;
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) use std::collections::HashSet;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -583,8 +567,6 @@ pub use connectivity_store::local_cluster_connectivity_record_cache_contains_for
 pub use connectivity_store::remove_local_cluster_connectivity_record_cache_entries_under_root_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity_store::reset_local_cluster_connectivity_prune_passes_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use lan::LanQuicEventFrameCodec;
 #[cfg(any(test, feature = "test-support"))]
 pub use lan::MAX_MDNS_DISCOVERY_RECORDS;
 #[cfg(any(test, feature = "test-support"))]
@@ -649,69 +631,9 @@ pub use object_file_store::remove_object_file_write_mark_entries_under_root_for_
 pub use object_file_store::write_object_file_compare_read_bytes_for_test;
 pub use object_file_store::write_object_file_create_new_serialized;
 #[cfg(any(test, feature = "test-support"))]
-pub use peer::AsyncNetworkServiceHandle;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::AsyncNetworkTransport;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::AsyncNetworkTransportFuture;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::DeliveryAck;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::DeliveryLedger;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::DeliveryStatus;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::EventFrame;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::EventFrameId;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::Heartbeat;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::HeartbeatPolicy;
-#[cfg(any(test, feature = "test-support"))]
 pub use peer::IN_PROCESS_MAILBOX_CAPACITY;
 #[cfg(any(test, feature = "test-support"))]
-pub use peer::InProcessRouter;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::InboundEventFrame;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::InboundOutcome;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::MeshMessage;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::MeshMessageBody;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::MeshMessageId;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::NETWORK_SERVICE_INBOUND_BATCH_LIMIT;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::NetworkService;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::NetworkServiceActorOptions;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::NetworkServiceCommandOptions;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::NodeEndpoint;
-#[cfg(any(test, feature = "test-support"))]
 pub use peer::PeerEndpointCandidate;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::PeerRegistry;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::PeerStatus;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::RetryPolicy;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::RouteDelivery;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::RouteDeliveryId;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::SeenEventCache;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::TransportKind;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::ack_timeout_for_latency_class;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::ClusterAuthMaterial;
 #[cfg(any(test, feature = "test-support"))]

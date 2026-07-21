@@ -6,7 +6,7 @@ individual Rust APIs or migration state.
 
 This is a developer-facing architecture document. Start with the
 [developer guide](developer/README.md) for repository navigation. Exact private
-carrier formats, tuning bounds, and compatibility behavior live in the
+carrier formats and tuning bounds live in the
 [network data-path reference](developer/network-data-path.md).
 
 ## Purpose
@@ -73,9 +73,8 @@ on separate private representations while retaining the same object-RPC call
 interface. Per-call flow control and fair scheduling prevent one body from
 monopolizing a carrier. Peer-confirmed liveness isolates stalled calls, bounded
 reusable buffers limit resident memory, and relays forward ownership-bearing
-payloads without exposing carrier frame boundaries to applications. Versioned
-negotiation can fall back to the canonical session path without changing the
-domain API.
+payloads without exposing carrier frame boundaries to applications. The local
+channel and cluster tunnel require the same exact protocol v1 shape.
 
 Ordered bodies first use bounded in-memory delivery. A slow consumer can spill
 the unread suffix to temporary storage, while a deliberately dropped body is
@@ -93,7 +92,7 @@ Sinomo-to-Sinomo protocols use the binary object boundary.
 
 See [Sinomo Object format](sinomo-object-format.md) for the stable encoding and
 the developer [network data-path reference](developer/network-data-path.md) for
-the current private carrier formats, bounds, and compatibility sequence.
+the current private carrier formats, bounds, and v1 protocol contract.
 
 ## Canonical Routing
 

@@ -20,7 +20,7 @@ pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 pub(crate) const RESPONSE_IDENTITY_PROOF_PROTOCOL: &str = "sinomo.rpc-response-identity.v1";
 
 const DAEMON_RPC_REQUEST_DIGEST_DOMAIN: &[u8] = b"sinomo.daemon-rpc-request\0";
-const LOCAL_CHANNEL_AUTH_PROTOCOL: &[u8] = b"sinomo.local-object-rpc-channel.v2\0";
+const LOCAL_CHANNEL_AUTH_PROTOCOL: &[u8] = b"sinomo.local-object-rpc-channel.v1\0";
 const DAEMON_SIGNING_IDENTITY_MAX_AGE: Duration = Duration::from_secs(1);
 
 static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =

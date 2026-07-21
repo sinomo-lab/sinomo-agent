@@ -152,9 +152,8 @@ pub trait NetworkModule: Send + Sync {
     /// Object-RPC/session framing, authentication, transfer progress, and
     /// retries live above this transport seam. Implementations must therefore
     /// preserve byte order and half-close semantics without interpreting or
-    /// collecting the stream. The default keeps source compatibility for
-    /// dial-only test modules while making the missing capability explicit at
-    /// runtime.
+    /// collecting the stream. Dial-only test modules use the default, which
+    /// reports the missing capability explicitly at runtime.
     fn open_rpc_stream(
         &self,
         endpoint: &ClusterEndpointRecord,

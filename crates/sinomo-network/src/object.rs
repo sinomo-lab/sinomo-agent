@@ -2238,9 +2238,9 @@ mod serde_bytes_tests {
     }
 
     #[test]
-    fn object_frame_rejects_legacy_u32_prefix() {
+    fn object_frame_rejects_u32_length_without_sof2_magic() {
         let record = BundleRecord {
-            name: "legacy-prefix".to_string(),
+            name: "u32-prefix".to_string(),
             payload: Some(vec![1, 2, 3, 4]),
         };
         let body = SinomoObjectCodec::network_frame()
@@ -2250,7 +2250,7 @@ mod serde_bytes_tests {
         frame.extend_from_slice(&body);
 
         let error = decode_single_object_frame_from_slice::<BundleRecord>(&frame)
-            .expect_err("legacy prefix must not be accepted");
+            .expect_err("a prefix without SOF2 magic must not be accepted");
         assert_eq!(
             error,
             NetworkError::Io {

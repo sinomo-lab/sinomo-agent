@@ -63,7 +63,7 @@ static BODY_READER_DIRECT_WAIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_DELIVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_SPILL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BODY_READER_DIRECT_WAIT_CLOSED_TOTAL: AtomicU64 = AtomicU64::new(0);
-const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v4";
+const OBJECT_RPC_SESSION_PROTOCOL: &str = "sinomo.object-rpc-session.v1";
 const OBJECT_RPC_SESSION_METADATA_KEY: &str = "sinomo.rpc-session";
 pub(crate) const OBJECT_RPC_RESPONSE_IDENTITY_PROOF_METADATA_KEY: &str =
     "sinomo.rpc-response-identity-proof";

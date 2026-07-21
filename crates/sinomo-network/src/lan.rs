@@ -1,7 +1,5 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
-#[cfg(any(test, feature = "test-support"))]
-use crate::peer::EventFrame;
 use crate::peer::PeerEndpointCandidate;
 use crate::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -184,21 +182,6 @@ impl PublicIpDiscoveryCache {
 pub enum PublicIpDiscoveryResult {
     Complete(Vec<IpAddr>),
     Deferred(Vec<IpAddr>),
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(any(test, feature = "test-support"))]
-pub struct LanQuicEventFrameCodec;
-
-#[cfg(any(test, feature = "test-support"))]
-impl LanQuicEventFrameCodec {
-    pub fn encode(&self, frame: &EventFrame) -> Result<Vec<u8>, NetworkError> {
-        SinomoObjectCodec::default().encode(frame)
-    }
-
-    pub fn decode(&self, bytes: &[u8]) -> Result<EventFrame, NetworkError> {
-        SinomoObjectCodec::default().decode(bytes)
-    }
 }
 
 pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {

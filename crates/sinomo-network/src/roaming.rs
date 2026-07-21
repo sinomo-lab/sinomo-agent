@@ -218,7 +218,7 @@ pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
             {
                 return Err(NetworkError::Io {
                     operation: "open object RPC session stream".to_string(),
-                    detail: "legacy multiplexed TCP-tunnel endpoints do not expose a canonical byte stream"
+                    detail: "v1 multiplexed TCP-tunnel endpoints expose object RPC channels, not canonical byte streams"
                         .to_string(),
                 });
             }

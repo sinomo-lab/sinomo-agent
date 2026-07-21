@@ -23,16 +23,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Current loopback object-RPC channel handshake version.
-pub const LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 4;
+/// Loopback object-RPC channel handshake version.
+pub const LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 1;
 
-const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_MAGIC: [u8; 4] = *b"SXC4";
-const LOCAL_OBJECT_RPC_CHANNEL_SERVER_MAGIC: [u8; 4] = *b"SXS4";
-const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_PROOF_MAGIC: [u8; 4] = *b"SXP4";
-const LOCAL_OBJECT_RPC_CHANNEL_SERVER_ACK_MAGIC: [u8; 4] = *b"SXA4";
+const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_MAGIC: [u8; 4] = *b"SXC1";
+const LOCAL_OBJECT_RPC_CHANNEL_SERVER_MAGIC: [u8; 4] = *b"SXS1";
+const LOCAL_OBJECT_RPC_CHANNEL_CLIENT_PROOF_MAGIC: [u8; 4] = *b"SXP1";
+const LOCAL_OBJECT_RPC_CHANNEL_SERVER_ACK_MAGIC: [u8; 4] = *b"SXA1";
 const LOCAL_OBJECT_RPC_CHANNEL_NEGOTIATION_BYTES: usize = 8;
-// Retained as an internal alias while raw old-daemon compatibility tests
-// construct only the fixed negotiation prefix.
 const LOCAL_OBJECT_RPC_CHANNEL_HANDSHAKE_BYTES: usize = LOCAL_OBJECT_RPC_CHANNEL_NEGOTIATION_BYTES;
 const LOCAL_OBJECT_RPC_CHANNEL_NONCE_BYTES: usize = 32;
 const LOCAL_OBJECT_RPC_CHANNEL_IDENTITY_BINDING_BYTES: usize = 32;
@@ -117,10 +115,8 @@ pub struct AcceptedLocalObjectRpcChannel {
 
 /// Negotiates one persistent object-RPC channel to a local daemon.
 ///
-/// `Ok(None)` means that the peer returned a valid `SXS4` protocol rejection.
-/// TCP, timeout, EOF, and malformed-handshake failures remain errors so callers
-/// can fall back for the current call without negative-caching a transient
-/// failure as protocol incompatibility.
+/// `Ok(None)` is reserved for non-loopback addresses, which do not support this
+/// local authenticated carrier. A loopback peer that rejects v1 is invalid.
 pub async fn connect_local_object_rpc_channel_async(
     data_dir: &SinomoDataDir,
     address: &str,
@@ -146,7 +142,9 @@ pub async fn connect_local_object_rpc_channel_async(
         LocalObjectRpcChannelServerHandshake::Accepted => {}
         LocalObjectRpcChannelServerHandshake::Rejected => {
             let _ = stream.shutdown().await;
-            return Ok(None);
+            return Err(NetworkError::Serialization {
+                detail: "local object RPC channel peer rejected protocol v1".to_string(),
+            });
         }
     }
     let mut response_extension = [0_u8;
@@ -424,8 +422,8 @@ fn negotiate_client_handshake(
     }
     let minimum = u16::from_be_bytes([handshake[4], handshake[5]]);
     let maximum = u16::from_be_bytes([handshake[6], handshake[7]]);
-    (minimum <= LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION
-        && maximum >= LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION)
+    (minimum == LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION
+        && maximum == LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION)
         .then_some(LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION)
 }
 
@@ -688,9 +686,15 @@ mod tests {
         );
 
         let mut unsupported = request;
-        unsupported[4..6].copy_from_slice(&1_u16.to_be_bytes());
-        unsupported[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        unsupported[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        unsupported[6..8].copy_from_slice(&2_u16.to_be_bytes());
         assert_eq!(negotiate_client_handshake(&unsupported), None);
+
+        let mut version_range = request;
+        version_range[4..6].copy_from_slice(&0_u16.to_be_bytes());
+        version_range[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(negotiate_client_handshake(&version_range), None);
+
         assert_eq!(
             parse_server_handshake(&server_handshake(None)).expect("rejected server handshake"),
             LocalObjectRpcChannelServerHandshake::Rejected
@@ -716,7 +720,7 @@ mod tests {
 
         let mut accepted_wrong_version =
             server_handshake(Some(LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION));
-        accepted_wrong_version[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        accepted_wrong_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
         assert!(matches!(
             parse_server_handshake(&accepted_wrong_version),
             Err(NetworkError::Serialization { .. })
@@ -1275,7 +1279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incompatible_peer_returns_none_for_canonical_fallback() {
+    async fn protocol_rejection_is_an_error() {
         let (_root, data_dir) = test_data_dir("sinomo-local-channel-incompatible");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1291,14 +1295,17 @@ mod tests {
                 .expect("reject");
         });
 
-        let connected = connect_local_object_rpc_channel_async(
+        let error = match connect_local_object_rpc_channel_async(
             &data_dir,
             &address,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
         )
         .await
-        .expect("connect result");
-        assert!(connected.is_none());
+        {
+            Err(error) => error,
+            Ok(_) => panic!("protocol rejection must fail"),
+        };
+        assert!(matches!(error, NetworkError::Serialization { .. }));
         server.await.expect("server task");
     }
 

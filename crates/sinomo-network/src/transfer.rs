@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_transfer_magic_is_rejected_before_header_allocation() {
+    async fn invalid_transfer_magic_is_rejected_before_header_allocation() {
         let mut prefix = [0_u8; TRANSFER_WIRE_PREFIX_BYTES];
         prefix[..4].copy_from_slice(b"SXFR");
         prefix[4] = TRANSFER_WIRE_CONTROL_KIND;
@@ -1232,7 +1232,7 @@ mod tests {
         writer
             .write_all(&prefix)
             .await
-            .expect("write legacy transfer prefix");
+            .expect("write invalid transfer prefix");
 
         let mut header_buffer = Vec::new();
         let Err(error) = read_transfer_encoded_frame_header(
@@ -1242,7 +1242,7 @@ mod tests {
         )
         .await
         else {
-            panic!("legacy transfer magic must be rejected");
+            panic!("invalid transfer magic must be rejected");
         };
         assert!(matches!(
             error,

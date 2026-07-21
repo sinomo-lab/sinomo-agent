@@ -13,7 +13,7 @@
 //!   `network_transports: ["iroh"]`, telling the daemon to also resolve the
 //!   network entry);
 //! - the pinned network-module vtable entry
-//!   `sinomo_network_module_create_v2` (see
+//!   `sinomo_network_module_create_v1` (see
 //!   `sinomo_network::network_module_abi`), which the daemon wraps in
 //!   `FfiNetworkModule` and registers in its `NetworkModuleRegistry`.
 
@@ -27,7 +27,7 @@ use sinomo_core::network::network_module_abi::{
     SINOMO_NETWORK_MODULE_ABI_MAGIC, SINOMO_NETWORK_MODULE_ABI_VERSION,
     SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_NETWORK_MODULE_STATUS_OK,
     SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR, SinomoNetworkByteBuffer, SinomoNetworkByteSlice,
-    SinomoNetworkModuleConfigV1, SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV2,
+    SinomoNetworkModuleConfigV1, SinomoNetworkModuleStatusCode, SinomoNetworkModuleVtableV1,
     SinomoNetworkRpcStreamV1, encode_network_module_rpc_error, encode_network_module_sobj,
 };
 use sinomo_core::network::{
@@ -55,7 +55,7 @@ use std::time::Duration;
 /// Module id under which the dylib installs (`[package.metadata.sinomo.native-dylib]`).
 pub const SINOMO_NETWORK_IROH_MODULE_ID: &str = "module.network-iroh";
 /// Interface version pinned in the loader state.
-pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v2";
+pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v1";
 /// Network-module descriptor id (`NetworkModuleDescriptor::id`).
 pub const SINOMO_NETWORK_IROH_NETWORK_MODULE_ID: &str = "iroh";
 const SINOMO_DISABLE_IROH_ENV: &str = "SINOMO_DISABLE_IROH";
@@ -691,7 +691,7 @@ impl OwnedIrohNetworkModuleInstance {
 
 /// # Safety
 ///
-/// `instance` must be a pointer produced by [`sinomo_network_module_create_v2`]
+/// `instance` must be a pointer produced by [`sinomo_network_module_create_v1`]
 /// that has not been destroyed.
 unsafe fn module_instance<'a>(instance: *mut c_void) -> Option<&'a IrohNetworkModuleInstance> {
     if !is_live_iroh_network_module_instance(instance) {
@@ -1052,18 +1052,17 @@ unsafe extern "C" fn iroh_network_module_destroy_ffi(instance: *mut c_void) {
     }));
 }
 
-/// The pinned v2 entry: creates the module instance and fills the
-/// self-describing vtable. Its symbol is intentionally distinct from the old
-/// response-buffer v1 entry.
+/// The pinned v1 entry creates the module instance and fills the
+/// self-describing vtable.
 ///
 /// # Safety
 ///
 /// `instance_out` and `vtable_out` must be valid, writable pointers. The host
 /// must eventually pass the returned instance to the vtable's `destroy`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sinomo_network_module_create_v2(
+pub unsafe extern "C" fn sinomo_network_module_create_v1(
     instance_out: *mut *mut c_void,
-    vtable_out: *mut SinomoNetworkModuleVtableV2,
+    vtable_out: *mut SinomoNetworkModuleVtableV1,
 ) -> SinomoNetworkModuleStatusCode {
     let result = catch_unwind(AssertUnwindSafe(|| {
         if instance_out.is_null() || vtable_out.is_null() {
@@ -1076,10 +1075,10 @@ pub unsafe extern "C" fn sinomo_network_module_create_v2(
         // per the entry contract.
         unsafe {
             *instance_out = instance as *mut c_void;
-            *vtable_out = SinomoNetworkModuleVtableV2 {
+            *vtable_out = SinomoNetworkModuleVtableV1 {
                 abi_magic: SINOMO_NETWORK_MODULE_ABI_MAGIC,
                 abi_version: SINOMO_NETWORK_MODULE_ABI_VERSION,
-                struct_size: SinomoNetworkModuleVtableV2::expected_struct_size(),
+                struct_size: SinomoNetworkModuleVtableV1::expected_struct_size(),
                 descriptor: Some(iroh_network_module_descriptor_ffi),
                 start: Some(iroh_network_module_start_ffi),
                 stop: Some(iroh_network_module_stop_ffi),
@@ -1113,11 +1112,11 @@ mod tests {
         }
     }
 
-    fn create_test_network_module_instance() -> (*mut c_void, SinomoNetworkModuleVtableV2) {
+    fn create_test_network_module_instance() -> (*mut c_void, SinomoNetworkModuleVtableV1) {
         let mut instance: *mut c_void = std::ptr::null_mut();
-        let mut vtable = SinomoNetworkModuleVtableV2::empty();
+        let mut vtable = SinomoNetworkModuleVtableV1::empty();
         // SAFETY: both output slots remain valid for the call.
-        let status = unsafe { sinomo_network_module_create_v2(&mut instance, &mut vtable) };
+        let status = unsafe { sinomo_network_module_create_v1(&mut instance, &mut vtable) };
         assert_eq!(status, SINOMO_NETWORK_MODULE_STATUS_OK);
         assert!(!instance.is_null());
         (instance, vtable)
@@ -1155,7 +1154,7 @@ mod tests {
         assert_eq!(vtable.abi_version, SINOMO_NETWORK_MODULE_ABI_VERSION);
         assert_eq!(
             vtable.struct_size,
-            SinomoNetworkModuleVtableV2::expected_struct_size()
+            SinomoNetworkModuleVtableV1::expected_struct_size()
         );
 
         let mut buffer = SinomoNetworkByteBuffer::null();

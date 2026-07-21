@@ -33,8 +33,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 pub const OBJECT_RPC_CHANNEL_MAX_CALLS: usize = 64;
 /// Hard aggregate payload-byte bound for the outbound Data scheduler.
 pub const OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
-/// Backward-compatible name retained for the Data configuration field.
-pub const OBJECT_RPC_CHANNEL_MAX_QUEUED_DATA_BYTES: usize = OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES;
 /// Control frames use an independent reservation so a full data window cannot
 /// prevent credit, cancellation, reset, or completion from reaching the wire.
 const OBJECT_RPC_CHANNEL_MAX_QUEUED_CONTROL_BYTES: usize = 1024 * 1024;
@@ -86,7 +84,7 @@ impl Default for ObjectRpcChannelConfig {
     fn default() -> Self {
         Self {
             max_calls: OBJECT_RPC_CHANNEL_MAX_CALLS,
-            max_queued_data_bytes: OBJECT_RPC_CHANNEL_MAX_QUEUED_DATA_BYTES,
+            max_queued_data_bytes: OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES,
             control_queue_depth: DEFAULT_CONTROL_QUEUE_DEPTH,
             data_queue_depth: DEFAULT_DATA_QUEUE_DEPTH,
         }
@@ -102,7 +100,7 @@ impl ObjectRpcChannelConfig {
             ));
         }
         if self.max_queued_data_bytes < OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
-            || self.max_queued_data_bytes > OBJECT_RPC_CHANNEL_MAX_QUEUED_DATA_BYTES
+            || self.max_queued_data_bytes > OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES
         {
             return Err(channel_resource_error(
                 "configure multiplexed object RPC queued bytes",
@@ -340,16 +338,6 @@ pub enum ObjectRpcChannelWireFrame {
         body: Option<ObjectRpcChannelBodyDescriptor>,
         initial_credit_bytes: u32,
     },
-    Data {
-        call_id: ObjectRpcChannelCallId,
-        direction: ObjectRpcChannelBodyDirection,
-        offset: u64,
-        #[serde(
-            serialize_with = "crate::fallible_serde::serialize_bytes",
-            deserialize_with = "crate::fallible_serde::deserialize_bytes"
-        )]
-        bytes: Vec<u8>,
-    },
     WindowUpdate {
         call_id: ObjectRpcChannelCallId,
         direction: ObjectRpcChannelBodyDirection,
@@ -387,7 +375,6 @@ impl ObjectRpcChannelWireFrame {
             Self::Request { call_id, .. }
             | Self::RequestAccepted { call_id, .. }
             | Self::Response { call_id, .. }
-            | Self::Data { call_id, .. }
             | Self::WindowUpdate { call_id, .. }
             | Self::BodyEnd { call_id, .. }
             | Self::LivenessProbe { call_id, .. }
@@ -888,8 +875,8 @@ pub struct ObjectRpcChannelIngress {
 }
 
 impl ObjectRpcChannelIngress {
-    /// Ingests one already-authenticated wire frame. This method never awaits
-    /// an application request or body queue.
+    /// Ingests one already-authenticated control frame. Body data uses the
+    /// fixed channel data header through [`Self::receive_data`].
     pub fn receive(&self, frame: ObjectRpcChannelWireFrame) -> Result<(), NetworkError> {
         let call_id = frame.call_id();
         self.shared.ensure_open()?;
@@ -905,16 +892,9 @@ impl ObjectRpcChannelIngress {
         Ok(())
     }
 
-    /// Ingests an SOBJ control frame. Raw Data is deliberately rejected at
-    /// this boundary so current carriers cannot accidentally serialize body
-    /// payloads through the control codec.
+    /// Ingests an SOBJ control frame.
     #[doc(hidden)]
     pub fn receive_control(&self, frame: ObjectRpcChannelWireFrame) -> Result<(), NetworkError> {
-        if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
-            return Err(NetworkError::Serialization {
-                detail: "multiplexed Data must use the fixed channel wire header".to_string(),
-            });
-        }
         self.receive(frame)
     }
 
@@ -1128,31 +1108,20 @@ pub struct ObjectRpcChannelEgress {
 }
 
 impl ObjectRpcChannelEgress {
-    /// Returns the next logical frame with bounded control priority. At most
-    /// eight controls bypass an already-queued data frame. This convenience
-    /// method treats the returned frame as written immediately; physical
-    /// transports must use [`Self::next_transport_frame`] and report the
-    /// actual socket-write result with [`Self::complete_frame_write`].
-    pub async fn next_frame(&mut self) -> Option<ObjectRpcChannelWireFrame> {
-        let frame = self.next_frame_for_transport().await?;
-        self.complete_frame_write(true);
-        Some(frame)
-    }
-
-    /// Compatibility adapter for low-level carriers using the legacy logical
-    /// frame enum. Current physical carriers use [`Self::next_transport_frame`]
-    /// so raw Data retains its `Bytes` allocation.
-    pub async fn next_frame_for_transport(&mut self) -> Option<ObjectRpcChannelWireFrame> {
-        let frame = self.next_transport_frame().await?;
-        Some(match frame {
-            ObjectRpcChannelTransportFrame::Control(frame) => frame,
-            ObjectRpcChannelTransportFrame::Data(frame) => ObjectRpcChannelWireFrame::Data {
-                call_id: frame.header.call_id,
-                direction: frame.header.direction,
-                offset: frame.header.offset,
-                bytes: frame.bytes.to_vec(),
-            },
-        })
+    /// Test convenience for control-only assertions. Tests that exercise body
+    /// transfer must consume [`Self::next_transport_frame`] so they cover the
+    /// fixed SCDF data path used by physical carriers.
+    #[cfg(test)]
+    async fn next_frame(&mut self) -> Option<ObjectRpcChannelWireFrame> {
+        match self.next_transport_frame().await? {
+            ObjectRpcChannelTransportFrame::Control(frame) => {
+                self.complete_frame_write(true);
+                Some(frame)
+            }
+            ObjectRpcChannelTransportFrame::Data(_) => {
+                panic!("body-data tests must consume the fixed transport frame")
+            }
+        }
     }
 
     /// Dequeues one frame while retaining its call completion and byte-budget
@@ -1724,15 +1693,6 @@ impl ChannelShared {
                 body,
                 initial_credit_bytes,
             } => self.receive_response(call_id, response, body, initial_credit_bytes),
-            ObjectRpcChannelWireFrame::Data {
-                call_id,
-                direction,
-                offset,
-                bytes,
-            } => {
-                let ingress = self.body_ingress(call_id, direction)?;
-                ingress.accept_data(offset, Bytes::from(bytes))
-            }
             ObjectRpcChannelWireFrame::WindowUpdate {
                 call_id,
                 direction,
@@ -3476,7 +3436,7 @@ impl OutboundQueues {
     #[cfg(test)]
     async fn queue_data(
         &self,
-        frame: ObjectRpcChannelWireFrame,
+        frame: ObjectRpcChannelDataFrame,
     ) -> Result<oneshot::Receiver<()>, NetworkError> {
         self.queue_call_data(frame, watch::channel(0).0, None).await
     }
@@ -3484,34 +3444,15 @@ impl OutboundQueues {
     #[cfg(test)]
     async fn queue_call_data(
         &self,
-        frame: ObjectRpcChannelWireFrame,
+        frame: ObjectRpcChannelDataFrame,
         progress: watch::Sender<u64>,
         timeline: Option<NetworkTimelineTraceContext>,
     ) -> Result<oneshot::Receiver<()>, NetworkError> {
-        let ObjectRpcChannelWireFrame::Data {
-            call_id,
-            direction,
-            offset,
-            bytes,
-        } = frame
-        else {
-            return Err(NetworkError::Serialization {
-                detail: "data scheduler accepted a control frame".to_string(),
-            });
-        };
-        let payload_len = u32::try_from(bytes.len()).map_err(|_| NetworkError::Serialization {
-            detail: "multiplexed Data payload length overflow".to_string(),
-        })?;
-        let frame = ObjectRpcChannelDataFrame {
-            header: ObjectRpcChannelDataHeader {
-                call_id,
-                direction,
-                offset,
-                payload_len,
-            },
-            bytes: Bytes::from(bytes),
-        };
-        let target = offset.saturating_add(u64::from(payload_len));
+        frame.validate()?;
+        let target = frame
+            .header
+            .offset
+            .saturating_add(u64::from(frame.header.payload_len));
         let tracker = Arc::new(BodyWriteTracker::new());
         let mut written = tracker.subscribe();
         self.queue_data_batch(vec![frame], Arc::clone(&tracker), progress, timeline, false)
@@ -3861,8 +3802,7 @@ fn channel_frame_timeline_flags(frame: &ObjectRpcChannelWireFrame) -> u16 {
         ObjectRpcChannelWireFrame::Request { .. }
         | ObjectRpcChannelWireFrame::RequestAccepted { .. } => network_timeline_flag::REQUEST,
         ObjectRpcChannelWireFrame::Response { .. } => network_timeline_flag::RESPONSE,
-        ObjectRpcChannelWireFrame::Data { direction, .. }
-        | ObjectRpcChannelWireFrame::WindowUpdate { direction, .. }
+        ObjectRpcChannelWireFrame::WindowUpdate { direction, .. }
         | ObjectRpcChannelWireFrame::BodyEnd { direction, .. } => match direction {
             ObjectRpcChannelBodyDirection::Request => network_timeline_flag::REQUEST,
             ObjectRpcChannelBodyDirection::Response => network_timeline_flag::RESPONSE,
@@ -3872,18 +3812,13 @@ fn channel_frame_timeline_flags(frame: &ObjectRpcChannelWireFrame) -> u16 {
         | ObjectRpcChannelWireFrame::Cancel { .. }
         | ObjectRpcChannelWireFrame::Reset { .. } => 0,
     };
-    direction
-        | if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
-            network_timeline_flag::DATA_FRAME
-        } else {
-            network_timeline_flag::CONTROL_FRAME
-        }
+    direction | network_timeline_flag::CONTROL_FRAME
 }
 
 /// Stable within the logical wire protocol, so the sender and receiver can
 /// pair a sampled frame without adding a profiling-only field to the frame.
 /// TCP ordering disambiguates the rare repeated WindowUpdate/Cancel values;
-/// Data and BodyEnd include their logical offsets.
+/// BodyEnd includes its logical offset.
 fn channel_frame_timeline_id(frame: &ObjectRpcChannelWireFrame) -> u64 {
     let (kind, direction, detail) = match frame {
         ObjectRpcChannelWireFrame::Request { .. } => (1_u64, 0_u64, 0_u64),
@@ -3894,9 +3829,6 @@ fn channel_frame_timeline_id(frame: &ObjectRpcChannelWireFrame) -> u64 {
             initial_credit_bytes,
             ..
         } => (3, 1, u64::from(*initial_credit_bytes)),
-        ObjectRpcChannelWireFrame::Data {
-            direction, offset, ..
-        } => (4, channel_body_direction_bit(*direction), *offset),
         ObjectRpcChannelWireFrame::WindowUpdate {
             direction,
             received_offset,
@@ -3950,7 +3882,6 @@ fn queued_frame_bytes(frame: &ObjectRpcChannelWireFrame) -> usize {
         ObjectRpcChannelWireFrame::Response { response, .. } => {
             response_head_bytes(response).saturating_add(QUEUED_CONTROL_FRAME_OVERHEAD_BYTES)
         }
-        ObjectRpcChannelWireFrame::Data { bytes, .. } => bytes.len(),
         ObjectRpcChannelWireFrame::Cancel { reason, .. }
         | ObjectRpcChannelWireFrame::Reset { reason, .. } => reason
             .len()
@@ -4002,13 +3933,6 @@ fn validate_wire_frame(frame: &ObjectRpcChannelWireFrame) -> Result<(), NetworkE
         });
     }
     match frame {
-        ObjectRpcChannelWireFrame::Data { bytes, .. } => {
-            if bytes.is_empty() || bytes.len() > OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES {
-                return Err(NetworkError::Serialization {
-                    detail: format!("invalid multiplexed data quantum {}", bytes.len()),
-                });
-            }
-        }
         ObjectRpcChannelWireFrame::RequestAccepted { credit_bytes, .. } => {
             if *credit_bytes as usize != OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES {
                 return Err(NetworkError::Serialization {
@@ -4124,6 +4048,31 @@ mod tests {
     use std::time::Duration;
     use tokio::io::ReadBuf;
     use tokio::time::timeout;
+
+    fn data_frame(
+        call_id: ObjectRpcChannelCallId,
+        direction: ObjectRpcChannelBodyDirection,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> ObjectRpcChannelDataFrame {
+        ObjectRpcChannelDataFrame::new(call_id, direction, offset, Bytes::from(bytes))
+            .expect("valid test data frame")
+    }
+
+    async fn next_data_frame(
+        egress: &mut ObjectRpcChannelEgress,
+        label: &str,
+    ) -> ObjectRpcChannelDataFrame {
+        let frame = egress.next_transport_frame().await.expect(label);
+        let frame = match frame {
+            ObjectRpcChannelTransportFrame::Data(frame) => frame,
+            ObjectRpcChannelTransportFrame::Control(frame) => {
+                panic!("expected channel data, got {frame:?}")
+            }
+        };
+        egress.complete_frame_write(true);
+        frame
+    }
 
     #[tokio::test]
     async fn fixed_data_receive_timeline_uses_header_and_preserves_bytes_owner() {
@@ -4243,13 +4192,13 @@ mod tests {
             trace_flags: 1,
         };
         let call_id = ObjectRpcChannelCallId(17);
-        let data = ObjectRpcChannelWireFrame::Data {
+        let data = data_frame(
             call_id,
-            direction: ObjectRpcChannelBodyDirection::Request,
-            offset: 4096,
-            bytes: vec![7; 32],
-        };
-        let data_frame_id = channel_frame_timeline_id(&data);
+            ObjectRpcChannelBodyDirection::Request,
+            4096,
+            vec![7; 32],
+        );
+        let data_frame_id = channel_data_timeline_id(&data.header);
         let (progress, _) = watch::channel(0);
         let emitted = endpoint
             .client
@@ -4394,12 +4343,12 @@ mod tests {
 
         for frame_index in 0..4 {
             ingress
-                .receive(ObjectRpcChannelWireFrame::Data {
+                .receive_data(data_frame(
                     call_id,
-                    direction: ObjectRpcChannelBodyDirection::Request,
-                    offset: (frame_index * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) as u64,
-                    bytes: vec![frame_index as u8; OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES],
-                })
+                    ObjectRpcChannelBodyDirection::Request,
+                    (frame_index * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) as u64,
+                    vec![frame_index as u8; OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES],
+                ))
                 .expect("request data");
         }
         ingress
@@ -4451,12 +4400,11 @@ mod tests {
     }
 
     impl FrameCounts {
-        fn record(&self, frame: &ObjectRpcChannelWireFrame) {
+        fn record_control(&self, frame: &ObjectRpcChannelWireFrame) {
             let counter = match frame {
                 ObjectRpcChannelWireFrame::Request { .. } => &self.requests,
                 ObjectRpcChannelWireFrame::RequestAccepted { .. } => &self.request_accepted,
                 ObjectRpcChannelWireFrame::Response { .. } => &self.responses,
-                ObjectRpcChannelWireFrame::Data { .. } => &self.data,
                 ObjectRpcChannelWireFrame::WindowUpdate { .. } => &self.window_updates,
                 ObjectRpcChannelWireFrame::BodyEnd { .. } => &self.body_ends,
                 ObjectRpcChannelWireFrame::LivenessProbe { .. } => &self.liveness_probes,
@@ -4509,17 +4457,37 @@ mod tests {
         let counts = Arc::new(FrameCounts::default());
         let left_counts = Arc::clone(&counts);
         let left_pump = tokio::spawn(async move {
-            while let Some(frame) = left_egress.next_frame().await {
-                left_counts.record(&frame);
-                right_ingress.receive(frame)?;
+            while let Some(frame) = left_egress.next_transport_frame().await {
+                let result = match frame {
+                    ObjectRpcChannelTransportFrame::Control(frame) => {
+                        left_counts.record_control(&frame);
+                        right_ingress.receive_control(frame)
+                    }
+                    ObjectRpcChannelTransportFrame::Data(frame) => {
+                        left_counts.data.fetch_add(1, Ordering::Relaxed);
+                        right_ingress.receive_data(frame)
+                    }
+                };
+                left_egress.complete_frame_write(result.is_ok());
+                result?;
             }
             Ok(())
         });
         let right_counts = Arc::clone(&counts);
         let right_pump = tokio::spawn(async move {
-            while let Some(frame) = right_egress.next_frame().await {
-                right_counts.record(&frame);
-                left_ingress.receive(frame)?;
+            while let Some(frame) = right_egress.next_transport_frame().await {
+                let result = match frame {
+                    ObjectRpcChannelTransportFrame::Control(frame) => {
+                        right_counts.record_control(&frame);
+                        left_ingress.receive_control(frame)
+                    }
+                    ObjectRpcChannelTransportFrame::Data(frame) => {
+                        right_counts.data.fetch_add(1, Ordering::Relaxed);
+                        left_ingress.receive_data(frame)
+                    }
+                };
+                right_egress.complete_frame_write(result.is_ok());
+                result?;
             }
             Ok(())
         });
@@ -5174,9 +5142,10 @@ mod tests {
         generation = expect_call_progress(&mut progress, generation, "request accepted").await;
 
         for offset in [0, OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES] {
+            let frame = next_data_frame(&mut egress, "request data").await;
             assert!(matches!(
-                egress.next_frame().await.expect("request data"),
-                ObjectRpcChannelWireFrame::Data {
+                frame.header,
+                ObjectRpcChannelDataHeader {
                     call_id: frame_call_id,
                     direction: ObjectRpcChannelBodyDirection::Request,
                     offset: frame_offset,
@@ -5195,17 +5164,17 @@ mod tests {
                 expect_call_progress(&mut progress, generation, "request window update").await;
         }
 
-        assert!(matches!(
-            egress.next_frame().await.expect("final request data"),
-            ObjectRpcChannelWireFrame::Data {
-                call_id: frame_call_id,
-                direction: ObjectRpcChannelBodyDirection::Request,
-                offset,
-                bytes,
-            } if frame_call_id == call_id
-                && offset == (2 * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) as u64
-                && bytes.len() == 7
-        ));
+        let frame = next_data_frame(&mut egress, "final request data").await;
+        assert_eq!(frame.header.call_id, call_id);
+        assert_eq!(
+            frame.header.direction,
+            ObjectRpcChannelBodyDirection::Request
+        );
+        assert_eq!(
+            frame.header.offset,
+            (2 * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES) as u64
+        );
+        assert_eq!(frame.bytes.len(), 7);
         generation = expect_call_progress(&mut progress, generation, "final request data").await;
         assert!(matches!(
             egress.next_frame().await.expect("request body end"),
@@ -5256,12 +5225,12 @@ mod tests {
         let mut body = std::mem::take(&mut incoming.request.body);
 
         ingress
-            .receive(ObjectRpcChannelWireFrame::Data {
+            .receive_data(data_frame(
                 call_id,
-                direction: ObjectRpcChannelBodyDirection::Request,
-                offset: 0,
-                bytes: payload.clone(),
-            })
+                ObjectRpcChannelBodyDirection::Request,
+                0,
+                payload.clone(),
+            ))
             .expect("request data");
         assert!(matches!(
             egress.next_frame().await.expect("request window update"),
@@ -5326,12 +5295,12 @@ mod tests {
             })
             .expect("fill control queue");
         ingress
-            .receive(ObjectRpcChannelWireFrame::Data {
+            .receive_data(data_frame(
                 call_id,
-                direction: ObjectRpcChannelBodyDirection::Response,
-                offset: 0,
-                bytes: payload.clone(),
-            })
+                ObjectRpcChannelBodyDirection::Response,
+                0,
+                payload.clone(),
+            ))
             .expect("response data");
 
         wait_for_active_calls(&client, 0).await;
@@ -5732,8 +5701,8 @@ mod tests {
             u64::try_from(expected.len()).ok(),
         );
 
-        // `ObjectRpcSessionResponse` has public fields for compatibility, so
-        // callers can bypass its normalizing constructor. The restored typed
+        // `ObjectRpcSessionResponse` has public fields, so callers can bypass
+        // its normalizing constructor. The restored typed
         // head must still take precedence over the empty forwarding marker.
         let (head, outgoing) = prepare_channel_response(ObjectRpcSessionResponse {
             response: materialized.response,
@@ -5970,7 +5939,7 @@ mod tests {
             frame => panic!("expected request, got {frame:?}"),
         };
 
-        let late_frames = [
+        let late_control_frames = [
             ObjectRpcChannelWireFrame::RequestAccepted {
                 call_id: cancelled_id,
                 credit_bytes: OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES as u32,
@@ -5980,12 +5949,6 @@ mod tests {
                 response: response("/channel/cancelled", Vec::new()),
                 body: None,
                 initial_credit_bytes: 0,
-            },
-            ObjectRpcChannelWireFrame::Data {
-                call_id: cancelled_id,
-                direction: ObjectRpcChannelBodyDirection::Response,
-                offset: 0,
-                bytes: vec![1],
             },
             ObjectRpcChannelWireFrame::WindowUpdate {
                 call_id: cancelled_id,
@@ -6002,9 +5965,17 @@ mod tests {
                 reason: "late reset".to_string(),
             },
         ];
-        for frame in late_frames {
+        for frame in late_control_frames {
             ingress.receive(frame).expect("late tombstoned frame");
         }
+        ingress
+            .receive_data(data_frame(
+                cancelled_id,
+                ObjectRpcChannelBodyDirection::Response,
+                0,
+                vec![1],
+            ))
+            .expect("late tombstoned data frame");
 
         ingress
             .receive(ObjectRpcChannelWireFrame::Response {
@@ -6075,12 +6046,12 @@ mod tests {
 
         for call_id in &retired {
             ingress
-                .receive(ObjectRpcChannelWireFrame::Data {
-                    call_id: *call_id,
-                    direction: ObjectRpcChannelBodyDirection::Response,
-                    offset: 0,
-                    bytes: vec![1],
-                })
+                .receive_data(data_frame(
+                    *call_id,
+                    ObjectRpcChannelBodyDirection::Response,
+                    0,
+                    vec![1],
+                ))
                 .expect("stale data after tombstone eviction");
         }
         let never_issued = ObjectRpcChannelCallId(retired.last().expect("retired id").0 + 100);
@@ -6958,11 +6929,13 @@ mod tests {
             mut egress,
         } = endpoint;
         let outbound = Arc::clone(&egress.shared.outbound);
-        let data_frame = |call_id| ObjectRpcChannelWireFrame::Data {
-            call_id: ObjectRpcChannelCallId(call_id),
-            direction: ObjectRpcChannelBodyDirection::Request,
-            offset: 0,
-            bytes: vec![1; OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES],
+        let data_frame = |call_id| {
+            data_frame(
+                ObjectRpcChannelCallId(call_id),
+                ObjectRpcChannelBodyDirection::Request,
+                0,
+                vec![1; OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES],
+            )
         };
         outbound
             .queue_data(data_frame(1))
@@ -6992,11 +6965,13 @@ mod tests {
             egress.queue_snapshot().queued_bytes,
             OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
         );
-        assert!(matches!(
-            egress.next_frame().await,
-            Some(ObjectRpcChannelWireFrame::Data { call_id, .. })
-                if call_id == ObjectRpcChannelCallId(1)
-        ));
+        assert_eq!(
+            next_data_frame(&mut egress, "first data frame")
+                .await
+                .header
+                .call_id,
+            ObjectRpcChannelCallId(1)
+        );
         timeout(Duration::from_secs(1), &mut second)
             .await
             .expect("second quantum admission timeout")
@@ -7006,7 +6981,7 @@ mod tests {
             egress.queue_snapshot().queued_data_bytes,
             OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
         );
-        let _ = egress.next_frame().await.expect("second data frame");
+        let _ = next_data_frame(&mut egress, "second data frame").await;
         assert_eq!(egress.queue_snapshot().queued_data_bytes, 0);
         assert_eq!(egress.queue_snapshot().queued_bytes, 0);
 
@@ -7068,12 +7043,12 @@ mod tests {
         } = endpoint;
         let outbound = Arc::clone(&egress.shared.outbound);
         outbound
-            .queue_data(ObjectRpcChannelWireFrame::Data {
-                call_id: ObjectRpcChannelCallId(1),
-                direction: ObjectRpcChannelBodyDirection::Request,
-                offset: 0,
-                bytes: vec![1],
-            })
+            .queue_data(data_frame(
+                ObjectRpcChannelCallId(1),
+                ObjectRpcChannelBodyDirection::Request,
+                0,
+                vec![1],
+            ))
             .await
             .expect("queue data");
         for call_id in 1..=CONTROL_BURST_BEFORE_DATA + 1 {
@@ -7090,10 +7065,7 @@ mod tests {
                 Some(ObjectRpcChannelWireFrame::Cancel { .. })
             ));
         }
-        assert!(matches!(
-            egress.next_frame().await,
-            Some(ObjectRpcChannelWireFrame::Data { .. })
-        ));
+        let _ = next_data_frame(&mut egress, "fairness data frame").await;
     }
 
     #[tokio::test]
@@ -7530,12 +7502,12 @@ mod tests {
         ));
         let incoming = server.accept().await.expect("incoming request");
         ingress
-            .receive(ObjectRpcChannelWireFrame::Data {
+            .receive_data(data_frame(
                 call_id,
-                direction: ObjectRpcChannelBodyDirection::Request,
-                offset: 0,
-                bytes: vec![3; payload_bytes],
-            })
+                ObjectRpcChannelBodyDirection::Request,
+                0,
+                vec![3; payload_bytes],
+            ))
             .expect("request data");
         tokio::task::yield_now().await;
 

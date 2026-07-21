@@ -57,9 +57,7 @@ fn network_rpc_outcome(result: &Result<ObjectRpcSessionResult, NetworkError>) ->
             | NetworkError::UnknownRoute { .. },
         ) => "no_route",
         Err(
-            NetworkError::DeliveryLedgerFull { .. }
-            | NetworkError::NetworkServiceCommandQueueFull { .. }
-            | NetworkError::MailboxFull { .. }
+            NetworkError::MailboxFull { .. }
             | NetworkError::ObjectFrameMemoryUnavailable { .. }
             | NetworkError::ObjectRpcRouteSaturated { .. }
             | NetworkError::FrameTooLarge { .. }
@@ -262,7 +260,7 @@ pub const CLUSTER_ROUTING_RPC_ROUTE_METADATA: &[(&str, &str)] =
     &[(CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY)];
 /// Origin node retained by a routed request so an authenticated final-hop
 /// channel can reuse cluster membership authority without re-verifying the
-/// same per-call signature. Canonical stream fallbacks still verify it.
+/// same per-call signature. Canonical sessions still verify it.
 pub const CLUSTER_RELAY_ORIGIN_NODE_ID_METADATA_KEY: &str = "sinomo.cluster-relay.origin-node-id";
 const CLUSTER_RELAY_FRESH_SIGNATURE_RETRY_METADATA_KEY: &str =
     "sinomo.cluster-relay.retry-from-origin";
@@ -2514,8 +2512,8 @@ pub trait ClusterSignedObjectRpcAsyncHost: Send {
     /// connection once; logical calls retain the same object-RPC contract and
     /// bounded body flow control without opening and signing a fresh session.
     ///
-    /// Hosts that do not own persistent connections keep using the canonical
-    /// one-session-per-stream fallback below.
+    /// Hosts that do not own persistent connections use the canonical
+    /// one-session-per-stream session below.
     fn object_rpc_channel_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
@@ -5143,9 +5141,8 @@ mod tests {
 
     #[test]
     fn known_attachments_use_the_channel_regardless_of_size() {
-        let request = || {
-            ObjectRpcRequest::from_encoded_body("/test/channel-compatibility", "test", Vec::new())
-        };
+        let request =
+            || ObjectRpcRequest::from_encoded_body("/test/channel-call-shape", "test", Vec::new());
         let small =
             ObjectRpcSessionCall::new(request(), ObjectRpcBodySource::bytes(vec![0_u8; 1024]));
         let bulk = ObjectRpcSessionCall::new(
@@ -5285,20 +5282,43 @@ mod tests {
         let close_ingress = left_ingress.clone();
         let left_pump = tokio::spawn(async move {
             let mut request_delivered = false;
-            while let Some(frame) = left_egress.next_frame().await {
+            while let Some(frame) = left_egress.next_transport_frame().await {
                 if blackhole_after_request && request_delivered {
+                    left_egress.complete_frame_write(true);
                     continue;
                 }
-                request_delivered |=
-                    matches!(&frame, crate::ObjectRpcChannelWireFrame::Request { .. });
-                if right_ingress.receive(frame).is_err() {
+                request_delivered |= matches!(
+                    &frame,
+                    crate::__channel_carrier::ObjectRpcChannelTransportFrame::Control(
+                        crate::ObjectRpcChannelWireFrame::Request { .. }
+                    )
+                );
+                let result = match frame {
+                    crate::__channel_carrier::ObjectRpcChannelTransportFrame::Control(frame) => {
+                        right_ingress.receive_control(frame)
+                    }
+                    crate::__channel_carrier::ObjectRpcChannelTransportFrame::Data(frame) => {
+                        right_ingress.receive_data(frame)
+                    }
+                };
+                left_egress.complete_frame_write(result.is_ok());
+                if result.is_err() {
                     break;
                 }
             }
         });
         let right_pump = tokio::spawn(async move {
-            while let Some(frame) = right_egress.next_frame().await {
-                if response_ingress.receive(frame).is_err() {
+            while let Some(frame) = right_egress.next_transport_frame().await {
+                let result = match frame {
+                    crate::__channel_carrier::ObjectRpcChannelTransportFrame::Control(frame) => {
+                        response_ingress.receive_control(frame)
+                    }
+                    crate::__channel_carrier::ObjectRpcChannelTransportFrame::Data(frame) => {
+                        response_ingress.receive_data(frame)
+                    }
+                };
+                right_egress.complete_frame_write(result.is_ok());
+                if result.is_err() {
                     break;
                 }
             }

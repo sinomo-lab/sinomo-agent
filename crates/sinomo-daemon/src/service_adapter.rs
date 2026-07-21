@@ -2145,9 +2145,8 @@ struct RolloutBinaryService {
     paths: DaemonPaths,
 }
 
-/// Daemon-owned rollout maintenance commands. These routes used to bypass the
-/// service registry through the legacy one-frame RPC path; keeping them here
-/// makes the canonical session dispatcher the sole ordinary RPC entry point.
+/// Daemon-owned rollout maintenance commands registered through the canonical
+/// session dispatcher, the sole ordinary RPC entry point.
 struct RolloutControlService {
     paths: DaemonPaths,
 }
@@ -5488,8 +5487,8 @@ fn daemon_authenticated_command_authorizes_route_descriptor(
 }
 
 /// Authenticates a request against the live route catalog. Catalog policy is
-/// authoritative for dynamic routes; legacy routes without policy metadata
-/// retain the static authorization table in `auth.rs`.
+/// authoritative for dynamic routes; routes without policy metadata use the
+/// static authorization table in `auth.rs`.
 pub(crate) fn authenticate_daemon_control_request_via_registry(
     paths: &DaemonPaths,
     request: &DaemonControlRequest,

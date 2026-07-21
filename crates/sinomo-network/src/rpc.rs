@@ -1598,18 +1598,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn object_route_descriptor_local_permissions_are_backward_compatible() {
-        let legacy = serde_json::json!({
-            "route": "/legacy/status",
-            "category": "legacy",
-            "summary": "legacy status",
-            "input_type": "LegacyStatusRequest",
-            "output_type": "LegacyStatusResponse"
-        });
-        let decoded: ObjectRouteDescriptor =
-            serde_json::from_value(legacy).expect("decode legacy descriptor");
-        assert!(decoded.required_local_permissions.is_empty());
-
+    fn object_route_descriptor_local_permissions_round_trip() {
         let descriptor = ObjectRouteDescriptor::new(
             "/remote/status",
             "remote",

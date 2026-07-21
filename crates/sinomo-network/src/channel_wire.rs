@@ -385,11 +385,6 @@ where
             MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES,
         )
         .await?;
-        if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
-            return Err(invalid_data_header(
-                "channel Data must use the fixed SCDF representation",
-            ));
-        }
         return Ok((ObjectRpcChannelTransportFrame::Control(frame), None));
     }
     if prefix != OBJECT_RPC_CHANNEL_DATA_MAGIC {
@@ -476,7 +471,6 @@ where
 {
     match frame {
         ObjectRpcChannelTransportFrame::Control(frame) => {
-            ensure_control_frame(frame)?;
             write_object_frame_async(writer, frame, options).await
         }
         ObjectRpcChannelTransportFrame::Data(frame) => {
@@ -495,10 +489,9 @@ where
     W: AsyncWrite + Unpin,
 {
     match frame {
-        ObjectRpcChannelTransportFrame::Control(frame) => match ensure_control_frame(frame) {
-            Ok(()) => write_object_frame_async_timed(writer, frame, options).await,
-            Err(error) => (Err(error), None),
-        },
+        ObjectRpcChannelTransportFrame::Control(frame) => {
+            write_object_frame_async_timed(writer, frame, options).await
+        }
         ObjectRpcChannelTransportFrame::Data(frame) => {
             let started = crate::network_timeline_monotonic_ns();
             let encoded = crate::network_timeline_monotonic_ns();
@@ -543,16 +536,6 @@ where
         );
     }
     Ok(())
-}
-
-fn ensure_control_frame(frame: &ObjectRpcChannelWireFrame) -> Result<(), NetworkError> {
-    if matches!(frame, ObjectRpcChannelWireFrame::Data { .. }) {
-        Err(invalid_data_header(
-            "channel Data must use the fixed SCDF representation",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn encode_direction(direction: ObjectRpcChannelBodyDirection) -> u8 {

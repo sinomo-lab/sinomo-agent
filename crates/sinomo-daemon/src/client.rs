@@ -35,8 +35,6 @@ use sinomo_rollout::{
 };
 use std::collections::HashMap;
 use std::path::Path;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -869,8 +867,6 @@ pub(crate) struct DaemonSignedObjectRpcAsyncHost {
     observe_connectivity: bool,
     paths: Option<DaemonPaths>,
     use_tcp_tunnel: bool,
-    #[cfg(test)]
-    tcp_tunnel_cluster_state_reads: AtomicUsize,
 }
 
 impl DaemonSignedObjectRpcAsyncHost {
@@ -880,8 +876,6 @@ impl DaemonSignedObjectRpcAsyncHost {
             observe_connectivity,
             paths: None,
             use_tcp_tunnel: true,
-            #[cfg(test)]
-            tcp_tunnel_cluster_state_reads: AtomicUsize::new(0),
         }
     }
 
@@ -891,8 +885,6 @@ impl DaemonSignedObjectRpcAsyncHost {
             observe_connectivity: false,
             paths: None,
             use_tcp_tunnel: false,
-            #[cfg(test)]
-            tcp_tunnel_cluster_state_reads: AtomicUsize::new(0),
         }
     }
 
@@ -915,17 +907,6 @@ impl DaemonSignedObjectRpcAsyncHost {
             detail: source.to_string(),
         })
     }
-
-    fn tcp_tunnel_available(&self) -> bool {
-        #[cfg(test)]
-        self.tcp_tunnel_cluster_state_reads
-            .fetch_add(1, Ordering::Relaxed);
-        self.use_tcp_tunnel
-            && self
-                .paths
-                .as_ref()
-                .is_some_and(daemon_paths_have_settled_cluster_state)
-    }
 }
 
 fn daemon_data_dir_from_paths(
@@ -941,18 +922,6 @@ fn daemon_data_dir_from_paths(
         });
     };
     Ok(sinomo_core::local::SinomoDataDir::new(data_dir))
-}
-
-fn daemon_paths_have_settled_cluster_state(paths: &DaemonPaths) -> bool {
-    let Ok(data_dir) = daemon_data_dir_from_paths(paths) else {
-        return false;
-    };
-    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) else {
-        return false;
-    };
-    state.cluster_id.as_str() != sinomo_core::cluster::PENDING_INVITE_CLUSTER_ID
-        && !sinomo_core::network::cluster_state_needs_join_registration(&state)
 }
 
 fn send_daemon_rpc_value<Req, Resp>(
@@ -1288,7 +1257,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         if !self.use_tcp_tunnel {
             return Box::pin(async { Ok(None) });
         }
-        // Healthy steady-state lookup is memory-only. A closed logical v2
+        // Healthy steady-state lookup is memory-only. A closed logical v1
         // channel is retired with its physical handle, then one caller
         // rebuilds the authenticated tunnel under the registry singleflight
         // lock instead of opening an independent canonical stream per RPC.
@@ -1326,20 +1295,14 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         'a,
         Box<dyn sinomo_core::network::NetworkDuplexStream>,
     > {
-        let runtime = self.runtime.clone();
-        let daemon_paths = self.paths.clone();
-        // Real endpoints never use the synthetic tunnel stream path, so avoid
-        // repeating the settlement read after a channel lookup miss.
-        let use_tcp_tunnel = daemon_endpoint_is_tcp_tunnel(endpoint) && self.tcp_tunnel_available();
+        let use_tcp_tunnel = daemon_endpoint_is_tcp_tunnel(endpoint);
         Box::pin(async move {
             if use_tcp_tunnel {
-                return crate::tcp_tunnel::open_object_rpc_session_stream_via_tcp_tunnel(
-                    endpoint,
-                    health,
-                    &runtime,
-                    daemon_paths.as_ref(),
-                )
-                .await;
+                return Err(sinomo_core::network::NetworkError::delivery_failed(
+                    "open object RPC session",
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                    "the v1 TCP tunnel carries object RPC channels only",
+                ));
             }
             sinomo_core::network::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health)
                 .await
@@ -3902,140 +3865,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_endpoint_host_does_not_tunnel_real_tcp_endpoint_with_stale_tunnel() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-real-endpoint-no-tunnel");
-        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let daemon_paths = crate::DaemonPaths::new(&data_dir);
-        daemon_paths.ensure().expect("daemon paths");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_client_real_endpoint")
-                .expect("cluster id");
-        let local_node =
-            sinomo_core::node::NodeId::from_legacy_named("node_client_real_endpoint_local")
-                .expect("local node");
-        let target_node =
-            sinomo_core::node::NodeId::from_legacy_named("node_client_real_endpoint_target")
-                .expect("target node");
-        let local_identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
-            .expect("local identity");
-        let target_root = sinomo_testdir::TestDir::new("sinomo-daemon-client-real-endpoint-target");
-        let target_data_dir = sinomo_core::local::SinomoDataDir::new(&target_root);
-        target_data_dir.ensure_root_layout().expect("target layout");
-        let target_identity =
-            sinomo_core::node::load_or_create_main_node_identity(&target_data_dir.root())
-                .expect("target identity");
-        let now = time::OffsetDateTime::now_utc();
-        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "client real endpoint",
-            local_node,
-            "local",
-            local_identity.public_key,
-            now,
-        );
-        state
-            .members
-            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
-                cluster_id,
-                target_node.clone(),
-                "target",
-                target_identity.public_key,
-                now,
-            ));
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-
-        let (tunnel_tx, mut tunnel_rx) = tokio::sync::mpsc::channel(1);
-        crate::tcp_tunnel::insert_test_tcp_tunnel(target_node.clone(), tunnel_tx);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let result = runtime.block_on(async {
-            let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
-                .await
-                .expect("listener");
-            let address = listener.local_addr_string().expect("listener address");
-            let server = tokio::spawn(async move {
-                let stream = listener.accept().await.expect("accept direct endpoint");
-                let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                    Box::new(stream.into_inner()),
-                    target_data_dir,
-                    sinomo_core::network::NetworkCallPolicy::default(),
-                    |_request, _node_id, _public_key| Ok(()),
-                )
-                .await
-                .expect("direct session request");
-                assert!(request.body.is_empty());
-                assert_eq!(request.request.route, "/test/direct-endpoint");
-                let response = sinomo_core::network::ObjectRpcResponse::encode_body(
-                    request.request.route,
-                    &"direct-ok",
-                )
-                .expect("direct response");
-                responder
-                    .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
-                        response,
-                    ))
-                    .await
-                    .expect("write direct response");
-            });
-
-            let endpoint = ClusterEndpointRecord {
-                endpoint_id: ClusterEndpointId::from_legacy_named(
-                    "endpoint_client_real_endpoint_direct",
-                )
-                .expect("endpoint"),
-                node_id: target_node.clone(),
-                transport: ClusterTransportKind::LanTcp,
-                address,
-                source: ClusterEndpointSource::Static,
-                privacy: ClusterEndpointPrivacy::Lan,
-                priority: 0,
-                last_observed_latency_ms: None,
-            };
-            let request = ObjectRpcRequest::encode_body("/test/direct-endpoint", "test", &())
-                .expect("request");
-            let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), false)
-                .with_paths(&daemon_paths);
-            let response = sinomo_core::network::ClusterObjectRpcClient::routed(
-                &mut host,
-                runtime.handle(),
-                &cluster_paths,
-            )
-            .call_endpoint(
-                &state,
-                &endpoint,
-                sinomo_core::network::ObjectRpcSessionCall::value(request),
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(
-                        1,
-                    )),
-                ),
-            )
-            .await
-            .expect("direct endpoint response");
-            assert!(response.body.is_empty());
-            server.await.expect("direct endpoint server");
-            assert!(
-                tunnel_rx.try_recv().is_err(),
-                "real endpoint traffic must not be sent through the stale tunnel"
-            );
-            response
-                .response
-                .decode_body::<String>()
-                .expect("response body")
-        });
-        crate::tcp_tunnel::remove_test_tcp_tunnel(&target_node);
-
-        assert_eq!(result, "direct-ok");
-    }
-
-    #[test]
     #[ignore = "requires SINOMO_LIVE_DFS_STATUS_ENDPOINT and SINOMO_LIVE_DFS_STATUS_NODE_ID"]
     fn live_signed_dfs_status_endpoint_from_env() {
         let endpoint_address = std::env::var("SINOMO_LIVE_DFS_STATUS_ENDPOINT")
@@ -4311,20 +4140,14 @@ mod tests {
                 )
                 .await
                 .expect("channel lookup")
-                .expect("established v2 channel");
+                .expect("established v1 channel");
                 assert!(!channel.is_closed());
             }
         });
 
         let elapsed = started.elapsed();
-        assert_eq!(
-            host.tcp_tunnel_cluster_state_reads
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "steady-state channel lookup must not consult cluster state"
-        );
         println!(
-            "{LOOKUPS} steady-state channel lookups in {elapsed:?} ({:.1}ns/lookup), cluster-state reads=0",
+            "{LOOKUPS} steady-state channel lookups in {elapsed:?} ({:.1}ns/lookup)",
             elapsed.as_nanos() as f64 / LOOKUPS as f64,
         );
 
@@ -4448,44 +4271,10 @@ mod tests {
         let direct = super::DaemonSignedObjectRpcAsyncHost::direct_only(runtime.handle());
         assert!(!direct.observe_connectivity);
         assert!(!direct.use_tcp_tunnel);
-        assert!(!direct.tcp_tunnel_available());
 
         let routed = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true);
         assert!(routed.observe_connectivity);
         assert!(routed.use_tcp_tunnel);
-        assert!(!routed.tcp_tunnel_available());
-
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-tcp-tunnel-availability");
-        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let daemon_paths = crate::DaemonPaths::new(&data_dir);
-        daemon_paths.ensure().expect("daemon paths");
-
-        let pre_cluster = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true)
-            .with_paths(&daemon_paths);
-        assert!(!pre_cluster.tcp_tunnel_available());
-
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_client_tunnel_available")
-                .expect("cluster id");
-        let local_node =
-            sinomo_core::node::NodeId::from_legacy_named("node_client_tunnel_available")
-                .expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "client tunnel available",
-            local_node,
-            "local",
-            "pk-local",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("state");
-
-        let clustered = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true)
-            .with_paths(&daemon_paths);
-        assert!(clustered.tcp_tunnel_available());
     }
 
     #[test]
@@ -4578,7 +4367,7 @@ mod tests {
                     tokio::time::timeout(Duration::from_millis(100), listener.accept())
                         .await
                         .is_err(),
-                    "ordinary endpoint RPC must not retry with legacy auth"
+                    "ordinary endpoint RPC must not retry after authorization denial"
                 );
             });
 

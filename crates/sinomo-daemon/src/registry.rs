@@ -302,10 +302,8 @@ pub fn register_internal_module_storage_paths(
 // --- network module surface adaptation (absorbed from sinomo-network-module) ---
 
 pub fn network_module_id() -> sinomo_module::ModuleId {
-    sinomo_module::ModuleId::from_legacy_named(
-        sinomo_core::network::SINOMO_NETWORK_MODULE_LEGACY_ID,
-    )
-    .expect("valid network module id")
+    sinomo_module::ModuleId::from_legacy_named(sinomo_core::network::SINOMO_NETWORK_MODULE_ID)
+        .expect("valid network module id")
 }
 
 pub fn network_module_surfaces() -> sinomo_module::ModuleSurfaces {
@@ -631,15 +629,15 @@ fn load_daemon_network_module_from_loader_state(
         )
     }
     .map_err(|error| network_error(error.to_string()))?;
-    // SAFETY: symbol type matches the pinned v2 entry signature.
+    // SAFETY: symbol type matches the pinned v1 entry signature.
     let entry = unsafe {
-        library.symbol::<sinomo_core::network::network_module_abi::SinomoNetworkModuleCreateV2Fn>(
+        library.symbol::<sinomo_core::network::network_module_abi::SinomoNetworkModuleCreateV1Fn>(
             sinomo_core::network::network_module_abi::SINOMO_NETWORK_MODULE_ENTRY_SYMBOL,
         )
     }
     .map_err(|error| network_error(error.to_string()))?;
     let mut instance: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut vtable = sinomo_core::network::network_module_abi::SinomoNetworkModuleVtableV2::empty();
+    let mut vtable = sinomo_core::network::network_module_abi::SinomoNetworkModuleVtableV1::empty();
     // SAFETY: calling the module's exported entry with valid out pointers.
     let status = unsafe { entry(&mut instance, &mut vtable) };
     if status != sinomo_core::network::network_module_abi::SINOMO_NETWORK_MODULE_STATUS_OK {

@@ -3768,8 +3768,8 @@ async fn dispatch_daemon_object_rpc_session_request_async(
         let timeline =
             sinomo_core::network::network_timeline_trace_context_for_request(&request.request);
         // This route is the trusted local API-to-daemon proxy boundary. The
-        // channel/legacy-session admission immediately above this dispatcher
-        // has already applied the live route descriptor's local-command
+        // session admission immediately above this dispatcher has already
+        // applied the live route descriptor's local-command
         // authorization. Keep the remaining route-policy invariant here while
         // avoiding a second router/catalog/authorization traversal on every
         // small remote RPC.
@@ -3824,8 +3824,8 @@ async fn dispatch_daemon_object_rpc_session_request_async(
         );
         let mut response = response?;
         // The generic registry adapter normally supplies this outer response
-        // attestation. Preserve it for legacy canonical sessions; persistent
-        // channels will retain the already-present identity.
+        // attestation. Canonical sessions need it here; persistent channels
+        // retain the already-present identity.
         crate::service_adapter::mark_daemon_rpc_response_responder(paths, &mut response);
         let response = if body.is_empty() {
             sinomo_core::network::ObjectRpcSessionResponse::value(response)
@@ -8057,16 +8057,26 @@ mod tests {
             } = right;
             let right_wire_ingress = right_ingress.clone();
             let left_to_right = tokio::spawn(async move {
-                while let Some(frame) = left_egress.next_frame().await {
-                    if right_wire_ingress.receive(frame).is_err() {
+                while let Some(frame) = left_egress.next_transport_frame().await {
+                    let result = match frame {
+                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Control(frame) => right_wire_ingress.receive_control(frame),
+                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Data(frame) => right_wire_ingress.receive_data(frame),
+                    };
+                    left_egress.complete_frame_write(result.is_ok());
+                    if result.is_err() {
                         break;
                     }
                 }
             });
             let left_wire_ingress = left_ingress.clone();
             let right_to_left = tokio::spawn(async move {
-                while let Some(frame) = right_egress.next_frame().await {
-                    if left_wire_ingress.receive(frame).is_err() {
+                while let Some(frame) = right_egress.next_transport_frame().await {
+                    let result = match frame {
+                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Control(frame) => left_wire_ingress.receive_control(frame),
+                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Data(frame) => left_wire_ingress.receive_data(frame),
+                    };
+                    right_egress.complete_frame_write(result.is_ok());
+                    if result.is_err() {
                         break;
                     }
                 }

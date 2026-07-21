@@ -11,14 +11,9 @@ use sinomo_local::SinomoDataDir;
 
 pub const CLUSTER_TCP_TUNNEL_OPEN_ROUTE: &str = "/cluster/tcp-tunnel/open";
 pub const CLUSTER_TCP_TUNNEL_RPC_CATEGORY: &str = "cluster.tcp-tunnel";
-pub const CLUSTER_TCP_TUNNEL_MIN_PROTOCOL_VERSION: u16 = 1;
-pub const CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION: u16 = 4;
-pub const CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION: u16 = 4;
-/// First tunnel protocol that carries channel Data as a fixed SCDF header and
-/// raw payload instead of nesting it in the SOBJ tunnel envelope.
-pub const CLUSTER_TCP_TUNNEL_FIXED_CHANNEL_DATA_PROTOCOL_VERSION: u16 = 4;
+pub const CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION: u16 = 1;
 pub const CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
-pub const CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL: &str = "sinomo.cluster-tcp-tunnel-handshake.v3";
+pub const CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL: &str = "sinomo.cluster-tcp-tunnel-handshake.v1";
 const CLUSTER_TCP_TUNNEL_HANDSHAKE_PROOF_ROUTE: &str = "/cluster/tcp-tunnel/handshake-proof";
 const CLUSTER_TCP_TUNNEL_HANDSHAKE_PROOF_CATEGORY: &str = "cluster.tcp-tunnel.handshake";
 
@@ -27,7 +22,7 @@ pub struct ClusterTcpTunnelOpenRequest {
     pub protocol_version: u16,
 }
 
-/// The one-time connection transcript authenticated before a v4 tunnel can
+/// The one-time connection transcript authenticated before a v1 tunnel can
 /// expose its unsigned object-RPC channel. The dialer's already-signed open
 /// nonce is the challenge, so replaying a prior response cannot authenticate a
 /// new physical connection.
@@ -125,7 +120,7 @@ pub fn sign_cluster_tcp_tunnel_handshake_from_data_dir(
 }
 
 /// Verifies both the exact dialer challenge transcript and the endpoint's
-/// authorized node identity before a v4 no-per-packet-auth channel is exposed.
+/// authorized node identity before a v1 no-per-packet-auth channel is exposed.
 pub fn verify_cluster_tcp_tunnel_handshake(
     proof: &ClusterTcpTunnelHandshakeProof,
     expected_transcript: &ClusterTcpTunnelHandshakeTranscript,
@@ -163,63 +158,19 @@ pub fn verify_cluster_tcp_tunnel_handshake(
         .map_err(|_| NetworkError::AuthDenied)
 }
 
-pub const fn negotiate_cluster_tcp_tunnel_protocol(requested_maximum: u16) -> Option<u16> {
-    if requested_maximum < CLUSTER_TCP_TUNNEL_MIN_PROTOCOL_VERSION {
-        None
-    } else if requested_maximum > CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION {
+pub const fn negotiate_cluster_tcp_tunnel_protocol(requested_version: u16) -> Option<u16> {
+    if requested_version == CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION {
         Some(CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION)
     } else {
-        Some(requested_maximum)
+        None
     }
-}
-
-pub const fn cluster_tcp_tunnel_protocol_supports_object_rpc_channel(
-    protocol_version: u16,
-) -> bool {
-    protocol_version >= CLUSTER_TCP_TUNNEL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION
-        && protocol_version <= CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION
-}
-
-pub const fn cluster_tcp_tunnel_protocol_supports_fixed_channel_data(
-    protocol_version: u16,
-) -> bool {
-    protocol_version >= CLUSTER_TCP_TUNNEL_FIXED_CHANNEL_DATA_PROTOCOL_VERSION
-        && protocol_version <= CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ClusterTcpTunnelFrame {
-    /// Carries one bounded logical object-RPC channel frame. This variant is
-    /// emitted only when the current tunnel protocol was negotiated.
+    /// Carries one bounded logical object-RPC channel control frame.
     ObjectRpcChannel {
         frame: ObjectRpcChannelWireFrame,
-    },
-    /// Opens one canonical full-duplex object-RPC byte stream inside the
-    /// persistent tunnel. Stream identifiers are allocated from disjoint
-    /// odd/even spaces by the two physical tunnel endpoints.
-    StreamOpen {
-        id: u64,
-    },
-    /// Confirms that the peer created the logical stream and attached its
-    /// canonical daemon session handler. Callers do not consume one-pass body
-    /// sources until this acknowledgement arrives.
-    StreamAccept {
-        id: u64,
-    },
-    /// Carries an ordered byte-stream fragment for one logical session.
-    StreamData {
-        id: u64,
-        bytes: Vec<u8>,
-    },
-    /// Half-closes the sender-to-receiver direction of one logical session.
-    StreamFinish {
-        id: u64,
-    },
-    /// Aborts both directions of one logical session without closing the
-    /// persistent tunnel or disturbing other multiplexed sessions.
-    StreamReset {
-        id: u64,
-        detail: String,
     },
     Close {
         detail: String,
@@ -277,31 +228,26 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_protocol_negotiates_v3_stream_fallback_and_v4_fixed_data_channel() {
+    fn tunnel_protocol_accepts_only_v1() {
         assert_eq!(negotiate_cluster_tcp_tunnel_protocol(0), None);
         assert_eq!(negotiate_cluster_tcp_tunnel_protocol(1), Some(1));
-        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(2), Some(2));
-        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(3), Some(3));
-        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(4), Some(4));
-        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(5), Some(4));
-        assert!(!cluster_tcp_tunnel_protocol_supports_object_rpc_channel(1));
-        assert!(!cluster_tcp_tunnel_protocol_supports_object_rpc_channel(2));
-        assert!(!cluster_tcp_tunnel_protocol_supports_object_rpc_channel(3));
-        assert!(cluster_tcp_tunnel_protocol_supports_object_rpc_channel(4));
-        assert!(!cluster_tcp_tunnel_protocol_supports_fixed_channel_data(3));
-        assert!(cluster_tcp_tunnel_protocol_supports_fixed_channel_data(4));
+        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(2), None);
+        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(3), None);
+        assert_eq!(negotiate_cluster_tcp_tunnel_protocol(4), None);
     }
 
     #[test]
-    fn tunnel_frame_round_trips_stream_and_legacy_sobj_channel_variants() {
+    fn tunnel_frame_round_trips_control_variants() {
         let codec = SinomoObjectCodec::network_frame();
         let frames = [
-            ClusterTcpTunnelFrame::StreamOpen { id: 7 },
             ClusterTcpTunnelFrame::ObjectRpcChannel {
                 frame: ObjectRpcChannelWireFrame::Reset {
                     call_id: ObjectRpcChannelCallId(9),
                     reason: "test reset".to_string(),
                 },
+            },
+            ClusterTcpTunnelFrame::Close {
+                detail: "test close".to_string(),
             },
         ];
         for frame in frames {
@@ -313,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_tunnel_handshake_accepts_valid_target_signed_transcript() {
+    fn v1_tunnel_handshake_accepts_valid_target_signed_transcript() {
         let fixture = handshake_fixture("tcp_tunnel_handshake_valid");
         let proof = sign_cluster_tcp_tunnel_handshake_from_data_dir(
             &fixture.data_dir,
@@ -326,13 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn v3_tunnel_handshake_rejects_tampered_protocol_or_cluster_context() {
+    fn v1_tunnel_handshake_rejects_tampered_protocol_or_cluster_context() {
         let fixture = handshake_fixture("tcp_tunnel_handshake_protocol");
         let proof =
             sign_cluster_tcp_tunnel_handshake_from_data_dir(&fixture.data_dir, fixture.transcript)
                 .expect("sign handshake");
         let mut tampered_protocol = proof.clone();
-        tampered_protocol.transcript.negotiated_protocol_version = 1;
+        tampered_protocol.transcript.negotiated_protocol_version = 2;
         let expected_protocol = tampered_protocol.transcript.clone();
 
         assert_eq!(
@@ -350,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_tunnel_handshake_rejects_replayed_challenge() {
+    fn v1_tunnel_handshake_rejects_replayed_challenge() {
         let fixture = handshake_fixture("tcp_tunnel_handshake_replay");
         let proof = sign_cluster_tcp_tunnel_handshake_from_data_dir(
             &fixture.data_dir,
@@ -367,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_tunnel_handshake_rejects_wrong_target_identity() {
+    fn v1_tunnel_handshake_rejects_wrong_target_identity() {
         let fixture = handshake_fixture("tcp_tunnel_handshake_target");
         let proof = sign_cluster_tcp_tunnel_handshake_from_data_dir(
             &fixture.data_dir,
