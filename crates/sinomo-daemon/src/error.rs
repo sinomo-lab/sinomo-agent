@@ -139,22 +139,6 @@ impl From<sinomo_core::local::LocalDataError> for DaemonError {
     }
 }
 
-impl From<sinomo_dfs::DfsExposeStoreError> for DaemonError {
-    fn from(error: sinomo_dfs::DfsExposeStoreError) -> Self {
-        match error {
-            sinomo_dfs::DfsExposeStoreError::Io { path, source } => Self::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            },
-            sinomo_dfs::DfsExposeStoreError::Serde(source) => Self::Json {
-                path: "dfs expose config".to_string(),
-                detail: source.to_string(),
-            },
-            sinomo_dfs::DfsExposeStoreError::InvalidConfig(detail) => Self::Parse { detail },
-        }
-    }
-}
-
 impl From<sinomo_dfs::MetadataBackendError> for DaemonError {
     fn from(error: sinomo_dfs::MetadataBackendError) -> Self {
         match error {

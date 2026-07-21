@@ -17573,7 +17573,7 @@ mod tests {
     #[test]
     fn advanced_non_sensitive_json_detail_remains_visible() {
         let item = test_config_item(
-            "dfs.expose",
+            "sandbox.policy",
             ConfigEditKind::Json,
             r#"{"entries":[{"path":"/workspace","read_only":true}]}"#,
         );

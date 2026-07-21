@@ -61,8 +61,6 @@ not the multi-location content-store abstraction.
 - the placement preview, reconciliation jobs, retry state, and activity history
   provide the right foundation for inter-node repair and for presenting
   node-local relocation activity.
-- `dfs.expose` maps an owned host directory into SIFS. It is not a DFS content
-  capacity setting and must remain separate from this work.
 
 ## Load-Bearing Invariants
 

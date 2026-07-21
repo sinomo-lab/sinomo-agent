@@ -1,4 +1,7 @@
 use super::*;
+use sinomo_runtime::cli_registry::{
+    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec, CliParseError, CliValueSpec,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallOptions {
@@ -30,53 +33,88 @@ impl Default for UninstallOptions {
     }
 }
 
-pub(crate) fn parse_install_options(args: &[String]) -> Result<InstallOptions, CliError> {
+pub(crate) fn install_cli_command_handler() -> DeclarativeCommandHandler<InstallOptions> {
+    DeclarativeCommandHandler::new(
+        "install",
+        CliCommandPolicy::default(),
+        install_cli_spec,
+        parse_install_matches,
+        install,
+    )
+}
+
+pub(crate) fn uninstall_cli_command_handler() -> DeclarativeCommandHandler<UninstallOptions> {
+    DeclarativeCommandHandler::new(
+        "uninstall",
+        CliCommandPolicy::default(),
+        uninstall_cli_spec,
+        parse_uninstall_matches,
+        uninstall,
+    )
+}
+
+fn install_cli_spec() -> CliCommandSpec {
+    CliCommandSpec::new("install", "install or update the local Sinomo runtime").with_options([
+        CliOptionSpec::value(
+            "--host",
+            "daemon bind host",
+            CliValueSpec::new("host", "host"),
+        ),
+        CliOptionSpec::value(
+            "--port",
+            "main daemon port",
+            CliValueSpec::new("port", "port"),
+        ),
+        CliOptionSpec::value(
+            "--shadow-port",
+            "shadow daemon port",
+            CliValueSpec::new("port", "port"),
+        ),
+        CliOptionSpec::flag("--no-start", "install without starting daemons"),
+    ])
+}
+
+fn uninstall_cli_spec() -> CliCommandSpec {
+    CliCommandSpec::new("uninstall", "remove local daemon boot entries").with_options([
+        CliOptionSpec::flag("--no-stop", "leave running daemons untouched"),
+    ])
+}
+
+fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, CliParseError> {
     let mut options = InstallOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "help" | "--help" | "-h" if args.len() == 1 => return Err(CliError::Usage),
-            "--host" => {
-                index += 1;
-                let Some(host) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.host = host.clone();
-            }
-            "--port" => {
-                index += 1;
-                let Some(port) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.port = parse_port("install port", port)?;
-            }
-            "--shadow-port" => {
-                index += 1;
-                let Some(port) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.shadow_port = parse_port("install shadow port", port)?;
-            }
-            "--no-start" => options.start = false,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
+    if let Some(host) = matches.value("--host") {
+        options.host = host.to_string();
     }
+    options.port = matches
+        .value("--port")
+        .map(|value| parse_port("install port", value).map_err(semantic_parse_error))
+        .transpose()?
+        .unwrap_or(options.port);
+    options.shadow_port = matches
+        .value("--shadow-port")
+        .map(|value| parse_port("install shadow port", value).map_err(semantic_parse_error))
+        .transpose()?
+        .unwrap_or(options.shadow_port);
+    options.start = !matches.contains("--no-start");
     Ok(options)
 }
 
-pub(crate) fn parse_uninstall_options(args: &[String]) -> Result<UninstallOptions, CliError> {
-    let mut options = UninstallOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "help" | "--help" | "-h" if args.len() == 1 => return Err(CliError::Usage),
-            "--no-stop" => options.stop = false,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
+fn parse_uninstall_matches(matches: &CliCommandMatches) -> Result<UninstallOptions, CliParseError> {
+    Ok(UninstallOptions {
+        stop: !matches.contains("--no-stop"),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn parse_install_schema_for_test(args: &[String]) -> Result<InstallOptions, CliError> {
+    parse_schema_command_for_test(install_cli_spec(), args, parse_install_matches)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_uninstall_schema_for_test(
+    args: &[String],
+) -> Result<UninstallOptions, CliError> {
+    parse_schema_command_for_test(uninstall_cli_spec(), args, parse_uninstall_matches)
 }
 
 pub(crate) fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {

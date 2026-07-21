@@ -247,6 +247,16 @@ pub struct DfsNamespaceShardCursor {
     pub after_sequence: u64,
 }
 
+/// Authenticated proof for one file in a local-eventual namespace batch.
+///
+/// The replica receipt attests that the requester's content blob is durable.
+/// `expected_base_version` fences an overwrite; `None` is an exclusive create.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsLocalEventualBatchWriteProof {
+    pub expected_base_version: Option<DfsVersion>,
+    pub receipt: DfsReplicaReceiptRecord,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
@@ -342,11 +352,12 @@ pub enum DfsNamespaceOperation {
     LookupPaths {
         paths: Vec<String>,
     },
-    /// Same-shard namespace batch routed to the metadata primary. This is used
-    /// for bulk local-eventual writes so the requester sends one authoritative
-    /// metadata transaction instead of N per-file routed mutations.
-    ApplyTransaction {
+    /// Same-shard local-eventual content commit. The metadata primary validates
+    /// every caller-owned file transition and commits the authenticated durable
+    /// receipts atomically with visible object/version metadata.
+    CommitLocalEventualBatch {
         transaction: DfsNamespaceTransaction,
+        writes: Vec<DfsLocalEventualBatchWriteProof>,
     },
     /// Idempotently applies one durable placement-reconciliation step on the
     /// object's metadata primary. The operation updates the object's policy,
@@ -465,7 +476,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, .. }
             | DfsNamespaceOperation::RenameDirectoryBounded { from, .. } => Some(from.as_str()),
             DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
-            DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
+            DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } => transaction
                 .objects
                 .first()
                 .map(|object| object.path.as_str()),
@@ -508,7 +519,7 @@ impl DfsNamespaceOperation {
                 existing_path,
                 link_path,
             } => vec![existing_path, link_path],
-            DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
+            DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } => transaction
                 .objects
                 .iter()
                 .map(|object| object.path.as_str())

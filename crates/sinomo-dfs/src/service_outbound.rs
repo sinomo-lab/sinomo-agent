@@ -311,11 +311,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsError::from_network)
     }
 
-    pub fn flush_deferred_content_durability(&mut self) -> Result<(), DfsError> {
-        self.content.flush_deferred_durable_dirs()?;
-        Ok(())
-    }
-
     pub(crate) fn send_dfs_message_if_routable_detached(
         &mut self,
         target_node_id: &NodeId,

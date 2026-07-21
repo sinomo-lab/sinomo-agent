@@ -3,7 +3,6 @@ use super::{
     ContentManifest, ContentStoreError, LocalContentStore, Result, VersionManifestEntry,
     decode_manifest, decode_stats_snapshot, encode_stats_snapshot, ensure_bytes_match_hash,
     file_content_hash, publish_file_as_blob, write_content_addressed_blob_bytes,
-    write_content_addressed_blob_bytes_prehashed_defer_durability_existing_parent,
     write_content_addressed_blob_bytes_prehashed_existing_parent,
 };
 use crate::content_store::fs_ops::{
@@ -402,25 +401,6 @@ impl LocalContentStore {
         self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
             before_len, after_len,
         ))
-    }
-
-    pub(super) fn write_tracked_blob_bytes_prehashed_deferred_dir_sync(
-        &self,
-        hash: &str,
-        blob_path: &Path,
-        bytes: &[u8],
-    ) -> Result<()> {
-        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
-            return self.write_tracked_blob_bytes_prehashed(hash, blob_path, bytes);
-        }
-        let deferred =
-            write_content_addressed_blob_bytes_prehashed_defer_durability_existing_parent(
-                hash, blob_path, bytes,
-            )?;
-        if let Some((blob_path, sync_dir)) = deferred {
-            self.defer_durable_blob_sync(blob_path, sync_dir)?;
-        }
-        Ok(())
     }
 
     pub(super) fn publish_tracked_file_as_blob(

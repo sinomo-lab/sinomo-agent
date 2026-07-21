@@ -65,10 +65,11 @@ the performance-refinement obligation.
 
 ## DFS
 
-Completed 2026-07-10: the namespace-command replay slice now captures the full
-requester/command key, exact cached-response replay, FIFO eviction, process
-restart, and requester-local cancellation boundary. It deliberately exposes
-re-execution after cache loss as a remaining durable-idempotency limitation.
+Updated 2026-07-21: the namespace-command replay slice now captures durable
+`Pending`/`Completed` admission keyed by requester and request id, immutable
+full-command identity, exact terminal-result replay across process restart,
+changed-payload rejection, fail-safe interrupted-pending handling, and the
+requester-local cancellation boundary.
 
 Completed 2026-07-10: the canonical POSIX synchronization slices now cover
 whole-file shared/exclusive advisory locks, exact epoch-fenced lock tokens,

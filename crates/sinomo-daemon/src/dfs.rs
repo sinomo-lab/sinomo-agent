@@ -1357,15 +1357,6 @@ fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSe
 // DFS inspection request/response types live in `sinomo-dfs`; this module only
 // adapts them to daemon-local paths and metadata backends.
 
-pub(crate) fn ensure_default_local_dfs_expose(paths: &DaemonPaths) -> Result<(), DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    sinomo_dfs::ensure_default_cluster_aware_dfs_expose_config(&data_dir, &cluster_paths)?;
-    Ok(())
-}
-
 pub(crate) fn open_daemon_dfs_metadata_backend(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,

@@ -685,14 +685,16 @@ or namespace mutation, and a duplicate application attempt leaves the one
 atomic result unchanged.
 
 The Rust refinement is the composition of a `DfsRoutedCall` attachment with the
-single `ObjectRpcSessionCall` contract. The sender carries a typed transaction
-descriptor and its encoded transaction as the semantic request attachment; the
-receiver validates the attachment before restoring and dispatching the
-`ApplyTransaction` operation. This is not a second transfer API or a payload
-size optimization. Concrete transfer-frame chunking, flow-window scheduling,
-relay authentication, retry behavior, resource exhaustion, and
-metadata-backend crash recovery remain in their existing network and
-namespace-transaction proof slices.
+single `ObjectRpcSessionCall` contract. The sender carries a typed
+`CommitLocalEventualBatch` descriptor and its encoded namespace transaction as
+the semantic request attachment. The receiver validates the attachment, the
+authenticated caller-owned file transitions, their expected base versions,
+and one durable content receipt per file before committing the receipts and
+visible metadata atomically on one metadata shard. This is not a second
+transfer API or a payload size optimization. Concrete transfer-frame chunking,
+flow-window scheduling, relay authentication, retry behavior, resource
+exhaustion, and metadata-backend crash recovery remain in their existing
+network and namespace-transaction proof slices.
 
 The `dfs_operation_authority_snapshot_reuse_safety.safety` invariant is the
 core-algorithm target for removing repeated cluster-KV snapshot loads and local
@@ -1553,31 +1555,35 @@ may remain in `pending_routed_writes` as terminal cached results for
 eventual progress, wall-clock timeout fairness, or end-to-end byte-body
 integrity across the DFS and network-session layers.
 
-The `dfs_namespace_command_replay_safety.safety` invariant refines the
-primary-side namespace replay cache and requester cancellation boundary:
+The `dfs_namespace_command_replay_safety.safety` invariant refines durable
+primary-side namespace-request admission and the requester cancellation
+boundary:
 
-- the replay key is the transport requester plus the complete
-  `DfsNamespaceCommand`, not request id alone;
-- an exact resident retry returns the original captured response without
-  executing another namespace effect;
-- changing the operation payload while retaining the request id is a new
-  command and executes normally;
-- cache insertion is FIFO bounded (two entries in the model, corresponding to
-  the production 32-entry `VecDeque`);
-- exact retry after FIFO eviction or process restart may execute the mutation
-  again, so the cache is not a durable exactly-once guarantee;
-- cancellation removes the requester-side wait but cannot retract a command
-  already sent to the metadata primary; and
-- a cancelled call retried with a fresh request id is a new replay key.
+- the durable ledger key is transport requester plus request id, while the row
+  retains a digest-equivalent copy of the complete `DfsNamespaceCommand`;
+- a fresh mutating request durably enters `Pending` before it receives the one
+  transient execution permit;
+- successful completion replaces that row with `Completed` and the terminal
+  result, so an exact retry returns the durable result without another
+  namespace effect, including after process restart;
+- reusing the same requester/request identity with a changed command is
+  rejected instead of being interpreted as new work;
+- restart after admission but before terminal result publication leaves an
+  indeterminate `Pending` row; an exact retry is rejected and never recreates
+  the execution permit;
+- cancellation removes the requester-side wait but cannot retract an already
+  admitted command; and
+- a cancelled call retried with a fresh request id is explicitly new work.
 
 This maps to `NetworkedDfsService::handle_namespace_request`,
-`served_namespace_replays`, `settle_routed_namespace_op_inner`, process-local
-service-state initialization, and fresh request-id allocation. Named witnesses
-make both the protected exact-retry path and the eviction, restart, changed
-payload, and cancellation limitations executable. The existing Rust regression
-`served_namespace_exact_retry_replays_completed_rename` covers the resident
-exact-retry case; durable domain idempotency after cache loss remains a separate
-hardening problem.
+`admit_durable_namespace_request`, `complete_durable_namespace_request`, the
+metadata backend's namespace-request table, process restart, and fresh
+request-id allocation. Named witnesses cover exact completed replay,
+changed-payload rejection, cancellation, completed replay after restart, and
+the fail-safe interrupted-`Pending` boundary. The Rust regressions
+`durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse`
+and `durable_pending_namespace_request_is_not_reexecuted_after_restart` cover
+the two restart-sensitive paths.
 
 The `dfs_repair_content_validation_safety.safety` invariant combines these properties:
 
@@ -2159,9 +2165,10 @@ normal script path instead of symbolically verified as a routine gate; a
 broader random exploration and seed-based replay.
 
 The namespace-command replay slice uses
-`QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS`, defaulting to 5; its 5-step
-Apalache check passed, while a fixed-seed 5,000-trace run reached all six
-resident-replay and cache-loss/cancellation witnesses.
+`QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS`, defaulting to 5. Its six named
+witnesses cover durable completed replay, changed-payload rejection,
+cancellation, interrupted-pending rejection, replay after restart, and a fresh
+request identity after cancellation.
 
 Use larger bounds for local audit runs, not as a routine CI gate:
 
@@ -2189,8 +2196,8 @@ This slice does not yet model:
   full-duplex session retry budgets, concrete transport nonce entropy, unbounded
   wall-clock fairness, and dynamic module enable/disable races;
 - directory fragments, local-owned owner routing, owner-inclusion replica-set
-  normalization, durable namespace-command idempotency across cache eviction or
-  restart, cross-primary repair handoff progress, router-local recovery after
+  normalization, automated resolution of an interrupted namespace-request
+  `Pending` outcome, cross-primary repair handoff progress, router-local recovery after
   sharded namespace index write failures, patch offset/base semantics,
   read-memory assembly details, distributed anti-entropy repair scheduling
   progress, wall-clock timeout fairness, concrete lock-lease clock bounds,

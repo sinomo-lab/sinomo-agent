@@ -1207,6 +1207,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(())
     }
 
+    /// Durably create or advance one routed namespace request admission record
+    /// on the exact authority shard that will execute the operation.
+    fn put_namespace_request_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        request: &DfsNamespaceRequestRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _ = (shard_id, request);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support durable namespace request admission".to_string(),
+        ))
+    }
+
+    /// Fetch a durable namespace request by authenticated requester and id.
+    fn get_namespace_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespaceRequestRecord>> {
+        let _ = (requester_node_id, request_id);
+        Ok(None)
+    }
+
     /// Create or replace a namespace maintenance job.
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         let _ = job;
@@ -1219,7 +1242,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
-    /// Compatibility helper that drains all namespace jobs.
+    /// Collect all namespace jobs through the bounded paging primitive.
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
         collect_metadata_pages(|cursor| {
             let page = self.list_namespace_jobs_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;

@@ -47,7 +47,6 @@ pub enum CliError {
     Memory(sinomo_memory::MemoryError),
     DfsMetadata(sinomo_runtime::dfs::MetadataBackendError),
     DfsPin(sinomo_runtime::dfs::DfsPinStoreError),
-    DfsExpose(sinomo_runtime::dfs::DfsExposeStoreError),
     Kv(KvError),
     LanguageModel(LanguageModelError),
     Eval(sinomo_runtime::eval::EvalError),
@@ -136,12 +135,6 @@ impl From<sinomo_runtime::dfs::DfsError> for CliError {
 impl From<sinomo_runtime::dfs::DfsPinStoreError> for CliError {
     fn from(error: sinomo_runtime::dfs::DfsPinStoreError) -> Self {
         Self::DfsPin(error)
-    }
-}
-
-impl From<sinomo_runtime::dfs::DfsExposeStoreError> for CliError {
-    fn from(error: sinomo_runtime::dfs::DfsExposeStoreError) -> Self {
-        Self::DfsExpose(error)
     }
 }
 
@@ -294,6 +287,9 @@ impl From<CliParseError> for CliError {
         match error {
             CliParseError::Usage => Self::Usage,
             CliParseError::Parse { detail } => Self::Parse { detail },
+            error @ CliParseError::InvalidUsage { .. } => Self::Parse {
+                detail: error.to_string(),
+            },
         }
     }
 }
@@ -507,7 +503,6 @@ impl std::fmt::Display for CliError {
             Self::Memory(error) => write!(formatter, "{error}"),
             Self::DfsMetadata(error) => write!(formatter, "{error}"),
             Self::DfsPin(error) => write!(formatter, "{error}"),
-            Self::DfsExpose(error) => write!(formatter, "{error}"),
             Self::Kv(error) => write!(formatter, "{error}"),
             Self::LanguageModel(error) => write!(formatter, "{error}"),
             Self::Eval(error) => write!(formatter, "{error}"),

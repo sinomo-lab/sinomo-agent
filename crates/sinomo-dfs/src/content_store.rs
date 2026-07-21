@@ -387,7 +387,6 @@ pub struct LocalContentStore {
     root: PathBuf,
     quota: Option<ContentStoreQuota>,
     quota_stats_initialized: Arc<AtomicBool>,
-    deferred_durable_blobs: Arc<Mutex<BTreeMap<PathBuf, PathBuf>>>,
     packed_index_cache: Arc<Mutex<PackedBlobIndexCache>>,
 }
 
@@ -445,12 +444,6 @@ struct VersionManifestEntry {
     extent_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlobOnlyDurability {
-    Deferred,
-    Synchronous,
-}
-
 struct PreparedSmallObjectVersion<'a> {
     bytes: &'a [u8],
     blob_path: PathBuf,
@@ -492,7 +485,6 @@ impl LocalContentStore {
             // not trusted for quota admission until this process has rebuilt
             // it from the durable store while quota mode is active.
             quota_stats_initialized: Arc::new(AtomicBool::new(false)),
-            deferred_durable_blobs: Arc::new(Mutex::new(BTreeMap::new())),
             packed_index_cache: Arc::new(Mutex::new(PackedBlobIndexCache::default())),
         }
     }
@@ -574,6 +566,9 @@ impl LocalContentStore {
         self.write_small_object_versions_batch(&versions)
     }
 
+    /// Durably stores content-addressed blobs without publishing per-object
+    /// manifests. Callers may publish visible metadata immediately after this
+    /// method returns.
     pub fn put_object_version_blobs_only<'a, I>(&self, versions: I) -> Result<Vec<ContentManifest>>
     where
         I: IntoIterator<Item = (&'a str, &'a str, &'a [u8])>,
@@ -589,12 +584,7 @@ impl LocalContentStore {
             return versions
                 .into_iter()
                 .map(|(object_id, version, bytes)| {
-                    self.write_object_version_blob_only(
-                        object_id,
-                        version,
-                        bytes,
-                        BlobOnlyDurability::Deferred,
-                    )
+                    self.write_object_version_blob_only(object_id, version, bytes)
                 })
                 .collect();
         }
@@ -646,7 +636,7 @@ impl LocalContentStore {
                 manifests.push(manifest);
             }
             self.ensure_quota_delta(quota_delta)?;
-            let blob_delta = self.write_packed_blobs_unlocked_relaxed(&mut index, &blob_writes)?;
+            let blob_delta = self.write_packed_blobs_unlocked(&mut index, &blob_writes)?;
             if !blob_delta.is_zero() {
                 self.apply_stats_delta(blob_delta)?;
             }
@@ -660,21 +650,7 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
-        self.write_object_version_blob_only(object_id, version, bytes, BlobOnlyDurability::Deferred)
-    }
-
-    pub fn put_object_version_blob_only_durable(
-        &self,
-        object_id: &str,
-        version: &str,
-        bytes: &[u8],
-    ) -> Result<ContentManifest> {
-        self.write_object_version_blob_only(
-            object_id,
-            version,
-            bytes,
-            BlobOnlyDurability::Synchronous,
-        )
+        self.write_object_version_blob_only(object_id, version, bytes)
     }
 
     pub fn put_blob_only_manifest(
@@ -700,46 +676,6 @@ impl LocalContentStore {
             size_bytes,
             extents: Vec::new(),
         })
-    }
-
-    pub fn flush_deferred_durable_dirs(&self) -> Result<()> {
-        let blobs = {
-            let mut blobs =
-                self.deferred_durable_blobs
-                    .lock()
-                    .map_err(|_| ContentStoreError::Io {
-                        path: self.root.clone(),
-                        source: io::Error::other("deferred durable blob lock is poisoned"),
-                    })?;
-            std::mem::take(&mut *blobs)
-        };
-        let mut dirs = BTreeSet::new();
-        for (blob_path, dir) in blobs {
-            let file = fs::File::open(&blob_path).map_err(|source| ContentStoreError::Io {
-                path: blob_path.clone(),
-                source,
-            })?;
-            file.sync_data().map_err(|source| ContentStoreError::Io {
-                path: blob_path,
-                source,
-            })?;
-            dirs.insert(dir);
-        }
-        for dir in dirs {
-            sync_dir(&dir)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_deferred_durable_blob_count(&self) -> Result<usize> {
-        self.deferred_durable_blobs
-            .lock()
-            .map(|blobs| blobs.len())
-            .map_err(|_| ContentStoreError::Io {
-                path: self.root.clone(),
-                source: io::Error::other("deferred durable blob lock is poisoned"),
-            })
     }
 
     pub fn put_object_version_from_reader<R: Read>(
@@ -2243,7 +2179,6 @@ impl LocalContentStore {
         object_id: &str,
         version: &str,
         bytes: &[u8],
-        durability: BlobOnlyDurability,
     ) -> Result<ContentManifest> {
         let trace_started = Instant::now();
         let manifest_check_started = Instant::now();
@@ -2275,8 +2210,8 @@ impl LocalContentStore {
         }
         let manifest_check_ms = manifest_check_started.elapsed().as_millis();
 
-        if self.uses_streamed_blob_only_deferred_path(durability, bytes.len()) {
-            return self.write_object_version_blob_only_streamed_deferred(
+        if self.uses_streamed_blob_only_path(bytes.len()) {
+            return self.write_object_version_blob_only_streamed_durable(
                 object_id,
                 version,
                 bytes,
@@ -2297,26 +2232,12 @@ impl LocalContentStore {
             extents: Vec::new(),
         };
 
-        let defer_blob_dir_sync =
-            durability == BlobOnlyDurability::Deferred && !self.tracks_stats_deltas();
         let has_blob_started = Instant::now();
-        let blob_exists = if defer_blob_dir_sync {
-            false
-        } else {
-            self.has_blob(&manifest.content_hash)?
-        };
+        let blob_exists = self.has_blob(&manifest.content_hash)?;
         let has_blob_ms = has_blob_started.elapsed().as_millis();
         let mut quota_ms = 0;
         let mut blob_write_ms = 0;
-        if defer_blob_dir_sync {
-            let blob_write_started = Instant::now();
-            self.write_tracked_blob_bytes_prehashed_deferred_dir_sync(
-                &manifest.content_hash,
-                &blob_path,
-                bytes,
-            )?;
-            blob_write_ms = blob_write_started.elapsed().as_millis();
-        } else if !blob_exists {
+        if !blob_exists {
             let quota_started = Instant::now();
             self.ensure_quota_delta(ContentStoreQuotaDelta {
                 blob_bytes: projected_file_growth(&blob_path, manifest.size_bytes)?,
@@ -2343,7 +2264,7 @@ impl LocalContentStore {
         Ok(manifest)
     }
 
-    fn write_object_version_blob_only_streamed_deferred(
+    fn write_object_version_blob_only_streamed_durable(
         &self,
         object_id: &str,
         version: &str,
@@ -2375,6 +2296,10 @@ impl LocalContentStore {
                         source,
                     })?;
             }
+            file.sync_all().map_err(|source| ContentStoreError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
             drop(file);
             let stream_hash_write_ms = stream_started.elapsed().as_millis();
             let hash = format!("{HASH_PREFIX}{}", hasher.finalize().to_hex());
@@ -2409,7 +2334,7 @@ impl LocalContentStore {
                     Ok(()) => {
                         remove_file_if_exists(&tmp_path)?;
                         if let Some(parent) = blob_path.parent() {
-                            self.defer_durable_blob_sync(blob_path.clone(), parent.to_path_buf())?;
+                            sync_dir(parent)?;
                         }
                     }
                     Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -2452,13 +2377,8 @@ impl LocalContentStore {
         result
     }
 
-    fn uses_streamed_blob_only_deferred_path(
-        &self,
-        durability: BlobOnlyDurability,
-        bytes_len: usize,
-    ) -> bool {
-        durability == BlobOnlyDurability::Deferred
-            && self.quota.is_none()
+    fn uses_streamed_blob_only_path(&self, bytes_len: usize) -> bool {
+        self.quota.is_none()
             && !self.tracks_stats_deltas()
             && bytes_len >= STREAMED_BLOB_ONLY_MIN_BYTES
     }
@@ -2734,17 +2654,6 @@ impl LocalContentStore {
         ))?;
         self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
-    }
-
-    fn defer_durable_blob_sync(&self, blob_path: PathBuf, dir: PathBuf) -> Result<()> {
-        self.deferred_durable_blobs
-            .lock()
-            .map_err(|_| ContentStoreError::Io {
-                path: dir.clone(),
-                source: io::Error::other("deferred durable blob lock is poisoned"),
-            })?
-            .insert(blob_path, dir);
-        Ok(())
     }
 
     fn collect_version_manifest_entries(
@@ -4226,87 +4135,6 @@ fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync(
     write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(hash, blob_path, bytes, true)
 }
 
-fn write_content_addressed_blob_bytes_prehashed_defer_durability_existing_parent(
-    hash: &str,
-    blob_path: &Path,
-    bytes: &[u8],
-) -> Result<Option<(PathBuf, PathBuf)>> {
-    let trace_started = Instant::now();
-    let existing_check_started = Instant::now();
-    if blob_path.is_file() {
-        if file_content_hash(blob_path).is_ok_and(|actual| actual == hash) {
-            content_store_perf_trace(format_args!(
-                "content-addressed-blob-write hash={} bytes={} existing=true create_dir_ms=0 existing_check_ms={} total_ms={}",
-                hash,
-                bytes.len(),
-                existing_check_started.elapsed().as_millis(),
-                trace_started.elapsed().as_millis()
-            ));
-            return Ok(None);
-        }
-        remove_file_if_exists(blob_path)?;
-    }
-    let existing_check_ms = existing_check_started.elapsed().as_millis();
-
-    let write_started = Instant::now();
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(blob_path)
-    {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            if file_content_hash(blob_path).is_ok_and(|actual| actual == hash) {
-                content_store_perf_trace(format_args!(
-                    "content-addressed-blob-write hash={} bytes={} existing_race=true create_dir_ms=0 existing_check_ms={} total_ms={}",
-                    hash,
-                    bytes.len(),
-                    existing_check_ms,
-                    trace_started.elapsed().as_millis()
-                ));
-                return Ok(None);
-            }
-            remove_file_if_exists(blob_path)?;
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(blob_path)
-                .map_err(|source| ContentStoreError::Io {
-                    path: blob_path.to_owned(),
-                    source,
-                })?
-        }
-        Err(source) => {
-            return Err(ContentStoreError::Io {
-                path: blob_path.to_owned(),
-                source,
-            });
-        }
-    };
-    if let Err(source) = file.write_all(bytes) {
-        drop(file);
-        remove_file_if_exists(blob_path).ok();
-        return Err(ContentStoreError::Io {
-            path: blob_path.to_owned(),
-            source,
-        });
-    }
-    drop(file);
-    let write_ms = write_started.elapsed().as_millis();
-    let Some(sync_dir) = blob_path.parent().map(Path::to_path_buf) else {
-        return Ok(None);
-    };
-    content_store_perf_trace(format_args!(
-        "content-addressed-blob-write hash={} bytes={} existing=false create_dir_ms=0 existing_check_ms={} write_ms={} sync_file_ms=deferred sync_dir_ms=deferred total_ms={}",
-        hash,
-        bytes.len(),
-        existing_check_ms,
-        write_ms,
-        trace_started.elapsed().as_millis()
-    ));
-    Ok(Some((blob_path.to_owned(), sync_dir)))
-}
-
 fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
     hash: &str,
     blob_path: &Path,
@@ -4658,8 +4486,9 @@ mod tests {
     }
 
     #[test]
-    fn no_quota_status_snapshot_preserves_streamed_blob_only_branch() {
-        let root = temp_root("no_quota_status_snapshot_preserves_streamed_blob_only_branch");
+    fn no_quota_status_snapshot_preserves_streamed_durable_blob_only_branch() {
+        let root =
+            temp_root("no_quota_status_snapshot_preserves_streamed_durable_blob_only_branch");
         let store = LocalContentStore::new(&root).expect("create store");
         let bytes = vec![0x71; STREAMED_BLOB_ONLY_MIN_BYTES + 4096];
 
@@ -4667,9 +4496,7 @@ mod tests {
         assert_eq!(empty, ContentStoreStats::default());
         let snapshot_before_write = read_file(&store.stats_snapshot_path()).expect("read snapshot");
         assert!(!store.tracks_stats_deltas());
-        assert!(
-            store.uses_streamed_blob_only_deferred_path(BlobOnlyDurability::Deferred, bytes.len())
-        );
+        assert!(store.uses_streamed_blob_only_path(bytes.len()));
 
         let manifest = store
             .put_object_version_blob_only("object-blob-only-large", "v1", &bytes)
@@ -4699,13 +4526,13 @@ mod tests {
     }
 
     #[test]
-    fn put_object_version_blob_only_durable_large_blob_skips_manifest() {
-        let root = temp_root("put_object_version_blob_only_durable_large_blob_skips_manifest");
+    fn put_object_version_blob_only_large_blob_skips_manifest() {
+        let root = temp_root("put_object_version_blob_only_large_blob_skips_manifest");
         let store = LocalContentStore::new(&root).expect("create store");
         let bytes = vec![0x73; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 4096];
 
         let manifest = store
-            .put_object_version_blob_only_durable("object-blob-only-durable-large", "v1", &bytes)
+            .put_object_version_blob_only("object-blob-only-durable-large", "v1", &bytes)
             .expect("put durable blob-only large object");
 
         assert_eq!(

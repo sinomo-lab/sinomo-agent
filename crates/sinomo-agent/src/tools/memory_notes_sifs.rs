@@ -24,7 +24,20 @@ const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const MEMORY_NOTE_LIST_PAGE_SIZE: usize = 128;
 const MAX_MEMORY_SEARCH_OVERLAP_BYTES: usize =
     super::memory_notes::MAX_MEMORY_NOTE_QUERY_BYTES * 4 + 16;
-const MEMORY_NOTE_SEARCH_CURSOR_PREFIX: &str = "sifs-memory-v2.";
+const MEMORY_NOTE_SEARCH_CURSOR_PREFIX: &str = "vfs-memory-v3.";
+const LEGACY_MEMORY_NOTE_SEARCH_CURSOR_PREFIX: &str = "sifs-memory-v2.";
+
+fn memory_note_root(agent_key: &str) -> Result<String, MemoryNoteBackendError> {
+    if agent_key.trim().is_empty() {
+        return Err(MemoryNoteBackendError::Invalid {
+            detail: "agent key for the memory-note root is empty".to_string(),
+        });
+    }
+    Ok(format!(
+        "{}/{MEMORY_NOTES_DIRECTORY}",
+        super::local_workspace::agent_home_sifs_path_for_id(agent_key)
+    ))
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SifsMemorySearchCursorState {
@@ -76,35 +89,58 @@ struct CachedMemoryDirectoryPage {
 }
 
 #[derive(Clone)]
-struct SifsMemoryVfs {
+struct MemoryNoteVfs {
     scoped: VfsHandle,
 }
 
-/// SIFS-backed Markdown notes confined to one agent's canonical home.
+/// VFS-backed Markdown notes confined to one agent's canonical home.
 ///
 /// The identity and root are injected by the host. Model input is always a
 /// validated relative `.md` path, so it cannot select another agent's home.
-pub struct SifsMemoryNoteBackend {
-    data_dir: PathBuf,
+/// Any VFS backend used here must implement the guarded no-link and versioned
+/// operations; unsupported backends fail closed.
+pub struct VfsMemoryNoteBackend {
+    sifs_data_dir: Option<PathBuf>,
     root: String,
-    vfs: Mutex<Option<SifsMemoryVfs>>,
+    vfs: Mutex<Option<MemoryNoteVfs>>,
 }
 
-impl SifsMemoryNoteBackend {
+/// Compatibility name for the normal runtime constructor, which lazily opens
+/// the agent's roaming SIFS-backed VFS.
+pub type SifsMemoryNoteBackend = VfsMemoryNoteBackend;
+
+impl VfsMemoryNoteBackend {
     pub fn new(data_dir: &SinomoDataDir, agent_key: &str) -> Result<Self, MemoryNoteBackendError> {
-        if agent_key.trim().is_empty() {
-            return Err(MemoryNoteBackendError::Invalid {
-                detail: "agent key for the memory-note root is empty".to_string(),
-            });
-        }
-        let root = format!(
-            "{}/{MEMORY_NOTES_DIRECTORY}",
-            super::local_workspace::agent_home_sifs_path_for_id(agent_key)
-        );
+        let root = memory_note_root(agent_key)?;
         Ok(Self {
-            data_dir: data_dir.root().to_path_buf(),
+            sifs_data_dir: Some(data_dir.root().to_path_buf()),
             root,
             vfs: Mutex::new(None),
+        })
+    }
+
+    /// Bind memory notes to an already-authorized VFS instead of opening DFS.
+    /// This is used by local/in-memory hosts and the memory-tools benchmark.
+    pub fn from_vfs(
+        filesystem: VfsHandle,
+        agent_key: &str,
+    ) -> Result<Self, MemoryNoteBackendError> {
+        let root = memory_note_root(agent_key)?;
+        filesystem
+            .create_dir_all_beneath_no_links(&root)
+            .map_err(|source| MemoryNoteBackendError::Unavailable {
+                detail: format!("cannot create agent memory-note VFS root {root}: {source}"),
+            })?;
+        let scoped =
+            filesystem
+                .scoped(&root)
+                .map_err(|source| MemoryNoteBackendError::Unavailable {
+                    detail: format!("cannot scope agent memory-note VFS root {root}: {source}"),
+                })?;
+        Ok(Self {
+            sifs_data_dir: None,
+            root,
+            vfs: Mutex::new(Some(MemoryNoteVfs { scoped })),
         })
     }
 
@@ -112,12 +148,12 @@ impl SifsMemoryNoteBackend {
         &self.root
     }
 
-    fn vfs_handles(&self) -> Result<SifsMemoryVfs, MemoryNoteBackendError> {
+    fn vfs_handles(&self) -> Result<MemoryNoteVfs, MemoryNoteBackendError> {
         let mut cached = self
             .vfs
             .lock()
             .map_err(|_| MemoryNoteBackendError::Unavailable {
-                detail: "memory-note SIFS handle cache is poisoned".to_string(),
+                detail: "memory-note VFS handle cache is poisoned".to_string(),
             })?;
         if let Some(vfs) = cached.as_ref() {
             return Ok(vfs.clone());
@@ -125,7 +161,13 @@ impl SifsMemoryNoteBackend {
         // Memory notes are the agent's authoritative roaming home, not a
         // best-effort node-local catalog. Use distributed SIFS reads so a
         // newly placed agent cannot silently observe an incomplete mirror.
-        let filesystem = mounted_sifs(Some(self.data_dir.clone())).map_err(|source| {
+        let data_dir =
+            self.sifs_data_dir
+                .as_ref()
+                .ok_or_else(|| MemoryNoteBackendError::Unavailable {
+                    detail: "injected memory-note VFS handle is unavailable".to_string(),
+                })?;
+        let filesystem = mounted_sifs(Some(data_dir.clone())).map_err(|source| {
             MemoryNoteBackendError::Unavailable {
                 detail: format!(
                     "cannot open agent memory-note SIFS root {}: {source}",
@@ -141,14 +183,14 @@ impl SifsMemoryNoteBackend {
                 ),
             }
         })?;
-        let vfs = SifsMemoryVfs { scoped };
+        let vfs = MemoryNoteVfs { scoped };
         *cached = Some(vfs.clone());
         Ok(vfs)
     }
 
     fn read_search_range(
         &self,
-        vfs: &SifsMemoryVfs,
+        vfs: &MemoryNoteVfs,
         path: &MemoryNotePath,
         offset: u64,
         max_bytes: u64,
@@ -168,7 +210,7 @@ impl SifsMemoryNoteBackend {
 
     fn prepare_note_parent(
         &self,
-        vfs: &SifsMemoryVfs,
+        vfs: &MemoryNoteVfs,
         path: &MemoryNotePath,
     ) -> Result<(), MemoryNoteBackendError> {
         let relative_parent = path
@@ -189,7 +231,7 @@ impl SifsMemoryNoteBackend {
     }
 }
 
-impl MemoryNoteBackend for SifsMemoryNoteBackend {
+impl MemoryNoteBackend for VfsMemoryNoteBackend {
     fn search(
         &self,
         request: MemoryNoteSearchRequest,
@@ -857,6 +899,11 @@ fn decode_memory_search_cursor(
     let encoded = cursor
         .as_str()
         .strip_prefix(MEMORY_NOTE_SEARCH_CURSOR_PREFIX)
+        .or_else(|| {
+            cursor
+                .as_str()
+                .strip_prefix(LEGACY_MEMORY_NOTE_SEARCH_CURSOR_PREFIX)
+        })
         .ok_or_else(|| MemoryNoteBackendError::Invalid {
             detail: "memory search cursor belongs to another backend".to_string(),
         })?;
@@ -952,7 +999,7 @@ fn memory_note_version_from_metadata(
             .ok_or_else(|| MemoryNoteBackendError::Unavailable {
                 detail: format!("memory note `{path}` has no storage version"),
             })?;
-    MemoryNoteVersion::new(format!("sifs:v1:{object_id}:{version}")).map_err(|source| {
+    MemoryNoteVersion::new(format!("vfs:v1:{object_id}:{version}")).map_err(|source| {
         MemoryNoteBackendError::Invalid {
             detail: format!("memory note `{path}` has an invalid version token: {source}"),
         }
@@ -964,7 +1011,8 @@ fn parse_memory_note_version<'a>(
     token: &'a MemoryNoteVersion,
 ) -> Result<(&'a str, &'a str), MemoryNoteBackendError> {
     let mut parts = token.as_str().split(':');
-    let valid_prefix = parts.next() == Some("sifs") && parts.next() == Some("v1");
+    let backend = parts.next();
+    let valid_prefix = matches!(backend, Some("vfs" | "sifs")) && parts.next() == Some("v1");
     let object_id = parts.next();
     let version = parts.next();
     if !valid_prefix
@@ -973,7 +1021,7 @@ fn parse_memory_note_version<'a>(
         || parts.next().is_some()
     {
         return Err(MemoryNoteBackendError::Invalid {
-            detail: format!("memory note `{path}` has an invalid SIFS version token"),
+            detail: format!("memory note `{path}` has an invalid VFS version token"),
         });
     }
     Ok((object_id.expect("checked"), version.expect("checked")))
@@ -1016,6 +1064,52 @@ mod tests {
 
     fn path(value: &str) -> MemoryNotePath {
         MemoryNotePath::new(value).expect("valid memory-note path")
+    }
+
+    #[test]
+    fn memory_notes_use_an_injected_memory_vfs_without_dfs() {
+        let backend = VfsMemoryNoteBackend::from_vfs(VfsHandle::memory(), "main-agent")
+            .expect("in-memory backend");
+        let cancellation = AgentCancellationToken::new();
+        let note_path = path("benchmarks/history.md");
+        let created = backend
+            .write(
+                MemoryNoteWriteRequest {
+                    path: note_path.clone(),
+                    markdown: "Remember the in-memory VFS needle.\n".to_string(),
+                    precondition: MemoryNoteWritePrecondition::CreateNew,
+                },
+                &cancellation,
+            )
+            .expect("write in-memory note");
+        assert!(created.version.as_str().starts_with("vfs:v1:"));
+
+        let page = backend
+            .search(
+                MemoryNoteSearchRequest {
+                    query: "VFS needle".to_string(),
+                    cursor: None,
+                    max_results: 10,
+                    max_output_bytes: 64 * 1024,
+                },
+                &cancellation,
+            )
+            .expect("search in-memory note");
+        assert_eq!(page.matches.len(), 1, "{page:#?}");
+        assert_eq!(page.matches[0].path, note_path);
+
+        let read = backend
+            .read(
+                MemoryNoteReadRequest {
+                    path: note_path,
+                    offset: 0,
+                    max_bytes: 4 * 1024,
+                    expected_version: Some(created.version),
+                },
+                &cancellation,
+            )
+            .expect("read in-memory note");
+        assert!(read.markdown.contains("in-memory VFS needle"));
     }
 
     #[test]

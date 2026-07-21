@@ -1,4 +1,7 @@
 use super::*;
+use sinomo_runtime::cli_registry::{
+    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec, CliParseError, CliValueSpec,
+};
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 #[allow(unused_imports)]
@@ -6,7 +9,6 @@ use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonCliCommand {
-    Help,
     Run(DaemonRunOptions),
     Start(DaemonRunOptions),
     Status(DaemonRunOptions),
@@ -24,94 +26,96 @@ pub(crate) fn print_daemon_platform(status: &DaemonStatus) {
     }
 }
 
-pub(crate) fn parse_daemon_command(args: &[String]) -> Result<DaemonCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(DaemonCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(DaemonCliCommand::Help)
-        }
-        Some((command, rest)) if command == "shadow" => parse_shadow_daemon_command(rest),
-        Some((command, rest)) if command == "run" => {
-            Ok(DaemonCliCommand::Run(parse_daemon_run_options(rest)?))
-        }
-        Some((command, rest)) if command == "start" => {
-            Ok(DaemonCliCommand::Start(parse_daemon_run_options(rest)?))
-        }
-        Some((command, rest)) if command == "status" => {
-            Ok(DaemonCliCommand::Status(parse_daemon_run_options(rest)?))
-        }
-        Some((command, rest)) if command == "stop" => {
-            Ok(DaemonCliCommand::Stop(parse_daemon_run_options(rest)?))
-        }
-        Some((command, [])) if command == "__complete-shadow-rollout" => {
-            Ok(DaemonCliCommand::CompleteShadowRollout)
-        }
-        _ => Err(CliError::Usage),
-    }
+pub(crate) fn daemon_cli_command_handler() -> DeclarativeCommandHandler<DaemonCliCommand> {
+    DeclarativeCommandHandler::new(
+        "daemon",
+        CliCommandPolicy::default(),
+        daemon_cli_spec,
+        parse_daemon_matches,
+        run_daemon_cli_command,
+    )
 }
 
-pub(crate) fn parse_shadow_daemon_command(args: &[String]) -> Result<DaemonCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(DaemonCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(DaemonCliCommand::Help)
-        }
-        Some((command, rest)) if command == "run" => Ok(DaemonCliCommand::ShadowRun(
-            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
-        )),
-        Some((command, rest)) if command == "start" => Ok(DaemonCliCommand::ShadowStart(
-            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
-        )),
-        Some((command, rest)) if command == "status" => Ok(DaemonCliCommand::ShadowStatus(
-            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
-        )),
-        Some((command, rest)) if command == "stop" => Ok(DaemonCliCommand::ShadowStop(
-            parse_daemon_options_with_default(rest, DaemonRunOptions::shadow_default())?,
-        )),
-        _ => Err(CliError::Usage),
-    }
+fn daemon_cli_spec() -> CliCommandSpec {
+    let daemon_action = |name: &'static str, about: &'static str| {
+        CliCommandSpec::new(name, about).with_options([
+            CliOptionSpec::value(
+                "--host",
+                "daemon bind host",
+                CliValueSpec::new("host", "host"),
+            ),
+            CliOptionSpec::value("--port", "daemon port", CliValueSpec::new("port", "port")),
+        ])
+    };
+    CliCommandSpec::new("daemon", "control local Sinomo daemons")
+        .help_on_empty()
+        .with_children([
+            daemon_action("run", "run the main daemon in the foreground"),
+            daemon_action("start", "start the main daemon detached"),
+            daemon_action("status", "show main daemon status"),
+            daemon_action("stop", "stop the main daemon"),
+            CliCommandSpec::new("shadow", "control the shadow daemon")
+                .help_on_empty()
+                .with_children([
+                    daemon_action("run", "run the shadow daemon in the foreground"),
+                    daemon_action("start", "start the shadow daemon detached"),
+                    daemon_action("status", "show shadow daemon status"),
+                    daemon_action("stop", "stop the shadow daemon"),
+                ]),
+            CliCommandSpec::new(
+                "__complete-shadow-rollout",
+                "complete a deferred shadow rollout",
+            )
+            .hidden(),
+        ])
 }
 
-pub(crate) fn parse_daemon_run_options(args: &[String]) -> Result<DaemonRunOptions, CliError> {
-    parse_daemon_options_with_default(args, DaemonRunOptions::default())
-}
-
-pub(crate) fn parse_daemon_options_with_default(
-    args: &[String],
+fn daemon_options_from_matches(
+    matches: &CliCommandMatches,
     mut options: DaemonRunOptions,
-) -> Result<DaemonRunOptions, CliError> {
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--host" => {
-                index += 1;
-                let Some(host) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.host = host.clone();
-            }
-            "--port" => {
-                index += 1;
-                let Some(port) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.port = port.parse::<u16>().map_err(|source| CliError::Parse {
-                    detail: format!("invalid daemon port `{port}`: {source}"),
-                })?;
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
+) -> Result<DaemonRunOptions, CliParseError> {
+    if let Some(host) = matches.value("--host") {
+        options.host = host.to_string();
+    }
+    if let Some(port) = matches.value("--port") {
+        options.port = port.parse::<u16>().map_err(|source| CliParseError::Parse {
+            detail: format!("invalid daemon port `{port}`: {source}"),
+        })?;
     }
     Ok(options)
 }
 
+fn parse_daemon_matches(matches: &CliCommandMatches) -> Result<DaemonCliCommand, CliParseError> {
+    let path = matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let main = || daemon_options_from_matches(matches, DaemonRunOptions::default());
+    let shadow = || daemon_options_from_matches(matches, DaemonRunOptions::shadow_default());
+    match path.as_slice() {
+        ["daemon", "run"] => main().map(DaemonCliCommand::Run),
+        ["daemon", "start"] => main().map(DaemonCliCommand::Start),
+        ["daemon", "status"] => main().map(DaemonCliCommand::Status),
+        ["daemon", "stop"] => main().map(DaemonCliCommand::Stop),
+        ["daemon", "shadow", "run"] => shadow().map(DaemonCliCommand::ShadowRun),
+        ["daemon", "shadow", "start"] => shadow().map(DaemonCliCommand::ShadowStart),
+        ["daemon", "shadow", "status"] => shadow().map(DaemonCliCommand::ShadowStatus),
+        ["daemon", "shadow", "stop"] => shadow().map(DaemonCliCommand::ShadowStop),
+        ["daemon", "__complete-shadow-rollout"] => Ok(DaemonCliCommand::CompleteShadowRollout),
+        _ => Err(CliParseError::Parse {
+            detail: "daemon requires a subcommand".to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parse_daemon_schema_for_test(args: &[String]) -> Result<DaemonCliCommand, CliError> {
+    parse_schema_command_for_test(daemon_cli_spec(), args, parse_daemon_matches)
+}
+
 pub(crate) fn run_daemon_cli_command(command: DaemonCliCommand) -> Result<(), CliError> {
     match command {
-        DaemonCliCommand::Help => {
-            print_daemon_help();
-            Ok(())
-        }
         DaemonCliCommand::Run(options) => run_daemon(options),
         DaemonCliCommand::Start(options) => start_daemon(options),
         DaemonCliCommand::Status(options) => print_daemon_status(options),

@@ -3594,7 +3594,9 @@ fn errno_for_posix_error(error: DfsPosixError) -> libc::c_int {
         // In-flight cross-shard moves reject mutations transiently; tell the
         // application to retry rather than reporting an I/O failure.
         DfsPosixError::Dfs(DfsError::Busy { .. }) => libc::EAGAIN,
-        DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) => libc::EIO,
+        DfsPosixError::PartialBulkCommit { .. }
+        | DfsPosixError::Dfs(_)
+        | DfsPosixError::Metadata(_) => libc::EIO,
     }
 }
 

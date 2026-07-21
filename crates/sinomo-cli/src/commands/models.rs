@@ -1,4 +1,9 @@
 use super::*;
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteChoice, CliCommand as RegisteredCommand, CliCommandError, CliCommandHandler,
+    CliCommandHelp, CliCommandMatches, CliCommandParseOutcome, CliCommandPolicy, CliCommandSpec,
+    CliOptionSpec, CliParseError, CliValueSpec,
+};
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
@@ -10,9 +15,10 @@ pub(crate) struct ModelDefaultOptions {
     pub(crate) model: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ModelsCliCommand {
-    Help,
+    Overview,
+    Help(CliCommandHelp),
     List(ModelListOptions),
     Default(ModelDefaultOptions),
     Options(ModelOptionsCliCommand),
@@ -73,94 +79,330 @@ pub(crate) struct ModelRuntimeSetOptions {
     pub(crate) pytorch_mock: Option<bool>,
 }
 
-pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(ModelsCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(ModelsCliCommand::Help)
-        }
-        Some((command, rest)) if command == "list" => {
-            Ok(ModelsCliCommand::List(parse_models_list_options(rest)?))
-        }
-        Some((command, rest)) if command == "default" => Ok(ModelsCliCommand::Default(
-            parse_model_default_options(rest)?,
-        )),
-        Some((command, rest)) if command == "options" => Ok(ModelsCliCommand::Options(
-            parse_model_options_command(rest)?,
-        )),
-        Some((command, rest)) if command == "runtime" => Ok(ModelsCliCommand::Runtime(
-            parse_models_runtime_command(rest)?,
-        )),
-        _ => Err(CliError::Usage),
+const MODELS_COMMAND_NAME: &str = "models";
+const MODELS_POLICY: CliCommandPolicy = CliCommandPolicy::local_capable();
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ModelsCliCommandHandler;
+
+pub(crate) fn models_cli_command_handler() -> ModelsCliCommandHandler {
+    ModelsCliCommandHandler
+}
+
+impl CliCommandHandler for ModelsCliCommandHandler {
+    fn metadata(&self) -> sinomo_runtime::cli_registry::CliCommandMetadata {
+        models_cli_spec().metadata(MODELS_POLICY)
+    }
+
+    fn specification(&self) -> Option<CliCommandSpec> {
+        Some(models_cli_spec())
+    }
+
+    fn parse(&self, args: &[String]) -> Result<Box<dyn RegisteredCommand>, CliParseError> {
+        Ok(Box::new(ModelsCliCommandRunner {
+            command: parse_models_command(args)?,
+        }))
     }
 }
 
-pub(crate) fn parse_model_options_command(
-    args: &[String],
-) -> Result<ModelOptionsCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(ModelOptionsCliCommand::Show(parse_model_options_target(
-            &[],
-            false,
+#[derive(Debug)]
+struct ModelsCliCommandRunner {
+    command: ModelsCliCommand,
+}
+
+impl RegisteredCommand for ModelsCliCommandRunner {
+    fn name(&self) -> &'static str {
+        MODELS_COMMAND_NAME
+    }
+
+    fn policy(&self) -> CliCommandPolicy {
+        MODELS_POLICY
+    }
+
+    fn is_help(&self) -> bool {
+        matches!(self.command, ModelsCliCommand::Help(_))
+    }
+
+    fn help(&self) -> CliCommandHelp {
+        models_cli_spec().help()
+    }
+
+    fn autocomplete(&self) -> sinomo_runtime::cli_registry::CliAutocompleteSpec {
+        models_cli_spec().autocomplete()
+    }
+
+    fn run(self: Box<Self>, context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {
+        run_models_cli_command(self.command, context)
+    }
+}
+
+pub(crate) fn models_cli_spec() -> CliCommandSpec {
+    let provider_value = || {
+        CliValueSpec::new("provider", "model provider id").with_choices(
+            default_model_provider_ids()
+                .iter()
+                .map(|provider| CliAutocompleteChoice::new(*provider, "available model provider")),
+        )
+    };
+    let account_option = || {
+        CliOptionSpec::value(
+            "--account",
+            "provider account",
+            CliValueSpec::new("account", "provider account"),
+        )
+    };
+    let model_option = || {
+        CliOptionSpec::value(
+            "--model",
+            "provider model id",
+            CliValueSpec::new("model", "provider model id"),
+        )
+    };
+    let provider_option = || CliOptionSpec::value("--provider", "model provider", provider_value());
+    let target_options = || [provider_option(), account_option(), model_option()];
+    let choice =
+        |value: &'static str, detail: &'static str| CliAutocompleteChoice::new(value, detail);
+
+    let options = CliCommandSpec::new("options", "show provider-specific account or model options")
+        .with_options(target_options())
+        .with_children([
+            CliCommandSpec::new("show", "show provider-specific account or model options")
+                .with_options(target_options()),
+            CliCommandSpec::new("set", "update provider-specific account or model options")
+                .with_options([
+                    provider_option().required(),
+                    account_option(),
+                    model_option(),
+                    CliOptionSpec::value(
+                        "--reasoning-effort",
+                        "reasoning effort override",
+                        CliValueSpec::new(
+                            "none|minimal|low|medium|high|xhigh|max|clear",
+                            "reasoning effort or clear",
+                        )
+                        .with_choices([
+                            choice("none", "disable reasoning effort"),
+                            choice("minimal", "minimal reasoning effort"),
+                            choice("low", "low reasoning effort"),
+                            choice("medium", "medium reasoning effort"),
+                            choice("high", "high reasoning effort"),
+                            choice("xhigh", "extra-high reasoning effort"),
+                            choice("max", "maximum supported reasoning effort"),
+                            choice("clear", "remove the configured override"),
+                            choice("unset", "remove the configured override"),
+                            choice("default", "remove the configured override"),
+                        ])
+                        .restricted(),
+                    ),
+                    CliOptionSpec::value(
+                        "--reasoning-budget-tokens",
+                        "reasoning token budget override",
+                        CliValueSpec::new("n|clear", "token budget or clear"),
+                    ),
+                    CliOptionSpec::value(
+                        "--text-verbosity",
+                        "text verbosity override",
+                        CliValueSpec::new("low|medium|high|clear", "text verbosity or clear")
+                            .with_choices([
+                                choice("low", "low response verbosity"),
+                                choice("medium", "medium response verbosity"),
+                                choice("high", "high response verbosity"),
+                                choice("clear", "remove the configured override"),
+                                choice("unset", "remove the configured override"),
+                                choice("default", "remove the configured override"),
+                            ])
+                            .restricted(),
+                    ),
+                    CliOptionSpec::value(
+                        "--vendor-option",
+                        "vendor-specific key=value option",
+                        CliValueSpec::new("key=value", "vendor option"),
+                    )
+                    .repeatable(),
+                    CliOptionSpec::value(
+                        "--clear-vendor-option",
+                        "vendor-specific option key to clear",
+                        CliValueSpec::new("key", "vendor option key"),
+                    )
+                    .repeatable(),
+                ]),
+            CliCommandSpec::new("clear", "clear provider-specific options").with_options([
+                provider_option().required(),
+                account_option(),
+                model_option(),
+            ]),
+        ]);
+
+    let runtime = CliCommandSpec::new("runtime", "show cluster-scoped model runtime settings")
+        .with_children([
+            CliCommandSpec::new("show", "show cluster-scoped model runtime settings"),
+            CliCommandSpec::new("set", "update cluster-scoped model runtime settings")
+                .with_options([
+                    CliOptionSpec::value(
+                        "--native-models-cache-dir",
+                        "native model cache directory",
+                        CliValueSpec::new("path", "cache directory path"),
+                    ),
+                    CliOptionSpec::value(
+                        "--minicpm-v46-model-dir",
+                        "MiniCPM-V 4.6 model directory",
+                        CliValueSpec::new("path", "model directory path"),
+                    ),
+                    CliOptionSpec::value(
+                        "--minicpm-v46-max-input-tokens",
+                        "MiniCPM-V 4.6 maximum input tokens",
+                        CliValueSpec::new("n", "input token limit"),
+                    ),
+                    CliOptionSpec::value(
+                        "--minicpm-v46-max-output-tokens",
+                        "MiniCPM-V 4.6 maximum output tokens",
+                        CliValueSpec::new("n", "output token limit"),
+                    ),
+                    CliOptionSpec::value(
+                        "--pytorch-endpoint",
+                        "PyTorch bridge endpoint",
+                        CliValueSpec::new("url", "bridge endpoint URL"),
+                    ),
+                    CliOptionSpec::value(
+                        "--pytorch-python",
+                        "PyTorch Python executable",
+                        CliValueSpec::new("path", "Python executable path"),
+                    ),
+                    CliOptionSpec::value(
+                        "--pytorch-device",
+                        "PyTorch execution device",
+                        CliValueSpec::new("auto|cpu|cuda", "execution device")
+                            .with_choices([
+                                choice("auto", "select the device automatically"),
+                                choice("cpu", "run on CPU"),
+                                choice("cuda", "run on CUDA"),
+                            ])
+                            .restricted(),
+                    ),
+                    CliOptionSpec::value(
+                        "--pytorch-timeout-seconds",
+                        "PyTorch request timeout",
+                        CliValueSpec::new("n", "timeout in seconds"),
+                    ),
+                    CliOptionSpec::value(
+                        "--pytorch-mock",
+                        "enable or disable the mock PyTorch bridge",
+                        CliValueSpec::new("true|false", "boolean value")
+                            .with_choices([
+                                choice("true", "enable mock mode"),
+                                choice("false", "disable mock mode"),
+                                choice("1", "enable mock mode"),
+                                choice("0", "disable mock mode"),
+                                choice("on", "enable mock mode"),
+                                choice("off", "disable mock mode"),
+                                choice("yes", "enable mock mode"),
+                                choice("no", "disable mock mode"),
+                            ])
+                            .restricted(),
+                    ),
+                ]),
+        ]);
+
+    CliCommandSpec::new(
+        MODELS_COMMAND_NAME,
+        "show the current default model and model commands",
+    )
+    .with_title("Models:")
+    .with_aliases(["model"])
+    .with_children([
+        CliCommandSpec::new("list", "list available or known models")
+            .with_options([provider_option()]),
+        CliCommandSpec::new("default", "set the default model for model-backed commands")
+            .with_options([
+                provider_option().required(),
+                model_option().required(),
+                account_option(),
+            ]),
+        options,
+        runtime,
+    ])
+    .with_after_help(
+        std::iter::once("Providers:".to_string()).chain(
+            default_model_provider_ids()
+                .iter()
+                .map(|provider| format!("  {provider}")),
+        ),
+    )
+}
+
+pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, CliParseError> {
+    let matches = match models_cli_spec().parse(args)? {
+        CliCommandParseOutcome::Help(help) => return Ok(ModelsCliCommand::Help(help)),
+        CliCommandParseOutcome::Matches(matches) => matches,
+    };
+    let path = matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match path.as_slice() {
+        ["models"] => Ok(ModelsCliCommand::Overview),
+        ["models", "list"] => Ok(ModelsCliCommand::List(parse_models_list_matches(&matches))),
+        ["models", "default"] => Ok(ModelsCliCommand::Default(parse_model_default_matches(
+            &matches,
         )?)),
-        Some((command, rest)) if matches!(command.as_str(), "show" | "help" | "--help" | "-h") => {
-            Ok(ModelOptionsCliCommand::Show(parse_model_options_target(
-                rest, false,
-            )?))
+        ["models", "options"] | ["models", "options", "show"] => Ok(ModelsCliCommand::Options(
+            ModelOptionsCliCommand::Show(parse_model_options_target(&matches)?),
+        )),
+        ["models", "options", "set"] => Ok(ModelsCliCommand::Options(ModelOptionsCliCommand::Set(
+            parse_model_options_set_matches(&matches)?,
+        ))),
+        ["models", "options", "clear"] => Ok(ModelsCliCommand::Options(
+            ModelOptionsCliCommand::Clear(parse_model_options_target(&matches)?),
+        )),
+        ["models", "runtime"] | ["models", "runtime", "show"] => {
+            Ok(ModelsCliCommand::Runtime(ModelRuntimeCliCommand::Show))
         }
-        Some((command, rest)) if command == "set" => Ok(ModelOptionsCliCommand::Set(
-            parse_model_options_set_options(rest)?,
-        )),
-        Some((command, rest)) if command == "clear" => Ok(ModelOptionsCliCommand::Clear(
-            parse_model_options_target(rest, true)?,
-        )),
-        _ => Err(CliError::Usage),
+        ["models", "runtime", "set"] => Ok(ModelsCliCommand::Runtime(ModelRuntimeCliCommand::Set(
+            parse_model_runtime_set_matches(&matches)?,
+        ))),
+        _ => Err(CliParseError::Parse {
+            detail: format!("unhandled models command path `{}`", path.join(" ")),
+        }),
     }
 }
 
-pub(crate) fn parse_model_options_target(
-    args: &[String],
-    require_provider: bool,
-) -> Result<ModelOptionsTarget, CliError> {
-    let mut provider = None;
-    let mut account = DEFAULT_PROVIDER_ACCOUNT.to_string();
-    let mut model = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--provider" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                provider =
-                    Some(
-                        normalize_model_provider(value).ok_or_else(|| CliError::Parse {
-                            detail: format!("unknown provider `{value}`"),
-                        })?,
-                    );
-                index += 2;
-            }
-            "--account" => {
-                account = normalize_provider_account_name(Some(
-                    args.get(index + 1).ok_or(CliError::Usage)?.as_str(),
-                ));
-                index += 2;
-            }
-            "--model" => {
-                model = Some(
-                    args.get(index + 1)
-                        .ok_or(CliError::Usage)?
-                        .trim()
-                        .to_string(),
-                );
-                index += 2;
-            }
-            _ => return Err(CliError::Usage),
-        }
+fn parse_models_list_matches(matches: &CliCommandMatches) -> ModelListOptions {
+    ModelListOptions {
+        provider: matches.value("--provider").map(str::to_string),
     }
-    if require_provider && provider.is_none() {
-        return Err(CliError::Parse {
-            detail: "--provider is required".to_string(),
-        });
-    }
+}
+
+fn parse_model_default_matches(
+    matches: &CliCommandMatches,
+) -> Result<ModelDefaultOptions, CliParseError> {
+    let raw_provider = required_match_value(matches, "--provider")?;
+    let provider = normalize_model_provider(raw_provider).ok_or_else(|| CliParseError::Parse {
+        detail: format!("unknown provider `{raw_provider}`"),
+    })?;
+    let model =
+        normalize_model_id_for_provider(&provider, required_match_value(matches, "--model")?);
+    let account = normalize_provider_account_name(matches.value("--account"));
+    Ok(ModelDefaultOptions {
+        provider,
+        account,
+        model,
+    })
+}
+
+fn parse_model_options_target(
+    matches: &CliCommandMatches,
+) -> Result<ModelOptionsTarget, CliParseError> {
+    let provider = matches
+        .value("--provider")
+        .map(|value| {
+            normalize_model_provider(value).ok_or_else(|| CliParseError::Parse {
+                detail: format!("unknown provider `{value}`"),
+            })
+        })
+        .transpose()?;
+    let account = normalize_provider_account_name(matches.value("--account"));
+    let model = matches.value("--model").map(str::trim).map(str::to_string);
     let model = match (provider.as_deref(), model) {
         (Some(provider), Some(model)) => Some(normalize_model_id_for_provider(provider, &model)),
         (_, model) => model,
@@ -172,9 +414,9 @@ pub(crate) fn parse_model_options_target(
     })
 }
 
-pub(crate) fn parse_model_options_set_options(
-    args: &[String],
-) -> Result<ModelOptionsSetOptions, CliError> {
+fn parse_model_options_set_matches(
+    matches: &CliCommandMatches,
+) -> Result<ModelOptionsSetOptions, CliParseError> {
     let mut options = ModelOptionsSetOptions {
         target: ModelOptionsTarget {
             account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
@@ -182,96 +424,69 @@ pub(crate) fn parse_model_options_set_options(
         },
         ..ModelOptionsSetOptions::default()
     };
-    let mut raw_model = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--provider" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.target.provider = Some(normalize_model_provider(value).ok_or_else(
-                    || CliError::Parse {
-                        detail: format!("unknown provider `{value}`"),
-                    },
-                )?);
-                index += 2;
+    let raw_provider = required_match_value(matches, "--provider")?;
+    let provider = normalize_model_provider(raw_provider).ok_or_else(|| CliParseError::Parse {
+        detail: format!("unknown provider `{raw_provider}`"),
+    })?;
+    options.target.provider = Some(provider.clone());
+    options.target.account = normalize_provider_account_name(matches.value("--account"));
+    options.target.model = matches
+        .value("--model")
+        .map(|model| normalize_model_id_for_provider(&provider, model.trim()));
+    options.reasoning_effort = matches
+        .value("--reasoning-effort")
+        .map(|value| {
+            parse_option_update(value, |value| {
+                value
+                    .parse::<ProviderReasoningEffort>()
+                    .map_err(|detail| CliParseError::Parse { detail })
+            })
+        })
+        .transpose()?;
+    options.reasoning_budget_tokens = matches
+        .value("--reasoning-budget-tokens")
+        .map(|value| {
+            parse_option_update(value, |value| {
+                value.parse::<u32>().map_err(|source| CliParseError::Parse {
+                    detail: format!("invalid reasoning budget `{value}`: {source}"),
+                })
+            })
+        })
+        .transpose()?;
+    options.text_verbosity = matches
+        .value("--text-verbosity")
+        .map(|value| {
+            parse_option_update(value, |value| {
+                value
+                    .parse::<ProviderTextVerbosity>()
+                    .map_err(|detail| CliParseError::Parse { detail })
+            })
+        })
+        .transpose()?;
+    options.vendor_options = matches
+        .values("--vendor-option")
+        .map(parse_vendor_option)
+        .collect::<Result<Vec<_>, _>>()?;
+    options.clear_vendor_options = matches
+        .values("--clear-vendor-option")
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(CliParseError::Parse {
+                    detail: "--clear-vendor-option requires a key".to_string(),
+                })
+            } else {
+                Ok(value.to_string())
             }
-            "--account" => {
-                options.target.account = normalize_provider_account_name(Some(
-                    args.get(index + 1).ok_or(CliError::Usage)?.as_str(),
-                ));
-                index += 2;
-            }
-            "--model" => {
-                raw_model = Some(
-                    args.get(index + 1)
-                        .ok_or(CliError::Usage)?
-                        .trim()
-                        .to_string(),
-                );
-                index += 2;
-            }
-            "--reasoning-effort" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.reasoning_effort = Some(parse_option_update(value, |value| {
-                    value
-                        .parse::<ProviderReasoningEffort>()
-                        .map_err(|detail| CliError::Parse { detail })
-                })?);
-                index += 2;
-            }
-            "--reasoning-budget-tokens" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.reasoning_budget_tokens = Some(parse_option_update(value, |value| {
-                    value.parse::<u32>().map_err(|source| CliError::Parse {
-                        detail: format!("invalid reasoning budget `{value}`: {source}"),
-                    })
-                })?);
-                index += 2;
-            }
-            "--text-verbosity" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.text_verbosity = Some(parse_option_update(value, |value| {
-                    value
-                        .parse::<ProviderTextVerbosity>()
-                        .map_err(|detail| CliError::Parse { detail })
-                })?);
-                index += 2;
-            }
-            "--vendor-option" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                let (key, value) = parse_vendor_option(value)?;
-                options.vendor_options.push((key, value));
-                index += 2;
-            }
-            "--clear-vendor-option" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                let value = value.trim();
-                if value.is_empty() {
-                    return Err(CliError::Parse {
-                        detail: "--clear-vendor-option requires a key".to_string(),
-                    });
-                }
-                options.clear_vendor_options.push(value.to_string());
-                index += 2;
-            }
-            _ => return Err(CliError::Usage),
-        }
-    }
-    let provider = options
-        .target
-        .provider
-        .as_deref()
-        .ok_or_else(|| CliError::Parse {
-            detail: "--provider is required".to_string(),
-        })?;
-    options.target.model = raw_model.map(|model| normalize_model_id_for_provider(provider, &model));
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if options.reasoning_effort.is_none()
         && options.reasoning_budget_tokens.is_none()
         && options.text_verbosity.is_none()
         && options.vendor_options.is_empty()
         && options.clear_vendor_options.is_empty()
     {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "no model options were provided".to_string(),
         });
     }
@@ -280,223 +495,133 @@ pub(crate) fn parse_model_options_set_options(
 
 fn parse_option_update<T>(
     value: &str,
-    parse: impl FnOnce(&str) -> Result<T, CliError>,
-) -> Result<ModelOptionValueUpdate<T>, CliError> {
+    parse: impl FnOnce(&str) -> Result<T, CliParseError>,
+) -> Result<ModelOptionValueUpdate<T>, CliParseError> {
     match value.trim() {
         "clear" | "unset" | "default" => Ok(ModelOptionValueUpdate::Clear),
         value => parse(value).map(ModelOptionValueUpdate::Set),
     }
 }
 
-fn parse_vendor_option(value: &str) -> Result<(String, String), CliError> {
+fn parse_vendor_option(value: &str) -> Result<(String, String), CliParseError> {
     let Some((key, value)) = value.split_once('=') else {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "--vendor-option requires key=value".to_string(),
         });
     };
     let key = key.trim();
     if key.is_empty() {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "--vendor-option requires a non-empty key".to_string(),
         });
     }
     Ok((key.to_string(), value.trim().to_string()))
 }
 
-pub(crate) fn parse_models_runtime_command(
-    args: &[String],
-) -> Result<ModelRuntimeCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(ModelRuntimeCliCommand::Show),
-        Some((command, [])) if matches!(command.as_str(), "show" | "help" | "--help" | "-h") => {
-            Ok(ModelRuntimeCliCommand::Show)
-        }
-        Some((command, rest)) if command == "set" => Ok(ModelRuntimeCliCommand::Set(
-            parse_model_runtime_set_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
-}
-
-pub(crate) fn parse_model_runtime_set_options(
-    args: &[String],
-) -> Result<ModelRuntimeSetOptions, CliError> {
+fn parse_model_runtime_set_matches(
+    matches: &CliCommandMatches,
+) -> Result<ModelRuntimeSetOptions, CliParseError> {
     let mut options = ModelRuntimeSetOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--native-models-cache-dir" => {
-                options.native_models_cache_dir = Some(
-                    args.get(index + 1)
-                        .ok_or(CliError::Usage)?
-                        .trim()
-                        .to_string(),
-                );
-                index += 2;
-            }
-            "--minicpm-v46-model-dir" => {
-                options.minicpm_v46_model_dir = Some(
-                    args.get(index + 1)
-                        .ok_or(CliError::Usage)?
-                        .trim()
-                        .to_string(),
-                );
-                index += 2;
-            }
-            "--minicpm-v46-max-input-tokens" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.minicpm_v46_max_input_tokens =
-                    Some(value.parse().map_err(|source| CliError::Parse {
-                        detail: format!(
-                            "invalid --minicpm-v46-max-input-tokens `{value}`: {source}"
-                        ),
-                    })?);
-                index += 2;
-            }
-            "--minicpm-v46-max-output-tokens" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.minicpm_v46_max_output_tokens =
-                    Some(value.parse().map_err(|source| CliError::Parse {
-                        detail: format!(
-                            "invalid --minicpm-v46-max-output-tokens `{value}`: {source}"
-                        ),
-                    })?);
-                index += 2;
-            }
-            "--pytorch-endpoint" => {
-                options.pytorch_endpoint = Some(
-                    args.get(index + 1)
-                        .ok_or(CliError::Usage)?
-                        .trim()
-                        .to_string(),
-                );
-                index += 2;
-            }
-            "--pytorch-python" => {
-                options.pytorch_python = Some(
-                    args.get(index + 1)
-                        .ok_or(CliError::Usage)?
-                        .trim()
-                        .to_string(),
-                );
-                index += 2;
-            }
-            "--pytorch-device" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                if !matches!(value.as_str(), "auto" | "cpu" | "cuda") {
-                    return Err(CliError::Parse {
-                        detail: format!("invalid --pytorch-device `{value}`"),
-                    });
-                }
-                options.pytorch_device = Some(value.clone());
-                index += 2;
-            }
-            "--pytorch-timeout-seconds" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.pytorch_timeout_seconds =
-                    Some(value.parse().map_err(|source| CliError::Parse {
-                        detail: format!("invalid --pytorch-timeout-seconds `{value}`: {source}"),
-                    })?);
-                index += 2;
-            }
-            "--pytorch-mock" => {
-                let value = args.get(index + 1).ok_or(CliError::Usage)?;
-                options.pytorch_mock = Some(parse_bool_flag_value(value)?);
-                index += 2;
-            }
-            _ => return Err(CliError::Usage),
-        }
-    }
+    options.native_models_cache_dir = trimmed_match_value(matches, "--native-models-cache-dir");
+    options.minicpm_v46_model_dir = trimmed_match_value(matches, "--minicpm-v46-model-dir");
+    options.minicpm_v46_max_input_tokens = matches
+        .value("--minicpm-v46-max-input-tokens")
+        .map(|value| {
+            value.parse().map_err(|source| CliParseError::Parse {
+                detail: format!("invalid --minicpm-v46-max-input-tokens `{value}`: {source}"),
+            })
+        })
+        .transpose()?;
+    options.minicpm_v46_max_output_tokens = matches
+        .value("--minicpm-v46-max-output-tokens")
+        .map(|value| {
+            value.parse().map_err(|source| CliParseError::Parse {
+                detail: format!("invalid --minicpm-v46-max-output-tokens `{value}`: {source}"),
+            })
+        })
+        .transpose()?;
+    options.pytorch_endpoint = trimmed_match_value(matches, "--pytorch-endpoint");
+    options.pytorch_python = trimmed_match_value(matches, "--pytorch-python");
+    options.pytorch_device = matches.value("--pytorch-device").map(str::to_string);
+    options.pytorch_timeout_seconds = matches
+        .value("--pytorch-timeout-seconds")
+        .map(|value| {
+            value.parse().map_err(|source| CliParseError::Parse {
+                detail: format!("invalid --pytorch-timeout-seconds `{value}`: {source}"),
+            })
+        })
+        .transpose()?;
+    options.pytorch_mock = matches
+        .value("--pytorch-mock")
+        .map(parse_bool_flag_value)
+        .transpose()?;
     Ok(options)
 }
 
-fn parse_bool_flag_value(value: &str) -> Result<bool, CliError> {
+fn parse_bool_flag_value(value: &str) -> Result<bool, CliParseError> {
     match value {
         "1" | "true" | "on" | "yes" => Ok(true),
         "0" | "false" | "off" | "no" => Ok(false),
-        _ => Err(CliError::Parse {
+        _ => Err(CliParseError::Parse {
             detail: format!("invalid boolean value `{value}`"),
         }),
     }
 }
 
-pub(crate) fn parse_models_list_options(args: &[String]) -> Result<ModelListOptions, CliError> {
-    match args {
-        [] => Ok(ModelListOptions { provider: None }),
-        [flag, provider] if flag == "--provider" => Ok(ModelListOptions {
-            provider: Some(provider.clone()),
-        }),
-        _ => Err(CliError::Usage),
-    }
+fn required_match_value<'a>(
+    matches: &'a CliCommandMatches,
+    option: &str,
+) -> Result<&'a str, CliParseError> {
+    matches.value(option).ok_or_else(|| CliParseError::Parse {
+        detail: format!("declarative parser omitted required option `{option}`"),
+    })
 }
 
-pub(crate) fn parse_model_default_options(
-    args: &[String],
-) -> Result<ModelDefaultOptions, CliError> {
-    let provider = flag_value(args, "--provider").ok_or(CliError::Usage)?;
-    let provider = normalize_model_provider(&provider).ok_or_else(|| CliError::Parse {
-        detail: format!("unknown provider `{provider}`"),
-    })?;
-    let model = flag_value(args, "--model").ok_or(CliError::Usage)?;
-    let model = normalize_model_id_for_provider(&provider, &model);
-    let account = normalize_provider_account_name(flag_value(args, "--account").as_deref());
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--provider" | "--model" | "--account" => index += 2,
-            _ => return Err(CliError::Usage),
-        }
-    }
-    Ok(ModelDefaultOptions {
-        provider,
-        account,
-        model,
-    })
+fn trimmed_match_value(matches: &CliCommandMatches, option: &str) -> Option<String> {
+    matches.value(option).map(str::trim).map(str::to_string)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UsageOptions {
     pub(crate) provider: Option<String>,
     pub(crate) json: bool,
-    pub(crate) help: bool,
 }
 
-pub(crate) fn parse_usage_options(args: &[String]) -> Result<UsageOptions, CliError> {
-    let mut provider = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "help" | "--help" | "-h" => {
-                return Ok(UsageOptions {
-                    provider: None,
-                    json: false,
-                    help: true,
-                });
-            }
-            "--json" => {
-                json = true;
-                index += 1;
-            }
-            "--provider" => {
-                let value = args.get(index + 1).ok_or_else(|| CliError::Parse {
-                    detail: "--provider requires a provider id".to_string(),
-                })?;
-                provider = Some(value.clone());
-                index += 2;
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unknown usage option `{value}`"),
-                });
-            }
-        }
-    }
+pub(crate) fn usage_cli_command_handler() -> DeclarativeCommandHandler<UsageOptions> {
+    DeclarativeCommandHandler::new(
+        "usage",
+        CliCommandPolicy::local_capable(),
+        usage_cli_spec,
+        parse_usage_matches,
+        usage,
+    )
+}
+
+fn usage_cli_spec() -> CliCommandSpec {
+    CliCommandSpec::new("usage", "show provider subscription usage").with_options([
+        CliOptionSpec::value(
+            "--provider",
+            "provider id",
+            CliValueSpec::new("provider", "provider id").with_choices(
+                subscription_usage_provider_ids()
+                    .iter()
+                    .map(|provider| CliAutocompleteChoice::new(*provider, "usage provider")),
+            ),
+        ),
+        CliOptionSpec::flag("--json", "print JSON output"),
+    ])
+}
+
+fn parse_usage_matches(matches: &CliCommandMatches) -> Result<UsageOptions, CliParseError> {
     Ok(UsageOptions {
-        provider,
-        json,
-        help: false,
+        provider: matches.value("--provider").map(str::to_string),
+        json: matches.contains("--json"),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn parse_usage_schema_for_test(args: &[String]) -> Result<UsageOptions, CliError> {
+    parse_schema_command_for_test(usage_cli_spec(), args, parse_usage_matches)
 }
 
 pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
@@ -515,27 +640,35 @@ pub(crate) fn current_default_model() -> Result<CurrentDefaultModel, CliError> {
     resolve_current_default_model(&data_dir).map_err(CliError::LanguageModel)
 }
 
-pub(crate) fn run_models_command(command: ModelsCliCommand) -> Result<(), CliError> {
-    match command {
-        ModelsCliCommand::Help => models_help(),
+fn run_models_cli_command(
+    command: ModelsCliCommand,
+    context: &mut CliCommandContext<'_>,
+) -> Result<(), CliCommandError> {
+    let result = match command {
+        ModelsCliCommand::Overview => return write_models_overview(context),
+        ModelsCliCommand::Help(help) => return help.write(context),
         ModelsCliCommand::List(options) => models_list(options),
         ModelsCliCommand::Default(options) => models_default(options),
         ModelsCliCommand::Options(command) => models_options(command),
         ModelsCliCommand::Runtime(command) => models_runtime(command),
-    }
+    };
+    result.map_err(|error| CliCommandError::new(error.to_string()))
 }
 
-pub(crate) fn models_help() -> Result<(), CliError> {
-    let current = current_default_model()?;
-    println!("Current default model:");
-    println!("  provider: {}", current.provider);
-    println!("  account: {}", current.account);
-    println!("  model: {}", current.model);
-    println!("  configured model: {}", current.configured_model);
-    println!("  config: {}", current.config_path.display());
-    println!();
-    print_models_help();
-    Ok(())
+fn write_models_overview(context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {
+    let current =
+        current_default_model().map_err(|error| CliCommandError::new(error.to_string()))?;
+    context.stdout_line(format_args!("Current default model:"))?;
+    context.stdout_line(format_args!("  provider: {}", current.provider))?;
+    context.stdout_line(format_args!("  account: {}", current.account))?;
+    context.stdout_line(format_args!("  model: {}", current.model))?;
+    context.stdout_line(format_args!(
+        "  configured model: {}",
+        current.configured_model
+    ))?;
+    context.stdout_line(format_args!("  config: {}", current.config_path.display()))?;
+    context.stdout_line(format_args!(""))?;
+    models_cli_spec().help().write(context)
 }
 
 pub(crate) fn models_list(options: ModelListOptions) -> Result<(), CliError> {
@@ -1181,10 +1314,6 @@ fn non_empty_option(value: String) -> Option<String> {
 }
 
 pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
-    if options.help {
-        print_usage_help();
-        return Ok(());
-    }
     let explicit_provider = options.provider.is_some();
     let providers = match options.provider {
         Some(provider) => {
@@ -1305,10 +1434,4 @@ pub(crate) fn format_usage_reset_at(reset_at_unix: i64) -> String {
         .ok()
         .and_then(|datetime| datetime.format(&Rfc3339).ok())
         .unwrap_or_else(|| reset_at_unix.to_string())
-}
-
-pub(crate) fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|pair| pair[0] == flag)
-        .map(|pair| pair[1].clone())
 }

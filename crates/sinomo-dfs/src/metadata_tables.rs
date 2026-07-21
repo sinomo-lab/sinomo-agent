@@ -18,9 +18,9 @@ use crate::metadata_keys::{
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord,
     DfsMetadataPrefixProof, DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespacePrepareRecord,
-    DfsNamespacePrepareStatus, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentRecord,
-    normalized_object_metadata,
+    DfsNamespacePrepareStatus, DfsNamespaceRequestRecord, DfsNamespaceTransaction,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord,
+    DfsWriteIntentRecord, normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -53,6 +53,7 @@ pub(crate) struct DfsMetadataTables {
         BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
     namespace_prepare_path_owners: BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
+    pub(crate) namespace_requests: BTreeMap<(NodeId, String), DfsNamespaceRequestRecord>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -150,6 +151,7 @@ impl DfsMetadataTables {
             || !self.advisory_lock_states.is_empty()
             || !self.namespace_transactions.is_empty()
             || !self.namespace_jobs.is_empty()
+            || !self.namespace_requests.is_empty()
             || !self.compacted_tombstones.is_empty()
             || !self.visible_commits.is_empty()
             || !self.namespace_prepares.is_empty()
@@ -490,6 +492,15 @@ impl DfsMetadataTables {
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 self.namespace_jobs.insert(job.job_id.clone(), job);
             }
+            DfsMetadataTableOp::PutNamespaceRequest { request } => {
+                self.namespace_requests.insert(
+                    (
+                        request.requester_node_id.clone(),
+                        request.request_id.clone(),
+                    ),
+                    request,
+                );
+            }
         }
     }
 
@@ -651,6 +662,7 @@ pub(crate) struct DfsMetadataTableRollback {
     namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
     namespace_prepares: BTreeMap<String, Option<DfsNamespacePrepareRecord>>,
     namespace_jobs: BTreeMap<String, Option<DfsNamespaceJobRecord>>,
+    namespace_requests: BTreeMap<(NodeId, String), Option<DfsNamespaceRequestRecord>>,
 }
 
 impl DfsMetadataTableRollback {
@@ -821,6 +833,14 @@ impl DfsMetadataTableRollback {
                 &tables.namespace_jobs,
                 job.job_id.clone(),
             ),
+            DfsMetadataTableOp::PutNamespaceRequest { request } => record_rollback_value(
+                &mut self.namespace_requests,
+                &tables.namespace_requests,
+                (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                ),
+            ),
         }
     }
 
@@ -853,6 +873,7 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
         tables.rebuild_namespace_prepare_footprint_indexes();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
+        rollback_map(&mut tables.namespace_requests, self.namespace_requests);
     }
 }
 

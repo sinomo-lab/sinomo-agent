@@ -45,6 +45,16 @@ pub enum DfsPosixError {
     Conflict { path: String, reason: String },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
+    #[error(
+        "bulk namespace commit was only partially observed: committed={committed_metadata_paths:?}, indeterminate={indeterminate_metadata_paths:?}, unattempted={unattempted_metadata_paths:?}: {source}"
+    )]
+    PartialBulkCommit {
+        committed_metadata_paths: Vec<String>,
+        indeterminate_metadata_paths: Vec<String>,
+        unattempted_metadata_paths: Vec<String>,
+        #[source]
+        source: Box<DfsPosixError>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DfsPosixError>;
@@ -300,9 +310,10 @@ pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsName
         DfsPosixError::Dfs(DfsError::Busy { path }) => {
             Some(DfsNamespacePosixError::Busy { path: path.clone() })
         }
-        DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) | DfsPosixError::PendingWrite { .. } => {
-            None
-        }
+        DfsPosixError::Dfs(_)
+        | DfsPosixError::Metadata(_)
+        | DfsPosixError::PendingWrite { .. }
+        | DfsPosixError::PartialBulkCommit { .. } => None,
     }
 }
 

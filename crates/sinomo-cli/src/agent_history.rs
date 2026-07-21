@@ -64,16 +64,23 @@ fn run_channel_history_after_body_read_hook() {
 }
 
 #[derive(Clone)]
-pub(crate) struct CliAgentHistorySearchBackend {
-    data_dir: SinomoDataDir,
+pub(crate) struct VfsAgentHistorySearchBackend {
+    sifs_data_dir: Option<SinomoDataDir>,
     history_vfs: Arc<Mutex<Option<VfsHandle>>>,
 }
 
-impl CliAgentHistorySearchBackend {
+impl VfsAgentHistorySearchBackend {
     pub(crate) fn new(data_dir: SinomoDataDir) -> Self {
         Self {
-            data_dir,
+            sifs_data_dir: Some(data_dir),
             history_vfs: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn from_vfs(history_vfs: VfsHandle) -> Self {
+        Self {
+            sifs_data_dir: None,
+            history_vfs: Arc::new(Mutex::new(Some(history_vfs))),
         }
     }
 
@@ -91,7 +98,13 @@ impl CliAgentHistorySearchBackend {
         if let Some(history_vfs) = cached.as_ref() {
             return Ok(history_vfs.clone());
         }
-        let history_vfs = mounted_sifs(Some(self.data_dir.root().to_path_buf())).map_err(|_| {
+        let data_dir =
+            self.sifs_data_dir
+                .as_ref()
+                .ok_or_else(|| SessionHistorySearchError::Unavailable {
+                    detail: "injected visible activity-history VFS is unavailable".to_string(),
+                })?;
+        let history_vfs = mounted_sifs(Some(data_dir.root().to_path_buf())).map_err(|_| {
             SessionHistorySearchError::Unavailable {
                 detail: "visible activity history is unavailable".to_string(),
             }
@@ -110,12 +123,26 @@ pub(crate) fn register_agent_history_search_tool(
         SessionHistorySearchPrincipal::new(agent_key).map_err(|source| CliError::Parse {
             detail: format!("configure session-history tool principal: {source}"),
         })?;
-    let backend = CliAgentHistorySearchBackend::new(data_dir.clone());
+    let backend = VfsAgentHistorySearchBackend::new(data_dir.clone());
     register_session_history_search_tool(registry, principal, Arc::new(backend));
     Ok(())
 }
 
-impl SessionHistorySearchBackend for CliAgentHistorySearchBackend {
+pub fn register_agent_history_search_tool_with_vfs(
+    registry: &AgentToolRegistry,
+    history_vfs: VfsHandle,
+    agent_key: &str,
+) -> Result<(), CliError> {
+    let principal =
+        SessionHistorySearchPrincipal::new(agent_key).map_err(|source| CliError::Parse {
+            detail: format!("configure session-history tool principal: {source}"),
+        })?;
+    let backend = VfsAgentHistorySearchBackend::from_vfs(history_vfs);
+    register_session_history_search_tool(registry, principal, Arc::new(backend));
+    Ok(())
+}
+
+impl SessionHistorySearchBackend for VfsAgentHistorySearchBackend {
     fn search(
         &self,
         principal: &SessionHistorySearchPrincipal,
@@ -128,11 +155,6 @@ impl SessionHistorySearchBackend for CliAgentHistorySearchBackend {
         let history_vfs = self.history_vfs()?;
         let binding = cursor_binding(principal.agent_key(), &request.query);
         let mut position = parse_cursor(request.cursor.as_deref(), &binding)?;
-        let store = SifsAgentChannelStore::open(&self.data_dir).map_err(|_| {
-            SessionHistorySearchError::Unavailable {
-                detail: "visible channel activity history is unavailable".to_string(),
-            }
-        })?;
         let mut matches = Vec::new();
         let mut scanned = SessionHistorySearchStats::default();
         let mut partial = false;
@@ -244,14 +266,13 @@ impl SessionHistorySearchBackend for CliAgentHistorySearchBackend {
                 channel_id = Some(current_channel_id.clone());
                 scanned.activities = scanned.activities.saturating_add(1);
                 let metadata_started_after_prior_scan = scanned.items > 0 || scanned.bytes > 0;
-                let metadata = store
-                    .load_channel_metadata_for_history(
-                        &history_vfs,
-                        &current_channel_id,
-                        request.max_scanned_items.saturating_sub(scanned.items),
-                        request.max_scanned_bytes.saturating_sub(scanned.bytes),
-                    )
-                    .map_err(channel_store_history_error)?;
+                let metadata = SifsAgentChannelStore::load_channel_metadata_for_history_from_vfs(
+                    &history_vfs,
+                    &current_channel_id,
+                    request.max_scanned_items.saturating_sub(scanned.items),
+                    request.max_scanned_bytes.saturating_sub(scanned.bytes),
+                )
+                .map_err(channel_store_history_error)?;
                 scanned.items = scanned.items.saturating_add(metadata.scanned_items);
                 scanned.bytes = scanned.bytes.saturating_add(metadata.scanned_bytes);
                 scanned.omitted_items = scanned
@@ -401,7 +422,6 @@ impl SessionHistorySearchBackend for CliAgentHistorySearchBackend {
                         && fresh_body_budget
                             .is_some_and(|(_, fresh_bytes)| body_bytes >= fresh_bytes);
                     let page = load_channel_history_message_page(
-                        &store,
                         &history_vfs,
                         &current.channel_id,
                         record_source,
@@ -537,8 +557,8 @@ impl SessionHistorySearchBackend for CliAgentHistorySearchBackend {
                     // first check avoids unauthorized I/O; this second check
                     // ensures a concurrent disable/delete cannot release the
                     // bodies we just read into model-visible output.
-                    let metadata_after_read = store
-                        .load_channel_metadata_for_history(
+                    let metadata_after_read =
+                        SifsAgentChannelStore::load_channel_metadata_for_history_from_vfs(
                             &history_vfs,
                             &current.channel_id,
                             request.max_scanned_items.saturating_sub(scanned.items),
@@ -789,10 +809,12 @@ impl SessionHistorySearchBackend for CliAgentHistorySearchBackend {
             unreachable!("channel history transitions to background history")
         };
         let store = AgentTaskActivityProjectionStore::from_vfs(history_vfs);
-        let local_activity_store = FileAgentSessionStore::for_data_dir(&self.data_dir);
-        partial |= local_activity_store
-            .has_pending_task_activity_mirrors(principal.agent_key())
-            .unwrap_or(true);
+        if let Some(data_dir) = &self.sifs_data_dir {
+            let local_activity_store = FileAgentSessionStore::for_data_dir(data_dir);
+            partial |= local_activity_store
+                .has_pending_task_activity_mirrors(principal.agent_key())
+                .unwrap_or(true);
+        }
         let mut activity_after = decode_vfs_cursor(activity_cursor.as_deref())?;
         loop {
             if cancellation.is_cancelled() {
@@ -1189,7 +1211,6 @@ fn reserve_post_read_authorization_budget(
 
 #[allow(clippy::too_many_arguments)]
 fn load_channel_history_message_page(
-    store: &SifsAgentChannelStore,
     history_vfs: &VfsHandle,
     channel_id: &SessionId,
     source: ChannelMessageSource,
@@ -1206,7 +1227,7 @@ fn load_channel_history_message_page(
 ) -> Result<ChannelHistoryMessagePage, AgentChannelStoreError> {
     match source {
         ChannelMessageSource::Legacy => {
-            let page = store.load_legacy_message_record_page(
+            let page = SifsAgentChannelStore::load_legacy_message_record_page_from_vfs(
                 history_vfs,
                 channel_id,
                 after,
@@ -1255,7 +1276,7 @@ fn load_channel_history_message_page(
                     detail: "invalid immutable message cursor state".to_string(),
                 });
             }
-            let page = store.load_immutable_message_record_page(
+            let page = SifsAgentChannelStore::load_immutable_message_record_page_from_vfs(
                 history_vfs,
                 channel_id,
                 after,
@@ -1491,7 +1512,7 @@ mod tests {
             .save_activity(&activity)
             .expect("save typed background activity");
 
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let page = backend
             .search(
                 &SessionHistorySearchPrincipal::new("main-agent").expect("principal"),
@@ -1523,6 +1544,50 @@ mod tests {
     }
 
     #[test]
+    fn history_backend_searches_an_injected_memory_vfs_without_dfs() {
+        let history_vfs = VfsHandle::memory();
+        let activity_store = AgentTaskActivityProjectionStore::from_vfs(history_vfs.clone());
+        let activity = AgentTaskActivityProjection {
+            activity_id: sinomo_agent::TaskId::generate(),
+            owner_agent_key: "main-agent".to_string(),
+            activity_kind: "benchmark".to_string(),
+            summary: "in-memory-history-needle".to_string(),
+            status: AgentTaskLifecycleStatus::Completed,
+            progress_summary: Some("completed".to_string()),
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        activity_store
+            .save_activity(&activity)
+            .expect("save in-memory activity");
+
+        let page = VfsAgentHistorySearchBackend::from_vfs(history_vfs)
+            .search(
+                &SessionHistorySearchPrincipal::new("main-agent").expect("principal"),
+                &SessionHistorySearchRequest {
+                    query: "in-memory-history-needle".to_string(),
+                    cursor: None,
+                    limit: 10,
+                    max_scanned_activities: 16,
+                    max_scanned_items: 64,
+                    max_scanned_bytes: 1024 * 1024,
+                    max_excerpt_bytes: 256,
+                    max_title_bytes: 256,
+                    max_author_bytes: 128,
+                },
+                &AgentCancellationToken::new(),
+            )
+            .expect("search injected VFS history");
+
+        assert!(page.complete, "{page:#?}");
+        assert_eq!(page.matches.len(), 1, "{page:#?}");
+        assert_eq!(page.matches[0].item_id, activity.activity_id);
+        assert_eq!(
+            page.matches[0].activity_kind,
+            SessionHistoryActivityKind::BackgroundActivity
+        );
+    }
+
+    #[test]
     fn background_activity_retries_after_channel_scan_consumes_remaining_bytes() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-background-fresh-budget");
         let data_dir = SinomoDataDir::new(&root);
@@ -1546,7 +1611,7 @@ mod tests {
         )
         .expect("append stable channel message");
 
-        let backend = CliAgentHistorySearchBackend::new(data_dir.clone());
+        let backend = VfsAgentHistorySearchBackend::new(data_dir.clone());
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
         let baseline = backend
             .search(
@@ -1677,7 +1742,7 @@ mod tests {
             .write(format!("{legacy_dir}/00000000.jsonl"), legacy_bytes)
             .expect("write bounded legacy chunk");
 
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
         let request = |query: &str| SessionHistorySearchRequest {
             query: query.to_string(),
@@ -1766,7 +1831,7 @@ mod tests {
             .saturating_mul(2)
             .saturating_add(second_bytes.len() as u64)
             .saturating_add(1);
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
         let mut request = SessionHistorySearchRequest {
             query: "fresh-budget-needle".to_string(),
@@ -1845,7 +1910,7 @@ mod tests {
             .expect("measure authorization proof");
         assert!(proof.complete);
         assert!(first_bytes.len() < second_bytes.len());
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
         let mut request = SessionHistorySearchRequest {
             query: "partial-tail-needle".to_string(),
@@ -1951,7 +2016,7 @@ mod tests {
             second_bytes > first_bytes.saturating_add(proof.scanned_bytes),
             "test must leave a positive but insufficient second-record budget"
         );
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
         let mut request = SessionHistorySearchRequest {
             query: "immutable-budget-needle".to_string(),
@@ -2012,7 +2077,7 @@ mod tests {
             sinomo_agent::AgentChannelStore::append_message(&channel_store, &channel_id, message)
                 .expect("append immutable record");
         }
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
         let mut request = SessionHistorySearchRequest {
             query: "limit-one-needle".to_string(),
@@ -2094,7 +2159,7 @@ mod tests {
             .posix_hardlink(&private_record, &imported_record)
             .expect("hardlink private record under authorized channel");
 
-        let backend = CliAgentHistorySearchBackend::new(data_dir);
+        let backend = VfsAgentHistorySearchBackend::new(data_dir);
         let page = backend
             .search(
                 &SessionHistorySearchPrincipal::new("main-agent").expect("principal"),
@@ -2153,7 +2218,7 @@ mod tests {
             hook_ran_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
-        let page = CliAgentHistorySearchBackend::new(data_dir)
+        let page = VfsAgentHistorySearchBackend::new(data_dir)
             .search(
                 &SessionHistorySearchPrincipal::new("main-agent").expect("principal"),
                 &SessionHistorySearchRequest {
@@ -2186,7 +2251,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-history-lazy-sifs");
         let blocked_root = root.join("not-a-directory");
         std::fs::write(&blocked_root, b"blocked").expect("create unusable data root");
-        let backend = CliAgentHistorySearchBackend::new(SinomoDataDir::new(&blocked_root));
+        let backend = VfsAgentHistorySearchBackend::new(SinomoDataDir::new(&blocked_root));
 
         assert!(
             backend

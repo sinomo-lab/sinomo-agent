@@ -1,5 +1,9 @@
 use super::*;
 use serde::Serialize;
+use sinomo_runtime::cli_registry::{
+    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec, CliParseError,
+    CliPositionalSpec, CliValueSpec,
+};
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::test::{
@@ -10,7 +14,6 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum TestCliCommand {
-    Help,
     List(TestListOptions),
     Run(TestRunOptions),
     Smoke(TestSmokeOptions),
@@ -119,189 +122,152 @@ pub(super) const fn cluster_test_has_expected_target_count(actual: usize, expect
     actual >= expected
 }
 
-pub(crate) fn parse_test_command(args: &[String]) -> Result<TestCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(TestCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(TestCliCommand::Help)
-        }
-        Some((command, rest)) if command == "list" => {
-            Ok(TestCliCommand::List(parse_test_list_options(rest)?))
-        }
-        Some((command, rest)) if command == "run" => {
-            Ok(TestCliCommand::Run(parse_test_run_options(rest)?))
-        }
-        Some((command, rest)) if command == "smoke" => {
-            Ok(TestCliCommand::Smoke(parse_test_smoke_options(rest)?))
-        }
-        _ => Err(CliError::Usage),
+pub(crate) fn test_cli_command_handler() -> DeclarativeCommandHandler<TestCliCommand> {
+    DeclarativeCommandHandler::new(
+        "test",
+        CliCommandPolicy::local_capable(),
+        test_cli_spec,
+        parse_test_matches,
+        run_test_command,
+    )
+    .with_parsed_policy(test_cli_policy)
+}
+
+fn test_cli_spec() -> CliCommandSpec {
+    let common_model_options = || {
+        [
+            CliOptionSpec::value(
+                "--provider",
+                "model provider",
+                CliValueSpec::new("provider", "provider id"),
+            ),
+            CliOptionSpec::value(
+                "--account",
+                "provider account",
+                CliValueSpec::new("account", "provider account"),
+            ),
+            CliOptionSpec::value(
+                "--model",
+                "model id",
+                CliValueSpec::new("model", "model id"),
+            ),
+            CliOptionSpec::flag("--live", "enable live external integration"),
+            CliOptionSpec::flag("--require-cluster", "require cluster state and quorum"),
+            CliOptionSpec::flag("--json", "print JSON output"),
+        ]
+    };
+    let mut run_options = common_model_options().to_vec();
+    run_options.extend([
+        CliOptionSpec::value(
+            "--tag",
+            "select tests by tag",
+            CliValueSpec::new("tag", "test tag"),
+        ),
+        CliOptionSpec::value(
+            "--param",
+            "test parameter key=value",
+            CliValueSpec::new("key=value", "test parameter"),
+        )
+        .repeatable(),
+    ]);
+    CliCommandSpec::new("test", "list and run registered Sinomo tests")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("list", "list registered tests").with_options([
+                CliOptionSpec::flag("--json", "print JSON output"),
+                CliOptionSpec::value(
+                    "--tag",
+                    "filter by tag",
+                    CliValueSpec::new("tag", "test tag"),
+                ),
+            ]),
+            CliCommandSpec::new("run", "run a test or tagged test group")
+                .with_options(run_options)
+                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                    "test-id", "test id",
+                ))]),
+            CliCommandSpec::new("smoke", "run the model smoke test")
+                .with_options(common_model_options()),
+        ])
+}
+
+fn parse_test_matches(matches: &CliCommandMatches) -> Result<TestCliCommand, CliParseError> {
+    match matches.command_name() {
+        "list" => Ok(TestCliCommand::List(TestListOptions {
+            json: matches.contains("--json"),
+            tag: matches.value("--tag").map(str::to_string),
+        })),
+        "run" => parse_test_run_matches(matches).map(TestCliCommand::Run),
+        "smoke" => Ok(TestCliCommand::Smoke(TestSmokeOptions {
+            provider: matches
+                .value("--provider")
+                .unwrap_or(DeepSeekProvider::PROVIDER_ID)
+                .to_string(),
+            account: normalize_provider_account_name(matches.value("--account")),
+            model: matches.value("--model").map(str::to_string),
+            live: matches.contains("--live"),
+            require_cluster: matches.contains("--require-cluster"),
+            json: matches.contains("--json"),
+        })),
+        _ => Err(CliParseError::Parse {
+            detail: "test requires a subcommand".to_string(),
+        }),
     }
 }
 
-fn parse_test_list_options(args: &[String]) -> Result<TestListOptions, CliError> {
-    let mut options = TestListOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => options.json = true,
-            "--tag" => {
-                index += 1;
-                options.tag = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--tag requires a value".to_string(),
-                })?);
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected test list argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(options)
+#[cfg(test)]
+pub(crate) fn parse_test_schema_for_test(args: &[String]) -> Result<TestCliCommand, CliError> {
+    parse_schema_command_for_test(test_cli_spec(), args, parse_test_matches)
 }
 
-fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
-    let mut id = None;
-    let mut tag = None;
-    let mut provider = None;
-    let mut account = DEFAULT_PROVIDER_ACCOUNT.to_string();
-    let mut model = None;
-    let mut live = false;
-    let mut require_cluster = false;
-    let mut json = false;
-    let mut params = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--provider" => {
-                index += 1;
-                provider = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--provider requires a value".to_string(),
-                })?);
-            }
-            "--account" => {
-                index += 1;
-                account = normalize_provider_account_name(Some(
-                    args.get(index)
-                        .ok_or_else(|| CliError::Parse {
-                            detail: "--account requires a value".to_string(),
-                        })?
-                        .as_str(),
-                ));
-            }
-            "--model" => {
-                index += 1;
-                model = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--model requires a value".to_string(),
-                })?);
-            }
-            "--live" => live = true,
-            "--require-cluster" => require_cluster = true,
-            "--json" => json = true,
-            "--tag" => {
-                index += 1;
-                tag = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--tag requires a value".to_string(),
-                })?);
-            }
-            "--param" => {
-                index += 1;
-                let raw = args.get(index).ok_or_else(|| CliError::Parse {
-                    detail: "--param requires a key=value argument".to_string(),
-                })?;
-                let (key, value) = raw.split_once('=').ok_or_else(|| CliError::Parse {
-                    detail: format!("--param expects key=value, got `{raw}`"),
-                })?;
-                if key.is_empty() {
-                    return Err(CliError::Parse {
-                        detail: format!("--param expects a non-empty key, got `{raw}`"),
-                    });
-                }
-                params.push((key.to_string(), value.to_string()));
-            }
-            value if id.is_none() => id = Some(value.to_string()),
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected test run argument `{value}`"),
+#[cfg(test)]
+fn parse_test_run_schema_for_test(args: &[String]) -> Result<TestRunOptions, CliError> {
+    let args = std::iter::once("run".to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    match parse_test_schema_for_test(&args)? {
+        TestCliCommand::Run(options) => Ok(options),
+        _ => unreachable!("test run schema returned the wrong command"),
+    }
+}
+
+fn parse_test_run_matches(matches: &CliCommandMatches) -> Result<TestRunOptions, CliParseError> {
+    let id = matches.positionals().first().cloned();
+    let tag = matches.value("--tag").map(str::to_string);
+    let params = matches
+        .values("--param")
+        .map(|raw| {
+            let (key, value) = raw.split_once('=').ok_or_else(|| CliParseError::Parse {
+                detail: format!("--param expects key=value, got `{raw}`"),
+            })?;
+            if key.is_empty() {
+                return Err(CliParseError::Parse {
+                    detail: format!("--param expects a non-empty key, got `{raw}`"),
                 });
             }
-        }
-        index += 1;
-    }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if id.is_some() && tag.is_some() {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "test run accepts either <test-id> or --tag <tag>, not both".to_string(),
         });
     }
     if id.is_none() && tag.is_none() {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "test run requires <test-id> or --tag <tag>".to_string(),
         });
     }
     Ok(TestRunOptions {
         id,
         tag,
-        provider,
-        account,
-        model,
-        live,
-        require_cluster,
-        json,
+        provider: matches.value("--provider").map(str::to_string),
+        account: normalize_provider_account_name(matches.value("--account")),
+        model: matches.value("--model").map(str::to_string),
+        live: matches.contains("--live"),
+        require_cluster: matches.contains("--require-cluster"),
+        json: matches.contains("--json"),
         params,
-    })
-}
-
-fn parse_test_smoke_options(args: &[String]) -> Result<TestSmokeOptions, CliError> {
-    let mut provider = DeepSeekProvider::PROVIDER_ID.to_string();
-    let mut account = DEFAULT_PROVIDER_ACCOUNT.to_string();
-    let mut model = None;
-    let mut live = false;
-    let mut require_cluster = false;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--provider" => {
-                index += 1;
-                provider = args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--provider requires a value".to_string(),
-                })?;
-            }
-            "--account" => {
-                index += 1;
-                account = normalize_provider_account_name(Some(
-                    args.get(index)
-                        .ok_or_else(|| CliError::Parse {
-                            detail: "--account requires a value".to_string(),
-                        })?
-                        .as_str(),
-                ));
-            }
-            "--model" => {
-                index += 1;
-                model = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--model requires a value".to_string(),
-                })?);
-            }
-            "--live" => live = true,
-            "--require-cluster" => require_cluster = true,
-            "--json" => json = true,
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected test smoke argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(TestSmokeOptions {
-        provider,
-        account,
-        model,
-        live,
-        require_cluster,
-        json,
     })
 }
 
@@ -309,16 +275,20 @@ pub(crate) fn test_command_requires_cluster_state(command: &TestCliCommand) -> b
     match command {
         TestCliCommand::Run(options) => options.require_cluster,
         TestCliCommand::Smoke(options) => options.require_cluster,
-        TestCliCommand::Help | TestCliCommand::List(_) => false,
+        TestCliCommand::List(_) => false,
+    }
+}
+
+fn test_cli_policy(command: &TestCliCommand) -> CliCommandPolicy {
+    if test_command_requires_cluster_state(command) {
+        CliCommandPolicy::cluster_required()
+    } else {
+        CliCommandPolicy::local_capable()
     }
 }
 
 pub(crate) fn run_test_command(command: TestCliCommand) -> Result<(), CliError> {
     match command {
-        TestCliCommand::Help => {
-            print_test_help();
-            Ok(())
-        }
         TestCliCommand::List(options) => test_list(options),
         TestCliCommand::Run(options) => test_run(options),
         TestCliCommand::Smoke(options) => test_smoke(options),
@@ -693,7 +663,7 @@ mod tests {
 
     #[test]
     fn run_options_parse_repeatable_params() {
-        let options = parse_test_run_options(&args(&[
+        let options = parse_test_run_schema_for_test(&args(&[
             "cluster.dfs.write",
             "--require-cluster",
             "--param",
@@ -716,7 +686,7 @@ mod tests {
 
     #[test]
     fn run_options_accept_tag_selector() {
-        let options = parse_test_run_options(&args(&[
+        let options = parse_test_run_schema_for_test(&args(&[
             "--tag",
             "agent-readiness",
             "--require-cluster",
@@ -731,12 +701,12 @@ mod tests {
 
     #[test]
     fn run_options_reject_malformed_params() {
-        assert!(parse_test_run_options(&args(&["x", "--param"])).is_err());
-        assert!(parse_test_run_options(&args(&["x", "--param", "no-equals"])).is_err());
-        assert!(parse_test_run_options(&args(&["x", "--param", "=value"])).is_err());
-        assert!(parse_test_run_options(&args(&["--tag"])).is_err());
-        assert!(parse_test_run_options(&args(&["x", "--tag", "agent-readiness"])).is_err());
-        assert!(parse_test_run_options(&args(&[])).is_err());
+        assert!(parse_test_run_schema_for_test(&args(&["x", "--param"])).is_err());
+        assert!(parse_test_run_schema_for_test(&args(&["x", "--param", "no-equals"])).is_err());
+        assert!(parse_test_run_schema_for_test(&args(&["x", "--param", "=value"])).is_err());
+        assert!(parse_test_run_schema_for_test(&args(&["--tag"])).is_err());
+        assert!(parse_test_run_schema_for_test(&args(&["x", "--tag", "agent-readiness"])).is_err());
+        assert!(parse_test_run_schema_for_test(&args(&[])).is_err());
     }
 
     #[test]

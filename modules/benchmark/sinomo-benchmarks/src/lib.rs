@@ -178,6 +178,7 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
             agent_channel_discussion_descriptor(),
             agent_skill_quality_descriptor(),
             longmemeval_s_descriptor(),
+            memory_tools_longmemeval_s_descriptor(),
         ],
         plans: vec![
             swebench_verified_10_plan(),
@@ -185,6 +186,7 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
             agent_compaction_quality_plan(),
             agent_memory_quality_plan(),
             longmemeval_s_plan(),
+            memory_tools_longmemeval_s_plan(),
             agent_channel_discussion_plan(),
             terminalbench_harbor_plan(),
             mcu_minestudio_plan(),
@@ -215,6 +217,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.agent.compaction.plan".to_string(),
             "benchmark.agent.memory.plan".to_string(),
             "benchmark.agent.memory.longmemeval-s.plan".to_string(),
+            "benchmark.agent.memory.memory-tools-longmemeval-s.plan".to_string(),
             "benchmark.agent.channel-discussion.plan".to_string(),
             "benchmark.agent.skill.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
@@ -294,6 +297,22 @@ pub fn longmemeval_s_descriptor() -> BenchmarkSuiteDescriptor {
         split: Some("longmemeval_s_cleaned".to_string()),
         runner: benchmark_module_path("agent/run_longmemeval_s.py"),
         baseline: Some("Sinomo indexed-file lexical retrieval".to_string()),
+    }
+}
+
+pub fn memory_tools_longmemeval_s_descriptor() -> BenchmarkSuiteDescriptor {
+    BenchmarkSuiteDescriptor {
+        name: "agent-memory-tools-longmemeval-s".to_string(),
+        family: BenchmarkFamily::Memory,
+        task_count: 500,
+        dataset: Some(
+            "xiaowu0162/longmemeval-cleaned@98d7416c24c778c2fee6e6f3006e7a073259d48f".to_string(),
+        ),
+        split: Some("longmemeval_s_cleaned".to_string()),
+        runner: benchmark_module_path("agent/run_longmemeval_s.py"),
+        baseline: Some(
+            "Sinomo session-history and memory-note tools over an isolated VFS".to_string(),
+        ),
     }
 }
 
@@ -450,6 +469,38 @@ pub fn longmemeval_s_plan() -> BenchmarkHarnessPlan {
             "Every question runs in a fresh disposable SINOMO_DATA_DIR, HOME, XDG, temporary, and workspace tree so synthetic histories cannot mix with one another or normal operational data."
                 .to_string(),
             "Only the explicitly selected account configuration and selected provider credential files may be copied into a reader case; unrelated accounts plus cluster, DFS, permissions, events, chats, sessions, memory, and index state are never copied from the operator data directory."
+                .to_string(),
+        ],
+    }
+}
+
+pub fn memory_tools_longmemeval_s_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "agent-memory-tools-longmemeval-s".to_string(),
+        setup_commands: vec![
+            "cargo build --release -p sinomo-benchmarks --features memory-tools-bench --bin sinomo-memory-tools-bench"
+                .to_string(),
+            format!(
+                "python3 {} --mode plan --retriever memory-tools --summary-out benchmark-results/agent-memory/memory-tools-longmemeval-s/plan.json",
+                benchmark_module_path("agent/run_longmemeval_s.py")
+            ),
+        ],
+        run_command: format!(
+            "python3 {} --mode run --retriever memory-tools --dataset benchmark-results/datasets/longmemeval_s_cleaned.json --reader none --summary-out benchmark-results/agent-memory/memory-tools-longmemeval-s/summary.json --retrieval-out benchmark-results/agent-memory/memory-tools-longmemeval-s/retrieval.jsonl --progress-out benchmark-results/agent-memory/memory-tools-longmemeval-s/progress.jsonl",
+            benchmark_module_path("agent/run_longmemeval_s.py")
+        ),
+        required_tools: vec![
+            AgentToolKind::SessionHistorySearch,
+            AgentToolKind::MemorySearch,
+            AgentToolKind::MemoryWrite,
+            AgentToolKind::RunShellCommand,
+        ],
+        notes: vec![
+            "This baseline uses the same pinned 500-question LongMemEval-S dataset, fixed development subset, and retrieval metrics as the indexed-file baseline."
+                .to_string(),
+            "Each case seeds background activities and Markdown notes through the production memory tools on a fresh in-memory VFS; it does not require DFS, a daemon, or operator state."
+                .to_string(),
+            "Question terms are deterministic and query both session_history_search and memory_search; the report includes each source ranking plus their reciprocal-rank fusion."
                 .to_string(),
         ],
     }
@@ -1479,6 +1530,36 @@ mod tests {
     }
 
     #[test]
+    fn memory_tools_longmemeval_s_uses_the_same_suite_without_dfs() {
+        let descriptor = memory_tools_longmemeval_s_descriptor();
+        assert_eq!(descriptor.name, "agent-memory-tools-longmemeval-s");
+        assert_eq!(descriptor.family, BenchmarkFamily::Memory);
+        assert_eq!(descriptor.task_count, 500);
+        assert_eq!(descriptor.dataset, longmemeval_s_descriptor().dataset);
+        assert_eq!(descriptor.split, longmemeval_s_descriptor().split);
+        assert!(descriptor.runner.ends_with("agent/run_longmemeval_s.py"));
+
+        let plan = memory_tools_longmemeval_s_plan();
+        assert_eq!(plan.name, "agent-memory-tools-longmemeval-s");
+        assert!(plan.setup_commands.iter().any(|command| {
+            command.contains("--features memory-tools-bench --bin sinomo-memory-tools-bench")
+        }));
+        assert!(plan.run_command.contains("--retriever memory-tools"));
+        assert!(plan.run_command.contains("--reader none"));
+        assert!(
+            plan.required_tools
+                .contains(&AgentToolKind::SessionHistorySearch)
+        );
+        assert!(plan.required_tools.contains(&AgentToolKind::MemorySearch));
+        assert!(plan.required_tools.contains(&AgentToolKind::MemoryWrite));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("does not require DFS"))
+        );
+    }
+
+    #[test]
     fn minestudio_plan_keeps_vision_path_explicit() {
         let plan = minestudio_plan();
         assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
@@ -1613,6 +1694,11 @@ mod tests {
         assert!(
             descriptor
                 .capabilities
+                .contains(&"benchmark.agent.memory.memory-tools-longmemeval-s.plan".to_string())
+        );
+        assert!(
+            descriptor
+                .capabilities
                 .contains(&"benchmark.agent.channel-discussion.plan".to_string())
         );
         assert!(
@@ -1643,11 +1729,12 @@ mod tests {
         let catalog = benchmark_module_catalog();
 
         assert_eq!(catalog.module_root, SINOMO_BENCHMARKS_MODULE_ROOT);
-        assert_eq!(catalog.suites.len(), 4);
+        assert_eq!(catalog.suites.len(), 5);
         assert_eq!(catalog.suites[0].name, "swebench-verified-10");
         assert_eq!(catalog.suites[1].name, "agent-channel-discussion");
         assert_eq!(catalog.suites[2].name, "agent-skill-quality");
         assert_eq!(catalog.suites[3].name, "agent-memory-longmemeval-s");
+        assert_eq!(catalog.suites[4].name, "agent-memory-tools-longmemeval-s");
         assert!(
             catalog
                 .plans
@@ -1677,6 +1764,12 @@ mod tests {
                 .plans
                 .iter()
                 .any(|plan| plan.name == "agent-memory-longmemeval-s")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "agent-memory-tools-longmemeval-s")
         );
         assert!(
             catalog

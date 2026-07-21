@@ -88,7 +88,9 @@ use sinomo_runtime::api::{
 #[cfg(test)]
 use sinomo_runtime::api::{daemon_package_version, write_daemon_status};
 use sinomo_runtime::cli_registry::{
-    CliCommandContext, CliCommandRegistry, CliParseError, RegisteredCliCommand,
+    CliAutocompleteChoice, CliCommandContext, CliCommandMatches, CliCommandPolicy,
+    CliCommandRegistry, CliCommandSpec, CliOptionSpec, CliParseError, CliPositionalSpec,
+    CliValueSpec, RegisteredCliCommand,
 };
 use sinomo_runtime::cluster;
 #[cfg(test)]
@@ -198,12 +200,11 @@ use sinomo_runtime::dfs::{
     LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
-    DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_expose_config_path,
-    dfs_import_metadata_root, dfs_import_namespace_root, ensure_default_dfs_expose_config,
-    fallback_dfs_node_id, list_local_dfs_pins, load_dfs_expose_config, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_dfs_expose_entry,
-    remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
+    DfsPinAddRequest, DfsPinMode, add_local_dfs_pin, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, dfs_import_metadata_root, dfs_import_namespace_root,
+    fallback_dfs_node_id, list_local_dfs_pins, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_local_dfs_pin,
+    resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
 };
 use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
@@ -271,6 +272,7 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 mod agent_history;
+pub use agent_history::register_agent_history_search_tool_with_vfs;
 mod chat_activity;
 mod error;
 mod help;
@@ -1299,62 +1301,24 @@ fn join_stdio_capture_reader(
     })
 }
 
-pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
-    match command {
-        CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
-        CliCommand::Test(command) => test_command_requires_cluster_state(command),
-        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
-            command.policy().requires_cluster_state
-        }
-        _ => false,
-    }
+pub(crate) fn cli_command_requires_cluster_state(command: &RegisteredCliCommand) -> bool {
+    command.policy().requires_cluster_state
 }
 
-pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> bool {
-    match command {
-        CliCommand::Tui
-        | CliCommand::Models(_)
-        | CliCommand::Providers(_)
-        | CliCommand::Agent(_)
-        | CliCommand::Skill(_) => true,
-        CliCommand::Test(command) => !test_command_requires_cluster_state(command),
-        CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
-        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
-            command.policy().supports_degraded_local_mode
-        }
-        _ => false,
-    }
+pub(crate) fn cli_command_supports_degraded_local_mode(command: &RegisteredCliCommand) -> bool {
+    command.policy().supports_degraded_local_mode
 }
 
-pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
-    match command {
-        CliCommand::Help | CliCommand::InstallHelp => true,
-        CliCommand::Cluster(ClusterCliCommand::Help)
-        | CliCommand::Daemon(DaemonCliCommand::Help)
-        | CliCommand::Debug(DebugCliCommand::Help)
-        | CliCommand::Rollout(RolloutCliCommand::Help)
-        | CliCommand::Dfs(DfsCliCommand::Help)
-        | CliCommand::Memory(MemoryCliCommand::Help)
-        | CliCommand::Models(ModelsCliCommand::Help)
-        | CliCommand::Providers(ProviderCliCommand::Help)
-        | CliCommand::Voice(VoiceCliCommand::Help)
-        | CliCommand::Test(TestCliCommand::Help)
-        | CliCommand::Agent(AgentCliCommand::Help)
-        | CliCommand::Skill(SkillCliCommand::Help)
-        | CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Help)) => true,
-        CliCommand::Registered(command) | CliCommand::RegisteredRolloutMutation(command) => {
-            command.is_help()
-        }
-        _ => false,
-    }
+pub(crate) fn cli_command_is_help(command: &RegisteredCliCommand) -> bool {
+    command.is_help()
 }
 
-fn cli_command_needs_daemon_probe(command: &CliCommand) -> bool {
+fn cli_command_needs_daemon_probe(command: &RegisteredCliCommand) -> bool {
     cli_command_requires_cluster_state(command) || cli_command_supports_degraded_local_mode(command)
 }
 
 fn cli_command_enters_degraded_local_mode(
-    command: &CliCommand,
+    command: &RegisteredCliCommand,
     daemon_available: bool,
     local_cluster_quorum: Option<bool>,
 ) -> bool {
@@ -1362,9 +1326,10 @@ fn cli_command_enters_degraded_local_mode(
         && (!daemon_available || local_cluster_quorum == Some(false))
 }
 
+#[cfg(test)]
 pub(crate) fn cli_invocation_force_local_mode(
     options: CliRuntimeOptions,
-    command: &CliCommand,
+    command: &RegisteredCliCommand,
     daemon_available: bool,
     local_cluster_quorum: Option<bool>,
 ) -> bool {
@@ -1373,10 +1338,10 @@ pub(crate) fn cli_invocation_force_local_mode(
 }
 
 fn cli_local_cluster_quorum_if_relevant(
-    command: &CliCommand,
+    supports_degraded_local_mode: bool,
     daemon: Option<&DaemonStatus>,
 ) -> Result<Option<bool>, CliError> {
-    if daemon.is_none() || !cli_command_supports_degraded_local_mode(command) {
+    if daemon.is_none() || !supports_degraded_local_mode {
         return Ok(None);
     }
     let paths = cluster_paths_from_defaults()?;
@@ -1407,7 +1372,7 @@ pub(crate) struct CliRuntimeOptions {
 
 #[derive(Debug)]
 pub(crate) struct CliInvocation {
-    pub(crate) command: CliCommand,
+    pub(crate) command: Option<RegisteredCliCommand>,
     pub(crate) options: CliRuntimeOptions,
 }
 
@@ -1437,30 +1402,6 @@ pub(crate) fn with_cli_force_local_mode<T>(force_local: bool, f: impl FnOnce() -
     f()
 }
 
-#[derive(Debug)]
-pub(crate) enum CliCommand {
-    Tui,
-    Help,
-    Cluster(ClusterCliCommand),
-    InstallHelp,
-    Install(InstallOptions),
-    Uninstall(UninstallOptions),
-    Daemon(DaemonCliCommand),
-    Debug(DebugCliCommand),
-    Rollout(RolloutCliCommand),
-    Dfs(DfsCliCommand),
-    Memory(MemoryCliCommand),
-    Models(ModelsCliCommand),
-    Providers(ProviderCliCommand),
-    Voice(VoiceCliCommand),
-    Test(TestCliCommand),
-    Agent(AgentCliCommand),
-    Skill(SkillCliCommand),
-    Registered(RegisteredCliCommand),
-    RegisteredRolloutMutation(RegisteredCliCommand),
-    Usage(UsageOptions),
-}
-
 pub fn default_cli_command_registry() -> CliCommandRegistry {
     let local_data_dir = SinomoDataDir::from_env_or_home().ok();
     let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
@@ -1484,6 +1425,22 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         })
         .unwrap_or(module_config);
     let mut registry = CliCommandRegistry::new()
+        .register(help_cli_command_handler())
+        .register(cluster_cli_command_handler())
+        .register(install_cli_command_handler())
+        .register(uninstall_cli_command_handler())
+        .register(daemon_cli_command_handler())
+        .register(debug_cli_command_handler())
+        .register(rollout_cli_command_handler())
+        .register(dfs_cli_command_handler())
+        .register(memory_cli_command_handler())
+        .register(providers_cli_command_handler())
+        .register(usage_cli_command_handler())
+        .register(voice_cli_command_handler())
+        .register(test_cli_command_handler())
+        .register(agent_cli_command_handler())
+        .register(skill_cli_command_handler())
+        .register(models_cli_command_handler())
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,
         ))
@@ -1506,6 +1463,9 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
             sinomo_runtime::remote_management::node_permissions_cli_command_handler(data_dir),
         );
     }
+    registry
+        .validate_reserved_names(&[])
+        .expect("registered CLI commands must not conflict with built-in commands");
     registry
 }
 
@@ -1677,84 +1637,18 @@ pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, Cli
     })
 }
 
-pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(CliCommand::Tui),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(CliCommand::Help)
-        }
-        Some((command, rest)) if command == "cluster" => {
-            Ok(CliCommand::Cluster(parse_cluster_command(rest)?))
-        }
-        Some((command, rest)) if command == "install" && is_help_args(rest) => {
-            Ok(CliCommand::InstallHelp)
-        }
-        Some((command, rest)) if command == "install" => {
-            Ok(CliCommand::Install(parse_install_options(rest)?))
-        }
-        Some((command, rest)) if command == "uninstall" && is_help_args(rest) => {
-            Ok(CliCommand::InstallHelp)
-        }
-        Some((command, rest)) if command == "uninstall" => {
-            Ok(CliCommand::Uninstall(parse_uninstall_options(rest)?))
-        }
-        Some((command, rest)) if command == "daemon" => {
-            Ok(CliCommand::Daemon(parse_daemon_command(rest)?))
-        }
-        Some((command, rest)) if command == "debug" => {
-            Ok(CliCommand::Debug(parse_debug_command(rest)?))
-        }
-        Some((command, rest)) if command == "rollout" => {
-            Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
-        }
-        Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
-        Some((command, rest)) if command == "memory" => {
-            Ok(CliCommand::Memory(parse_memory_command(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "models" | "model") => {
-            Ok(CliCommand::Models(parse_models_command(rest)?))
-        }
-        Some((command, rest)) if command == "providers" => {
-            Ok(CliCommand::Providers(parse_provider_command(rest)?))
-        }
-        Some((command, rest)) if command == "voice" => {
-            Ok(CliCommand::Voice(parse_voice_command(rest)?))
-        }
-        Some((command, rest)) if command == "test" => {
-            Ok(CliCommand::Test(parse_test_command(rest)?))
-        }
-        Some((command, rest)) if command == "agent" => {
-            Ok(CliCommand::Agent(parse_agent_command(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "skill" | "skills") => {
-            Ok(CliCommand::Skill(parse_skill_command(rest)?))
-        }
-        Some((command, rest)) if command == "usage" => {
-            Ok(CliCommand::Usage(parse_usage_options(rest)?))
-        }
-        _ => match cli_command_registry().parse(args)? {
-            Some(command) if registered_command_requires_rollout_admission(args) => {
-                Ok(CliCommand::RegisteredRolloutMutation(command))
-            }
-            Some(command) => Ok(CliCommand::Registered(command)),
-            None => Err(CliError::Usage),
-        },
+pub(crate) fn parse_cli_command(args: &[String]) -> Result<Option<RegisteredCliCommand>, CliError> {
+    if args.is_empty() {
+        return Ok(None);
     }
-}
-
-fn registered_command_requires_rollout_admission(args: &[String]) -> bool {
-    matches!(
-        args,
-        [module, native_dylib, mutation, ..]
-            if module == "module"
-                && native_dylib == "native-dylib"
-                && matches!(mutation.as_str(), "activate" | "unload")
-    )
+    cli_command_registry()
+        .parse(args)?
+        .ok_or(CliError::Usage)
+        .map(Some)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum AgentCliCommand {
-    Help,
     Export(AgentExportOptions),
     Import(AgentImportOptions),
     Inspect(AgentInspectOptions),
@@ -1766,7 +1660,6 @@ pub(crate) enum AgentCliCommand {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum AgentSessionCliCommand {
-    Help,
     Inspect(AgentSessionInspectOptions),
     Progress(AgentSessionProgressOptions),
     TerminalResults(AgentSessionTerminalResultsOptions),
@@ -1778,7 +1671,6 @@ pub(crate) enum AgentSessionCliCommand {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum SkillCliCommand {
-    Help,
     List(SkillListOptions),
     Show(SkillShowOptions),
     Import(SkillImportOptions),
@@ -1905,278 +1797,724 @@ pub(crate) struct AgentSessionResumeOptions {
     pub json: bool,
 }
 
-pub(crate) fn parse_agent_command(args: &[String]) -> Result<AgentCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(AgentCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(AgentCliCommand::Help)
-        }
-        Some((command, rest)) if command == "export" => {
-            Ok(AgentCliCommand::Export(parse_agent_export_options(rest)?))
-        }
-        Some((command, rest)) if command == "import" => {
-            Ok(AgentCliCommand::Import(parse_agent_import_options(rest)?))
-        }
-        Some((command, rest)) if command == "inspect" => {
-            Ok(AgentCliCommand::Inspect(parse_agent_inspect_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "readiness" | "ready") => Ok(
-            AgentCliCommand::Readiness(parse_agent_readiness_options(rest)?),
-        ),
-        Some((command, rest)) if command == "run" => {
-            Ok(AgentCliCommand::Run(parse_agent_run_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "session" | "sessions") => {
-            Ok(AgentCliCommand::Session(parse_agent_session_command(rest)?))
-        }
-        Some((command, rest)) if command == "validate" => Ok(AgentCliCommand::Validate(
-            parse_agent_validate_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
+pub(crate) fn agent_cli_command_handler() -> DeclarativeCommandHandler<AgentCliCommand> {
+    DeclarativeCommandHandler::new(
+        "agent",
+        CliCommandPolicy::local_capable(),
+        agent_cli_spec,
+        parse_agent_matches,
+        run_agent_command,
+    )
 }
 
-pub(crate) fn parse_skill_command(args: &[String]) -> Result<SkillCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(SkillCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(SkillCliCommand::Help)
-        }
-        Some((command, rest)) if matches!(command.as_str(), "list" | "ls") => {
-            Ok(SkillCliCommand::List(parse_skill_list_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "show" | "inspect" | "describe") => {
-            Ok(SkillCliCommand::Show(parse_skill_show_options(rest)?))
-        }
-        Some((command, rest)) if command == "import" => {
-            Ok(SkillCliCommand::Import(parse_skill_import_options(rest)?))
-        }
-        Some((command, rest)) if command == "export" => {
-            Ok(SkillCliCommand::Export(parse_skill_export_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "activate" | "enable") => Ok(
-            SkillCliCommand::Activate(parse_skill_activate_options(rest)?),
-        ),
-        _ => Err(CliError::Usage),
-    }
+pub(crate) fn skill_cli_command_handler() -> DeclarativeCommandHandler<SkillCliCommand> {
+    DeclarativeCommandHandler::new(
+        "skill",
+        CliCommandPolicy::local_capable(),
+        skill_cli_spec,
+        parse_skill_matches,
+        run_skill_command,
+    )
 }
 
-pub(crate) fn parse_skill_list_options(args: &[String]) -> Result<SkillListOptions, CliError> {
-    let mut all = false;
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--all" | "-a" => all = true,
-            "--json" => json = true,
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected skill list argument `{value}`"),
-                });
-            }
-        }
-    }
-    Ok(SkillListOptions { all, json })
-}
-
-pub(crate) fn parse_skill_show_options(args: &[String]) -> Result<SkillShowOptions, CliError> {
-    let mut skill_id = None;
-    let mut version = None;
-    let mut text = false;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--text" | "--markdown" => text = true,
-            "--version" => {
-                index += 1;
-                version = Some(skill_option_value(args.get(index), "--version")?);
-            }
-            "--skill" | "--id" => {
-                index += 1;
-                skill_id = Some(skill_option_value(args.get(index), "--skill")?);
-            }
-            value if skill_id.is_none() => skill_id = Some(value.to_string()),
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected skill show argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(SkillShowOptions {
-        skill_id: skill_id.ok_or_else(|| CliError::Parse {
-            detail: "skill show requires a skill id".to_string(),
-        })?,
-        version,
-        text,
-        json,
-    })
-}
-
-pub(crate) fn parse_skill_import_options(args: &[String]) -> Result<SkillImportOptions, CliError> {
-    let mut path = None;
-    let mut skill_id = None;
-    let mut version = "1.0.0".to_string();
-    let mut source = SkillCatalogSourceKind::User;
-    let mut source_id = "local-user".to_string();
-    let mut activate = true;
-    let mut scope = SkillActivationScope::Cluster.as_str().to_string();
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--no-activate" => activate = false,
-            "--activate" => activate = true,
-            "--file" | "--path" => {
-                index += 1;
-                path = Some(PathBuf::from(skill_option_value(
-                    args.get(index),
-                    "--file",
-                )?));
-            }
-            "--id" | "--skill" => {
-                index += 1;
-                skill_id = Some(skill_option_value(args.get(index), "--id")?);
-            }
-            "--version" => {
-                index += 1;
-                version = skill_option_value(args.get(index), "--version")?;
-            }
-            "--source" => {
-                index += 1;
-                source =
-                    parse_skill_source_kind(&skill_option_value(args.get(index), "--source")?)?;
-            }
-            "--source-id" => {
-                index += 1;
-                source_id = skill_option_value(args.get(index), "--source-id")?;
-            }
-            "--scope" => {
-                index += 1;
-                scope = skill_option_value(args.get(index), "--scope")?;
-            }
-            value if path.is_none() => path = Some(PathBuf::from(value)),
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected skill import argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(SkillImportOptions {
-        path: path.ok_or_else(|| CliError::Parse {
-            detail: "skill import requires a SKILL.md path or skill directory".to_string(),
-        })?,
-        skill_id,
-        version,
-        source,
-        source_id,
-        activate,
-        scope,
-        json,
-    })
-}
-
-pub(crate) fn parse_skill_export_options(args: &[String]) -> Result<SkillExportOptions, CliError> {
-    let mut skill_id = None;
-    let mut version = None;
-    let mut output = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--version" => {
-                index += 1;
-                version = Some(skill_option_value(args.get(index), "--version")?);
-            }
-            "--output" | "-o" => {
-                index += 1;
-                output = Some(PathBuf::from(skill_option_value(
-                    args.get(index),
+fn agent_cli_spec() -> CliCommandSpec {
+    let json = || CliOptionSpec::flag("--json", "print JSON output");
+    let session = || {
+        CliOptionSpec::value(
+            "--session",
+            "agent session id",
+            CliValueSpec::new("session-id", "agent session id"),
+        )
+        .with_aliases(["--session-id"])
+    };
+    let optional_agent =
+        || CliPositionalSpec::optional(CliValueSpec::new("agent-id", "agent package id"));
+    let session_positional =
+        || CliPositionalSpec::optional(CliValueSpec::new("session-id", "agent session id"));
+    let message_command = |name: &'static str, about: &'static str| {
+        CliCommandSpec::new(name, about)
+            .with_options([
+                session(),
+                CliOptionSpec::value(
+                    "--message",
+                    "message or reason text",
+                    CliValueSpec::new("text", "message text"),
+                )
+                .with_aliases(["--reason"])
+                .repeatable(),
+                json(),
+            ])
+            .with_positionals([
+                session_positional(),
+                CliPositionalSpec::optional(CliValueSpec::new("message", "message text"))
+                    .repeatable(),
+            ])
+    };
+    let sessions = CliCommandSpec::new("session", "inspect and control agent sessions")
+        .with_aliases(["sessions"])
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("inspect", "inspect persisted agent session state")
+                .with_options([session(), json()])
+                .with_positionals([session_positional()]),
+            CliCommandSpec::new("progress", "read agent session control-plane events")
+                .with_options([
+                    session(),
+                    CliOptionSpec::value(
+                        "--cursor",
+                        "event cursor offset",
+                        CliValueSpec::new("offset", "event cursor offset"),
+                    )
+                    .with_aliases(["--offset"]),
+                    CliOptionSpec::value(
+                        "--last-event",
+                        "last observed event id",
+                        CliValueSpec::new("event-id", "event id"),
+                    )
+                    .with_aliases(["--last-event-id"]),
+                    json(),
+                ])
+                .with_positionals([session_positional()]),
+            CliCommandSpec::new("terminal-results", "read terminal agent task results")
+                .with_aliases(["results"])
+                .with_options([
+                    session(),
+                    CliOptionSpec::value(
+                        "--task",
+                        "filter by task id",
+                        CliValueSpec::new("task-id", "agent task id"),
+                    )
+                    .with_aliases(["--task-id"]),
+                    json(),
+                ])
+                .with_positionals([session_positional()]),
+            message_command("steer", "steer a live agent session"),
+            message_command("follow-up", "queue a follow-up for a live agent session")
+                .with_aliases(["followup"]),
+            message_command("interrupt", "interrupt a live agent session"),
+            CliCommandSpec::new("resume", "reattach to a live agent session")
+                .with_options([session(), json()])
+                .with_positionals([session_positional()]),
+        ]);
+    CliCommandSpec::new("agent", "run and inspect Sinomo agents")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("export", "export an agent package")
+                .with_options([CliOptionSpec::value(
                     "--output",
-                )?));
-            }
-            "--skill" | "--id" => {
-                index += 1;
-                skill_id = Some(skill_option_value(args.get(index), "--skill")?);
-            }
-            value if skill_id.is_none() => skill_id = Some(value.to_string()),
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected skill export argument `{value}`"),
-                });
-            }
+                    "output JSON path",
+                    CliValueSpec::new("path", "output path"),
+                )
+                .with_aliases(["-o"])])
+                .with_positionals([optional_agent()]),
+            CliCommandSpec::new("import", "import an agent package")
+                .with_options([
+                    CliOptionSpec::value(
+                        "--file",
+                        "agent package JSON path",
+                        CliValueSpec::new("path", "package path"),
+                    ),
+                    json(),
+                ])
+                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                    "path",
+                    "package path",
+                ))]),
+            CliCommandSpec::new("inspect", "inspect an agent package")
+                .with_options([
+                    CliOptionSpec::value(
+                        "--agent",
+                        "agent package id",
+                        CliValueSpec::new("agent-id", "agent package id"),
+                    ),
+                    json(),
+                ])
+                .with_positionals([optional_agent()]),
+            CliCommandSpec::new("readiness", "run deterministic local agent readiness gates")
+                .with_aliases(["ready"])
+                .with_options([json()]),
+            CliCommandSpec::new(
+                "run",
+                "run one agent turn with durable session resume and persisted context projection",
+            )
+            .with_options([
+                CliOptionSpec::value(
+                    "--prompt",
+                    "agent prompt",
+                    CliValueSpec::new("text", "prompt text"),
+                ),
+                CliOptionSpec::value(
+                    "--agent",
+                    "agent package id",
+                    CliValueSpec::new("agent-id", "agent package id"),
+                ),
+                CliOptionSpec::value(
+                    "--provider",
+                    "model provider",
+                    CliValueSpec::new("provider", "provider id"),
+                ),
+                CliOptionSpec::value(
+                    "--model",
+                    "model id",
+                    CliValueSpec::new("model", "model id"),
+                ),
+                CliOptionSpec::value(
+                    "--account",
+                    "provider account",
+                    CliValueSpec::new("account", "provider account"),
+                ),
+                session(),
+                CliOptionSpec::flag("--compact-after", "compact the session after the turn"),
+                json(),
+            ])
+            .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                "prompt",
+                "agent prompt",
+            ))]),
+            sessions,
+            CliCommandSpec::new("validate", "validate an agent package")
+                .with_options([
+                    CliOptionSpec::value(
+                        "--file",
+                        "agent package JSON path",
+                        CliValueSpec::new("path", "package path"),
+                    ),
+                    json(),
+                ])
+                .with_positionals([optional_agent()]),
+        ])
+}
+
+fn skill_cli_spec() -> CliCommandSpec {
+    let json = || CliOptionSpec::flag("--json", "print JSON output");
+    let version = || {
+        CliOptionSpec::value(
+            "--version",
+            "skill version",
+            CliValueSpec::new("version", "skill version"),
+        )
+    };
+    let skill = || {
+        CliOptionSpec::value(
+            "--skill",
+            "skill id",
+            CliValueSpec::new("skill-id", "skill id"),
+        )
+        .with_aliases(["--id"])
+    };
+    let optional_skill = || CliPositionalSpec::optional(CliValueSpec::new("skill-id", "skill id"));
+    CliCommandSpec::new("skill", "manage the SIFS-backed skill catalog")
+        .with_aliases(["skills"])
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("list", "list catalog skills")
+                .with_aliases(["ls"])
+                .with_options([
+                    CliOptionSpec::flag("--all", "include inactive versions").with_aliases(["-a"]),
+                    json(),
+                ]),
+            CliCommandSpec::new("show", "show a skill descriptor")
+                .with_aliases(["inspect", "describe"])
+                .with_options([
+                    skill(),
+                    version(),
+                    CliOptionSpec::flag("--text", "include stored SKILL.md text")
+                        .with_aliases(["--markdown"]),
+                    json(),
+                ])
+                .with_positionals([optional_skill()]),
+            CliCommandSpec::new("import", "import a SKILL.md file or directory")
+                .with_options([
+                    CliOptionSpec::value(
+                        "--file",
+                        "SKILL.md path or skill directory",
+                        CliValueSpec::new("path", "skill path"),
+                    )
+                    .with_aliases(["--path"]),
+                    skill(),
+                    version(),
+                    CliOptionSpec::value(
+                        "--source",
+                        "catalog source kind",
+                        CliValueSpec::new("kind", "source kind")
+                            .with_choices([
+                                CliAutocompleteChoice::new("sinomo", "built-in Sinomo skill"),
+                                CliAutocompleteChoice::new("module", "module-provided skill"),
+                                CliAutocompleteChoice::new("user", "user-provided skill"),
+                                CliAutocompleteChoice::new("agent", "agent-provided skill"),
+                                CliAutocompleteChoice::new("evolution", "evolution-provided skill"),
+                            ])
+                            .restricted(),
+                    ),
+                    CliOptionSpec::value(
+                        "--source-id",
+                        "source identity",
+                        CliValueSpec::new("id", "source identity"),
+                    ),
+                    CliOptionSpec::flag("--activate", "activate the imported skill"),
+                    CliOptionSpec::flag("--no-activate", "leave the imported skill inactive"),
+                    CliOptionSpec::value(
+                        "--scope",
+                        "activation scope",
+                        CliValueSpec::new("scope", "activation scope"),
+                    ),
+                    json(),
+                ])
+                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                    "path",
+                    "skill path",
+                ))]),
+            CliCommandSpec::new("export", "export a catalog skill as SKILL.md")
+                .with_options([
+                    skill(),
+                    version(),
+                    CliOptionSpec::value(
+                        "--output",
+                        "output path",
+                        CliValueSpec::new("path", "output path"),
+                    )
+                    .with_aliases(["-o"]),
+                    json(),
+                ])
+                .with_positionals([optional_skill()]),
+            CliCommandSpec::new("activate", "activate a catalog skill")
+                .with_aliases(["enable"])
+                .with_options([
+                    skill(),
+                    version(),
+                    CliOptionSpec::value(
+                        "--scope",
+                        "activation scope",
+                        CliValueSpec::new("scope", "activation scope"),
+                    ),
+                    CliOptionSpec::value(
+                        "--reason",
+                        "activation reason",
+                        CliValueSpec::new("text", "activation reason"),
+                    ),
+                    json(),
+                ])
+                .with_positionals([optional_skill()]),
+        ])
+}
+
+fn parse_agent_matches(matches: &CliCommandMatches) -> Result<AgentCliCommand, CliParseError> {
+    let path = matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match path.as_slice() {
+        ["agent", "export"] => Ok(AgentCliCommand::Export(AgentExportOptions {
+            agent: matches
+                .positionals()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "main-agent".to_string()),
+            output: matches.value("--output").map(PathBuf::from),
+        })),
+        ["agent", "import"] => {
+            let path = matches
+                .value("--file")
+                .or_else(|| matches.positionals().first().map(String::as_str))
+                .ok_or_else(|| CliParseError::Parse {
+                    detail: "agent import requires a package JSON path".to_string(),
+                })?;
+            Ok(AgentCliCommand::Import(AgentImportOptions {
+                path: PathBuf::from(path),
+                json: matches.contains("--json"),
+            }))
         }
-        index += 1;
+        ["agent", "inspect"] => Ok(AgentCliCommand::Inspect(AgentInspectOptions {
+            agent: matches
+                .value("--agent")
+                .or_else(|| matches.positionals().first().map(String::as_str))
+                .unwrap_or("main-agent")
+                .to_string(),
+            json: matches.contains("--json"),
+        })),
+        ["agent", "readiness"] => Ok(AgentCliCommand::Readiness(AgentReadinessOptions {
+            json: matches.contains("--json"),
+        })),
+        ["agent", "run"] => parse_agent_run_matches(matches).map(AgentCliCommand::Run),
+        ["agent", "session", command] => {
+            parse_agent_session_matches(command, matches).map(AgentCliCommand::Session)
+        }
+        ["agent", "validate"] => Ok(AgentCliCommand::Validate(AgentValidateOptions {
+            agent: matches
+                .positionals()
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "main-agent".to_string()),
+            file: matches.value("--file").map(PathBuf::from),
+            json: matches.contains("--json"),
+        })),
+        _ => Err(CliParseError::Parse {
+            detail: "agent requires a subcommand".to_string(),
+        }),
     }
-    Ok(SkillExportOptions {
-        skill_id: skill_id.ok_or_else(|| CliError::Parse {
-            detail: "skill export requires a skill id".to_string(),
-        })?,
-        version,
-        output,
-        json,
+}
+
+fn parse_agent_run_matches(matches: &CliCommandMatches) -> Result<AgentRunOptions, CliParseError> {
+    let prompt = matches
+        .value("--prompt")
+        .or_else(|| matches.positionals().first().map(String::as_str))
+        .ok_or_else(|| CliParseError::Parse {
+            detail: "agent run requires --prompt <text>".to_string(),
+        })?;
+    let agent_explicit = matches.contains("--agent");
+    let session_id = matches
+        .value("--session")
+        .map(parse_agent_session_id)
+        .transpose()
+        .map_err(semantic_parse_error)?;
+    Ok(AgentRunOptions {
+        prompt: prompt.to_string(),
+        agent: matches.value("--agent").unwrap_or("main-agent").to_string(),
+        agent_explicit,
+        provider: matches
+            .value("--provider")
+            .unwrap_or(CODEX_PROVIDER_ID)
+            .to_string(),
+        model: matches
+            .value("--model")
+            .unwrap_or(CODEX_DEFAULT_MODEL)
+            .to_string(),
+        account: matches.value("--account").map(str::to_string),
+        session_id,
+        compact_after: matches.contains("--compact-after"),
+        json: matches.contains("--json"),
     })
 }
 
-pub(crate) fn parse_skill_activate_options(
+fn agent_session_id_from_matches(matches: &CliCommandMatches) -> Result<SessionId, CliParseError> {
+    let value = matches
+        .value("--session")
+        .or_else(|| matches.positionals().first().map(String::as_str))
+        .ok_or_else(|| CliParseError::Parse {
+            detail: format!(
+                "agent session {} requires a session id",
+                matches.command_name()
+            ),
+        })?;
+    parse_agent_session_id(value).map_err(semantic_parse_error)
+}
+
+fn parse_agent_session_matches(
+    command: &str,
+    matches: &CliCommandMatches,
+) -> Result<AgentSessionCliCommand, CliParseError> {
+    let session_id = agent_session_id_from_matches(matches)?;
+    let json = matches.contains("--json");
+    match command {
+        "inspect" => Ok(AgentSessionCliCommand::Inspect(
+            AgentSessionInspectOptions { session_id, json },
+        )),
+        "progress" => {
+            let offset = matches
+                .value("--cursor")
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|source| CliParseError::Parse {
+                            detail: format!("invalid --cursor value `{value}`: {source}"),
+                        })
+                })
+                .transpose()?;
+            let last_event_id = matches
+                .value("--last-event")
+                .map(|value| {
+                    TaskId::from_str(value).map_err(|source| CliParseError::Parse {
+                        detail: format!("invalid agent task id `{value}`: {source}"),
+                    })
+                })
+                .transpose()?;
+            let cursor = (offset.is_some() || last_event_id.is_some()).then(|| {
+                AgentSessionControlEventCursor {
+                    offset: offset.unwrap_or_default(),
+                    last_event_id,
+                }
+            });
+            Ok(AgentSessionCliCommand::Progress(
+                AgentSessionProgressOptions {
+                    session_id,
+                    cursor,
+                    json,
+                },
+            ))
+        }
+        "terminal-results" => {
+            let task_id = matches
+                .value("--task")
+                .map(|value| {
+                    TaskId::from_str(value).map_err(|source| CliParseError::Parse {
+                        detail: format!("invalid agent task id `{value}`: {source}"),
+                    })
+                })
+                .transpose()?;
+            Ok(AgentSessionCliCommand::TerminalResults(
+                AgentSessionTerminalResultsOptions {
+                    session_id,
+                    task_id,
+                    json,
+                },
+            ))
+        }
+        "steer" | "follow-up" | "interrupt" => {
+            let positional_start = usize::from(!matches.contains("--session"));
+            let message = matches
+                .values("--message")
+                .chain(
+                    matches
+                        .positionals()
+                        .iter()
+                        .skip(positional_start)
+                        .map(String::as_str),
+                )
+                .collect::<Vec<_>>()
+                .join(" ");
+            if message.trim().is_empty() {
+                return Err(CliParseError::Parse {
+                    detail: format!("agent session {command} requires a message"),
+                });
+            }
+            let options = AgentSessionMessageOptions {
+                session_id,
+                message,
+                json,
+            };
+            match command {
+                "steer" => Ok(AgentSessionCliCommand::Steer(options)),
+                "follow-up" => Ok(AgentSessionCliCommand::FollowUp(options)),
+                "interrupt" => Ok(AgentSessionCliCommand::Interrupt(options)),
+                _ => unreachable!(),
+            }
+        }
+        "resume" => Ok(AgentSessionCliCommand::Resume(AgentSessionResumeOptions {
+            session_id,
+            json,
+        })),
+        _ => Err(CliParseError::Parse {
+            detail: format!("unknown agent session command `{command}`"),
+        }),
+    }
+}
+
+fn parse_skill_matches(matches: &CliCommandMatches) -> Result<SkillCliCommand, CliParseError> {
+    let skill_id = || {
+        matches
+            .value("--skill")
+            .or_else(|| matches.positionals().first().map(String::as_str))
+            .map(str::to_string)
+    };
+    match matches.command_name() {
+        "list" => Ok(SkillCliCommand::List(SkillListOptions {
+            all: matches.contains("--all"),
+            json: matches.contains("--json"),
+        })),
+        "show" => Ok(SkillCliCommand::Show(SkillShowOptions {
+            skill_id: skill_id().ok_or_else(|| CliParseError::Parse {
+                detail: "skill show requires a skill id".to_string(),
+            })?,
+            version: matches.value("--version").map(str::to_string),
+            text: matches.contains("--text"),
+            json: matches.contains("--json"),
+        })),
+        "import" => {
+            if matches.contains("--activate") && matches.contains("--no-activate") {
+                return Err(CliParseError::Parse {
+                    detail: "skill import cannot combine --activate and --no-activate".to_string(),
+                });
+            }
+            let path = matches
+                .value("--file")
+                .or_else(|| matches.positionals().first().map(String::as_str))
+                .ok_or_else(|| CliParseError::Parse {
+                    detail: "skill import requires a SKILL.md path or skill directory".to_string(),
+                })?;
+            let source = matches
+                .value("--source")
+                .map(parse_skill_source_kind)
+                .transpose()
+                .map_err(semantic_parse_error)?
+                .unwrap_or(SkillCatalogSourceKind::User);
+            Ok(SkillCliCommand::Import(SkillImportOptions {
+                path: PathBuf::from(path),
+                skill_id: matches.value("--skill").map(str::to_string),
+                version: matches.value("--version").unwrap_or("1.0.0").to_string(),
+                source,
+                source_id: matches
+                    .value("--source-id")
+                    .unwrap_or("local-user")
+                    .to_string(),
+                activate: !matches.contains("--no-activate"),
+                scope: matches
+                    .value("--scope")
+                    .unwrap_or(SkillActivationScope::Cluster.as_str())
+                    .to_string(),
+                json: matches.contains("--json"),
+            }))
+        }
+        "export" => Ok(SkillCliCommand::Export(SkillExportOptions {
+            skill_id: skill_id().ok_or_else(|| CliParseError::Parse {
+                detail: "skill export requires a skill id".to_string(),
+            })?,
+            version: matches.value("--version").map(str::to_string),
+            output: matches.value("--output").map(PathBuf::from),
+            json: matches.contains("--json"),
+        })),
+        "activate" => Ok(SkillCliCommand::Activate(SkillActivateOptions {
+            skill_id: skill_id().ok_or_else(|| CliParseError::Parse {
+                detail: "skill activate requires a skill id".to_string(),
+            })?,
+            version: matches.value("--version").map(str::to_string),
+            scope: matches
+                .value("--scope")
+                .unwrap_or(SkillActivationScope::Cluster.as_str())
+                .to_string(),
+            reason: matches
+                .value("--reason")
+                .unwrap_or("manual skill activation")
+                .to_string(),
+            json: matches.contains("--json"),
+        })),
+        _ => Err(CliParseError::Parse {
+            detail: "skill requires a subcommand".to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn prefixed_schema_args(prefix: &[&str], args: &[String]) -> Vec<String> {
+    prefix
+        .iter()
+        .map(|value| (*value).to_string())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn parse_agent_schema_for_test(args: &[String]) -> Result<AgentCliCommand, CliError> {
+    parse_schema_command_for_test(agent_cli_spec(), args, parse_agent_matches)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_agent_session_schema_for_test(
     args: &[String],
-) -> Result<SkillActivateOptions, CliError> {
-    let mut skill_id = None;
-    let mut version = None;
-    let mut scope = SkillActivationScope::Cluster.as_str().to_string();
-    let mut reason = "manual skill activation".to_string();
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--version" => {
-                index += 1;
-                version = Some(skill_option_value(args.get(index), "--version")?);
-            }
-            "--scope" => {
-                index += 1;
-                scope = skill_option_value(args.get(index), "--scope")?;
-            }
-            "--reason" => {
-                index += 1;
-                reason = skill_option_value(args.get(index), "--reason")?;
-            }
-            "--skill" | "--id" => {
-                index += 1;
-                skill_id = Some(skill_option_value(args.get(index), "--skill")?);
-            }
-            value if skill_id.is_none() => skill_id = Some(value.to_string()),
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected skill activate argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
+) -> Result<AgentSessionCliCommand, CliError> {
+    match parse_agent_schema_for_test(&prefixed_schema_args(&["session"], args))? {
+        AgentCliCommand::Session(command) => Ok(command),
+        _ => unreachable!("session schema returned a non-session command"),
     }
-    Ok(SkillActivateOptions {
-        skill_id: skill_id.ok_or_else(|| CliError::Parse {
-            detail: "skill activate requires a skill id".to_string(),
-        })?,
-        version,
-        scope,
-        reason,
-        json,
-    })
 }
 
-fn skill_option_value(value: Option<&String>, option: &str) -> Result<String, CliError> {
-    value.cloned().ok_or_else(|| CliError::Parse {
-        detail: format!("{option} requires a value"),
-    })
+#[cfg(test)]
+macro_rules! agent_schema_options_for_test {
+    ($function:ident, $command:literal, $variant:path, $output:ty) => {
+        pub(crate) fn $function(args: &[String]) -> Result<$output, CliError> {
+            match parse_agent_schema_for_test(&prefixed_schema_args(&[$command], args))? {
+                $variant(options) => Ok(options),
+                _ => unreachable!("agent schema returned the wrong command"),
+            }
+        }
+    };
 }
+
+#[cfg(test)]
+agent_schema_options_for_test!(
+    parse_agent_run_schema_for_test,
+    "run",
+    AgentCliCommand::Run,
+    AgentRunOptions
+);
+#[cfg(test)]
+agent_schema_options_for_test!(
+    parse_agent_inspect_schema_for_test,
+    "inspect",
+    AgentCliCommand::Inspect,
+    AgentInspectOptions
+);
+#[cfg(test)]
+agent_schema_options_for_test!(
+    parse_agent_export_schema_for_test,
+    "export",
+    AgentCliCommand::Export,
+    AgentExportOptions
+);
+#[cfg(test)]
+agent_schema_options_for_test!(
+    parse_agent_import_schema_for_test,
+    "import",
+    AgentCliCommand::Import,
+    AgentImportOptions
+);
+#[cfg(test)]
+agent_schema_options_for_test!(
+    parse_agent_readiness_schema_for_test,
+    "readiness",
+    AgentCliCommand::Readiness,
+    AgentReadinessOptions
+);
+#[cfg(test)]
+agent_schema_options_for_test!(
+    parse_agent_validate_schema_for_test,
+    "validate",
+    AgentCliCommand::Validate,
+    AgentValidateOptions
+);
+
+#[cfg(test)]
+fn parse_skill_schema_for_test(args: &[String]) -> Result<SkillCliCommand, CliError> {
+    parse_schema_command_for_test(skill_cli_spec(), args, parse_skill_matches)
+}
+
+#[cfg(test)]
+macro_rules! skill_schema_options_for_test {
+    ($function:ident, $command:literal, $variant:path, $output:ty) => {
+        pub(crate) fn $function(args: &[String]) -> Result<$output, CliError> {
+            match parse_skill_schema_for_test(&prefixed_schema_args(&[$command], args))? {
+                $variant(options) => Ok(options),
+                _ => unreachable!("skill schema returned the wrong command"),
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+skill_schema_options_for_test!(
+    parse_skill_list_schema_for_test,
+    "list",
+    SkillCliCommand::List,
+    SkillListOptions
+);
+#[cfg(test)]
+skill_schema_options_for_test!(
+    parse_skill_show_schema_for_test,
+    "show",
+    SkillCliCommand::Show,
+    SkillShowOptions
+);
+#[cfg(test)]
+skill_schema_options_for_test!(
+    parse_skill_import_schema_for_test,
+    "import",
+    SkillCliCommand::Import,
+    SkillImportOptions
+);
+#[cfg(test)]
+skill_schema_options_for_test!(
+    parse_skill_export_schema_for_test,
+    "export",
+    SkillCliCommand::Export,
+    SkillExportOptions
+);
+#[cfg(test)]
+skill_schema_options_for_test!(
+    parse_skill_activate_schema_for_test,
+    "activate",
+    SkillCliCommand::Activate,
+    SkillActivateOptions
+);
 
 fn parse_skill_source_kind(value: &str) -> Result<SkillCatalogSourceKind, CliError> {
     match value {
@@ -2193,507 +2531,12 @@ fn parse_skill_source_kind(value: &str) -> Result<SkillCatalogSourceKind, CliErr
     }
 }
 
-pub(crate) fn parse_agent_session_command(
-    args: &[String],
-) -> Result<AgentSessionCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(AgentSessionCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(AgentSessionCliCommand::Help)
-        }
-        Some((command, rest)) if command == "inspect" => Ok(AgentSessionCliCommand::Inspect(
-            parse_agent_session_inspect_options(rest)?,
-        )),
-        Some((command, rest)) if command == "progress" => Ok(AgentSessionCliCommand::Progress(
-            parse_agent_session_progress_options(rest)?,
-        )),
-        Some((command, rest)) if matches!(command.as_str(), "terminal-results" | "results") => {
-            Ok(AgentSessionCliCommand::TerminalResults(
-                parse_agent_session_terminal_results_options(rest)?,
-            ))
-        }
-        Some((command, rest)) if command == "steer" => Ok(AgentSessionCliCommand::Steer(
-            parse_agent_session_message_options(rest, "steer")?,
-        )),
-        Some((command, rest)) if matches!(command.as_str(), "follow-up" | "followup") => {
-            Ok(AgentSessionCliCommand::FollowUp(
-                parse_agent_session_message_options(rest, "follow-up")?,
-            ))
-        }
-        Some((command, rest)) if command == "interrupt" => Ok(AgentSessionCliCommand::Interrupt(
-            parse_agent_session_message_options(rest, "interrupt")?,
-        )),
-        Some((command, rest)) if command == "resume" => Ok(AgentSessionCliCommand::Resume(
-            parse_agent_session_resume_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
-}
-
-pub(crate) fn parse_agent_inspect_options(
-    args: &[String],
-) -> Result<AgentInspectOptions, CliError> {
-    let mut agent = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => {
-                json = true;
-            }
-            "--agent" => {
-                index += 1;
-                agent = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--agent requires a value".to_string(),
-                })?);
-            }
-            value if agent.is_none() => {
-                agent = Some(value.to_string());
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent inspect argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentInspectOptions {
-        agent: agent.unwrap_or_else(|| "main-agent".to_string()),
-        json,
-    })
-}
-
-pub(crate) fn parse_agent_session_inspect_options(
-    args: &[String],
-) -> Result<AgentSessionInspectOptions, CliError> {
-    let mut session_id = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--session" | "--session-id" => {
-                index += 1;
-                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
-            }
-            value if session_id.is_none() => {
-                session_id = Some(parse_agent_session_id(value)?);
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent session inspect argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentSessionInspectOptions {
-        session_id: session_id.ok_or_else(|| CliError::Parse {
-            detail: "agent session inspect requires a session id".to_string(),
-        })?,
-        json,
-    })
-}
-
-pub(crate) fn parse_agent_session_progress_options(
-    args: &[String],
-) -> Result<AgentSessionProgressOptions, CliError> {
-    let mut session_id = None;
-    let mut offset = None;
-    let mut last_event_id = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--session" | "--session-id" => {
-                index += 1;
-                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
-            }
-            "--cursor" | "--offset" => {
-                index += 1;
-                offset = Some(parse_usize_arg(args.get(index), "--cursor")?);
-            }
-            "--last-event" | "--last-event-id" => {
-                index += 1;
-                last_event_id = Some(parse_agent_task_id_arg(args.get(index), "--last-event")?);
-            }
-            value if session_id.is_none() => {
-                session_id = Some(parse_agent_session_id(value)?);
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent session progress argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentSessionProgressOptions {
-        session_id: session_id.ok_or_else(|| CliError::Parse {
-            detail: "agent session progress requires a session id".to_string(),
-        })?,
-        cursor: if offset.is_some() || last_event_id.is_some() {
-            Some(AgentSessionControlEventCursor {
-                offset: offset.unwrap_or_default(),
-                last_event_id,
-            })
-        } else {
-            None
-        },
-        json,
-    })
-}
-
-pub(crate) fn parse_agent_session_terminal_results_options(
-    args: &[String],
-) -> Result<AgentSessionTerminalResultsOptions, CliError> {
-    let mut session_id = None;
-    let mut task_id = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--session" | "--session-id" => {
-                index += 1;
-                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
-            }
-            "--task" | "--task-id" => {
-                index += 1;
-                task_id = Some(parse_agent_task_id_arg(args.get(index), "--task")?);
-            }
-            value if session_id.is_none() => {
-                session_id = Some(parse_agent_session_id(value)?);
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent session terminal-results argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentSessionTerminalResultsOptions {
-        session_id: session_id.ok_or_else(|| CliError::Parse {
-            detail: "agent session terminal-results requires a session id".to_string(),
-        })?,
-        task_id,
-        json,
-    })
-}
-
-pub(crate) fn parse_agent_session_message_options(
-    args: &[String],
-    command: &str,
-) -> Result<AgentSessionMessageOptions, CliError> {
-    let mut session_id = None;
-    let mut message_parts = Vec::new();
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--session" | "--session-id" => {
-                index += 1;
-                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
-            }
-            "--message" | "--reason" => {
-                index += 1;
-                message_parts.push(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: format!("{} requires a value", args[index - 1]),
-                })?);
-            }
-            value if session_id.is_none() => {
-                session_id = Some(parse_agent_session_id(value)?);
-            }
-            value => {
-                message_parts.push(value.to_string());
-            }
-        }
-        index += 1;
-    }
-    let message = message_parts.join(" ");
-    if message.trim().is_empty() {
-        return Err(CliError::Parse {
-            detail: format!("agent session {command} requires a message"),
-        });
-    }
-    Ok(AgentSessionMessageOptions {
-        session_id: session_id.ok_or_else(|| CliError::Parse {
-            detail: format!("agent session {command} requires a session id"),
-        })?,
-        message,
-        json,
-    })
-}
-
-pub(crate) fn parse_agent_session_resume_options(
-    args: &[String],
-) -> Result<AgentSessionResumeOptions, CliError> {
-    let mut session_id = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => json = true,
-            "--session" | "--session-id" => {
-                index += 1;
-                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
-            }
-            value if session_id.is_none() => {
-                session_id = Some(parse_agent_session_id(value)?);
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent session resume argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentSessionResumeOptions {
-        session_id: session_id.ok_or_else(|| CliError::Parse {
-            detail: "agent session resume requires a session id".to_string(),
-        })?,
-        json,
-    })
-}
-
-fn parse_agent_session_id_arg(value: Option<&String>, option: &str) -> Result<SessionId, CliError> {
-    parse_agent_session_id(value.ok_or_else(|| CliError::Parse {
-        detail: format!("{option} requires a value"),
-    })?)
-}
-
 fn parse_agent_session_id(value: &str) -> Result<SessionId, CliError> {
     SessionId::from_str(value)
         .or_else(|_| SessionId::from_legacy_named(value))
         .map_err(|source| CliError::Parse {
             detail: format!("invalid agent session id `{value}`: {source}"),
         })
-}
-
-fn parse_agent_task_id_arg(value: Option<&String>, option: &str) -> Result<TaskId, CliError> {
-    let value = value.ok_or_else(|| CliError::Parse {
-        detail: format!("{option} requires a value"),
-    })?;
-    TaskId::from_str(value).map_err(|source| CliError::Parse {
-        detail: format!("invalid agent task id `{value}`: {source}"),
-    })
-}
-
-fn parse_usize_arg(value: Option<&String>, option: &str) -> Result<usize, CliError> {
-    let value = value.ok_or_else(|| CliError::Parse {
-        detail: format!("{option} requires a value"),
-    })?;
-    value.parse::<usize>().map_err(|source| CliError::Parse {
-        detail: format!("invalid {option} value `{value}`: {source}"),
-    })
-}
-
-pub(crate) fn parse_agent_export_options(args: &[String]) -> Result<AgentExportOptions, CliError> {
-    let mut agent = None;
-    let mut output = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--output" | "-o" => {
-                index += 1;
-                output =
-                    Some(
-                        args.get(index)
-                            .map(PathBuf::from)
-                            .ok_or_else(|| CliError::Parse {
-                                detail: "--output requires a value".to_string(),
-                            })?,
-                    );
-            }
-            value if agent.is_none() => {
-                agent = Some(value.to_string());
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent export argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentExportOptions {
-        agent: agent.unwrap_or_else(|| "main-agent".to_string()),
-        output,
-    })
-}
-
-pub(crate) fn parse_agent_import_options(args: &[String]) -> Result<AgentImportOptions, CliError> {
-    let mut path = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => {
-                json = true;
-            }
-            "--file" => {
-                index += 1;
-                path = Some(
-                    args.get(index)
-                        .map(PathBuf::from)
-                        .ok_or_else(|| CliError::Parse {
-                            detail: "--file requires a value".to_string(),
-                        })?,
-                );
-            }
-            value if path.is_none() => {
-                path = Some(PathBuf::from(value));
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent import argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    let path = path.ok_or_else(|| CliError::Parse {
-        detail: "agent import requires a package JSON path".to_string(),
-    })?;
-    Ok(AgentImportOptions { path, json })
-}
-
-pub(crate) fn parse_agent_readiness_options(
-    args: &[String],
-) -> Result<AgentReadinessOptions, CliError> {
-    let mut json = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" => json = true,
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent readiness argument `{value}`"),
-                });
-            }
-        }
-    }
-    Ok(AgentReadinessOptions { json })
-}
-
-pub(crate) fn parse_agent_validate_options(
-    args: &[String],
-) -> Result<AgentValidateOptions, CliError> {
-    let mut agent = None;
-    let mut file = None;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--json" => {
-                json = true;
-            }
-            "--file" => {
-                index += 1;
-                file = Some(
-                    args.get(index)
-                        .map(PathBuf::from)
-                        .ok_or_else(|| CliError::Parse {
-                            detail: "--file requires a value".to_string(),
-                        })?,
-                );
-            }
-            value if agent.is_none() && file.is_none() => {
-                agent = Some(value.to_string());
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent validate argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentValidateOptions {
-        agent: agent.unwrap_or_else(|| "main-agent".to_string()),
-        file,
-        json,
-    })
-}
-
-pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions, CliError> {
-    let mut prompt = None;
-    let mut agent = "main-agent".to_string();
-    let mut agent_explicit = false;
-    let mut provider = CODEX_PROVIDER_ID.to_string();
-    let mut model = CODEX_DEFAULT_MODEL.to_string();
-    let mut account = None;
-    let mut session_id = None;
-    let mut compact_after = false;
-    let mut json = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--prompt" => {
-                index += 1;
-                prompt = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--prompt requires a value".to_string(),
-                })?);
-            }
-            "--agent" => {
-                index += 1;
-                agent = args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--agent requires a value".to_string(),
-                })?;
-                agent_explicit = true;
-            }
-            "--provider" => {
-                index += 1;
-                provider = args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--provider requires a value".to_string(),
-                })?;
-            }
-            "--model" => {
-                index += 1;
-                model = args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--model requires a value".to_string(),
-                })?;
-            }
-            "--account" => {
-                index += 1;
-                account = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
-                    detail: "--account requires a value".to_string(),
-                })?);
-            }
-            "--session" | "--session-id" => {
-                index += 1;
-                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
-            }
-            "--compact-after" => compact_after = true,
-            "--json" => json = true,
-            value if prompt.is_none() => {
-                prompt = Some(value.to_string());
-            }
-            value => {
-                return Err(CliError::Parse {
-                    detail: format!("unexpected agent run argument `{value}`"),
-                });
-            }
-        }
-        index += 1;
-    }
-    Ok(AgentRunOptions {
-        prompt: prompt.ok_or_else(|| CliError::Parse {
-            detail: "agent run requires --prompt <text>".to_string(),
-        })?,
-        agent,
-        agent_explicit,
-        provider,
-        model,
-        account,
-        session_id,
-        compact_after,
-        json,
-    })
 }
 
 struct ConfiguredInteractionModel {
@@ -3051,10 +2894,6 @@ fn ensure_local_pytorch_endpoint(endpoint: &str, model: &str) -> Result<(), Lang
 
 pub(crate) fn run_skill_command(command: SkillCliCommand) -> Result<(), CliError> {
     match command {
-        SkillCliCommand::Help => {
-            print_skill_help();
-            Ok(())
-        }
         SkillCliCommand::List(options) => list_skills(options),
         SkillCliCommand::Show(options) => show_skill(options),
         SkillCliCommand::Import(options) => import_skill(options),
@@ -3452,10 +3291,6 @@ fn skill_catalog_cli_error(error: sinomo_agent::SkillCatalogError) -> CliError {
 
 pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError> {
     match command {
-        AgentCliCommand::Help => {
-            print_agent_help();
-            Ok(())
-        }
         AgentCliCommand::Export(options) => export_agent_package(options),
         AgentCliCommand::Import(options) => import_agent_package(options),
         AgentCliCommand::Inspect(options) => inspect_agent_package(options),
@@ -3468,10 +3303,6 @@ pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError
 
 pub(crate) fn run_agent_session_command(command: AgentSessionCliCommand) -> Result<(), CliError> {
     match command {
-        AgentSessionCliCommand::Help => {
-            print_agent_session_help();
-            Ok(())
-        }
         AgentSessionCliCommand::Inspect(options) => {
             let response: AgentSessionInspectResponse = send_agent_session_rpc(
                 AGENT_SESSION_INSPECT_ROUTE,
@@ -5574,7 +5405,6 @@ fn unsafe_coding_workspace_error(workspace_root: &Path) -> CliError {
 
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
-    let builder = sinomo_runtime::dfs::register_dfs_config_definitions(builder)?;
     let builder = sinomo_runtime::module::register_config_definitions(builder)
         .map_err(|detail| CliError::Parse { detail })?;
     let builder =
@@ -5591,10 +5421,6 @@ fn agent_decision_json(decision: &sinomo_agent::AgentLoopDecision) -> Result<Str
     serde_json::to_string_pretty(decision).map_err(|source| CliError::Parse {
         detail: source.to_string(),
     })
-}
-
-pub(crate) fn is_help_args(args: &[String]) -> bool {
-    matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
 }
 
 /// Installs the KV-backed cluster directory provider once per CLI process so
@@ -5641,11 +5467,14 @@ fn run_registered_cli_command(
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
     ensure_cluster_directory_installed();
     let command = invocation.command;
-    let command_is_help = cli_command_is_help(&command);
-    let daemon = if invocation.options.force_local
-        || command_is_help
-        || !cli_command_needs_daemon_probe(&command)
-    {
+    let command_is_help = command.as_ref().is_some_and(cli_command_is_help);
+    let supports_degraded_local_mode = command
+        .as_ref()
+        .map_or(true, cli_command_supports_degraded_local_mode);
+    let needs_daemon_probe = command
+        .as_ref()
+        .map_or(true, cli_command_needs_daemon_probe);
+    let daemon = if invocation.options.force_local || command_is_help || !needs_daemon_probe {
         None
     } else {
         default_main_daemon_status()?
@@ -5653,54 +5482,39 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
     let local_cluster_quorum = if invocation.options.force_local || command_is_help {
         None
     } else {
-        cli_local_cluster_quorum_if_relevant(&command, daemon.as_ref())?
+        cli_local_cluster_quorum_if_relevant(supports_degraded_local_mode, daemon.as_ref())?
     };
-    let force_local = cli_invocation_force_local_mode(
-        invocation.options,
-        &command,
-        daemon.is_some(),
-        local_cluster_quorum,
-    );
+    let force_local = invocation.options.force_local
+        || match command.as_ref() {
+            Some(command) => cli_command_enters_degraded_local_mode(
+                command,
+                daemon.is_some(),
+                local_cluster_quorum,
+            ),
+            None => daemon.is_none() || local_cluster_quorum == Some(false),
+        };
     let _guard = enter_cli_force_local_mode(force_local);
 
-    if !cli_force_local_mode() && !command_is_help && cli_command_requires_cluster_state(&command) {
+    if !cli_force_local_mode()
+        && !command_is_help
+        && command
+            .as_ref()
+            .is_some_and(cli_command_requires_cluster_state)
+    {
         let paths = cluster_paths_from_defaults()?;
         require_cluster_runtime_quorum_with_paths_and_daemon(&paths, daemon.as_ref())?;
     }
 
     match command {
-        CliCommand::Tui => run_tui(),
-        CliCommand::Help => {
-            print_usage();
-            Ok(())
-        }
-        CliCommand::Cluster(command) => run_cluster_cli_command(command),
-        CliCommand::InstallHelp => {
-            print_install_help();
-            Ok(())
-        }
-        CliCommand::Install(options) => install(options),
-        CliCommand::Uninstall(options) => uninstall(options),
-        CliCommand::Daemon(command) => run_daemon_cli_command(command),
-        CliCommand::Debug(command) => run_debug_cli_command(command),
-        CliCommand::Rollout(command) => run_rollout_cli_command(command),
-        CliCommand::Dfs(command) => run_dfs_cli_command(command),
-        CliCommand::Memory(command) => run_memory_cli_command(command),
-        CliCommand::Models(command) => run_models_command(command),
-        CliCommand::Providers(command) => run_provider_command(command),
-        CliCommand::Voice(command) => run_voice_command(command),
-        CliCommand::Test(command) => run_test_command(command),
-        CliCommand::Agent(command) => run_agent_command(command),
-        CliCommand::Skill(command) => run_skill_command(command),
-        CliCommand::Registered(command) => run_registered_cli_command(command, force_local),
-        CliCommand::RegisteredRolloutMutation(command) => {
+        None => run_tui(),
+        Some(command) if command.requires_rollout_admission() => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
             with_rollout_activation_admission(&rollout_paths, || {
                 run_registered_cli_command(command, force_local)
             })
         }
-        CliCommand::Usage(options) => usage(options),
+        Some(command) => run_registered_cli_command(command, force_local),
     }
 }
 

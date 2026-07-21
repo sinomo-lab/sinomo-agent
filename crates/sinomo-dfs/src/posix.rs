@@ -33,14 +33,15 @@ use crate::posix_path::{
     parent_posix_path, posix_path_is_at_or_under_prefix,
 };
 use crate::{
-    DfsControlPlaneStore, DfsError, DfsFileSystem, DfsMessageTransport, DfsNamespaceOperation,
-    DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsReadData, DfsReplicationPolicy,
+    DfsControlPlaneStore, DfsError, DfsFileSystem, DfsLocalEventualBatchWriteProof,
+    DfsMessageTransport, DfsMetadataShardConfig, DfsNamespaceOperation, DfsNamespaceTransaction,
+    DfsObjectKind, DfsObjectMetadata, DfsReadData, DfsReplicaReceiptRecord, DfsReplicationPolicy,
     NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsWriteOutcome, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
-use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
+use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
@@ -83,8 +84,9 @@ struct PosixBulkLocalWrite<'a> {
     path: String,
     object: DfsObjectMetadata,
     target_version: DfsVersion,
+    expected_base_version: Option<DfsVersion>,
     bytes: &'a [u8],
-    metadata_primary: Option<NodeId>,
+    metadata_shard: Option<DfsMetadataShardConfig>,
     parent_touch: Option<PosixBulkParentTouch>,
     link_count_hint: Option<u64>,
 }
@@ -92,7 +94,7 @@ struct PosixBulkLocalWrite<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PosixBulkParentTouch {
     path: String,
-    metadata_primary: Option<NodeId>,
+    metadata_shard: Option<DfsMetadataShardConfig>,
 }
 
 fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
@@ -1202,7 +1204,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             let path = join_posix_path(&resolved_parent, child_name);
             let mut link_count_hint = None;
-            let object = match self.lookup_sifs_path(&path)? {
+            let (object, expected_base_version, touch_parent_on_create) = match self
+                .lookup_sifs_path(&path)?
+            {
                 Some(object) if object.kind == DfsObjectKind::Directory => {
                     return Err(DfsPosixError::IsDirectory { path });
                 }
@@ -1210,18 +1214,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return self.posix_write_files_local_eventual_fallback(&files);
                 }
                 Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                    self.resolve_hardlink_target(&object)?
+                    let object = self.resolve_hardlink_target(&object)?;
+                    let base = Some(object.version.clone());
+                    (object, base, false)
                 }
                 Some(object) if object.kind == DfsObjectKind::Tombstone => {
                     let object =
                         recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                     link_count_hint = Some(1);
-                    object
+                    (object, None, true)
                 }
-                Some(object) => object,
+                Some(object) => {
+                    let base = Some(object.version.clone());
+                    (object, base, false)
+                }
                 None => {
                     link_count_hint = Some(1);
-                    new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File)
+                    (
+                        new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File),
+                        None,
+                        true,
+                    )
                 }
             };
             if !seen_objects.insert(object.object_id.clone()) {
@@ -1232,20 +1245,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 return self.posix_write_files_local_eventual_fallback(&files);
             }
-            let metadata_primary = match metadata_shard_snapshot.as_deref() {
+            let metadata_shard = match metadata_shard_snapshot.as_deref() {
                 Some(shards) => {
-                    self.routed_namespace_primary_for_path_from_snapshot(&path, shards)?
+                    self.select_sifs_metadata_shard_for_path_from_snapshot(&path, shards)?
                 }
                 None => None,
+            };
+            let parent_touch = if touch_parent_on_create {
+                Some(PosixBulkParentTouch {
+                    path: resolved_parent.clone(),
+                    metadata_shard: match metadata_shard_snapshot.as_deref() {
+                        Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
+                            &resolved_parent,
+                            shards,
+                        )?,
+                        None => None,
+                    },
+                })
+            } else {
+                None
             };
             let target_version = next_version(&object.version);
             prepared.push(PosixBulkLocalWrite {
                 path,
                 object,
                 target_version,
+                expected_base_version,
                 bytes: *bytes,
-                metadata_primary,
-                parent_touch: None,
+                metadata_shard,
+                parent_touch,
                 link_count_hint,
             });
         }
@@ -1266,7 +1294,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
-        let mut existing_children_by_parent = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut seen_paths = BTreeSet::new();
         let mut resolved_parents = BTreeMap::<String, String>::new();
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for (path, bytes) in files {
@@ -1289,38 +1317,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::InvalidPath { path });
             };
             let path = join_posix_path(&resolved_parent, child_name);
-            if !existing_children_by_parent.contains_key(&resolved_parent) {
-                let existing_children = self
-                    .child_objects_for_sifs_dir(&resolved_parent)?
-                    .into_iter()
-                    .filter_map(|child| {
-                        normalize_posix_path(&child.path).ok().and_then(|path| {
-                            path.rsplit_once('/').map(|(_, name)| name.to_string())
-                        })
-                    })
-                    .collect::<BTreeSet<_>>();
-                existing_children_by_parent.insert(resolved_parent.clone(), existing_children);
-            }
-            let existing_children = existing_children_by_parent
-                .get_mut(&resolved_parent)
-                .expect("parent children inserted");
-            if !existing_children.insert(child_name.to_string()) {
+            if !seen_paths.insert(path.clone())
+                || self
+                    .lookup_sifs_path(&path)?
+                    .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
+            {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
             let object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
             if !seen_objects.insert(object.object_id.clone()) {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
-            let metadata_primary = match metadata_shard_snapshot.as_deref() {
+            let metadata_shard = match metadata_shard_snapshot.as_deref() {
                 Some(shards) => {
-                    self.routed_namespace_primary_for_path_from_snapshot(&path, shards)?
+                    self.select_sifs_metadata_shard_for_path_from_snapshot(&path, shards)?
                 }
                 None => None,
             };
             let parent_touch = Some(PosixBulkParentTouch {
                 path: resolved_parent.clone(),
-                metadata_primary: match metadata_shard_snapshot.as_deref() {
-                    Some(shards) => self.routed_namespace_primary_for_path_from_snapshot(
+                metadata_shard: match metadata_shard_snapshot.as_deref() {
+                    Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
                         &resolved_parent,
                         shards,
                     )?,
@@ -1332,8 +1349,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path,
                 object,
                 target_version,
+                expected_base_version: None,
                 bytes,
-                metadata_primary,
+                metadata_shard,
                 parent_touch,
                 link_count_hint: Some(1),
             });
@@ -1369,26 +1387,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.last_modified_by_event_id = Some(EventId::generate());
             committed_objects.push(object);
         }
-        let mut objects_by_metadata_primary =
-            BTreeMap::<Option<NodeId>, Vec<DfsObjectMetadata>>::new();
+        type MetadataAuthorityKey = Option<(NodeId, String, u64)>;
+        let authority_key = |shard: Option<&DfsMetadataShardConfig>| {
+            shard.map(|shard| {
+                (
+                    shard.primary_node_id.clone(),
+                    shard.shard_id.clone(),
+                    shard.epoch,
+                )
+            })
+        };
+        let mut metadata_shards =
+            BTreeMap::<MetadataAuthorityKey, Option<DfsMetadataShardConfig>>::new();
+        let mut objects_by_metadata_authority =
+            BTreeMap::<MetadataAuthorityKey, Vec<DfsObjectMetadata>>::new();
         for (write, object) in prepared.iter().zip(committed_objects.iter().cloned()) {
-            objects_by_metadata_primary
-                .entry(write.metadata_primary.clone())
+            let key = authority_key(write.metadata_shard.as_ref());
+            metadata_shards
+                .entry(key.clone())
+                .or_insert_with(|| write.metadata_shard.clone());
+            objects_by_metadata_authority
+                .entry(key)
                 .or_default()
                 .push(object);
         }
         let mut touched_parent_objects =
-            BTreeMap::<(Option<NodeId>, DfsObjectId), DfsObjectMetadata>::new();
+            BTreeMap::<(MetadataAuthorityKey, DfsObjectId), DfsObjectMetadata>::new();
         let mut resolved_parent_objects =
-            BTreeMap::<(Option<NodeId>, String), DfsObjectMetadata>::new();
+            BTreeMap::<(MetadataAuthorityKey, String), DfsObjectMetadata>::new();
         for write in &prepared {
             let Some(parent_touch) = write.parent_touch.as_ref() else {
                 continue;
             };
-            let parent_cache_key = (
-                parent_touch.metadata_primary.clone(),
-                parent_touch.path.clone(),
-            );
+            let metadata_authority = authority_key(parent_touch.metadata_shard.as_ref());
+            metadata_shards
+                .entry(metadata_authority.clone())
+                .or_insert_with(|| parent_touch.metadata_shard.clone());
+            let parent_cache_key = (metadata_authority.clone(), parent_touch.path.clone());
             let parent = if let Some(parent) = resolved_parent_objects.get(&parent_cache_key) {
                 parent.clone()
             } else {
@@ -1415,10 +1450,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: parent_touch.path.clone(),
                 });
             }
-            let key = (
-                parent_touch.metadata_primary.clone(),
-                parent.object_id.clone(),
-            );
+            let key = (metadata_authority, parent.object_id.clone());
             touched_parent_objects.entry(key).or_insert_with(|| {
                 let mut parent = parent.clone();
                 parent.version = next_version(&parent.version);
@@ -1428,13 +1460,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 parent
             });
         }
-        for ((metadata_primary, _), object) in touched_parent_objects {
-            objects_by_metadata_primary
-                .entry(metadata_primary)
+        for ((metadata_authority, _), object) in touched_parent_objects {
+            objects_by_metadata_authority
+                .entry(metadata_authority)
                 .or_default()
                 .push(object);
         }
-        for (metadata_primary, objects) in objects_by_metadata_primary {
+        let all_metadata_paths = objects_by_metadata_authority
+            .values()
+            .flatten()
+            .map(|object| object.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut committed_metadata_paths = BTreeSet::new();
+        for (metadata_authority, objects) in objects_by_metadata_authority {
+            let group_metadata_paths = objects
+                .iter()
+                .map(|object| object.path.clone())
+                .collect::<BTreeSet<_>>();
+            let selected_shard = metadata_shards.remove(&metadata_authority).unwrap_or(None);
             let versions = objects
                 .iter()
                 .map(|object| crate::object_version_record(object, object.content_size_bytes))
@@ -1452,14 +1495,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 advisory_lock_states: Vec::new(),
                 created_at: time::OffsetDateTime::now_utc(),
             };
-            if let Some(primary) = metadata_primary {
+            let authority_node_id = selected_shard
+                .as_ref()
+                .map(|shard| shard.primary_node_id.clone())
+                .unwrap_or_else(|| self.node_id.clone());
+            let writes = prepared
+                .iter()
+                .zip(committed_objects.iter())
+                .filter(|(write, _)| {
+                    authority_key(write.metadata_shard.as_ref()) == metadata_authority
+                })
+                .map(|(write, object)| DfsLocalEventualBatchWriteProof {
+                    expected_base_version: write.expected_base_version.clone(),
+                    receipt: DfsReplicaReceiptRecord {
+                        receipt: DfsWriteReceipt {
+                            file_system_id: object.file_system_id.clone(),
+                            object_id: object.object_id.clone(),
+                            committed_version: object.version.clone(),
+                            owner_node_id: authority_node_id.clone(),
+                            event_id: object
+                                .last_modified_by_event_id
+                                .clone()
+                                .expect("bulk committed objects carry a write event"),
+                        },
+                        replica_node_id: self.node_id.clone(),
+                        content_hash: object.content_hash.clone(),
+                        received_at: time::OffsetDateTime::now_utc(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let result = if authority_node_id != self.node_id {
                 self.route_namespace_operation_without_local_replay(
-                    primary,
-                    DfsNamespaceOperation::ApplyTransaction { transaction },
-                )?;
+                    authority_node_id,
+                    DfsNamespaceOperation::CommitLocalEventualBatch {
+                        transaction,
+                        writes,
+                    },
+                )
             } else {
-                self.add_object_metadata_batch(objects)?;
+                let requester_node_id = self.node_id.clone();
+                self.apply_local_eventual_batch_commit(
+                    &requester_node_id,
+                    transaction,
+                    &writes,
+                    selected_shard,
+                )
+                .map(drop)
+                .map_err(DfsPosixError::from)
+            };
+            if let Err(source) = result {
+                let unattempted_metadata_paths = all_metadata_paths
+                    .difference(&committed_metadata_paths)
+                    .filter(|path| !group_metadata_paths.contains(*path))
+                    .cloned()
+                    .collect();
+                return Err(DfsPosixError::PartialBulkCommit {
+                    committed_metadata_paths: committed_metadata_paths.iter().cloned().collect(),
+                    indeterminate_metadata_paths: group_metadata_paths.iter().cloned().collect(),
+                    unattempted_metadata_paths,
+                    source: Box::new(source),
+                });
             }
+            committed_metadata_paths.extend(group_metadata_paths);
         }
         committed_objects
             .iter()
@@ -1696,19 +1793,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && !remote_metadata_primary;
         let materialized_remote_primary_write = remote_metadata_primary;
         let content_started = Instant::now();
-        let manifest_result = if options.wait_for_commit {
-            self.content.put_object_version_blob_only_durable(
-                object.object_id.as_str(),
-                target_version.as_str(),
-                bytes,
-            )
-        } else {
-            self.content.put_object_version_blob_only(
-                object.object_id.as_str(),
-                target_version.as_str(),
-                bytes,
-            )
-        };
+        let manifest_result = self.content.put_object_version_blob_only(
+            object.object_id.as_str(),
+            target_version.as_str(),
+            bytes,
+        );
         let manifest = match manifest_result {
             Ok(manifest) => manifest,
             Err(error) => {

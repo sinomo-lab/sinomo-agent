@@ -761,10 +761,12 @@ envelope before replay. The byte-level WAL and Rust metadata-transaction
 refinement remain open. The namespace composition binds each reachable finite
 manifest shape to a distinct symbolic digest and couples its deterministic
 terminal retry to the gateway result. It still fixes one request identity and
-does not model arbitrary payload hashes, multiple requests, or a general
-payload-keyed namespace replay table. A changed canonical journal head
-invalidates either plan and requires reclassification. Explicit conflict
-resolution is itself a target strong compare-and-swap transaction.
+does not model arbitrary payload hashes or multiple requests. The separate
+namespace-request admission slice covers the general durable requester/request
+identity ledger and changed-payload rejection. A changed canonical journal
+head invalidates either reconciliation plan and requires reclassification.
+Explicit conflict resolution is itself a target strong compare-and-swap
+transaction.
 
 The first bounded Quint slices cover regular-file write, truncate, local sync,
 crash recovery, sealing and reconciliation, plus one same-shard create, mkdir,

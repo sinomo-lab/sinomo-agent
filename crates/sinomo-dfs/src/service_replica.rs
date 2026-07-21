@@ -1864,6 +1864,7 @@ mod authority_probe_tests {
                 path: object.path.clone(),
                 expected_object_id: Some(object.object_id.clone()),
             }],
+            content_receipts: Vec::new(),
             transaction: DfsNamespaceTransaction {
                 transaction_id: "transaction_namespace_authority".to_string(),
                 file_system_id: object.file_system_id.clone(),

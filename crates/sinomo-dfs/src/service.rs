@@ -24,17 +24,16 @@ use crate::direct_read::handle_dfs_direct_read_rpc_request_with_initialized_cont
 use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsOperatorInspector, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
-    LocalContentStore, decode_dfs_message_rpc_request, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, dfs_module_surfaces, dfs_route_is_message_data_plane,
-    ensure_default_cluster_aware_dfs_expose_config, inspect_cluster_aware_dfs_status,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
+    DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
+    DfsMessageCommand, DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus,
+    DfsOutboundAttachment, DfsSmokeReport, LocalContentStore, decode_dfs_message_rpc_request,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
+    dfs_route_is_message_data_plane, inspect_cluster_aware_dfs_status, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, resolve_dfs_conflicts,
+    sifs_file_system_id, use_dfs_conflict_version,
 };
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
@@ -271,13 +270,6 @@ impl Service for DfsService {
                         started_at.elapsed().as_millis()
                     ));
                     response
-                }
-                DFS_EXPOSE_CONFIG_ROUTE => {
-                    let _: () = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        DFS_EXPOSE_CONFIG_ROUTE,
-                        &dfs_expose_config(&ctx.data_dir)?,
-                    )?
                 }
                 DFS_METADATA_JOURNAL_BATCH_ROUTE => {
                     let command: DfsMetadataJournalBatchCommand = request.decode_body()?;
@@ -604,16 +596,6 @@ fn dfs_inspection(
     Ok(response)
 }
 
-/// Ensure a default DFS expose config exists, then return it as pretty JSON (the wire
-/// contract is a JSON string, matching the daemon).
-fn dfs_expose_config(data_dir: &SinomoDataDir) -> Result<String, ServiceError> {
-    data_dir.ensure_root_layout().map_err(service_error)?;
-    let cluster_paths = ClusterPaths::new(data_dir);
-    let config = ensure_default_cluster_aware_dfs_expose_config(data_dir, &cluster_paths)
-        .map_err(service_error)?;
-    serde_json::to_string_pretty(&config).map_err(service_error)
-}
-
 fn dfs_metadata_journal_batch(
     data_dir: &SinomoDataDir,
     authenticated_source_node_id: &NodeId,
@@ -665,7 +647,7 @@ mod tests {
     use super::*;
     use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY};
     use crate::{
-        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig, DfsFileSystem,
+        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystem,
         DfsMetadataJournalBatch, DfsMetadataJournalReplicationReport, DfsMetadataShardAssignment,
         DfsMetadataShardId, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
         DfsMetadataSnapshotInstallResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
@@ -1114,20 +1096,6 @@ mod tests {
         };
         assert_eq!(status.object_count, 1);
         assert_eq!(status.pending_repair_count, 0);
-    }
-
-    #[tokio::test]
-    async fn dfs_expose_config_serves_default_in_local_mode() {
-        let registry = register_services(ServiceRegistry::builder()).build();
-        let (disposition, response) = {
-            let (_root, data_dir) = temp_data_dir();
-            dispatch_local(&registry, data_dir, DFS_EXPOSE_CONFIG_ROUTE, &()).await
-        };
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let json: String = response.decode_body().expect("decode json string");
-        // The wire body is pretty-JSON that parses back into a DfsExposeConfig.
-        let _config: DfsExposeConfig =
-            serde_json::from_str(&json).expect("valid expose config json");
     }
 
     #[tokio::test]

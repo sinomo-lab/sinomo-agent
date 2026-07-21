@@ -1,30 +1,30 @@
 use super::{
-    AgentCliCommand, AgentExportOptions, AgentImportOptions, AgentInspectOptions,
-    AgentReadinessOptions, AgentRunOptions, AgentSessionCliCommand, AgentSessionInspectOptions,
+    AgentExportOptions, AgentImportOptions, AgentInspectOptions, AgentReadinessOptions,
+    AgentRunOptions, AgentSessionCliCommand, AgentSessionInspectOptions,
     AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
-    AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
-    CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT, CLUSTER_HEALTH_PROBE_TIMEOUT, CliClusterMemberMutationHost,
-    CliClusterStateAuthorityReachabilityHost, CliCommand, CliDaemonTargetRpc, CliError,
-    CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions, ClusterInviteChannelOutput,
-    ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions,
-    ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions,
-    ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
-    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
-    DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
-    DfsExposeCliCommand, DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions,
-    DfsPinCliCommand, DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
-    DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
-    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
-    ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand,
-    ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutAdvanceOptions,
-    RolloutCliCommand, RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    AgentSessionTerminalResultsOptions, AgentValidateOptions, CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT,
+    CLUSTER_HEALTH_PROBE_TIMEOUT, CliClusterMemberMutationHost,
+    CliClusterStateAuthorityReachabilityHost, CliDaemonTargetRpc, CliError, CliRuntimeOptions,
+    ClusterCliCommand, ClusterInitOptions, ClusterInviteChannelOutput, ClusterInviteOptions,
+    ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths,
+    ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
+    ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
+    DfsConflictResolveOptions, DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions,
+    DfsConflictVersionsOptions, DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions,
+    DfsMountOptions, DfsPinCliCommand, DfsPlacementAuthorityClearOptions,
+    DfsPlacementAuthorityCliCommand, DfsPlacementAuthorityInspectOptions,
+    DfsPlacementAuthorityRecovery, InstallLayout, InstallOptions, InteractionModel,
+    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
     RolloutProgressExpectation, RolloutProgressTiming, RolloutTarget,
     RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    SkillActivateOptions, SkillCliCommand, SkillExportOptions, SkillImportOptions,
-    SkillListOptions, SkillShowOptions, TestCliCommand, UninstallOptions,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    SkillActivateOptions, SkillExportOptions, SkillImportOptions, SkillListOptions,
+    SkillShowOptions, TestCliCommand, UninstallOptions, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index,
     cli_cluster_state_authority_reachability_options, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
     cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
@@ -44,11 +44,11 @@ use super::{
     main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
     models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
-    parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
-    parse_uninstall_options, parse_usage_options, read_cluster_rollout_status,
+    parse_cluster_join_invite_argument, parse_cluster_schema_for_test,
+    parse_daemon_schema_for_test, parse_dfs_schema_for_test, parse_install_schema_for_test,
+    parse_models_command, parse_provider_schema_for_test, parse_rollout_schema_for_test,
+    parse_slash_command, parse_test_schema_for_test, parse_uninstall_schema_for_test,
+    parse_usage_schema_for_test, read_cluster_rollout_status,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
     rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_missing_status_grace,
     rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
@@ -553,11 +553,14 @@ impl sinomo_runtime::cli_registry::CliCommand for TestRegisteredCommand {
     }
 }
 
-fn registered_test_command(name: &'static str, policy: CliCommandPolicy) -> CliCommand {
+fn registered_test_command(name: &'static str, policy: CliCommandPolicy) -> RegisteredCliCommand {
     registered_test_command_with_help(name, policy, false)
 }
 
-fn registered_test_help_command(name: &'static str, policy: CliCommandPolicy) -> CliCommand {
+fn registered_test_help_command(
+    name: &'static str,
+    policy: CliCommandPolicy,
+) -> RegisteredCliCommand {
     registered_test_command_with_help(name, policy, true)
 }
 
@@ -565,15 +568,13 @@ fn registered_test_command_with_help(
     name: &'static str,
     policy: CliCommandPolicy,
     is_help: bool,
-) -> CliCommand {
+) -> RegisteredCliCommand {
     let handler = TestRegisteredCommandHandler {
         name,
         policy,
         is_help,
     };
-    CliCommand::Registered(RegisteredCliCommand::new(
-        handler.parse(&[]).expect("parse registered test command"),
-    ))
+    RegisteredCliCommand::new(handler.parse(&[]).expect("parse registered test command"))
 }
 
 fn authenticated_test_command(
@@ -660,7 +661,7 @@ fn handle_cluster_raft_vote_rpc(
 #[test]
 fn provider_commands_parse_action_before_provider() {
     assert_eq!(
-        parse_provider_command(&["auth".to_string(), "gemini".to_string(),])
+        parse_provider_schema_for_test(&["auth".to_string(), "gemini".to_string(),])
             .expect("provider command"),
         ProviderCliCommand::Auth(ProviderCommandOptions {
             provider: ProviderName::Gemini,
@@ -668,7 +669,7 @@ fn provider_commands_parse_action_before_provider() {
         })
     );
     assert_eq!(
-        parse_provider_command(&["test".to_string(), "github-copilot".to_string(),])
+        parse_provider_schema_for_test(&["test".to_string(), "github-copilot".to_string(),])
             .expect("provider command"),
         ProviderCliCommand::Test(ProviderCommandOptions {
             provider: ProviderName::GitHubCopilot,
@@ -676,7 +677,7 @@ fn provider_commands_parse_action_before_provider() {
         })
     );
     assert_eq!(
-        parse_provider_command(&[
+        parse_provider_schema_for_test(&[
             "auth".to_string(),
             "claude".to_string(),
             "--account".to_string(),
@@ -689,7 +690,7 @@ fn provider_commands_parse_action_before_provider() {
         })
     );
     assert_eq!(
-        parse_provider_command(&[
+        parse_provider_schema_for_test(&[
             "auth".to_string(),
             "codex".to_string(),
             "--account".to_string(),
@@ -702,7 +703,7 @@ fn provider_commands_parse_action_before_provider() {
         })
     );
     assert_eq!(
-        parse_provider_command(&[
+        parse_provider_schema_for_test(&[
             "auth".to_string(),
             "deepseek".to_string(),
             "--account".to_string(),
@@ -719,8 +720,8 @@ fn provider_commands_parse_action_before_provider() {
 #[test]
 fn provider_commands_reject_provider_before_action_order() {
     assert!(matches!(
-        parse_provider_command(&["gemini".to_string(), "auth".to_string()]),
-        Err(CliError::Usage)
+        parse_provider_schema_for_test(&["gemini".to_string(), "auth".to_string()]),
+        Err(CliError::Parse { .. })
     ));
 }
 
@@ -741,294 +742,107 @@ fn top_level_cli_parser_rejects_removed_local_flag() {
 
 #[test]
 fn top_level_cli_parser_routes_subcommands() {
-    assert!(matches!(
-        parse_cli_command(&[]).expect("tui"),
-        CliCommand::Tui
-    ));
-    assert!(matches!(
-        parse_cli_command(&["help".to_string()]).expect("help"),
-        CliCommand::Help
-    ));
-    assert!(matches!(
-        parse_cli_command(&["daemon".to_string(), "status".to_string()]).expect("daemon"),
-        CliCommand::Daemon(DaemonCliCommand::Status(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&["daemon".to_string()]).expect("daemon help"),
-        CliCommand::Daemon(DaemonCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["debug".to_string()]).expect("debug help"),
-        CliCommand::Debug(DebugCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "debug".to_string(),
-            "sobj".to_string(),
-            "state.sobj".to_string()
-        ])
-        .expect("debug sobj"),
-        CliCommand::Debug(DebugCliCommand::Sobj(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&["cluster".to_string(), "status".to_string()]).expect("cluster status"),
-        CliCommand::Cluster(ClusterCliCommand::Status)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["cluster".to_string(), "health".to_string()]).expect("cluster health"),
-        CliCommand::Cluster(ClusterCliCommand::Health)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["cluster".to_string(), "doctor".to_string()]).expect("cluster doctor"),
-        CliCommand::Cluster(ClusterCliCommand::Doctor)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["install".to_string(), "help".to_string()]).expect("install help"),
-        CliCommand::InstallHelp
-    ));
-    assert!(matches!(
-        parse_cli_command(&["install".to_string(), "--no-start".to_string()]).expect("install"),
-        CliCommand::Install(InstallOptions { start: false, .. })
-    ));
-    assert!(matches!(
-        parse_cli_command(&["uninstall".to_string(), "--no-stop".to_string()]).expect("uninstall"),
-        CliCommand::Uninstall(UninstallOptions { stop: false })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "providers".to_string(),
-            "test".to_string(),
-            "openai".to_string()
-        ])
-        .expect("providers"),
-        CliCommand::Providers(ProviderCliCommand::Test(ProviderCommandOptions {
-            provider: ProviderName::OpenAi,
-            account: _,
-        }))
-    ));
-    assert!(matches!(
-        parse_cli_command(&["models".to_string(), "list".to_string()]).expect("models"),
-        CliCommand::Models(ModelsCliCommand::List(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&["test".to_string(), "list".to_string()]).expect("test list"),
-        CliCommand::Test(TestCliCommand::List(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "test".to_string(),
-            "run".to_string(),
-            "--tag".to_string(),
-            "agent-readiness".to_string(),
-            "--require-cluster".to_string(),
-        ])
-        .expect("test run tag"),
-        CliCommand::Test(TestCliCommand::Run(options))
-            if options.id.is_none()
-                && options.tag.as_deref() == Some("agent-readiness")
-                && options.require_cluster
-    ));
-    assert!(matches!(
-        parse_cli_command(&["models".to_string()]).expect("models help"),
-        CliCommand::Models(ModelsCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["model".to_string()]).expect("model alias help"),
-        CliCommand::Models(ModelsCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["model".to_string(), "list".to_string()]).expect("model alias"),
-        CliCommand::Models(ModelsCliCommand::List(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "usage".to_string(),
-            "--provider".to_string(),
-            "codex".to_string()
-        ])
-        .expect("usage"),
-        CliCommand::Usage(_)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["providers".to_string()]).expect("providers help"),
-        CliCommand::Providers(ProviderCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["rollout".to_string(), "status".to_string()]).expect("rollout"),
-        CliCommand::Rollout(RolloutCliCommand::Status)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["observe".to_string(), "events".to_string()]).expect("observe"),
-        CliCommand::Registered(command) if command.name() == "observe"
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "module".to_string(),
-            "native-rust".to_string(),
-            "disable".to_string(),
-            "module.observe".to_string()
-        ])
-        .expect("module native-rust disable"),
-        CliCommand::Registered(command) if command.name() == "module"
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "module".to_string(),
-            "native-dylib".to_string(),
-            "activate".to_string(),
-            "/tmp/libsinomo_test_module.so".to_string(),
-        ])
-        .expect("module native-dylib activate"),
-        CliCommand::RegisteredRolloutMutation(command) if command.name() == "module"
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "module".to_string(),
-            "native-dylib".to_string(),
-            "unload".to_string(),
-            "module.test-native-dylib".to_string(),
-        ])
-        .expect("module native-dylib unload"),
-        CliCommand::RegisteredRolloutMutation(command) if command.name() == "module"
-    ));
-    assert!(matches!(
-        parse_cli_command(&["dfs".to_string(), "status".to_string()]).expect("dfs"),
-        CliCommand::Dfs(DfsCliCommand::Status(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&["sandbox".to_string()]).expect("sandbox help"),
-        CliCommand::Registered(command) if command.name() == "sandbox"
-    ));
-    assert!(matches!(
-        parse_cli_command(&["sandbox".to_string(), "create".to_string()]).expect("sandbox create"),
-        CliCommand::Registered(command) if command.name() == "sandbox"
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "sandbox".to_string(),
-            "status".to_string(),
-            "01kreqaaaaaaaaaaaaaaaaaaaa".to_string()
-        ])
-        .expect("sandbox status"),
-        CliCommand::Registered(command) if command.name() == "sandbox"
-    ));
-    assert!(matches!(
-        parse_cli_command(&["sandbox".to_string(), "doctor".to_string()]).expect("sandbox doctor"),
-        CliCommand::Registered(command) if command.name() == "sandbox"
-    ));
-    assert!(matches!(
-        parse_cli_command(&["agent".to_string()]).expect("agent help"),
-        CliCommand::Agent(AgentCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["agent".to_string(), "help".to_string()]).expect("agent help"),
-        CliCommand::Agent(AgentCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["skill".to_string()]).expect("skill help"),
-        CliCommand::Skill(SkillCliCommand::Help)
-    ));
-    assert!(matches!(
-        parse_cli_command(&["skills".to_string(), "list".to_string(), "--all".to_string()])
-            .expect("skills list"),
-        CliCommand::Skill(SkillCliCommand::List(options))
-            if options == (SkillListOptions { all: true, json: false })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "export".to_string(),
-            "coding-agent".to_string(),
-            "--output".to_string(),
-            "coding-agent.json".to_string(),
-        ])
-        .expect("agent export"),
-        CliCommand::Agent(AgentCliCommand::Export(options))
-            if options == (AgentExportOptions {
-                agent: "coding-agent".to_string(),
-                output: Some(PathBuf::from("coding-agent.json")),
-            })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "import".to_string(),
-            "coding-agent.json".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("agent import"),
-        CliCommand::Agent(AgentCliCommand::Import(options))
-            if options == (AgentImportOptions {
-                path: PathBuf::from("coding-agent.json"),
-                json: true,
-            })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "inspect".to_string(),
-            "coding-agent".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("agent inspect"),
-        CliCommand::Agent(AgentCliCommand::Inspect(options))
-            if options == (AgentInspectOptions {
-                agent: "coding-agent".to_string(),
-                json: true,
-            })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "validate".to_string(),
-            "--file".to_string(),
-            "coding-agent.json".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("agent validate"),
-        CliCommand::Agent(AgentCliCommand::Validate(options))
-            if options == (AgentValidateOptions {
-                agent: "main-agent".to_string(),
-                file: Some(PathBuf::from("coding-agent.json")),
-                json: true,
-            })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "run".to_string(),
-            "--prompt".to_string(),
-            "hello".to_string(),
-        ])
-        .expect("agent"),
-        CliCommand::Agent(AgentCliCommand::Run(_))
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "readiness".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("agent readiness"),
-        CliCommand::Agent(AgentCliCommand::Readiness(options))
-            if options == (AgentReadinessOptions { json: true })
-    ));
-    assert!(matches!(
-        parse_cli_command(&[
-            "agent".to_string(),
-            "session".to_string(),
-            "inspect".to_string(),
-            "sess_cli_agent_session".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("agent session inspect"),
-        CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Inspect(options)))
-            if options == (AgentSessionInspectOptions {
-                session_id: SessionId::from_legacy_named("sess_cli_agent_session").expect("session id"),
-                json: true,
-            })
-    ));
+    assert!(parse_cli_command(&[]).expect("tui").is_none());
+
+    let cases = [
+        (vec!["help"], "help", true),
+        (vec!["daemon", "status"], "daemon", false),
+        (vec!["daemon"], "daemon", true),
+        (vec!["debug", "sobj", "state.sobj"], "debug", false),
+        (vec!["cluster", "status"], "cluster", false),
+        (vec!["install", "--no-start"], "install", false),
+        (vec!["providers", "test", "openai"], "providers", false),
+        (vec!["models", "list"], "models", false),
+        (vec!["model", "--help"], "models", true),
+        (vec!["usage", "--provider", "codex"], "usage", false),
+        (vec!["rollout", "status"], "rollout", false),
+        (vec!["observe", "events"], "observe", false),
+        (vec!["dfs", "status"], "dfs", false),
+        (vec!["sandbox"], "sandbox", true),
+        (vec!["agent"], "agent", true),
+        (vec!["skills", "list", "--all"], "skill", false),
+    ];
+    for (args, expected_name, expected_help) in cases {
+        let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let command = parse_cli_command(&args)
+            .expect("parse command")
+            .expect("registered command");
+        assert_eq!(command.name(), expected_name, "args: {args:?}");
+        assert_eq!(command.is_help(), expected_help, "args: {args:?}");
+    }
+
+    let activate = parse_cli_command(&[
+        "module".to_string(),
+        "native-dylib".to_string(),
+        "activate".to_string(),
+        "/tmp/libsinomo_test_module.so".to_string(),
+    ])
+    .expect("module native-dylib activate")
+    .expect("registered module command");
+    assert!(activate.requires_rollout_admission());
+
+    let list = parse_cli_command(&["module".to_string(), "list".to_string()])
+        .expect("module list")
+        .expect("registered module command");
+    assert!(!list.requires_rollout_admission());
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+#[test]
+fn models_registry_uses_schema_for_alias_help_and_errors() {
+    let alias = parse_cli_command(&[
+        "model".to_string(),
+        "list".to_string(),
+        "--provider=codex".to_string(),
+    ])
+    .expect("models alias")
+    .expect("registered models command");
+    assert_eq!(alias.name(), "models");
+
+    let help = parse_cli_command(&[
+        "models".to_string(),
+        "options".to_string(),
+        "--help".to_string(),
+    ])
+    .expect("nested models help")
+    .expect("registered models command");
+    assert!(cli_command_is_help(&help));
+
+    let missing = parse_cli_command(&[
+        "models".to_string(),
+        "default".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+    ])
+    .expect_err("missing provider");
+    assert!(matches!(missing, CliError::Parse { ref detail }
+        if detail.contains("required option `--provider`")
+            && detail.contains("Usage: sinomo models default")));
+
+    let duplicate = parse_cli_command(&[
+        "models".to_string(),
+        "list".to_string(),
+        "--provider".to_string(),
+        "codex".to_string(),
+        "--provider".to_string(),
+        "openai".to_string(),
+    ])
+    .expect_err("duplicate provider");
+    assert!(matches!(duplicate, CliError::Parse { ref detail }
+        if detail.contains("may only be provided once")));
+}
+
+#[test]
+fn models_nested_help_does_not_execute_the_show_command() {
+    let execution = super::run_cli_command_with_capture(&[
+        "models".to_string(),
+        "options".to_string(),
+        "--help".to_string(),
+    ]);
+    execution.result.expect("models options help");
+    let output = String::from_utf8(execution.output.stdout).expect("utf8 help");
+    assert!(output.contains("sinomo models options"));
+    assert!(!output.contains("model provider options:"));
+    assert!(!output.contains("config:"));
 }
 
 #[test]
@@ -1096,17 +910,20 @@ fn cluster_health_daemon_rpc_timeout_covers_health_probe_budget() {
 }
 
 #[test]
-fn documented_builtin_top_level_commands_are_parseable() {
-    for command in BUILTIN_TOP_LEVEL_USAGE_COMMANDS {
-        parse_cli_command(&[command.to_string()]).unwrap_or_else(|error| {
-            panic!("documented command `{command}` did not parse: {error}")
+fn registered_top_level_commands_are_parseable() {
+    for command in super::cli_command_registry().metadata() {
+        parse_cli_command(&[command.name.clone()]).unwrap_or_else(|error| {
+            panic!(
+                "registered command `{}` did not parse: {error}",
+                command.name
+            )
         });
     }
 }
 
 #[test]
 fn test_parser_accepts_live_cluster_smoke_options() {
-    let command = parse_test_command(&[
+    let command = parse_test_schema_for_test(&[
         "smoke".to_string(),
         "--provider".to_string(),
         "deepseek".to_string(),
@@ -5744,7 +5561,7 @@ fn wasi_stdin_to_stdout_module() -> &'static str {
 fn agent_run_parser_accepts_provider_model_account_and_prompt() {
     let session_id = SessionId::generate();
     assert_eq!(
-        super::parse_agent_run_options(&[
+        super::parse_agent_run_schema_for_test(&[
             "--agent".to_string(),
             "coding-agent".to_string(),
             "--provider".to_string(),
@@ -5775,7 +5592,7 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
     );
 
     let defaults =
-        super::parse_agent_run_options(&["hello".to_string()]).expect("default agent run");
+        super::parse_agent_run_schema_for_test(&["hello".to_string()]).expect("default agent run");
     assert_eq!(defaults.agent, "main-agent");
     assert!(!defaults.agent_explicit);
     assert!(defaults.session_id.is_none());
@@ -6085,7 +5902,7 @@ fn agent_run_compaction_evidence_requires_the_persisted_projection() {
 #[test]
 fn agent_inspect_parser_accepts_agent_and_json() {
     assert_eq!(
-        super::parse_agent_inspect_options(&[
+        super::parse_agent_inspect_schema_for_test(&[
             "--agent".to_string(),
             "evolution-agent".to_string(),
             "--json".to_string(),
@@ -6097,7 +5914,7 @@ fn agent_inspect_parser_accepts_agent_and_json() {
         }
     );
     assert_eq!(
-        super::parse_agent_inspect_options(&[]).expect("default agent inspect"),
+        super::parse_agent_inspect_schema_for_test(&[]).expect("default agent inspect"),
         AgentInspectOptions {
             agent: "main-agent".to_string(),
             json: false,
@@ -6108,7 +5925,7 @@ fn agent_inspect_parser_accepts_agent_and_json() {
 #[test]
 fn agent_export_import_validate_parsers_accept_package_artifacts() {
     assert_eq!(
-        super::parse_agent_export_options(&[
+        super::parse_agent_export_schema_for_test(&[
             "coding-agent".to_string(),
             "--output".to_string(),
             "coding-agent.json".to_string(),
@@ -6120,14 +5937,14 @@ fn agent_export_import_validate_parsers_accept_package_artifacts() {
         }
     );
     assert_eq!(
-        super::parse_agent_export_options(&[]).expect("default export"),
+        super::parse_agent_export_schema_for_test(&[]).expect("default export"),
         AgentExportOptions {
             agent: "main-agent".to_string(),
             output: None,
         }
     );
     assert_eq!(
-        super::parse_agent_import_options(&[
+        super::parse_agent_import_schema_for_test(&[
             "--file".to_string(),
             "coding-agent.json".to_string(),
             "--json".to_string(),
@@ -6139,7 +5956,7 @@ fn agent_export_import_validate_parsers_accept_package_artifacts() {
         }
     );
     assert_eq!(
-        super::parse_agent_validate_options(&[
+        super::parse_agent_validate_schema_for_test(&[
             "--file".to_string(),
             "coding-agent.json".to_string(),
             "--json".to_string(),
@@ -6152,7 +5969,7 @@ fn agent_export_import_validate_parsers_accept_package_artifacts() {
         }
     );
     assert_eq!(
-        super::parse_agent_validate_options(&["coding-agent".to_string()])
+        super::parse_agent_validate_schema_for_test(&["coding-agent".to_string()])
             .expect("agent validate catalog"),
         AgentValidateOptions {
             agent: "coding-agent".to_string(),
@@ -6186,11 +6003,12 @@ fn agent_package_json_artifact_loads_and_validates() {
 #[test]
 fn agent_readiness_parser_accepts_json() {
     assert_eq!(
-        super::parse_agent_readiness_options(&["--json".to_string()]).expect("agent readiness"),
+        super::parse_agent_readiness_schema_for_test(&["--json".to_string()])
+            .expect("agent readiness"),
         AgentReadinessOptions { json: true }
     );
     assert_eq!(
-        super::parse_agent_readiness_options(&[]).expect("default readiness"),
+        super::parse_agent_readiness_schema_for_test(&[]).expect("default readiness"),
         AgentReadinessOptions { json: false }
     );
 }
@@ -6198,7 +6016,7 @@ fn agent_readiness_parser_accepts_json() {
 #[test]
 fn skill_parsers_accept_markdown_catalog_management_options() {
     assert_eq!(
-        super::parse_skill_list_options(&["--all".to_string(), "--json".to_string()])
+        super::parse_skill_list_schema_for_test(&["--all".to_string(), "--json".to_string()])
             .expect("skill list"),
         SkillListOptions {
             all: true,
@@ -6206,7 +6024,7 @@ fn skill_parsers_accept_markdown_catalog_management_options() {
         }
     );
     assert_eq!(
-        super::parse_skill_show_options(&[
+        super::parse_skill_show_schema_for_test(&[
             "rust-debug".to_string(),
             "--version".to_string(),
             "2.0.0".to_string(),
@@ -6221,7 +6039,7 @@ fn skill_parsers_accept_markdown_catalog_management_options() {
         }
     );
     assert_eq!(
-        super::parse_skill_import_options(&[
+        super::parse_skill_import_schema_for_test(&[
             "skills/rust-debug".to_string(),
             "--id".to_string(),
             "rust-debug".to_string(),
@@ -6247,7 +6065,7 @@ fn skill_parsers_accept_markdown_catalog_management_options() {
         }
     );
     assert_eq!(
-        super::parse_skill_export_options(&[
+        super::parse_skill_export_schema_for_test(&[
             "rust-debug".to_string(),
             "--output".to_string(),
             "SKILL.md".to_string(),
@@ -6262,7 +6080,7 @@ fn skill_parsers_accept_markdown_catalog_management_options() {
         }
     );
     assert_eq!(
-        super::parse_skill_activate_options(&[
+        super::parse_skill_activate_schema_for_test(&[
             "rust-debug".to_string(),
             "--version".to_string(),
             "1.2.3".to_string(),
@@ -6289,7 +6107,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
     let event_id = sinomo_agent::TaskId::generate();
 
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "inspect".to_string(),
             "sess_agent_session_parser".to_string(),
             "--json".to_string(),
@@ -6301,7 +6119,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
         })
     );
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "progress".to_string(),
             "sess_agent_session_parser".to_string(),
             "--cursor".to_string(),
@@ -6321,7 +6139,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
         })
     );
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "terminal-results".to_string(),
             "sess_agent_session_parser".to_string(),
             "--task".to_string(),
@@ -6335,7 +6153,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
         })
     );
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "steer".to_string(),
             "sess_agent_session_parser".to_string(),
             "keep".to_string(),
@@ -6351,7 +6169,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
         })
     );
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "follow-up".to_string(),
             "--session".to_string(),
             "sess_agent_session_parser".to_string(),
@@ -6366,7 +6184,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
         })
     );
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "interrupt".to_string(),
             "sess_agent_session_parser".to_string(),
             "--reason".to_string(),
@@ -6380,7 +6198,7 @@ fn agent_session_parsers_accept_inspect_progress_results_and_control() {
         })
     );
     assert_eq!(
-        super::parse_agent_session_command(&[
+        super::parse_agent_session_schema_for_test(&[
             "resume".to_string(),
             "sess_agent_session_parser".to_string(),
             "--json".to_string(),
@@ -6525,7 +6343,7 @@ fn agent_readiness_text_renders_gate_results() {
 #[test]
 fn cluster_repair_members_parser_accepts_peer_and_promotion() {
     assert_eq!(
-        super::parse_cluster_command(&[
+        super::parse_cluster_schema_for_test(&[
             "repair-members".to_string(),
             "--from".to_string(),
             "10.0.0.2:21353".to_string(),
@@ -6543,7 +6361,7 @@ fn cluster_repair_members_parser_accepts_peer_and_promotion() {
 #[test]
 fn install_parser_accepts_custom_daemon_ports() {
     assert_eq!(
-        parse_install_options(&[
+        parse_install_schema_for_test(&[
             "--host".to_string(),
             "127.0.0.1".to_string(),
             "--port".to_string(),
@@ -6561,7 +6379,7 @@ fn install_parser_accepts_custom_daemon_ports() {
         }
     );
     assert_eq!(
-        parse_uninstall_options(&["--no-stop".to_string()]).expect("uninstall options"),
+        parse_uninstall_schema_for_test(&["--no-stop".to_string()]).expect("uninstall options"),
         UninstallOptions { stop: false }
     );
 }
@@ -7462,12 +7280,55 @@ fn install_detects_daemon_option_mismatch() {
 
 #[test]
 fn cluster_state_guard_applies_to_distributed_runtime_commands() {
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Daemon(
-        DaemonCliCommand::Status(DaemonRunOptions::default())
-    )));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Rollout(
-        RolloutCliCommand::Status
-    )));
+    let parse = |args: &[&str]| {
+        parse_cli_command(
+            &args
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("parse command")
+        .expect("registered command")
+    };
+
+    for args in [
+        &["daemon", "status"][..],
+        &["rollout", "status"][..],
+        &["cluster", "status"][..],
+        &["dfs"][..],
+        &["models", "--help"][..],
+        &["providers"][..],
+        &["skill"][..],
+        &["observe"][..],
+    ] {
+        let command = parse(args);
+        assert!(
+            !cli_command_requires_cluster_state(&command),
+            "unexpected cluster requirement for {args:?}"
+        );
+    }
+
+    for args in [
+        &["dfs", "status", "--cluster"][..],
+        &["dfs", "services"][..],
+        &["dfs", "metadata", "publish"][..],
+        &[
+            "dfs",
+            "metadata",
+            "shard",
+            "transfer-primary",
+            "root",
+            "--to",
+            "01hxy6qa9k0t9vr4g9n8d3q5d5",
+        ][..],
+    ] {
+        let command = parse(args);
+        assert!(
+            cli_command_requires_cluster_state(&command),
+            "missing cluster requirement for {args:?}"
+        );
+    }
+
     let registered_cluster_command =
         registered_test_command("registered-cluster", CliCommandPolicy::cluster_required());
     assert!(cli_command_requires_cluster_state(
@@ -7482,103 +7343,61 @@ fn cluster_state_guard_applies_to_distributed_runtime_commands() {
         &registered_cluster_help_command
     ));
     assert!(cli_command_is_help(&registered_cluster_help_command));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Cluster(
-        ClusterCliCommand::Status
-    )));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Dfs(
-        DfsCliCommand::Help
-    )));
-    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
-        DfsCliCommand::Status(DfsCommonOptions {
-            cluster: true,
-            ..DfsCommonOptions::default()
-        })
-    )));
-    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
-        DfsCliCommand::Services { json: false }
-    )));
-    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
-        DfsCliCommand::MetadataPublish { json: false }
-    )));
-    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
-        DfsCliCommand::MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions {
-            file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
-            shard_id: "root".to_string(),
-            new_primary_node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node"),
-            expected_epoch: Some(1),
-            json: false,
-        })
-    )));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
-        ModelsCliCommand::Help
-    )));
-    assert!(cli_command_is_help(&CliCommand::Models(
-        ModelsCliCommand::Help
-    )));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
-        ProviderCliCommand::Help
-    )));
-    assert!(!cli_command_requires_cluster_state(&CliCommand::Skill(
-        SkillCliCommand::Help
-    )));
-    let observe = parse_cli_command(&["observe".to_string()]).expect("observe");
-    assert!(!cli_command_requires_cluster_state(&observe));
+
+    let models_help = parse(&["models", "--help"]);
+    assert!(cli_command_is_help(&models_help));
 }
 
 #[test]
 fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
-    let models = CliCommand::Models(ModelsCliCommand::Help);
-    assert!(cli_command_supports_degraded_local_mode(&models));
-    assert!(cli_invocation_force_local_mode(
-        CliRuntimeOptions::default(),
-        &models,
-        false,
-        None
-    ));
+    let parse = |args: &[&str]| {
+        parse_cli_command(
+            &args
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("parse command")
+        .expect("registered command")
+    };
+
+    for args in [
+        &["models", "list"][..],
+        &["dfs", "status"][..],
+        &["skill", "list"][..],
+        &["observe"][..],
+    ] {
+        let command = parse(args);
+        assert!(cli_command_supports_degraded_local_mode(&command));
+        assert!(cli_invocation_force_local_mode(
+            CliRuntimeOptions::default(),
+            &command,
+            false,
+            None,
+        ));
+    }
+
+    let models = parse(&["models", "list"]);
     assert!(cli_invocation_force_local_mode(
         CliRuntimeOptions::default(),
         &models,
         true,
-        Some(false)
+        Some(false),
     ));
     assert!(!cli_invocation_force_local_mode(
         CliRuntimeOptions::default(),
         &models,
         true,
-        Some(true)
+        Some(true),
     ));
 
-    let dfs_local = CliCommand::Dfs(DfsCliCommand::Status(DfsCommonOptions::default()));
-    assert!(cli_command_supports_degraded_local_mode(&dfs_local));
-    assert!(cli_invocation_force_local_mode(
-        CliRuntimeOptions::default(),
-        &dfs_local,
-        false,
-        None
-    ));
-
-    let dfs_cluster = CliCommand::Dfs(DfsCliCommand::Status(DfsCommonOptions {
-        cluster: true,
-        ..DfsCommonOptions::default()
-    }));
+    let dfs_cluster = parse(&["dfs", "status", "--cluster"]);
     assert!(!cli_command_supports_degraded_local_mode(&dfs_cluster));
     assert!(!cli_invocation_force_local_mode(
         CliRuntimeOptions::default(),
         &dfs_cluster,
         false,
-        None
-    ));
-
-    let skill = CliCommand::Skill(SkillCliCommand::List(SkillListOptions {
-        all: false,
-        json: false,
-    }));
-    assert!(cli_command_supports_degraded_local_mode(&skill));
-    assert!(cli_invocation_force_local_mode(
-        CliRuntimeOptions::default(),
-        &skill,
-        false,
-        None
+        None,
     ));
 
     let registered_cluster_command =
@@ -7590,19 +7409,9 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
         CliRuntimeOptions::default(),
         &registered_cluster_command,
         false,
-        None
-    ));
-
-    let observe = parse_cli_command(&["observe".to_string()]).expect("observe");
-    assert!(cli_command_supports_degraded_local_mode(&observe));
-    assert!(cli_invocation_force_local_mode(
-        CliRuntimeOptions::default(),
-        &observe,
-        false,
-        None
+        None,
     ));
 }
-
 #[test]
 fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-daemon-guard");
@@ -7808,7 +7617,7 @@ fn signed_test_invite_uri(
 fn dfs_parser_accepts_operator_and_pin_commands() {
     let metadata_root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-meta");
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "status".to_string(),
             "--metadata-root".to_string(),
             metadata_root.display().to_string(),
@@ -7822,7 +7631,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "status".to_string(),
             "--cluster".to_string(),
             "--json".to_string(),
@@ -7835,7 +7644,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "conflicts".to_string(),
             "--filesystem".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
@@ -7860,7 +7669,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "conflicts".to_string(),
             "resolve".to_string(),
             "--path".to_string(),
@@ -7888,7 +7697,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "conflicts".to_string(),
             "versions".to_string(),
             "--path".to_string(),
@@ -7911,7 +7720,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "conflicts".to_string(),
             "use-version".to_string(),
             "--object".to_string(),
@@ -7936,7 +7745,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "conflicts".to_string(),
             "save-version".to_string(),
             "--object".to_string(),
@@ -7967,7 +7776,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert!(matches!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "path".to_string(),
             "/services/sandbox/instances/01hxy6qa9k0t9vr4g9n8d3q5d2/manifest.sobj"
                 .to_string(),
@@ -7982,15 +7791,16 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
                 && options.json
     ));
     assert_eq!(
-        parse_dfs_command(&["services".to_string(), "--json".to_string()]).expect("dfs services"),
+        parse_dfs_schema_for_test(&["services".to_string(), "--json".to_string()])
+            .expect("dfs services"),
         DfsCliCommand::Services { json: true }
     );
     assert_eq!(
-        parse_dfs_command(&["smoke".to_string(), "--json".to_string()]).expect("dfs smoke"),
+        parse_dfs_schema_for_test(&["smoke".to_string(), "--json".to_string()]).expect("dfs smoke"),
         DfsCliCommand::Smoke { json: true }
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "metadata".to_string(),
             "shard".to_string(),
             "transfer-primary".to_string(),
@@ -8011,7 +7821,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "mount".to_string(),
             "/mnt/sifs".to_string(),
             "--root".to_string(),
@@ -8033,7 +7843,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         })
     );
     assert!(matches!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "mount".to_string(),
             "/mnt/agent-home".to_string(),
             "--root".to_string(),
@@ -8048,7 +7858,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
     ));
     #[cfg(not(windows))]
     {
-        let background = match parse_dfs_command(&[
+        let background = match parse_dfs_schema_for_test(&[
             "mount".to_string(),
             "/mnt/sifs".to_string(),
             "--background".to_string(),
@@ -8062,7 +7872,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             .expect_err("Unix background mount must be rejected explicitly");
         assert!(error.to_string().contains("--background"));
 
-        let sync_local = match parse_dfs_command(&[
+        let sync_local = match parse_dfs_schema_for_test(&[
             "mount".to_string(),
             "/mnt/sifs".to_string(),
             "--sync-local-changes".to_string(),
@@ -8077,7 +7887,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         assert!(error.to_string().contains("Windows Cloud Files"));
     }
     assert!(matches!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "pin".to_string(),
             "add".to_string(),
             "--path".to_string(),
@@ -8091,7 +7901,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
                 && options.path == "src/lib.rs"
     ));
     assert!(matches!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "pin".to_string(),
             "remove".to_string(),
             "--filesystem".to_string(),
@@ -8106,25 +7916,6 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             if options.mode == Some(sinomo_runtime::dfs::DfsPinMode::Metadata)
                 && options.path == "src/lib.rs"
     ));
-    assert!(matches!(
-        parse_dfs_command(&[
-            "expose".to_string(),
-            "add".to_string(),
-            "--source".to_string(),
-            "/tmp/shared".to_string(),
-            "--dfs-path".to_string(),
-            "/sinomo/nodes/node_alpha/files/shared".to_string(),
-            "--node".to_string(),
-            "01hxy6qa9k0t9vr4g9n8d3q5d5".to_string(),
-            "--read-only".to_string(),
-        ])
-        .expect("dfs expose add"),
-        DfsCliCommand::Expose(DfsExposeCliCommand::Add(options))
-            if options.source == PathBuf::from("/tmp/shared")
-                && options.dfs_path == "/sinomo/nodes/node_alpha/files/shared"
-                && options.node_id == Some(NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node"))
-                && !options.writable
-    ));
 }
 
 #[test]
@@ -8132,7 +7923,7 @@ fn dfs_parser_requires_explicit_placement_authority_recovery_evidence() {
     let file_system_id = sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
         .expect("filesystem");
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "placement-authority".to_string(),
             "inspect".to_string(),
             "--json".to_string(),
@@ -8146,7 +7937,7 @@ fn dfs_parser_requires_explicit_placement_authority_recovery_evidence() {
         ))
     );
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "placement-authority".to_string(),
             "clear".to_string(),
             "--filesystem".to_string(),
@@ -8168,7 +7959,7 @@ fn dfs_parser_requires_explicit_placement_authority_recovery_evidence() {
     );
     let acknowledgement = sinomo_runtime::dfs::DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT;
     assert_eq!(
-        parse_dfs_command(&[
+        parse_dfs_schema_for_test(&[
             "placement-authority".to_string(),
             "clear".to_string(),
             "--expected-token".to_string(),
@@ -8222,8 +8013,8 @@ fn dfs_parser_requires_explicit_placement_authority_recovery_evidence() {
         ],
     ] {
         assert!(matches!(
-            parse_dfs_command(&args.into_iter().map(str::to_string).collect::<Vec<_>>()),
-            Err(CliError::Usage)
+            parse_dfs_schema_for_test(&args.into_iter().map(str::to_string).collect::<Vec<_>>()),
+            Err(CliError::Parse { .. })
         ));
     }
 }
@@ -8338,7 +8129,7 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
 #[test]
 fn cluster_parser_accepts_init_and_join_options() {
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "init".to_string(),
             "--name".to_string(),
             "home".to_string(),
@@ -8355,7 +8146,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "join".to_string(),
             "sinomo-join://token".to_string(),
             "--name".to_string(),
@@ -8371,7 +8162,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "invite".to_string(),
             "--introducer".to_string(),
             "192.168.1.10:21353".to_string(),
@@ -8407,7 +8198,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "migrate".to_string(),
             "plan".to_string(),
             "sinomo-join://token".to_string(),
@@ -8421,7 +8212,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         }))
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "rename".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "workstation-a".to_string(),
@@ -8433,11 +8224,12 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&["rename-hostnames".to_string()]).expect("cluster rename-hostnames"),
+        parse_cluster_schema_for_test(&["rename-hostnames".to_string()])
+            .expect("cluster rename-hostnames"),
         ClusterCliCommand::RenameHostnames
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "role".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "server".to_string(),
@@ -8449,7 +8241,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "state-authority".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "observer".to_string(),
@@ -8461,7 +8253,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "raft-role".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "non_voting".to_string(),
@@ -8473,7 +8265,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "promote".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string()
         ])
@@ -8484,7 +8276,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&[
+        parse_cluster_schema_for_test(&[
             "remove".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d7".to_string(),
@@ -8498,7 +8290,7 @@ fn cluster_parser_accepts_init_and_join_options() {
         })
     );
     assert_eq!(
-        parse_cluster_command(&["cleanup-legacy-shadow-members".to_string()])
+        parse_cluster_schema_for_test(&["cleanup-legacy-shadow-members".to_string()])
             .expect("cluster cleanup legacy shadow members"),
         ClusterCliCommand::CleanupLegacyShadowMembers
     );
@@ -8506,7 +8298,7 @@ fn cluster_parser_accepts_init_and_join_options() {
 
 #[test]
 fn cluster_invite_parser_rejects_duplicate_channel_addresses_and_output_paths() {
-    let duplicate_address = parse_cluster_command(&[
+    let duplicate_address = parse_cluster_schema_for_test(&[
         "invite".to_string(),
         "--channel-output".to_string(),
         "192.0.2.10:21353=node-1.txt".to_string(),
@@ -8521,7 +8313,7 @@ fn cluster_invite_parser_rejects_duplicate_channel_addresses_and_output_paths() 
         other => panic!("unexpected error: {other}"),
     }
 
-    let duplicate_path = parse_cluster_command(&[
+    let duplicate_path = parse_cluster_schema_for_test(&[
         "invite".to_string(),
         "--output".to_string(),
         "invite.txt".to_string(),
@@ -9638,24 +9430,6 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             super::DaemonSignerAuthority::JoinCandidate,
             "node_join",
             "pk_join"
-        ))
-        .is_ok()
-    );
-    assert!(
-        super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE,
-            super::DaemonSignerAuthority::Member,
-            "node_member",
-            "pk_member"
-        ))
-        .is_err()
-    );
-    assert!(
-        super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE,
-            super::DaemonSignerAuthority::Local,
-            "node_local",
-            "pk_local"
         ))
         .is_ok()
     );
@@ -12240,15 +12014,15 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
 #[test]
 fn rollout_parser_accepts_apply_status_and_init_source() {
     assert_eq!(
-        parse_rollout_command(&["status".to_string()]).expect("status"),
+        parse_rollout_schema_for_test(&["status".to_string()]).expect("status"),
         RolloutCliCommand::Status
     );
     assert_eq!(
-        parse_rollout_command(&["apply".to_string()]).expect("apply"),
+        parse_rollout_schema_for_test(&["apply".to_string()]).expect("apply"),
         RolloutCliCommand::Apply(RolloutOptions::default())
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "import-source".to_string(),
             "--repo".to_string(),
             "/work/sinomo".to_string()
@@ -12260,7 +12034,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "export-source".to_string(),
             "--repo".to_string(),
             "/work/sinomo".to_string()
@@ -12272,7 +12046,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "apply-external".to_string(),
             "--repo".to_string(),
             "/work/sinomo".to_string()
@@ -12284,7 +12058,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "init-source".to_string(),
             "--repo".to_string(),
             "/work/sinomo".to_string()
@@ -12298,7 +12072,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "cluster".to_string(),
             "--repo".to_string(),
             "/work/sinomo".to_string(),
@@ -12318,7 +12092,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "cluster".to_string(),
             "--remote-build".to_string(),
             "--remote-repo".to_string(),
@@ -12339,7 +12113,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "module".to_string(),
             "native-dylib".to_string(),
             "module.remote-management".to_string(),
@@ -12361,7 +12135,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&["apply".to_string(), "--force-overwrite".to_string()])
+        parse_rollout_schema_for_test(&["apply".to_string(), "--force-overwrite".to_string()])
             .expect("apply force overwrite"),
         RolloutCliCommand::Apply(RolloutOptions {
             force_source_overwrite: true,
@@ -12369,7 +12143,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "diagnostics".to_string(),
             "--target".to_string(),
             "192.0.2.11:21353".to_string(),
@@ -12381,7 +12155,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "clear-status".to_string(),
             "--target".to_string(),
             "192.0.2.11:21353".to_string(),
@@ -12393,7 +12167,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "advance".to_string(),
             "--node".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d5".to_string(),
@@ -12421,7 +12195,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "advance".to_string(),
             "--module-replay-report".to_string(),
             "/tmp/replay-report.json".to_string(),
@@ -12439,7 +12213,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "advance".to_string(),
             "--shadow-telemetry".to_string(),
             "--shadow-telemetry-limit".to_string(),
@@ -12458,7 +12232,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "telemetry-gates".to_string(),
             "set".to_string(),
             "--disable-auto-promotion".to_string(),
@@ -12481,7 +12255,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         })
     );
     assert_eq!(
-        parse_rollout_command(&["telemetry-gates".to_string(), "show".to_string(),])
+        parse_rollout_schema_for_test(&["telemetry-gates".to_string(), "show".to_string(),])
             .expect("telemetry gates show"),
         RolloutCliCommand::TelemetryGatesShow
     );
@@ -12489,7 +12263,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
 
 #[test]
 fn rollout_parser_scopes_native_module_skip_to_cluster_binary_push() {
-    let parsed = parse_rollout_command(&[
+    let parsed = parse_rollout_schema_for_test(&[
         "cluster".to_string(),
         "--binary".to_string(),
         "/tmp/sinomo".to_string(),
@@ -12513,7 +12287,7 @@ fn rollout_parser_scopes_native_module_skip_to_cluster_binary_push() {
             .iter()
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
-        match parse_rollout_command(&args).expect_err("incompatible rollout options") {
+        match parse_rollout_schema_for_test(&args).expect_err("incompatible rollout options") {
             CliError::Parse { detail } => detail,
             other => panic!("expected parse error, got {other}"),
         }
@@ -12531,10 +12305,10 @@ fn rollout_parser_scopes_native_module_skip_to_cluster_binary_push() {
     assert!(detail.contains("cannot be combined with --remote-repo"));
 
     let detail = parse_error(&["apply", "--skip-native-modules"]);
-    assert!(detail.contains("only supported by `rollout cluster` binary-push rollouts"));
+    assert!(detail.contains("unknown option") && detail.contains("--skip-native-modules"));
 
     let detail = parse_error(&["apply-external", "--skip-native-modules"]);
-    assert!(detail.contains("only supported by `rollout cluster` binary-push rollouts"));
+    assert!(detail.contains("unknown option") && detail.contains("--skip-native-modules"));
 
     let detail = parse_error(&[
         "module",
@@ -12542,7 +12316,7 @@ fn rollout_parser_scopes_native_module_skip_to_cluster_binary_push() {
         "module.test",
         "--skip-native-modules",
     ]);
-    assert!(detail.contains("only for cluster binary-push rollouts"));
+    assert!(detail.contains("unknown option") && detail.contains("--skip-native-modules"));
 }
 
 #[test]
@@ -14332,7 +14106,7 @@ fn module_shadow_telemetry_event(
 #[test]
 fn rollout_parser_reuses_daemon_endpoint_defaults() {
     assert_eq!(
-        parse_rollout_command(&[
+        parse_rollout_schema_for_test(&[
             "apply".to_string(),
             "--host".to_string(),
             "0.0.0.0".to_string(),
@@ -14352,21 +14126,22 @@ fn rollout_parser_reuses_daemon_endpoint_defaults() {
 #[test]
 fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
     assert_eq!(
-        parse_daemon_command(&["shadow".to_string(), "run".to_string()]).expect("shadow"),
+        parse_daemon_schema_for_test(&["shadow".to_string(), "run".to_string()]).expect("shadow"),
         DaemonCliCommand::ShadowRun(DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_354,
         })
     );
     assert_eq!(
-        parse_daemon_command(&["shadow".to_string(), "status".to_string()]).expect("shadow"),
+        parse_daemon_schema_for_test(&["shadow".to_string(), "status".to_string()])
+            .expect("shadow"),
         DaemonCliCommand::ShadowStatus(DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_354,
         })
     );
     assert_eq!(
-        parse_daemon_command(&["__complete-shadow-rollout".to_string()]).expect("helper"),
+        parse_daemon_schema_for_test(&["__complete-shadow-rollout".to_string()]).expect("helper"),
         DaemonCliCommand::CompleteShadowRollout
     );
 }
@@ -14387,21 +14162,21 @@ fn daemon_paths_for_shadow_are_separate_from_main_daemon() {
 #[test]
 fn daemon_parser_uses_port_21353_by_default() {
     assert_eq!(
-        parse_daemon_command(&["run".to_string()]).expect("daemon run"),
+        parse_daemon_schema_for_test(&["run".to_string()]).expect("daemon run"),
         DaemonCliCommand::Run(DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_353,
         })
     );
     assert_eq!(
-        parse_daemon_command(&["status".to_string()]).expect("daemon status"),
+        parse_daemon_schema_for_test(&["status".to_string()]).expect("daemon status"),
         DaemonCliCommand::Status(DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_353,
         })
     );
     assert_eq!(
-        parse_daemon_command(&[
+        parse_daemon_schema_for_test(&[
             "run".to_string(),
             "--host".to_string(),
             "0.0.0.0".to_string(),
@@ -15308,28 +15083,36 @@ fn main_agent_fixture_response(
     }
 }
 
+fn parse_models_args(args: &[&str]) -> Result<ModelsCliCommand, CliParseError> {
+    parse_models_command(
+        &args
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[test]
 fn model_list_parser_accepts_optional_provider() {
     assert_eq!(
-        parse_models_list_options(&[]).expect("empty args"),
-        super::ModelListOptions { provider: None }
+        parse_models_args(&["list"]).expect("empty args"),
+        ModelsCliCommand::List(super::ModelListOptions { provider: None })
     );
     assert_eq!(
-        parse_models_list_options(&["--provider".to_string(), "github-copilot".to_string()])
-            .expect("provider"),
-        super::ModelListOptions {
+        parse_models_args(&["list", "--provider", "github-copilot"]).expect("provider"),
+        ModelsCliCommand::List(super::ModelListOptions {
             provider: Some("github-copilot".to_string())
-        }
+        })
     );
     assert!(matches!(
-        parse_models_list_options(&["github-copilot".to_string()]),
-        Err(CliError::Usage)
+        parse_models_args(&["list", "github-copilot"]),
+        Err(CliParseError::InvalidUsage { .. })
     ));
 }
 
 #[test]
 fn usage_parser_accepts_provider_and_json() {
-    let options = parse_usage_options(&[
+    let options = parse_usage_schema_for_test(&[
         "--provider".to_string(),
         "codex".to_string(),
         "--json".to_string(),
@@ -15338,18 +15121,16 @@ fn usage_parser_accepts_provider_and_json() {
 
     assert_eq!(options.provider.as_deref(), Some("codex"));
     assert!(options.json);
-    assert!(!options.help);
 }
 
 #[test]
 fn model_default_parser_accepts_provider_model() {
-    let options = parse_model_default_options(&[
-        "--provider".to_string(),
-        "openai-api".to_string(),
-        "--model".to_string(),
-        "gpt-5.5".to_string(),
-    ])
-    .expect("options");
+    let ModelsCliCommand::Default(options) =
+        parse_models_args(&["default", "--provider", "openai-api", "--model", "gpt-5.5"])
+            .expect("options")
+    else {
+        panic!("expected models default");
+    };
 
     assert_eq!(options.provider, "openai");
     assert_eq!(options.model, "gpt-5.5");
@@ -15357,13 +15138,16 @@ fn model_default_parser_accepts_provider_model() {
 
 #[test]
 fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
-    let options = parse_model_default_options(&[
-        "--provider".to_string(),
-        "nvidia".to_string(),
-        "--model".to_string(),
-        "nvidia/nvidia/nemotron-3-super-120b-a12b".to_string(),
+    let ModelsCliCommand::Default(options) = parse_models_args(&[
+        "default",
+        "--provider",
+        "nvidia",
+        "--model",
+        "nvidia/nvidia/nemotron-3-super-120b-a12b",
     ])
-    .expect("options");
+    .expect("options") else {
+        panic!("expected models default");
+    };
 
     assert_eq!(options.provider, "nvidia");
     assert_eq!(options.model, "nvidia/nemotron-3-super-120b-a12b");
@@ -15371,24 +15155,27 @@ fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
 
 #[test]
 fn model_options_parser_accepts_reasoning_and_vendor_options() {
-    let command = parse_model_options_command(&[
-        "set".to_string(),
-        "--provider".to_string(),
-        "openai-api".to_string(),
-        "--account".to_string(),
-        "team-a".to_string(),
-        "--model".to_string(),
-        "gpt-5.5".to_string(),
-        "--reasoning-effort".to_string(),
-        "none".to_string(),
-        "--reasoning-budget-tokens".to_string(),
-        "4096".to_string(),
-        "--text-verbosity".to_string(),
-        "low".to_string(),
-        "--vendor-option".to_string(),
-        "reasoning.summary=auto".to_string(),
+    let ModelsCliCommand::Options(command) = parse_models_args(&[
+        "options",
+        "set",
+        "--provider",
+        "openai-api",
+        "--account",
+        "team-a",
+        "--model",
+        "gpt-5.5",
+        "--reasoning-effort",
+        "none",
+        "--reasoning-budget-tokens",
+        "4096",
+        "--text-verbosity",
+        "low",
+        "--vendor-option",
+        "reasoning.summary=auto",
     ])
-    .expect("model options");
+    .expect("model options") else {
+        panic!("expected models options");
+    };
 
     assert_eq!(
         command,
@@ -15409,16 +15196,19 @@ fn model_options_parser_accepts_reasoning_and_vendor_options() {
 
 #[test]
 fn model_options_parser_distinguishes_clear_from_none() {
-    let command = parse_model_options_command(&[
-        "set".to_string(),
-        "--provider".to_string(),
-        "anthropic".to_string(),
-        "--reasoning-effort".to_string(),
-        "clear".to_string(),
-        "--text-verbosity".to_string(),
-        "clear".to_string(),
+    let ModelsCliCommand::Options(command) = parse_models_args(&[
+        "options",
+        "set",
+        "--provider",
+        "anthropic",
+        "--reasoning-effort",
+        "clear",
+        "--text-verbosity",
+        "clear",
     ])
-    .expect("model options");
+    .expect("model options") else {
+        panic!("expected models options");
+    };
 
     assert_eq!(
         command,
@@ -15524,7 +15314,6 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
         .filter_map(|definition| definition.get("key").and_then(serde_json::Value::as_str))
         .collect();
     for expected in [
-        "dfs.expose",
         "rollout.telemetry.gates",
         "sandbox.policy",
         "lm.providers",
@@ -16155,11 +15944,18 @@ fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
     .expect("cluster init");
     assert!(model_config_uses_cluster(&data_dir));
 
-    let command = CliCommand::Models(ModelsCliCommand::Default(super::ModelDefaultOptions {
-        provider: "openai".to_string(),
-        account: "local".to_string(),
-        model: "gpt-5.5".to_string(),
-    }));
+    let command = parse_cli_command(&[
+        "models".to_string(),
+        "default".to_string(),
+        "--provider".to_string(),
+        "openai".to_string(),
+        "--account".to_string(),
+        "local".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+    ])
+    .expect("models default command")
+    .expect("registered models command");
     let force_local =
         cli_invocation_force_local_mode(CliRuntimeOptions::default(), &command, false, None);
     assert!(force_local);
@@ -16424,28 +16220,31 @@ fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
 
 #[test]
 fn models_runtime_parser_accepts_cluster_runtime_settings() {
-    let command = parse_models_runtime_command(&[
-        "set".to_string(),
-        "--native-models-cache-dir".to_string(),
-        "/cluster/models".to_string(),
-        "--minicpm-v46-model-dir".to_string(),
-        "/cluster/models/minicpm-v46".to_string(),
-        "--minicpm-v46-max-input-tokens".to_string(),
-        "32768".to_string(),
-        "--minicpm-v46-max-output-tokens".to_string(),
-        "4096".to_string(),
-        "--pytorch-endpoint".to_string(),
-        "https://runtime.example.invalid/api".to_string(),
-        "--pytorch-python".to_string(),
-        "/cluster/bin/python".to_string(),
-        "--pytorch-device".to_string(),
-        "cuda".to_string(),
-        "--pytorch-timeout-seconds".to_string(),
-        "60".to_string(),
-        "--pytorch-mock".to_string(),
-        "false".to_string(),
+    let ModelsCliCommand::Runtime(command) = parse_models_args(&[
+        "runtime",
+        "set",
+        "--native-models-cache-dir",
+        "/cluster/models",
+        "--minicpm-v46-model-dir",
+        "/cluster/models/minicpm-v46",
+        "--minicpm-v46-max-input-tokens",
+        "32768",
+        "--minicpm-v46-max-output-tokens",
+        "4096",
+        "--pytorch-endpoint",
+        "https://runtime.example.invalid/api",
+        "--pytorch-python",
+        "/cluster/bin/python",
+        "--pytorch-device",
+        "cuda",
+        "--pytorch-timeout-seconds",
+        "60",
+        "--pytorch-mock",
+        "false",
     ])
-    .expect("runtime command");
+    .expect("runtime command") else {
+        panic!("expected models runtime");
+    };
 
     assert_eq!(
         command,
@@ -16465,15 +16264,10 @@ fn models_runtime_parser_accepts_cluster_runtime_settings() {
 
 #[test]
 fn model_default_parser_requires_known_provider() {
-    let error = parse_model_default_options(&[
-        "--provider".to_string(),
-        "unknown".to_string(),
-        "--model".to_string(),
-        "model".to_string(),
-    ])
-    .expect_err("unknown provider rejected");
+    let error = parse_models_args(&["default", "--provider", "unknown", "--model", "model"])
+        .expect_err("unknown provider rejected");
 
-    assert!(matches!(error, CliError::Parse { .. }));
+    assert!(matches!(error, CliParseError::Parse { .. }));
 }
 
 #[test]

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Run cleaned LongMemEval-S against Sinomo's real indexed-file memory path.
+"""Run cleaned LongMemEval-S against Sinomo memory retrieval implementations.
 
 Each benchmark question is a distinct synthetic user.  It is therefore run in
 its own disposable Sinomo data directory and working directory.  No cluster,
 DFS, permissions, chat, session, memory or index state is copied from the
 operator's normal data directory.
 
-The default run is retrieval-only and deterministic.  ``--reader sinomo`` also
-runs the Sinomo agent in the same isolated case and emits the official
+The default indexed-files run is retrieval-only and deterministic.
+``--retriever memory-tools`` instead exercises ``session_history_search`` plus
+``memory_search`` over an isolated in-memory VFS as a no-DFS baseline.
+``--reader sinomo`` is available for indexed files and emits the official
 ``{question_id, hypothesis}`` JSONL contract for LongMemEval's external judge.
 """
 
@@ -54,8 +56,14 @@ def find_repo_root(start: Path) -> Path:
 
 REPO_ROOT = find_repo_root(Path(__file__).resolve())
 DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmark-results" / "agent-memory" / "longmemeval-s"
+DEFAULT_MEMORY_TOOLS_RESULTS_DIR = (
+    REPO_ROOT / "benchmark-results" / "agent-memory" / "memory-tools-longmemeval-s"
+)
 DEFAULT_SINOMO_BIN = REPO_ROOT / "target" / "debug" / (
     "sinomo.exe" if os.name == "nt" else "sinomo"
+)
+DEFAULT_MEMORY_TOOLS_BIN = REPO_ROOT / "target" / "release" / (
+    "sinomo-memory-tools-bench.exe" if os.name == "nt" else "sinomo-memory-tools-bench"
 )
 OFFICIAL_DATASET_URL = (
     "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/"
@@ -66,7 +74,58 @@ OFFICIAL_DATASET_SHA256 = "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5
 OFFICIAL_DATASET_BYTES = 277_383_467
 LONGMEMEVAL_LICENSE = "MIT"
 RESULT_SCHEMA = "sinomo.benchmark.longmemeval-s.v1"
+MEMORY_TOOLS_INPUT_SCHEMA = "sinomo.benchmark.memory-tools-case.v1"
+MEMORY_TOOLS_OUTPUT_SCHEMA = "sinomo.benchmark.memory-tools-result.v1"
 TURN_MARKER = re.compile(r"<!-- sinomo-longmemeval-turn:(\d{6}) -->\s*$")
+QUERY_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_'’-]*")
+MEMORY_TOOL_QUERY_STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "has",
+    "how",
+    "into",
+    "its",
+    "not",
+    "the",
+    "was",
+    "were",
+    "who",
+    "why",
+    "will",
+    "you",
+    "about",
+    "after",
+    "also",
+    "been",
+    "before",
+    "being",
+    "could",
+    "does",
+    "from",
+    "have",
+    "just",
+    "more",
+    "most",
+    "should",
+    "that",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "with",
+    "would",
+    "your",
+}
 QUESTION_TYPES = {
     "single-session-user",
     "single-session-assistant",
@@ -425,6 +484,90 @@ def render_case_corpus(
     return mapping
 
 
+def memory_tool_queries(question: str, max_terms: int) -> list[str]:
+    """Build a deterministic literal-query policy for the explicit tools.
+
+    Both baseline tools expose bounded literal search rather than a ranked
+    natural-language query. The benchmark therefore issues distinct,
+    non-stopword question tokens and lets the driver fuse their result ranks.
+    This policy is recorded in every plan so it is not confused with learned
+    query generation.
+    """
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for match in QUERY_TOKEN.finditer(question):
+        token = match.group(0).lower().strip("_'’-")
+        if len(token) < 3 or token in MEMORY_TOOL_QUERY_STOPWORDS or token in seen:
+            continue
+        queries.append(token)
+        seen.add(token)
+        if len(queries) >= max_terms:
+            break
+    if queries:
+        return queries
+    fallback = flatten_turn_content(question).lower()[:256]
+    return [fallback] if fallback else ["memory"]
+
+
+def render_memory_tools_input(
+    case: LongMemEvalCase,
+    path: Path,
+    max_query_terms: int,
+    max_ranked_results: int,
+) -> list[str]:
+    queries = memory_tool_queries(case.question, max_query_terms)
+    payload = {
+        "schema": MEMORY_TOOLS_INPUT_SCHEMA,
+        "case_id": case.question_id,
+        "queries": queries,
+        "max_ranked_results": max_ranked_results,
+        "sessions": [
+            {
+                "session_id": session.session_id,
+                "date": session.date,
+                "turns": [
+                    {"role": turn.role, "content": turn.content}
+                    for turn in session.turns
+                ],
+            }
+            for session in case.sessions
+        ],
+    }
+    write_json(path, payload)
+    return queries
+
+
+def parse_memory_tools_result(stdout: object, case: LongMemEvalCase) -> dict[str, object]:
+    payload = (
+        dict(stdout)
+        if isinstance(stdout, Mapping)
+        else _json_object(stdout, "sinomo-memory-tools-bench")
+    )
+    if payload.get("schema") != MEMORY_TOOLS_OUTPUT_SCHEMA:
+        raise LongMemEvalExecutionError("memory-tools driver returned an unsupported schema")
+    if payload.get("case_id") != case.question_id:
+        raise LongMemEvalExecutionError("memory-tools driver returned the wrong question id")
+    rankings = payload.get("rankings")
+    if not isinstance(rankings, dict):
+        raise LongMemEvalExecutionError("memory-tools driver returned no rankings")
+    for ranking_name in ("combined", "session_history_search", "memory_search"):
+        ranking = rankings.get(ranking_name)
+        if not isinstance(ranking, dict):
+            raise LongMemEvalExecutionError(
+                f"memory-tools driver returned no {ranking_name} ranking"
+            )
+        for field in ("ranked_session_ids", "ranked_turn_ids"):
+            values = ranking.get(field)
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) for value in values
+            ):
+                raise LongMemEvalExecutionError(
+                    f"memory-tools driver returned an invalid {field} ranking"
+                )
+    return payload
+
+
 def _json_object(stdout: object, context: str) -> dict[str, object]:
     try:
         payload = json.loads(str(stdout))
@@ -631,38 +774,87 @@ def evaluate_case(
         path_to_session = render_case_corpus(case, isolated.corpus_dir)
         corpus_bytes = sum(path.stat().st_size for path in isolated.corpus_dir.iterdir())
 
-        root_started = time.perf_counter()
-        root_invocation = run_sinomo(
-            args, isolated, ["memory", "root", "add", str(isolated.corpus_dir)]
-        )
-        root_payload = _required_invocation(root_invocation, "memory root add")
-        root_seconds = time.perf_counter() - root_started
-        root_id = root_payload.get("root_id")
-        if not isinstance(root_id, str) or not root_id:
-            raise LongMemEvalExecutionError("memory root add JSON has no root_id")
+        source_rankings: object = None
+        source_stats: object = None
+        query_terms: object = None
+        if args.retriever == "indexed-files":
+            root_started = time.perf_counter()
+            root_invocation = run_sinomo(
+                args, isolated, ["memory", "root", "add", str(isolated.corpus_dir)]
+            )
+            root_payload = _required_invocation(root_invocation, "memory root add")
+            root_seconds = time.perf_counter() - root_started
+            root_id = root_payload.get("root_id")
+            if not isinstance(root_id, str) or not root_id:
+                raise LongMemEvalExecutionError("memory root add JSON has no root_id")
 
-        index_started = time.perf_counter()
-        index_invocation = run_sinomo(args, isolated, ["memory", "index", root_id])
-        index_payload = _required_invocation(index_invocation, "memory index")
-        index_seconds = time.perf_counter() - index_started
+            index_started = time.perf_counter()
+            index_invocation = run_sinomo(args, isolated, ["memory", "index", root_id])
+            index_payload = _required_invocation(index_invocation, "memory index")
+            index_seconds = time.perf_counter() - index_started
 
-        query_started = time.perf_counter()
-        query_invocation = run_sinomo(
-            args,
-            isolated,
-            [
-                "memory",
-                "query",
-                case.question,
-                "--max-records",
-                str(args.max_records),
-                "--max-bytes",
-                str(args.max_bytes),
-            ],
-        )
-        query_payload = _required_invocation(query_invocation, "memory query")
-        query_seconds = time.perf_counter() - query_started
-        ranked_sessions, ranked_turns = evidence_rankings(query_payload, path_to_session)
+            query_started = time.perf_counter()
+            query_invocation = run_sinomo(
+                args,
+                isolated,
+                [
+                    "memory",
+                    "query",
+                    case.question,
+                    "--max-records",
+                    str(args.max_records),
+                    "--max-bytes",
+                    str(args.max_bytes),
+                ],
+            )
+            query_payload = _required_invocation(query_invocation, "memory query")
+            query_seconds = time.perf_counter() - query_started
+            ranked_sessions, ranked_turns = evidence_rankings(query_payload, path_to_session)
+            evidence_count = (
+                len(query_payload.get("evidence", []))
+                if isinstance(query_payload.get("evidence"), list)
+                else 0
+            )
+        else:
+            case_input = isolated.workspace_dir / "memory-tools-case.json"
+            query_terms = render_memory_tools_input(
+                case, case_input, args.max_query_terms, args.max_records
+            )
+            driver_invocation = run_isolated_process(
+                [str(args.memory_tools_bin), "--input", str(case_input)],
+                isolated,
+                timeout_seconds=args.command_timeout_seconds,
+            )
+            driver_payload = parse_memory_tools_result(
+                _required_invocation(driver_invocation, "memory-tools retrieval"), case
+            )
+            rankings = driver_payload["rankings"]
+            combined = rankings["combined"]
+            ranked_sessions = list(combined["ranked_session_ids"])
+            ranked_turns = list(combined["ranked_turn_ids"])
+            source_rankings = rankings
+            source_stats = driver_payload.get("source_stats")
+            root_seconds = 0.0
+            index_seconds = float(driver_payload.get("seed_seconds", 0.0))
+            query_seconds = float(driver_payload.get("query_seconds", 0.0))
+            index_payload = {
+                "implementation": "explicit memory tools over in-memory VFS",
+                "seeded_sessions": driver_payload.get("seeded_sessions"),
+                "seeded_turns": driver_payload.get("seeded_turns"),
+                "seeded_memory_notes": driver_payload.get("seeded_memory_notes"),
+            }
+            query_payload = {
+                "coverage": None,
+                "trace": {
+                    "query_policy": "distinct non-stopword question tokens",
+                    "query_terms": query_terms,
+                },
+            }
+            evidence_count = sum(
+                int(stats.get("returned_matches", 0))
+                for stats in source_stats.values()
+                if isinstance(stats, dict)
+            ) if isinstance(source_stats, dict) else 0
 
         metrics: dict[str, object]
         if case.is_abstention:
@@ -746,14 +938,16 @@ def evaluate_case(
             "gold_session_count": len(case.answer_session_ids),
             "gold_turn_count": len(case.answer_turn_ids),
             "retrieval_results": {
+                "retriever": args.retriever,
                 "ranked_session_ids": ranked_sessions,
                 "ranked_turn_ids": ranked_turns,
                 "metrics": metrics,
                 "coverage": query_payload.get("coverage"),
                 "trace": query_payload.get("trace"),
-                "evidence_count": len(query_payload.get("evidence", []))
-                if isinstance(query_payload.get("evidence"), list)
-                else 0,
+                "evidence_count": evidence_count,
+                "source_rankings": source_rankings,
+                "source_stats": source_stats,
+                "query_terms": query_terms,
             },
             "performance": {
                 "corpus_bytes": corpus_bytes,
@@ -880,6 +1074,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
     return {
         "schema": RESULT_SCHEMA,
         "mode": args.mode,
+        "retriever": args.retriever,
         "dataset": {
             "name": "LongMemEval-S cleaned",
             "revision": OFFICIAL_DATASET_REVISION,
@@ -901,10 +1096,32 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         },
         "allows_unpinned_dataset": args.allow_unpinned_dataset,
         "retrieval": {
-            "implementation": "sinomo indexed-file memory CLI",
-            "granularity": "turn anchors with session source files",
+            "implementation": (
+                "sinomo indexed-file memory CLI"
+                if args.retriever == "indexed-files"
+                else "session_history_search plus memory_search over an in-memory VFS"
+            ),
+            "granularity": (
+                "turn anchors with session source files"
+                if args.retriever == "indexed-files"
+                else "one activity projection per turn plus one Markdown note per session"
+            ),
             "max_records": args.max_records,
-            "max_bytes": args.max_bytes,
+            "max_bytes": args.max_bytes if args.retriever == "indexed-files" else None,
+            "memory_tool_query_policy": (
+                None
+                if args.retriever == "indexed-files"
+                else {
+                    "kind": "distinct non-stopword question tokens",
+                    "max_terms": args.max_query_terms,
+                    "fusion": "query coverage, source coverage, then reciprocal rank fusion k=60",
+                }
+            ),
+            "storage_backend": (
+                "indexed source files"
+                if args.retriever == "indexed-files"
+                else "VfsHandle::memory with guarded versioned operations; no DFS or daemon"
+            ),
             "session_cutoffs": list(SESSION_CUTOFFS),
             "turn_cutoffs": list(TURN_CUTOFFS),
             "metrics": ["recall_any", "recall_all", "ndcg_any"],
@@ -914,11 +1131,15 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         "containment": {
             "fresh_data_dir_per_question": True,
             "fresh_home_xdg_tmp_workspace_per_question": True,
-            "copy_allowlist": [
-                "configs/lm/providers.json (selected account only, when --account is used)",
-                "configs/lm/credentials/<selected-provider>.json",
-                "providers/<selected-provider>/credentials.json (legacy fallback only)",
-            ],
+            "copy_allowlist": (
+                [
+                    "configs/lm/providers.json (selected account only, when --account is used)",
+                    "configs/lm/credentials/<selected-provider>.json",
+                    "providers/<selected-provider>/credentials.json (legacy fallback only)",
+                ]
+                if args.reader == "sinomo"
+                else []
+            ),
             "copies_cluster_dfs_permissions_events_sessions_memory": False,
             "inherits_sinomo_environment": False,
             "local_permissions_start_deny_all": True,
@@ -942,6 +1163,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
                 "--mode run",
                 "--dataset benchmark-results/datasets/longmemeval_s_cleaned.json",
                 "--reader none",
+                "--retriever",
+                args.retriever,
                 "--subset development",
             ]
         ),
@@ -962,6 +1185,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question-type", action="append", choices=sorted(QUESTION_TYPES), default=[])
     parser.add_argument("--subset", choices=sorted(BENCHMARK_SUBSETS))
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--retriever", choices=["indexed-files", "memory-tools"], default="indexed-files"
+    )
     parser.add_argument("--reader", choices=["none", "sinomo"], default="none")
     parser.add_argument("--provider", default="codex")
     parser.add_argument("--model", default="gpt-5.2-codex")
@@ -969,14 +1195,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sinomo-bin", type=Path, default=DEFAULT_SINOMO_BIN
     )
+    parser.add_argument(
+        "--memory-tools-bin", type=Path, default=DEFAULT_MEMORY_TOOLS_BIN
+    )
     parser.add_argument("--config-source-data-dir", type=Path)
     parser.add_argument("--scratch-root", type=Path)
     parser.add_argument("--pass-env", action="append", default=[])
     parser.add_argument("--max-records", type=int, default=50)
     parser.add_argument("--max-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--max-query-terms", type=int, default=8)
     parser.add_argument("--command-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--model-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--summary-out", type=Path)
     parser.add_argument("--retrieval-out", type=Path)
     parser.add_argument("--predictions-out", type=Path)
@@ -991,6 +1221,10 @@ def parse_args() -> argparse.Namespace:
         )
     if args.max_records <= 0 or args.max_bytes <= 0:
         parser.error("retrieval record and byte limits must be positive")
+    if args.max_query_terms <= 0:
+        parser.error("--max-query-terms must be positive")
+    if args.retriever == "memory-tools" and args.reader != "none":
+        parser.error("--reader sinomo currently requires --retriever indexed-files")
     if args.command_timeout_seconds <= 0 or args.model_timeout_seconds <= 0:
         parser.error("timeouts must be positive")
     try:
@@ -1000,6 +1234,13 @@ def parse_args() -> argparse.Namespace:
     if args.mode == "run" and args.dataset is None:
         parser.error("--dataset is required in run mode")
     args.sinomo_bin = args.sinomo_bin.expanduser().resolve(strict=False)
+    args.memory_tools_bin = args.memory_tools_bin.expanduser().resolve(strict=False)
+    if args.results_dir is None:
+        args.results_dir = (
+            DEFAULT_RESULTS_DIR
+            if args.retriever == "indexed-files"
+            else DEFAULT_MEMORY_TOOLS_RESULTS_DIR
+        )
     args.results_dir = args.results_dir.expanduser().resolve(strict=False)
     for attribute in (
         "summary_out",
@@ -1038,8 +1279,13 @@ def main() -> int:
     dataset = args.dataset.expanduser().resolve(strict=True)
     if not dataset.is_file():
         raise SystemExit(f"LongMemEval dataset is not a file: {dataset}")
-    if not args.sinomo_bin.is_file():
+    if args.retriever == "indexed-files" and not args.sinomo_bin.is_file():
         raise SystemExit(f"Sinomo binary does not exist; build it first: {args.sinomo_bin}")
+    if args.retriever == "memory-tools" and not args.memory_tools_bin.is_file():
+        raise SystemExit(
+            "memory-tools driver does not exist; build it first: "
+            f"{args.memory_tools_bin}"
+        )
     dataset_bytes = dataset.stat().st_size
     dataset_sha256 = file_sha256(dataset)
     dataset_matches_official = (
@@ -1073,7 +1319,12 @@ def main() -> int:
     results: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
     started_at = utc_now()
-    progress.emit("run-start", dataset_sha256=dataset_sha256, reader=args.reader)
+    progress.emit(
+        "run-start",
+        dataset_sha256=dataset_sha256,
+        reader=args.reader,
+        retriever=args.retriever,
+    )
     try:
         selected = iter_selected_cases(
             dataset,
@@ -1116,8 +1367,16 @@ def main() -> int:
         "started_at": started_at,
         "completed_at": utc_now(),
         "repo_git_revision": git_revision(),
-        "sinomo_binary": str(args.sinomo_bin),
-        "sinomo_binary_sha256": file_sha256(args.sinomo_bin),
+        "sinomo_binary": str(args.sinomo_bin) if args.retriever == "indexed-files" else None,
+        "sinomo_binary_sha256": (
+            file_sha256(args.sinomo_bin) if args.retriever == "indexed-files" else None
+        ),
+        "memory_tools_binary": (
+            str(args.memory_tools_bin) if args.retriever == "memory-tools" else None
+        ),
+        "memory_tools_binary_sha256": (
+            file_sha256(args.memory_tools_bin) if args.retriever == "memory-tools" else None
+        ),
         "dataset_path": str(dataset),
         "dataset_bytes": dataset_bytes,
         "dataset_sha256": dataset_sha256,

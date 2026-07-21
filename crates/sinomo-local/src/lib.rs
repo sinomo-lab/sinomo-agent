@@ -84,10 +84,6 @@ impl SinomoDataDir {
         self.root.join("files")
     }
 
-    pub fn dfs_expose_config_file(&self) -> PathBuf {
-        self.shared_configs_dir().join("dfs").join("expose.json")
-    }
-
     pub fn cluster_endpoint_config_file(&self) -> PathBuf {
         self.shared_configs_dir()
             .join("cluster")
@@ -214,19 +210,6 @@ mod tests {
                 .join("providers")
                 .join("github-copilot")
                 .join("credentials.json")
-        );
-    }
-
-    #[test]
-    fn dfs_expose_config_lives_under_shared_configs_dir() {
-        let data = SinomoDataDir::new("root");
-
-        assert_eq!(
-            data.dfs_expose_config_file(),
-            PathBuf::from("root")
-                .join("configs")
-                .join("dfs")
-                .join("expose.json")
         );
     }
 }

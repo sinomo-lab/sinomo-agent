@@ -7,10 +7,13 @@ use sinomo_runtime::build::{
     BuildTargetCapability, NativeModuleSelection, build_content_hash,
     discover_native_dylib_outputs, rank_build_candidates,
 };
+use sinomo_runtime::cli_registry::{
+    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec, CliParseError,
+    CliPositionalSpec, CliValueSpec,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum RolloutCliCommand {
-    Help,
     InitSource(RolloutOptions),
     ImportSource(RolloutOptions),
     ExportSource(RolloutOptions),
@@ -138,149 +141,365 @@ impl RolloutTarget {
     }
 }
 
-pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(RolloutCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(RolloutCliCommand::Help)
-        }
-        Some((command, rest)) if command == "init-source" => Ok(RolloutCliCommand::InitSource(
-            parse_rollout_options_without_native_module_skip(rest, "rollout init-source")?,
-        )),
-        Some((command, rest))
-            if matches!(command.as_str(), "import-source" | "sync-from-external") =>
-        {
-            Ok(RolloutCliCommand::ImportSource(
-                parse_rollout_options_without_native_module_skip(rest, "rollout import-source")?,
-            ))
-        }
-        Some((command, rest))
-            if matches!(command.as_str(), "export-source" | "sync-to-external") =>
-        {
-            Ok(RolloutCliCommand::ExportSource(
-                parse_rollout_options_without_native_module_skip(rest, "rollout export-source")?,
-            ))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "apply-external" | "from-external") => {
-            Ok(RolloutCliCommand::ApplyExternal(
-                parse_rollout_options_without_native_module_skip(rest, "rollout apply-external")?,
-            ))
-        }
-        Some((command, rest)) if command == "apply" => Ok(RolloutCliCommand::Apply(
-            parse_rollout_options_without_native_module_skip(rest, "rollout apply")?,
-        )),
-        Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => Ok(
-            RolloutCliCommand::Cluster(parse_rollout_cluster_options(rest)?),
+pub(crate) fn rollout_cli_command_handler() -> DeclarativeCommandHandler<RolloutCliCommand> {
+    DeclarativeCommandHandler::new(
+        "rollout",
+        CliCommandPolicy::default(),
+        rollout_cli_spec,
+        parse_rollout_matches,
+        run_rollout_cli_command,
+    )
+}
+
+fn rollout_cli_spec() -> CliCommandSpec {
+    let option = |name: &'static str, help: &'static str, value: &'static str| {
+        CliOptionSpec::value(name, help, CliValueSpec::new(value, help))
+    };
+    let source_options = || {
+        [
+            option("--repo", "source repository", "path"),
+            CliOptionSpec::flag("--force-source", "allow managed source overwrite")
+                .with_aliases(["--force-overwrite"]),
+        ]
+    };
+    let endpoint_options = || {
+        [
+            option("--host", "local daemon host", "host"),
+            option("--port", "local daemon port", "port"),
+            option("--shadow-port", "shadow daemon port", "port"),
+        ]
+    };
+    let mut apply_options = source_options().to_vec();
+    apply_options.extend(endpoint_options());
+    let mut cluster_options = apply_options.clone();
+    cluster_options.extend([
+        option("--binary", "prebuilt binary path", "path"),
+        option("--target", "explicit rollout target", "host:port").repeatable(),
+        CliOptionSpec::flag("--remote-build", "build on a remote target"),
+        option("--remote-repo", "remote source repository", "path"),
+        CliOptionSpec::flag("--skip-local", "exclude the local node"),
+        CliOptionSpec::flag(
+            "--skip-native-modules",
+            "push only the main binary during bootstrap",
         ),
-        Some((command, rest)) if command == "module" => parse_rollout_module_command(rest),
-        Some((command, rest)) if command == "advance" => Ok(RolloutCliCommand::Advance(
-            parse_rollout_advance_options(rest)?,
-        )),
-        Some((command, rest))
-            if matches!(command.as_str(), "telemetry-gates" | "telemetry-gate") =>
-        {
-            parse_rollout_telemetry_gates_command(rest)
-        }
-        Some((command, rest)) if matches!(command.as_str(), "diagnostics" | "diag") => {
-            Ok(RolloutCliCommand::Diagnostics(
-                parse_rollout_options_without_native_module_skip(rest, "rollout diagnostics")?,
-            ))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "clear-status" | "clear-state") => {
-            Ok(RolloutCliCommand::ClearStatus(
-                parse_rollout_options_without_native_module_skip(rest, "rollout clear-status")?,
-            ))
-        }
-        Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
-        _ => Err(CliError::Usage),
-    }
+    ]);
+    let mut module_options = endpoint_options().to_vec();
+    module_options.extend([
+        option("--repo", "source repository", "path"),
+        option("--target", "explicit rollout target", "host:port").repeatable(),
+        option("--module", "native module selector", "module"),
+        CliOptionSpec::flag("--skip-local", "exclude the local node"),
+    ]);
+    CliCommandSpec::new("rollout", "manage source, binary, and module rollout")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("init-source", "initialize the managed source repository")
+                .with_options(source_options()),
+            CliCommandSpec::new("import-source", "merge external source into managed source")
+                .with_aliases(["sync-from-external"])
+                .with_options(source_options()),
+            CliCommandSpec::new(
+                "export-source",
+                "merge managed source into an external repo",
+            )
+            .with_aliases(["sync-to-external"])
+            .with_options([option("--repo", "external repository", "path")]),
+            CliCommandSpec::new(
+                "apply-external",
+                "import external source and apply it locally",
+            )
+            .with_aliases(["from-external"])
+            .with_options(apply_options.clone()),
+            CliCommandSpec::new("apply", "build and stage managed source locally")
+                .with_options(apply_options),
+            CliCommandSpec::new("cluster", "roll out to cluster targets")
+                .with_aliases(["apply-cluster"])
+                .with_options(cluster_options),
+            CliCommandSpec::new("module", "roll out native modules").with_children([
+                CliCommandSpec::new("native-dylib", "roll out one native dynamic module")
+                    .with_options(module_options)
+                    .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                        "module",
+                        "native module selector",
+                    ))]),
+            ]),
+            CliCommandSpec::new("advance", "advance candidate rollout state").with_options([
+                option("--node", "candidate node id", "node-id").with_aliases(["--node-id"]),
+                option("--scorecard", "evaluation scorecard", "path"),
+                option("--module-replay-report", "module replay report", "path"),
+                CliOptionSpec::flag("--shadow-telemetry", "ingest default shadow telemetry"),
+                option(
+                    "--shadow-telemetry-limit",
+                    "shadow telemetry event limit",
+                    "count",
+                ),
+                option("--incident", "incident event id", "event-id")
+                    .with_aliases(["--incident-event"])
+                    .repeatable(),
+                option("--user-corrections", "user correction count", "count")
+                    .with_aliases(["--user-correction-count"]),
+                option("--rollback-trigger", "rollback trigger", "trigger").repeatable(),
+                option("--evidence", "evidence reference", "reference").repeatable(),
+            ]),
+            CliCommandSpec::new("telemetry-gates", "inspect or update promotion gates")
+                .with_aliases(["telemetry-gate"])
+                .with_children([
+                    CliCommandSpec::new("show", "show telemetry promotion gates"),
+                    CliCommandSpec::new("set", "update telemetry promotion gates").with_options([
+                        CliOptionSpec::flag(
+                            "--enable-auto-promotion",
+                            "enable automatic promotion",
+                        ),
+                        CliOptionSpec::flag(
+                            "--disable-auto-promotion",
+                            "disable automatic promotion",
+                        ),
+                        option("--event-limit", "telemetry event limit", "count"),
+                        option("--min-events", "minimum event count", "count")
+                            .with_aliases(["--minimum-event-count"]),
+                        option(
+                            "--max-auto-weight-bps",
+                            "maximum automatic weight",
+                            "bps|unlimited",
+                        ),
+                        option(
+                            "--max-candidate-latency-p95-ms",
+                            "maximum candidate p95 latency",
+                            "milliseconds|unlimited",
+                        ),
+                    ]),
+                ]),
+            CliCommandSpec::new("diagnostics", "fetch rollout diagnostics")
+                .with_aliases(["diag"])
+                .with_options([option("--target", "rollout target", "host:port").repeatable()]),
+            CliCommandSpec::new("clear-status", "clear stale rollout status")
+                .with_aliases(["clear-state"])
+                .with_options([option("--target", "rollout target", "host:port").repeatable()]),
+            CliCommandSpec::new("status", "show rollout paths and state"),
+        ])
 }
 
-fn parse_rollout_module_command(args: &[String]) -> Result<RolloutCliCommand, CliError> {
-    match args.split_first() {
-        Some((kind, rest)) if kind == "native-dylib" => Ok(RolloutCliCommand::ModuleNativeDylib(
-            parse_rollout_module_native_dylib_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
-}
-
-pub(crate) fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, CliError> {
+fn rollout_options_from_matches(
+    matches: &CliCommandMatches,
+) -> Result<RolloutOptions, CliParseError> {
     let mut options = RolloutOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--repo" => {
-                index += 1;
-                let Some(repo) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.repo = Some(PathBuf::from(repo));
-            }
-            "--binary" => {
-                index += 1;
-                let Some(binary) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.binary = Some(PathBuf::from(binary));
-            }
-            "--remote-repo" => {
-                index += 1;
-                let Some(repo) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.remote_repo = Some(PathBuf::from(repo));
-            }
-            "--target" => {
-                index += 1;
-                let Some(target) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.targets.push(non_empty_address(target)?);
-            }
-            "--host" => {
-                index += 1;
-                let Some(host) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.host = host.clone();
-            }
-            "--port" => {
-                index += 1;
-                let Some(port) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.port = port.parse::<u16>().map_err(|source| CliError::Parse {
-                    detail: format!("invalid rollout daemon port `{port}`: {source}"),
-                })?;
-            }
-            "--shadow-port" => {
-                index += 1;
-                let Some(port) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.shadow_port = port.parse::<u16>().map_err(|source| CliError::Parse {
-                    detail: format!("invalid rollout shadow daemon port `{port}`: {source}"),
-                })?;
-            }
-            "--skip-local" => options.skip_local = true,
-            "--remote-build" => options.remote_build = true,
-            "--skip-native-modules" => options.skip_native_modules = true,
-            "--force-source" | "--force-overwrite" => options.force_source_overwrite = true,
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
+    options.repo = matches.value("--repo").map(PathBuf::from);
+    options.binary = matches.value("--binary").map(PathBuf::from);
+    options.remote_repo = matches.value("--remote-repo").map(PathBuf::from);
+    options.targets = matches
+        .values("--target")
+        .map(|value| non_empty_address(value).map_err(semantic_parse_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(host) = matches.value("--host") {
+        options.host = host.to_string();
     }
+    options.port = matches
+        .value("--port")
+        .map(|value| {
+            value.parse::<u16>().map_err(|source| CliParseError::Parse {
+                detail: format!("invalid rollout daemon port `{value}`: {source}"),
+            })
+        })
+        .transpose()?
+        .unwrap_or(options.port);
+    options.shadow_port = matches
+        .value("--shadow-port")
+        .map(|value| {
+            value.parse::<u16>().map_err(|source| CliParseError::Parse {
+                detail: format!("invalid rollout shadow daemon port `{value}`: {source}"),
+            })
+        })
+        .transpose()?
+        .unwrap_or(options.shadow_port);
+    options.skip_local = matches.contains("--skip-local");
+    options.remote_build = matches.contains("--remote-build");
+    options.skip_native_modules = matches.contains("--skip-native-modules");
+    options.force_source_overwrite = matches.contains("--force-source");
     Ok(options)
 }
 
-fn parse_rollout_options_without_native_module_skip(
+fn parse_rollout_matches(matches: &CliCommandMatches) -> Result<RolloutCliCommand, CliParseError> {
+    let path = matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match path.as_slice() {
+        ["rollout", "init-source"] => {
+            rollout_options_from_matches(matches).map(RolloutCliCommand::InitSource)
+        }
+        ["rollout", "import-source"] => {
+            rollout_options_from_matches(matches).map(RolloutCliCommand::ImportSource)
+        }
+        ["rollout", "export-source"] => {
+            rollout_options_from_matches(matches).map(RolloutCliCommand::ExportSource)
+        }
+        ["rollout", "apply-external"] => {
+            rollout_options_from_matches(matches).map(RolloutCliCommand::ApplyExternal)
+        }
+        ["rollout", "apply"] => rollout_options_from_matches(matches).map(RolloutCliCommand::Apply),
+        ["rollout", "cluster"] => {
+            let options = rollout_options_from_matches(matches)?;
+            validate_cluster_native_module_skip(&options).map_err(semantic_parse_error)?;
+            Ok(RolloutCliCommand::Cluster(options))
+        }
+        ["rollout", "module", "native-dylib"] => {
+            let module_selector = matches
+                .value("--module")
+                .or_else(|| matches.positionals().first().map(String::as_str))
+                .ok_or_else(|| CliParseError::Parse {
+                    detail: "rollout module native-dylib requires a module selector".to_string(),
+                })?;
+            Ok(RolloutCliCommand::ModuleNativeDylib(
+                RolloutModuleNativeDylibOptions {
+                    module_selector: non_empty_rollout_module_selector(module_selector)
+                        .map_err(semantic_parse_error)?,
+                    rollout: rollout_options_from_matches(matches)?,
+                },
+            ))
+        }
+        ["rollout", "advance"] => {
+            parse_rollout_advance_matches(matches).map(RolloutCliCommand::Advance)
+        }
+        ["rollout", "telemetry-gates"] | ["rollout", "telemetry-gates", "show"] => {
+            Ok(RolloutCliCommand::TelemetryGatesShow)
+        }
+        ["rollout", "telemetry-gates", "set"] => {
+            parse_rollout_telemetry_gate_matches(matches).map(RolloutCliCommand::TelemetryGatesSet)
+        }
+        ["rollout", "diagnostics"] => {
+            rollout_options_from_matches(matches).map(RolloutCliCommand::Diagnostics)
+        }
+        ["rollout", "clear-status"] => {
+            rollout_options_from_matches(matches).map(RolloutCliCommand::ClearStatus)
+        }
+        ["rollout", "status"] => Ok(RolloutCliCommand::Status),
+        _ => Err(CliParseError::Parse {
+            detail: "rollout requires a subcommand".to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parse_rollout_schema_for_test(
     args: &[String],
-    command: &str,
-) -> Result<RolloutOptions, CliError> {
-    let options = parse_rollout_options(args)?;
-    reject_native_module_skip(&options, command)?;
-    Ok(options)
+) -> Result<RolloutCliCommand, CliError> {
+    parse_schema_command_for_test(rollout_cli_spec(), args, parse_rollout_matches)
+}
+
+fn parse_rollout_advance_matches(
+    matches: &CliCommandMatches,
+) -> Result<RolloutAdvanceOptions, CliParseError> {
+    let shadow_telemetry_limit = if let Some(value) = matches.value("--shadow-telemetry-limit") {
+        let value = value
+            .parse::<usize>()
+            .map_err(|source| CliParseError::Parse {
+                detail: format!("invalid rollout shadow telemetry limit `{value}`: {source}"),
+            })?;
+        if value == 0 {
+            return Err(CliParseError::Parse {
+                detail: "rollout shadow telemetry limit must be non-zero".to_string(),
+            });
+        }
+        Some(value)
+    } else if matches.contains("--shadow-telemetry") {
+        Some(DEFAULT_SHADOW_TELEMETRY_LIMIT)
+    } else {
+        None
+    };
+    Ok(RolloutAdvanceOptions {
+        node_id: matches
+            .value("--node")
+            .map(parse_rollout_node_id)
+            .transpose()
+            .map_err(semantic_parse_error)?,
+        scorecard: matches.value("--scorecard").map(PathBuf::from),
+        module_replay_report: matches.value("--module-replay-report").map(PathBuf::from),
+        shadow_telemetry_limit,
+        incident_event_ids: matches
+            .values("--incident")
+            .map(|value| parse_rollout_event_id(value).map_err(semantic_parse_error))
+            .collect::<Result<Vec<_>, _>>()?,
+        user_correction_count: matches
+            .value("--user-corrections")
+            .map(|value| {
+                value.parse::<u32>().map_err(|source| CliParseError::Parse {
+                    detail: format!("invalid user correction count `{value}`: {source}"),
+                })
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        rollback_triggers: matches
+            .values("--rollback-trigger")
+            .map(|value| parse_rollout_rollback_trigger(value).map_err(semantic_parse_error))
+            .collect::<Result<Vec<_>, _>>()?,
+        evidence_refs: matches
+            .values("--evidence")
+            .map(|value| {
+                if value.trim().is_empty() {
+                    Err(CliParseError::Parse {
+                        detail: "rollout evidence reference cannot be empty".to_string(),
+                    })
+                } else {
+                    Ok(value.to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_rollout_telemetry_gate_matches(
+    matches: &CliCommandMatches,
+) -> Result<RolloutTelemetryGateSetOptions, CliParseError> {
+    if matches.contains("--enable-auto-promotion") && matches.contains("--disable-auto-promotion") {
+        return Err(CliParseError::Parse {
+            detail: "telemetry gates cannot enable and disable auto-promotion together".to_string(),
+        });
+    }
+    Ok(RolloutTelemetryGateSetOptions {
+        automatic_promotion_enabled: if matches.contains("--enable-auto-promotion") {
+            Some(true)
+        } else if matches.contains("--disable-auto-promotion") {
+            Some(false)
+        } else {
+            None
+        },
+        event_limit: matches
+            .value("--event-limit")
+            .map(|value| parse_nonzero_usize("rollout telemetry event limit", value))
+            .transpose()
+            .map_err(semantic_parse_error)?,
+        minimum_event_count: matches
+            .value("--min-events")
+            .map(|value| {
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|source| CliParseError::Parse {
+                        detail: format!(
+                            "invalid rollout telemetry minimum event count `{value}`: {source}"
+                        ),
+                    })?;
+                if parsed == 0 {
+                    Err(CliParseError::Parse {
+                        detail: "rollout telemetry minimum event count must be non-zero"
+                            .to_string(),
+                    })
+                } else {
+                    Ok(parsed)
+                }
+            })
+            .transpose()?,
+        maximum_automatic_weight_bps: matches
+            .value("--max-auto-weight-bps")
+            .map(parse_optional_bps)
+            .transpose()
+            .map_err(semantic_parse_error)?,
+        maximum_candidate_latency_p95_ms: matches
+            .value("--max-candidate-latency-p95-ms")
+            .map(|value| parse_optional_u64("candidate latency p95", value))
+            .transpose()
+            .map_err(semantic_parse_error)?,
+    })
 }
 
 fn reject_native_module_skip(options: &RolloutOptions, command: &str) -> Result<(), CliError> {
@@ -292,12 +511,6 @@ fn reject_native_module_skip(options: &RolloutOptions, command: &str) -> Result<
         });
     }
     Ok(())
-}
-
-fn parse_rollout_cluster_options(args: &[String]) -> Result<RolloutOptions, CliError> {
-    let options = parse_rollout_options(args)?;
-    validate_cluster_native_module_skip(&options)?;
-    Ok(options)
 }
 
 fn validate_cluster_native_module_skip(options: &RolloutOptions) -> Result<(), CliError> {
@@ -319,78 +532,6 @@ fn validate_cluster_native_module_skip(options: &RolloutOptions) -> Result<(), C
     Ok(())
 }
 
-fn parse_rollout_module_native_dylib_options(
-    args: &[String],
-) -> Result<RolloutModuleNativeDylibOptions, CliError> {
-    let mut rollout_args = Vec::new();
-    let mut selector = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--module" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                if selector
-                    .replace(non_empty_rollout_module_selector(value)?)
-                    .is_some()
-                {
-                    return Err(CliError::Usage);
-                }
-            }
-            value if value.starts_with('-') => {
-                rollout_args.push(args[index].clone());
-                if matches!(
-                    value,
-                    "--repo"
-                        | "--binary"
-                        | "--remote-repo"
-                        | "--target"
-                        | "--host"
-                        | "--port"
-                        | "--shadow-port"
-                ) {
-                    index += 1;
-                    let Some(next) = args.get(index) else {
-                        return Err(CliError::Usage);
-                    };
-                    rollout_args.push(next.clone());
-                }
-            }
-            value => {
-                if selector
-                    .replace(non_empty_rollout_module_selector(value)?)
-                    .is_some()
-                {
-                    return Err(CliError::Usage);
-                }
-            }
-        }
-        index += 1;
-    }
-    let Some(module_selector) = selector else {
-        return Err(CliError::Usage);
-    };
-    let rollout = parse_rollout_options(&rollout_args)?;
-    if rollout.binary.is_some()
-        || rollout.remote_build
-        || rollout.remote_repo.is_some()
-        || rollout.skip_native_modules
-        || rollout.force_source_overwrite
-    {
-        return Err(CliError::Parse {
-            detail:
-                "module native-dylib rollout supports --repo, --target, --host, --port, --shadow-port, and --skip-local; --skip-native-modules is only for cluster binary-push rollouts"
-                    .to_string(),
-        });
-    }
-    Ok(RolloutModuleNativeDylibOptions {
-        module_selector,
-        rollout,
-    })
-}
-
 fn non_empty_rollout_module_selector(value: &str) -> Result<String, CliError> {
     let value = value.trim();
     if value.is_empty() {
@@ -399,175 +540,6 @@ fn non_empty_rollout_module_selector(value: &str) -> Result<String, CliError> {
         });
     }
     Ok(value.to_string())
-}
-
-pub(crate) fn parse_rollout_advance_options(
-    args: &[String],
-) -> Result<RolloutAdvanceOptions, CliError> {
-    let mut options = RolloutAdvanceOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--node" | "--node-id" => {
-                index += 1;
-                let Some(node_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.node_id = Some(parse_rollout_node_id(node_id)?);
-            }
-            "--scorecard" => {
-                index += 1;
-                let Some(scorecard) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.scorecard = Some(PathBuf::from(scorecard));
-            }
-            "--module-replay-report" => {
-                index += 1;
-                let Some(report) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.module_replay_report = Some(PathBuf::from(report));
-            }
-            "--shadow-telemetry" => {
-                options
-                    .shadow_telemetry_limit
-                    .get_or_insert(DEFAULT_SHADOW_TELEMETRY_LIMIT);
-            }
-            "--shadow-telemetry-limit" => {
-                index += 1;
-                let Some(limit) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                let limit = limit.parse::<usize>().map_err(|source| CliError::Parse {
-                    detail: format!("invalid rollout shadow telemetry limit `{limit}`: {source}"),
-                })?;
-                if limit == 0 {
-                    return Err(CliError::Parse {
-                        detail: "rollout shadow telemetry limit must be non-zero".to_string(),
-                    });
-                }
-                options.shadow_telemetry_limit = Some(limit);
-            }
-            "--incident" | "--incident-event" => {
-                index += 1;
-                let Some(event_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options
-                    .incident_event_ids
-                    .push(parse_rollout_event_id(event_id)?);
-            }
-            "--user-corrections" | "--user-correction-count" => {
-                index += 1;
-                let Some(count) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.user_correction_count =
-                    count.parse::<u32>().map_err(|source| CliError::Parse {
-                        detail: format!("invalid user correction count `{count}`: {source}"),
-                    })?;
-            }
-            "--rollback-trigger" => {
-                index += 1;
-                let Some(trigger) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options
-                    .rollback_triggers
-                    .push(parse_rollout_rollback_trigger(trigger)?);
-            }
-            "--evidence" => {
-                index += 1;
-                let Some(reference) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                if reference.trim().is_empty() {
-                    return Err(CliError::Parse {
-                        detail: "rollout evidence reference cannot be empty".to_string(),
-                    });
-                }
-                options.evidence_refs.push(reference.clone());
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-pub(crate) fn parse_rollout_telemetry_gates_command(
-    args: &[String],
-) -> Result<RolloutCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(RolloutCliCommand::TelemetryGatesShow),
-        Some((command, [])) if command == "show" => Ok(RolloutCliCommand::TelemetryGatesShow),
-        Some((command, rest)) if command == "set" => Ok(RolloutCliCommand::TelemetryGatesSet(
-            parse_rollout_telemetry_gate_set_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
-}
-
-pub(crate) fn parse_rollout_telemetry_gate_set_options(
-    args: &[String],
-) -> Result<RolloutTelemetryGateSetOptions, CliError> {
-    let mut options = RolloutTelemetryGateSetOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--enable-auto-promotion" => {
-                options.automatic_promotion_enabled = Some(true);
-            }
-            "--disable-auto-promotion" => {
-                options.automatic_promotion_enabled = Some(false);
-            }
-            "--event-limit" => {
-                index += 1;
-                let Some(limit) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                let limit = parse_nonzero_usize("rollout telemetry event limit", limit)?;
-                options.event_limit = Some(limit);
-            }
-            "--min-events" | "--minimum-event-count" => {
-                index += 1;
-                let Some(count) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                let count = count.parse::<u64>().map_err(|source| CliError::Parse {
-                    detail: format!(
-                        "invalid rollout telemetry minimum event count `{count}`: {source}"
-                    ),
-                })?;
-                if count == 0 {
-                    return Err(CliError::Parse {
-                        detail: "rollout telemetry minimum event count must be non-zero"
-                            .to_string(),
-                    });
-                }
-                options.minimum_event_count = Some(count);
-            }
-            "--max-auto-weight-bps" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.maximum_automatic_weight_bps = Some(parse_optional_bps(value)?);
-            }
-            "--max-candidate-latency-p95-ms" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.maximum_candidate_latency_p95_ms =
-                    Some(parse_optional_u64("candidate latency p95", value)?);
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
 }
 
 fn parse_nonzero_usize(label: &str, value: &str) -> Result<usize, CliError> {
@@ -645,10 +617,6 @@ fn parse_rollout_rollback_trigger(value: &str) -> Result<RollbackTrigger, CliErr
 
 pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), CliError> {
     match command {
-        RolloutCliCommand::Help => {
-            print_rollout_help();
-            Ok(())
-        }
         RolloutCliCommand::InitSource(options) => rollout_init_source(options),
         RolloutCliCommand::ImportSource(options) => rollout_import_source(options),
         RolloutCliCommand::ExportSource(options) => rollout_export_source(options),

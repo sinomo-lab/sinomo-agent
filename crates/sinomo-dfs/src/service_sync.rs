@@ -3773,6 +3773,7 @@ mod tests {
                 path: fixture.object.path.clone(),
                 expected_object_id: Some(fixture.object.object_id.clone()),
             }],
+            content_receipts: Vec::new(),
             transaction: crate::DfsNamespaceTransaction {
                 transaction_id: "transaction:must-not-append-after-fence".to_string(),
                 file_system_id: moved.file_system_id.clone(),

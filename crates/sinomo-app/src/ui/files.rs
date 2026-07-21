@@ -33,21 +33,21 @@ use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
     CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView, Constraints,
-    ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase,
-    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState,
-    Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, NumberInput, Observable,
-    PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment,
-    RadioButton, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size,
-    SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
-    SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, ToggleState,
-    Tooltip, TooltipPlacement, TrailingSlotRow, VirtualCollectionModel, VirtualList,
-    VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
-    VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
-    paint_placement_badge_with, paint_text_cell,
+    ContextMenu, ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx,
+    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState,
+    Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, MenuItem, NumberInput,
+    Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Point, PointerButton,
+    PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect, RichText,
+    ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion,
+    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator,
+    SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack, StackHostOptions, StatusBadge,
+    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint,
+    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow,
+    VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable,
+    VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
+    VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, paint_checkbox_indicator,
+    paint_leading_label_cell, paint_placement_badge_with, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -75,9 +75,16 @@ use crate::ui::settings::SettingsSection;
 use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
 
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
-const WIDE_THRESHOLD: f32 = 640.0;
+/// The wide branch reserves enough room for Places, the inspector, and the compact file table so
+/// the Placement column never disappears behind horizontal overflow.
+const WIDE_THRESHOLD: f32 = 880.0;
+#[cfg(test)]
 const INSPECTOR_W: f32 = 340.0;
 const ROW_THUMBNAIL_SIDE: f32 = 20.0;
+/// At narrower list widths Details yields to Placement, which is required for every file row.
+const COMPLETE_FILE_TABLE_MIN_W: f32 = 560.0;
+const COMPACT_FILE_NAME_MIN_W: f32 = 120.0;
+const COMPACT_FILE_PLACEMENT_W: f32 = 144.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 44.0;
 const HEADER_COMMAND_GAP: f32 = 4.0;
@@ -90,7 +97,11 @@ const FILES_TASK_BADGE_W: f32 = 210.0;
 const FILES_TASK_POPOVER_W: f32 = 420.0;
 const FILES_TASK_ROW_H: f32 = 44.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
-const PLACES_W: f32 = 208.0;
+const PLACES_SIDEBAR_INITIAL_RATIO: f32 = 0.24;
+const PLACES_SIDEBAR_MIN_W: f32 = 168.0;
+const FILE_LIST_MIN_W: f32 = 360.0;
+const INSPECTOR_SIDEBAR_INITIAL_RATIO: f32 = 0.28;
+const INSPECTOR_SIDEBAR_MIN_W: f32 = 280.0;
 const PLACE_ROW_H: f32 = 46.0;
 const PLACES_HEADER_H: f32 = 42.0;
 const PLACE_SECTION_HEADER_H: f32 = 28.0;
@@ -1062,6 +1073,10 @@ pub struct FilesState {
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
     pub scroll: f32,
+    /// Retained first-pane ratio for the desktop Locations splitter.
+    places_sidebar_ratio: f32,
+    /// Retained second-pane ratio for the desktop Inspector splitter.
+    inspector_sidebar_ratio: f32,
     pub inspector_details_open: bool,
     compact_overlay: Option<CompactFilesOverlay>,
     worker_tx: Option<Sender<FilesWorkerCommand>>,
@@ -1499,6 +1514,8 @@ impl FilesState {
             tasks: Vec::new(),
             pending_select_path: None,
             scroll: 0.0,
+            places_sidebar_ratio: PLACES_SIDEBAR_INITIAL_RATIO,
+            inspector_sidebar_ratio: INSPECTOR_SIDEBAR_INITIAL_RATIO,
             inspector_details_open: false,
             compact_overlay: None,
             worker_tx: None,
@@ -1551,6 +1568,14 @@ impl FilesState {
             placement_activity_in_flight_generation: Arc::new(AtomicU64::new(0)),
             placement_activity_refresh_dirty: false,
         }
+    }
+
+    fn set_places_sidebar_ratio(&mut self, ratio: f32) {
+        self.places_sidebar_ratio = ratio.clamp(0.0, 1.0);
+    }
+
+    fn set_inspector_sidebar_ratio(&mut self, ratio: f32) {
+        self.inspector_sidebar_ratio = ratio.clamp(0.0, 1.0);
     }
 
     pub(crate) fn connection_attention_detail(&self) -> Option<String> {
@@ -3657,6 +3682,19 @@ impl FilesState {
             self.request_selected_details();
         }
         changed
+    }
+
+    /// Select the row targeted by a context click. A click outside the marked set starts a new
+    /// single-item context, while clicking a marked row preserves the batch operation target.
+    fn select_context_entry(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        let cleared_marks = !self.entry_marked(index) && !self.marked_entries.is_empty();
+        if cleared_marks {
+            self.clear_marked_entries();
+        }
+        self.select_entry(index) || cleared_marks
     }
 
     fn open_action_prompt(&mut self, kind: FileActionPromptKind) {
@@ -8874,11 +8912,7 @@ struct FileRowPlacementBadge {
     replicas: Option<(usize, usize)>,
 }
 
-fn file_row_placement_badge(
-    entry: &SifsEntry,
-    files: &FilesState,
-    row_index: usize,
-) -> FileRowPlacementBadge {
+fn file_row_placement_badge(entry: &SifsEntry, files: &FilesState) -> FileRowPlacementBadge {
     if files.source == FilesSourceKind::Local {
         return FileRowPlacementBadge {
             label: "this device".to_string(),
@@ -8886,28 +8920,6 @@ fn file_row_placement_badge(
             icon: IconGlyph::Storage,
             replicas: None,
         };
-    }
-
-    let active = files.selected == Some(row_index);
-    if active && files.details_loading {
-        return FileRowPlacementBadge {
-            label: "syncing".to_string(),
-            tone: SemanticTone::Accent,
-            icon: IconGlyph::Redo,
-            replicas: None,
-        };
-    }
-    if active && files.details_error.is_some() {
-        return FileRowPlacementBadge {
-            label: "failed".to_string(),
-            tone: SemanticTone::Danger,
-            icon: IconGlyph::Alert,
-            replicas: None,
-        };
-    }
-
-    if active && let Some(details) = files.selected_details.as_ref() {
-        return sifs_details_placement_badge(details);
     }
 
     if let Some(metadata) = files.entry_metadata.get(&entry.path) {
@@ -8941,6 +8953,51 @@ fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementB
     }
 
     let count = metadata.current_locations.len();
+    if metadata.policy.starts_with("replicated")
+        && let Some(placement) = metadata.placement.as_ref()
+    {
+        let desired = placement.desired_replicas.max(count).max(1);
+        let replicas = Some((count, desired));
+        return match placement.agent_state.as_str() {
+            "conflicted" => FileRowPlacementBadge {
+                label: "conflict".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Alert,
+                replicas,
+            },
+            "pending-write" => FileRowPlacementBadge {
+                label: "syncing".to_string(),
+                tone: SemanticTone::Accent,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            "pending-repair" if count > 0 => FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            _ if count == 0 => FileRowPlacementBadge {
+                label: "placing".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            _ if count < desired => FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            },
+            _ => FileRowPlacementBadge {
+                label: "synced".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas,
+            },
+        };
+    }
+
     if count == 0 {
         return FileRowPlacementBadge {
             label: "placing".to_string(),
@@ -8960,76 +9017,6 @@ fn sifs_entry_placement_badge(metadata: &SifsEntryMetadata) -> FileRowPlacementB
         icon: IconGlyph::Storage,
         replicas: None,
     }
-}
-
-fn sifs_details_placement_badge(details: &SifsObjectDetails) -> FileRowPlacementBadge {
-    let replicas = sifs_details_replica_dots(details);
-    if let Some(health) = details.health.as_ref() {
-        if health.open_conflict_count > 0 {
-            return FileRowPlacementBadge {
-                label: "conflict".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Alert,
-                replicas,
-            };
-        }
-        if sifs_repair_backlog_count(health) > 0 {
-            return FileRowPlacementBadge {
-                label: "repair".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Redo,
-                replicas,
-            };
-        }
-    }
-
-    if details.policy == "local-owned" || details.policy == "ephemeral-local" {
-        return FileRowPlacementBadge {
-            label: "this device".to_string(),
-            tone: SemanticTone::Neutral,
-            icon: IconGlyph::Storage,
-            replicas: None,
-        };
-    }
-
-    if details.current_locations.is_empty() {
-        return FileRowPlacementBadge {
-            label: "queued".to_string(),
-            tone: SemanticTone::Neutral,
-            icon: IconGlyph::Storage,
-            replicas,
-        };
-    }
-
-    let (label, tone) = if details.policy.starts_with("replicated") {
-        if details
-            .health
-            .as_ref()
-            .is_some_and(|health| sifs_agent_state_is_current(&health.agent_state))
-        {
-            ("synced", SemanticTone::Success)
-        } else {
-            ("on mesh", SemanticTone::Info)
-        }
-    } else {
-        ("on mesh", SemanticTone::Info)
-    };
-
-    FileRowPlacementBadge {
-        label: label.to_string(),
-        tone,
-        icon: IconGlyph::Storage,
-        replicas,
-    }
-}
-
-fn sifs_details_replica_dots(details: &SifsObjectDetails) -> Option<(usize, usize)> {
-    if !(details.policy.starts_with("replicated")) {
-        return None;
-    }
-    let current = details.current_locations.len();
-    let desired = sifs_replica_desired_count(details).max(current);
-    (desired > 0).then_some((current, desired))
 }
 
 fn sort_file_entries_by(entries: &mut [SifsEntry], sort_mode: FileSortMode) {
@@ -9525,7 +9512,7 @@ fn unselected_inspector_status(source: FilesSourceKind, entries_empty: bool) -> 
         return "No entries in this directory";
     }
     match source {
-        FilesSourceKind::Sifs => "Select an object to inspect placement",
+        FilesSourceKind::Sifs => "Placement is shown for every object",
         FilesSourceKind::Local => "Select an object to inspect metadata",
     }
 }
@@ -10731,6 +10718,209 @@ fn files_list_body_rebuild(
     })
 }
 
+/// Transparent event target around the virtual table. The table owns primary-click selection;
+/// this wrapper handles the secondary-click counterpart before the parent [`ContextMenu`] opens.
+struct FileListContextTarget {
+    shared: Shared,
+    table_state: VirtualTableState,
+    child: WidgetPod,
+}
+
+impl FileListContextTarget {
+    fn new<W>(shared: Shared, table_state: VirtualTableState, child: W) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            shared,
+            table_state,
+            child: WidgetPod::new(child),
+        }
+    }
+
+    fn row_at_position(&self, bounds: Rect, position: Point) -> Option<usize> {
+        let theme = self.shared.theme();
+        let padding = theme.metrics.data_viewport_padding;
+        let header_height = theme.metrics.table_header_height;
+        let header_gap = theme.metrics.select_menu_gap;
+        let body = Rect::new(
+            bounds.x() + padding.left,
+            bounds.y() + padding.top + header_height + header_gap,
+            (bounds.width() - padding.left - padding.right).max(0.0),
+            (bounds.height() - padding.top - padding.bottom - header_height - header_gap).max(0.0),
+        );
+        if !body.contains(position) {
+            return None;
+        }
+        let row_height = theme.metrics.table_row_height.max(1.0);
+        let scroll_y = self.table_state.scroll_state().current_offset().y;
+        let index = ((position.y - body.y() + scroll_y) / row_height).floor() as usize;
+        (index < self.shared.files().entries.len()).then_some(index)
+    }
+}
+
+impl Widget for FileListContextTarget {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() != EventPhase::Capture
+            && let Event::Pointer(pointer) = event
+            && pointer.kind == PointerEventKind::Down
+            && pointer.button == Some(PointerButton::Secondary)
+        {
+            if let Some(index) = self.row_at_position(ctx.bounds(), pointer.position) {
+                self.shared.files_mut().select_context_entry(index);
+                ctx.request_paint();
+                ctx.request_semantics();
+            } else {
+                // Do not let the parent menu open over the table header or unused body space.
+                ctx.set_handled();
+            }
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+fn files_context_menu_item(label: impl Into<String>, enabled: bool) -> MenuItem {
+    let item = MenuItem::new(label);
+    if enabled { item } else { item.disabled() }
+}
+
+fn files_context_menu_items(files: &FilesState) -> Vec<MenuItem> {
+    let Some(entry) = files.selected_entry() else {
+        return Vec::new();
+    };
+    let batch = files.marked_count() > 0;
+    let can_modify = files.can_modify_current_location();
+    let mut items = vec![MenuItem::new("Open")];
+    if !entry.is_dir {
+        items.push(MenuItem::new("Attach to current chat"));
+    }
+    items.push(
+        files_context_menu_item(
+            if batch { "Copy selected to" } else { "Copy to" },
+            can_modify,
+        )
+        .separator_before(),
+    );
+    items.push(files_context_menu_item(
+        if batch { "Move selected to" } else { "Move to" },
+        can_modify,
+    ));
+    items.push(files_context_menu_item(
+        match (files.source, batch) {
+            (FilesSourceKind::Local, false) => "Copy to SIFS",
+            (FilesSourceKind::Local, true) => "Copy selected to SIFS",
+            (FilesSourceKind::Sifs, false) => "Download",
+            (FilesSourceKind::Sifs, true) => "Download selected",
+        },
+        can_modify,
+    ));
+    items.push(files_context_menu_item("Rename", can_modify));
+    items.push(
+        files_context_menu_item(if batch { "Delete selected" } else { "Delete" }, can_modify)
+            .destructive()
+            .separator_before(),
+    );
+    items
+}
+
+fn activate_files_context_menu_item(shared: &Shared, label: &str, ctx: &mut EventCtx) {
+    match label {
+        "Open" => {
+            if let Some(index) = shared.files().selected {
+                shared.files_mut().activate_row(index);
+            }
+        }
+        "Attach to current chat" => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_attach_selected(waker);
+        }
+        "Copy to" | "Copy selected to" => {
+            let kind = if shared.files().marked_count() > 0 {
+                FileActionPromptKind::CopySelected
+            } else {
+                FileActionPromptKind::Copy
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        "Move to" | "Move selected to" => {
+            let kind = if shared.files().marked_count() > 0 {
+                FileActionPromptKind::MoveSelected
+            } else {
+                FileActionPromptKind::Move
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        "Copy to SIFS" | "Download" => {
+            let kind = match shared.files().source {
+                FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
+                FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        "Copy selected to SIFS" | "Download selected" => {
+            shared
+                .files_mut()
+                .open_action_prompt(FileActionPromptKind::TransferSelected);
+        }
+        "Rename" => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::Rename),
+        "Delete" | "Delete selected" => {
+            let kind = if shared.files().marked_count() > 0 {
+                FileActionPromptKind::DeleteSelected
+            } else {
+                FileActionPromptKind::Delete
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        _ => return,
+    }
+    request_files_overlay_rebuild(ctx);
+}
+
+fn files_table_with_context_menu<W>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    table_state: &VirtualTableState,
+    table: W,
+) -> ContextMenu
+where
+    W: Widget + 'static,
+{
+    let target = FileListContextTarget::new(shared.clone(), table_state.clone(), table);
+    let items_shared = shared.clone();
+    let action_shared = shared.clone();
+    ContextMenu::new("files-list-context-menu", target)
+        .theme_when(clone_reader(reader))
+        .items_when(move || files_context_menu_items(&items_shared.files()))
+        .on_activate_with_ctx(move |ctx, _index, item| {
+            activate_files_context_menu_item(&action_shared, item.label(), ctx);
+        })
+}
+
 fn files_list_body_table(
     shared: &Shared,
     reader: &ThemeReader,
@@ -10756,30 +10946,45 @@ fn files_list_body_table(
         ));
     }
 
-    let row_entries = entries.clone();
-    let paint_shared = shared.clone();
-    let name_entries = entries.clone();
-    let description_entries = entries.clone();
-    let table = {
+    let build_table = |show_details: bool| {
+        let row_entries = entries.clone();
+        let paint_shared = shared.clone();
+        let name_entries = entries.clone();
+        let description_entries = entries.clone();
         let s = shared.clone();
         let cell_s = shared.clone();
         let header_s = shared.clone();
         let page_s = shared.clone();
         let description_s = shared.clone();
-        VirtualTable::new("files-listing")
-            .state(table_state.clone())
-            .columns([
-                VirtualTableColumn::new("").key(1).width(36.0),
-                VirtualTableColumn::new("Name")
-                    .key(2)
-                    .min_width(180.0)
-                    .sort_direction(sort_mode.name_sort_direction()),
-                VirtualTableColumn::new("Placement").key(3).width(156.0),
+        let mut columns = vec![
+            VirtualTableColumn::new("").key(1).width(36.0),
+            VirtualTableColumn::new("Name")
+                .key(2)
+                .min_width(if show_details {
+                    180.0
+                } else {
+                    COMPACT_FILE_NAME_MIN_W
+                })
+                .sort_direction(sort_mode.name_sort_direction()),
+            VirtualTableColumn::new("Placement")
+                .key(3)
+                .width(if show_details {
+                    156.0
+                } else {
+                    COMPACT_FILE_PLACEMENT_W
+                }),
+        ];
+        if show_details {
+            columns.push(
                 VirtualTableColumn::new("Details")
                     .key(4)
                     .width(156.0)
                     .sort_direction(sort_mode.meta_sort_direction()),
-            ])
+            );
+        }
+        let table = VirtualTable::new("files-listing")
+            .state(table_state.clone())
+            .columns(columns)
             .collection_window(CollectionWindow::loaded(
                 0..entries.len(),
                 Some(total_count),
@@ -10824,18 +11029,11 @@ fn files_list_body_table(
                     description.push_str(". Single click selects; double click opens the folder");
                 }
                 if files.source == FilesSourceKind::Sifs {
-                    let placement = file_row_placement_badge(entry, &files, index);
+                    let placement = file_row_placement_badge(entry, &files);
                     description.push_str(". Placement: ");
                     description.push_str(&placement.label);
-                    if files.selected == Some(index) {
-                        description.push_str("; ");
-                        description.push_str(&sifs_compact_header_line(
-                            entry,
-                            files.selected_details.as_ref(),
-                            files.clustered,
-                            files.details_loading,
-                            files.details_error.as_deref(),
-                        ));
+                    if let Some((current, desired)) = placement.replicas {
+                        description.push_str(&format!("; {current}/{desired} replicas"));
                     }
                     description.push_str(". Details: ");
                     description.push_str(&entry_row_meta(
@@ -10873,10 +11071,16 @@ fn files_list_body_table(
                     let waker = { page_s.borrow().waker.clone() };
                     page_s.files_mut().request_more_entries(waker);
                 }
-            })
+            });
+        files_table_with_context_menu(shared, reader, table_state, table)
     };
 
-    WidgetPod::new(table)
+    let compact_table = build_table(false);
+    let complete_table = build_table(true);
+    WidgetPod::new(ConstraintView::new(compact_table).when(
+        ConstraintQuery::new().min_width(COMPLETE_FILE_TABLE_MIN_W),
+        complete_table,
+    ))
 }
 
 fn file_entry_key(entry: &SifsEntry) -> u64 {
@@ -10945,13 +11149,16 @@ fn paint_file_table_row(
     }
 
     if let Some(placement_cell) = row.column_rects.get(2).copied() {
-        let placement = file_row_placement_badge(entry, &files, row.row_index);
+        let placement = file_row_placement_badge(entry, &files);
+        // The compact badge has a fixed maximum width. Keep the full local-placement label
+        // visible by yielding its redundant storage icon instead of truncating "this device".
+        let placement_icon = (placement.label.as_str() != "this device").then_some(placement.icon);
         paint_placement_badge_with(
             ctx,
             &theme,
             placement_cell,
             &placement.label,
-            Some(placement.icon),
+            placement_icon,
             placement.tone,
             placement.replicas,
             PlacementBadgePaint::new().padding(8.0, 5.0, 8.0, 5.0),
@@ -13792,12 +13999,9 @@ fn list_column(
     RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss))
 }
 
-/// Wide split: header docked on top, body fills with [ list (flex) | vertical separator |
-/// inspector (340) ]. We use the `Dock` helper so the body actually *fills* the remaining vertical
-/// space (a bare vertical `Stack` only sizes children to their natural height, which would collapse
-/// the list/inspector to the listing's content height); and a small [`Split`] so the inspector
-/// keeps its fixed 340px while the list takes the rest (a horizontal `Stack` would let the list
-/// greedily consume the full width before the inspector is measured).
+/// Wide split: header docked on top, with independently resizable Locations and Inspector
+/// sidebars around the file list. The native splitters retain their ratios in [`FilesState`] so a
+/// theme/scale rebuild does not discard the operator's preferred widths.
 fn wide_pod(
     shared: &Shared,
     reader: &ThemeReader,
@@ -13811,20 +14015,35 @@ fn wide_pod(
         let s = shared.clone();
         move || palette(&s).sidebar
     });
-    let list_with_places = FixedPaneSplit::horizontal(
-        places,
-        Separator::vertical().theme_when(clone_reader(reader)),
-        list_column(shared, reader, scroll_state),
-    )
-    .fixed_first(PLACES_W)
-    .divider_extent(1.0);
-    let body = FixedPaneSplit::horizontal(
+    let places_ratio = shared.files().places_sidebar_ratio;
+    let places_ratio_shared = shared.clone();
+    let list_with_places = SplitView::horizontal(places, list_column(shared, reader, scroll_state))
+        .name("File locations sidebar")
+        .ratio(places_ratio)
+        .min_first(PLACES_SIDEBAR_MIN_W)
+        .min_second(FILE_LIST_MIN_W)
+        .theme(reader())
+        .on_change(move |ratio| {
+            places_ratio_shared
+                .files_mut()
+                .set_places_sidebar_ratio(ratio)
+        });
+    let inspector_ratio = shared.files().inspector_sidebar_ratio;
+    let inspector_ratio_shared = shared.clone();
+    let body = SplitView::horizontal(
         list_with_places,
-        Separator::vertical().theme_when(clone_reader(reader)),
         inspector(shared, reader, inspector_scroll_state),
     )
-    .fixed_second(INSPECTOR_W)
-    .divider_extent(1.0);
+    .name("File inspector sidebar")
+    .ratio(1.0 - inspector_ratio)
+    .min_first(PLACES_SIDEBAR_MIN_W + FILE_LIST_MIN_W)
+    .min_second(INSPECTOR_SIDEBAR_MIN_W)
+    .theme(reader())
+    .on_change(move |ratio| {
+        inspector_ratio_shared
+            .files_mut()
+            .set_inspector_sidebar_ratio(1.0 - ratio)
+    });
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(
@@ -17345,7 +17564,7 @@ mod tests {
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
-    use sinomo_cli::app_api::SifsPinDetails;
+    use sinomo_cli::app_api::{SifsEntryPlacement, SifsPinDetails};
 
     fn files_test_temp_dir(name: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -19925,9 +20144,13 @@ mod tests {
                 .with_name("More file commands")
         };
 
+        let compact_width = WIDE_THRESHOLD - 1.0;
         window
             .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(639.0, 720.0))))?;
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                compact_width,
+                720.0,
+            ))))?;
         app.run_until_idle()?;
         more().expect().to_be_visible()?;
         let compact_id = window
@@ -19944,7 +20167,10 @@ mod tests {
 
         window
             .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(640.0, 720.0))))?;
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                WIDE_THRESHOLD,
+                720.0,
+            ))))?;
         app.run_until_idle()?;
         let wide_id = window
             .snapshot()?
@@ -19964,7 +20190,10 @@ mod tests {
 
         window
             .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(639.0, 720.0))))?;
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                compact_width,
+                720.0,
+            ))))?;
         app.run_until_idle()?;
         more().expect().to_be_visible()?;
         let restored_id = window
@@ -20479,6 +20708,125 @@ mod tests {
         let files = shared.files();
         assert_eq!(files.source, FilesSourceKind::Sifs);
         assert_eq!(files.path, "/services");
+
+        Ok(())
+    }
+
+    #[test]
+    fn wide_files_sidebars_are_independently_resizable() -> sui::Result<()> {
+        use sui::{Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Resizable Files sidebars")
+                    .root(
+                        SizedBox::new()
+                            .width(1_200.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let before = window.snapshot()?;
+
+        let locations_divider = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Splitter
+                    && node.name.as_deref() == Some("File locations sidebar")
+            })
+            .expect("Locations should expose a native splitter")
+            .bounds;
+        let inspector_divider = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Splitter
+                    && node.name.as_deref() == Some("File inspector sidebar")
+            })
+            .expect("Inspector should expose a native splitter")
+            .bounds;
+        let initial_places_ratio = shared.files().places_sidebar_ratio;
+        let initial_inspector_ratio = shared.files().inspector_sidebar_ratio;
+        let divider = shared.theme().metrics.split_view_divider_thickness.max(1.0);
+
+        let drag_splitter = |from: Point, to: Point| -> sui::Result<()> {
+            let root = window.root();
+            root.dispatch_event(Event::Pointer(PointerEvent::new(
+                PointerEventKind::Move,
+                from,
+            )))?;
+            let mut down = PointerEvent::new(PointerEventKind::Down, from);
+            down.pointer_id = 1;
+            down.button = Some(PointerButton::Primary);
+            down.buttons = PointerButtons::new(1);
+            root.dispatch_event(Event::Pointer(down))?;
+            let mut moved = PointerEvent::new(PointerEventKind::Move, to);
+            moved.pointer_id = 1;
+            moved.buttons = PointerButtons::new(1);
+            root.dispatch_event(Event::Pointer(moved))?;
+            let mut up = PointerEvent::new(PointerEventKind::Up, to);
+            up.pointer_id = 1;
+            up.button = Some(PointerButton::Primary);
+            root.dispatch_event(Event::Pointer(up))?;
+            window.run_until_idle()?;
+            Ok(())
+        };
+
+        let locations_start = Point::new(
+            locations_divider.x()
+                + (locations_divider.width() - divider) * initial_places_ratio
+                + divider * 0.5,
+            locations_divider.y() + locations_divider.height() * 0.5,
+        );
+        drag_splitter(
+            locations_start,
+            Point::new(locations_start.x + 90.0, locations_start.y),
+        )?;
+        let places_after_drag = shared.files().places_sidebar_ratio;
+        assert!(
+            places_after_drag > initial_places_ratio + 0.05,
+            "dragging the Locations divider should retain its wider ratio: before={initial_places_ratio}, after={places_after_drag}"
+        );
+        assert!(
+            (shared.files().inspector_sidebar_ratio - initial_inspector_ratio).abs() < 0.001,
+            "resizing Locations must not change the Inspector width"
+        );
+
+        let inspector_start = Point::new(
+            inspector_divider.x()
+                + (inspector_divider.width() - divider) * (1.0 - initial_inspector_ratio)
+                + divider * 0.5,
+            inspector_divider.y() + inspector_divider.height() * 0.5,
+        );
+        drag_splitter(
+            inspector_start,
+            Point::new(inspector_start.x - 100.0, inspector_start.y),
+        )?;
+        assert!(
+            shared.files().inspector_sidebar_ratio > initial_inspector_ratio + 0.05,
+            "dragging the Inspector divider should retain its wider ratio"
+        );
+        assert!(
+            (shared.files().places_sidebar_ratio - places_after_drag).abs() < 0.001,
+            "resizing Inspector must not change the Locations width"
+        );
 
         Ok(())
     }
@@ -21150,7 +21498,7 @@ mod tests {
         );
         assert_eq!(
             unselected_inspector_status(FilesSourceKind::Sifs, false),
-            "Select an object to inspect placement"
+            "Placement is shown for every object"
         );
         assert_eq!(
             unselected_inspector_title(FilesSourceKind::Local),
@@ -21753,6 +22101,7 @@ mod tests {
                 modified_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                placement: None,
             },
         );
 
@@ -21762,12 +22111,63 @@ mod tests {
 
         state.selected = None;
         assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
+            file_row_placement_badge(&entry, &state),
             FileRowPlacementBadge {
                 label: "2 copies".to_string(),
                 tone: SemanticTone::Success,
                 icon: IconGlyph::Storage,
                 replicas: None,
+            }
+        );
+    }
+
+    #[test]
+    fn sifs_entry_placement_badge_maps_refreshed_live_state() {
+        let mut metadata = SifsEntryMetadata {
+            path: "/artifact.txt".to_string(),
+            object_id: "object-artifact".to_string(),
+            version: "version-1".to_string(),
+            modified_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+            placement: Some(SifsEntryPlacement {
+                agent_state: "current".to_string(),
+                desired_replicas: 1,
+            }),
+        };
+
+        assert_eq!(
+            sifs_entry_placement_badge(&metadata),
+            FileRowPlacementBadge {
+                label: "synced".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas: Some((1, 1)),
+            }
+        );
+
+        metadata.placement = Some(SifsEntryPlacement {
+            agent_state: "pending-repair".to_string(),
+            desired_replicas: 2,
+        });
+        assert_eq!(
+            sifs_entry_placement_badge(&metadata),
+            FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas: Some((1, 2)),
+            }
+        );
+
+        metadata.placement.as_mut().unwrap().agent_state = "conflicted".to_string();
+        assert_eq!(
+            sifs_entry_placement_badge(&metadata),
+            FileRowPlacementBadge {
+                label: "conflict".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Alert,
+                replicas: Some((1, 2)),
             }
         );
     }
@@ -21822,14 +22222,14 @@ mod tests {
     }
 
     #[test]
-    fn file_row_placement_badge_maps_sifs_sync_truth() {
+    fn file_row_placement_badge_is_stable_across_selection_details() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.source = FilesSourceKind::Sifs;
         state.clustered = true;
         state.details_loading = false;
         state.details_error = None;
-        state.selected = Some(0);
+        state.selected = None;
         state.entries = vec![SifsEntry {
             name: "artifact.txt".to_string(),
             path: "/artifact.txt".to_string(),
@@ -21837,7 +22237,30 @@ mod tests {
             is_link: false,
             size: Some(5),
         }];
+        state.entry_metadata.insert(
+            "/artifact.txt".to_string(),
+            SifsEntryMetadata {
+                path: "/artifact.txt".to_string(),
+                object_id: "object-artifact".to_string(),
+                version: "version-1".to_string(),
+                modified_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string()],
+                placement: Some(SifsEntryPlacement {
+                    agent_state: "current".to_string(),
+                    desired_replicas: 1,
+                }),
+            },
+        );
         let entry = state.entries[0].clone();
+        let expected = FileRowPlacementBadge {
+            label: "synced".to_string(),
+            tone: SemanticTone::Success,
+            icon: IconGlyph::Storage,
+            replicas: Some((1, 1)),
+        };
+
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
 
         let mut details = test_sifs_details(Vec::new());
         details.current_locations = vec!["node-a".to_string(), "node-b".to_string()];
@@ -21851,15 +22274,8 @@ mod tests {
             missing_replica_nodes: Vec::new(),
         });
         state.selected_details = Some(details.clone());
-        assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
-            FileRowPlacementBadge {
-                label: "synced".to_string(),
-                tone: SemanticTone::Success,
-                icon: IconGlyph::Storage,
-                replicas: Some((2, 2)),
-            }
-        );
+        state.selected = Some(0);
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
 
         details.health = Some(SifsObjectHealth {
             agent_state: "pending-repair".to_string(),
@@ -21871,26 +22287,12 @@ mod tests {
             missing_replica_nodes: vec!["node-c".to_string()],
         });
         state.selected_details = Some(details);
-        assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
-            FileRowPlacementBadge {
-                label: "repair".to_string(),
-                tone: SemanticTone::Warning,
-                icon: IconGlyph::Redo,
-                replicas: Some((2, 3)),
-            }
-        );
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
 
+        state.details_loading = true;
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
         state.details_error = Some("metadata failed".to_string());
-        assert_eq!(
-            file_row_placement_badge(&entry, &state, 0),
-            FileRowPlacementBadge {
-                label: "failed".to_string(),
-                tone: SemanticTone::Danger,
-                icon: IconGlyph::Alert,
-                replicas: None,
-            }
-        );
+        assert_eq!(file_row_placement_badge(&entry, &state), expected);
     }
 
     #[test]
@@ -23817,6 +24219,168 @@ mod tests {
     }
 
     #[test]
+    fn file_context_menu_adapts_to_sifs_and_marked_batches() {
+        let mut files = FilesState::new(&Backend::local_fallback());
+        files.source = FilesSourceKind::Sifs;
+        files.loaded = true;
+        files.loading = false;
+        files.error = None;
+        files.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        files.selected = Some(0);
+
+        let labels = files_context_menu_items(&files)
+            .into_iter()
+            .map(|item| item.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label == "Download"));
+        assert!(!labels.iter().any(|label| label == "Copy to SIFS"));
+
+        files.marked_entries.insert(0);
+        let labels = files_context_menu_items(&files)
+            .into_iter()
+            .map(|item| item.label().to_string())
+            .collect::<Vec<_>>();
+        for label in [
+            "Copy selected to",
+            "Move selected to",
+            "Download selected",
+            "Delete selected",
+        ] {
+            assert!(labels.iter().any(|item| item == label));
+        }
+    }
+
+    #[test]
+    fn file_list_right_click_selects_target_and_exposes_common_operations() -> sui::Result<()> {
+        use sui::{PointerButtons, PointerEvent};
+
+        let root = files_test_temp_dir("context-menu");
+        let first_path = root.join("first.txt");
+        let second_path = root.join("second.txt");
+        fs::write(&first_path, b"first").expect("write first file");
+        fs::write(&second_path, b"second").expect("write second file");
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.path = root.to_string_lossy().into_owned();
+            files.entries = vec![
+                SifsEntry {
+                    name: "first.txt".to_string(),
+                    path: first_path.to_string_lossy().into_owned(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(5),
+                },
+                SifsEntry {
+                    name: "second.txt".to_string(),
+                    path: second_path.to_string_lossy().into_owned(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(6),
+                },
+            ];
+            files.entries_total_count = 2;
+            files.selected = Some(0);
+            files.marked_entries.insert(0);
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files context menu").root(
+                    SizedBox::new()
+                        .width(760.0)
+                        .height(640.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let row = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("second.txt")
+            })
+            .expect("second file row semantics");
+        let position = Point::new(
+            row.bounds.x() + row.bounds.width() * 0.5,
+            row.bounds.y() + row.bounds.height() * 0.5,
+        );
+        let window_root = window.root();
+        let mut down = PointerEvent::new(PointerEventKind::Down, position);
+        down.pointer_id = 1;
+        down.button = Some(PointerButton::Secondary);
+        down.buttons = PointerButtons::new(2);
+        window_root.dispatch_event(Event::Pointer(down))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, position);
+        up.pointer_id = 1;
+        up.button = Some(PointerButton::Secondary);
+        window_root.dispatch_event(Event::Pointer(up))?;
+        app.run_until_idle()?;
+
+        assert_eq!(shared.files().selected, Some(1));
+        assert_eq!(
+            shared.files().marked_count(),
+            0,
+            "context-clicking outside the marked set should target only the clicked row"
+        );
+        let menu_labels = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .filter(|node| node.role == SemanticsRole::MenuItem)
+            .filter_map(|node| node.name)
+            .collect::<Vec<_>>();
+        for label in [
+            "Open",
+            "Attach to current chat",
+            "Copy to",
+            "Move to",
+            "Copy to SIFS",
+            "Rename",
+            "Delete",
+        ] {
+            assert!(
+                menu_labels.iter().any(|item| item == label),
+                "file context menu should contain {label}; got {menu_labels:?}"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::MenuItem)
+            .with_name("Rename")
+            .click()?;
+        app.run_until_idle()?;
+        let files = shared.files();
+        let prompt = files.action_prompt.as_ref().expect("rename prompt");
+        assert_eq!(prompt.kind, FileActionPromptKind::Rename);
+        assert_eq!(
+            prompt.target_path.as_deref(),
+            Some(second_path.to_string_lossy().as_ref())
+        );
+
+        drop(files);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn empty_directory_placeholder_exposes_create_actions() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -24000,7 +24564,7 @@ mod tests {
     }
 
     #[test]
-    fn files_toolbar_repairs_replicas_and_row_semantics_show_placement() -> sui::Result<()> {
+    fn compact_file_table_keeps_unselected_placement_visible() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24018,6 +24582,142 @@ mod tests {
                 is_link: false,
                 size: Some(5),
             }];
+            files.entry_metadata.insert(
+                "/artifact.txt".to_string(),
+                SifsEntryMetadata {
+                    path: "/artifact.txt".to_string(),
+                    object_id: "object-artifact".to_string(),
+                    version: "version-1".to_string(),
+                    modified_at_unix_nanos: 0,
+                    policy: "replicated-eventual".to_string(),
+                    current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                    placement: Some(SifsEntryPlacement {
+                        agent_state: "current".to_string(),
+                        desired_replicas: 2,
+                    }),
+                },
+            );
+            files.selected = None;
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files compact placement")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(360.0, 640.0))))?;
+        app.run_until_idle()?;
+
+        let snapshot = window.snapshot()?;
+        let table = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Table
+                    && node.name.as_deref() == Some("files-listing")
+            })
+            .expect("compact files table semantics");
+        assert!(
+            table
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Columns: Name, Placement;")),
+            "compact table should retain Placement, got {:?}",
+            table.description
+        );
+        assert!(
+            !table
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Details")),
+            "Details should yield before Placement in the compact table, got {:?}",
+            table.description
+        );
+
+        let row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("artifact.txt")
+            })
+            .expect("unselected artifact row semantics");
+        assert!(
+            row.description
+                .as_deref()
+                .is_some_and(|description| description.contains("Placement: synced; 2/2 replicas")),
+            "unselected row should expose placement metadata, got {:?}",
+            row.description
+        );
+        let unselected_description = row.description.clone();
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("artifact.txt")
+            .click()?;
+        app.run_until_idle()?;
+        let selected_description = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("artifact.txt")
+            })
+            .expect("selected artifact row semantics")
+            .description;
+        assert_eq!(
+            selected_description, unselected_description,
+            "selection should not change placement presentation in the file list"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn files_toolbar_repairs_replicas_while_row_placement_stays_stable() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Sifs;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.clustered = true;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.entry_metadata.insert(
+                "/artifact.txt".to_string(),
+                SifsEntryMetadata {
+                    path: "/artifact.txt".to_string(),
+                    object_id: "object-artifact".to_string(),
+                    version: "version-1".to_string(),
+                    modified_at_unix_nanos: 0,
+                    policy: "replicated-eventual".to_string(),
+                    current_locations: vec!["node-a".to_string()],
+                    placement: Some(SifsEntryPlacement {
+                        agent_state: "current".to_string(),
+                        desired_replicas: 1,
+                    }),
+                },
+            );
             files.selected = Some(0);
             let mut details = test_sifs_details(Vec::new());
             details.health = Some(SifsObjectHealth {
@@ -24059,11 +24759,10 @@ mod tests {
             })
             .expect("artifact row semantics");
         assert!(
-            row.description
-                .as_deref()
-                .is_some_and(|description| description
-                    .contains("Placement: repair; 5 B · 1/2 replicas · 1 repair")),
-            "selected SIFS row should expose compact placement metadata, got {:?}",
+            row.description.as_deref().is_some_and(|description| {
+                description.contains("Placement: synced; 1/1 replicas. Details: 5 B")
+            }),
+            "selected SIFS row should keep page-level placement metadata, got {:?}",
             row.description
         );
 
@@ -25819,7 +26518,7 @@ mod tests {
             .join("files-workflow-layout");
         fs::create_dir_all(&artifact_dir).expect("create visual artifact directory");
 
-        for width in [560.0_f32, 760.0_f32] {
+        for width in [560.0_f32, WIDE_THRESHOLD] {
             let shared = prepared_shared(false);
             let runtime = sui::Application::new()
                 .window(

@@ -120,7 +120,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::SyncPath { .. } => "sync-path",
         DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
         DfsNamespaceOperation::LookupPaths { .. } => "lookup-paths",
-        DfsNamespaceOperation::ApplyTransaction { .. } => "apply-transaction",
+        DfsNamespaceOperation::CommitLocalEventualBatch { .. } => "commit-local-eventual-batch",
         DfsNamespaceOperation::ReconcilePlacement { .. } => "reconcile-placement",
         DfsNamespaceOperation::AdvisoryLock { .. } => "advisory-lock",
         DfsNamespaceOperation::FileSync { .. } => "file-sync",

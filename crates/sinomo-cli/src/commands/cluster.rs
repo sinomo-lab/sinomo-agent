@@ -7,6 +7,10 @@ use cluster::{
     verify_cluster_join_invite_signature,
 };
 pub(crate) use network::cluster_state_needs_join_registration;
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteChoice, CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec,
+    CliParseError, CliPositionalSpec, CliValueSpec,
+};
 use sinomo_runtime::cluster;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
@@ -26,7 +30,6 @@ pub(crate) fn build_cluster_raft_append_request_from_next_index(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClusterCliCommand {
-    Help,
     Init(ClusterInitOptions),
     Invite(ClusterInviteOptions),
     Join(ClusterJoinOptions),
@@ -139,174 +142,303 @@ impl Default for ClusterInviteOptions {
     }
 }
 
-pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(ClusterCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(ClusterCliCommand::Help)
+pub(crate) fn cluster_cli_command_handler() -> DeclarativeCommandHandler<ClusterCliCommand> {
+    DeclarativeCommandHandler::new(
+        "cluster",
+        CliCommandPolicy::default(),
+        cluster_cli_spec,
+        parse_cluster_matches,
+        run_cluster_cli_command,
+    )
+}
+
+fn cluster_cli_spec() -> CliCommandSpec {
+    let option = |name: &'static str, help: &'static str, value: &'static str| {
+        CliOptionSpec::value(name, help, CliValueSpec::new(value, help))
+    };
+    let positional = |name: &'static str, help: &'static str| {
+        CliPositionalSpec::required(CliValueSpec::new(name, help))
+    };
+    let node_roles = CliValueSpec::new("role", "node role")
+        .with_choices([
+            CliAutocompleteChoice::new("workstation", "workstation node"),
+            CliAutocompleteChoice::new("mobile", "mobile node"),
+            CliAutocompleteChoice::new("server", "server node"),
+            CliAutocompleteChoice::new("sensor", "sensor node"),
+            CliAutocompleteChoice::new("test", "test node"),
+        ])
+        .restricted();
+    let authority_roles = CliValueSpec::new("role", "state authority role").with_choices([
+        CliAutocompleteChoice::new("authority", "state authority voter"),
+        CliAutocompleteChoice::new("replica", "state replica learner"),
+        CliAutocompleteChoice::new("observer", "non-authority observer"),
+        CliAutocompleteChoice::new("voter", "state authority voter"),
+        CliAutocompleteChoice::new("learner", "state replica learner"),
+        CliAutocompleteChoice::new("non-voting", "non-authority observer"),
+    ]);
+    CliCommandSpec::new("cluster", "inspect and modify cluster membership")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("init", "bootstrap a new local cluster").with_options([
+                option("--name", "local node name", "name"),
+                option("--cluster-id", "explicit cluster id", "cluster-id"),
+                option("--node-id", "explicit local node id", "node-id"),
+            ]),
+            CliCommandSpec::new("invite", "create a portable join invite").with_options([
+                option(
+                    "--introducer",
+                    "advertised introducer endpoint",
+                    "host:port",
+                )
+                .repeatable(),
+                option("--ttl-seconds", "invite lifetime", "seconds"),
+                option("--output", "invite output path", "path"),
+                option(
+                    "--channel-output",
+                    "per-introducer invite output",
+                    "introducer=path",
+                )
+                .repeatable(),
+            ]),
+            CliCommandSpec::new("join", "join an existing cluster")
+                .with_options([
+                    option("--name", "local node name", "name"),
+                    option("--cluster-id", "expected cluster id", "cluster-id"),
+                    option("--node-id", "explicit local node id", "node-id"),
+                ])
+                .with_positionals([positional("invite", "join URI or invite file")]),
+            CliCommandSpec::new("migrate", "plan cluster identity migration")
+                .with_aliases(["migration"])
+                .with_children([CliCommandSpec::new(
+                    "plan",
+                    "plan migration into another cluster",
+                )
+                .with_options([option(
+                    "--mode",
+                    "migration mode",
+                    "single-node|cluster-merge",
+                )])
+                .with_positionals([positional("invite", "join URI or invite file")])]),
+            CliCommandSpec::new("rename", "rename one cluster node")
+                .with_aliases(["set-name"])
+                .with_positionals([
+                    positional("node-id", "cluster node id"),
+                    positional("name", "new node name"),
+                ]),
+            CliCommandSpec::new("rename-hostnames", "rename members from live hostnames")
+                .with_aliases(["rename-to-hostnames", "rename-nodes-to-hostnames"]),
+            CliCommandSpec::new("role", "set a documented node role")
+                .with_aliases(["set-role"])
+                .with_positionals([
+                    positional("node-id", "cluster node id"),
+                    CliPositionalSpec::required(node_roles),
+                ]),
+            CliCommandSpec::new("state-authority", "set a state authority role")
+                .with_aliases([
+                    "authority-role",
+                    "set-state-authority",
+                    "set-authority-role",
+                    "raft-role",
+                    "set-raft-role",
+                ])
+                .with_positionals([
+                    positional("node-id", "cluster node id"),
+                    CliPositionalSpec::required(authority_roles.clone()),
+                ]),
+            CliCommandSpec::new("promote", "promote a node to state authority").with_positionals([
+                positional("node-id", "cluster node id"),
+                CliPositionalSpec::optional(authority_roles),
+            ]),
+            CliCommandSpec::new("repair-members", "import member records from a peer")
+                .with_aliases(["repair"])
+                .with_options([
+                    option("--from", "source peer endpoint", "host:port|iroh://..."),
+                    option("--promote", "promote imported node", "node-id"),
+                ])
+                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                    "endpoint",
+                    "source peer endpoint",
+                ))]),
+            CliCommandSpec::new("remove", "remove cluster members")
+                .with_aliases(["rm"])
+                .with_positionals([positional("node-id", "cluster node id").repeatable()]),
+            CliCommandSpec::new(
+                "cleanup-legacy-shadow-members",
+                "remove legacy shadow member records",
+            )
+            .with_aliases(["cleanup-shadow-members", "cleanup-shadows"]),
+            CliCommandSpec::new("status", "show cluster status"),
+            CliCommandSpec::new("health", "show cluster node health").with_aliases(["nodes"]),
+            CliCommandSpec::new("doctor", "diagnose cluster reachability")
+                .with_aliases(["diagnose"]),
+            CliCommandSpec::new("connectivity", "show cluster connectivity routes")
+                .with_aliases(["routes"]),
+            CliCommandSpec::new("peers", "list known peers"),
+            CliCommandSpec::new("leave", "remove local cluster state"),
+        ])
+}
+
+fn parse_cluster_matches(matches: &CliCommandMatches) -> Result<ClusterCliCommand, CliParseError> {
+    let path = matches
+        .path()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let node_id = |value: &str| {
+        NodeId::new(value.to_string()).map_err(|source| CliParseError::Parse {
+            detail: format!("invalid node id `{value}`: {source}"),
+        })
+    };
+    match path.as_slice() {
+        ["cluster", "init"] => {
+            let defaults = ClusterInitOptions::default();
+            Ok(ClusterCliCommand::Init(ClusterInitOptions {
+                cluster_id: matches
+                    .value("--cluster-id")
+                    .map(parse_cluster_id)
+                    .transpose()
+                    .map_err(semantic_parse_error)?,
+                node_id: matches.value("--node-id").map(node_id).transpose()?,
+                name: matches
+                    .value("--name")
+                    .map(non_empty_cluster_name)
+                    .transpose()
+                    .map_err(semantic_parse_error)?
+                    .unwrap_or(defaults.name),
+            }))
         }
-        Some((command, rest)) if command == "init" => {
-            Ok(ClusterCliCommand::Init(parse_cluster_init_options(rest)?))
+        ["cluster", "invite"] => {
+            let ttl_seconds = matches
+                .value("--ttl-seconds")
+                .map(|value| {
+                    value.parse::<i64>().map_err(|source| CliParseError::Parse {
+                        detail: format!("invalid invite ttl `{value}`: {source}"),
+                    })
+                })
+                .transpose()?
+                .unwrap_or(CLUSTER_INVITE_DEFAULT_TTL_SECONDS);
+            if ttl_seconds <= 0 {
+                return Err(CliParseError::Parse {
+                    detail: "invite ttl must be greater than zero seconds".to_string(),
+                });
+            }
+            let mut options = ClusterInviteOptions {
+                ttl_seconds,
+                introducers: matches
+                    .values("--introducer")
+                    .map(|value| non_empty_address(value).map_err(semantic_parse_error))
+                    .collect::<Result<Vec<_>, _>>()?,
+                output: matches.value("--output").map(PathBuf::from),
+                channel_outputs: matches
+                    .values("--channel-output")
+                    .map(|value| {
+                        parse_cluster_invite_channel_output(value).map_err(semantic_parse_error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            normalize_cluster_invite_options(&mut options).map_err(semantic_parse_error)?;
+            Ok(ClusterCliCommand::Invite(options))
         }
-        Some((command, rest)) if command == "invite" => Ok(ClusterCliCommand::Invite(
-            parse_cluster_invite_options(rest)?,
+        ["cluster", "join"] => {
+            let mut options = ClusterJoinOptions {
+                invite: required_positional(matches, 0)?.to_string(),
+                cluster_id: matches
+                    .value("--cluster-id")
+                    .map(parse_cluster_id)
+                    .transpose()
+                    .map_err(semantic_parse_error)?,
+                node_id: matches.value("--node-id").map(node_id).transpose()?,
+                name: default_cluster_node_name("sinomo-node"),
+                name_explicit: matches.contains("--name"),
+            };
+            if let Some(name) = matches.value("--name") {
+                options.name = non_empty_cluster_name(name).map_err(semantic_parse_error)?;
+            }
+            Ok(ClusterCliCommand::Join(options))
+        }
+        ["cluster", "migrate", "plan"] => Ok(ClusterCliCommand::Migrate(
+            ClusterMigrateCommand::Plan(ClusterMigrationPlanOptions {
+                invite: required_positional(matches, 0)?.to_string(),
+                mode: matches
+                    .value("--mode")
+                    .map(parse_cluster_migration_mode)
+                    .transpose()
+                    .map_err(semantic_parse_error)?
+                    .unwrap_or(ClusterMigrationMode::SingleNode),
+            }),
         )),
-        Some((command, rest)) if command == "join" => {
-            Ok(ClusterCliCommand::Join(parse_cluster_join_options(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "migrate" | "migration") => Ok(
-            ClusterCliCommand::Migrate(parse_cluster_migrate_command(rest)?),
-        ),
-        Some((command, rest)) if matches!(command.as_str(), "rename" | "set-name") => Ok(
-            ClusterCliCommand::Rename(parse_cluster_rename_options(rest)?),
-        ),
-        Some((command, []))
-            if matches!(
-                command.as_str(),
-                "rename-hostnames" | "rename-to-hostnames" | "rename-nodes-to-hostnames"
-            ) =>
-        {
-            Ok(ClusterCliCommand::RenameHostnames)
-        }
-        Some((command, rest)) if matches!(command.as_str(), "role" | "set-role") => {
-            Ok(ClusterCliCommand::Role(parse_cluster_role_options(rest)?))
-        }
-        Some((command, rest))
-            if matches!(
-                command.as_str(),
-                "state-authority"
-                    | "authority-role"
-                    | "set-state-authority"
-                    | "set-authority-role"
-                    | "raft-role"
-                    | "set-raft-role"
-            ) =>
-        {
-            Ok(ClusterCliCommand::StateAuthority(
-                parse_cluster_state_authority_options(rest)?,
-            ))
-        }
-        Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::StateAuthority(
-            parse_cluster_promote_options(rest)?,
+        ["cluster", "rename"] => Ok(ClusterCliCommand::Rename(ClusterRenameOptions {
+            node_id: node_id(required_positional(matches, 0)?)?,
+            name: non_empty_cluster_name(required_positional(matches, 1)?)
+                .map_err(semantic_parse_error)?,
+        })),
+        ["cluster", "rename-hostnames"] => Ok(ClusterCliCommand::RenameHostnames),
+        ["cluster", "role"] => Ok(ClusterCliCommand::Role(ClusterRoleOptions {
+            node_id: node_id(required_positional(matches, 0)?)?,
+            role: parse_cluster_node_role(required_positional(matches, 1)?)
+                .map_err(semantic_parse_error)?,
+        })),
+        ["cluster", "state-authority"] => Ok(ClusterCliCommand::StateAuthority(
+            ClusterStateAuthorityOptions {
+                node_id: node_id(required_positional(matches, 0)?)?,
+                role: parse_cluster_state_authority_role(required_positional(matches, 1)?)
+                    .map_err(semantic_parse_error)?,
+            },
         )),
-        Some((command, rest)) if matches!(command.as_str(), "repair-members" | "repair") => Ok(
-            ClusterCliCommand::RepairMembers(parse_cluster_repair_members_options(rest)?),
-        ),
-        Some((command, rest)) if matches!(command.as_str(), "remove" | "rm") => Ok(
-            ClusterCliCommand::Remove(parse_cluster_remove_options(rest)?),
-        ),
-        Some((command, []))
-            if matches!(
-                command.as_str(),
-                "cleanup-legacy-shadow-members" | "cleanup-shadow-members" | "cleanup-shadows"
-            ) =>
-        {
+        ["cluster", "promote"] => Ok(ClusterCliCommand::StateAuthority(
+            ClusterStateAuthorityOptions {
+                node_id: node_id(required_positional(matches, 0)?)?,
+                role: matches
+                    .positionals()
+                    .get(1)
+                    .map(|role| parse_cluster_state_authority_role(role))
+                    .transpose()
+                    .map_err(semantic_parse_error)?
+                    .unwrap_or(ClusterMemberRole::Voter),
+            },
+        )),
+        ["cluster", "repair-members"] => Ok(ClusterCliCommand::RepairMembers(
+            ClusterRepairMembersOptions {
+                from: non_empty_address(
+                    matches
+                        .value("--from")
+                        .or_else(|| matches.positionals().first().map(String::as_str))
+                        .ok_or_else(|| CliParseError::Parse {
+                            detail: "cluster repair-members requires --from <host:port|iroh://...>"
+                                .to_string(),
+                        })?,
+                )
+                .map_err(semantic_parse_error)?,
+                promote: matches.value("--promote").map(node_id).transpose()?,
+            },
+        )),
+        ["cluster", "remove"] => Ok(ClusterCliCommand::Remove(ClusterRemoveOptions {
+            node_ids: matches
+                .positionals()
+                .iter()
+                .map(|value| node_id(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        })),
+        ["cluster", "cleanup-legacy-shadow-members"] => {
             Ok(ClusterCliCommand::CleanupLegacyShadowMembers)
         }
-        Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
-        Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
-            Ok(ClusterCliCommand::Health)
-        }
-        Some((command, [])) if matches!(command.as_str(), "doctor" | "diagnose") => {
-            Ok(ClusterCliCommand::Doctor)
-        }
-        Some((command, [])) if matches!(command.as_str(), "connectivity" | "routes") => {
-            Ok(ClusterCliCommand::Connectivity)
-        }
-        Some((command, [])) if command == "peers" => Ok(ClusterCliCommand::Peers),
-        Some((command, [])) if command == "leave" => Ok(ClusterCliCommand::Leave),
-        _ => Err(CliError::Usage),
+        ["cluster", "status"] => Ok(ClusterCliCommand::Status),
+        ["cluster", "health"] => Ok(ClusterCliCommand::Health),
+        ["cluster", "doctor"] => Ok(ClusterCliCommand::Doctor),
+        ["cluster", "connectivity"] => Ok(ClusterCliCommand::Connectivity),
+        ["cluster", "peers"] => Ok(ClusterCliCommand::Peers),
+        ["cluster", "leave"] => Ok(ClusterCliCommand::Leave),
+        _ => Err(CliParseError::Parse {
+            detail: "cluster requires a subcommand".to_string(),
+        }),
     }
 }
 
-pub(crate) fn parse_cluster_init_options(args: &[String]) -> Result<ClusterInitOptions, CliError> {
-    let mut options = ClusterInitOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--cluster-id" => {
-                index += 1;
-                let Some(cluster_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.cluster_id = Some(parse_cluster_id(cluster_id)?);
-            }
-            "--node-id" => {
-                index += 1;
-                let Some(node_id) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.node_id =
-                    Some(
-                        NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-                            detail: format!("invalid node id `{node_id}`: {source}"),
-                        })?,
-                    );
-            }
-            "--name" => {
-                index += 1;
-                let Some(name) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.name = non_empty_cluster_name(name)?;
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-pub(crate) fn parse_cluster_invite_options(
+#[cfg(test)]
+pub(crate) fn parse_cluster_schema_for_test(
     args: &[String],
-) -> Result<ClusterInviteOptions, CliError> {
-    let mut options = ClusterInviteOptions::default();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--ttl-seconds" => {
-                index += 1;
-                let Some(ttl) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.ttl_seconds = ttl.parse::<i64>().map_err(|source| CliError::Parse {
-                    detail: format!("invalid invite ttl `{ttl}`: {source}"),
-                })?;
-                if options.ttl_seconds <= 0 {
-                    return Err(CliError::Parse {
-                        detail: "invite ttl must be greater than zero seconds".to_string(),
-                    });
-                }
-            }
-            "--introducer" => {
-                index += 1;
-                let Some(introducer) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.introducers.push(non_empty_address(introducer)?);
-            }
-            "--output" => {
-                index += 1;
-                let Some(output) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.output = Some(PathBuf::from(output));
-            }
-            "--channel-output" => {
-                index += 1;
-                let Some(channel_output) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options
-                    .channel_outputs
-                    .push(parse_cluster_invite_channel_output(channel_output)?);
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    normalize_cluster_invite_options(&mut options)?;
-    Ok(options)
+) -> Result<ClusterCliCommand, CliError> {
+    parse_schema_command_for_test(cluster_cli_spec(), args, parse_cluster_matches)
 }
 
 fn parse_cluster_invite_channel_output(
@@ -391,114 +523,6 @@ fn normalize_cluster_invite_options(options: &mut ClusterInviteOptions) -> Resul
     Ok(())
 }
 
-pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinOptions, CliError> {
-    let Some((invite, rest)) = args.split_first() else {
-        return Err(CliError::Usage);
-    };
-    if invite.starts_with("--") {
-        return Err(CliError::Usage);
-    }
-
-    let mut options = ClusterJoinOptions {
-        invite: invite.clone(),
-        cluster_id: None,
-        node_id: None,
-        name: default_cluster_node_name("sinomo-node"),
-        name_explicit: false,
-    };
-    let mut index = 0;
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "--cluster-id" => {
-                index += 1;
-                let Some(cluster_id) = rest.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.cluster_id = Some(parse_cluster_id(cluster_id)?);
-            }
-            "--node-id" => {
-                index += 1;
-                let Some(node_id) = rest.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.node_id =
-                    Some(
-                        NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-                            detail: format!("invalid node id `{node_id}`: {source}"),
-                        })?,
-                    );
-            }
-            "--name" => {
-                index += 1;
-                let Some(name) = rest.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.name = non_empty_cluster_name(name)?;
-                options.name_explicit = true;
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-pub(crate) fn parse_cluster_rename_options(
-    args: &[String],
-) -> Result<ClusterRenameOptions, CliError> {
-    let [node_id, name] = args else {
-        return Err(CliError::Usage);
-    };
-    Ok(ClusterRenameOptions {
-        node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-            detail: format!("invalid node id `{node_id}`: {source}"),
-        })?,
-        name: non_empty_cluster_name(name)?,
-    })
-}
-
-pub(crate) fn parse_cluster_migrate_command(
-    args: &[String],
-) -> Result<ClusterMigrateCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "plan" => Ok(ClusterMigrateCommand::Plan(
-            parse_cluster_migration_plan_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
-    }
-}
-
-pub(crate) fn parse_cluster_migration_plan_options(
-    args: &[String],
-) -> Result<ClusterMigrationPlanOptions, CliError> {
-    let Some((invite, rest)) = args.split_first() else {
-        return Err(CliError::Usage);
-    };
-    if invite.starts_with("--") {
-        return Err(CliError::Usage);
-    }
-
-    let mut options = ClusterMigrationPlanOptions {
-        invite: invite.clone(),
-        mode: ClusterMigrationMode::SingleNode,
-    };
-    let mut index = 0;
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "--mode" => {
-                index += 1;
-                let Some(mode) = rest.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                options.mode = parse_cluster_migration_mode(mode)?;
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
 pub(crate) fn parse_cluster_migration_mode(mode: &str) -> Result<ClusterMigrationMode, CliError> {
     match mode.trim().to_ascii_lowercase().as_str() {
         "single-node" | "single_node" | "single" => Ok(ClusterMigrationMode::SingleNode),
@@ -511,104 +535,6 @@ pub(crate) fn parse_cluster_migration_mode(mode: &str) -> Result<ClusterMigratio
             ),
         }),
     }
-}
-
-pub(crate) fn parse_cluster_role_options(args: &[String]) -> Result<ClusterRoleOptions, CliError> {
-    let [node_id, role] = args else {
-        return Err(CliError::Usage);
-    };
-    Ok(ClusterRoleOptions {
-        node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-            detail: format!("invalid node id `{node_id}`: {source}"),
-        })?,
-        role: parse_cluster_node_role(role)?,
-    })
-}
-
-pub(crate) fn parse_cluster_state_authority_options(
-    args: &[String],
-) -> Result<ClusterStateAuthorityOptions, CliError> {
-    let [node_id, role] = args else {
-        return Err(CliError::Usage);
-    };
-    Ok(ClusterStateAuthorityOptions {
-        node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-            detail: format!("invalid node id `{node_id}`: {source}"),
-        })?,
-        role: parse_cluster_state_authority_role(role)?,
-    })
-}
-
-pub(crate) fn parse_cluster_promote_options(
-    args: &[String],
-) -> Result<ClusterStateAuthorityOptions, CliError> {
-    match args {
-        [node_id] => Ok(ClusterStateAuthorityOptions {
-            node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-                detail: format!("invalid node id `{node_id}`: {source}"),
-            })?,
-            role: ClusterMemberRole::Voter,
-        }),
-        _ => parse_cluster_state_authority_options(args),
-    }
-}
-
-pub(crate) fn parse_cluster_repair_members_options(
-    args: &[String],
-) -> Result<ClusterRepairMembersOptions, CliError> {
-    let mut from = None;
-    let mut promote = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--from" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                from = Some(non_empty_address(value)?);
-            }
-            "--promote" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                promote = Some(
-                    NodeId::new(value.clone()).map_err(|source| CliError::Parse {
-                        detail: format!("invalid node id `{value}`: {source}"),
-                    })?,
-                );
-            }
-            value if from.is_none() => {
-                from = Some(non_empty_address(value)?);
-            }
-            _ => return Err(CliError::Usage),
-        }
-        index += 1;
-    }
-    Ok(ClusterRepairMembersOptions {
-        from: from.ok_or_else(|| CliError::Parse {
-            detail: "cluster repair-members requires --from <host:port|iroh://...>".to_string(),
-        })?,
-        promote,
-    })
-}
-
-pub(crate) fn parse_cluster_remove_options(
-    args: &[String],
-) -> Result<ClusterRemoveOptions, CliError> {
-    if args.is_empty() {
-        return Err(CliError::Usage);
-    }
-    let mut node_ids = Vec::with_capacity(args.len());
-    for node_id in args {
-        node_ids.push(
-            NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
-                detail: format!("invalid node id `{node_id}`: {source}"),
-            })?,
-        );
-    }
-    Ok(ClusterRemoveOptions { node_ids })
 }
 
 pub(crate) fn parse_cluster_node_role(role: &str) -> Result<ClusterNodeRole, CliError> {
@@ -825,10 +751,6 @@ fn endpoint_address_port(address: &str) -> Option<u16> {
 
 pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), CliError> {
     match command {
-        ClusterCliCommand::Help => {
-            print_cluster_help();
-            Ok(())
-        }
         ClusterCliCommand::Init(options) => cluster_init(options),
         ClusterCliCommand::Invite(options) => cluster_invite(options),
         ClusterCliCommand::Join(options) => cluster_join(options),

@@ -132,19 +132,8 @@ sinomo dfs mount /path/to/mount-point --root /sinomo
 The mount command stays attached while mounted. Use `--read-only` when write
 access is unnecessary, and choose a narrower SIFS root for everyday use. The
 [SIFS reference](../sifs.md) explains the namespace and placement policies;
-`sinomo dfs help` lists inspection, pinning, exposure, conflict, and repair
+`sinomo dfs help` lists inspection, pinning, conflict, and repair
 commands.
-
-Local host-path exposure is explicit and node-owned:
-
-```sh
-sinomo dfs expose init
-sinomo dfs expose list
-sinomo dfs expose add --source /local/path --dfs-path /sinomo/exposed/name --read-only
-```
-
-Review symlink and write behavior before exposing a directory. Cluster
-membership does not expose host paths automatically.
 
 ## Voice and Realtime Models
 

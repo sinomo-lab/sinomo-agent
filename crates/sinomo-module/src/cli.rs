@@ -313,6 +313,15 @@ impl CliCommand for ModuleCliCommandRunner {
         matches!(self.command, ModuleCliCommand::Help)
     }
 
+    fn requires_rollout_admission(&self) -> bool {
+        matches!(
+            self.command,
+            ModuleCliCommand::NativeDylib(
+                ModuleNativeDylibCliCommand::Activate(_) | ModuleNativeDylibCliCommand::Unload(_)
+            )
+        )
+    }
+
     fn help(&self) -> CliCommandHelp {
         module_cli_help(&self.config)
     }

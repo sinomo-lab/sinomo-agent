@@ -1,280 +1,267 @@
-/// Invariant checks for the current DFS namespace-command replay cache.
+/// Invariant checks for durable DFS namespace-request admission.
 module dfs_namespace_command_replay_safety {
   import common.* from "../../lib/common"
   import dfs_namespace_command_replay.* from "../../models/dfs/namespace_command_replay"
 
-  def cacheShapeIsFifoBounded: bool = all {
-    cacheSize(replayCache) <= 2,
-    isSome(replayCache.newer) implies isSome(replayCache.older),
-  }
-
-
-  def replayEntryHasMatchingResponseIdentity(entry: ReplayEntry): bool = all {
-    entry.response.requestId == entry.key.command.requestId,
-    entry.response.responseSerial > 0,
-  }
-
-
-  def cachedResponsesMatchTheirCompleteCommands: bool = all {
-    match replayCache.older {
-      | Some(entry) => replayEntryHasMatchingResponseIdentity(entry)
-      | None => true
-    },
-    match replayCache.newer {
-      | Some(entry) => replayEntryHasMatchingResponseIdentity(entry)
-      | None => true
-    },
-    cacheKeys(replayCache).subseteq(executedKeys),
-  }
-
-
-  def cacheSlotsDoNotDuplicateKeys: bool =
-    match replayCache.older {
-      | Some(older) =>
-          match replayCache.newer {
-            | Some(newer) => older.key != newer.key
-            | None => true
-          }
-      | None => true
-    }
-
-
-  def responseAuditsPreserveIdentityAndEffectBoundary: bool =
-    match lastServe {
-      | Some(audit) => all {
-          audit.response.requestId == audit.key.command.requestId,
-          audit.responseDelivered == audit.waitWasActive,
-          if (isSome(audit.cachedResponseBefore)) {
-            all {
-              audit.response == unwrapOr(audit.cachedResponseBefore, defaultResponse),
-              audit.effectCountAfter == audit.effectCountBefore,
-            }
+  def admissionRecordIsWellFormed(key: RequestKey): bool =
+    match replay.ledger.get(key) {
+      | Some(record) => all {
+          record.command.requestId == key.requestId,
+          if (record.status == AdmissionPending) {
+            record.response == None
           } else {
-            audit.effectCountAfter == audit.effectCountBefore + 1
+            match record.response {
+              | Some(response) => all {
+                  response.requestId == key.requestId,
+                  response.responseSerial > 0,
+                }
+              | None => false
+            }
           },
         }
       | None => true
     }
 
+  def ledgerRecordsAreWellFormed: bool =
+    RequestKeys.forall(admissionRecordIsWellFormed)
 
-  def replayDecisionRequiresResidentExactResponse: bool =
-    match lastLifecycle {
-      | ResponseReplayed(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
-          all {
-            lastServe != None,
-            audit.key == key,
-            audit.cachedResponseBefore == Some(audit.response),
-            replayLookup(replayCache, key) == Some(audit.response),
-            audit.effectCountAfter == audit.effectCountBefore,
-          }
-        }
-      | _ => true
-    }
+  def completedRecordsNameExactlyExecutedIdentities: bool =
+    completedKeys(replay.ledger) == replay.executedKeys
 
-
-  def executionDecisionRequiresCacheMissAndOneEffect: bool =
-    match lastLifecycle {
-      | CommandExecuted(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
-          all {
-            lastServe != None,
-            audit.key == key,
-            audit.cachedResponseBefore == None,
-            audit.effectCountAfter == audit.effectCountBefore + 1,
-            executedKeys.contains(key),
-          }
-        }
-      | _ => true
-    }
-
-
-  def changedCommandAuditReallyDiffersBeyondRequestId: bool =
-    match lastServe {
-      | Some(audit) =>
-          match audit.sameRequestDifferentKeyBefore {
-            | Some(previous) => all {
-                previous.requester == audit.key.requester,
-                previous.command.requestId == audit.key.command.requestId,
-                previous.command != audit.key.command,
-                audit.cachedResponseBefore == None,
-              }
-            | None => true
-          }
-      | None => true
-    }
-
-
-  def duplicateExecutionRequiresAReplayBoundary: bool =
-    reexecutedKeys.forall(key => all {
-      executedKeys.contains(key),
-      any {
-        evictedKeys.contains(key),
-        restartClearedKeys.contains(key),
-      },
-    })
-
-
-  def replayHistorySetsComeFromExecutedCommands: bool = all {
-    evictedKeys.subseteq(executedKeys),
-    restartClearedKeys.subseteq(executedKeys),
-    reexecutedKeys.subseteq(executedKeys),
+  def effectsAreAtMostOncePerIdentity: bool = all {
+    replay.effectCount == replay.executedKeys.size(),
+    replay.effectCount >= 0,
+    replay.effectCount <= MaxEffectExecutions,
   }
 
+  def executionPermitNamesExactPendingAdmission: bool =
+    match replay.executionPermit {
+      | Some(request) => all {
+          replay.inFlight == Some(request),
+          isExactPending(recordFor(replay.ledger, request), request.command),
+          not(replay.executedKeys.contains(keyFor(request))),
+        }
+      | None => true
+    }
 
   def activeWaitTracksTheDispatchedCommand: bool =
-    match waitingFor {
-      | Some(key) => inFlight == Some(key)
+    match replay.waitingFor {
+      | Some(request) => replay.inFlight == Some(request)
       | None => true
     }
 
-
-  def cancellationDoesNotRetractInFlightCommand: bool =
-    match lastLifecycle {
-      | WaitCancelled(key) => all {
-          waitingFor == None,
-          inFlight == Some(key),
-          cancelledKeys.contains(key),
+  def cancellationDoesNotRetractAdmittedExecution: bool =
+    match replay.lastLifecycle {
+      | WaitCancelled(request) => all {
+          replay.waitingFor == None,
+          replay.inFlight == Some(request),
+          replay.cancelledKeys.contains(keyFor(request)),
         }
       | _ => true
     }
 
-
-  def responsesAreClassifiedByWaitState: bool = all {
-    deliveredResponses.forall(entry =>
-      replayEntryHasMatchingResponseIdentity(entry)
-    ),
-    discardedResponses.forall(entry =>
-      replayEntryHasMatchingResponseIdentity(entry)
-    ),
-  }
-
-
-  def countersStayInsideModelBounds: bool = all {
-    effectCount >= 0,
-    effectCount <= MaxEffectExecutions,
-    restartCount >= 0,
-    restartCount <= MaxRestarts,
-  }
-
-
-  /// Exact full-command retry while resident returns the original response and
-  /// adds no namespace effect.
-  def witnessExactResidentRetryReplays: bool =
-    match lastLifecycle {
-      | ResponseReplayed(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
+  def completionRequiresPendingAndAddsOneEffect: bool =
+    match replay.lastLifecycle {
+      | CommandCompleted(request) => {
+          val audit = unwrapOr(replay.lastServe, {
+            request: defaultRequest,
+            recordBefore: None,
+            response: None,
+            waitWasActive: false,
+            responseDelivered: false,
+            effectCountBefore: 0,
+            effectCountAfter: 0,
+          })
           all {
-            audit.key == key,
-            audit.cachedResponseBefore == Some(audit.response),
+            audit.request == request,
+            isExactPending(audit.recordBefore, request.command),
+            audit.effectCountAfter == audit.effectCountBefore + 1,
+            replay.executedKeys.contains(keyFor(request)),
+            isExactCompleted(recordFor(replay.ledger, request), request.command),
+          }
+        }
+      | _ => true
+    }
+
+  def replayRequiresCompletedAndAddsNoEffect: bool =
+    match replay.lastLifecycle {
+      | ResponseReplayed(request) => {
+          val audit = unwrapOr(replay.lastServe, {
+            request: defaultRequest,
+            recordBefore: None,
+            response: None,
+            waitWasActive: false,
+            responseDelivered: false,
+            effectCountBefore: 0,
+            effectCountAfter: 0,
+          })
+          all {
+            audit.request == request,
+            isExactCompleted(audit.recordBefore, request.command),
+            audit.response == Some(responseFor(audit.recordBefore)),
             audit.effectCountAfter == audit.effectCountBefore,
           }
         }
-      | _ => false
+      | _ => true
     }
 
-
-  /// Request id alone is not the key: a changed operation payload executes.
-  def witnessSameRequestIdChangedPayloadExecutes: bool =
-    match lastLifecycle {
-      | CommandExecuted(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
-          match audit.sameRequestDifferentKeyBefore {
-            | Some(previous) => all {
-                previous.requester == key.requester,
-                previous.command.requestId == key.command.requestId,
-                previous.command.mutation != key.command.mutation,
-                audit.effectCountAfter == audit.effectCountBefore + 1,
-              }
-            | None => false
+  def rejectionPreservesEffectCount: bool =
+    match replay.lastLifecycle {
+      | ChangedPayloadRejected(request) => {
+          val audit = unwrapOr(replay.lastServe, {
+            request: defaultRequest,
+            recordBefore: None,
+            response: None,
+            waitWasActive: false,
+            responseDelivered: false,
+            effectCountBefore: 0,
+            effectCountAfter: 0,
+          })
+          all {
+            audit.request == request,
+            isSome(audit.recordBefore),
+            unwrapOr(audit.recordBefore, {
+              command: defaultCommand,
+              status: AdmissionPending,
+              response: None,
+            }).command != request.command,
+            audit.effectCountAfter == audit.effectCountBefore,
           }
+        }
+      | PendingOutcomeRejected(request) => {
+          val audit = unwrapOr(replay.lastServe, {
+            request: defaultRequest,
+            recordBefore: None,
+            response: None,
+            waitWasActive: false,
+            responseDelivered: false,
+            effectCountBefore: 0,
+            effectCountAfter: 0,
+          })
+          all {
+            audit.request == request,
+            isExactPending(audit.recordBefore, request.command),
+            audit.effectCountAfter == audit.effectCountBefore,
+          }
+        }
+      | _ => true
+    }
+
+  def interruptedPendingNeverExecuted: bool =
+    match replay.interruptedPending {
+      | Some(request) => all {
+          isExactPending(recordFor(replay.ledger, request), request.command),
+          not(replay.executedKeys.contains(keyFor(request))),
+        }
+      | None => true
+    }
+
+  def completedBeforeRestartRemainsCompleted: bool =
+    replay.completedBeforeRestart.forall(key =>
+      match replay.ledger.get(key) {
+        | Some(record) => record.status == AdmissionCompleted
+        | None => false
+      }
+    )
+
+  def countersStayInsideModelBounds: bool = all {
+    replay.restartCount >= 0,
+    replay.restartCount <= MaxRestarts,
+  }
+
+  def witnessExactCompletedRetryReplays: bool =
+    match replay.lastLifecycle {
+      | ResponseReplayed(request) => all {
+          replay.executedKeys.contains(keyFor(request)),
+          unwrapOr(replay.lastServe, {
+            request: defaultRequest,
+            recordBefore: None,
+            response: None,
+            waitWasActive: false,
+            responseDelivered: false,
+            effectCountBefore: 0,
+            effectCountAfter: 0,
+          }).effectCountAfter == replay.effectCount,
         }
       | _ => false
     }
 
+  def witnessChangedPayloadSameIdRejected: bool =
+    match replay.lastLifecycle {
+      | ChangedPayloadRejected(request) => all {
+          isSome(recordFor(replay.ledger, request)),
+          unwrapOr(recordFor(replay.ledger, request), {
+            command: defaultCommand,
+            status: AdmissionPending,
+            response: None,
+          }).command.mutation != request.command.mutation,
+        }
+      | _ => false
+    }
 
-  /// Cancellation stops the requester wait, not primary execution.
-  def witnessCancelledCommandStillExecutes: bool =
-    match lastLifecycle {
-      | CommandExecuted(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
+  def witnessCancelledCommandStillCompletes: bool =
+    match replay.lastLifecycle {
+      | CommandCompleted(request) => {
+          val audit = unwrapOr(replay.lastServe, {
+            request: defaultRequest,
+            recordBefore: None,
+            response: None,
+            waitWasActive: false,
+            responseDelivered: false,
+            effectCountBefore: 0,
+            effectCountAfter: 0,
+          })
           all {
-            cancelledKeys.contains(key),
+            replay.cancelledKeys.contains(keyFor(request)),
             not(audit.waitWasActive),
             not(audit.responseDelivered),
-            audit.effectCountAfter == audit.effectCountBefore + 1,
           }
         }
       | _ => false
     }
 
+  def witnessRestartedPendingRetryRejected: bool =
+    match replay.lastLifecycle {
+      | PendingOutcomeRejected(request) => all {
+          replay.interruptedPending == Some(request),
+          not(replay.executedKeys.contains(keyFor(request))),
+        }
+      | _ => false
+    }
 
-  /// Once FIFO eviction removes a key, an exact delayed retry can execute the
-  /// mutation again. This is deliberately a limitation witness.
-  def witnessEvictedExactRetryReexecutes: bool =
-    match lastLifecycle {
-      | CommandExecuted(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
+  def witnessCompletedRetryAfterRestartReplays: bool =
+    match replay.lastLifecycle {
+      | ResponseReplayed(request) =>
+          replay.completedBeforeRestart.contains(keyFor(request))
+      | _ => false
+    }
+
+  def witnessCancelledFreshIdExecutes: bool =
+    match replay.lastLifecycle {
+      | CommandCompleted(request) => {
+          val cancelled = unwrapOr(replay.lastCancelled, defaultRequest)
           all {
-            audit.key == key,
-            audit.executedBefore,
-            audit.evictedBefore,
-            reexecutedKeys.contains(key),
+            replay.lastCancelled != None,
+            request.requester == cancelled.requester,
+            request.command.requestId != cancelled.command.requestId,
+            request.command.mutation == cancelled.command.mutation,
           }
         }
       | _ => false
     }
-
-
-  /// The cache is not durable: restart-cleared exact retries can execute again.
-  def witnessRestartClearedRetryReexecutes: bool =
-    match lastLifecycle {
-      | CommandExecuted(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
-          all {
-            audit.key == key,
-            audit.executedBefore,
-            audit.restartClearedBefore,
-            reexecutedKeys.contains(key),
-          }
-        }
-      | _ => false
-    }
-
-
-  /// A retry of a cancelled top-level call with a fresh request id is not an
-  /// exact cache retry, even if the mutation payload is unchanged.
-  def witnessCancelledFreshIdRetryExecutes: bool =
-    match lastLifecycle {
-      | CommandExecuted(key) => {
-          val audit = unwrapOr(lastServe, defaultAudit)
-          val cancelled = unwrapOr(mostRecentCancelled, defaultKey)
-          all {
-            mostRecentCancelled != None,
-            key.requester == cancelled.requester,
-            key.command.requestId != cancelled.command.requestId,
-            key.command.mutation == cancelled.command.mutation,
-            audit.cachedResponseBefore == None,
-            audit.effectCountAfter == audit.effectCountBefore + 1,
-          }
-        }
-      | _ => false
-    }
-
 
   def safety: bool = all {
-    cacheShapeIsFifoBounded,
-    cachedResponsesMatchTheirCompleteCommands,
-    cacheSlotsDoNotDuplicateKeys,
-    responseAuditsPreserveIdentityAndEffectBoundary,
-    replayDecisionRequiresResidentExactResponse,
-    executionDecisionRequiresCacheMissAndOneEffect,
-    changedCommandAuditReallyDiffersBeyondRequestId,
-    duplicateExecutionRequiresAReplayBoundary,
-    replayHistorySetsComeFromExecutedCommands,
+    ledgerRecordsAreWellFormed,
+    completedRecordsNameExactlyExecutedIdentities,
+    effectsAreAtMostOncePerIdentity,
+    executionPermitNamesExactPendingAdmission,
     activeWaitTracksTheDispatchedCommand,
-    cancellationDoesNotRetractInFlightCommand,
-    responsesAreClassifiedByWaitState,
+    cancellationDoesNotRetractAdmittedExecution,
+    completionRequiresPendingAndAddsOneEffect,
+    replayRequiresCompletedAndAddsNoEffect,
+    rejectionPreservesEffectCount,
+    interruptedPendingNeverExecuted,
+    completedBeforeRestartRemainsCompleted,
     countersStayInsideModelBounds,
   }
 }

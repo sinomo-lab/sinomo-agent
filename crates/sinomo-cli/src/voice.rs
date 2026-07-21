@@ -1,4 +1,8 @@
 use super::*;
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteChoice, CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec,
+    CliParseError, CliValueSpec,
+};
 use sinomo_runtime::cluster;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,7 +18,6 @@ fn native_voice_video_failure_is_terminal(failures: &mut u8) -> bool {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum VoiceCliCommand {
-    Help,
     Devices,
     Call(VoiceCallOptions),
 }
@@ -85,194 +88,220 @@ impl Default for VoiceCallOptions {
     }
 }
 
-pub(crate) fn parse_voice_command(args: &[String]) -> Result<VoiceCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(VoiceCliCommand::Help),
-        Some((arg, [])) if matches!(arg.as_str(), "help" | "--help" | "-h") => {
-            Ok(VoiceCliCommand::Help)
-        }
-        Some((command, [])) if command == "devices" => Ok(VoiceCliCommand::Devices),
-        Some((command, rest)) if command == "call" => {
-            Ok(VoiceCliCommand::Call(parse_voice_call_options(rest)?))
-        }
-        _ => Err(CliError::Usage),
+pub(crate) fn voice_cli_command_handler() -> DeclarativeCommandHandler<VoiceCliCommand> {
+    DeclarativeCommandHandler::new(
+        "voice",
+        CliCommandPolicy::local_capable(),
+        voice_cli_spec,
+        parse_voice_matches,
+        run_voice_command,
+    )
+}
+
+fn voice_cli_spec() -> CliCommandSpec {
+    let free = |name: &'static str, help: &'static str, placeholder: &'static str| {
+        CliOptionSpec::value(name, help, CliValueSpec::new(placeholder, help))
+    };
+    let choices = |name: &'static str,
+                   help: &'static str,
+                   placeholder: &'static str,
+                   values: &'static [&'static str]| {
+        CliOptionSpec::value(
+            name,
+            help,
+            CliValueSpec::new(placeholder, help)
+                .with_choices(
+                    values
+                        .iter()
+                        .map(|value| CliAutocompleteChoice::new(*value, help)),
+                )
+                .restricted(),
+        )
+    };
+    CliCommandSpec::new("voice", "use realtime voice and native media devices")
+        .help_on_empty()
+        .with_children([
+            CliCommandSpec::new("devices", "list native microphones, cameras, and speakers"),
+            CliCommandSpec::new("call", "run a realtime voice session").with_options([
+                free("--provider", "realtime model provider", "provider"),
+                free("--model", "realtime model id", "model"),
+                free("--instructions", "session instructions", "text").with_aliases(["--prompt"]),
+                free("--input", "raw PCM input path or -", "path|-"),
+                free("--output", "raw PCM output path or -", "path|-"),
+                free("--video-frame", "JPEG or PNG video frame", "path")
+                    .with_aliases(["--image"])
+                    .repeatable(),
+                choices(
+                    "--video-format",
+                    "video frame format",
+                    "format",
+                    &["jpg", "jpeg", "image/jpeg", "png", "image/png"],
+                )
+                .with_aliases(["--image-format"]),
+                choices(
+                    "--video-detail",
+                    "video frame detail",
+                    "detail",
+                    &["auto", "low", "high"],
+                )
+                .with_aliases(["--image-detail"]),
+                free("--video-frame-ms", "video frame interval", "milliseconds"),
+                free("--session", "session id", "session-id").with_aliases(["--session-id"]),
+                free("--endpoint", "realtime endpoint URL", "url").with_aliases(["--url"]),
+                free("--voice", "voice id or reference audio", "voice"),
+                free("--chunk-ms", "audio chunk duration", "milliseconds"),
+                free("--sample-rate", "input sample rate", "hz")
+                    .with_aliases(["--input-sample-rate"]),
+                choices(
+                    "--input-format",
+                    "input audio sample format",
+                    "format",
+                    &[
+                        "pcm16",
+                        "pcm16-le",
+                        "s16le",
+                        "f32",
+                        "f32-le",
+                        "float32",
+                        "float32-le",
+                    ],
+                ),
+                choices(
+                    "--turn",
+                    "turn detection mode",
+                    "mode",
+                    &["manual", "none", "semantic-vad", "vad"],
+                )
+                .with_aliases(["--turn-detection"]),
+                free("--receive-timeout-ms", "receive timeout", "milliseconds"),
+                CliOptionSpec::flag("--native", "use native microphone and speaker"),
+                CliOptionSpec::flag("--native-mic", "use a native microphone")
+                    .with_aliases(["--microphone"]),
+                free("--mic-device", "microphone selector", "selector")
+                    .with_aliases(["--microphone-device"]),
+                CliOptionSpec::flag("--native-camera", "use a native camera")
+                    .with_aliases(["--camera"]),
+                free("--camera-device", "camera selector", "selector"),
+                CliOptionSpec::flag("--native-speaker", "use a native speaker")
+                    .with_aliases(["--speaker"]),
+                free("--speaker-device", "speaker selector", "selector"),
+                free("--call-ms", "maximum call duration", "milliseconds")
+                    .with_aliases(["--duration-ms"]),
+                CliOptionSpec::flag("--no-pacing", "disable realtime input pacing"),
+                CliOptionSpec::flag("--force-listen", "force response listening"),
+                CliOptionSpec::flag("--no-audio", "disable audio input")
+                    .with_aliases(["--no-audio-input"]),
+            ]),
+        ])
+}
+
+fn parse_voice_matches(matches: &CliCommandMatches) -> Result<VoiceCliCommand, CliParseError> {
+    match matches.command_name() {
+        "devices" => Ok(VoiceCliCommand::Devices),
+        "call" => parse_voice_call_matches(matches).map(VoiceCliCommand::Call),
+        _ => Err(CliParseError::Parse {
+            detail: "voice requires a subcommand".to_string(),
+        }),
     }
 }
 
-fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliError> {
+#[cfg(test)]
+fn parse_voice_schema_for_test(args: &[String]) -> Result<VoiceCliCommand, CliError> {
+    parse_schema_command_for_test(voice_cli_spec(), args, parse_voice_matches)
+}
+
+fn parse_voice_call_matches(
+    matches: &CliCommandMatches,
+) -> Result<VoiceCallOptions, CliParseError> {
     let mut options = VoiceCallOptions::default();
-    let mut input_specified = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--provider" => {
-                index += 1;
-                options.provider = required_value(args, index, "--provider")?.to_string();
-            }
-            "--model" => {
-                index += 1;
-                options.model = Some(required_value(args, index, "--model")?.to_string());
-            }
-            "--instructions" | "--prompt" => {
-                index += 1;
-                options.instructions = required_value(args, index, "--instructions")?.to_string();
-            }
-            "--input" => {
-                index += 1;
-                input_specified = true;
-                let value = required_value(args, index, "--input")?;
-                options.input = if value == "-" {
-                    None
-                } else {
-                    Some(PathBuf::from(value))
-                };
-            }
-            "--output" => {
-                index += 1;
-                let value = required_value(args, index, "--output")?;
-                options.output = if value == "-" {
-                    Some(PathBuf::from("-"))
-                } else {
-                    Some(PathBuf::from(value))
-                };
-            }
-            "--video-frame" | "--image" => {
-                index += 1;
-                options.video_frames.push(PathBuf::from(required_value(
-                    args,
-                    index,
-                    "--video-frame",
-                )?));
-            }
-            "--video-format" | "--image-format" => {
-                index += 1;
-                options.video_format = Some(parse_video_format(required_value(
-                    args,
-                    index,
-                    "--video-format",
-                )?)?);
-            }
-            "--video-detail" | "--image-detail" => {
-                index += 1;
-                options.video_detail =
-                    parse_video_detail(required_value(args, index, "--video-detail")?)?;
-            }
-            "--video-frame-ms" => {
-                index += 1;
-                options.video_frame_ms = parse_u64_option(args, index, "--video-frame-ms")?;
-            }
-            "--session" | "--session-id" => {
-                index += 1;
-                let value = required_value(args, index, "--session")?;
-                options.session_id = Some(value.parse().map_err(|source| CliError::Parse {
-                    detail: format!("invalid session id `{value}`: {source}"),
-                })?);
-            }
-            "--endpoint" | "--url" => {
-                index += 1;
-                options.endpoint = Some(required_value(args, index, "--endpoint")?.to_string());
-            }
-            "--voice" => {
-                index += 1;
-                options.voice = Some(required_value(args, index, "--voice")?.to_string());
-            }
-            "--chunk-ms" => {
-                index += 1;
-                options.chunk_ms = parse_u64_option(args, index, "--chunk-ms")?;
-            }
-            "--sample-rate" | "--input-sample-rate" => {
-                index += 1;
-                options.input_sample_rate_hz =
-                    Some(parse_u64_option(args, index, "--sample-rate")? as u32);
-            }
-            "--input-format" => {
-                index += 1;
-                options.input_format = Some(parse_audio_format(required_value(
-                    args,
-                    index,
-                    "--input-format",
-                )?)?);
-            }
-            "--turn" | "--turn-detection" => {
-                index += 1;
-                options.turn_detection =
-                    parse_turn_detection(required_value(args, index, "--turn")?)?;
-            }
-            "--receive-timeout-ms" => {
-                index += 1;
-                options.receive_timeout_ms =
-                    Some(parse_u64_option(args, index, "--receive-timeout-ms")?);
-            }
-            "--native" => {
-                options.native_microphone = true;
-                options.native_speaker = true;
-            }
-            "--native-mic" | "--microphone" => {
-                options.native_microphone = true;
-            }
-            "--mic-device" | "--microphone-device" => {
-                index += 1;
-                options.native_microphone = true;
-                options.microphone_device =
-                    Some(required_value(args, index, "--mic-device")?.to_string());
-            }
-            "--native-camera" | "--camera" => {
-                options.native_camera = true;
-            }
-            "--camera-device" => {
-                index += 1;
-                options.native_camera = true;
-                options.camera_device =
-                    Some(required_value(args, index, "--camera-device")?.to_string());
-            }
-            "--native-speaker" | "--speaker" => {
-                options.native_speaker = true;
-            }
-            "--speaker-device" => {
-                index += 1;
-                options.native_speaker = true;
-                options.speaker_device =
-                    Some(required_value(args, index, "--speaker-device")?.to_string());
-            }
-            "--call-ms" | "--duration-ms" => {
-                index += 1;
-                options.call_ms = Some(parse_u64_option(args, index, "--call-ms")?);
-            }
-            "--no-pacing" => {
-                options.pace = false;
-            }
-            "--force-listen" => {
-                options.force_listen = true;
-            }
-            "--no-audio" | "--no-audio-input" => {
-                options.audio_input = false;
-            }
-            "--help" | "-h" => return Err(CliError::Usage),
-            other => {
-                return Err(CliError::Parse {
-                    detail: format!("unknown voice call option `{other}`"),
-                });
-            }
-        }
-        index += 1;
+    let input_specified = matches.contains("--input");
+    if let Some(value) = matches.value("--provider") {
+        options.provider = value.to_string();
     }
+    options.model = matches.value("--model").map(str::to_string);
+    if let Some(value) = matches.value("--instructions") {
+        options.instructions = value.to_string();
+    }
+    options.input = matches
+        .value("--input")
+        .and_then(|value| (value != "-").then(|| PathBuf::from(value)));
+    options.output = matches.value("--output").map(PathBuf::from);
+    options.video_frames = matches.values("--video-frame").map(PathBuf::from).collect();
+    options.video_format = matches
+        .value("--video-format")
+        .map(parse_video_format)
+        .transpose()
+        .map_err(semantic_parse_error)?;
+    if let Some(value) = matches.value("--video-detail") {
+        options.video_detail = parse_video_detail(value).map_err(semantic_parse_error)?;
+    }
+    if let Some(value) = matches.value("--video-frame-ms") {
+        options.video_frame_ms = parse_u64_value("--video-frame-ms", value)?;
+    }
+    options.session_id = matches
+        .value("--session")
+        .map(|value| {
+            value.parse().map_err(|source| CliParseError::Parse {
+                detail: format!("invalid session id `{value}`: {source}"),
+            })
+        })
+        .transpose()?;
+    options.endpoint = matches.value("--endpoint").map(str::to_string);
+    options.voice = matches.value("--voice").map(str::to_string);
+    if let Some(value) = matches.value("--chunk-ms") {
+        options.chunk_ms = parse_u64_value("--chunk-ms", value)?;
+    }
+    options.input_sample_rate_hz = matches
+        .value("--sample-rate")
+        .map(|value| parse_u64_value("--sample-rate", value).map(|value| value as u32))
+        .transpose()?;
+    options.input_format = matches
+        .value("--input-format")
+        .map(parse_audio_format)
+        .transpose()
+        .map_err(semantic_parse_error)?;
+    if let Some(value) = matches.value("--turn") {
+        options.turn_detection = parse_turn_detection(value).map_err(semantic_parse_error)?;
+    }
+    options.receive_timeout_ms = matches
+        .value("--receive-timeout-ms")
+        .map(|value| parse_u64_value("--receive-timeout-ms", value))
+        .transpose()?;
+    options.native_microphone = matches.contains("--native")
+        || matches.contains("--native-mic")
+        || matches.contains("--mic-device");
+    options.microphone_device = matches.value("--mic-device").map(str::to_string);
+    options.native_camera =
+        matches.contains("--native-camera") || matches.contains("--camera-device");
+    options.camera_device = matches.value("--camera-device").map(str::to_string);
+    options.native_speaker = matches.contains("--native")
+        || matches.contains("--native-speaker")
+        || matches.contains("--speaker-device");
+    options.speaker_device = matches.value("--speaker-device").map(str::to_string);
+    options.call_ms = matches
+        .value("--call-ms")
+        .map(|value| parse_u64_value("--call-ms", value))
+        .transpose()?;
+    options.pace = !matches.contains("--no-pacing");
+    options.force_listen = matches.contains("--force-listen");
+    options.audio_input = !matches.contains("--no-audio");
     if options.chunk_ms == 0 {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "--chunk-ms must be greater than zero".to_string(),
         });
     }
     if options.video_frame_ms == 0 {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "--video-frame-ms must be greater than zero".to_string(),
         });
     }
     if options.call_ms == Some(0) {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "--call-ms must be greater than zero".to_string(),
         });
     }
     if options.native_microphone && input_specified {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "--native-mic cannot be combined with --input".to_string(),
         });
     }
@@ -280,7 +309,7 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
         options.audio_input = false;
     }
     if !options.audio_input && options.video_frames.is_empty() && !options.native_camera {
-        return Err(CliError::Parse {
+        return Err(CliParseError::Parse {
             detail: "voice call needs audio input, native camera, or at least one --video-frame"
                 .to_string(),
         });
@@ -288,18 +317,8 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
     Ok(options)
 }
 
-fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, CliError> {
-    args.get(index)
-        .map(String::as_str)
-        .filter(|value| !value.starts_with("--"))
-        .ok_or_else(|| CliError::Parse {
-            detail: format!("{flag} requires a value"),
-        })
-}
-
-fn parse_u64_option(args: &[String], index: usize, flag: &str) -> Result<u64, CliError> {
-    let value = required_value(args, index, flag)?;
-    value.parse::<u64>().map_err(|source| CliError::Parse {
+fn parse_u64_value(flag: &str, value: &str) -> Result<u64, CliParseError> {
+    value.parse::<u64>().map_err(|source| CliParseError::Parse {
         detail: format!("invalid {flag} value `{value}`: {source}"),
     })
 }
@@ -362,10 +381,6 @@ fn video_format_from_path(path: &Path) -> Option<sinomo_lm::RealtimeVideoFrameFo
 
 pub(crate) fn run_voice_command(command: VoiceCliCommand) -> Result<(), CliError> {
     match command {
-        VoiceCliCommand::Help => {
-            print_voice_help();
-            Ok(())
-        }
         VoiceCliCommand::Devices => run_voice_devices(),
         VoiceCliCommand::Call(options) => run_voice_call(options),
     }
@@ -1350,7 +1365,7 @@ mod tests {
 
     #[test]
     fn voice_call_options_parse_minicpm_audio_defaults() {
-        let command = parse_voice_command(&[
+        let command = parse_voice_schema_for_test(&[
             "call".to_string(),
             "--provider".to_string(),
             "minicpm-o".to_string(),
@@ -1378,7 +1393,7 @@ mod tests {
 
     #[test]
     fn voice_call_options_accept_video_frames_without_stdin_audio() {
-        let command = parse_voice_command(&[
+        let command = parse_voice_schema_for_test(&[
             "call".to_string(),
             "--provider".to_string(),
             "openai".to_string(),
@@ -1403,7 +1418,7 @@ mod tests {
 
     #[test]
     fn voice_call_options_keep_stdin_audio_when_explicit_with_video() {
-        let command = parse_voice_command(&[
+        let command = parse_voice_schema_for_test(&[
             "call".to_string(),
             "--video-frame".to_string(),
             "frame-001.jpg".to_string(),
@@ -1421,7 +1436,7 @@ mod tests {
 
     #[test]
     fn voice_call_options_accept_native_media_devices() {
-        let command = parse_voice_command(&[
+        let command = parse_voice_schema_for_test(&[
             "call".to_string(),
             "--native-mic".to_string(),
             "--camera-device".to_string(),

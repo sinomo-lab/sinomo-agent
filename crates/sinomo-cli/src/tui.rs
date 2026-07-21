@@ -6022,7 +6022,6 @@ mod tui_tests {
             .map(TuiSettingsEntry::key)
             .collect::<Vec<_>>();
 
-        assert!(keys.iter().any(|key| *key == "dfs.expose"));
         assert!(keys.iter().any(|key| *key == "rollout.telemetry.gates"));
         assert!(keys.iter().any(|key| *key == "lm.providers"));
         assert!(

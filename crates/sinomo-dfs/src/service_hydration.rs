@@ -890,7 +890,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // but their running/terminal state owns the replica-local
             // failover guard and must update it on every replayed transition.
             DfsMetadataMutation::PutAdvisoryLockState { .. }
-            | DfsMetadataMutation::PutNamespacePrepare { .. } => {}
+            | DfsMetadataMutation::PutNamespacePrepare { .. }
+            | DfsMetadataMutation::PutNamespaceRequest { .. } => {}
             DfsMetadataMutation::PutNamespaceJob { job, .. } => {
                 let Some(job) = job.as_ref() else {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
@@ -1022,7 +1023,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
             DfsMetadataMutation::PutAdvisoryLockState { .. }
-            | DfsMetadataMutation::PutNamespacePrepare { .. } => {}
+            | DfsMetadataMutation::PutNamespacePrepare { .. }
+            | DfsMetadataMutation::PutNamespaceRequest { .. } => {}
             DfsMetadataMutation::PutNamespaceJob { job_id, .. } => {
                 let job = self
                     .metadata_backend

@@ -467,10 +467,6 @@ impl SifsFileManagerBackend {
             let previous_deadline = operation_deadline
                 .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
             let result: Result<(), String> = (|| {
-                sifs_operation_remaining(operation_deadline, "deferred content durability")?;
-                service
-                    .flush_deferred_content_durability()
-                    .map_err(|error| error.to_string())?;
                 sifs_operation_remaining(operation_deadline, "detached DFS sends")?;
                 service
                     .flush_detached_transport_sends()

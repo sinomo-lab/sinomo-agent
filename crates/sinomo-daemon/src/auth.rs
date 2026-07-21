@@ -331,9 +331,6 @@ pub fn authorize_authenticated_daemon_command(
         {
             authenticated.signer.can_run_admin_command()
         }
-        route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
-            authenticated.signer.can_run_local_command()
-        }
         route if route == crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE => {
             authenticated.signer.can_run_admin_command()
         }

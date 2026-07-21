@@ -72,10 +72,11 @@ pub(crate) fn attach_dfs_message_request_attachment(
             command.snapshot = SinomoObjectCodec::network_frame().decode(&bytes)?;
         }
         DfsNetworkMessage::NamespaceRequest(command) => {
-            let DfsNamespaceOperation::ApplyTransaction { transaction } = &mut command.operation
+            let DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } =
+                &mut command.operation
             else {
                 return Err(serialization_error(
-                    "DFS namespace request attachment requires an apply-transaction head",
+                    "DFS namespace request attachment requires a local-eventual batch head",
                 ));
             };
             let decoded: DfsNamespaceTransaction =

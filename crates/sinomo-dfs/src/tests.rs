@@ -1108,7 +1108,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
             include_metadata_journal_batches: true,
             metadata_journal_after_sequences: Vec::new(),
             authority_shards: Vec::new(),
-            operation: DfsNamespaceOperation::ApplyTransaction {
+            operation: DfsNamespaceOperation::CommitLocalEventualBatch {
                 transaction: DfsNamespaceTransaction {
                     transaction_id: "bulk-transaction".to_string(),
                     file_system_id,
@@ -1117,6 +1117,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
                     advisory_lock_states: Vec::new(),
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 },
+                writes: Vec::new(),
             },
         }),
     );
@@ -10420,6 +10421,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
             path: object.path.clone(),
             expected_object_id: None,
         }],
+        content_receipts: Vec::new(),
         transaction,
         status: DfsNamespacePrepareStatus::Prepared,
     };
@@ -10607,6 +10609,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             path: object.path.clone(),
             expected_object_id: None,
         }],
+        content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
             transaction_id: "transaction-authority-gap".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -11022,6 +11025,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             path: source_object.path.clone(),
             expected_object_id: Some(source_object.object_id.clone()),
         }],
+        content_receipts: Vec::new(),
         transaction: DfsNamespaceTransaction {
             transaction_id: "service-authority-transaction".to_string(),
             file_system_id: file_system.file_system_id.clone(),
@@ -30810,7 +30814,7 @@ fn sifs_cluster_primary_posix_write(cluster: &mut SifsPosixCluster, path: &str, 
 }
 
 #[test]
-fn sifs_cluster_primary_detached_large_write_defers_blob_durability_flush() {
+fn sifs_cluster_primary_detached_large_write_is_readable_without_follow_up_flush() {
     let mut cluster = sifs_posix_cluster("sifs-cluster-primary-detached-large");
     let path = "/services/primary-detached-large.bin";
     let bytes = (0..(2 * 1024 * 1024 + 8192))
@@ -30830,23 +30834,9 @@ fn sifs_cluster_primary_detached_large_write_defers_blob_durability_flush() {
         cluster
             .primary
             .content
-            .debug_deferred_durable_blob_count()
-            .expect("deferred durable blob count"),
-        1,
-        "local metadata-primary detached writes must not synchronously flush blob durability"
-    );
-
-    cluster
-        .primary
-        .flush_deferred_content_durability()
-        .expect("flush deferred durability");
-    assert_eq!(
-        cluster
-            .primary
-            .content
-            .debug_deferred_durable_blob_count()
-            .expect("deferred durable blob count after flush"),
-        0
+            .read_blob(&expected_hash)
+            .expect("durable blob is readable when metadata becomes visible"),
+        bytes
     );
 
     std::fs::remove_dir_all(&cluster.root).ok();
@@ -36427,11 +36417,14 @@ fn routed_namespace_rejects_stale_authority_stamp_before_mutation() {
 }
 
 #[test]
-fn served_namespace_exact_retry_replays_completed_rename() {
+fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse() {
     let cluster = sifs_two_primary_cluster("sifs-namespace-rename-replay");
     let SifsTwoPrimaryCluster {
         root,
+        users_primary_node,
+        services_primary_node,
         replica_node,
+        shared_kv,
         mut services_primary,
         replica,
         ..
@@ -36477,6 +36470,39 @@ fn served_namespace_exact_retry_replays_completed_rename() {
         .posix_stat(destination)
         .expect("destination after first rename")
         .version;
+    let durable_request = services_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&replica_node, &request_id)
+        .expect("durable namespace request lookup")
+        .expect("completed namespace request record");
+    assert_eq!(durable_request.status, DfsNamespaceRequestStatus::Completed);
+    assert_eq!(durable_request.result, Some(DfsNamespaceResult::Applied));
+
+    let restarted_transport = services_primary.transport.clone();
+    drop(services_primary);
+    let restarted_shards = sifs_two_primary_shard_configs(
+        &users_primary_node,
+        &services_primary_node,
+        2,
+        vec![services_primary_node.clone(), replica_node.clone()],
+        vec![users_primary_node.clone(), replica_node.clone()],
+    );
+    let mut services_primary = NetworkedDfsService::new(
+        restarted_transport,
+        LocalContentStore::new(root.join("services-primary").join("content"))
+            .expect("restarted services content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(
+            root.join("services-primary").join("metadata"),
+            restarted_shards,
+        )
+        .expect("reopen services metadata"),
+    )
+    .expect("attach restarted services metadata");
 
     let replay = services_primary
         .handle_namespace_request(replica_node.clone(), command)
@@ -36518,19 +36544,123 @@ fn served_namespace_exact_retry_replays_completed_rename() {
     };
     let distinct = services_primary
         .handle_namespace_request(replica_node, distinct_same_id)
-        .expect("same request id with a distinct command must execute");
+        .expect("same request id with a distinct command must be rejected");
     assert!(matches!(
         distinct,
         NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            result: DfsNamespaceResult::Applied,
-            mutates_metadata: true,
+            result: DfsNamespaceResult::Rejected { ref reason, .. },
+            mutates_metadata: false,
             ..
-        }
+        } if reason.contains("already used for a different command")
     ));
-    assert!(services_primary.posix_stat(second_destination).is_ok());
+    assert!(matches!(
+        services_primary.posix_stat(second_destination),
+        Err(DfsPosixError::NotFound { .. })
+    ));
 
     drop(replica);
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
+    let cluster = sifs_two_primary_cluster("sifs-namespace-pending-restart");
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary_node,
+        services_primary_node,
+        replica_node,
+        shared_kv,
+        mut services_primary,
+        replica,
+        ..
+    } = cluster;
+    let source = "/services/pending-source.txt";
+    let destination = "/services/pending-destination.txt";
+    let primary_node = services_primary.node_id().clone();
+    services_primary
+        .posix_write_file(
+            source,
+            b"pending request payload",
+            DfsWriteOptions::replicated_eventual(vec![primary_node]),
+        )
+        .expect("seed pending source");
+
+    let command = DfsNamespaceCommand {
+        request_id: "dfs_net_req_pending_restart".to_string(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: replica_node.clone(),
+        include_metadata_journal_batches: true,
+        metadata_journal_after_sequences: Vec::new(),
+        authority_shards: Vec::new(),
+        operation: DfsNamespaceOperation::Rename {
+            from: source.to_string(),
+            to: destination.to_string(),
+        },
+    };
+    let encoded = serde_json::to_vec(&command).expect("encode command digest");
+    let now = OffsetDateTime::now_utc();
+    let pending = DfsNamespaceRequestRecord {
+        file_system_id: command.file_system_id.clone(),
+        requester_node_id: replica_node.clone(),
+        request_id: command.request_id.clone(),
+        command_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
+        status: DfsNamespaceRequestStatus::Pending,
+        result: None,
+        posix_coordination_result: None,
+        created_at: now,
+        updated_at: now,
+    };
+    services_primary
+        .metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_namespace_request_on_shard(&DfsMetadataShardId::new("services"), &pending)
+        .expect("persist pending request");
+
+    let restarted_transport = services_primary.transport.clone();
+    drop(services_primary);
+    let restarted_shards = sifs_two_primary_shard_configs(
+        &users_primary_node,
+        &services_primary_node,
+        2,
+        vec![services_primary_node.clone(), replica_node.clone()],
+        vec![users_primary_node.clone(), replica_node.clone()],
+    );
+    let mut services_primary = NetworkedDfsService::new(
+        restarted_transport,
+        LocalContentStore::new(root.join("services-primary").join("content"))
+            .expect("restarted services content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(
+            root.join("services-primary").join("metadata"),
+            restarted_shards,
+        )
+        .expect("reopen services metadata"),
+    )
+    .expect("attach restarted services metadata");
+
+    let event = services_primary
+        .handle_namespace_request(replica_node, command)
+        .expect("serve interrupted request retry");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Rejected { ref reason, .. },
+            mutates_metadata: false,
+            ..
+        } if reason.contains("indeterminate durable outcome")
+    ));
+    assert!(services_primary.posix_stat(source).is_ok());
+    assert!(matches!(
+        services_primary.posix_stat(destination),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    drop(replica);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -36639,8 +36769,8 @@ fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
 }
 
 #[test]
-fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
-    let root = temp_root("apply-transaction-shard-selection-once");
+fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths() {
+    let root = temp_root("local-eventual-batch-shard-selection-once");
     let primary = NodeId::from_legacy_named("node_apply_txn_primary").expect("primary");
     let requester = NodeId::from_legacy_named("node_apply_txn_requester").expect("requester");
     let shards = sifs_two_primary_shard_configs(
@@ -36690,8 +36820,8 @@ fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
             path,
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
-            owner_node_id: primary.clone(),
-            current_locations: vec![primary.clone()],
+            owner_node_id: requester.clone(),
+            current_locations: vec![requester.clone()],
             content_hash: Some(format!("hash-{index:03}")),
             content_size_bytes: Some(4096),
             link_target_object_id: None,
@@ -36706,11 +36836,32 @@ fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
                 .expect("version"),
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
-            last_modified_by_event_id: None,
+            last_modified_by_event_id: Some(EventId::generate()),
         };
         versions.push(object_version_record(&object, object.content_size_bytes));
         objects.push(object);
     }
+    let writes = objects
+        .iter()
+        .map(|object| DfsLocalEventualBatchWriteProof {
+            expected_base_version: None,
+            receipt: DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    committed_version: object.version.clone(),
+                    owner_node_id: primary.clone(),
+                    event_id: object
+                        .last_modified_by_event_id
+                        .clone()
+                        .expect("write event"),
+                },
+                replica_node_id: requester.clone(),
+                content_hash: object.content_hash.clone(),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        })
+        .collect::<Vec<_>>();
     let transaction = DfsNamespaceTransaction {
         transaction_id: namespace_transaction_id_for_batch(
             "visible-batch",
@@ -36724,22 +36875,25 @@ fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
         advisory_lock_states: Vec::new(),
         created_at: OffsetDateTime::UNIX_EPOCH,
     };
+    let committed_object_id = transaction.objects[0].object_id.clone();
+    let committed_version = transaction.objects[0].version.clone();
 
     range_prefix_calls.store(0, Ordering::SeqCst);
+    let command = DfsNamespaceCommand {
+        request_id: "dfs_net_req_local_eventual_bulk".to_string(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: requester.clone(),
+        include_metadata_journal_batches: false,
+        metadata_journal_after_sequences: Vec::new(),
+        authority_shards: Vec::new(),
+        operation: DfsNamespaceOperation::CommitLocalEventualBatch {
+            transaction,
+            writes,
+        },
+    };
     let event = dfs
-        .handle_namespace_request(
-            requester.clone(),
-            DfsNamespaceCommand {
-                request_id: "dfs_net_req_apply_txn_bulk".to_string(),
-                file_system_id: sifs_file_system_id(),
-                requesting_node_id: requester,
-                include_metadata_journal_batches: false,
-                metadata_journal_after_sequences: Vec::new(),
-                authority_shards: Vec::new(),
-                operation: DfsNamespaceOperation::ApplyTransaction { transaction },
-            },
-        )
-        .expect("apply transaction namespace request");
+        .handle_namespace_request(requester.clone(), command.clone())
+        .expect("commit local-eventual batch namespace request");
 
     assert!(matches!(
         event,
@@ -36751,15 +36905,93 @@ fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
     assert_eq!(
         range_prefix_calls.load(Ordering::SeqCst),
         1,
-        "bulk ApplyTransaction shard selection must classify paths from one shard snapshot"
+        "bulk local-eventual shard selection must classify paths from one shard snapshot"
     );
+    assert!(
+        dfs.backend_receipt_for_replica(&committed_object_id, &committed_version, &requester,)
+            .expect("durable batch receipt lookup")
+            .is_some(),
+        "visible batch metadata must have its caller receipt"
+    );
+
+    // The durable request ledger and committed transaction/receipts remain the
+    // retry anchor; revalidating against the changed base would reject it.
+    let replay = dfs
+        .handle_namespace_request(requester, command)
+        .expect("durable local-eventual batch replay");
+    assert!(matches!(
+        replay,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: false,
+            ..
+        }
+    ));
 
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn apply_transaction_rejects_multiple_shards_with_the_same_local_primary() {
-    let root = temp_root("apply-transaction-rejects-multiple-local-shards");
+fn bulk_local_eventual_splits_distinct_shards_owned_by_the_same_primary() {
+    let root = temp_root("bulk-local-eventual-same-primary-distinct-shards");
+    let primary = NodeId::from_legacy_named("node_bulk_same_primary").expect("primary");
+    let shards = sifs_two_primary_shard_configs(&primary, &primary, 1, Vec::new(), Vec::new());
+    let mut kv = InProcessKvStore::new();
+    {
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    }
+
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(primary),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata"),
+    )
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+    dfs.posix_mkdir_all("/users/bulk-same-primary")
+        .expect("users parent");
+    dfs.posix_mkdir_all("/services/bulk-same-primary")
+        .expect("services parent");
+
+    let files = [
+        (
+            "/users/bulk-same-primary/users.txt",
+            b"users shard bytes".as_slice(),
+        ),
+        (
+            "/services/bulk-same-primary/services.txt",
+            b"services shard bytes".as_slice(),
+        ),
+    ];
+    let stats = dfs
+        .posix_create_files_local_eventual_with_known_parents(files)
+        .expect("same-primary multi-shard bulk create");
+
+    assert_eq!(stats.len(), 2);
+    for (path, bytes) in files {
+        assert_eq!(
+            dfs.posix_read_file(path).expect("read committed file"),
+            bytes
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
+    let root = temp_root("local-eventual-batch-rejects-multiple-local-shards");
     let primary = NodeId::from_legacy_named("node_apply_txn_multi_primary").expect("primary");
     let requester = NodeId::from_legacy_named("node_apply_txn_multi_requester").expect("requester");
     let shards = sifs_two_primary_shard_configs(
@@ -36831,7 +37063,10 @@ fn apply_transaction_rejects_multiple_shards_with_the_same_local_primary() {
                 include_metadata_journal_batches: false,
                 metadata_journal_after_sequences: Vec::new(),
                 authority_shards: Vec::new(),
-                operation: DfsNamespaceOperation::ApplyTransaction { transaction },
+                operation: DfsNamespaceOperation::CommitLocalEventualBatch {
+                    transaction,
+                    writes: Vec::new(),
+                },
             },
         )
         .expect("multi-shard namespace request produces a typed rejection");

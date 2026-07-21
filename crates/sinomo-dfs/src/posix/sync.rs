@@ -45,10 +45,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         kind: DfsPosixSyncKind,
     ) -> Result<DfsPosixFileSyncCertificate> {
-        // The caller may hold a durable receipt whose blob directory flush was
-        // deferred by a detached write. Flush it before routing so the remote
-        // metadata primary never certifies a merely logical local receipt.
-        self.flush_deferred_content_durability()?;
         let target = self.posix_capture_file_sync_target(path, kind)?;
         self.posix_sync_file_target(&target)
     }
@@ -61,7 +57,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsPosixFileSyncTarget,
     ) -> Result<DfsPosixFileSyncCertificate> {
-        self.flush_deferred_content_durability()?;
         let authority_path = self
             .current_read_object_metadata(&target.object_id)
             .ok()
@@ -330,7 +325,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         timeout: Duration,
     ) -> Result<DfsPosixFileSyncCertificate> {
         let started_at = Instant::now();
-        self.flush_deferred_content_durability()?;
         let content_evidence = loop {
             self.check_cancelled("file sync content receipts")?;
             match self.posix_validate_file_sync_target_local(target) {

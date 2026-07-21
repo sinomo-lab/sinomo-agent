@@ -7,7 +7,7 @@ use crate::dfs::{
     DaemonDfsMaintenanceTickOutcome, DaemonDfsPendingMaintenanceWork,
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
     daemon_dfs_now_unix_nanos, daemon_dfs_pending_maintenance_work,
-    ensure_default_local_dfs_expose, evict_daemon_dfs_message_service_cache_on_shutdown,
+    evict_daemon_dfs_message_service_cache_on_shutdown,
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,
     register_daemon_dfs_data_owner_lock, run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
@@ -1422,9 +1422,6 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     crate::observe::register_observe_metric_exporters(&service_hooks);
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
         tracing::warn!("sinomo {label} cluster raft startup repair skipped: {error}");
-    }
-    if daemon_role_owns_default_dfs(label) {
-        ensure_default_local_dfs_expose(&paths)?;
     }
     let daemon_runtime = crate::build_daemon_async_runtime_with_profile(label, execution_profile)?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
