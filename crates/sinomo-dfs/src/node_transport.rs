@@ -23,14 +23,15 @@ use sinomo_core::node::NodeId;
 use crate::{
     AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DfsBlobTransferResult,
     DfsDirectReadClientResponse, DfsDirectReadClientResult, DfsDirectReadRequest, DfsError,
-    DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport,
-    DfsMessageTransportFuture, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsNetworkMessage, DfsOutboundAttachment, DfsReadData, DfsReadResponse, DfsReadResult,
-    DfsRoutedCall, DfsRoutedMessage, DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity,
-    DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
-    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
-    dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_session_result,
-    dfs_direct_read_rpc_request, dfs_message_is_read_only_request, dfs_message_rpc_request,
+    DfsMessageCommand, DfsMessageProcessReport, DfsMessageProcessResult, DfsMessageResponse,
+    DfsMessageTransport, DfsMessageTransportFuture, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsNetworkMessage, DfsOutboundAttachment, DfsReadData,
+    DfsReadResponse, DfsReadResult, DfsRoutedCall, DfsRoutedMessage, DfsRoutedSend,
+    DfsRoutedSendOutcome, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
+    NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
+    decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
+    dfs_direct_read_response_from_rpc_session_result, dfs_direct_read_rpc_request,
+    dfs_message_is_read_only_request, dfs_message_rpc_request,
     dfs_metadata_journal_batch_rpc_request, dfs_network_message_allows_write_repair_progress,
     dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
     dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
@@ -6522,6 +6523,28 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     }
 
     pub fn process_message_command(
+        &mut self,
+        command: DfsMessageCommand,
+    ) -> Result<DfsMessageProcessResult, DfsError> {
+        self.process_message_command_report(command).outcome
+    }
+
+    /// Process one served message while retaining durable work independently
+    /// from response construction and delivery.
+    pub fn process_message_command_report(
+        &mut self,
+        command: DfsMessageCommand,
+    ) -> DfsMessageProcessReport {
+        self.begin_message_committed_work();
+        let outcome = self.process_message_command_inner(command);
+        let committed_work = self.take_message_committed_work();
+        DfsMessageProcessReport {
+            outcome,
+            committed_work,
+        }
+    }
+
+    fn process_message_command_inner(
         &mut self,
         command: DfsMessageCommand,
     ) -> Result<DfsMessageProcessResult, DfsError> {

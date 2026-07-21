@@ -74,8 +74,25 @@ pub mod __channel_carrier {
         OBJECT_RPC_CHANNEL_DATA_VERSION, OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_BYTES,
         ObjectRpcChannelDataFrame, ObjectRpcChannelDataHeader, ObjectRpcChannelReceiveBufferPool,
         ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
+        read_object_rpc_channel_transport_frame_async_timed,
         write_object_rpc_channel_data_frame_async, write_object_rpc_channel_transport_frame_async,
         write_object_rpc_channel_transport_frame_async_timed,
+    };
+}
+/// Internal generation-fenced local connectivity-store boundary used by the
+/// daemon's reactive projection owner.
+#[doc(hidden)]
+pub mod __connectivity_store {
+    pub use super::connectivity_store::{
+        ClusterConnectivityRoutingProjection,
+        LocalClusterConnectivityRoutingGenerationSubscription,
+        LocalClusterConnectivitySourceSetCommit, LocalClusterConnectivityStoreSnapshot,
+        capture_local_cluster_connectivity_store_snapshot, cluster_connectivity_routing_projection,
+        commit_local_cluster_connectivity_source_set_if_snapshot,
+        commit_local_cluster_connectivity_source_set_if_snapshot_async,
+        local_cluster_connectivity_content_generation,
+        record_daemon_owned_local_cluster_endpoint_command_connectivity,
+        subscribe_local_cluster_connectivity_routing_generation,
     };
 }
 pub use connectivity::cluster_network_record_live;
@@ -85,9 +102,10 @@ pub use connectivity::{
     ClusterConnectivityGraph, ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
     ClusterConnectivityProbeObservation, ClusterConnectivityProbeState, ClusterConnectivityRecord,
     ClusterConnectivityRecordQuery, ClusterConnectivityState,
-    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, apply_cluster_connectivity_probe_results,
-    cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_due_with_startup_settle,
-    cluster_connectivity_record, cluster_connectivity_record_for_command_auth_denied,
+    MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+    apply_cluster_connectivity_probe_results, cluster_connectivity_probe_due_with_graph,
+    cluster_connectivity_probe_due_with_startup_settle, cluster_connectivity_record,
+    cluster_connectivity_record_for_command_auth_denied,
     cluster_connectivity_record_for_probe_observation, select_cluster_connectivity_probe_batch,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -98,7 +116,8 @@ pub use connectivity::{
     cluster_connectivity_record_for_startup_probe_failure,
 };
 pub use connectivity::{
-    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
+    cluster_connectivity_record_should_refresh, cluster_connectivity_stable_eq,
+    validate_cluster_connectivity_records_for_source,
 };
 pub use connectivity_store::{
     invalidate_local_cluster_connectivity_cache,
@@ -106,7 +125,9 @@ pub use connectivity_store::{
     prune_local_cluster_connectivity_records_for_state_async,
     read_local_cluster_connectivity_records, read_local_cluster_connectivity_records_for_source,
     record_local_cluster_endpoint_command_auth_denied,
-    record_local_cluster_endpoint_command_connectivity, write_local_cluster_connectivity_records,
+    record_local_cluster_endpoint_command_connectivity,
+    write_local_cluster_connectivity_record_groups,
+    write_local_cluster_connectivity_record_groups_async, write_local_cluster_connectivity_records,
     write_local_cluster_connectivity_records_async,
 };
 pub use connectivity_store::{
@@ -115,9 +136,10 @@ pub use connectivity_store::{
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,
     daemon_auth_decode_public_key, daemon_auth_encode_public_key, daemon_auth_signing_payload,
-    daemon_rpc_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
-    sign_daemon_rpc_request_digest_from_data_dir, sign_daemon_rpc_request_for_local_node,
-    sign_daemon_rpc_request_from_data_dir, try_sign_daemon_rpc_request_digest_from_cached_data_dir,
+    daemon_rpc_body_sha256, invalidate_cached_daemon_signing_identity,
+    sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_digest_from_data_dir,
+    sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
+    try_sign_daemon_rpc_request_digest_from_cached_data_dir,
 };
 pub use directory::{
     ClusterDirectory, ClusterDirectoryFactory, DirectoryVersion, EmptyClusterDirectory,
@@ -127,13 +149,14 @@ pub use directory::{
 pub use endpoint_advertisement::{
     MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
     PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL, clear_public_endpoint_reachability_cache,
-    daemon_loopback_endpoint, public_endpoint_is_reachable_for_local_ips_async,
+    public_endpoint_is_reachable_for_local_ips_async,
     public_endpoint_is_reachable_for_local_ips_with_probe_at,
     public_endpoint_is_reachable_with_probe, public_endpoint_is_reachable_with_probe_at,
 };
 pub use endpoint_advertisement::{
     daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
     daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
+    daemon_loopback_endpoint,
 };
 pub use endpoint_records::apply_cluster_endpoint_advertisement;
 pub use endpoint_records::cleanup_cluster_endpoint_duplicates;
@@ -296,14 +319,16 @@ pub use tcp_tunnel::{
 };
 pub use timeline::{
     NETWORK_TIMELINE_DEFAULT_MAX_EVENTS, NETWORK_TIMELINE_EVENT_BYTES,
-    NETWORK_TIMELINE_MAX_CAPTURE_BYTES, NetworkTimelineCaptureError, NetworkTimelineEvent,
+    NETWORK_TIMELINE_MAX_CAPTURE_BYTES, NETWORK_TIMELINE_MAX_ENDPOINT_IDENTITIES,
+    NetworkTimelineCaptureError, NetworkTimelineEndpointIdentity, NetworkTimelineEvent,
     NetworkTimelineSnapshot, NetworkTimelineTraceContext, NetworkTimelineTraceparentError,
     network_timeline_capture_is_active, network_timeline_channel_lookup_outcome,
     network_timeline_flag, network_timeline_monotonic_ns, network_timeline_stage,
     network_timeline_stage_name, network_timeline_trace_context_for_request,
     parse_network_timeline_traceparent, record_network_timeline_event,
-    record_network_timeline_event_now, snapshot_network_timeline_capture,
-    start_network_timeline_capture, stop_network_timeline_capture,
+    record_network_timeline_event_now, register_network_timeline_endpoint,
+    snapshot_network_timeline_capture, start_network_timeline_capture,
+    stop_network_timeline_capture,
 };
 
 pub type ClusterEndpointId = sinomo_base::Id;
@@ -383,6 +408,8 @@ pub struct NetworkObjectRpcToolSurface {
     pub category: &'static str,
     pub operation: &'static str,
     pub auth: NetworkModuleRouteAuth,
+    pub request_body_mode: ObjectRpcBodyMode,
+    pub response_body_mode: ObjectRpcBodyMode,
 }
 
 pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] = &[
@@ -391,18 +418,24 @@ pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] = &[
         category: CLUSTER_HEALTH_RPC_CATEGORY,
         operation: CLUSTER_HEALTH_READ_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+        request_body_mode: ObjectRpcBodyMode::None,
+        response_body_mode: ObjectRpcBodyMode::None,
     },
     NetworkObjectRpcToolSurface {
         route: CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
         category: CLUSTER_NETWORK_RPC_CATEGORY,
         operation: CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+        request_body_mode: ObjectRpcBodyMode::None,
+        response_body_mode: ObjectRpcBodyMode::None,
     },
     NetworkObjectRpcToolSurface {
         route: CLUSTER_NETWORK_PING_ROUTE,
         category: CLUSTER_NETWORK_RPC_CATEGORY,
         operation: CLUSTER_NETWORK_PING_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+        request_body_mode: ObjectRpcBodyMode::Optional,
+        response_body_mode: ObjectRpcBodyMode::Optional,
     },
 ];
 
@@ -461,6 +494,11 @@ pub fn register_storage_paths(
         .field("target_node_id", "NodeId")
         .field("endpoint_id", "ClusterEndpointId"),
     )?;
+    layout.register_binary(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/connectivity-local.sobj.lock",
+    )?;
     layout.register_escape_path(
         "sinomo-network",
         StorageRing::R1,
@@ -514,11 +552,12 @@ mod storage_contract_tests {
     use sinomo_storage::StorageLayout;
 
     #[test]
-    fn network_storage_contract_covers_dynamic_iroh_records() {
+    fn network_storage_contract_covers_runtime_locks_and_dynamic_iroh_records() {
         let mut layout = StorageLayout::new();
         register_storage_paths(&mut layout).expect("register network storage paths");
 
         for path in [
+            "cluster/connectivity-local.sobj.lock",
             "cluster/iroh/node.endpoint.sobj",
             "cluster/iroh/node.secret.sobj",
             "cluster/iroh/node.secret.lock",

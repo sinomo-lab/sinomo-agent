@@ -20,13 +20,13 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::cluster_network_record_should_refresh;
 use sinomo_network::read_local_cluster_connectivity_records_for_source;
 use sinomo_network::write_local_cluster_connectivity_record_set;
 use sinomo_network::{CLUSTER_NETWORK_PUBLISH_INTERVAL, cluster_network_publish_interval_for_role};
 use sinomo_network::{
     ClusterConnectivityRecord, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
+    cluster_connectivity_record_should_refresh, cluster_connectivity_stable_eq,
+    validate_cluster_connectivity_records_for_source,
 };
 use sinomo_node::cluster_node_is_local_process;
 use std::collections::BTreeMap;
@@ -126,6 +126,11 @@ pub fn cluster_network_publish_interval_for_node(
         .unwrap_or(CLUSTER_NETWORK_PUBLISH_INTERVAL)
 }
 
+/// Publishes an authoritative current source-owned connectivity set.
+///
+/// Async observation producers must generation-fence the set in the network
+/// store before calling this function. The publisher re-reads that local set;
+/// it does not infer a source-set generation from endpoint timestamps.
 pub fn sync_cluster_connectivity_records_to_kv(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -187,6 +192,11 @@ fn read_cluster_kv_current_or_empty_snapshot_arc_for_source(
     .map_err(kv_err)
 }
 
+/// Publishes an authoritative current source-owned connectivity set to quorum.
+///
+/// Callers that assembled the set asynchronously must first use the network
+/// store's snapshot/conditional-commit boundary. This function owns
+/// publication, not stale-task arbitration.
 pub fn sync_cluster_connectivity_records_to_quorum_with_host<H>(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -227,40 +237,16 @@ where
             sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
         )?;
         if success.is_empty() {
-            if latest.is_some() {
-                // A previous commit in this call already crossed Raft. Warm
-                // the cache from its authoritative response and finish.
-                if let Some(published) =
-                    cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
-                {
-                    host.remember_published_connectivity_record_set(
-                        paths,
-                        source_node_id,
-                        &published,
-                    );
-                }
-                return Ok(latest);
-            }
-            if state.is_none() {
-                state = Some(read_cluster_state_without_kv(paths)?);
-            }
-            let committed = host.commit_cluster_kv_txn_with_quorum(
-                paths,
-                state
-                    .as_mut()
-                    .expect("cluster state is initialized before connectivity publish"),
-                KvTxnRequest::generated(KvTxn {
-                    compares: Vec::new(),
-                    success: Vec::new(),
-                    failure: Vec::new(),
-                }),
-            )?;
             if let Some(published) =
-                cluster_connectivity_records_for_source_from_snapshot(&committed, source_node_id)
+                cluster_connectivity_records_for_source_from_snapshot(snapshot, source_node_id)
             {
                 host.remember_published_connectivity_record_set(paths, source_node_id, &published);
             }
-            return Ok(Some(committed));
+            // The local materialized snapshot already contains the complete
+            // source-owned record set. An unchanged publication is terminal;
+            // it must not manufacture an empty Raft transaction merely to
+            // refresh a cache derived from that same snapshot.
+            return Ok(latest);
         }
         if previous_ops.as_ref() == Some(&success) {
             return Ok(latest);
@@ -285,6 +271,9 @@ where
     }
 }
 
+/// Async publisher for a source set already committed by its observation
+/// owner. A caller-produced async set must cross the generation-fenced local
+/// store boundary before publication.
 pub async fn sync_cluster_connectivity_records_to_quorum_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -306,6 +295,9 @@ where
     .await
 }
 
+/// Async publisher for a source set already committed by its observation
+/// owner. A caller-produced async set must cross the generation-fenced local
+/// store boundary before publication.
 pub async fn sync_cluster_connectivity_records_to_quorum_async_with_state_and_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -436,50 +428,7 @@ where
             }
         };
         if success.is_empty() {
-            if latest.is_some() {
-                // The earlier round already crossed Raft. Cache its stored
-                // values, not the incoming refresh, and finish.
-                if let Some(published) = published_on_noop {
-                    host.remember_published_connectivity_record_set_async(
-                        paths,
-                        source_node_id,
-                        &published,
-                    )
-                    .await?;
-                }
-                return Ok(latest);
-            }
-            if state.is_none() {
-                let state_paths = paths.clone();
-                state = Some(
-                    runtime
-                        .spawn_blocking(move || read_cluster_state_without_kv(&state_paths))
-                        .await
-                        .map_err(|source| {
-                            H::Error::from(NetworkError::Io {
-                                operation: "read cluster state".to_string(),
-                                detail: format!("cluster state read task failed: {source}"),
-                            })
-                        })?
-                        .map_err(H::Error::from)?,
-                );
-            }
-            let committed = host
-                .commit_cluster_kv_txn_with_quorum_async(
-                    paths,
-                    state
-                        .as_mut()
-                        .expect("cluster state is initialized before connectivity publish"),
-                    KvTxnRequest::generated(KvTxn {
-                        compares: Vec::new(),
-                        success: Vec::new(),
-                        failure: Vec::new(),
-                    }),
-                )
-                .await?;
-            if let Some(published) =
-                cluster_connectivity_records_for_source_from_snapshot(&committed, source_node_id)
-            {
+            if let Some(published) = published_on_noop {
                 host.remember_published_connectivity_record_set_async(
                     paths,
                     source_node_id,
@@ -487,7 +436,9 @@ where
                 )
                 .await?;
             }
-            return Ok(Some(committed));
+            // Source-change publication is already converged. Keep the
+            // operation read-only instead of appending an empty transaction.
+            return Ok(latest);
         }
         if previous_ops.as_ref() == Some(&success) {
             return Ok(latest);
@@ -577,7 +528,10 @@ pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
                 .is_ok_and(|existing| {
                     existing == **record
                         || (cluster_connectivity_stable_eq(&existing, record)
-                            && !cluster_network_record_should_refresh(existing.expires_at, now))
+                            && !cluster_connectivity_record_should_refresh(
+                                existing.expires_at,
+                                now,
+                            ))
                 })
         });
         if stable {
@@ -781,7 +735,7 @@ pub fn cluster_connectivity_publish_record_matches(
     now: OffsetDateTime,
 ) -> bool {
     cluster_connectivity_stable_eq(known, record)
-        && !cluster_network_record_should_refresh(known.expires_at, now)
+        && !cluster_connectivity_record_should_refresh(known.expires_at, now)
 }
 
 #[cfg(any(test, feature = "test-support"))]

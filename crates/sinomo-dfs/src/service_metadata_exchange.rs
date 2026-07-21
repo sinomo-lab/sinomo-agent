@@ -314,6 +314,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 command.snapshot,
             ) {
                 Ok(archived_existing) => {
+                    // Replacing the backend is the durable replica-progress
+                    // boundary. Retain that edge before rehydration or ACK
+                    // delivery, either of which may still fail after the
+                    // snapshot has committed.
+                    self.record_message_committed_work(DfsMessageCommittedWork {
+                        metadata_replica_progress: true,
+                        ..DfsMessageCommittedWork::default()
+                    });
                     // The backend was replaced wholesale; in-memory state
                     // must follow it.
                     self.hydrate_from_metadata_backend()?;
@@ -618,16 +626,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        let backend = self
+        let apply_result = self
             .metadata_backend
             .as_mut()
-            .expect("metadata backend checked above");
+            .expect("metadata backend checked above")
+            .apply_journal_batch_with_replica_permit(&permit, &command.batch);
 
-        match backend.apply_journal_batch_with_replica_permit(&permit, &command.batch) {
+        match apply_result {
             Ok(applied_entries) => {
+                // A successful backend apply is the durable replica-progress
+                // boundary. Record it before authority-proof persistence,
+                // service-state hydration, or ACK delivery so a later error
+                // cannot discard the committed edge.
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    metadata_replica_progress: true,
+                    ..DfsMessageCommittedWork::default()
+                });
                 let verified_authority_probe_id = if let Some(probe) =
                     command.authority_probe.as_ref()
                 {
+                    let backend = self
+                        .metadata_backend
+                        .as_mut()
+                        .expect("metadata backend checked above");
                     let verification =
                         crate::service_replica::verify_persisted_metadata_authority_probe(
                             backend.as_ref(),
@@ -819,6 +840,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             probe.journal_sequence,
         );
         if local_fingerprint.as_ref() == Ok(&probe.state_fingerprint) {
+            let mut durable_prefix_progress = false;
             let verified_primary_handoff_id = if let Some(handoff) = primary_handoff {
                 let freeze = backend
                     .freeze_metadata_shard_for_membership_handoff(
@@ -843,15 +865,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         handoff.handoff_id, probe.shard_id.0
                     )));
                 }
+                durable_prefix_progress = true;
                 Some(handoff.handoff_id)
             } else {
                 None
             };
-            backend.put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
-                shard_id: probe.shard_id.clone(),
-                journal_sequence: probe.journal_sequence,
-                state_fingerprint: probe.state_fingerprint.clone(),
-            })?;
+            let prefix_floor_result =
+                backend.put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
+                    shard_id: probe.shard_id.clone(),
+                    journal_sequence: probe.journal_sequence,
+                    state_fingerprint: probe.state_fingerprint.clone(),
+                });
+            durable_prefix_progress |= prefix_floor_result.is_ok();
+            if durable_prefix_progress {
+                // The freeze marker and prefix floor are durable evidence
+                // consumed by promotion/default reconciliation. Retain that
+                // edge before the floor error or later ACK delivery can leave
+                // this message without an observational event.
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    metadata_replica_progress: true,
+                    ..DfsMessageCommittedWork::default()
+                });
+            }
+            prefix_floor_result?;
             return Ok(Ok(verified_primary_handoff_id));
         }
         Ok(Err(format!(

@@ -278,11 +278,14 @@ millisecond sleeps in the benchmark are driver polling between
 root after collecting its JSONL output.
 
 Use two separate Docker projects or fully tear down the first project between
-the durability and algorithm measurements. The disk-backed suite remains the
-correctness, restart, damage, and convergence gate:
+the durability and algorithm measurements. Docker formation has a fixed,
+non-configurable ten-second acceptance gate. Both performance projects must be
+formed fresh with formation observation disabled; an observation-enabled
+project is diagnostic evidence, not a benchmark environment. The disk-backed
+suite remains the correctness, restart, damage, and convergence gate:
 
 ```sh
-SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_WAIT=120 \
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_OBSERVE=0 \
   SINOMO_DFS_PERF_TRACE=1 docker/test-cluster.sh
 ```
 
@@ -292,7 +295,7 @@ have all passed, measure the three live shard primaries, and tear it down with
 the same compose files:
 
 ```sh
-SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_WAIT=120 \
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_OBSERVE=0 \
   SINOMO_TEST_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
   SINOMO_TEST_NETWORK_ONLY=1 SINOMO_TEST_KEEP=1 SINOMO_DFS_PERF_TRACE=1 \
   docker/test-cluster.sh

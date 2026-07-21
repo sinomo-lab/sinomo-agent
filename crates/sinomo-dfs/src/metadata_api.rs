@@ -182,7 +182,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         file_system: &DfsFileSystem,
     ) -> Result<Option<DfsMetadataJournalEntry>> {
-        if self.get_file_system(&file_system.file_system_id)?.as_ref() == Some(file_system) {
+        if self
+            .get_file_system(&file_system.file_system_id)?
+            .as_ref()
+            .is_some_and(|current| {
+                crate::placement::dfs_file_system_semantically_eq(current, file_system)
+            })
+        {
             return Ok(None);
         }
         self.put_file_system(file_system).map(Some)
@@ -1165,6 +1171,17 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<Option<DfsNamespaceTransaction>> {
         let _ = transaction_id;
         Ok(None)
+    }
+
+    /// Project retention-eligible tombstones without taking a write lock.
+    ///
+    /// Reactive maintenance schedulers use the returned due count and next
+    /// eligibility deadline to avoid periodic full passes on idle metadata.
+    fn tombstone_compaction_projection(
+        &self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        Ok(DfsTombstoneCompactionReport::for_options(&options))
     }
 
     /// Compact eligible tombstone records according to backend policy.

@@ -137,24 +137,32 @@ pub use control_plane::{
     DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
     metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
     metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    metadata_shards_prefix, placement_reconciliation_key, placement_reconciliations_prefix,
+    metadata_shards_prefix, placement_authority_permit_key,
+    placement_reconciliation_activity_index_key, placement_reconciliation_key,
+    placement_reconciliations_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use default_cluster::test_establish_default_cluster_dfs_replica_progress_subscription;
 pub use default_cluster::{
     DfsControlPlaneDefaultClusterAsyncBootstrapHost, DfsControlPlaneDefaultClusterBootstrapHost,
     DfsDefaultClusterAsyncBootstrapHost, DfsDefaultClusterBootstrapFuture,
     DfsDefaultClusterBootstrapHost, DfsDefaultClusterBootstrapOptions,
     DfsDefaultClusterBootstrapReport, DfsDefaultClusterSmokeOptions,
+    default_cluster_dfs_materialization_awaits_replica_progress,
     default_cluster_metadata_shard_with_async_host, default_cluster_metadata_shard_with_host,
     default_cluster_metadata_shards_with_async_host, default_cluster_metadata_shards_with_host,
     default_cluster_sifs, default_cluster_sifs_owner, default_cluster_sifs_subtree_policies,
     default_metadata_shard_primary_node_id, default_metadata_shard_replica_node_ids,
-    dfs_service_members, ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
+    default_metadata_shard_transition_awaits_head_watermark, dfs_service_members,
+    ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
     ensure_default_distributed_dfs_with_async_host, ensure_default_distributed_dfs_with_host,
+    invalidate_default_cluster_dfs_materialization_for_replica_progress,
     metadata_shard_layout_matches, metadata_shard_primary_transfer_ready_from_local_backend,
     metadata_shard_replica_node_ids, run_default_cluster_dfs_smoke_with_peer_transport,
-    stable_dfs_service_node_ids,
+    stable_dfs_service_node_ids, take_default_cluster_dfs_materialization_immediate_retry,
 };
 pub(crate) use direct_read::dfs_direct_read_request_from_read_request;
 #[cfg(test)]
@@ -232,15 +240,17 @@ pub use maintenance::{
     LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost, clear_dfs_anti_entropy_cursor,
     default_dfs_anti_entropy_cursor_path,
     default_dfs_metadata_replication_suppression_snapshot_path,
-    default_dfs_repair_attempt_snapshot_path, dfs_lifecycle_maintenance_notice_lines,
-    dfs_maintenance_tick_observations, dfs_namespace_job_maintenance_notice_lines,
-    dfs_repair_maintenance_notice_lines, dfs_write_intent_maintenance_notice_lines,
-    legacy_dfs_anti_entropy_cursor_path, legacy_dfs_metadata_replication_cursor_path,
-    migrate_legacy_dfs_metadata_replication_cursor, put_local_dfs_metadata_replication_suppression,
-    read_dfs_anti_entropy_cursor, read_dfs_metadata_replication_suppression_snapshot,
-    read_dfs_repair_attempt_snapshot, run_cluster_dfs_maintenance_tick_with_async_peer_transport,
+    default_dfs_repair_attempt_snapshot_path, dfs_events_should_wake_repair_maintenance,
+    dfs_lifecycle_maintenance_notice_lines, dfs_maintenance_tick_observations,
+    dfs_namespace_job_maintenance_notice_lines, dfs_repair_maintenance_notice_lines,
+    dfs_write_intent_maintenance_notice_lines, legacy_dfs_anti_entropy_cursor_path,
+    legacy_dfs_metadata_replication_cursor_path, migrate_legacy_dfs_metadata_replication_cursor,
+    put_local_dfs_metadata_replication_suppression, read_dfs_anti_entropy_cursor,
+    read_dfs_metadata_replication_suppression_snapshot, read_dfs_repair_attempt_snapshot,
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions,
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker,
     run_cluster_dfs_maintenance_tick_with_peer_transport, run_dfs_lifecycle_maintenance_with_host,
     run_dfs_maintenance_tick_with_async_host,
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions,
@@ -301,18 +311,19 @@ pub use metadata_replication::{
     DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext,
     DfsMetadataSnapshotInstallSender, LocalDfsMetadataJournalPublisherHost,
-    cluster_dfs_metadata_replica_shard_context, dfs_events_should_publish_metadata,
-    dfs_metadata_replication_notice_lines, dfs_metadata_replication_report_needs_retry,
-    dfs_metadata_replication_sent_count, materialize_default_sifs_metadata,
-    materialize_default_sifs_metadata_on_shards, process_cluster_dfs_metadata_journal_batch,
-    process_cluster_dfs_metadata_snapshot_install, process_dfs_metadata_journal_batch,
-    process_dfs_metadata_snapshot_install, publish_cluster_dfs_metadata_journal,
-    publish_cluster_dfs_metadata_journal_async,
+    cluster_dfs_metadata_replica_shard_context, dfs_events_advance_metadata_replica,
+    dfs_events_should_publish_metadata, dfs_metadata_replication_notice_lines,
+    dfs_metadata_replication_report_needs_retry, dfs_metadata_replication_sent_count,
+    materialize_default_sifs_metadata, materialize_default_sifs_metadata_on_shards,
+    process_cluster_dfs_metadata_journal_batch, process_cluster_dfs_metadata_snapshot_install,
+    process_dfs_metadata_journal_batch, process_dfs_metadata_snapshot_install,
+    publish_cluster_dfs_metadata_journal, publish_cluster_dfs_metadata_journal_async,
     publish_cluster_dfs_metadata_journal_async_with_execution_exclusions,
     publish_cluster_dfs_metadata_journal_with_async_peer_transport,
     publish_cluster_dfs_metadata_journal_with_peer_transport,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions,
+    publish_cluster_dfs_metadata_shard_with_peer_transports_async_and_execution_exclusions,
     publish_dfs_metadata_journal_with_async_host,
     publish_dfs_metadata_journal_with_async_host_and_execution_exclusions,
     publish_dfs_metadata_journal_with_host, refresh_cluster_dfs_kv_snapshot_with_peer_transport,
@@ -350,8 +361,8 @@ pub use metadata_sharded_backend::LocalShardedMetadataBackend;
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPlacementScope, DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy,
-    DfsWriteOutcome, ReadRoute, ReadRouteAction, WriteIntent, WriteIntentStatus, WriteRoute,
-    WriteRouteAction,
+    DfsTombstoneProvenance, DfsWriteOutcome, ReadRoute, ReadRouteAction, WriteIntent,
+    WriteIntentStatus, WriteRoute, WriteRouteAction,
 };
 pub(crate) use model::{normalize_current_locations, path_index_key};
 pub use module_surface::{
@@ -517,11 +528,12 @@ pub(crate) use service_state::{
 };
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
-    DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictReadView,
-    DfsMessageProcessResult, DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome,
-    DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness,
-    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome,
+    DfsCommittedWork, DfsCommittedWorkTracker, DfsConfirmedTimeoutAction,
+    DfsConfirmedTimeoutOutcome, DfsConflictReadView, DfsMessageCommittedWork,
+    DfsMessageProcessReport, DfsMessageProcessResult, DfsMetadataReplicationOutcome,
+    DfsOwnerHandoffOutcome, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,
+    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 pub use service_trace::with_dfs_traceparent;
 pub(crate) use service_trace::{

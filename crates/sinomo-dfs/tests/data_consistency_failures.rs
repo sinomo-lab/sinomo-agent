@@ -843,6 +843,7 @@ fn replicated_object_metadata_with_locations(
         file_system_id,
         path: path.to_string(),
         kind: DfsObjectKind::Artifact,
+        tombstone_provenance: None,
         owner_node_id: owner.clone(),
         current_locations: locations,
         content_hash: None,

@@ -113,11 +113,30 @@ pub fn write_cluster_kv_materialized_snapshot_if_changed(
     Ok(wrote)
 }
 
+/// Materializes an imported read model without replacing a locally cached view
+/// at a higher revision. Anchored Raft snapshot restoration uses the explicit
+/// local-cache writer because consensus metadata, not revision alone, makes that
+/// replacement authoritative.
 pub fn write_cluster_kv_snapshot_if_changed(
     paths: &ClusterKvPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, KvError> {
-    let wrote = paths.local_cache().write_snapshot_if_changed(snapshot)?;
+    let wrote = paths
+        .local_cache()
+        .write_imported_snapshot_if_changed(snapshot)?;
+    if wrote {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(wrote)
+}
+
+pub(crate) fn write_cluster_kv_authoritative_snapshot_if_changed(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+) -> Result<bool, KvError> {
+    let wrote = paths
+        .local_cache()
+        .write_authoritative_snapshot_if_changed(snapshot)?;
     if wrote {
         notify_cluster_kv_watchers(paths);
     }
@@ -132,39 +151,16 @@ pub fn write_imported_cluster_kv_snapshot_if_changed<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    if cluster_kv_imported_snapshot_can_defer_materialized_delta(
-        paths,
-        snapshot,
-        key_can_defer_materialized_snapshot,
-    )? {
-        return Ok(false);
+    let wrote = paths
+        .local_cache()
+        .write_imported_snapshot_if_changed_with_defer(
+            snapshot,
+            key_can_defer_materialized_snapshot,
+        )?;
+    if wrote {
+        notify_cluster_kv_watchers(paths);
     }
-    write_cluster_kv_snapshot_if_changed(paths, snapshot)
-}
-
-pub(crate) fn cluster_kv_imported_snapshot_can_defer_materialized_delta<F>(
-    paths: &ClusterKvPaths,
-    snapshot: &KvSnapshot,
-    key_can_defer_materialized_snapshot: F,
-) -> Result<bool, KvError>
-where
-    F: FnMut(&str) -> bool,
-{
-    let Some(existing) = paths.local_cache().cached_snapshot_arc_if_present()? else {
-        return Ok(false);
-    };
-    if !cluster_kv_snapshot_delta_only_deferable(
-        existing.as_ref(),
-        snapshot,
-        key_can_defer_materialized_snapshot,
-    ) {
-        return Ok(false);
-    }
-    Ok(cluster_kv_materialized_snapshot_is_fresh_enough_against(
-        existing.revision,
-        snapshot.revision,
-        cluster_kv_materialized_snapshot_age(paths),
-    ))
+    Ok(wrote)
 }
 
 pub(crate) fn cluster_kv_materialized_snapshot_age(paths: &ClusterKvPaths) -> Option<Duration> {
@@ -225,6 +221,41 @@ impl KvSnapshot {
     /// retained event history already have KV-domain limits; total payload bytes
     /// are only checked for arithmetic overflow.
     pub fn validate_resource_bounds(&self) -> Result<(), KvError> {
+        self.validate_resource_bounds_with_committed_request_size_sink(|_| {})
+    }
+
+    pub(crate) fn validate_resource_bounds_with_committed_request_sizes(
+        &self,
+    ) -> Result<Vec<usize>, KvError> {
+        // Restore needs both the normal snapshot validation and the immutable
+        // per-record measurements. Collect them during the validation pass so a
+        // restored store never re-encodes the retained ledger to initialize its
+        // cached accounting.
+        self.validate_resource_cardinality_bounds()?;
+        let mut encoded_sizes = Vec::new();
+        try_reserve_kv_items(
+            &mut encoded_sizes,
+            self.committed_requests.len(),
+            "restore committed KV request byte accounting",
+        )?;
+        self.validate_resource_bounds_after_cardinality(|encoded_bytes| {
+            encoded_sizes.push(encoded_bytes);
+        })?;
+        Ok(encoded_sizes)
+    }
+
+    fn validate_resource_bounds_with_committed_request_size_sink<F>(
+        &self,
+        committed_request_size_sink: F,
+    ) -> Result<(), KvError>
+    where
+        F: FnMut(usize),
+    {
+        self.validate_resource_cardinality_bounds()?;
+        self.validate_resource_bounds_after_cardinality(committed_request_size_sink)
+    }
+
+    fn validate_resource_cardinality_bounds(&self) -> Result<(), KvError> {
         if self.leases.len() > MAX_ACTIVE_LEASES {
             return Err(KvError::LeaseLimit {
                 max: MAX_ACTIVE_LEASES,
@@ -248,10 +279,22 @@ impl KvSnapshot {
                 max_records: MAX_EXPIRED_KV_REQUEST_TOMBSTONES,
             });
         }
+        Ok(())
+    }
+
+    fn validate_resource_bounds_after_cardinality<F>(
+        &self,
+        mut committed_request_size_sink: F,
+    ) -> Result<(), KvError>
+    where
+        F: FnMut(usize),
+    {
         let mut committed_request_bytes = 0_usize;
         for record in &self.committed_requests {
+            let encoded_bytes = encode_kv_value(record)?.len();
+            committed_request_size_sink(encoded_bytes);
             committed_request_bytes = committed_request_bytes
-                .checked_add(encode_kv_value(record)?.len())
+                .checked_add(encoded_bytes)
                 .ok_or_else(|| KvError::ResourceExhausted {
                     operation: "validate committed KV request record bytes".to_string(),
                     requested_bytes: usize::MAX,
@@ -447,6 +490,58 @@ pub struct KvMaterializedCache {
     max_materialized_events: Option<usize>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct MaterializedCacheRaftWritePause {
+    path: PathBuf,
+    compared: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static MATERIALIZED_CACHE_RAFT_WRITE_PAUSE: LazyLock<
+    Mutex<Option<MaterializedCacheRaftWritePause>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn install_materialized_cache_raft_write_pause_for_test(
+    path: PathBuf,
+    compared: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+) {
+    *MATERIALIZED_CACHE_RAFT_WRITE_PAUSE
+        .lock()
+        .expect("materialized cache write pause") = Some(MaterializedCacheRaftWritePause {
+        path,
+        compared,
+        resume,
+    });
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn clear_materialized_cache_raft_write_pause_for_test(path: &Path) {
+    let mut pause = MATERIALIZED_CACHE_RAFT_WRITE_PAUSE
+        .lock()
+        .expect("materialized cache write pause");
+    if pause.as_ref().is_some_and(|pause| pause.path == path) {
+        *pause = None;
+    }
+}
+
+#[cfg(test)]
+fn pause_materialized_cache_raft_write_after_compare_for_test(path: &Path) {
+    let pause = MATERIALIZED_CACHE_RAFT_WRITE_PAUSE
+        .lock()
+        .ok()
+        .and_then(|pause| pause.as_ref().filter(|pause| pause.path == path).cloned());
+    if let Some(pause) = pause {
+        pause.compared.wait();
+        pause.resume.wait();
+    }
+}
+
 impl KvMaterializedCache {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -485,6 +580,36 @@ impl KvMaterializedCache {
     }
 
     pub fn read_snapshot_arc_if_present(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        let identity = optional_file_identity_for_read(&self.path)?;
+        let cache_identity = match identity {
+            Some(Some(identity)) => Some(identity),
+            Some(None) => return Ok(None),
+            None => None,
+        };
+        if let Some(identity) = cache_identity
+            && let Some(cached) = cache_lookup_snapshot(&self.path, identity)
+        {
+            return Ok(Some(cached));
+        }
+        let Some(bytes) = read_optional_object_file_bytes(&self.path)? else {
+            return Ok(None);
+        };
+        let snapshot = decode_object_file::<KvSnapshot>(&self.path, &bytes)?;
+        snapshot.validate_resource_bounds()?;
+        let snapshot = Arc::new(snapshot.canonicalized());
+        if let Some(identity) = cache_identity {
+            cache_store_snapshot(&self.path, identity, snapshot.clone());
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Reads the file while the materialized-cache write lock is held. The full
+    /// file identity makes a process-cache hit safe here: a completed write from
+    /// another process changes the atomic replacement's inode (as well as its
+    /// usual mtime/length identity), while the lock excludes a concurrent writer.
+    /// Avoiding an unconditional SOBJ decode is important because every routine
+    /// materialized publication passes through this comparison.
+    fn read_snapshot_arc_if_present_locked(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
         let identity = optional_file_identity_for_read(&self.path)?;
         let cache_identity = match identity {
             Some(Some(identity)) => Some(identity),
@@ -579,7 +704,9 @@ impl KvMaterializedCache {
                     return Err(error);
                 }
             };
-            if refresh_materialized && let Err(error) = self.write_snapshot_if_changed(&snapshot) {
+            if refresh_materialized
+                && let Err(error) = self.write_raft_snapshot_if_changed(&snapshot)
+            {
                 record_kv_read("local", "durable_raft_open", "error", started);
                 return Err(error);
             }
@@ -610,6 +737,33 @@ impl KvMaterializedCache {
         self.read_snapshot().and_then(InProcessKvStore::restore)
     }
 
+    fn write_lock_path(&self) -> PathBuf {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(".lock");
+        PathBuf::from(path)
+    }
+
+    fn lock_write(&self) -> Result<File, KvError> {
+        let lock_path = self.write_lock_path();
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| KvError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| KvError::Io {
+                path: lock_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        lock_node_exclusive(&lock, &lock_path, RAFT_NODE_LOCK_WAIT)?;
+        Ok(lock)
+    }
+
     /// Returns the snapshot that should actually be persisted: the input with its
     /// event history compacted to the configured materialized-event limit.
     fn materialized(&self, snapshot: &KvSnapshot) -> KvSnapshot {
@@ -625,18 +779,11 @@ impl KvMaterializedCache {
         snapshot
     }
 
-    /// Persists `snapshot` and refreshes the process-wide read cache so subsequent
-    /// reads hit memory rather than re-reading the file.
-    fn write_and_cache(&self, snapshot: KvSnapshot) -> Result<(), KvError> {
-        self.write_and_cache_if_materialized_changed(snapshot)
-            .map(|_| ())
-    }
-
     /// Persists `snapshot` exactly as materialized and reports whether the object
     /// file changed. Unlike `write_snapshot_if_changed`, this treats revision and
     /// watch-event history as meaningful so callers that publish snapshot-backed
     /// events can suppress only truly redundant notifications.
-    fn write_and_cache_if_materialized_changed(
+    fn write_and_cache_if_materialized_changed_locked(
         &self,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
@@ -649,17 +796,45 @@ impl KvMaterializedCache {
     }
 
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
-        self.write_and_cache(self.materialized(snapshot))
+        let desired = self.materialized(snapshot);
+        let _write_lock = self.lock_write()?;
+        self.write_and_cache_if_materialized_changed_locked(desired)
+            .map(|_| ())
     }
 
     pub fn write_snapshot_if_materialized_changed(
         &self,
         snapshot: &KvSnapshot,
     ) -> Result<bool, KvError> {
-        self.write_and_cache_if_materialized_changed(self.materialized(snapshot))
+        let desired = self.materialized(snapshot);
+        let _write_lock = self.lock_write()?;
+        self.write_and_cache_if_materialized_changed_locked(desired)
     }
 
     pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        let _write_lock = self.lock_write()?;
+        let existing = self.read_snapshot_arc_if_present_locked()?;
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+    }
+
+    fn write_authoritative_snapshot_if_changed(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<bool, KvError> {
+        let desired = self.materialized(snapshot);
+        let _write_lock = self.lock_write()?;
+        // An anchored Raft snapshot is the authoritative state, including its
+        // revision, per-entry bookkeeping, retained events, and request records.
+        // Compare the complete serialized materialization and deliberately avoid
+        // decoding the old cache so this path can also heal a corrupt read model.
+        self.write_and_cache_if_materialized_changed_locked(desired)
+    }
+
+    fn write_snapshot_if_changed_against_locked(
+        &self,
+        snapshot: &KvSnapshot,
+        existing: Option<&KvSnapshot>,
+    ) -> Result<bool, KvError> {
         // Skip the rewrite when the durable key/value/lease state is unchanged, even
         // if the snapshot revision, per-entry revision metadata, or watch-event tail
         // advanced. Re-putting an identical value bumps modify_revision/version and
@@ -669,14 +844,110 @@ impl KvMaterializedCache {
         // snapshots are the source of truth for revision/version/events), so
         // persisting stale bookkeeping there is safe. Check before materializing
         // `snapshot` so the common no-op path avoids cloning the full entry set.
-        if self.read_snapshot_arc_if_present().is_ok_and(|existing| {
-            existing.is_some_and(|existing| kv_snapshot_durable_eq(existing.as_ref(), snapshot))
-        }) {
+        if existing.is_some_and(|existing| kv_snapshot_durable_eq(existing, snapshot)) {
             return Ok(false);
         }
         let desired = self.materialized(snapshot);
-        self.write_and_cache(desired)?;
+        self.write_and_cache_if_materialized_changed_locked(desired)?;
         Ok(true)
+    }
+
+    /// Persists an applied local Raft view unless the materialized read model is
+    /// ahead of it. Imported snapshots are intentionally allowed to lead a
+    /// learner's applied log, so routine local metadata changes and partial log
+    /// replay must not make readers move backwards while Raft catches up.
+    fn write_raft_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        let _write_lock = self.lock_write()?;
+        let existing = self.read_snapshot_arc_if_present_locked()?;
+        if existing.as_deref().is_some_and(|existing| {
+            kv_snapshot_materialized_generation(existing)
+                > kv_snapshot_materialized_generation(snapshot)
+        }) {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        pause_materialized_cache_raft_write_after_compare_for_test(&self.path);
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+    }
+
+    fn write_imported_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        let _write_lock = self.lock_write()?;
+        let existing = self.read_snapshot_arc_if_present_locked()?;
+        if let Some(existing) = existing.as_deref() {
+            match kv_snapshot_materialized_generation(existing)
+                .cmp(&kv_snapshot_materialized_generation(snapshot))
+            {
+                std::cmp::Ordering::Greater => return Ok(false),
+                std::cmp::Ordering::Equal => {
+                    if kv_snapshot_durable_eq(existing, snapshot) {
+                        return Ok(false);
+                    }
+                    return Err(KvError::ImportedSnapshotRevisionConflict {
+                        revision: snapshot.revision,
+                    });
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+    }
+
+    fn write_imported_snapshot_if_changed_with_defer<F>(
+        &self,
+        snapshot: &KvSnapshot,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<bool, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let _write_lock = self.lock_write()?;
+        let existing = self.read_snapshot_arc_if_present_locked()?;
+        if let Some(existing) = existing.as_deref() {
+            // Resolve monotonic materialized-generation semantics before
+            // considering projection deferral. KV revision alone is not a full
+            // state generation: barriers, semantic no-ops, and lease-only
+            // commands can advance the applied Raft log without bumping it.
+            match kv_snapshot_materialized_generation(existing)
+                .cmp(&kv_snapshot_materialized_generation(snapshot))
+            {
+                std::cmp::Ordering::Greater => return Ok(false),
+                std::cmp::Ordering::Equal => {
+                    if kv_snapshot_durable_eq(existing, snapshot) {
+                        return Ok(false);
+                    }
+                    return Err(KvError::ImportedSnapshotRevisionConflict {
+                        revision: snapshot.revision,
+                    });
+                }
+                std::cmp::Ordering::Less => {}
+            }
+            // The classifier runs while the cross-process materialized-cache
+            // lock is held so compare, defer, and write remain one decision.
+            // Callers must therefore keep it pure, non-blocking, and free of
+            // materialized-cache reads or writes.
+            if cluster_kv_snapshot_delta_only_deferable(
+                existing,
+                snapshot,
+                key_can_defer_materialized_snapshot,
+            ) && cluster_kv_materialized_snapshot_is_fresh_enough_against(
+                existing.revision,
+                snapshot.revision,
+                self.materialized_snapshot_age(),
+            ) {
+                return Ok(false);
+            }
+        }
+        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+    }
+
+    fn materialized_snapshot_age(&self) -> Option<Duration> {
+        let Ok(metadata) = fs::metadata(&self.path) else {
+            return None;
+        };
+        metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
     }
 
     pub fn read_store_with_raft_view(
@@ -860,6 +1131,44 @@ impl KvLocalCache {
         self.materialized.write_snapshot_if_changed(snapshot)
     }
 
+    pub(crate) fn write_raft_snapshot_if_changed(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.materialized.write_raft_snapshot_if_changed(snapshot)
+    }
+
+    pub(crate) fn write_imported_snapshot_if_changed(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.materialized
+            .write_imported_snapshot_if_changed(snapshot)
+    }
+
+    pub(crate) fn write_imported_snapshot_if_changed_with_defer<F>(
+        &self,
+        snapshot: &KvSnapshot,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<bool, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.materialized
+            .write_imported_snapshot_if_changed_with_defer(
+                snapshot,
+                key_can_defer_materialized_snapshot,
+            )
+    }
+
+    pub(crate) fn write_authoritative_snapshot_if_changed(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.materialized
+            .write_authoritative_snapshot_if_changed(snapshot)
+    }
+
     /// Cache a remote read model when it is newer than the local applied Raft
     /// state. This deliberately does not restore Raft: `KvSnapshot` has no
     /// log index or term and therefore cannot be a consensus baseline.
@@ -876,17 +1185,21 @@ impl KvLocalCache {
             wal_paths,
             &self.materialized,
         )?;
-        if snapshot.revision <= node.store().revision() {
+        let local_snapshot = node.store().try_snapshot()?;
+        if kv_snapshot_materialized_generation(&snapshot)
+            <= kv_snapshot_materialized_generation(&local_snapshot)
+        {
             return self
                 .materialized
-                .write_snapshot_if_changed(&node.store().try_snapshot()?);
+                .write_raft_snapshot_if_changed(&local_snapshot);
         }
         // Cache the newer read model, but do not install it into Raft. A plain
         // `KvSnapshot` carries no last-included index or term, so it cannot
         // establish a safe consensus baseline. The learner must replay from its
         // actual log position or receive an anchored `RaftSnapshot` from the
         // leader.
-        self.materialized.write_snapshot_if_changed(&snapshot)
+        self.materialized
+            .write_imported_snapshot_if_changed(&snapshot)
     }
 
     pub fn open_raft_node(&self, node_id: NodeId) -> Result<DurableRaftKvNode, KvError> {
@@ -951,6 +1264,30 @@ pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
     left_leases.eq(right_leases)
         && left.committed_requests == right.committed_requests
         && left.expired_requests == right.expired_requests
+}
+
+/// Returns the monotonic generation available in the current `KvSnapshot`
+/// format for materialized read-model arbitration.
+///
+/// KV revision counts key mutation events, so a committed barrier, semantic
+/// no-op, or lease-only command may advance the applied Raft log while leaving
+/// that revision unchanged. Every normally applied command records its log
+/// index in `committed_requests`, and bounded request retention removes the
+/// oldest records first, so the maximum retained index disambiguates that legal
+/// same-revision progress. Legacy snapshots without request records retain the
+/// former revision-only ordering through the zero fallback.
+///
+/// This is a materialized-cache compatibility generation, not a consensus
+/// position. Replication must continue to use an anchored `RaftSnapshot` or the
+/// explicit applied index carried by `KvLocalRead`.
+pub(crate) fn kv_snapshot_materialized_generation(snapshot: &KvSnapshot) -> (KvRevision, u64) {
+    let max_committed_log_index = snapshot
+        .committed_requests
+        .iter()
+        .map(|record| record.log_index)
+        .max()
+        .unwrap_or(0);
+    (snapshot.revision, max_committed_log_index)
 }
 
 pub fn compact_kv_snapshot_event_history(snapshot: &mut KvSnapshot, max_events: usize) {

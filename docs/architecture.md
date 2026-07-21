@@ -111,6 +111,13 @@ control plane, not a general content database. Large files, media, model
 weights, event archives, and high-cardinality filesystem metadata stay outside
 the cluster KV.
 
+KV convergence is fully reactive and action-owned. Exact commits own their
+replication fanout, configuration operations own lifecycle reconciliation,
+storage mutations own threshold compaction, detected gaps own targeted
+recovery, and changed member or endpoint sources own publication. There is no
+generic KV maintenance sweep, and observational status, health, app, or CLI
+reads do not schedule control-plane work.
+
 Cluster discovery finds possible routes; it never grants authority. Membership
 and signed identity establish trust. A node without cluster state is in a
 bootstrap or recovery condition and may perform only local setup, credentials,

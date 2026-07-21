@@ -5,12 +5,14 @@
 //! before acquiring a pooled receive buffer, then move the resulting `Bytes`
 //! directly into channel ingress.
 
+use crate::channel::{OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES, OBJECT_RPC_CHANNEL_MAX_CALLS};
 use crate::object::write_all_vectored_async_frame;
 use crate::{
     MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, NetworkError, OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES,
-    ObjectFrameIoOptions, ObjectFrameWriteTiming, ObjectRpcChannelBodyDirection,
-    ObjectRpcChannelCallId, ObjectRpcChannelWireFrame, read_object_frame_async_with_max_bytes,
-    write_object_frame_async, write_object_frame_async_timed,
+    ObjectFrameIoOptions, ObjectFrameReadTiming, ObjectFrameWriteTiming,
+    ObjectRpcChannelBodyDirection, ObjectRpcChannelCallId, ObjectRpcChannelWireFrame,
+    read_object_frame_async_with_max_bytes, write_object_frame_async,
+    write_object_frame_async_timed,
 };
 use bytes::{Bytes, BytesMut};
 use std::io::Cursor;
@@ -25,8 +27,19 @@ pub const OBJECT_RPC_CHANNEL_DATA_MAGIC: [u8; 4] = *b"SCDF";
 pub const OBJECT_RPC_CHANNEL_DATA_VERSION: u16 = 1;
 /// Fixed bytes preceding every raw channel Data payload.
 pub const OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES: usize = 32;
-/// Default active plus reusable receive-buffer memory held by one carrier.
-pub const OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum active receive-buffer memory held by one carrier.
+///
+/// Every admitted call may retain one quantum in the application adapter and
+/// one in its isolated direct-delivery task. The final slab is reserved for
+/// the physical reader, allowing it to consume the next Data frame and reach
+/// following cancellation, reset, and flow-control frames even when every
+/// logical body is stalled.
+pub const OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_BYTES: usize =
+    (2 * OBJECT_RPC_CHANNEL_MAX_CALLS + 1) * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES;
+/// Released slabs retained for reuse by an otherwise idle carrier. Active
+/// traffic may grow to the bound above, but idle peers do not pin that peak.
+pub const OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_CACHE_BYTES: usize =
+    2 * OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES;
 
 const OBJECT_FRAME_MAGIC: [u8; 4] = *b"SOF2";
 const DIRECTION_REQUEST: u8 = 0;
@@ -44,6 +57,7 @@ pub struct ObjectRpcChannelReceiveBufferPool {
     slots: Arc<Semaphore>,
     buffers: Mutex<Vec<BytesMut>>,
     max_slots: usize,
+    max_cached_slots: usize,
 }
 
 impl ObjectRpcChannelReceiveBufferPool {
@@ -61,6 +75,10 @@ impl ObjectRpcChannelReceiveBufferPool {
             slots: Arc::new(Semaphore::new(max_slots)),
             buffers: Mutex::new(Vec::new()),
             max_slots,
+            max_cached_slots: max_slots.min(
+                OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_CACHE_BYTES
+                    / OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES,
+            ),
         }))
     }
 
@@ -111,7 +129,7 @@ impl ObjectRpcChannelReceiveBufferPool {
         let Ok(mut buffers) = self.buffers.lock() else {
             return;
         };
-        if buffers.len() < self.max_slots {
+        if buffers.len() < self.max_cached_slots {
             buffers.push(buffer);
         }
     }
@@ -300,6 +318,63 @@ where
     R: AsyncRead + Unpin,
     F: FnOnce(&ObjectRpcChannelDataHeader) -> Result<(), NetworkError>,
 {
+    read_object_rpc_channel_transport_frame_async_inner(
+        reader,
+        options,
+        receive_pool,
+        validate_data_header,
+        false,
+    )
+    .await
+    .map(|(frame, _timing)| frame)
+}
+
+/// Timed mixed-frame reader used by persistent carriers during a bounded
+/// network timeline capture. Control frames deliberately retain their
+/// existing reader and timing behavior; only fixed SCDF Data returns timing.
+pub async fn read_object_rpc_channel_transport_frame_async_timed<R, F>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    receive_pool: &Arc<ObjectRpcChannelReceiveBufferPool>,
+    validate_data_header: F,
+) -> Result<
+    (
+        ObjectRpcChannelTransportFrame,
+        Option<ObjectFrameReadTiming>,
+    ),
+    NetworkError,
+>
+where
+    R: AsyncRead + Unpin,
+    F: FnOnce(&ObjectRpcChannelDataHeader) -> Result<(), NetworkError>,
+{
+    read_object_rpc_channel_transport_frame_async_inner(
+        reader,
+        options,
+        receive_pool,
+        validate_data_header,
+        true,
+    )
+    .await
+}
+
+async fn read_object_rpc_channel_transport_frame_async_inner<R, F>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    receive_pool: &Arc<ObjectRpcChannelReceiveBufferPool>,
+    validate_data_header: F,
+    time_fixed_data: bool,
+) -> Result<
+    (
+        ObjectRpcChannelTransportFrame,
+        Option<ObjectFrameReadTiming>,
+    ),
+    NetworkError,
+>
+where
+    R: AsyncRead + Unpin,
+    F: FnOnce(&ObjectRpcChannelDataHeader) -> Result<(), NetworkError>,
+{
     let prefix = read_frame_magic(reader, options.idle_timeout).await?;
     if prefix == OBJECT_FRAME_MAGIC {
         let prefix = Cursor::new(prefix);
@@ -315,7 +390,7 @@ where
                 "channel Data must use the fixed SCDF representation",
             ));
         }
-        return Ok(ObjectRpcChannelTransportFrame::Control(frame));
+        return Ok((ObjectRpcChannelTransportFrame::Control(frame), None));
     }
     if prefix != OBJECT_RPC_CHANNEL_DATA_MAGIC {
         return Err(invalid_data_header(format!(
@@ -324,6 +399,14 @@ where
         )));
     }
 
+    let capture_generation = if time_fixed_data {
+        crate::timeline::network_timeline_capture_generation()
+    } else {
+        0
+    };
+    let first_read_monotonic_ns = (capture_generation != 0)
+        .then(crate::network_timeline_monotonic_ns)
+        .unwrap_or(0);
     let mut encoded = [0_u8; OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES];
     encoded[..4].copy_from_slice(&prefix);
     read_exact_with_idle(
@@ -351,11 +434,34 @@ where
             u64::try_from(OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES + buffer.len()).unwrap_or(u64::MAX),
         );
     }
+    let body_read_completed_monotonic_ns = (capture_generation != 0)
+        .then(crate::network_timeline_monotonic_ns)
+        .unwrap_or(0);
+    let decode_started_monotonic_ns = body_read_completed_monotonic_ns;
     let frame = ObjectRpcChannelDataFrame {
         header,
         bytes: receive_pool.into_bytes(buffer, permit),
     };
-    Ok(ObjectRpcChannelTransportFrame::Data(frame))
+    // This final validation is allocation-free and keeps FRAME_DECODE ordered
+    // after the complete payload read. Header structure and call/window state
+    // were already validated before the receive pool was acquired.
+    frame.validate()?;
+    let decoded_monotonic_ns = (capture_generation != 0)
+        .then(crate::network_timeline_monotonic_ns)
+        .unwrap_or(0);
+    let timing = (capture_generation != 0).then_some(ObjectFrameReadTiming {
+        capture_generation,
+        ready_monotonic_ns: 0,
+        read_poll_monotonic_ns: 0,
+        first_read_monotonic_ns,
+        body_read_completed_monotonic_ns,
+        decode_started_monotonic_ns,
+        decoded_monotonic_ns,
+        wire_bytes: u32::try_from(OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES + frame.bytes.len())
+            .unwrap_or(u32::MAX),
+        first_read_bytes: u32::try_from(OBJECT_RPC_CHANNEL_DATA_MAGIC.len()).unwrap_or(u32::MAX),
+    });
+    Ok((ObjectRpcChannelTransportFrame::Data(frame), timing))
 }
 
 /// Writes one mixed carrier frame. SCDF Data uses one partial-write-safe
@@ -682,6 +788,125 @@ mod tests {
         assert_eq!(second_buffer.as_ptr(), first_ptr, "slab must be reused");
         drop(pool.into_bytes(second_buffer, second_permit));
         assert_eq!(pool.cached_buffers(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_stalled_call_leaves_one_work_slab_and_controls_need_no_slab() {
+        let pool = ObjectRpcChannelReceiveBufferPool::default_for_carrier();
+        assert_eq!(
+            pool.max_bytes(),
+            (2 * OBJECT_RPC_CHANNEL_MAX_CALLS + 1) * OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
+        );
+
+        let stalled_frames = 2 * OBJECT_RPC_CHANNEL_MAX_CALLS;
+        let mut stalled_bodies = Vec::with_capacity(stalled_frames);
+        for _ in 0..stalled_frames {
+            let (buffer, permit) = pool
+                .acquire(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
+                .await
+                .expect("stalled call receive slab");
+            stalled_bodies.push(pool.into_bytes(buffer, permit));
+        }
+
+        let unrelated = ObjectRpcChannelDataFrame::new(
+            ObjectRpcChannelCallId(29),
+            ObjectRpcChannelBodyDirection::Response,
+            0,
+            Bytes::from(vec![0x29; OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES]),
+        )
+        .expect("unrelated Data");
+        let following_control =
+            ObjectRpcChannelTransportFrame::Control(ObjectRpcChannelWireFrame::BodyEnd {
+                call_id: ObjectRpcChannelCallId(29),
+                direction: ObjectRpcChannelBodyDirection::Response,
+                total_bytes: OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES as u64,
+            });
+        let (mut local, mut peer) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            write_object_rpc_channel_data_frame_async(
+                &mut peer,
+                &unrelated,
+                ObjectFrameIoOptions::none(),
+            )
+            .await?;
+            write_object_rpc_channel_transport_frame_async(
+                &mut peer,
+                &following_control,
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+        });
+
+        let work_frame = tokio::time::timeout(
+            Duration::from_millis(250),
+            read_object_rpc_channel_transport_frame_async(
+                &mut local,
+                ObjectFrameIoOptions::none(),
+                &pool,
+                |header| {
+                    assert_eq!(header.call_id, ObjectRpcChannelCallId(29));
+                    assert_eq!(header.offset, 0);
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("unrelated Data must use the final work slab")
+        .expect("read unrelated Data");
+        let ObjectRpcChannelTransportFrame::Data(work_frame) = work_frame else {
+            panic!("expected unrelated Data frame");
+        };
+        assert_eq!(
+            work_frame.bytes.len(),
+            OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES
+        );
+
+        let control = tokio::time::timeout(
+            Duration::from_millis(250),
+            read_object_rpc_channel_transport_frame_async(
+                &mut local,
+                ObjectFrameIoOptions::none(),
+                &pool,
+                |_| Ok(()),
+            ),
+        )
+        .await
+        .expect("following control must not need a receive slab")
+        .expect("read following control");
+        assert!(matches!(
+            control,
+            ObjectRpcChannelTransportFrame::Control(ObjectRpcChannelWireFrame::BodyEnd {
+                call_id: ObjectRpcChannelCallId(29),
+                ..
+            })
+        ));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                pool.acquire(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES),
+            )
+            .await
+            .is_err(),
+            "both receive windows must remain inside the carrier memory bound"
+        );
+        drop(work_frame);
+        let (buffer, permit) = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.acquire(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES),
+        )
+        .await
+        .expect("dropping unrelated Data releases one reserve slab")
+        .expect("reacquire reserve slab");
+        drop(pool.into_bytes(buffer, permit));
+        drop(stalled_bodies);
+        writer.await.expect("writer task").expect("write frames");
+
+        assert_eq!(
+            pool.cached_buffers(),
+            OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_CACHE_BYTES / OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES,
+            "an idle carrier must retain only the smaller cache bound"
+        );
     }
 
     #[tokio::test]

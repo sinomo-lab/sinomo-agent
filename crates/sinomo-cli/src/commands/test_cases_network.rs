@@ -64,9 +64,33 @@ const CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM: usize = 16;
 // Exercise the ordinary RPC interface with a substantial request and response.
 // This is a test fixture size, not a protocol boundary.
 const ARBITRARY_MESSAGE_PAYLOAD_BYTES: usize = 1024 * 1024;
+// Exercise one complete 8 MiB per-call flow window in each direction without
+// embedding the bytes in either SOBJ head.
+const SEMANTIC_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BENCHMARK_REQUESTS_PER_TARGET: usize = 10_000;
+const MAX_BENCHMARK_CONCURRENCY: usize = 1_024;
+const MAX_BENCHMARK_TIMEOUT_MS: u64 = 300_000;
+const MAX_PREPARED_NETWORK_PING_JOBS: usize = 100_000;
+const MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NetworkPingPayloadMode {
+    EmbeddedSobj,
+    SemanticAttachment,
+}
+
+impl NetworkPingPayloadMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmbeddedSobj => "embedded-sobj",
+            Self::SemanticAttachment => "semantic-attachment",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct NetworkPingRunDefaults {
+    payload_mode: NetworkPingPayloadMode,
     parameter_prefix: Option<&'static str>,
     requests_per_target: usize,
     warmup_requests_per_target: Option<usize>,
@@ -87,6 +111,7 @@ struct NetworkPingRunDefaults {
 impl NetworkPingRunDefaults {
     const fn benchmark() -> Self {
         Self {
+            payload_mode: NetworkPingPayloadMode::EmbeddedSobj,
             parameter_prefix: None,
             requests_per_target: DEFAULT_REQUESTS_PER_TARGET,
             warmup_requests_per_target: Some(DEFAULT_WARMUP_REQUESTS_PER_TARGET),
@@ -107,6 +132,7 @@ impl NetworkPingRunDefaults {
 
     const fn arbitrary_message() -> Self {
         Self {
+            payload_mode: NetworkPingPayloadMode::EmbeddedSobj,
             parameter_prefix: Some("arbitrary-message"),
             requests_per_target: 1,
             warmup_requests_per_target: Some(0),
@@ -125,6 +151,27 @@ impl NetworkPingRunDefaults {
         }
     }
 
+    const fn semantic_attachment() -> Self {
+        Self {
+            payload_mode: NetworkPingPayloadMode::SemanticAttachment,
+            parameter_prefix: Some("attachment"),
+            requests_per_target: 4,
+            warmup_requests_per_target: Some(1),
+            concurrency: 4,
+            timeout_ms: 30_000,
+            expected_targets: DEFAULT_EXPECTED_TARGETS,
+            max_failures: 0,
+            max_p50_ms: 0,
+            max_p95_ms: 0,
+            max_p50_us: 0,
+            max_p95_us: 0,
+            min_requests_per_second: 0.0,
+            payload_bytes: SEMANTIC_ATTACHMENT_BYTES,
+            response_payload_bytes: SEMANTIC_ATTACHMENT_BYTES,
+            min_payload_bytes_per_second: 0.0,
+        }
+    }
+
     fn parameter_name(self, name: &str) -> String {
         self.parameter_prefix
             .map(|prefix| format!("{prefix}-{name}"))
@@ -137,12 +184,25 @@ pub fn register_network_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(network_ping_benchmark())
+        .register(network_semantic_attachment_benchmark())
         .register(network_arbitrary_message())
         .register(network_state_hygiene())
         .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
         .register(network_tcp_tunnel_stale_fallback())
         .register(network_stale_direct_timeout_demotion())
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_semantic_attachment_benchmark(ctx) {
+        id: "cluster.network.semantic-attachment-benchmark",
+        summary: "Stream small SOBJ heads with large semantic request and response attachments",
+        tags: ["cluster-network", "probe", "performance", "semantic-attachment"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_semantic_attachment_benchmark(ctx)
+        }
+    }
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -501,6 +561,10 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::benchmark())
 }
 
+fn run_network_semantic_attachment_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    run_network_ping_with_defaults(ctx, NetworkPingRunDefaults::semantic_attachment())
+}
+
 fn should_sample_network_timeline(
     job_index: usize,
     total_jobs: usize,
@@ -586,6 +650,37 @@ fn run_network_ping_with_defaults(
         &response_payload_bytes_name,
         defaults.response_payload_bytes,
     )?;
+    let (attachment_request_bytes, attachment_response_bytes) =
+        if defaults.payload_mode == NetworkPingPayloadMode::SemanticAttachment {
+            let request_bytes =
+                u64::try_from(payload_bytes).map_err(|_| SinomoTestError::InvalidParameter {
+                    name: payload_bytes_name.clone(),
+                    detail: "does not fit the attachment byte-count field".to_string(),
+                })?;
+            let response_bytes = u64::try_from(response_payload_bytes).map_err(|_| {
+                SinomoTestError::InvalidParameter {
+                    name: response_payload_bytes_name.clone(),
+                    detail: "does not fit the attachment byte-count field".to_string(),
+                }
+            })?;
+            for (name, bytes) in [
+                (&payload_bytes_name, request_bytes),
+                (&response_payload_bytes_name, response_bytes),
+            ] {
+                if bytes > cluster::CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES {
+                    return Err(SinomoTestError::InvalidParameter {
+                        name: name.clone(),
+                        detail: format!(
+                            "must be at most {} bytes",
+                            cluster::CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES
+                        ),
+                    });
+                }
+            }
+            (request_bytes, response_bytes)
+        } else {
+            (0, 0)
+        };
     let min_payload_bytes_per_second = optional_f64_parameter(
         ctx,
         &min_payload_bytes_per_second_name,
@@ -601,6 +696,23 @@ fn run_network_ping_with_defaults(
     require_positive(&requests_per_target_name, requests_per_target)?;
     require_positive(&concurrency_name, concurrency)?;
     require_positive(&timeout_name, timeout_ms as usize)?;
+    require_at_most(
+        &requests_per_target_name,
+        requests_per_target,
+        MAX_BENCHMARK_REQUESTS_PER_TARGET,
+    )?;
+    require_at_most(
+        &warmup_requests_per_target_name,
+        warmup_requests_per_target,
+        MAX_BENCHMARK_REQUESTS_PER_TARGET,
+    )?;
+    require_at_most(&concurrency_name, concurrency, MAX_BENCHMARK_CONCURRENCY)?;
+    if timeout_ms > MAX_BENCHMARK_TIMEOUT_MS {
+        return Err(SinomoTestError::InvalidParameter {
+            name: timeout_name,
+            detail: format!("must be at most {MAX_BENCHMARK_TIMEOUT_MS}"),
+        });
+    }
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
     super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
@@ -629,6 +741,52 @@ fn run_network_ping_with_defaults(
         )));
     }
 
+    let measured_job_count = target_count
+        .checked_mul(requests_per_target)
+        .ok_or_else(|| SinomoTestError::InvalidParameter {
+            name: requests_per_target_name.clone(),
+            detail: "target count times requests per target overflows".to_string(),
+        })?;
+    let warmup_job_count = target_count
+        .checked_mul(warmup_requests_per_target)
+        .ok_or_else(|| SinomoTestError::InvalidParameter {
+            name: warmup_requests_per_target_name.clone(),
+            detail: "target count times warmup requests per target overflows".to_string(),
+        })?;
+    for (name, jobs) in [
+        (&requests_per_target_name, measured_job_count),
+        (&warmup_requests_per_target_name, warmup_job_count),
+    ] {
+        if jobs > MAX_PREPARED_NETWORK_PING_JOBS {
+            return Err(SinomoTestError::InvalidParameter {
+                name: name.clone(),
+                detail: format!(
+                    "would prepare {jobs} jobs, above the bounded maximum {MAX_PREPARED_NETWORK_PING_JOBS}"
+                ),
+            });
+        }
+    }
+    if defaults.payload_mode == NetworkPingPayloadMode::EmbeddedSobj {
+        let prepared_payload_bytes = measured_job_count
+            .checked_add(warmup_job_count)
+            .and_then(|jobs| jobs.checked_mul(payload_bytes))
+            .unwrap_or(usize::MAX);
+        let maximum_live_payload_bytes = concurrency
+            .checked_mul(payload_bytes.max(response_payload_bytes))
+            .unwrap_or(usize::MAX);
+        if prepared_payload_bytes > MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES
+            || maximum_live_payload_bytes > MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES
+        {
+            return Err(SinomoTestError::InvalidParameter {
+                name: payload_bytes_name,
+                detail: format!(
+                    "embedded benchmark payloads exceed the bounded {} byte preparation/live budget",
+                    MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES
+                ),
+            });
+        }
+    }
+
     let benchmark_started = Instant::now();
     let prepare_started = Instant::now();
     let nonce_prefix = format!("{}-{}", current_millis(), std::process::id());
@@ -654,46 +812,57 @@ fn run_network_ping_with_defaults(
         .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
     let daemon_address = daemon_client.address().to_string();
     let control_timeout = Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1));
-    let build_jobs = |phase: &str,
-                      requests_per_target: usize|
-     -> Result<Vec<NetworkPingJob>, SinomoTestError> {
-        let total_jobs = target_count.saturating_mul(requests_per_target);
-        let mut jobs = Vec::with_capacity(total_jobs);
-        for attempt in 0..requests_per_target {
-            for target_node_id in &targets {
-                let nonce = format!("ping-{phase}-{nonce_prefix}-{target_node_id}-{attempt}");
-                let mut request = cluster::cluster_network_ping_rpc_request_with_response_payload(
-                    &nonce,
-                    payload_bytes,
-                    response_payload_bytes,
-                )
-                .map_err(|source| {
-                    SinomoTestError::failed(format!(
-                        "cannot prepare network ping request for {}: {source}",
-                        target_node_id
-                    ))
-                })?;
-                if phase == "measure"
-                    && should_sample_network_timeline(jobs.len(), total_jobs, timeline_samples)
-                {
-                    request = request
-                        .with_trace_context_if_missing()
-                        .with_observe_sampled(true);
+    let build_jobs =
+        |phase: &str, requests_per_target: usize| -> Result<Vec<NetworkPingJob>, SinomoTestError> {
+            let total_jobs = target_count.saturating_mul(requests_per_target);
+            let mut jobs = Vec::with_capacity(total_jobs);
+            for attempt in 0..requests_per_target {
+                for target_node_id in &targets {
+                    let nonce = format!("ping-{phase}-{nonce_prefix}-{target_node_id}-{attempt}");
+                    let mut request = match defaults.payload_mode {
+                        NetworkPingPayloadMode::EmbeddedSobj => {
+                            cluster::cluster_network_ping_rpc_request_with_response_payload(
+                                &nonce,
+                                payload_bytes,
+                                response_payload_bytes,
+                            )
+                        }
+                        NetworkPingPayloadMode::SemanticAttachment => {
+                            cluster::cluster_network_ping_attachment_rpc_request(
+                                &nonce,
+                                attachment_request_bytes,
+                                attachment_response_bytes,
+                            )
+                        }
+                    }
+                    .map_err(|source| {
+                        SinomoTestError::failed(format!(
+                            "cannot prepare network ping request for {}: {source}",
+                            target_node_id
+                        ))
+                    })?;
+                    if phase == "measure"
+                        && should_sample_network_timeline(jobs.len(), total_jobs, timeline_samples)
+                    {
+                        request = request
+                            .with_trace_context_if_missing()
+                            .with_observe_sampled(true);
+                    }
+                    jobs.push(NetworkPingJob {
+                        payload_mode: defaults.payload_mode,
+                        target_node_id: target_node_id.clone(),
+                        timeout: Duration::from_millis(timeout_ms),
+                        control_timeout,
+                        request_payload_bytes: payload_bytes,
+                        response_payload_bytes,
+                        nonce,
+                        request,
+                        daemon_address: daemon_address.clone(),
+                    });
                 }
-                jobs.push(NetworkPingJob {
-                    target_node_id: target_node_id.clone(),
-                    timeout: Duration::from_millis(timeout_ms),
-                    control_timeout,
-                    request_payload_bytes: payload_bytes,
-                    response_payload_bytes,
-                    nonce,
-                    request,
-                    daemon_address: daemon_address.clone(),
-                });
             }
-        }
-        Ok(jobs)
-    };
+            Ok(jobs)
+        };
     let warmup_jobs = build_jobs("warmup", warmup_requests_per_target)?;
     let jobs = build_jobs("measure", requests_per_target)?;
     let timeline_sample_count = jobs
@@ -703,6 +872,12 @@ fn run_network_ping_with_defaults(
     let timeline_first_sample = jobs.iter().find(|job| job.request.observe_sampled());
     let prepare_elapsed = prepare_started.elapsed();
     let total_requests = jobs.len();
+    let maximum_request_sobj_head_bytes = jobs
+        .iter()
+        .map(|job| job.request.body.len())
+        .max()
+        .unwrap_or(0);
+    ctx.record("payload_mode", defaults.payload_mode.as_str());
     ctx.record("requests_per_target", requests_per_target);
     ctx.record("warmup_requests_per_target", warmup_requests_per_target);
     ctx.record("warmup_total_requests", warmup_jobs.len());
@@ -712,6 +887,10 @@ fn run_network_ping_with_defaults(
     ctx.record("timeout_ms", timeout_ms);
     ctx.record("request_payload_bytes", payload_bytes);
     ctx.record("response_payload_bytes", response_payload_bytes);
+    ctx.record(
+        "maximum_request_sobj_head_bytes",
+        maximum_request_sobj_head_bytes,
+    );
     ctx.record("max_failures", max_failures);
     ctx.record("max_p50_ms", max_p50_ms);
     ctx.record("max_p95_ms", max_p95_ms);
@@ -860,7 +1039,11 @@ fn run_network_ping_with_defaults(
     let slowest_targets_us = network_ping_slowest_target_summaries(&latencies_by_target_us, "us");
     let requests_per_second = rate_per_second(success_count as f64, elapsed);
     let payload_bytes_per_success = payload_bytes.saturating_add(response_payload_bytes);
+    let total_success_request_bytes = payload_bytes.saturating_mul(success_count);
+    let total_success_response_bytes = response_payload_bytes.saturating_mul(success_count);
     let total_success_payload_bytes = payload_bytes_per_success.saturating_mul(success_count);
+    let request_bytes_per_second = rate_per_second(total_success_request_bytes as f64, elapsed);
+    let response_bytes_per_second = rate_per_second(total_success_response_bytes as f64, elapsed);
     let payload_bytes_per_second = rate_per_second(total_success_payload_bytes as f64, elapsed);
     let latency_by_target_ms = latencies_by_target
         .into_iter()
@@ -906,6 +1089,48 @@ fn run_network_ping_with_defaults(
     ctx.record("requests_per_second", requests_per_second);
     ctx.record("success_payload_bytes", total_success_payload_bytes as u64);
     ctx.record("payload_bytes_per_second", payload_bytes_per_second);
+    ctx.record(
+        "logical_transfer_bytes_per_success",
+        payload_bytes_per_success as u64,
+    );
+    match defaults.payload_mode {
+        NetworkPingPayloadMode::EmbeddedSobj => {
+            ctx.record(
+                "embedded_sobj_logical_bytes",
+                total_success_payload_bytes as u64,
+            );
+            ctx.record(
+                "embedded_sobj_logical_bytes_per_second",
+                payload_bytes_per_second,
+            );
+        }
+        NetworkPingPayloadMode::SemanticAttachment => {
+            ctx.record(
+                "successful_request_attachment_bytes",
+                total_success_request_bytes as u64,
+            );
+            ctx.record(
+                "request_attachment_bytes_per_second",
+                request_bytes_per_second,
+            );
+            ctx.record(
+                "successful_response_attachment_bytes",
+                total_success_response_bytes as u64,
+            );
+            ctx.record(
+                "response_attachment_bytes_per_second",
+                response_bytes_per_second,
+            );
+            ctx.record(
+                "semantic_attachment_duplex_logical_bytes",
+                total_success_payload_bytes as u64,
+            );
+            ctx.record(
+                "semantic_attachment_duplex_logical_bytes_per_second",
+                payload_bytes_per_second,
+            );
+        }
+    }
     ctx.record("latency_min_ms", min_ms);
     ctx.record("latency_p50_ms", p50_ms);
     ctx.record("latency_p95_ms", p95_ms);
@@ -967,12 +1192,22 @@ fn run_network_ping_with_defaults(
     if min_payload_bytes_per_second > 0.0 && payload_bytes_per_second < min_payload_bytes_per_second
     {
         return Ok(SinomoTestOutcome::failed(format!(
-            "network ping payload throughput {payload_bytes_per_second:.2} bytes/s is below required {min_payload_bytes_per_second:.2} bytes/s"
+            "network ping {} aggregate duplex logical throughput {payload_bytes_per_second:.2} bytes/s is below required {min_payload_bytes_per_second:.2} bytes/s",
+            defaults.payload_mode.as_str()
         )));
     }
 
+    let throughput_summary = match defaults.payload_mode {
+        NetworkPingPayloadMode::EmbeddedSobj => {
+            format!("{payload_bytes_per_second:.2} embedded-SOBJ logical bytes/s")
+        }
+        NetworkPingPayloadMode::SemanticAttachment => format!(
+            "{payload_bytes_per_second:.2} aggregate duplex logical bytes/s (request {request_bytes_per_second:.2}, response {response_bytes_per_second:.2})"
+        ),
+    };
     Ok(SinomoTestOutcome::passed(format!(
-        "network ping completed {success_count}/{total_requests} RPCs in {}ms ({requests_per_second:.2} req/s, {payload_bytes_per_second:.2} payload bytes/s, p50={p50_ms}ms/{p50_us}us p95={p95_ms}ms/{p95_us}us)",
+        "network ping completed {success_count}/{total_requests} {} RPCs in {}ms ({requests_per_second:.2} req/s, {throughput_summary}, p50={p50_ms}ms/{p50_us}us p95={p95_ms}ms/{p95_us}us)",
+        defaults.payload_mode.as_str(),
         elapsed.as_millis()
     )))
 }
@@ -2221,6 +2456,7 @@ fn normalized_tcp_endpoint_address(address: &str) -> &str {
 
 #[derive(Clone, Debug)]
 struct NetworkPingJob {
+    payload_mode: NetworkPingPayloadMode,
     target_node_id: NodeId,
     nonce: String,
     timeout: Duration,
@@ -2247,14 +2483,8 @@ enum NetworkPingOutcome {
 
 async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     let started = Instant::now();
-    let deadline = job.timeout.saturating_add(Duration::from_secs(2));
-    let outcome = match tokio::time::timeout(deadline, run_network_ping_job_inner(&job)).await {
-        Ok(outcome) => outcome,
-        Err(_) => NetworkPingOutcome::Failure(format!(
-            "network ping job exceeded {}ms deadline",
-            deadline.as_millis()
-        )),
-    };
+    let outcome =
+        run_network_ping_outcome_with_deadline(job.timeout, run_network_ping_job_inner(&job)).await;
     let elapsed = started.elapsed();
     NetworkPingResult {
         target_node_id: job.target_node_id,
@@ -2264,21 +2494,67 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     }
 }
 
+async fn run_network_ping_outcome_with_deadline(
+    deadline: Duration,
+    outcome: impl std::future::Future<Output = NetworkPingOutcome>,
+) -> NetworkPingOutcome {
+    match tokio::time::timeout(deadline, outcome).await {
+        Ok(outcome) => outcome,
+        Err(_) => NetworkPingOutcome::Failure(format!(
+            "network ping job exceeded {}ms deadline",
+            deadline.as_millis()
+        )),
+    }
+}
+
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
     let client =
         DaemonApiClient::at_address(job.daemon_address.clone()).with_timeout(job.control_timeout);
-    let response = match client
-        .object_rpc_to_target_with_deadline_async(
-            &job.target_node_id,
-            &job.request,
-            job.timeout,
-            Some(job.timeout),
-            true,
-        )
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+    let (response, response_body) = match job.payload_mode {
+        NetworkPingPayloadMode::EmbeddedSobj => {
+            let response = match client
+                .object_rpc_to_target_with_deadline_async(
+                    &job.target_node_id,
+                    &job.request,
+                    job.timeout,
+                    Some(job.timeout),
+                    true,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+            };
+            (response, None)
+        }
+        NetworkPingPayloadMode::SemanticAttachment => {
+            let request_attachment_bytes = match u64::try_from(job.request_payload_bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return NetworkPingOutcome::Failure(
+                        "request attachment size does not fit u64".to_string(),
+                    );
+                }
+            };
+            let call = network::ObjectRpcSessionCall::new(
+                job.request.clone(),
+                network::ObjectRpcBodySource::zeroes(request_attachment_bytes),
+            );
+            let result = match client
+                .object_rpc_session_to_target_with_deadline_async(
+                    &job.target_node_id,
+                    call,
+                    job.timeout,
+                    Some(job.timeout),
+                    true,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+            };
+            (result.response, Some(result.body))
+        }
     };
     if let Err(error) = response.error_detail() {
         return NetworkPingOutcome::Failure(error.to_string());
@@ -2299,18 +2575,90 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
             response.responder_node_id, job.target_node_id
         ));
     }
-    if response.payload_bytes != job.request_payload_bytes {
-        return NetworkPingOutcome::Failure(format!(
-            "payload length mismatch: got {}, expected {}",
-            response.payload_bytes, job.request_payload_bytes
-        ));
-    }
-    if response.response_payload.len() != job.response_payload_bytes {
-        return NetworkPingOutcome::Failure(format!(
-            "response payload length mismatch: got {}, expected {}",
-            response.response_payload.len(),
-            job.response_payload_bytes
-        ));
+    match job.payload_mode {
+        NetworkPingPayloadMode::EmbeddedSobj => {
+            if response.payload_mode != cluster::ClusterNetworkPingPayloadMode::EmbeddedSobj {
+                return NetworkPingOutcome::Failure(format!(
+                    "response payload mode mismatch: got {:?}, expected embedded SOBJ",
+                    response.payload_mode
+                ));
+            }
+            if response.payload_bytes != job.request_payload_bytes {
+                return NetworkPingOutcome::Failure(format!(
+                    "payload length mismatch: got {}, expected {}",
+                    response.payload_bytes, job.request_payload_bytes
+                ));
+            }
+            if response.response_payload.len() != job.response_payload_bytes {
+                return NetworkPingOutcome::Failure(format!(
+                    "response payload length mismatch: got {}, expected {}",
+                    response.response_payload.len(),
+                    job.response_payload_bytes
+                ));
+            }
+        }
+        NetworkPingPayloadMode::SemanticAttachment => {
+            if response.payload_mode != cluster::ClusterNetworkPingPayloadMode::SemanticAttachment {
+                return NetworkPingOutcome::Failure(format!(
+                    "response payload mode mismatch: got {:?}, expected semantic attachment",
+                    response.payload_mode
+                ));
+            }
+            if response.payload_bytes != 0 || !response.response_payload.is_empty() {
+                return NetworkPingOutcome::Failure(
+                    "semantic attachment response mixed bytes into the SOBJ head".to_string(),
+                );
+            }
+            let expected_request_bytes = match u64::try_from(job.request_payload_bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return NetworkPingOutcome::Failure(
+                        "request attachment size does not fit u64".to_string(),
+                    );
+                }
+            };
+            if response.request_attachment_bytes != expected_request_bytes {
+                return NetworkPingOutcome::Failure(format!(
+                    "request attachment length mismatch: got {}, expected {}",
+                    response.request_attachment_bytes, job.request_payload_bytes
+                ));
+            }
+            let expected_response_bytes = match u64::try_from(job.response_payload_bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return NetworkPingOutcome::Failure(
+                        "response attachment size does not fit u64".to_string(),
+                    );
+                }
+            };
+            if response.response_attachment_bytes != expected_response_bytes {
+                return NetworkPingOutcome::Failure(format!(
+                    "response attachment head length mismatch: got {}, expected {}",
+                    response.response_attachment_bytes, expected_response_bytes
+                ));
+            }
+            let Some(response_body) = response_body else {
+                return NetworkPingOutcome::Failure(
+                    "semantic attachment response omitted its body stream".to_string(),
+                );
+            };
+            if response_body.total_bytes() != Some(expected_response_bytes) {
+                return NetworkPingOutcome::Failure(format!(
+                    "response attachment descriptor declares {:?} bytes, expected {}",
+                    response_body.total_bytes(),
+                    expected_response_bytes
+                ));
+            }
+            let actual_response_bytes = match response_body.discard_owned_chunks().await {
+                Ok(bytes) => bytes,
+                Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+            };
+            if actual_response_bytes != expected_response_bytes {
+                return NetworkPingOutcome::Failure(format!(
+                    "response attachment delivered {actual_response_bytes} bytes, expected {expected_response_bytes}"
+                ));
+            }
+        }
     }
     NetworkPingOutcome::Success
 }
@@ -2392,6 +2740,16 @@ fn require_positive(name: &str, value: usize) -> Result<(), SinomoTestError> {
         return Err(SinomoTestError::InvalidParameter {
             name: name.to_string(),
             detail: "must be greater than zero".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn require_at_most(name: &str, value: usize, maximum: usize) -> Result<(), SinomoTestError> {
+    if value > maximum {
+        return Err(SinomoTestError::InvalidParameter {
+            name: name.to_string(),
+            detail: format!("must be at most {maximum}"),
         });
     }
     Ok(())
@@ -2545,13 +2903,16 @@ mod tests {
 
     #[test]
     fn client_timeline_capacity_covers_one_mib_full_duplex_payloads() {
+        let payload_quanta = 2 * ARBITRARY_MESSAGE_PAYLOAD_BYTES
+            .div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES);
         assert_eq!(
             benchmark_client_timeline_capacity(
                 1,
                 ARBITRARY_MESSAGE_PAYLOAD_BYTES,
                 ARBITRARY_MESSAGE_PAYLOAD_BYTES,
             ),
-            1056
+            payload_quanta * CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM
+                + CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE
         );
     }
 
@@ -2573,6 +2934,69 @@ mod tests {
             response_parameter,
             "arbitrary-message-response-payload-bytes"
         );
+    }
+
+    #[test]
+    fn semantic_attachment_defaults_exercise_one_window_per_direction_with_bounded_concurrency() {
+        let defaults = NetworkPingRunDefaults::semantic_attachment();
+
+        assert_eq!(
+            defaults.payload_mode,
+            NetworkPingPayloadMode::SemanticAttachment
+        );
+        assert_eq!(defaults.payload_bytes, 8 * 1024 * 1024);
+        assert_eq!(defaults.response_payload_bytes, 8 * 1024 * 1024);
+        assert_eq!(defaults.requests_per_target, 4);
+        assert_eq!(defaults.warmup_requests_per_target, Some(1));
+        assert_eq!(defaults.concurrency, 4);
+        assert_eq!(
+            defaults.parameter_name("payload-bytes"),
+            "attachment-payload-bytes"
+        );
+    }
+
+    #[test]
+    fn network_ping_job_parameters_have_explicit_allocation_bounds() {
+        assert!(
+            require_at_most(
+                "requests-per-target",
+                MAX_BENCHMARK_REQUESTS_PER_TARGET,
+                MAX_BENCHMARK_REQUESTS_PER_TARGET,
+            )
+            .is_ok()
+        );
+        assert!(
+            require_at_most(
+                "requests-per-target",
+                MAX_BENCHMARK_REQUESTS_PER_TARGET + 1,
+                MAX_BENCHMARK_REQUESTS_PER_TARGET,
+            )
+            .is_err()
+        );
+        assert!(MAX_PREPARED_NETWORK_PING_JOBS >= 6 * 128);
+        assert!(MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES >= 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn network_ping_deadline_covers_a_stalled_response_body_phase() {
+        let (head_complete_tx, head_complete_rx) = tokio::sync::oneshot::channel();
+        let outcome =
+            run_network_ping_outcome_with_deadline(Duration::from_millis(10), async move {
+                head_complete_tx
+                    .send(())
+                    .expect("mark response head complete");
+                std::future::pending::<NetworkPingOutcome>().await
+            })
+            .await;
+
+        head_complete_rx
+            .await
+            .expect("deadline future reached response body phase");
+        assert!(matches!(
+            outcome,
+            NetworkPingOutcome::Failure(detail)
+                if detail == "network ping job exceeded 10ms deadline"
+        ));
     }
 
     fn test_state() -> ClusterBootstrapState {

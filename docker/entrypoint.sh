@@ -40,13 +40,34 @@ MAIN_PORT="${MAIN_PORT:-21353}"
 JOIN_READY_DIR="${JOIN_READY_DIR:-/shared}"
 WAIT_FOR_INTRODUCER_READY="${WAIT_FOR_INTRODUCER_READY:-0}"
 WAIT_FOR_JOIN_READY_NODES="${WAIT_FOR_JOIN_READY_NODES:-}"
+FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+FORMATION_OBSERVE_MAX_EVENTS="${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
 
 export SINOMO_DATA_DIR="$DATA"
 # This segmented test cluster runs with iroh off by default so segmentation is real.
 export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
 export SINOMO_DAEMON_ADVERTISE_HOST="${SINOMO_DAEMON_ADVERTISE_HOST:-$NODE_NAME}"
+# Install the diagnostic filter before the shadow supervisor starts either the
+# initial or identity-replacement daemon. The ordinary dev cluster keeps the
+# production default filter; only explicitly observed Docker runs pay for the
+# extra formation trace events.
+if [ "$FORMATION_OBSERVE" = 1 ]; then
+  export SINOMO_OBSERVE_FILTER="$FORMATION_OBSERVE_FILTER"
+fi
 
 log() { echo "[entrypoint $(hostname)] $*"; }
+
+formation_cpu_profile_enabled() {
+  local configured="${FORMATION_OBSERVE_CPU_NODES//[[:space:]]/}"
+  case ",$configured," in
+    *,all,*|*,"$NODE_NAME",*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 JOIN_FAILURE_MARKER="/shared/$NODE_NAME.join-failed"
 
@@ -163,10 +184,119 @@ cluster_state_id() {
     | awk '/^cluster:/{print $2; exit}'
 }
 
+local_cluster_state_id() {
+  local state_file="$DATA/cluster/state.sobj"
+  [ -f "$state_file" ] || return 1
+  # `cluster status` decorates local identity with live cluster reads and can
+  # consume a full transport timeout on a freshly joined deep-segment node.
+  # Decode only the durable local state that the completed join just wrote.
+  "$BIN" debug sobj "$state_file" 2>/dev/null \
+    | sed -n 's/.*payload={"cluster_id": "\([^"]*\)".*/\1/p'
+}
+
 local_daemon_pid() {
-  local timeout_seconds="${1:-$CLUSTER_STATUS_TIMEOUT}"
-  timeout --foreground "${timeout_seconds}s" "$BIN" daemon status 2>/dev/null \
-    | awk '/^  pid:/{print $2; exit}'
+  local excluded_pid="${1:-}"
+  # `daemon status` performs a live RPC and decorates the result with cluster
+  # state. A freshly joined deep-segment node can therefore spend its complete
+  # transport timeout here even though the replacement process already wrote
+  # status and bound its listener. Process identity is all callers need. Skip
+  # the retiring process explicitly because it may briefly overlap its
+  # replacement in the process table.
+  ps -eo pid=,args= 2>/dev/null \
+    | awk -v bin="$BIN" -v excluded_pid="$excluded_pid" '
+        $1 != excluded_pid && $2 == bin && $3 == "daemon" && $4 == "run" {
+          print $1
+          exit
+        }
+      '
+}
+
+# Run bounded observe RPCs off the formation dependency path. Even local
+# observation RPCs can queue behind the work being measured, so synchronously
+# waiting for them here would delay the next bridge's readiness marker and
+# contaminate the ten-second Docker-only acceptance measurement.
+run_formation_observation() {
+  local pid="$1" capture="$2" observe_dir="$3" command_timeout=3
+  local trace_pid startup_trace_pid timeline_pid profile_pid
+  timeout --foreground "${command_timeout}s" "$BIN" observe control \
+    --capture "$capture" --filter "$FORMATION_OBSERVE_FILTER" --json \
+    > "$observe_dir/$capture.trace-control.json" 2> "$observe_dir/$capture.trace-control.stderr.log" \
+    || log "WARN: formation trace capture did not start for daemon pid $pid" &
+  trace_pid=$!
+  # Capture the complete process-local ring without a capture-id filter. It
+  # includes startup records emitted before the asynchronous control RPC could
+  # attach `$capture`, and remains on disk if this daemon exits during join.
+  timeout --foreground "${command_timeout}s" "$BIN" observe traces \
+    --limit 4096 --json \
+    > "$observe_dir/$capture.startup-traces.json" \
+    2> "$observe_dir/$capture.startup-traces.stderr.log" \
+    || log "WARN: formation startup traces were unavailable for daemon pid $pid" &
+  startup_trace_pid=$!
+  timeout --foreground "${command_timeout}s" "$BIN" observe timeline network start \
+    --capture "$capture" --duration-seconds "$FORMATION_OBSERVE_DURATION_SECONDS" \
+    --max-events "$FORMATION_OBSERVE_MAX_EVENTS" --json \
+    > "$observe_dir/$capture.timeline-start.json" 2> "$observe_dir/$capture.timeline-start.stderr.log" \
+    || log "WARN: formation network timeline did not start for daemon pid $pid" &
+  timeline_pid=$!
+  profile_pid=""
+  if formation_cpu_profile_enabled; then
+    timeout --foreground "${command_timeout}s" "$BIN" observe profile cpu start \
+      --capture "$capture" --duration-seconds "$FORMATION_OBSERVE_DURATION_SECONDS" \
+      --frequency-hz "$FORMATION_OBSERVE_FREQUENCY_HZ" --json \
+      > "$observe_dir/$capture.profile-start.json" 2> "$observe_dir/$capture.profile-start.stderr.log" \
+      || log "WARN: formation CPU profile did not start for daemon pid $pid" &
+    profile_pid=$!
+  else
+    log "skipping in-process formation CPU profile for daemon pid $pid"
+  fi
+
+  wait "$trace_pid" "$startup_trace_pid" "$timeline_pid" 2>/dev/null || true
+  if [ -n "$profile_pid" ]; then
+    wait "$profile_pid" 2>/dev/null || true
+  fi
+  : > "$observe_dir/$capture.ready"
+
+  log "started bounded formation observation capture $capture"
+}
+
+# Optional Docker-only diagnostic capture. The production daemon has no
+# ten-second join assumption; this helper simply brackets the dev cluster's
+# formation window with the ordinary observe RPCs. It schedules once per main
+# daemon PID, including identity-changing replacement daemons, without making
+# observer startup a prerequisite for downstream cluster formation.
+start_formation_observation() {
+  [ "$FORMATION_OBSERVE" = 1 ] || return 0
+  local pid="${1:-}" capture observe_dir current_pid_file
+  if [ -z "$pid" ]; then
+    pid="$(local_daemon_pid || true)"
+  fi
+  if [ -z "$pid" ]; then
+    log "WARN: formation observation could not resolve the main daemon pid"
+    return 0
+  fi
+  observe_dir="$DATA/observe/formation"
+  current_pid_file="$observe_dir/current-daemon-pid"
+  if [ -f "$current_pid_file" ] \
+    && [ "$(sed -n '1p' "$current_pid_file" 2>/dev/null)" = "$pid" ]; then
+    return 0
+  fi
+  mkdir -p "$observe_dir" || return 0
+  capture="formation-${NODE_NAME}-${pid}"
+
+  # Publish the intent before spawning so concurrent readiness paths cannot
+  # schedule duplicate captures for the same daemon generation.
+  printf '%s\n' "$capture" > "$observe_dir/current-capture"
+  printf '%s\n' "$pid" > "$current_pid_file"
+  printf '%s\t%s\n' "$capture" "$pid" >> "$observe_dir/captures.tsv"
+  run_formation_observation "$pid" "$capture" "$observe_dir" &
+  log "scheduled bounded formation observation capture $capture"
+}
+
+local_daemon_status_contains_cluster() {
+  local cluster_id="$1" status_file="$DATA/daemon/status.sobj"
+  [ -n "$cluster_id" ] \
+    && [ -f "$status_file" ] \
+    && grep -aFq "$cluster_id" "$status_file"
 }
 
 # A successful join replaces the cluster identity captured by the boot-time
@@ -176,11 +306,10 @@ local_daemon_pid() {
 LOCAL_DAEMON_ACTIVATION_FAILURE=""
 wait_for_local_daemon_cluster_activation() {
   local previous_pid="$1" timeout="${2:-$JOIN_TIMEOUT}"
-  local started elapsed remaining probe_timeout expected_cluster status_output
-  local current_pid current_cluster network_output="" status=0
+  local started elapsed remaining expected_cluster current_pid
   started="$SECONDS"
   LOCAL_DAEMON_ACTIVATION_FAILURE=""
-  expected_cluster="$(cluster_state_id "$CLUSTER_STATUS_TIMEOUT" || true)"
+  expected_cluster="$(local_cluster_state_id || true)"
   if [ -z "$expected_cluster" ]; then
     LOCAL_DAEMON_ACTIVATION_FAILURE="accepted cluster state did not report a cluster id"
     return 1
@@ -190,45 +319,29 @@ wait_for_local_daemon_cluster_activation() {
     elapsed=$((SECONDS - started))
     [ "$elapsed" -lt "$timeout" ] || break
     remaining=$((timeout - elapsed))
-    probe_timeout="$CLUSTER_STATUS_TIMEOUT"
-    if [ "$probe_timeout" -gt "$remaining" ]; then
-      probe_timeout="$remaining"
-    fi
-    status_output="$(timeout --foreground "${probe_timeout}s" "$BIN" daemon status 2>&1)"
-    status=$?
-    current_pid="$(printf '%s\n' "$status_output" | awk '/^  pid:/{print $2; exit}')"
-    current_cluster="$(printf '%s\n' "$status_output" | awk '/^  cluster:/{print $2; exit}')"
-    if [ "$status" -eq 0 ] \
-      && [ -n "$current_pid" ] \
+    current_pid="$(local_daemon_pid "$previous_pid" || true)"
+    if [ -n "$current_pid" ] \
       && [ "$current_pid" != "$previous_pid" ] \
-      && [ "$current_cluster" = "$expected_cluster" ]; then
-      network_output="$(timeout --foreground "${probe_timeout}s" \
-        "$BIN" test run cluster.network.ping-benchmark --require-cluster --json \
-          --param requests-per-target=1 \
-          --param warmup-requests-per-target=0 \
-          --param concurrency=4 \
-          --param timeout-ms=2000 \
-          --param max-failures=0 \
-          --param max-p50-ms=0 \
-          --param max-p95-ms=0 \
-          --param max-p50-us=0 \
-          --param max-p95-us=0 \
-          --param min-requests-per-second=0 2>&1)"
-      if [ "$?" -eq 0 ]; then
-        log "activated joined cluster $current_cluster in network-ready replacement daemon pid $current_pid"
-        return 0
+      && local_daemon_status_contains_cluster "$expected_cluster"; then
+      elapsed=$((SECONDS - started))
+      remaining=$((timeout - elapsed))
+      if [ "$remaining" -le 0 ] \
+        || ! wait_for_tcp "127.0.0.1:$MAIN_PORT" "$remaining"; then
+        break
       fi
+      # Use the replacement PID proven above. Re-resolving without excluding
+      # the retiring process can select its lower PID during the brief overlap.
+      start_formation_observation "$current_pid"
+      # This marker gates the next hop's join, not steady-state acceptance.
+      # Prove only that this replacement has bound its local control listener;
+      # the outer cluster test owns the single end-to-end health/doctor gate.
+      log "activated joined cluster $expected_cluster in listening replacement daemon pid $current_pid"
+      return 0
     fi
     sleep "$JOIN_WAIT_INTERVAL"
   done
 
-  LOCAL_DAEMON_ACTIVATION_FAILURE="replacement daemon did not advertise accepted cluster $expected_cluster within ${timeout}s (previous pid ${previous_pid:-unknown}, last exit $status)"
-  if [ -n "${status_output:-}" ]; then
-    LOCAL_DAEMON_ACTIVATION_FAILURE="$LOCAL_DAEMON_ACTIVATION_FAILURE: $status_output"
-  fi
-  if [ -n "$network_output" ]; then
-    LOCAL_DAEMON_ACTIVATION_FAILURE="$LOCAL_DAEMON_ACTIVATION_FAILURE; last network readiness probe: $network_output"
-  fi
+  LOCAL_DAEMON_ACTIVATION_FAILURE="replacement daemon did not publish accepted cluster $expected_cluster and bind its listener within ${timeout}s (previous pid ${previous_pid:-unknown}, current pid ${current_pid:-unknown})"
   return 1
 }
 
@@ -356,30 +469,78 @@ mark_all_invites_failed() {
 }
 
 publish_invites_once() {
-  local spec introducer output command_output command_status marker reason
+  local spec introducer output staged command_output command_status marker reason
+  local invite_count=0 batch_started_ms batch_finished_ms batch_elapsed_ms
+  local publish_failed=0
+  local -a publish_args=()
   [ -n "${PUBLISH_INVITES:-}" ] || return 0
+
+  # One durable invite may advertise multiple introducers. Ask the daemon to
+  # publish that invite once, then have the CLI project an exact one-channel
+  # compact reference into each staged file. This keeps route-specific join
+  # files without repeating the authoritative barrier and quorum transaction.
   for spec in $PUBLISH_INVITES; do
     introducer="${spec%%=*}"; output="${spec##*=}"
-    marker="$output.failed"
-    log "publishing join invite (introducer $introducer) -> $output"
-    command_output="$("$BIN" cluster invite --introducer "$introducer" --ttl-seconds 86400 --output "$output" 2>&1)"
-    command_status=$?
-    if [ -n "$command_output" ]; then
-      printf '%s\n' "$command_output"
-    fi
-    if [ "$command_status" -eq 0 ] && [ -f "$output" ]; then
-      rm -f "$marker" 2>/dev/null || true
+    staged="$output.pending.$$"
+    invite_count=$((invite_count + 1))
+    log "staging join invite channel ordinal=$invite_count introducer=$introducer output=$output"
+    rm -f "$staged" 2>/dev/null || true
+    publish_args+=(--channel-output "$introducer=$staged")
+  done
+
+  batch_started_ms="$(date +%s%3N 2>/dev/null || true)"
+  log "publishing join invite batch phase=cli_call batch_size=$invite_count"
+  command_output="$("$BIN" cluster invite --ttl-seconds 86400 "${publish_args[@]}" 2>&1)"
+  command_status=$?
+  batch_finished_ms="$(date +%s%3N 2>/dev/null || true)"
+  batch_elapsed_ms=""
+  if [[ "$batch_started_ms" =~ ^[0-9]+$ ]] && [[ "$batch_finished_ms" =~ ^[0-9]+$ ]]; then
+    batch_elapsed_ms=$((batch_finished_ms - batch_started_ms))
+  fi
+  log "published join invite batch phase=cli_call batch_size=$invite_count status=$command_status duration_ms=${batch_elapsed_ms:-unknown}"
+  if [ -n "$command_output" ]; then
+    printf '%s\n' "$command_output"
+  fi
+
+  for spec in $PUBLISH_INVITES; do
+    introducer="${spec%%=*}"; output="${spec##*=}"
+    staged="$output.pending.$$"
+    if [ "$command_status" -eq 0 ] && [ -f "$staged" ]; then
       continue
     fi
-
     if [ "$command_status" -eq 0 ]; then
-      reason="cluster invite returned success but did not create $output"
+      reason="cluster invite returned success but did not create its staged output"
     else
       reason="cluster invite exited with status $command_status"
     fi
     log "WARN: failed to publish invite for introducer $introducer: $reason"
     write_invite_failure_marker "$introducer" "$output" "$reason" "$command_output"
+    publish_failed=1
   done
+
+  if [ "$publish_failed" -ne 0 ]; then
+    for spec in $PUBLISH_INVITES; do
+      output="${spec##*=}"
+      rm -f "$output.pending.$$" 2>/dev/null || true
+    done
+    return 1
+  fi
+
+  for spec in $PUBLISH_INVITES; do
+    introducer="${spec%%=*}"; output="${spec##*=}"
+    staged="$output.pending.$$"
+    marker="$output.failed"
+    if mv -f "$staged" "$output"; then
+      rm -f "$marker" 2>/dev/null || true
+      continue
+    fi
+    reason="could not atomically expose staged invitation at $output"
+    log "WARN: failed to publish invite for introducer $introducer: $reason"
+    write_invite_failure_marker "$introducer" "$output" "$reason"
+    publish_failed=1
+  done
+
+  [ "$publish_failed" -eq 0 ]
 }
 
 publish_invites_once_in_background() {
@@ -388,6 +549,7 @@ publish_invites_once_in_background() {
     mark_all_invites_failed "$LOCAL_DAEMON_READY_FAILURE"
     return
   fi
+  start_formation_observation
   publish_invites_once
 }
 
@@ -409,10 +571,6 @@ join_once_in_background() {
     fail_join "invite $JOIN_INVITE never appeared (<=${JOIN_TIMEOUT}s); staying unclustered"
     return
   fi
-  if ! wait_for_tcp "$INTRODUCER" "$JOIN_TIMEOUT"; then
-    fail_join "introducer $INTRODUCER unreachable (<=${JOIN_TIMEOUT}s); staying unclustered"
-    return
-  fi
   if ! wait_for_introducer_ready; then
     fail_join "$JOIN_WAIT_FAILURE_REASON"
     return
@@ -421,16 +579,31 @@ join_once_in_background() {
     fail_join "$JOIN_WAIT_FAILURE_REASON"
     return
   fi
+  # The readiness marker may follow an identity-changing daemon restart. Probe
+  # after observing it so this one-shot mutation never relies on a connection
+  # check that succeeded against the introducer's retired process.
+  elapsed=$((SECONDS - started))
+  activation_timeout=$((JOIN_TIMEOUT - elapsed))
+  if [ "$activation_timeout" -le 0 ] \
+    || ! wait_for_tcp "$INTRODUCER" "$activation_timeout"; then
+    fail_join "introducer $INTRODUCER unreachable after its readiness marker within the ${JOIN_TIMEOUT}s join budget; staying unclustered"
+    return
+  fi
   log "joining cluster as '$NODE_NAME' via introducer $INTRODUCER"
   if cluster_join_already_accepted; then
     publish_join_ready
     return
   fi
-  pre_join_pid="$(local_daemon_pid "$CLUSTER_STATUS_TIMEOUT" || true)"
+  pre_join_pid="$(local_daemon_pid || true)"
   if [ -z "$pre_join_pid" ]; then
     fail_join "could not capture the local daemon pid before join; staying unclustered"
     return
   fi
+  # Downstream nodes may wait several seconds for a bridge readiness marker.
+  # Start the old-process profile at the actual mutation boundary so its
+  # bounded window measures join work instead of expiring during dependency
+  # waiting. The accepted replacement gets its own capture after activation.
+  start_formation_observation "$pre_join_pid"
   output="$("$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME" 2>&1)"
   command_status=$?
   if [ "$command_status" -eq 0 ]; then
@@ -488,10 +661,10 @@ if [ ! -f "$DATA/cluster/state.sobj" ]; then
     DEFER_JOIN=1
   fi
 
-  # The seed (a voter) publishes a join invite for EACH segment, naming the reachable
-  # bridge as that segment's introducer. PUBLISH_INVITES is a space-separated list of
-  # "introducer-host:port=output-file". Defer publication until the daemon is reachable
-  # so node1 can answer health and forwarded join traffic immediately after startup.
+  # The seed (a voter) publishes one multi-channel invite and projects one compact
+  # reference for each segment, naming its reachable bridge. PUBLISH_INVITES is a
+  # space-separated list of "introducer-host:port=output-file". Defer publication
+  # until the daemon is reachable so node1 can answer health and forwarded join traffic.
   [ -n "${PUBLISH_INVITES:-}" ] && DEFER_PUBLISH_INVITES=1
 else
   existing_status="$(cluster_join_status || true)"

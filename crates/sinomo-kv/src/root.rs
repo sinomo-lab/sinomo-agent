@@ -292,7 +292,7 @@ pub use config_change::{
     cluster_kv_raft_peer_progress_next_index_hint,
     cluster_kv_raft_peer_progress_next_index_hint_async, finish_cluster_kv_raft_config_change,
     read_cluster_kv_raft_peer_progress, record_cluster_kv_raft_catch_up_proof,
-    record_cluster_kv_raft_peer_progress,
+    record_cluster_kv_raft_peer_progress, record_cluster_kv_raft_peer_progress_batch,
 };
 pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
 pub use keyspace::{
@@ -320,8 +320,8 @@ pub use raft::{
     ClusterKvRaftAppendRequest, ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult,
     ClusterKvRaftCompactionPolicy, ClusterKvRaftConfigRecord, ClusterKvRaftLeaderElectionAsyncHost,
     ClusterKvRaftLeaderElectionHost, ClusterKvRaftLeaderElectionOptions,
-    ClusterKvRaftLocalCommandStorage, ClusterKvRaftLocalVoteMetadata, ClusterKvRaftOperationGuard,
-    ClusterKvRaftQuorumCommitAsyncHost, ClusterKvRaftQuorumCommitHost,
+    ClusterKvRaftLocalCommandStorage, ClusterKvRaftLocalVoteMetadata, ClusterKvRaftObservedAppend,
+    ClusterKvRaftOperationGuard, ClusterKvRaftQuorumCommitAsyncHost, ClusterKvRaftQuorumCommitHost,
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvRaftQuorumFuture,
     ClusterKvRaftStore, ClusterKvRaftTargetReplicationAttempt,
     ClusterKvRaftTargetReplicationAttempts, ClusterKvRaftTargetReplicationStatus,

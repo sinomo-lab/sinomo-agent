@@ -27,7 +27,7 @@ use crate::metadata_journal::DfsMetadataJournalHead;
 #[cfg(test)]
 use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
-    DfsMetadataReplayCursor, bounded_metadata_journal_batch,
+    DfsMetadataReplayCursor, bounded_metadata_journal_batch, durable_journal_entries_since_limited,
     journal_entries_since_limited_with_next_sequence, migrate_legacy_journal_entries,
     persist_replayed_journal_entries, read_next_journal_sequence_lenient,
     recover_next_journal_sequence, write_local_journal_entries, write_local_journal_entry,
@@ -104,7 +104,7 @@ use std::fs;
 use std::io;
 #[cfg(test)]
 use std::io::Write;
-use std::ops::Bound::{Included, Unbounded};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -140,6 +140,8 @@ fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
 thread_local! {
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_BACKEND_OPEN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_JOURNAL_WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_RECOVERY_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_PREPARE_HISTORY_SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -156,13 +158,33 @@ fn metadata_begin_write_calls() -> usize {
 }
 
 #[cfg(test)]
-fn reset_metadata_current_tables_snapshot_calls() {
+pub(crate) fn reset_metadata_current_tables_snapshot_calls() {
     METADATA_CURRENT_TABLES_SNAPSHOT_CALLS.set(0);
 }
 
 #[cfg(test)]
-fn metadata_current_tables_snapshot_calls() -> usize {
+pub(crate) fn metadata_current_tables_snapshot_calls() -> usize {
     METADATA_CURRENT_TABLES_SNAPSHOT_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_backend_open_calls() {
+    METADATA_BACKEND_OPEN_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_backend_open_calls() -> usize {
+    METADATA_BACKEND_OPEN_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_journal_write_count() {
+    METADATA_JOURNAL_WRITE_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_journal_write_count() -> usize {
+    METADATA_JOURNAL_WRITE_COUNT.get()
 }
 
 #[cfg(test)]
@@ -796,6 +818,14 @@ struct MetadataReceiptScanCounters {
     object_version_pages: AtomicUsize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DfsConditionalSourceEviction {
+    Applied { sequence: u64 },
+    AlreadyApplied,
+    JournalAdvanced,
+    SourceChanged,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
@@ -824,6 +854,8 @@ impl LocalSobjMetadataBackend {
     /// journal entries not yet reflected in tables, and finishes interrupted
     /// namespace or visible-version commits.
     pub fn new(shard_id: DfsMetadataShardId, root: impl Into<PathBuf>) -> Result<Self> {
+        #[cfg(test)]
+        METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
         let trace_started = Instant::now();
         let root = root.into();
         let create_dirs_started = Instant::now();
@@ -934,6 +966,8 @@ impl LocalSobjMetadataBackend {
         shard_id: DfsMetadataShardId,
         root: impl Into<PathBuf>,
     ) -> Result<Self> {
+        #[cfg(test)]
+        METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
         let root = root.into();
         let state = read_metadata_table_state_lenient(&root)?;
         let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
@@ -954,6 +988,19 @@ impl LocalSobjMetadataBackend {
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
         })
+    }
+
+    /// Refresh a retained read-only inspection handle from the durable table
+    /// log without running writer recovery or acquiring authority. Reactive
+    /// bounded migration keeps these handles across yielded continuations so
+    /// a 256-record page does not rehydrate every shard catalog.
+    pub(crate) fn refresh_for_inspection(&mut self) -> Result<()> {
+        self.refresh_metadata_tables()?;
+        self.next_sequence = self
+            .next_sequence
+            .max(self.materialized_through_sequence.saturating_add(1))
+            .max(1);
+        Ok(())
     }
 
     /// Open the last durable table image without replaying an unreadable
@@ -1208,6 +1255,17 @@ impl LocalSobjMetadataBackend {
     /// Last local or replayed journal sequence visible to this shard.
     pub fn journal_last_sequence(&self) -> u64 {
         self.next_sequence.saturating_sub(1)
+    }
+
+    /// Read a bounded slice from the durable journal tail, including entries
+    /// appended by another backend instance after this one opened.
+    pub(crate) fn durable_journal_since_limited(
+        &self,
+        after_sequence: u64,
+        max_entries: usize,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let _lock = self.metadata_write_lock()?;
+        durable_journal_entries_since_limited(&self.root, after_sequence, max_entries)
     }
 
     /// Export the current materialized table state for replica snapshot repair.
@@ -2153,6 +2211,8 @@ impl LocalSobjMetadataBackend {
             &mut self.next_sequence,
             mutation,
         )?;
+        #[cfg(test)]
+        METADATA_JOURNAL_WRITE_COUNT.set(METADATA_JOURNAL_WRITE_COUNT.get().saturating_add(1));
         self.advance_metadata_prefix_proof_unlocked(std::slice::from_ref(&entry))?;
         Ok(entry)
     }
@@ -2187,6 +2247,12 @@ impl LocalSobjMetadataBackend {
             &mut self.next_sequence,
             mutations,
         )?;
+        #[cfg(test)]
+        METADATA_JOURNAL_WRITE_COUNT.set(
+            METADATA_JOURNAL_WRITE_COUNT
+                .get()
+                .saturating_add(entries.len()),
+        );
         self.advance_metadata_prefix_proof_unlocked(&entries)?;
         Ok(entries)
     }
@@ -2830,6 +2896,183 @@ impl LocalSobjMetadataBackend {
             &self.table_snapshot_fingerprint,
             &self.read_snapshot_cache,
         )
+    }
+
+    /// Collect retained compacted deletion evidence for a bounded set of
+    /// object IDs while acquiring only one current table snapshot.
+    ///
+    /// This is kept on the concrete local backend rather than the general
+    /// metadata API: user-facing object reads must continue to treat compacted
+    /// tombstones as absent. Point lookups are deliberate here: walking the
+    /// compacted map from its beginning makes a late migration cursor perform
+    /// work proportional to the already-settled prefix on every pass.
+    pub(crate) fn compacted_tombstones_for_object_ids(
+        &self,
+        object_ids: &BTreeSet<DfsObjectId>,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tables = self.current_tables_snapshot()?;
+        Ok(object_ids
+            .iter()
+            .filter_map(|object_id| tables.compacted_tombstones.get(object_id).cloned())
+            .collect())
+    }
+
+    pub(crate) fn object_or_compacted_tombstone(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .objects
+            .get(object_id)
+            .or_else(|| tables.compacted_tombstones.get(object_id))
+            .cloned())
+    }
+
+    /// Install a source-eviction marker only if both the complete source
+    /// journal prefix and object generation still match the migration fence.
+    ///
+    /// The journal check and tombstone append share one metadata write lock.
+    /// A family mutation that races the final tail read therefore either lands
+    /// before the check (and asks the caller to replay) or after the durable
+    /// eviction; it cannot be silently stranded between them.
+    pub(crate) fn put_cross_shard_tombstone_if_unchanged(
+        &mut self,
+        expected_source: &DfsObjectMetadata,
+        target_object: &DfsObjectMetadata,
+        source_shard_id: &DfsMetadataShardId,
+        target_shard_id: &DfsMetadataShardId,
+        expected_journal_sequence: u64,
+    ) -> Result<DfsConditionalSourceEviction> {
+        let _lock = self.begin_metadata_write()?;
+        let current = self
+            .tables
+            .objects
+            .get(&expected_source.object_id)
+            .or_else(|| {
+                self.tables
+                    .compacted_tombstones
+                    .get(&expected_source.object_id)
+            })
+            .cloned();
+        if current.as_ref().is_some_and(|current| {
+            matches!(
+                current.tombstone_provenance.as_ref(),
+                Some(crate::DfsTombstoneProvenance::SourceEviction {
+                    source_shard_id: recorded_source,
+                    target_shard_id: recorded_target,
+                }) if recorded_source == source_shard_id && recorded_target == target_shard_id
+            )
+        }) {
+            return Ok(DfsConditionalSourceEviction::AlreadyApplied);
+        }
+        if self.journal_last_sequence() != expected_journal_sequence {
+            return Ok(DfsConditionalSourceEviction::JournalAdvanced);
+        }
+        if current.as_ref() != Some(expected_source) {
+            return Ok(DfsConditionalSourceEviction::SourceChanged);
+        }
+        let Some(tombstone) = crate::metadata_shard_migration::cross_shard_eviction_tombstone(
+            expected_source,
+            target_object,
+            source_shard_id,
+            target_shard_id,
+        ) else {
+            return Ok(DfsConditionalSourceEviction::AlreadyApplied);
+        };
+        let tombstone = normalized_object_metadata(&tombstone);
+        let table_ops = self.object_index_table_ops_with_previous(&tombstone, current.as_ref())?;
+        let entry = self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_object(&tombstone),
+            table_ops,
+        )?;
+        Ok(DfsConditionalSourceEviction::Applied {
+            sequence: entry.sequence,
+        })
+    }
+
+    /// Exact receipt lookup for bounded migration/install work.
+    ///
+    /// The public metadata trait exposes receipt pages because ordinary
+    /// callers scan sets. Migration already has the complete composite key;
+    /// paging from the first replica for every equality check would turn a
+    /// bounded copy into quadratic work for objects with many receipts.
+    pub(crate) fn receipt_for_replica(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .receipts
+            .get(&(object_id.clone(), version.clone(), replica_node_id.clone()))
+            .cloned())
+    }
+
+    /// Return one object-id-ordered page from a single shard snapshot.
+    ///
+    /// Default-shard migration must merge duplicate object generations across
+    /// authorities before choosing a canonical record. Path-ordered pages
+    /// cannot do that without retaining the whole catalog because the same
+    /// object may have different paths after an interrupted rename. The
+    /// filesystem/object secondary table gives the migration lane a stable,
+    /// bounded k-way cursor without changing the public metadata API.
+    pub(crate) fn objects_for_file_system_by_id_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        after_object_id: Option<&DfsObjectId>,
+        max_entries: usize,
+    ) -> Result<(Vec<DfsObjectMetadata>, Option<DfsObjectId>)> {
+        if max_entries == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = after_object_id.map_or_else(
+            || {
+                Included((
+                    file_system_id.clone(),
+                    crate::metadata_keys::id_lower_bound(),
+                ))
+            },
+            |object_id| Excluded((file_system_id.clone(), object_id.clone())),
+        );
+        let mut objects = Vec::with_capacity(max_entries.saturating_add(1));
+        for ((record_file_system_id, object_id), path_record) in tables
+            .file_system_objects
+            .range((start, Unbounded))
+            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
+        {
+            if record_file_system_id != file_system_id
+                || path_record.file_system_id != *file_system_id
+                || path_record.object_id != *object_id
+            {
+                continue;
+            }
+            let Some(object) = tables.objects.get(object_id) else {
+                continue;
+            };
+            if object.file_system_id != *file_system_id
+                || normalize_path(&object.path) != path_record.path
+            {
+                continue;
+            }
+            objects.push(object.clone());
+            if objects.len() > max_entries {
+                break;
+            }
+        }
+        let has_more = objects.len() > max_entries;
+        if has_more {
+            objects.truncate(max_entries);
+        }
+        let next_after = has_more
+            .then(|| objects.last().map(|object| object.object_id.clone()))
+            .flatten();
+        Ok((objects, next_after))
     }
 
     pub(crate) fn child_objects_for_directory_page_entries(
@@ -4429,6 +4672,17 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(tables.namespace_prepares.get(operation_id).cloned())
     }
 
+    fn tombstone_compaction_projection(
+        &self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        let tables = self.current_tables_snapshot()?;
+        let now = options
+            .now_unix_nanos
+            .unwrap_or_else(metadata_now_unix_nanos);
+        Ok(plan_tombstone_compaction(&tables, &options, now).report)
+    }
+
     fn compact_tombstones(
         &mut self,
         options: DfsTombstoneCompactionOptions,
@@ -5079,6 +5333,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: "docs/readme.md".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_owner")],
             content_hash: Some("blake3:old".to_string()),
@@ -5412,6 +5667,60 @@ mod tests {
             0,
             "healthy restart must load the checkpoint instead of hashing the full shard"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn ensure_file_system_does_not_journal_distinct_policy_reordering() {
+        let root = temp_root("ensure_file_system_policy_reordering_noop");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let mut file_system = file_system();
+        file_system.subtree_policies = vec![
+            crate::DfsSubtreePolicy::legacy("/users", DfsObjectPolicy::ReplicatedEventual),
+            crate::DfsSubtreePolicy::legacy("/services", DfsObjectPolicy::ReplicatedEventual),
+        ];
+        let first = backend
+            .ensure_file_system(&file_system)
+            .expect("initial filesystem")
+            .expect("initial journal entry");
+        assert_eq!(first.sequence, 1);
+        let first_proof = backend.metadata_prefix_proof().expect("initial proof");
+
+        let mut reordered = file_system.clone();
+        reordered.subtree_policies.reverse();
+        assert!(
+            backend
+                .ensure_file_system(&reordered)
+                .expect("semantically identical filesystem")
+                .is_none(),
+            "discovery order alone must not author a PutFileSystem mutation"
+        );
+        assert_eq!(backend.journal_last_sequence(), 1);
+        assert_eq!(
+            backend.metadata_prefix_proof().expect("unchanged proof"),
+            first_proof
+        );
+        assert_eq!(
+            backend
+                .get_file_system(&file_system.file_system_id)
+                .expect("stored filesystem"),
+            Some(file_system.clone()),
+            "a semantic no-op must not rewrite the durable representation"
+        );
+
+        reordered.subtree_policies[0].policy = DfsObjectPolicy::ReplicatedConfirmed;
+        let changed = backend
+            .ensure_file_system(&reordered)
+            .expect("changed filesystem")
+            .expect("changed policy journal entry");
+        assert_eq!(changed.sequence, 2);
+        assert!(matches!(
+            changed.mutation,
+            DfsMetadataMutation::PutFileSystem { .. }
+        ));
 
         cleanup(&root);
     }
@@ -6481,7 +6790,8 @@ mod tests {
                 .get_object_by_path(&file_system.file_system_id, "/services/readme.md")
                 .expect("old path")
                 .map(|object| object.kind),
-            Some(DfsObjectKind::Tombstone)
+            None,
+            "source-eviction storage evidence is not a logical namespace tombstone"
         );
 
         cleanup(&root);
@@ -6551,6 +6861,145 @@ mod tests {
                 .expect("destination index")
                 .map(|index| index.shard_id),
             Some(DfsMetadataShardId::new("services"))
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_never_promotes_source_eviction_after_path_routes_back_to_source() {
+        let root = temp_root("sharded_backend_source_eviction_reroute");
+        let initial_configs = vec![
+            shard_config("root", DfsMetadataShardAssignment::Root),
+            shard_config(
+                "services",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+            ),
+        ];
+        let mut backend =
+            LocalShardedMetadataBackend::new(&root, initial_configs).expect("sharded backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let mut live = object(version("version_source_eviction_reroute"));
+        live.path = "/services/rerouted-live.txt".to_string();
+        live.changed_at_unix_nanos = 10;
+        backend
+            .shard_backend_mut(&DfsMetadataShardId::new("services"))
+            .expect("services shard")
+            .put_object(&live)
+            .expect("live target");
+
+        let mut source_eviction = live.clone();
+        source_eviction.kind = DfsObjectKind::Tombstone;
+        source_eviction.changed_at_unix_nanos = 11;
+        source_eviction.tombstone_provenance =
+            Some(crate::DfsTombstoneProvenance::SourceEviction {
+                source_shard_id: DfsMetadataShardId::new("root"),
+                target_shard_id: DfsMetadataShardId::new("services"),
+            });
+        backend
+            .shard_backend_mut(&DfsMetadataShardId::new("root"))
+            .expect("root shard")
+            .put_object(&source_eviction)
+            .expect("source eviction marker");
+        crate::metadata_shard_index::write_object_shard_index(
+            &root,
+            &source_eviction,
+            &DfsMetadataShardId::new("root"),
+        )
+        .expect("stale source index");
+        drop(backend);
+
+        // A later topology generation routes /services through root again.
+        // The newer physical eviction marker must remain non-authoritative;
+        // the live target is the only logical namespace record until the
+        // migration lane moves it to the new route.
+        let rerouted_configs = vec![
+            shard_config("root", DfsMetadataShardAssignment::Root),
+            shard_config(
+                "services",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/retired-services".to_string(),
+                },
+            ),
+        ];
+        let backend = LocalShardedMetadataBackend::new(&root, rerouted_configs)
+            .expect("rerouted sharded backend");
+        assert_eq!(
+            backend.get_object(&live.object_id).expect("object by id"),
+            Some(live.clone()),
+            "a source-eviction marker is never authoritative deletion evidence"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &live.path)
+                .expect("object by path"),
+            Some(live.clone()),
+            "a newly path-selected eviction marker must not suppress the live fallback"
+        );
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("merged objects"),
+            vec![live]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn conditional_source_eviction_yields_to_concurrent_family_append() {
+        let root = temp_root("conditional_source_eviction_family_fence");
+        let source_shard_id = DfsMetadataShardId::new("root");
+        let target_shard_id = DfsMetadataShardId::new("services");
+        let mut source =
+            LocalSobjMetadataBackend::new(source_shard_id.clone(), &root).expect("source backend");
+        source.put_file_system(&file_system()).expect("filesystem");
+        let expected_source = object(version("version_family_fence_source"));
+        source.put_object(&expected_source).expect("source object");
+        let fenced_sequence = source.journal_last_sequence();
+
+        let mut concurrent = LocalSobjMetadataBackend::new(source_shard_id.clone(), &root)
+            .expect("concurrent source writer");
+        concurrent
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: expected_source.file_system_id.clone(),
+                object_id: expected_source.object_id.clone(),
+                version: version("version_family_fence_late"),
+                content_hash: Some("blake3:family-fence-late".to_string()),
+                size_bytes: Some(1),
+                locations: vec![node("node_owner")],
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            })
+            .expect("concurrent family append");
+        drop(concurrent);
+
+        let mut target_object = expected_source.clone();
+        target_object.path = "/services/readme.md".to_string();
+        assert_eq!(
+            source
+                .put_cross_shard_tombstone_if_unchanged(
+                    &expected_source,
+                    &target_object,
+                    &source_shard_id,
+                    &target_shard_id,
+                    fenced_sequence,
+                )
+                .expect("conditional eviction"),
+            DfsConditionalSourceEviction::JournalAdvanced,
+            "a family append between tail observation and eviction must win the source lock fence"
+        );
+        assert_eq!(
+            source
+                .get_object(&expected_source.object_id)
+                .expect("source object after fence"),
+            Some(expected_source),
+            "the source remains live until the late family entry is replayed"
         );
 
         cleanup(&root);
@@ -11637,6 +12086,20 @@ mod tests {
                 .is_empty(),
             "compacted tombstones should not hydrate through object scans"
         );
+        reset_metadata_current_tables_snapshot_calls();
+        let compacted = backend
+            .compacted_tombstones_for_object_ids(&BTreeSet::from([
+                tombstone.object_id.clone(),
+                DfsObjectId::from_legacy_named("obj_unrelated_compacted_lookup")
+                    .expect("unrelated object id"),
+            ]))
+            .expect("bounded compacted evidence");
+        assert_eq!(compacted, vec![tombstone.clone()]);
+        assert_eq!(
+            metadata_current_tables_snapshot_calls(),
+            1,
+            "a bounded evidence set must be joined against one shard snapshot"
+        );
 
         drop(backend);
         let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
@@ -11836,6 +12299,68 @@ mod tests {
                 .kind,
             DfsObjectKind::Tombstone
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_compaction_skips_activated_retiring_shard() {
+        let root = temp_root("sharded_backend_compaction_skips_retiring_shard");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut root_tombstone = object(version("version_compaction_active_root"));
+        root_tombstone.path = "/deleted.md".to_string();
+        root_tombstone.kind = DfsObjectKind::Tombstone;
+        root_tombstone.content_hash = None;
+        root_tombstone.changed_at_unix_nanos = 1;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&root_tombstone).expect("root tombstone");
+
+        let services = DfsMetadataShardId::new("services");
+        backend
+            .freeze_metadata_shard_for_membership_handoff(&services, "handoff-retired-services", 1)
+            .expect("freeze services shard")
+            .expect("configured services shard");
+        backend
+            .mark_metadata_shard_membership_handoff_activated(
+                &services,
+                "handoff-retired-services",
+                2,
+            )
+            .expect("mark successor activation");
+
+        let report = backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::ZERO)
+                    .with_now_unix_nanos(100),
+            )
+            .expect("an unrelated retired shard must not abort compaction");
+        assert_eq!(report.compacted_tombstone_count, 1);
+        assert_eq!(
+            backend
+                .get_object(&root_tombstone.object_id)
+                .expect("compacted root tombstone"),
+            None
+        );
+        assert!(matches!(
+            backend
+                .shard_backend_mut(&services)
+                .expect("services backend")
+                .put_object(&object(version("version_retired_shard_stays_frozen"))),
+            Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
 
         cleanup(&root);
     }

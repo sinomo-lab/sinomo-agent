@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+use sinomo_base::{ClusterEndpointRecord, ClusterTransportKind};
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -12,6 +14,12 @@ const CAPTURE_STOPPING: u8 = 2;
 pub const NETWORK_TIMELINE_MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 /// A bounded default suitable for short diagnostic captures.
 pub const NETWORK_TIMELINE_DEFAULT_MAX_EVENTS: usize = 32 * 1024;
+/// Endpoint identities retained alongside one bounded diagnostic capture.
+///
+/// Timeline recording remains event-bounded; this second, small bound lets a
+/// short-lived bootstrap client expose the exact endpoint behind a compact
+/// event correlation token without putting endpoint strings in every event.
+pub const NETWORK_TIMELINE_MAX_ENDPOINT_IDENTITIES: usize = 256;
 
 /// Stable numeric stage identifiers used by the zero-allocation recorder and
 /// translated to names only after a capture has stopped.
@@ -172,6 +180,11 @@ pub struct NetworkTimelineEvent {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub connection_id: u64,
+    /// Stable capture-local link to [`NetworkTimelineEndpointIdentity`].
+    ///
+    /// This is separate from `connection_id`: bootstrap transports may open a
+    /// one-shot stream without creating a logical channel connection ID.
+    pub endpoint_correlation_id: u64,
     pub call_id: u64,
     pub frame_id: u64,
     pub stage: u16,
@@ -200,6 +213,7 @@ impl NetworkTimelineEvent {
             trace_id: trace.trace_id,
             span_id: trace.span_id,
             connection_id,
+            endpoint_correlation_id: 0,
             call_id,
             frame_id,
             stage,
@@ -208,9 +222,27 @@ impl NetworkTimelineEvent {
             aux,
         }
     }
+
+    pub const fn with_endpoint_correlation_id(mut self, endpoint_correlation_id: u64) -> Self {
+        self.endpoint_correlation_id = endpoint_correlation_id;
+        self
+    }
 }
 
 pub const NETWORK_TIMELINE_EVENT_BYTES: usize = size_of::<NetworkTimelineEvent>();
+
+/// Exact endpoint identity associated with compact timeline events.
+///
+/// `correlation_id` is derived from the durable endpoint ID, so independent
+/// process captures can be joined without treating an address or transient
+/// socket connection as identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkTimelineEndpointIdentity {
+    pub correlation_id: u64,
+    pub endpoint_id: String,
+    pub node_id: String,
+    pub transport: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkTimelineSnapshot {
@@ -218,6 +250,7 @@ pub struct NetworkTimelineSnapshot {
     pub captured_monotonic_ns: u64,
     pub max_events: usize,
     pub events: Vec<NetworkTimelineEvent>,
+    pub endpoint_identities: Vec<NetworkTimelineEndpointIdentity>,
     pub dropped_events: u64,
     pub overflowed: bool,
     pub active: bool,
@@ -285,6 +318,7 @@ struct TimelineCapture {
     max_events: usize,
     next_sequence: u64,
     events: Vec<NetworkTimelineEvent>,
+    endpoint_identities: Vec<NetworkTimelineEndpointIdentity>,
 }
 
 static CAPTURE_STATE: AtomicU8 = AtomicU8::new(CAPTURE_DISABLED);
@@ -382,6 +416,81 @@ pub fn network_timeline_monotonic_ns() -> u64 {
     elapsed.min(u128::from(u64::MAX)) as u64
 }
 
+/// Registers an endpoint for a currently active bounded capture and returns a
+/// stable numeric token suitable for timeline events.
+///
+/// This is a cold diagnostic path. Ordinary forwarding never calls it unless
+/// a timeline is explicitly active, and the exact identity table is bounded
+/// independently from event storage.
+pub fn register_network_timeline_endpoint(endpoint: &ClusterEndpointRecord) -> Option<u64> {
+    if CAPTURE_STATE.load(Ordering::Relaxed) != CAPTURE_ACTIVE {
+        return None;
+    }
+    let storage = CAPTURE.get()?;
+    let mut slot = storage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if CAPTURE_STATE.load(Ordering::Relaxed) != CAPTURE_ACTIVE {
+        return None;
+    }
+    let capture = slot.as_mut()?;
+    let endpoint_id = endpoint.endpoint_id.as_str();
+    if let Some(identity) = capture
+        .endpoint_identities
+        .iter()
+        .find(|identity| identity.endpoint_id == endpoint_id)
+    {
+        return Some(identity.correlation_id);
+    }
+    if capture.endpoint_identities.len() >= NETWORK_TIMELINE_MAX_ENDPOINT_IDENTITIES {
+        return None;
+    }
+
+    let mut correlation_id = stable_endpoint_correlation_id(endpoint_id);
+    while capture.endpoint_identities.iter().any(|identity| {
+        identity.correlation_id == correlation_id && identity.endpoint_id != endpoint_id
+    }) {
+        correlation_id = correlation_id.wrapping_add(1).max(1);
+    }
+    capture.endpoint_identities.try_reserve(1).ok()?;
+    capture
+        .endpoint_identities
+        .push(NetworkTimelineEndpointIdentity {
+            correlation_id,
+            endpoint_id: endpoint_id.to_string(),
+            node_id: endpoint.node_id.to_string(),
+            transport: network_timeline_transport_name(&endpoint.transport).to_string(),
+        });
+    Some(correlation_id)
+}
+
+fn stable_endpoint_correlation_id(endpoint_id: &str) -> u64 {
+    // FNV-1a is deliberately fixed here rather than using DefaultHasher,
+    // whose output is not a cross-process persistence contract.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in b"sinomo.network.endpoint.v1\0"
+        .iter()
+        .chain(endpoint_id.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+fn network_timeline_transport_name(transport: &ClusterTransportKind) -> &'static str {
+    match transport {
+        ClusterTransportKind::InProcess => "in-process",
+        ClusterTransportKind::Loopback => "loopback",
+        ClusterTransportKind::LanTcp => "lan-tcp",
+        ClusterTransportKind::LanQuic => "lan-quic",
+        ClusterTransportKind::Iroh => "iroh",
+        ClusterTransportKind::WebRtc => "web-rtc",
+        ClusterTransportKind::TurnRelay => "turn-relay",
+        ClusterTransportKind::HttpsRelay => "https-relay",
+    }
+}
+
 #[inline]
 pub fn network_timeline_capture_is_active() -> bool {
     CAPTURE_STATE.load(Ordering::Relaxed) == CAPTURE_ACTIVE
@@ -426,6 +535,7 @@ pub fn start_network_timeline_capture(
         max_events,
         next_sequence: 1,
         events,
+        endpoint_identities: Vec::new(),
     });
     CAPTURE_DROPPED_EVENTS.store(0, Ordering::Relaxed);
     CAPTURE_OVERFLOWED.store(false, Ordering::Relaxed);
@@ -460,11 +570,17 @@ pub fn snapshot_network_timeline_capture()
         .try_reserve_exact(capture.events.len())
         .map_err(|_| NetworkTimelineCaptureError::AllocationFailed)?;
     events.extend_from_slice(&capture.events);
+    let mut endpoint_identities = Vec::new();
+    endpoint_identities
+        .try_reserve_exact(capture.endpoint_identities.len())
+        .map_err(|_| NetworkTimelineCaptureError::AllocationFailed)?;
+    endpoint_identities.extend(capture.endpoint_identities.iter().cloned());
     Ok(NetworkTimelineSnapshot {
         started_monotonic_ns: capture.started_monotonic_ns,
         captured_monotonic_ns: network_timeline_monotonic_ns(),
         max_events: capture.max_events,
         events,
+        endpoint_identities,
         dropped_events: CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed),
         overflowed: CAPTURE_OVERFLOWED.load(Ordering::Relaxed),
         active: true,
@@ -504,6 +620,7 @@ pub fn stop_network_timeline_capture()
         captured_monotonic_ns: network_timeline_monotonic_ns(),
         max_events: capture.max_events,
         events: capture.events,
+        endpoint_identities: capture.endpoint_identities,
         dropped_events: CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed),
         overflowed: CAPTURE_OVERFLOWED.load(Ordering::Relaxed),
         active: false,
@@ -697,7 +814,7 @@ mod tests {
     fn capture_validates_memory_cap_and_preallocates() {
         let _serial = serial_capture_test();
         ensure_capture_stopped();
-        assert_eq!(NETWORK_TIMELINE_EVENT_BYTES, 88);
+        assert_eq!(NETWORK_TIMELINE_EVENT_BYTES, 96);
         assert_eq!(
             start_network_timeline_capture(0),
             Err(NetworkTimelineCaptureError::InvalidCapacity)
@@ -718,6 +835,42 @@ mod tests {
         assert!(slot.as_ref().expect("active capture").events.capacity() >= 7);
         drop(slot);
         stop_network_timeline_capture().expect("stop bounded capture");
+    }
+
+    #[test]
+    fn endpoint_identity_is_exact_bounded_and_stable_across_captures() {
+        let _serial = serial_capture_test();
+        ensure_capture_stopped();
+        let mut endpoint = ClusterEndpointRecord::loopback(
+            sinomo_base::Id::derived("timeline-test-node", b"node-a"),
+            "node-a:21353",
+        );
+        endpoint.endpoint_id = sinomo_base::Id::derived("timeline-test-endpoint", b"node-a:21353");
+        endpoint.transport = ClusterTransportKind::LanTcp;
+
+        start_network_timeline_capture(4).expect("start first capture");
+        let first = register_network_timeline_endpoint(&endpoint).expect("register endpoint");
+        assert_eq!(
+            register_network_timeline_endpoint(&endpoint),
+            Some(first),
+            "one capture must reuse the same correlation token"
+        );
+        let first_snapshot = stop_network_timeline_capture().expect("stop first capture");
+        assert_eq!(first_snapshot.endpoint_identities.len(), 1);
+        assert_eq!(
+            first_snapshot.endpoint_identities[0],
+            NetworkTimelineEndpointIdentity {
+                correlation_id: first,
+                endpoint_id: endpoint.endpoint_id.to_string(),
+                node_id: endpoint.node_id.to_string(),
+                transport: "lan-tcp".to_string(),
+            }
+        );
+
+        start_network_timeline_capture(4).expect("start second capture");
+        let second = register_network_timeline_endpoint(&endpoint).expect("register endpoint");
+        stop_network_timeline_capture().expect("stop second capture");
+        assert_eq!(first, second, "endpoint token must be process-independent");
     }
 
     #[test]

@@ -33,6 +33,27 @@ fn stale_write_base_error(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn record_durable_write_intent_work(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        receipt_node_ids: &[NodeId],
+    ) {
+        let mut durable_nodes = self
+            .coordinator
+            .receipts_for_intent(&intent.intent_id)
+            .into_iter()
+            .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        durable_nodes.extend(receipt_node_ids.iter().cloned());
+        self.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            repair_maintenance: durable_nodes.len() < intent.policy.desired_replicas,
+            namespace_maintenance: false,
+            metadata_replica_progress: false,
+        });
+    }
+
     fn persist_receipts_and_apply_ready_intent(
         &mut self,
         intent: &DistributedWriteIntent,
@@ -66,10 +87,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 content_hash,
                 content_size_bytes,
             )?;
+            self.record_durable_write_intent_work(&updated_intent, receipt_node_ids);
             return Ok(updated_intent);
         }
 
         self.put_metadata_intent_and_receipts(intent, content_hash, receipt_node_ids)?;
+        // Intent and receipt rows are durable before the in-memory transition
+        // and visible-commit path below. A later failure must not discard the
+        // authority's publication or missing-replica ownership.
+        self.record_durable_write_intent_work(intent, receipt_node_ids);
         let mut updated_intent = intent.clone();
         for replica_node_id in receipt_node_ids {
             updated_intent = self
@@ -1063,6 +1089,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &committed_object,
                 Some(manifest.size_bytes),
             )?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..DfsMessageCommittedWork::default()
+            });
             self.coordinator.set_committed_version(
                 committed_object.file_system_id.clone(),
                 committed_object.object_id.clone(),
@@ -1323,6 +1353,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .record_durable_receipt(&intent.intent_id, request.requesting_node_id.clone())?;
         let record_receipt_elapsed = record_receipt_started.elapsed();
         let commit_started = Instant::now();
+        let receipt_node_ids = vec![request.requesting_node_id.clone()];
         if !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
             && self.can_commit_ready_intent_batched(&updated_intent)?
@@ -1333,9 +1364,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &content_hash,
                 content_size_bytes,
             )?;
+            self.record_durable_write_intent_work(&updated_intent, &receipt_node_ids);
         } else {
-            let receipt_node_ids = vec![request.requesting_node_id.clone()];
             self.put_metadata_intent_and_receipts(&intent, &content_hash, &receipt_node_ids)?;
+            self.record_durable_write_intent_work(&intent, &receipt_node_ids);
             self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
         }
         let commit_elapsed = commit_started.elapsed();
@@ -1599,6 +1631,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &committed_object,
                 Some(manifest.size_bytes),
             )?;
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..DfsMessageCommittedWork::default()
+            });
             self.coordinator.set_committed_version(
                 committed_object.file_system_id.clone(),
                 committed_object.object_id.clone(),

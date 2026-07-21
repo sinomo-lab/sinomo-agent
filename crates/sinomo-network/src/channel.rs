@@ -53,12 +53,14 @@ const OBJECT_RPC_CHANNEL_WINDOW_UPDATE_INTERVAL: std::time::Duration =
 const OBJECT_RPC_CHANNEL_QUEUE_BATCH_BYTES: usize = 1024 * 1024;
 /// Values at or below this size stay in the Request/Response control exchange.
 pub const OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES: usize = 64 * 1024;
-/// Materialized typed values are bounded; larger payloads must use attachments.
-pub const OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES: usize = 8 * 1024 * 1024;
-/// Aggregate typed-value materialization budget across both directions.
-pub const OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES: usize =
-    OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES;
-
+/// Encoded typed values get bounded envelope headroom beyond one flow window.
+/// Larger payloads must use attachments; the window still limits bytes in flight.
+const OBJECT_RPC_CHANNEL_MATERIALIZED_VALUE_ENVELOPE_BYTES: usize = 256 * 1024;
+pub const OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES: usize =
+    OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES + OBJECT_RPC_CHANNEL_MATERIALIZED_VALUE_ENVELOPE_BYTES;
+/// Aggregate typed-value memory per physical peer channel. Bulk attachments do
+/// not consume this budget because they remain ownership-bearing streams.
+const OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CONTROL_QUEUE_DEPTH: usize = 256;
 const DEFAULT_DATA_QUEUE_DEPTH: usize = 256;
 const MAX_CONTROL_QUEUE_DEPTH: usize = 256;
@@ -117,8 +119,19 @@ impl ObjectRpcChannelConfig {
                 self.control_queue_depth.max(self.data_queue_depth),
             ));
         }
+        let _ = materialized_value_budget_bytes(self.max_calls)?;
         Ok(())
     }
+}
+
+fn materialized_value_budget_bytes(max_calls: usize) -> Result<usize, NetworkError> {
+    max_calls
+        .checked_mul(OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES)
+        .map(|bytes| bytes.min(OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BUDGET_BYTES))
+        .filter(|bytes| *bytes <= Semaphore::MAX_PERMITS)
+        .ok_or_else(|| {
+            channel_resource_error("configure multiplexed materialized value budget", max_calls)
+        })
 }
 
 /// Assigns disjoint call-id parity to the two physical-channel endpoints.
@@ -406,6 +419,7 @@ impl ObjectRpcChannelEndpoint {
         config: ObjectRpcChannelConfig,
     ) -> Result<Self, NetworkError> {
         config.validate()?;
+        let materialized_value_budget_bytes = materialized_value_budget_bytes(config.max_calls)?;
         let connection_id = NEXT_OBJECT_RPC_CHANNEL_CONNECTION_ID
             .fetch_add(1, Ordering::Relaxed)
             .max(1);
@@ -440,9 +454,7 @@ impl ObjectRpcChannelEndpoint {
             max_calls: config.max_calls,
             outbound,
             inbound_sender,
-            materialized_value_budget: Arc::new(Semaphore::new(
-                OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES,
-            )),
+            materialized_value_budget: Arc::new(Semaphore::new(materialized_value_budget_bytes)),
             pending: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(CallTombstones::default()),
@@ -776,6 +788,9 @@ impl ObjectRpcChannelServer {
 pub struct ObjectRpcChannelInboundRequest {
     pub request: ObjectRpcSessionRequest,
     responder: ObjectRpcChannelResponder,
+    // Retain the aggregate peer-memory reservation for a materialized typed
+    // request until the application-facing request owner is dropped.
+    _materialized_value_permit: Option<OwnedSemaphorePermit>,
     timeline: Option<NetworkTimelineTraceContext>,
     timeline_queued_ns: u64,
     connection_id: u64,
@@ -974,8 +989,55 @@ impl ObjectRpcChannelIngress {
         };
         let flags =
             channel_frame_timeline_flags(frame) | carrier_flag | network_timeline_flag::SUCCESS;
-        let call_id = frame.call_id();
-        let frame_id = channel_frame_timeline_id(frame);
+        self.record_decoded_frame_read_timeline(
+            trace,
+            frame.call_id(),
+            channel_frame_timeline_id(frame),
+            flags,
+            timing,
+        );
+    }
+
+    /// Records one fixed SCDF Data receive directly from its allocation-free
+    /// header. This intentionally avoids rebuilding a logical Data frame (and
+    /// therefore cannot copy its ownership-bearing `Bytes` payload to `Vec`).
+    pub fn record_data_frame_read_timeline(
+        &self,
+        header: &ObjectRpcChannelDataHeader,
+        timing: Option<ObjectFrameReadTiming>,
+        carrier_flag: u16,
+    ) {
+        let Some(timing) = timing else {
+            return;
+        };
+        if timing.capture_generation != 0
+            && crate::timeline::network_timeline_capture_generation() != timing.capture_generation
+        {
+            return;
+        }
+        let Some(trace) = self.shared.call_timeline(header.call_id) else {
+            return;
+        };
+        let flags = channel_data_timeline_flags(header.direction)
+            | carrier_flag
+            | network_timeline_flag::SUCCESS;
+        self.record_decoded_frame_read_timeline(
+            trace,
+            header.call_id,
+            channel_data_timeline_id(header),
+            flags,
+            timing,
+        );
+    }
+
+    fn record_decoded_frame_read_timeline(
+        &self,
+        trace: NetworkTimelineTraceContext,
+        call_id: ObjectRpcChannelCallId,
+        frame_id: u64,
+        flags: u16,
+        timing: ObjectFrameReadTiming,
+    ) {
         if timing.ready_monotonic_ns != 0
             && timing.read_poll_monotonic_ns >= timing.ready_monotonic_ns
         {
@@ -1878,6 +1940,7 @@ impl ChannelShared {
                     if let Err(error) = self.try_deliver_inbound(ObjectRpcChannelInboundRequest {
                         request: incoming,
                         responder,
+                        _materialized_value_permit: None,
                         timeline,
                         timeline_queued_ns: timeline
                             .map(|_| network_timeline_monotonic_ns())
@@ -1911,6 +1974,7 @@ impl ChannelShared {
                                     .send(ObjectRpcChannelInboundRequest {
                                         request: incoming,
                                         responder,
+                                        _materialized_value_permit: Some(materialized_value_permit),
                                         timeline,
                                         timeline_queued_ns: timeline
                                             .map(|_| network_timeline_monotonic_ns())
@@ -1930,7 +1994,6 @@ impl ChannelShared {
                             }
                             Err(error) => shared.reset_inbound(call_id, error.to_string(), true),
                         }
-                        drop(materialized_value_permit);
                     });
                 }
             }
@@ -1938,6 +2001,7 @@ impl ChannelShared {
             if let Err(error) = self.try_deliver_inbound(ObjectRpcChannelInboundRequest {
                 request: ObjectRpcSessionRequest::value(request),
                 responder,
+                _materialized_value_permit: None,
                 timeline,
                 timeline_queued_ns: timeline
                     .map(|_| network_timeline_monotonic_ns())
@@ -2077,14 +2141,14 @@ impl ChannelShared {
                                     ObjectRpcSessionResult::materialized_channel_value(
                                         response,
                                         total_bytes,
-                                    ),
+                                    )
+                                    .with_materialized_value_permit(materialized_value_permit),
                                 ));
                             }
                             Err(error) => {
                                 let _ = result_sender.send(Err(error));
                             }
                         }
-                        drop(materialized_value_permit);
                     });
                 }
             }
@@ -3154,9 +3218,8 @@ async fn run_outgoing_body(
     // A request-side producer is not even opened until RequestAccepted grants
     // the first credit. This is important for one-pass readers: a rejected
     // request must remain completely unconsumed.
-    let mut producer: Option<BodyProducer> =
-        Some(source.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?);
-    drop(source);
+    let mut source = Some(source);
+    let mut producer: Option<BodyProducer> = None;
     let mut offset = 0_u64;
     let write_tracker = Arc::new(BodyWriteTracker::new());
     let mut written = write_tracker.subscribe();
@@ -3170,6 +3233,12 @@ async fn run_outgoing_body(
             && !producer_finished
         {
             let available = window.wait_available().await?;
+            if producer.is_none() {
+                let body = source
+                    .take()
+                    .expect("body source is present until its producer opens");
+                producer = Some(body.producer(OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)?);
+            }
             let next = if let Some(bytes) = pending_bytes.take() {
                 Some(bytes)
             } else if batch.is_empty() {
@@ -4055,6 +4124,111 @@ mod tests {
     use std::time::Duration;
     use tokio::io::ReadBuf;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn fixed_data_receive_timeline_uses_header_and_preserves_bytes_owner() {
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(64).expect("start capture");
+
+        let ObjectRpcChannelEndpoint {
+            client: _,
+            mut server,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Acceptor,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let call_id = ObjectRpcChannelCallId(1);
+        let payload = Bytes::from_static(b"ownership-bearing-scdf");
+        let payload_pointer = payload.as_ptr();
+        let request = request("/channel/data-read-timeline", Vec::new())
+            .with_traceparent("00-41414141414141414141414141414141-4242424242424242-01")
+            .with_observe_sampled(true);
+        ingress
+            .receive_control(ObjectRpcChannelWireFrame::Request {
+                call_id,
+                request,
+                body: Some(ObjectRpcChannelBodyDescriptor {
+                    kind: ObjectRpcChannelBodyKind::Attachment,
+                    total_bytes: Some(payload.len() as u64),
+                }),
+            })
+            .expect("request head");
+        assert!(matches!(
+            egress.next_frame().await,
+            Some(ObjectRpcChannelWireFrame::RequestAccepted { .. })
+        ));
+        let incoming = server.accept().await.expect("incoming request");
+        let frame = ObjectRpcChannelDataFrame::new(
+            call_id,
+            ObjectRpcChannelBodyDirection::Request,
+            0,
+            payload,
+        )
+        .expect("data frame");
+        let now = crate::network_timeline_monotonic_ns();
+        ingress.record_data_frame_read_timeline(
+            &frame.header,
+            Some(ObjectFrameReadTiming {
+                capture_generation: 0,
+                ready_monotonic_ns: 0,
+                read_poll_monotonic_ns: 0,
+                first_read_monotonic_ns: now,
+                body_read_completed_monotonic_ns: now.saturating_add(1),
+                decode_started_monotonic_ns: now.saturating_add(1),
+                decoded_monotonic_ns: now.saturating_add(2),
+                wire_bytes: u32::try_from(
+                    crate::channel_wire::OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES + frame.bytes.len(),
+                )
+                .unwrap_or(u32::MAX),
+                first_read_bytes: 4,
+            }),
+            network_timeline_flag::LOCAL_CARRIER,
+        );
+        assert_eq!(frame.bytes.as_ptr(), payload_pointer);
+        ingress.receive_data(frame).expect("data ingress");
+        ingress
+            .receive_control(ObjectRpcChannelWireFrame::BodyEnd {
+                call_id,
+                direction: ObjectRpcChannelBodyDirection::Request,
+                total_bytes: b"ownership-bearing-scdf".len() as u64,
+            })
+            .expect("body end");
+        let received = incoming
+            .request
+            .body
+            .collect_to_vec(1024)
+            .await
+            .expect("body payload");
+        assert_eq!(received, b"ownership-bearing-scdf");
+
+        let snapshot = crate::stop_network_timeline_capture().expect("stop capture");
+        let stages = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.call_id == call_id.0
+                    && event.flags & network_timeline_flag::DATA_FRAME != 0
+                    && event.flags & network_timeline_flag::LOCAL_CARRIER != 0
+            })
+            .map(|event| event.stage)
+            .collect::<HashSet<_>>();
+        for stage in [
+            network_timeline_stage::FRAME_FIRST_READ,
+            network_timeline_stage::FRAME_READ,
+            network_timeline_stage::FRAME_DECODE,
+        ] {
+            assert!(
+                stages.contains(&stage),
+                "missing Data receive stage {stage}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn streamed_data_and_body_end_retain_exact_write_timeline_ids() {
@@ -5198,6 +5372,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_request_without_credit_does_not_consume_one_pass_reader() {
+        struct CountingReader {
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Release);
+                if let Some(first) = buffer.first_mut() {
+                    *first = 0x5a;
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+
+        let ObjectRpcChannelEndpoint {
+            client,
+            server: _,
+            ingress,
+            mut egress,
+        } = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let pending = client
+            .call(ObjectRpcSessionCall::new(
+                request("/channel/rejected-reader", Vec::new()),
+                ObjectRpcBodySource::from_reader(
+                    CountingReader {
+                        reads: Arc::clone(&reads),
+                    },
+                    Some(1),
+                ),
+            ))
+            .await
+            .expect("queue request");
+        let call_id = match egress.next_frame().await.expect("request head") {
+            ObjectRpcChannelWireFrame::Request { call_id, .. } => call_id,
+            frame => panic!("expected request head, got {frame:?}"),
+        };
+
+        // Completing the head write starts the body task, but without
+        // RequestAccepted there is no credit and therefore no producer open.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(reads.load(Ordering::Acquire), 0);
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Reset {
+                call_id,
+                reason: "request rejected".to_string(),
+            })
+            .expect("reject request");
+        assert!(pending.result().await.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn cancelling_call_drops_permanently_pending_async_reader() {
         let mut endpoints = linked_endpoints(ObjectRpcChannelConfig::default());
         let polled = Arc::new(AtomicBool::new(false));
@@ -5381,8 +5616,16 @@ mod tests {
     #[tokio::test]
     async fn materialized_response_value_is_restreamed_across_a_second_channel() {
         let route = "/channel/materialized-response-forward";
-        let expected = patterned_body(1024 * 1024 + 257, 37);
+        let expected = patterned_body(
+            OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES + OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES + 257,
+            37,
+        );
         let mut target_hop = linked_endpoints(ObjectRpcChannelConfig::default());
+        let target_receiver_budget = target_hop
+            .left_client
+            .shared
+            .materialized_value_budget
+            .available_permits();
         let target_pending = target_hop
             .left_client
             .call(ObjectRpcSessionCall::value(request(route, Vec::new())))
@@ -5407,8 +5650,30 @@ mod tests {
             target_result.response.body.as_slice() == expected.as_slice(),
             "target hop returned a mismatched materialized value"
         );
+        assert_eq!(
+            target_hop
+                .left_client
+                .shared
+                .materialized_value_budget
+                .available_permits(),
+            target_receiver_budget - expected.len(),
+            "the downstream materialized value must remain reserved while the relay owns it"
+        );
+        let relay_response = target_result
+            .into_relay_response()
+            .expect("convert the target result into the production relay response");
 
         let mut origin_hop = linked_endpoints(ObjectRpcChannelConfig::default());
+        let origin_receiver_budget = origin_hop
+            .left_client
+            .shared
+            .materialized_value_budget
+            .available_permits();
+        let origin_sender_budget = origin_hop
+            .right_client
+            .shared
+            .materialized_value_budget
+            .available_permits();
         let origin_pending = origin_hop
             .left_client
             .call(ObjectRpcSessionCall::value(request(route, Vec::new())))
@@ -5418,13 +5683,18 @@ mod tests {
             .await
             .expect("origin-hop request timeout")
             .expect("origin-hop request");
-        origin_request
-            .respond(ObjectRpcSessionResponse::new(
-                target_result.response,
-                ObjectRpcBodySource::from_incoming_body(target_result.body),
-            ))
-            .await
-            .expect("re-stream materialized response across origin hop");
+        timeout(
+            Duration::from_secs(5),
+            origin_request
+                .responder()
+                .respond_and_wait_written(relay_response),
+        )
+        .await
+        .expect("relayed response physical-write timeout")
+        .expect("re-stream materialized response across origin hop");
+        wait_for_available_materialized_bytes(&target_hop.left_client, target_receiver_budget)
+            .await;
+        wait_for_available_materialized_bytes(&origin_hop.right_client, origin_sender_budget).await;
         let origin_result = timeout(Duration::from_secs(5), origin_pending.result())
             .await
             .expect("origin-hop result timeout")
@@ -5433,8 +5703,24 @@ mod tests {
             origin_result.response.body.as_slice() == expected.as_slice(),
             "origin hop returned a mismatched re-streamed value"
         );
+        assert_eq!(
+            origin_hop
+                .left_client
+                .shared
+                .materialized_value_budget
+                .available_permits(),
+            origin_receiver_budget - expected.len(),
+            "the upstream result must retain its own peer-memory reservation"
+        );
+        drop(origin_result);
+        wait_for_available_materialized_bytes(&origin_hop.left_client, origin_receiver_budget)
+            .await;
         assert!(FrameCounts::load(&target_hop.counts.data) > 0);
         assert!(FrameCounts::load(&origin_hop.counts.data) > 0);
+        wait_for_active_calls(&target_hop.left_client, 0).await;
+        wait_for_active_calls(&target_hop.right_client, 0).await;
+        wait_for_active_calls(&origin_hop.left_client, 0).await;
+        wait_for_active_calls(&origin_hop.right_client, 0).await;
     }
 
     #[tokio::test]
@@ -5956,8 +6242,13 @@ mod tests {
             max_calls: 1,
             ..ObjectRpcChannelConfig::default()
         });
+        let aggregate_bytes = endpoints
+            .right_client
+            .shared
+            .materialized_value_budget
+            .available_permits();
         let remaining_bytes = OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES;
-        let held_bytes = OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES
+        let held_bytes = aggregate_bytes
             .checked_sub(remaining_bytes)
             .expect("aggregate budget exceeds inline threshold");
         let held_budget = Arc::clone(&endpoints.right_client.shared.materialized_value_budget)
@@ -6017,15 +6308,264 @@ mod tests {
         )
         .await;
         drop(held_budget);
-        wait_for_available_materialized_bytes(
-            &endpoints.right_client,
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES,
-        )
-        .await;
+        wait_for_available_materialized_bytes(&endpoints.right_client, aggregate_bytes).await;
     }
 
     #[tokio::test]
-    async fn materialized_values_share_one_budget_and_attachments_do_not_consume_it() {
+    async fn retained_materialized_request_owner_keeps_peer_budget_reserved() {
+        let mut endpoints = linked_endpoints(ObjectRpcChannelConfig {
+            max_calls: 1,
+            ..ObjectRpcChannelConfig::default()
+        });
+        let value_bytes = OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES + 1;
+        let aggregate_bytes = endpoints
+            .right_client
+            .shared
+            .materialized_value_budget
+            .available_permits();
+        let held_bytes = aggregate_bytes
+            .checked_sub(value_bytes)
+            .expect("aggregate budget exceeds streamed value");
+        let held_budget = Arc::clone(&endpoints.right_client.shared.materialized_value_budget)
+            .try_acquire_many_owned(u32::try_from(held_bytes).expect("held budget fits u32"))
+            .expect("reserve deterministic request pressure");
+
+        let first_route = "/channel/request/retained-budget";
+        let first_pending = endpoints
+            .left_client
+            .call(ObjectRpcSessionCall::value(request(
+                first_route,
+                vec![0x31; value_bytes],
+            )))
+            .await
+            .expect("first materialized request");
+        let retained = timeout(Duration::from_secs(1), endpoints.right_server.accept())
+            .await
+            .expect("first materialized request timeout")
+            .expect("first materialized request ingress");
+        assert_eq!(retained.request.request.body.len(), value_bytes);
+        assert_eq!(
+            endpoints
+                .right_client
+                .shared
+                .materialized_value_budget
+                .available_permits(),
+            0,
+            "the accepted request owner must retain its materialization reservation"
+        );
+        retained
+            .respond(ObjectRpcSessionResponse::value(response(
+                first_route,
+                b"ok".to_vec(),
+            )))
+            .await
+            .expect("complete first materialized request");
+        first_pending
+            .result()
+            .await
+            .expect("first materialized request result");
+        wait_for_active_calls(&endpoints.left_client, 0).await;
+        wait_for_active_calls(&endpoints.right_client, 0).await;
+
+        let rejected = endpoints
+            .left_client
+            .call(ObjectRpcSessionCall::value(request(
+                "/channel/request/retained-budget/rejected",
+                vec![0x32; value_bytes],
+            )))
+            .await
+            .expect("queue request rejected by retained budget");
+        let error = timeout(Duration::from_secs(1), rejected.result())
+            .await
+            .expect("retained request budget rejection timeout")
+            .expect_err("retained request owner must block another materialized value");
+        assert!(
+            error
+                .to_string()
+                .contains("reserve multiplexed materialized value"),
+            "unexpected retained request budget error: {error}"
+        );
+
+        drop(retained);
+        wait_for_available_materialized_bytes(&endpoints.right_client, value_bytes).await;
+        assert_linked_channel_accepts_replacement(
+            &mut endpoints,
+            "/channel/request/retained-budget/replacement",
+        )
+        .await;
+        drop(held_budget);
+        wait_for_available_materialized_bytes(&endpoints.right_client, aggregate_bytes).await;
+    }
+
+    #[tokio::test]
+    async fn retained_materialized_result_keeps_peer_budget_reserved() {
+        let mut endpoints = linked_endpoints(ObjectRpcChannelConfig {
+            max_calls: 1,
+            ..ObjectRpcChannelConfig::default()
+        });
+        let value_bytes = OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES + 1;
+        let aggregate_bytes = endpoints
+            .left_client
+            .shared
+            .materialized_value_budget
+            .available_permits();
+        let held_bytes = aggregate_bytes
+            .checked_sub(value_bytes)
+            .expect("aggregate budget exceeds streamed value");
+        let held_budget = Arc::clone(&endpoints.left_client.shared.materialized_value_budget)
+            .try_acquire_many_owned(u32::try_from(held_bytes).expect("held budget fits u32"))
+            .expect("reserve deterministic response pressure");
+
+        let first_route = "/channel/response/retained-budget";
+        let first_pending = endpoints
+            .left_client
+            .call(ObjectRpcSessionCall::value(request(
+                first_route,
+                Vec::new(),
+            )))
+            .await
+            .expect("first materialized response call");
+        let first_inbound = timeout(Duration::from_secs(1), endpoints.right_server.accept())
+            .await
+            .expect("first materialized response request timeout")
+            .expect("first materialized response request");
+        first_inbound
+            .respond(ObjectRpcSessionResponse::value(response(
+                first_route,
+                vec![0x41; value_bytes],
+            )))
+            .await
+            .expect("first materialized response");
+        let retained = timeout(Duration::from_secs(1), first_pending.result())
+            .await
+            .expect("first materialized response timeout")
+            .expect("first materialized response result");
+        assert_eq!(retained.response.body.len(), value_bytes);
+        assert_eq!(
+            endpoints
+                .left_client
+                .shared
+                .materialized_value_budget
+                .available_permits(),
+            0,
+            "the result owner must retain its materialization reservation"
+        );
+        wait_for_active_calls(&endpoints.left_client, 0).await;
+        wait_for_active_calls(&endpoints.right_client, 0).await;
+
+        let rejected_route = "/channel/response/retained-budget/rejected";
+        let rejected = endpoints
+            .left_client
+            .call(ObjectRpcSessionCall::value(request(
+                rejected_route,
+                Vec::new(),
+            )))
+            .await
+            .expect("second materialized response call");
+        let rejected_inbound = timeout(Duration::from_secs(1), endpoints.right_server.accept())
+            .await
+            .expect("second materialized response request timeout")
+            .expect("second materialized response request");
+        let _ = rejected_inbound
+            .respond(ObjectRpcSessionResponse::value(response(
+                rejected_route,
+                vec![0x42; value_bytes],
+            )))
+            .await;
+        let error = timeout(Duration::from_secs(1), rejected.result())
+            .await
+            .expect("retained result budget rejection timeout")
+            .expect_err("retained result must block another materialized response");
+        assert!(
+            error
+                .to_string()
+                .contains("reserve multiplexed materialized value"),
+            "unexpected retained result budget error: {error}"
+        );
+
+        drop(retained);
+        wait_for_available_materialized_bytes(&endpoints.left_client, value_bytes).await;
+        assert_linked_channel_accepts_replacement(
+            &mut endpoints,
+            "/channel/response/retained-budget/replacement",
+        )
+        .await;
+        drop(held_budget);
+        wait_for_available_materialized_bytes(&endpoints.left_client, aggregate_bytes).await;
+    }
+
+    #[test]
+    fn materialized_value_budget_scales_with_call_admission_and_caps_per_peer() {
+        for max_calls in [1, 4, OBJECT_RPC_CHANNEL_MAX_CALLS] {
+            let endpoint = ObjectRpcChannelEndpoint::new(
+                ObjectRpcChannelRole::Dialer,
+                ObjectRpcChannelConfig {
+                    max_calls,
+                    ..ObjectRpcChannelConfig::default()
+                },
+            )
+            .expect("endpoint");
+            assert_eq!(
+                endpoint
+                    .client
+                    .shared
+                    .materialized_value_budget
+                    .available_permits(),
+                (max_calls * OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES)
+                    .min(OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BUDGET_BYTES)
+            );
+        }
+    }
+
+    #[test]
+    fn default_materialized_value_budget_rejects_concurrent_peer_exhaustion() {
+        let endpoint = ObjectRpcChannelEndpoint::new(
+            ObjectRpcChannelRole::Dialer,
+            ObjectRpcChannelConfig::default(),
+        )
+        .expect("endpoint");
+        let descriptor = ObjectRpcChannelBodyDescriptor {
+            kind: ObjectRpcChannelBodyKind::Value,
+            total_bytes: Some(OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES as u64),
+        };
+        let accepted_values = OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BUDGET_BYTES
+            / OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES;
+        let mut reservations = Vec::with_capacity(accepted_values);
+        for _ in 0..accepted_values {
+            let (_, permit) = endpoint
+                .client
+                .shared
+                .try_reserve_materialized_value(&descriptor)
+                .expect("value reservation")
+                .expect("value descriptor reservation");
+            reservations.push(permit);
+        }
+        let error = endpoint
+            .client
+            .shared
+            .try_reserve_materialized_value(&descriptor)
+            .expect_err("aggregate peer budget must reject another full value");
+        assert!(
+            error
+                .to_string()
+                .contains("reserve multiplexed materialized value"),
+            "unexpected aggregate budget error: {error}"
+        );
+        drop(reservations);
+        assert_eq!(
+            endpoint
+                .client
+                .shared
+                .materialized_value_budget
+                .available_permits(),
+            OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BUDGET_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_values_share_one_budget_and_attachments_do_not_consume_it() {
+        let max_calls = 3;
+        let aggregate_bytes = max_calls * OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES;
         let ObjectRpcChannelEndpoint {
             client,
             server: _server,
@@ -6033,10 +6573,13 @@ mod tests {
             mut egress,
         } = ObjectRpcChannelEndpoint::new(
             ObjectRpcChannelRole::Dialer,
-            ObjectRpcChannelConfig::default(),
+            ObjectRpcChannelConfig {
+                max_calls,
+                ..ObjectRpcChannelConfig::default()
+            },
         )
         .expect("endpoint");
-        let value_bytes = 5 * 1024 * 1024;
+        let value_bytes = OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES;
         let value_descriptor = ObjectRpcChannelBodyDescriptor {
             kind: ObjectRpcChannelBodyKind::Value,
             total_bytes: Some(value_bytes as u64),
@@ -6062,12 +6605,32 @@ mod tests {
         ));
         assert_eq!(
             client.shared.materialized_value_budget.available_permits(),
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES - value_bytes
+            aggregate_bytes - value_bytes
         );
 
         ingress
             .receive(ObjectRpcChannelWireFrame::Request {
                 call_id: ObjectRpcChannelCallId(4),
+                request: request("/channel/value-two", Vec::new()),
+                body: Some(value_descriptor.clone()),
+            })
+            .expect("second value admission");
+        assert!(matches!(
+            egress.next_frame().await.expect("second value accepted"),
+            ObjectRpcChannelWireFrame::RequestAccepted {
+                call_id: ObjectRpcChannelCallId(4),
+                ..
+            }
+        ));
+        assert_eq!(
+            client.shared.materialized_value_budget.available_permits(),
+            aggregate_bytes - 2 * value_bytes,
+            "every admitted value needs its own bounded materialization slot"
+        );
+
+        ingress
+            .receive(ObjectRpcChannelWireFrame::Request {
+                call_id: ObjectRpcChannelCallId(6),
                 request: request("/channel/large-attachment", Vec::new()),
                 body: Some(attachment_descriptor),
             })
@@ -6075,109 +6638,64 @@ mod tests {
         assert!(matches!(
             egress.next_frame().await.expect("attachment accepted"),
             ObjectRpcChannelWireFrame::RequestAccepted {
-                call_id: ObjectRpcChannelCallId(4),
+                call_id: ObjectRpcChannelCallId(6),
                 ..
             }
         ));
         assert_eq!(
             client.shared.materialized_value_budget.available_permits(),
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES - value_bytes,
+            aggregate_bytes - 2 * value_bytes,
             "attachments must not reserve typed-value memory"
         );
 
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Request {
-                call_id: ObjectRpcChannelCallId(6),
-                request: request("/channel/value-excess", Vec::new()),
-                body: Some(value_descriptor.clone()),
-            })
-            .expect("excess value must reset without closing the carrier");
-        assert!(matches!(
-            egress.next_frame().await.expect("excess value reset"),
-            ObjectRpcChannelWireFrame::Reset {
-                call_id: ObjectRpcChannelCallId(6),
-                ..
-            }
-        ));
+        for call_id in [2, 4, 6] {
+            ingress
+                .receive(ObjectRpcChannelWireFrame::Cancel {
+                    call_id: ObjectRpcChannelCallId(call_id),
+                    reason: "release admitted call".to_string(),
+                })
+                .expect("cancel admitted call");
+        }
+        wait_for_available_materialized_bytes(&client, aggregate_bytes).await;
+    }
 
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Cancel {
-                call_id: ObjectRpcChannelCallId(2),
-                reason: "release value budget".to_string(),
-            })
-            .expect("cancel first value");
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Cancel {
-                call_id: ObjectRpcChannelCallId(4),
-                reason: "release attachment".to_string(),
-            })
-            .expect("cancel attachment");
-        wait_for_available_materialized_bytes(
-            &client,
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES,
-        )
-        .await;
-
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Request {
-                call_id: ObjectRpcChannelCallId(8),
-                request: request("/channel/value-after-release", Vec::new()),
-                body: Some(value_descriptor),
-            })
-            .expect("value admission after release");
-        assert!(matches!(
-            egress.next_frame().await.expect("released value accepted"),
-            ObjectRpcChannelWireFrame::RequestAccepted {
-                call_id: ObjectRpcChannelCallId(8),
-                ..
-            }
-        ));
-        ingress
-            .receive(ObjectRpcChannelWireFrame::Cancel {
-                call_id: ObjectRpcChannelCallId(8),
-                reason: "test complete".to_string(),
-            })
-            .expect("cancel released value");
-        wait_for_available_materialized_bytes(
-            &client,
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES,
-        )
-        .await;
-
-        let mut outgoing_value = client
+    #[tokio::test]
+    async fn materialized_value_can_cross_one_flow_window() {
+        let mut endpoints = linked_endpoints(ObjectRpcChannelConfig {
+            max_calls: 1,
+            ..ObjectRpcChannelConfig::default()
+        });
+        let value_bytes = OBJECT_RPC_CHANNEL_CALL_WINDOW_BYTES + 1;
+        let expected = patterned_body(value_bytes, 73);
+        let pending = endpoints
+            .left_client
             .call(ObjectRpcSessionCall::value(request(
-                "/channel/outgoing-value-one",
-                vec![9_u8; value_bytes],
+                "/channel/value-crosses-window",
+                expected.clone(),
             )))
             .await
-            .expect("first outgoing value admission");
-        assert_eq!(
-            client.shared.materialized_value_budget.available_permits(),
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES - value_bytes
-        );
-        assert!(matches!(
-            client
-                .call(ObjectRpcSessionCall::value(request(
-                    "/channel/outgoing-value-excess",
-                    vec![7_u8; value_bytes],
-                )))
-                .await,
-            Err(NetworkError::ResourceExhausted { .. })
-        ));
-        let mut outgoing_attachment = client
-            .call(ObjectRpcSessionCall::new(
-                request("/channel/outgoing-attachment", Vec::new()),
-                ObjectRpcBodySource::from_reader(std::io::empty(), Some(64 * 1024 * 1024)),
-            ))
+            .expect("cross-window value call");
+        let incoming = timeout(Duration::from_secs(5), endpoints.right_server.accept())
             .await
-            .expect("outgoing attachment bypasses value budget");
-        outgoing_value.cancel("release outgoing value budget");
-        outgoing_attachment.cancel("release outgoing attachment");
-        wait_for_available_materialized_bytes(
-            &client,
-            OBJECT_RPC_CHANNEL_MAX_AGGREGATE_MATERIALIZED_VALUE_BYTES,
-        )
-        .await;
+            .expect("cross-window value timeout")
+            .expect("cross-window value request");
+        assert_eq!(incoming.request.request.body, expected);
+        incoming
+            .respond(ObjectRpcSessionResponse::value(response(
+                "/channel/value-crosses-window",
+                b"ok".to_vec(),
+            )))
+            .await
+            .expect("cross-window value response");
+        let result = timeout(Duration::from_secs(1), pending.result())
+            .await
+            .expect("cross-window result timeout")
+            .expect("cross-window result");
+        assert_eq!(result.response.body, b"ok");
+        assert!(
+            FrameCounts::load(&endpoints.counts.window_updates) > 0,
+            "a value larger than one flow window must advance via cumulative credit"
+        );
     }
 
     #[tokio::test]

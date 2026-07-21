@@ -6,11 +6,11 @@ use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
 
 use crate::{
-    AsyncDfsMessageTransport, DfsCancellationFlag, DfsConflictStatus, DfsControlPlaneKvClient,
-    DfsError, DfsFileSystem, DfsMessageTransport, DfsMetadataBackend, DfsMetadataStore,
-    DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedCall, DfsRoutedMessage,
-    DfsTransportIdentity, DistributedEventualCoordinator, LocalContentStore, NetworkedDfsService,
-    NetworkedDfsServiceEvent, build_dfs_routed_message,
+    AsyncDfsMessageTransport, DfsCancellationFlag, DfsCommittedWorkTracker, DfsConflictStatus,
+    DfsControlPlaneKvClient, DfsError, DfsFileSystem, DfsMessageCommittedWork, DfsMessageTransport,
+    DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedCall,
+    DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator, LocalContentStore,
+    NetworkedDfsService, NetworkedDfsServiceEvent, build_dfs_routed_message,
 };
 
 impl<T> NetworkedDfsService<T> {
@@ -74,6 +74,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: BTreeSet::new(),
             last_events: Vec::new(),
+            message_committed_work: DfsMessageCommittedWork::default(),
+            committed_work_tracker: None,
             transport,
             repair_retry_tick: 0,
             next_frame_id: 1,
@@ -267,6 +269,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn last_events(&self) -> &[NetworkedDfsServiceEvent] {
         &self.last_events
+    }
+
+    pub(crate) fn begin_message_committed_work(&mut self) {
+        self.message_committed_work = DfsMessageCommittedWork::default();
+    }
+
+    pub(crate) fn record_message_committed_work(&mut self, work: DfsMessageCommittedWork) {
+        self.message_committed_work.merge(work);
+        if let Some(tracker) = &self.committed_work_tracker {
+            tracker.record(work);
+        }
+    }
+
+    pub(crate) fn set_committed_work_tracker(&mut self, tracker: DfsCommittedWorkTracker) {
+        self.committed_work_tracker = Some(tracker);
+    }
+
+    pub(crate) fn take_message_committed_work(&mut self) -> DfsMessageCommittedWork {
+        std::mem::take(&mut self.message_committed_work)
     }
 
     pub fn into_transport(self) -> T {

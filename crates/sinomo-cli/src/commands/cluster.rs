@@ -96,6 +96,13 @@ pub(crate) struct ClusterInviteOptions {
     pub(crate) ttl_seconds: i64,
     pub(crate) introducers: Vec<String>,
     pub(crate) output: Option<PathBuf>,
+    pub(crate) channel_outputs: Vec<ClusterInviteChannelOutput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterInviteChannelOutput {
+    pub(crate) introducer: String,
+    pub(crate) output: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +134,7 @@ impl Default for ClusterInviteOptions {
             ttl_seconds: CLUSTER_INVITE_DEFAULT_TTL_SECONDS,
             introducers: Vec::new(),
             output: None,
+            channel_outputs: Vec::new(),
         }
     }
 }
@@ -284,11 +292,103 @@ pub(crate) fn parse_cluster_invite_options(
                 };
                 options.output = Some(PathBuf::from(output));
             }
+            "--channel-output" => {
+                index += 1;
+                let Some(channel_output) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options
+                    .channel_outputs
+                    .push(parse_cluster_invite_channel_output(channel_output)?);
+            }
             _ => return Err(CliError::Usage),
         }
         index += 1;
     }
+    normalize_cluster_invite_options(&mut options)?;
     Ok(options)
+}
+
+fn parse_cluster_invite_channel_output(
+    value: &str,
+) -> Result<ClusterInviteChannelOutput, CliError> {
+    let Some((introducer, output)) = value.split_once('=') else {
+        return Err(CliError::Parse {
+            detail: "--channel-output must use <introducer>=<path>".to_string(),
+        });
+    };
+    let output = output.trim();
+    if output.is_empty() {
+        return Err(CliError::Parse {
+            detail: "--channel-output path cannot be empty".to_string(),
+        });
+    }
+    Ok(ClusterInviteChannelOutput {
+        introducer: non_empty_address(introducer)?,
+        output: PathBuf::from(output),
+    })
+}
+
+fn normalize_cluster_invite_options(options: &mut ClusterInviteOptions) -> Result<(), CliError> {
+    let mut introducers = Vec::with_capacity(
+        options
+            .introducers
+            .len()
+            .saturating_add(options.channel_outputs.len()),
+    );
+    for introducer in &options.introducers {
+        let introducer = non_empty_address(introducer)?;
+        if !introducers.contains(&introducer) {
+            introducers.push(introducer);
+        }
+    }
+
+    let mut channel_introducers = Vec::with_capacity(options.channel_outputs.len());
+    let mut output_paths = Vec::with_capacity(
+        options
+            .channel_outputs
+            .len()
+            .saturating_add(usize::from(options.output.is_some())),
+    );
+    if let Some(output) = &options.output {
+        if output.as_os_str().is_empty() {
+            return Err(CliError::Parse {
+                detail: "cluster invite output path cannot be empty".to_string(),
+            });
+        }
+        output_paths.push(output.clone());
+    }
+    for channel_output in &mut options.channel_outputs {
+        channel_output.introducer = non_empty_address(&channel_output.introducer)?;
+        if channel_output.output.as_os_str().is_empty() {
+            return Err(CliError::Parse {
+                detail: "--channel-output path cannot be empty".to_string(),
+            });
+        }
+        if channel_introducers.contains(&channel_output.introducer) {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "duplicate --channel-output introducer `{}`",
+                    channel_output.introducer
+                ),
+            });
+        }
+        if output_paths.contains(&channel_output.output) {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "duplicate cluster invite output path `{}`",
+                    channel_output.output.display()
+                ),
+            });
+        }
+        channel_introducers.push(channel_output.introducer.clone());
+        output_paths.push(channel_output.output.clone());
+        if !introducers.contains(&channel_output.introducer) {
+            introducers.push(channel_output.introducer.clone());
+        }
+    }
+    options.introducers = introducers;
+    Ok(())
 }
 
 pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinOptions, CliError> {
@@ -842,41 +942,48 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
         },
         other => other,
     })?;
-    if daemon.is_none() {
+    let daemon = daemon.ok_or_else(|| CliError::ClusterReadOnly {
+        detail: "local daemon is not running; cluster-dependent operations are paused".to_string(),
+    })?;
+    if !local_daemon_matches_cluster_state(daemon, &state) {
         return Err(CliError::ClusterReadOnly {
-            detail: "local daemon is not running; cluster-dependent operations are paused"
+            detail: "local daemon identity does not match the local cluster state; cluster-dependent operations are paused"
                 .to_string(),
         });
     }
-    if let Some(daemon) = daemon
-        && local_daemon_can_serve_authoritative_cluster_kv_snapshot(daemon, &state)
-    {
-        return Ok(());
-    }
-    if cluster_has_local_quorum(&paths, &state) {
+    let quorum = cluster_state_authority_quorum_status(paths, &state, Some(daemon)).map_err(
+        |error| CliError::ClusterReadOnly {
+            detail: format!(
+                "cannot project committed cluster voter configuration for quorum admission: {error}"
+            ),
+        },
+    )?;
+    if quorum.has_quorum() {
         Ok(())
     } else {
         Err(CliError::ClusterReadOnly {
             detail: format!(
                 "quorum unavailable; cluster-dependent operations are paused ({} reachable cluster state authorities, {} required)",
-                cluster_reachable_state_authority_count(&paths, &state),
-                sinomo_runtime::kv::cluster_kv_raft_quorum_size_for_state(&state)
+                quorum.reachable, quorum.required
             ),
         })
     }
 }
 
-pub(crate) fn local_daemon_can_serve_authoritative_cluster_kv_snapshot(
+/// Returns whether the already-probed local daemon owns this cluster state.
+///
+/// CLI admission is observational: it must not issue an authoritative KV
+/// snapshot RPC because that RPC commits a Raft barrier. Reachability is
+/// checked separately through the read-only cluster authority probes, and the
+/// requested operation remains responsible for its own authoritative commit.
+pub(crate) fn local_daemon_matches_cluster_state(
     daemon: &DaemonStatus,
     state: &ClusterBootstrapState,
 ) -> bool {
     let Some(cluster) = daemon.cluster.as_ref() else {
         return false;
     };
-    if cluster.cluster_id != state.cluster_id || cluster.node_id != state.local_node_id {
-        return false;
-    }
-    daemon_fetch_cluster_kv_authoritative_snapshot(&daemon.address, DAEMON_PROBE_TIMEOUT).is_ok()
+    cluster.cluster_id == state.cluster_id && cluster.node_id == state.local_node_id
 }
 
 /// `sinomo cluster init`: daemon-first — a reachable main daemon initializes
@@ -964,7 +1071,8 @@ pub(crate) fn initialize_single_node_cluster_with_paths(
 /// publishes the invite through `/cluster/control/invite` with its own
 /// advertised introducers unless explicit invite options override them. The
 /// direct implementation stays reachable through [`cluster_invite_with_paths`].
-pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
+pub(crate) fn cluster_invite(mut options: ClusterInviteOptions) -> Result<(), CliError> {
+    normalize_cluster_invite_options(&mut options)?;
     let client = cluster_control_daemon_client("invite")?;
     let response = client.cluster_invite_with_request(cluster::ClusterControlInviteRequest {
         ttl_seconds: (options.ttl_seconds != CLUSTER_INVITE_DEFAULT_TTL_SECONDS)
@@ -973,6 +1081,8 @@ pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliErr
     })?;
     let uri = response.invite;
     let invite = decode_cluster_join_invite(&uri)?;
+    let channel_join_commands =
+        cluster_invite_channel_join_commands(&invite, &options.channel_outputs)?;
     if !cluster_invite_has_remote_usable_introducer(&invite) {
         println!(
             "warning: invite only contains local-only introducers; remote machines cannot use it until the daemon advertises a LAN-reachable address"
@@ -994,19 +1104,70 @@ pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliErr
         sinomo_runtime::node::cluster_invitation_key(&invite.invite_id)
     );
     if let Some(output) = &options.output {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|source| CliError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(output, format!("{join_command}\n")).map_err(|source| CliError::Io {
-            path: output.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        write_cluster_invite_command(output, &join_command)?;
         println!("output: {}", output.display());
     }
+    for (channel_output, join_command) in options
+        .channel_outputs
+        .iter()
+        .zip(channel_join_commands.iter())
+    {
+        write_cluster_invite_command(&channel_output.output, join_command)?;
+        println!(
+            "channel output ({}): {}",
+            channel_output.introducer,
+            channel_output.output.display()
+        );
+    }
     Ok(())
+}
+
+fn cluster_invite_channel_join_commands(
+    invite: &ClusterJoinInvite,
+    channel_outputs: &[ClusterInviteChannelOutput],
+) -> Result<Vec<String>, CliError> {
+    channel_outputs
+        .iter()
+        .map(|channel_output| {
+            let mut matches = invite
+                .communication_channels
+                .iter()
+                .filter(|channel| channel.endpoint.address == channel_output.introducer);
+            let channel = matches.next().ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "invite response did not contain requested channel `{}`",
+                    channel_output.introducer
+                ),
+            })?;
+            if matches.next().is_some() {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "invite response contained duplicate channels for `{}`",
+                        channel_output.introducer
+                    ),
+                });
+            }
+
+            let mut projected = invite.clone();
+            projected.communication_channels = vec![channel.clone()];
+            projected.introducers.clear();
+            let uri = encode_cluster_join_invite(&projected)?;
+            Ok(cluster_join_command(&uri))
+        })
+        .collect()
+}
+
+fn write_cluster_invite_command(output: &Path, join_command: &str) -> Result<(), CliError> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    fs::write(output, format!("{join_command}\n")).map_err(|source| CliError::Io {
+        path: output.display().to_string(),
+        detail: source.to_string(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1093,9 +1254,10 @@ fn print_cluster_migration_plan_report(report: &ClusterMigrationPlanReport) {
 }
 
 pub(crate) fn cluster_invite_with_paths(
-    options: ClusterInviteOptions,
+    mut options: ClusterInviteOptions,
     paths: &ClusterPaths,
 ) -> Result<RenderedClusterInvite, CliError> {
+    normalize_cluster_invite_options(&mut options)?;
     paths.ensure()?;
     let state = read_cluster_state(paths)?;
     if !sinomo_runtime::kv::cluster_kv_raft_local_is_voter(&state) {
@@ -1110,18 +1272,18 @@ pub(crate) fn cluster_invite_with_paths(
     }
     let uri = encode_cluster_join_invite(&invite)?;
     let join_command = cluster_join_command(&uri);
+    let channel_join_commands =
+        cluster_invite_channel_join_commands(&invite, &options.channel_outputs)?;
     publish_cluster_invitation(paths, &state, &invite)?;
     if let Some(output) = &options.output {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|source| CliError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(output, format!("{join_command}\n")).map_err(|source| CliError::Io {
-            path: output.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        write_cluster_invite_command(output, &join_command)?;
+    }
+    for (channel_output, join_command) in options
+        .channel_outputs
+        .iter()
+        .zip(channel_join_commands.iter())
+    {
+        write_cluster_invite_command(&channel_output.output, join_command)?;
     }
     Ok(RenderedClusterInvite {
         persisted_key: sinomo_runtime::node::cluster_invitation_key(&invite.invite_id),

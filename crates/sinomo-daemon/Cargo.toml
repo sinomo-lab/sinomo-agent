@@ -23,6 +23,7 @@ blake3.workspace = true
 fs2.workspace = true
 metrics.workspace = true
 netwatcher.workspace = true
+notify.workspace = true
 ring = "0.17.14"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
@@ -50,4 +51,5 @@ sysinfo.workspace = true
 
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support"] }
+sinomo-dfs = { path = "../sinomo-dfs", features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

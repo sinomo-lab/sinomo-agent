@@ -20,9 +20,9 @@ use crate::posix_path::{
     normalize_posix_path_with_trailing_directory, parent_posix_path, subtree_prefix,
 };
 use crate::{
-    DfsMessageTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
-    DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction, DfsObjectId,
-    DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
+    DfsMessageCommittedWork, DfsMessageTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind,
+    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
 };
 
 pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
@@ -349,8 +349,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(super) fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
-        if let Some(backend) = self.metadata_backend.as_mut() {
+        let persisted = if let Some(backend) = self.metadata_backend.as_mut() {
             backend.put_namespace_job(job)?;
+            true
+        } else {
+            false
+        };
+        if persisted {
+            // The backend row is the durable owner for a resumable namespace
+            // saga. Retain its publication and one reactive maintenance edge
+            // before quorum checkpointing or destination RPCs can fail.
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                repair_maintenance: false,
+                namespace_maintenance: job.status == DfsNamespaceJobStatus::Running,
+                metadata_replica_progress: false,
+            });
         }
         if namespace_job_kind_is_cross_shard(&job.kind) {
             // The locally durable running record is already an authority

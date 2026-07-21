@@ -1291,7 +1291,11 @@ pub fn write_rollout_runtime_state(
     rollout_paths: &SelfRolloutPaths,
     state: &RolloutRuntimeState,
 ) -> Result<(), RolloutError> {
-    write_object(&rollout_runtime_state_path(rollout_paths), state)
+    let path = rollout_runtime_state_path(rollout_paths);
+    if read_rollout_runtime_state(rollout_paths)?.as_ref() == Some(state) {
+        return Ok(());
+    }
+    write_object(&path, state)
 }
 
 pub fn read_rollout_telemetry_advance_state(
@@ -1355,7 +1359,20 @@ pub fn write_rollout_telemetry_gate_config(
     config: &RolloutTelemetryGateConfig,
 ) -> Result<(), RolloutError> {
     let data_dir = rollout_config_data_dir(rollout_paths)?;
-    rollout_config_store()?
+    let path = rollout_telemetry_gate_config_path(rollout_paths);
+    let store = rollout_config_store()?;
+    if path.exists()
+        && store
+            .get_typed::<RolloutTelemetryGateConfig>(
+                &data_dir,
+                None,
+                ROLLOUT_TELEMETRY_GATE_CONFIG_KEY,
+            )
+            .is_ok_and(|current| current == *config)
+    {
+        return Ok(());
+    }
+    store
         .set_typed(
             &data_dir,
             None,
@@ -1363,8 +1380,8 @@ pub fn write_rollout_telemetry_gate_config(
             config,
             ConfigWriteTarget::Local,
         )
-        .map(|_| ())
-        .map_err(map_rollout_config_error)
+        .map_err(map_rollout_config_error)?;
+    Ok(())
 }
 
 pub fn read_rollout_main_exit(

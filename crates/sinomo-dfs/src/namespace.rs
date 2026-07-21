@@ -85,6 +85,7 @@ pub fn directory_object_with_policy(
         file_system_id: sifs_file_system_id(),
         path: normalize_sifs_path(path),
         kind: DfsObjectKind::Directory,
+        tombstone_provenance: None,
         owner_node_id: owner_node_id.clone(),
         current_locations: vec![owner_node_id],
         content_hash: None,

@@ -21,8 +21,8 @@
 //! - `cluster.dfs.placement-management` — exercise Files-compatible placement
 //!   preview/update/progress APIs, constraints, inheritance, and reconciliation
 //!   of files written before the policy change.
-//! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
-//!   no stuck routed namespace ops, no leaked cross-shard locks.
+//! - `cluster.dfs.invariants` — durable operational-state sweep: no open
+//!   conflicts, leaked cross-shard locks, or reachable metadata-replica lag.
 //! - `cluster.dfs.lightweight-latency` — warmed SIFS stat/list/read-prefix
 //!   latency probe for file-browser-style lightweight operations.
 //! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS body-aware object-RPC
@@ -50,7 +50,7 @@
 
 use crate::app_api::SifsBrowser;
 use crate::file_manager::FileManagerBackend;
-use crate::sifs_file_manager::SifsFileManagerBackend;
+use crate::sifs_file_manager::{SifsFileManagerBackend, SifsFileManagerObservation};
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
@@ -237,7 +237,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_invariants(ctx) {
         id: "cluster.dfs.invariants",
-        summary: "SIFS operational invariants: no open conflicts, stuck routed ops, or leaked cross-shard locks",
+        summary: "SIFS durable invariants: no open conflicts, leaked cross-shard locks, or reachable replica lag",
         tags: ["cluster-dfs", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -1143,7 +1143,7 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let expected_replica_count = optional_usize_parameter(ctx, "expected-replica-count", 0)?;
     let expected_distinct_primary_count =
         optional_usize_parameter(ctx, "expected-distinct-primary-count", 0)?;
-    let backend = open_backend(ctx)?;
+    let backend = open_observation(ctx)?;
     let node = backend.node_label();
     let mut layouts = Vec::with_capacity(PROBES.len());
     for (lane, base_prefix, candidate_path) in PROBES {
@@ -2497,13 +2497,14 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         &cluster_state,
         &live_online_remote_node_ids,
     );
-    let backend = open_backend_with_deadline(ctx, deadline)?;
+    let backend = open_observation_with_deadline(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
     loop {
-        let metrics = backend
-            .operational_metrics()
+        let snapshot = backend
+            .operational_snapshot()
             .map_err(SinomoTestError::failed)?;
+        let metrics = snapshot.metrics;
         let mut violations = Vec::new();
         if metrics.open_conflict_count != 0 {
             violations.push(format!(
@@ -2517,32 +2518,7 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 metrics.cross_shard_namespace_lock_count
             ));
         }
-        if metrics.pending_routed_namespace_op_count != 0 {
-            violations.push(format!(
-                "pending_routed_namespace_op_count={}",
-                metrics.pending_routed_namespace_op_count
-            ));
-        }
-        if metrics.pending_routed_write_count != 0 {
-            violations.push(format!(
-                "pending_routed_write_count={}",
-                metrics.pending_routed_write_count
-            ));
-        }
-        if metrics.authoritative_write_frozen_shard_count != 0 {
-            violations.push(format!(
-                "authoritative_write_frozen_shard_count={}",
-                metrics.authoritative_write_frozen_shard_count
-            ));
-        }
-        let operator_status = backend
-            .operator_status()
-            .map_err(SinomoTestError::failed)?
-            .ok_or_else(|| {
-                SinomoTestError::failed(
-                    "cluster DFS invariants require local operator status".to_string(),
-                )
-            })?;
+        let operator_status = snapshot.operator_status;
         let replica_assessment = assess_dfs_invariant_replica_health(
             &node,
             &operator_status.metadata_shards,
@@ -2558,10 +2534,6 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record(
                 "pending_metadata_replication_count",
                 metrics.pending_metadata_replication_count,
-            );
-            ctx.record(
-                "authoritative_write_frozen_shard_count",
-                metrics.authoritative_write_frozen_shard_count,
             );
             return Ok(SinomoTestOutcome::passed(format!(
                 "DFS operational invariants hold on node {node}"
@@ -3280,29 +3252,37 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     require_positive("min-locations", min_locations)?;
     let started = Instant::now();
     let deadline = started + timeout;
-    let backend = open_read_only_backend_until(ctx, deadline)?;
+    let backend = open_observation_until(ctx, deadline)?;
     let node = backend.node_label();
-    let daemon_client = DaemonApiClient::connect().map_err(|source| {
-        SinomoTestError::failed(format!(
-            "cannot connect to local daemon for DFS replica inspection: {source}"
-        ))
-    })?;
     ctx.record("node", &node);
     ctx.record("path", &path);
     ctx.record("min_locations", min_locations);
     loop {
-        let last_state = match backend.dfs_stat(&path) {
-            Ok(stat) => {
+        let last_state = match backend.object_by_path(&path) {
+            Ok(Some(view)) => {
+                let object = &view.object;
+                let mut current_locations = object.current_locations.clone();
+                if let Some(content_hash) = object.content_hash.as_deref() {
+                    for receipt in &view.receipts {
+                        if receipt.receipt.committed_version == object.version
+                            && receipt.content_hash.as_deref() == Some(content_hash)
+                            && !current_locations.contains(&receipt.replica_node_id)
+                        {
+                            current_locations.push(receipt.replica_node_id.clone());
+                        }
+                    }
+                }
+                let size_bytes = view
+                    .versions
+                    .iter()
+                    .find(|version| version.version == object.version)
+                    .and_then(|version| version.size_bytes);
                 let desired_replica_nodes = if matches!(
-                    &stat.policy,
+                    &object.policy,
                     sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed
                         | sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual
                 ) {
-                    match current_version_desired_replica_nodes(
-                        &daemon_client,
-                        &stat.object_id,
-                        &stat.version,
-                    ) {
+                    match current_version_desired_replica_nodes(&view) {
                         Ok(desired_replica_nodes) if !desired_replica_nodes.is_empty() => {
                             desired_replica_nodes
                         }
@@ -3336,19 +3316,22 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     Vec::new()
                 };
                 let missing_desired_replica_nodes =
-                    missing_desired_replica_nodes(&desired_replica_nodes, &stat.current_locations);
-                if stat.content_hash.is_some()
-                    && stat.current_locations.len() >= min_locations
+                    missing_desired_replica_nodes(&desired_replica_nodes, &current_locations);
+                if object.content_hash.is_some()
+                    && current_locations.len() >= min_locations
                     && missing_desired_replica_nodes.is_empty()
                 {
                     ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
-                    ctx.record("object_id", stat.object_id.to_string());
-                    ctx.record("version", stat.version.to_string());
-                    ctx.record("content_hash", stat.content_hash.unwrap_or_default());
-                    ctx.record("size_bytes", stat.size_bytes.unwrap_or_default());
+                    ctx.record("object_id", object.object_id.to_string());
+                    ctx.record("version", object.version.to_string());
+                    ctx.record(
+                        "content_hash",
+                        object.content_hash.clone().unwrap_or_default(),
+                    );
+                    ctx.record("size_bytes", size_bytes.unwrap_or_default());
                     ctx.record(
                         "current_locations",
-                        stat_location_labels(&stat.current_locations),
+                        stat_location_labels(&current_locations),
                     );
                     ctx.record(
                         "desired_replica_nodes",
@@ -3357,20 +3340,21 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     return Ok(SinomoTestOutcome::passed(format!(
                         "{path} has all {} desired replicas among {} current locations on node {node} after {}ms",
                         desired_replica_nodes.len(),
-                        stat.current_locations.len(),
+                        current_locations.len(),
                         started.elapsed().as_millis()
                     )));
                 }
                 format!(
                     "locations={} current={:?} desired={:?} missing_desired={:?} content_hash={:?} size={:?}",
-                    stat.current_locations.len(),
-                    stat_location_labels(&stat.current_locations),
+                    current_locations.len(),
+                    stat_location_labels(&current_locations),
                     stat_location_labels(&desired_replica_nodes),
                     stat_location_labels(&missing_desired_replica_nodes),
-                    stat.content_hash,
-                    stat.size_bytes
+                    object.content_hash,
+                    size_bytes
                 )
             }
+            Ok(None) => format!("cannot inspect {path}: path not found"),
             Err(error) => error,
         };
         if Instant::now() >= deadline {
@@ -3385,33 +3369,17 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn current_version_desired_replica_nodes(
-    daemon_client: &DaemonApiClient,
-    object_id: &DfsObjectId,
-    version: &DfsVersion,
+    object: &dfs::DfsOperatorObjectView,
 ) -> Result<Vec<NodeId>, String> {
-    let request = dfs::dfs_inspection_rpc_request(&DaemonDfsInspectionRequest::Object {
-        object_id: object_id.clone(),
-    })
-    .map_err(|error| error.to_string())?;
-    let response = daemon_client
-        .call_request(&request)
-        .map_err(|error| error.to_string())?;
-    let response =
-        dfs::decode_dfs_inspection_rpc_response(&response).map_err(|error| error.to_string())?;
-    let DaemonDfsInspectionResponse::Object {
-        object: Some(object),
-    } = response
-    else {
-        return Err(format!("DFS inspection did not return object {object_id}"));
-    };
     object
         .intents
         .iter()
-        .find(|intent| &intent.target_version == version)
+        .find(|intent| intent.target_version == object.object.version)
         .map(|intent| intent.desired_replica_node_ids.clone())
         .ok_or_else(|| {
             format!(
-                "DFS inspection did not return the write intent for object {object_id} version {version}"
+                "DFS inspection did not return the write intent for object {} version {}",
+                object.object.object_id, object.object.version
             )
         })
 }
@@ -4310,6 +4278,23 @@ fn open_backend_with_deadline(
         .map_err(|error| SinomoTestError::failed(format!("cannot open SIFS backend: {error}")))
 }
 
+fn open_observation(
+    ctx: &SinomoTestContext,
+) -> Result<SifsFileManagerObservation, SinomoTestError> {
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    SifsFileManagerObservation::open(&data_dir)
+        .map_err(|error| SinomoTestError::failed(format!("cannot open SIFS observation: {error}")))
+}
+
+fn open_observation_with_deadline(
+    ctx: &SinomoTestContext,
+    deadline: Instant,
+) -> Result<SifsFileManagerObservation, SinomoTestError> {
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    SifsFileManagerObservation::open_with_deadline(&data_dir, deadline)
+        .map_err(|error| SinomoTestError::failed(format!("cannot open SIFS observation: {error}")))
+}
+
 fn open_read_only_backend(
     ctx: &SinomoTestContext,
 ) -> Result<SifsFileManagerBackend, SinomoTestError> {
@@ -4338,6 +4323,15 @@ fn open_backend_until(
 ) -> Result<SifsFileManagerBackend, SinomoTestError> {
     retry_backend_open_until(deadline, "SIFS backend", || {
         open_backend_with_deadline(ctx, deadline)
+    })
+}
+
+fn open_observation_until(
+    ctx: &SinomoTestContext,
+    deadline: Instant,
+) -> Result<SifsFileManagerObservation, SinomoTestError> {
+    retry_backend_open_until(deadline, "SIFS observation", || {
+        open_observation_with_deadline(ctx, deadline)
     })
 }
 

@@ -12,8 +12,9 @@ use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError,
     DfsFileSystemConfig, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
+    DfsMetadataShardConfig, DfsNamespaceJobKind, DfsNamespaceJobStatus, DfsNodeAdvertisement,
+    DfsNodeTransport, DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView,
+    DfsOperatorStatus, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
     DfsPinAddRequest, DfsPinMode, DfsPlacementBlockingDiagnostic, DfsPlacementImpact,
     DfsPlacementNodePreview, DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
     DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
@@ -23,12 +24,13 @@ use sinomo_runtime::dfs::{
     LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
     fallback_dfs_node_id, metadata_shards_prefix,
+    open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
     preview_placement_with_unavailable_nodes,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
-use sinomo_runtime::kv::{KvError, KvOp, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -51,6 +53,42 @@ pub(crate) struct SifsFileManagerBackend {
     replica_candidates: Vec<NodeId>,
 }
 
+/// A metadata-only, observational SIFS view.
+///
+/// This is deliberately a separate type from [`SifsFileManagerBackend`]. An
+/// observation must never construct a networked DFS service: service bootstrap
+/// owns namespace initialization, recovery, and replication work, all of which
+/// are mutations even when the caller only intends to inspect status.
+///
+/// Its operational metrics are also limited to durable, lane-independent
+/// state. Whether authoritative writes are frozen is a property of one
+/// long-lived backend instance: a cold inspection handle intentionally has no
+/// process-local authority binding and therefore cannot report the daemon
+/// lane's writability. Callers that need that evidence must exercise the live
+/// daemon mutation lane.
+#[derive(Clone, Debug)]
+pub(crate) struct SifsFileManagerObservation {
+    data_dir: SinomoDataDir,
+    node_id: NodeId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SifsFileManagerObservationSnapshot {
+    pub(crate) metrics: SifsFileManagerObservationMetrics,
+    pub(crate) operator_status: DfsOperatorStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SifsFileManagerObservationMetrics {
+    pub(crate) object_count: usize,
+    pub(crate) open_conflict_count: usize,
+    pub(crate) repair_job_count: usize,
+    pub(crate) repair_attempt_count: usize,
+    pub(crate) pending_write_count: usize,
+    pub(crate) pending_metadata_replication_count: usize,
+    pub(crate) cross_shard_namespace_lock_count: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct SifsParallelReadPool {
     workers: Vec<SifsFileManagerBackend>,
@@ -67,6 +105,129 @@ pub(crate) struct SifsMetadataPrimaryTransferReport {
     pub(crate) changed: bool,
     pub(crate) shard: DfsMetadataShardConfig,
     pub(crate) local_node_id: String,
+}
+
+impl SifsFileManagerObservation {
+    pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
+        let cluster_paths = ClusterPaths::new(data_dir);
+        let node_id = if cluster_paths.state.exists() {
+            cluster::read_cluster_state_without_kv(&cluster_paths)
+                .map_err(|error| format!("cannot read local cluster state: {error}"))?
+                .local_node_id
+        } else {
+            fallback_dfs_node_id()
+        };
+        Ok(Self {
+            data_dir: data_dir.clone(),
+            node_id,
+        })
+    }
+
+    pub(crate) fn open_with_deadline(
+        data_dir: &SinomoDataDir,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        let operation_deadline = Some(deadline);
+        sifs_operation_remaining(operation_deadline, "opening the SIFS observation")?;
+        let observation = Self::open(data_dir)?;
+        sifs_operation_remaining(operation_deadline, "opening the SIFS observation")?;
+        Ok(observation)
+    }
+
+    pub(crate) fn node_label(&self) -> String {
+        self.node_id.to_string()
+    }
+
+    pub(crate) fn metadata_shard_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Ok(None);
+        }
+        let mut kv = SifsSnapshotControlPlaneKvClient::new(&cluster_paths);
+        DfsControlPlaneStore::new(&mut kv)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
+            .map_err(|error| format!("cannot read SIFS metadata shard for {path}: {error}"))
+    }
+
+    pub(crate) fn object_by_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<DfsOperatorObjectView>, String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let metadata =
+            open_cluster_aware_dfs_metadata_backend_for_inspection(&self.data_dir, &cluster_paths)
+                .map_err(|error| format!("cannot open SIFS metadata for observation: {error}"))?;
+        sinomo_runtime::dfs::DfsOperatorInspector::new(metadata.as_ref())
+            .object_by_path(&sifs_file_system_id(), &path)
+            .map_err(|error| format!("cannot inspect SIFS path {path}: {error}"))
+    }
+
+    pub(crate) fn operational_snapshot(
+        &self,
+    ) -> Result<SifsFileManagerObservationSnapshot, String> {
+        const NAMESPACE_JOB_PAGE_SIZE: usize = 256;
+
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err("cluster SIFS observation requires local cluster state".to_string());
+        }
+        let operator_status =
+            sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&self.data_dir, &cluster_paths)
+                .map_err(|error| format!("cannot read SIFS operator status: {error}"))?;
+        let metadata =
+            open_cluster_aware_dfs_metadata_backend_for_inspection(&self.data_dir, &cluster_paths)
+                .map_err(|error| format!("cannot open SIFS metadata for observation: {error}"))?;
+
+        let mut cross_shard_namespace_locks = BTreeSet::new();
+        let mut namespace_job_cursor = None;
+        loop {
+            let page = metadata
+                .list_namespace_jobs_page(namespace_job_cursor.as_ref(), NAMESPACE_JOB_PAGE_SIZE)
+                .map_err(|error| format!("cannot inspect SIFS namespace jobs: {error}"))?;
+            for job in page.jobs {
+                if job.status == DfsNamespaceJobStatus::Running
+                    && matches!(
+                        job.kind,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                    )
+                {
+                    cross_shard_namespace_locks.insert((job.file_system_id, job.root_path));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            namespace_job_cursor = Some(next_cursor);
+        }
+
+        let pending_metadata_replication_count = operator_status
+            .metadata_shards
+            .iter()
+            .filter(|shard| shard.primary_node_id.as_ref() == Some(&self.node_id))
+            .flat_map(|shard| &shard.replica_lag)
+            .filter(|replica| replica.lag_entries != 0)
+            .count();
+        let metrics = SifsFileManagerObservationMetrics {
+            object_count: operator_status.object_count,
+            open_conflict_count: operator_status.open_conflict_count,
+            repair_job_count: operator_status.pending_repair_count,
+            repair_attempt_count: operator_status.repair_attempt_count,
+            pending_write_count: operator_status.pending_write_count,
+            pending_metadata_replication_count,
+            cross_shard_namespace_lock_count: cross_shard_namespace_locks.len(),
+        };
+        Ok(SifsFileManagerObservationSnapshot {
+            metrics,
+            operator_status,
+        })
+    }
 }
 
 impl SifsFileManagerBackend {
@@ -106,12 +267,8 @@ impl SifsFileManagerBackend {
         let operation_deadline = Some(deadline);
         sifs_operation_remaining(operation_deadline, "creating the SIFS RPC runtime")?;
         let rpc_runtime = SifsRpcRuntime::new()?;
-        let service = open_sifs_service_with_hydration_until(
-            data_dir,
-            &rpc_runtime,
-            false,
-            operation_deadline,
-        )?;
+        let service =
+            open_sifs_service_read_only_until(data_dir, &rpc_runtime, operation_deadline)?;
         sifs_operation_remaining(operation_deadline, "opening the read-only SIFS backend")?;
         Self::from_service(data_dir, rpc_runtime, service)
     }
@@ -1195,15 +1352,6 @@ impl SifsFileManagerBackend {
         result
     }
 
-    pub(crate) fn operational_metrics(
-        &self,
-    ) -> Result<sinomo_runtime::dfs::DfsOperationalMetrics, String> {
-        let service = self.lock_service()?;
-        service
-            .operational_metrics()
-            .map_err(|error| format!("cannot read SIFS operational metrics: {error}"))
-    }
-
     pub(crate) fn operator_status(
         &self,
     ) -> Result<Option<sinomo_runtime::dfs::DfsOperatorStatus>, String> {
@@ -1798,7 +1946,57 @@ fn open_sifs_service_read_only(
     data_dir: &SinomoDataDir,
     rpc_runtime: &SifsRpcRuntime,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
-    open_sifs_service_with_hydration(data_dir, rpc_runtime, false)
+    open_sifs_service_read_only_until(data_dir, rpc_runtime, None)
+}
+
+fn open_sifs_service_read_only_until(
+    data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
+    operation_deadline: Option<Instant>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+    sifs_operation_remaining(operation_deadline, "reading local cluster state")?;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
+        let state = cluster::read_cluster_state_without_kv(&cluster_paths)
+            .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        (state.local_node_id, peer_node_ids)
+    } else {
+        (fallback_dfs_node_id(), Vec::new())
+    };
+    sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
+        .map_err(|error| format!("cannot open DFS content store: {error}"))?;
+    let (sync_peer_transport, async_peer_transport) =
+        match sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone()) {
+            Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
+            Err(_) => shared_sifs_peer_transports(SifsDfsPeerTransport::new(
+                rpc_runtime.clone(),
+                data_dir.clone(),
+            )),
+        };
+    let mut service = NetworkedDfsService::new(
+        DfsNodeTransport::with_peer_transports_for_nodes(
+            local_node_id,
+            peer_node_ids,
+            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+            sync_peer_transport,
+            async_peer_transport,
+        ),
+        content,
+    );
+    if cluster_paths.state.exists() {
+        service =
+            service.with_control_plane(SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
+    }
+    sifs_operation_remaining(operation_deadline, "opening read-only DFS metadata")?;
+    let metadata = open_cluster_aware_dfs_metadata_backend_for_inspection(data_dir, &cluster_paths)
+        .map_err(|error| format!("cannot open read-only SIFS metadata: {error}"))?;
+    let service = service
+        .with_boxed_metadata_backend_lazy(metadata)
+        .map_err(|error| format!("cannot open read-only SIFS metadata: {error}"))?;
+    sifs_operation_remaining(operation_deadline, "opening read-only DFS metadata")?;
+    Ok(service)
 }
 
 fn open_sifs_service_with_hydration(
@@ -1936,6 +2134,52 @@ fn refresh_sifs_cluster_kv_snapshot(
             .map_err(|error| format!("cannot refresh SIFS cluster KV snapshot: {error}"))?;
     }
     Ok(())
+}
+
+/// Snapshot-only control-plane reader for strict observation paths.
+///
+/// Unlike the ordinary CLI client, a miss never probes the daemon and the
+/// mutation methods are hard failures. The daemon owns reactive publication of
+/// the local snapshot; an observer consumes that state without becoming a new
+/// scheduling edge.
+#[derive(Clone, Debug)]
+struct SifsSnapshotControlPlaneKvClient {
+    cluster_paths: ClusterPaths,
+}
+
+impl SifsSnapshotControlPlaneKvClient {
+    fn new(cluster_paths: &ClusterPaths) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+        }
+    }
+
+    fn kv_error(&self, detail: impl Into<String>) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+impl DfsControlPlaneKvClient for SifsSnapshotControlPlaneKvClient {
+    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
+        cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
+            .map_err(|source| self.kv_error(source.to_string()))
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
+        cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
+            .map_err(|source| self.kv_error(source.to_string()))
+    }
+
+    fn put(&mut self, _key: String, _value: Vec<u8>) -> Result<KvRevision, KvError> {
+        Err(self.kv_error("SIFS observation cannot mutate cluster KV"))
+    }
+
+    fn txn(&mut self, _txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        Err(self.kv_error("SIFS observation cannot mutate cluster KV"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2973,6 +3217,8 @@ fn parent_sifs_path(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::file_manager::FileManagerState;
+    use sinomo_runtime::dfs::DfsMetadataBackend as _;
+    use std::fs;
     use std::sync::Arc;
 
     #[derive(Clone, Debug)]
@@ -3071,6 +3317,129 @@ mod tests {
             "the SIFS RPC runtime must stay process-shared: per-open runtimes \
              deadlock whichever thread drops the last handle while a blocking \
              daemon probe or peer RPC is still in flight"
+        );
+    }
+
+    #[test]
+    fn sifs_observation_backend_does_not_advance_metadata_journal_heads() {
+        let root = temp_sifs_data_dir("observation-journal-heads");
+        let data_dir = SinomoDataDir::new(&root);
+        let shards = seed_observation_cluster(&data_dir);
+        let before = metadata_journal_heads(&data_dir, &shards);
+
+        let observation = SifsFileManagerObservation::open(&data_dir).expect("observation");
+        for (path, expected_shard) in [
+            ("/cluster-tests/layout-probe", "root"),
+            ("/services/cluster-tests/layout-probe", "services"),
+            ("/users/cluster-tests/layout-probe", "users"),
+        ] {
+            let shard = observation
+                .metadata_shard_for_path(path)
+                .expect("observe shard layout")
+                .expect("configured shard");
+            assert_eq!(shard.shard_id, expected_shard);
+        }
+        let snapshot = observation
+            .operational_snapshot()
+            .expect("observe DFS invariants");
+        assert_eq!(snapshot.operator_status.metadata_shards.len(), 3);
+        assert!(
+            observation
+                .object_by_path("/absent")
+                .expect("observe absent path")
+                .is_none()
+        );
+
+        assert_eq!(
+            metadata_journal_heads(&data_dir, &shards),
+            before,
+            "layout, invariant, and path observations must not append metadata"
+        );
+    }
+
+    #[test]
+    fn activated_handoff_marker_is_not_a_cold_observation_invariant() {
+        let root = temp_sifs_data_dir("observation-activated-handoff-marker");
+        let data_dir = SinomoDataDir::new(&root);
+        let shards = seed_observation_cluster(&data_dir);
+        let root_shard = sinomo_runtime::dfs::DfsMetadataShardId::new("root");
+        let mut retiring =
+            sinomo_runtime::dfs::open_local_metadata_shard_backend(&data_dir, root_shard.clone())
+                .expect("retiring metadata backend");
+        retiring
+            .freeze_metadata_shard_for_membership_handoff(
+                &root_shard,
+                "observation-activated-handoff",
+                1,
+            )
+            .expect("install handoff marker")
+            .expect("matching local shard");
+        assert!(
+            retiring
+                .mark_metadata_shard_membership_handoff_activated(
+                    &root_shard,
+                    "observation-activated-handoff",
+                    2,
+                )
+                .expect("activate handoff marker")
+        );
+        let activated_marker = retiring
+            .metadata_shard_write_freeze(&root_shard)
+            .expect("read activated marker")
+            .expect("durable activated marker");
+        drop(retiring);
+
+        let before = metadata_journal_heads(&data_dir, &shards);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let inspection =
+            open_cluster_aware_dfs_metadata_backend_for_inspection(&data_dir, &cluster_paths)
+                .expect("fresh inspection backend");
+        assert!(
+            inspection
+                .metadata_shard_authoritative_writes_frozen(&root_shard)
+                .expect("inspect process-local authority fence"),
+            "a fresh inspection backend has no process-local authority binding"
+        );
+        drop(inspection);
+
+        let snapshot = SifsFileManagerObservation::open(&data_dir)
+            .expect("observation")
+            .operational_snapshot()
+            .expect("activated markers are not durable invariant failures");
+        assert_eq!(snapshot.metrics.open_conflict_count, 0);
+        assert_eq!(snapshot.metrics.cross_shard_namespace_lock_count, 0);
+        assert_eq!(snapshot.metrics.pending_metadata_replication_count, 0);
+
+        let inspection =
+            open_cluster_aware_dfs_metadata_backend_for_inspection(&data_dir, &cluster_paths)
+                .expect("reopen inspection backend");
+        assert_eq!(
+            inspection
+                .metadata_shard_write_freeze(&root_shard)
+                .expect("read marker after observation"),
+            Some(activated_marker),
+            "observation must not rebind or rewrite the durable handoff marker"
+        );
+        assert_eq!(
+            metadata_journal_heads(&data_dir, &shards),
+            before,
+            "observing an activated handoff marker must not append metadata"
+        );
+    }
+
+    #[test]
+    fn sifs_service_backed_reader_open_does_not_advance_metadata_journal_heads() {
+        let root = temp_sifs_data_dir("read-only-journal-heads");
+        let data_dir = SinomoDataDir::new(&root);
+        let shards = seed_observation_cluster(&data_dir);
+        let before = metadata_journal_heads(&data_dir, &shards);
+
+        let _reader = SifsFileManagerBackend::open_read_only(&data_dir).expect("read-only reader");
+
+        assert_eq!(
+            metadata_journal_heads(&data_dir, &shards),
+            before,
+            "opening a data reader must not bootstrap or recover metadata"
         );
     }
 
@@ -4178,6 +4547,105 @@ mod tests {
             forbidden: false,
             explanation: String::new(),
         }
+    }
+
+    fn seed_observation_cluster(data_dir: &SinomoDataDir) -> Vec<DfsMetadataShardConfig> {
+        let cluster_paths = ClusterPaths::new(data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let cluster_id = sinomo_runtime::node::ClusterId::from_legacy_named(
+            "cluster_sifs_observation_journal_heads",
+        )
+        .expect("cluster id");
+        let local_node_id =
+            NodeId::from_legacy_named("node_sifs_observation_local").expect("node id");
+        let state = sinomo_runtime::core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "SIFS observation journal heads",
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let file_system_id = sifs_file_system_id();
+        let shards = vec![
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: local_node_id.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::Root,
+                default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: local_node_id.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id,
+                shard_id: "users".to_string(),
+                primary_node_id: local_node_id.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/users".to_string(),
+                },
+                default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            },
+        ];
+        let mut kv = sinomo_runtime::kv::InProcessKvStore::new();
+        {
+            let mut control = DfsControlPlaneStore::new(&mut kv);
+            for shard in &shards {
+                control.put_metadata_shard(shard).expect("metadata shard");
+            }
+        }
+        sinomo_runtime::kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &kv.try_snapshot().expect("KV snapshot"),
+        )
+        .expect("write KV snapshot");
+
+        let file_system = sinomo_runtime::dfs::DfsFileSystem::sifs(local_node_id);
+        for shard in &shards {
+            let mut metadata = sinomo_runtime::dfs::open_local_metadata_shard_backend(
+                data_dir,
+                sinomo_runtime::dfs::DfsMetadataShardId::new(&shard.shard_id),
+            )
+            .expect("metadata shard backend");
+            metadata
+                .put_file_system(&file_system)
+                .expect("seed metadata journal");
+        }
+        shards
+    }
+
+    fn metadata_journal_heads(
+        data_dir: &SinomoDataDir,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Vec<(String, Vec<u8>)> {
+        shards
+            .iter()
+            .map(|shard| {
+                let shard_id = sinomo_runtime::dfs::DfsMetadataShardId::new(&shard.shard_id);
+                let head = sinomo_runtime::dfs::local_dfs_metadata_shard_path(data_dir, &shard_id)
+                    .join("journal/head.sobj");
+                (
+                    shard.shard_id.clone(),
+                    fs::read(&head)
+                        .unwrap_or_else(|error| panic!("cannot read {}: {error}", head.display())),
+                )
+            })
+            .collect()
     }
 
     fn temp_sifs_data_dir(name: &str) -> sinomo_testdir::TestDir {

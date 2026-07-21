@@ -1024,6 +1024,7 @@ mod tests {
             file_system_id: file_system.file_system_id.clone(),
             path: "/services/cluster-tests/status-scope.txt".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: local.clone(),
             current_locations: vec![local.clone()],
             content_hash: Some(content_hash.clone()),

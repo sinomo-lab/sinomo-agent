@@ -36,10 +36,11 @@
 #   docker/test-cluster.sh                  # build current binary, up, test, down -v
 #   SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
 #   SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
+#   SINOMO_TEST_TIMING_HELPERS_SELF_TEST=1 docker/test-cluster.sh  # no-Docker helper test
 #
 # Env knobs:
 #   SINOMO_TEST_PROJECT         compose project name   (default sinomo-dfs-test)
-#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 60)
+#   Cluster formation has a non-configurable 10-second hard acceptance gate.
 #   SINOMO_TEST_EXPECT_TIMEOUT  cross-node poll seconds (default 90)
 #   SINOMO_TEST_PERF_FILES      files per bulk-performance leg (default 64)
 #   SINOMO_TEST_PERF_WARMUP_FILES files in the no-threshold warmup leg (default 8)
@@ -88,10 +89,8 @@
 #   SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS warmup RPCs in each no-load realtime gate (default 20)
 #   SINOMO_TEST_NETWORK_DIRECT_MAX_US       max direct small-RPC p50 and p95 (default 1000)
 #   SINOMO_TEST_NETWORK_FORWARD_MAX_US      max one-forward small-RPC p50 and p95 (default 2000)
-#   SINOMO_TEST_NETWORK_QUIET_WAIT           seconds to wait for idle containers before each realtime leg (default 60)
-#   SINOMO_TEST_NETWORK_QUIET_SAMPLES        consecutive idle CPU samples required (default 3)
-#   SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT max CPU percent allowed per cluster container (default 10)
-#   SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS   delay between idle CPU samples (default 1)
+#   SINOMO_TEST_NETWORK_QUIET_WAIT           seconds to find the hard 30-second idle window (default and maximum 120)
+#   SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT max CPU percent allowed per cluster container (default and maximum 10)
 #   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES response bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC min latency-baseline payload throughput (default 0, disabled)
@@ -99,9 +98,24 @@
 #   SINOMO_TEST_NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET warmup payload RPCs per remote node (default same as payload requests)
 #   SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY payload-throughput workers (default 8)
 #   SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS  payload-throughput RPC timeout (default 5000)
-#   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 49152)
-#   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 475136)
+#   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
+#   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 262144)
 #   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 16777216)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_REQUESTS_PER_TARGET semantic-attachment RPCs per remote node (default 4)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_WARMUP_REQUESTS_PER_TARGET warmup attachment RPCs per remote node (default 1)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_CONCURRENCY semantic-attachment workers (default 4)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_TIMEOUT_MS semantic-attachment RPC timeout (default 30000)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_REQUEST_BYTES request attachment bytes per RPC (default 8388608)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_RESPONSE_BYTES response attachment bytes per RPC (default 8388608)
+#   SINOMO_TEST_NETWORK_ATTACHMENT_MIN_BYTES_PER_SEC min aggregate duplex logical attachment throughput (default 0, disabled)
+#   SINOMO_TEST_NETWORK_SATURATION=1 enable the optional one-origin saturation profile (default 0)
+#   SINOMO_TEST_NETWORK_SATURATION_ORIGIN origin node for the saturation profile (default node1)
+#   SINOMO_TEST_NETWORK_SATURATION_REQUESTS_PER_TARGET measured RPCs per remote target (default 128)
+#   SINOMO_TEST_NETWORK_SATURATION_WARMUP_REQUESTS_PER_TARGET warmup RPCs per remote target (default 1)
+#   SINOMO_TEST_NETWORK_SATURATION_CONCURRENCY saturation workers (default 8)
+#   SINOMO_TEST_NETWORK_SATURATION_TIMEOUT_MS per-RPC timeout (default 120000)
+#   SINOMO_TEST_NETWORK_SATURATION_REQUEST_BYTES request attachment bytes per RPC (default 67108864)
+#   SINOMO_TEST_NETWORK_SATURATION_RESPONSE_BYTES response attachment bytes per RPC (default 67108864)
 #   SINOMO_TEST_CLUSTER_KV_ITERATIONS        quorum commits per selected node (default 12)
 #   SINOMO_TEST_CLUSTER_KV_VALUE_BYTES       value bytes per quorum commit (default 256)
 #   SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS        per-commit timeout (default 5000)
@@ -119,11 +133,19 @@
 #   SINOMO_TEST_HOST_TIMEOUT_GRACE          host cleanup grace beyond the container timeout (default 5)
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
+#   SINOMO_TEST_FORMATION_ONLY=1            stop after the ten-second formation gate and optional captures
 #   SINOMO_TEST_BUILD=0         reuse an existing host binary instead of rebuilding
 #   SINOMO_TEST_BINARY          host binary to validate/mount (default target/debug/sinomo)
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
 #   SINOMO_TEST_ALLOW_OTHER_COMPOSE=1       allow running while unrelated compose projects are up
 #   SINOMO_TEST_COMPOSE_OVERRIDE optional second compose file (for measurement-only overrides)
+#   SINOMO_TEST_FORMATION_OBSERVE=1 start bounded trace, RPC-timeline, and CPU
+#                                  captures before Docker formation work; diagnostic only
+#   SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS capture watchdog seconds (default 12)
+#   SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ CPU samples/second (default 49)
+#   SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES comma-separated nodes profiled in-process
+#                                           (default node1; use all explicitly)
+#   SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS bounded RPC-timeline records/node (default 32768)
 #
 # Exits non-zero if any scenario fails; failure evidence (probe JSON, compose ps,
 # cluster health/doctor, per-node logs) lands in the artifact directory.
@@ -135,7 +157,28 @@ COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
 COMPOSE_OVERRIDE_FILE="${SINOMO_TEST_COMPOSE_OVERRIDE:-}"
 
 PROJECT="${SINOMO_TEST_PROJECT:-sinomo-dfs-test}"
-FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-60}"
+# HARD ACCEPTANCE GATE: all six clean main daemons must form within ten wall-clock
+# seconds. This Docker-only benchmark guard is intentionally non-configurable.
+# Exceeding it still indicates a formation bug; it is not a production join
+# deadline and must never be copied into runtime timeout policy.
+FORMATION_WAIT=10
+# Keep formation observations dense enough to enforce the hard gate precisely.
+# This cadence is intentionally independent of the configurable polling used by
+# longer readiness and convergence waits.
+FORMATION_POLL_MILLIS=100
+FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
+FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
+FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
+FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
+FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
+FORMATION_OBSERVE_MAX_EVENTS="${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
+FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
+export SINOMO_TEST_FORMATION_OBSERVE="$FORMATION_OBSERVE"
+export SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS="$FORMATION_OBSERVE_DURATION_SECONDS"
+export SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ="$FORMATION_OBSERVE_FREQUENCY_HZ"
+export SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES="$FORMATION_OBSERVE_CPU_NODES"
+export SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS="$FORMATION_OBSERVE_MAX_EVENTS"
+export SINOMO_TEST_FORMATION_OBSERVE_FILTER="$FORMATION_OBSERVE_FILTER"
 DFS_READY_WAIT="${SINOMO_TEST_DFS_READY_WAIT:-240}"
 DFS_CONVERGENCE_WAIT="${SINOMO_TEST_DFS_CONVERGENCE_WAIT:-240}"
 EXPECT_TIMEOUT="${SINOMO_TEST_EXPECT_TIMEOUT:-90}"
@@ -196,10 +239,20 @@ NETWORK_REALTIME_REQUESTS="${SINOMO_TEST_NETWORK_REALTIME_REQUESTS:-100}"
 NETWORK_REALTIME_WARMUP_REQUESTS="${SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS:-20}"
 NETWORK_DIRECT_MAX_US="${SINOMO_TEST_NETWORK_DIRECT_MAX_US:-1000}"
 NETWORK_FORWARD_MAX_US="${SINOMO_TEST_NETWORK_FORWARD_MAX_US:-2000}"
-NETWORK_QUIET_WAIT="${SINOMO_TEST_NETWORK_QUIET_WAIT:-60}"
-NETWORK_QUIET_SAMPLES="${SINOMO_TEST_NETWORK_QUIET_SAMPLES:-3}"
+# HARD ACCEPTANCE GATE: the cluster must remain continuously below the CPU
+# ceiling for thirty monotonic seconds. A continuous Docker stats stream covers
+# the complete interval; observation count is deliberately not part of the
+# invariant. Keep this non-configurable and do not shorten it.
+NETWORK_QUIET_DURATION_SECONDS=30
+# Discovery has one absolute deadline. Operators may fail faster, but cannot
+# lengthen this acceptance budget to hide a control-plane quietness failure.
+NETWORK_QUIET_MAX_WAIT_SECONDS=120
+NETWORK_QUIET_WAIT="${SINOMO_TEST_NETWORK_QUIET_WAIT:-$NETWORK_QUIET_MAX_WAIT_SECONDS}"
 NETWORK_QUIET_MAX_CPU_PERCENT="${SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT:-10}"
-NETWORK_QUIET_POLL_SECONDS="${SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS:-1}"
+# A continuous Docker stats stream normally produces one cumulative CPU
+# interval per second. Treat a five-second silence as unavailable evidence and
+# reset rather than assuming the unobserved interval was quiet.
+NETWORK_QUIET_STREAM_STALL_SECONDS=5
 NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
 NETWORK_RESPONSE_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES:-0}"
 NETWORK_MIN_PAYLOAD_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC:-0}"
@@ -212,6 +265,21 @@ NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
 NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
 NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-16777216}"
+NETWORK_ATTACHMENT_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_ATTACHMENT_REQUESTS_PER_TARGET:-4}"
+NETWORK_ATTACHMENT_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_ATTACHMENT_WARMUP_REQUESTS_PER_TARGET:-1}"
+NETWORK_ATTACHMENT_CONCURRENCY="${SINOMO_TEST_NETWORK_ATTACHMENT_CONCURRENCY:-4}"
+NETWORK_ATTACHMENT_TIMEOUT_MS="${SINOMO_TEST_NETWORK_ATTACHMENT_TIMEOUT_MS:-30000}"
+NETWORK_ATTACHMENT_REQUEST_BYTES="${SINOMO_TEST_NETWORK_ATTACHMENT_REQUEST_BYTES:-8388608}"
+NETWORK_ATTACHMENT_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_ATTACHMENT_RESPONSE_BYTES:-8388608}"
+NETWORK_ATTACHMENT_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_ATTACHMENT_MIN_BYTES_PER_SEC:-0}"
+NETWORK_SATURATION="${SINOMO_TEST_NETWORK_SATURATION:-0}"
+NETWORK_SATURATION_ORIGIN="${SINOMO_TEST_NETWORK_SATURATION_ORIGIN:-node1}"
+NETWORK_SATURATION_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_SATURATION_REQUESTS_PER_TARGET:-128}"
+NETWORK_SATURATION_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_SATURATION_WARMUP_REQUESTS_PER_TARGET:-1}"
+NETWORK_SATURATION_CONCURRENCY="${SINOMO_TEST_NETWORK_SATURATION_CONCURRENCY:-8}"
+NETWORK_SATURATION_TIMEOUT_MS="${SINOMO_TEST_NETWORK_SATURATION_TIMEOUT_MS:-120000}"
+NETWORK_SATURATION_REQUEST_BYTES="${SINOMO_TEST_NETWORK_SATURATION_REQUEST_BYTES:-67108864}"
+NETWORK_SATURATION_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_SATURATION_RESPONSE_BYTES:-67108864}"
 CLUSTER_KV_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_ITERATIONS:-12}"
 CLUSTER_KV_VALUE_BYTES="${SINOMO_TEST_CLUSTER_KV_VALUE_BYTES:-256}"
 CLUSTER_KV_TIMEOUT_MS="${SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS:-5000}"
@@ -268,13 +336,71 @@ validate_network_realtime_gate_config() {
     && require_bounded_uint SINOMO_TEST_NETWORK_FORWARD_MAX_US \
       "$NETWORK_FORWARD_MAX_US" 1 1000000 \
     && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_WAIT \
-      "$NETWORK_QUIET_WAIT" 1 600 \
-    && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_SAMPLES \
-      "$NETWORK_QUIET_SAMPLES" 1 10 \
+      "$NETWORK_QUIET_WAIT" "$NETWORK_QUIET_DURATION_SECONDS" \
+      "$NETWORK_QUIET_MAX_WAIT_SECONDS" \
     && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT \
-      "$NETWORK_QUIET_MAX_CPU_PERCENT" 1 100 \
-    && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS \
-      "$NETWORK_QUIET_POLL_SECONDS" 1 10
+      "$NETWORK_QUIET_MAX_CPU_PERCENT" 1 10 \
+    && if [ -n "${SINOMO_TEST_NETWORK_QUIET_SAMPLES+x}" ]; then
+      log "SINOMO_TEST_NETWORK_QUIET_SAMPLES is no longer supported; the quiet gate is a hard ${NETWORK_QUIET_DURATION_SECONDS}-second monotonic duration"
+      return 1
+    elif [ -n "${SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS+x}" ]; then
+      log "SINOMO_TEST_NETWORK_QUIET_POLL_SECONDS is no longer supported; the quiet gate consumes a continuous Docker stats stream"
+      return 1
+    fi
+}
+
+validate_network_saturation_config() {
+  case "$NETWORK_SATURATION" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      log "SINOMO_TEST_NETWORK_SATURATION must be 0 or 1, got: $NETWORK_SATURATION"
+      return 1
+      ;;
+  esac
+  case " $NODES " in
+    *" $NETWORK_SATURATION_ORIGIN "*) ;;
+    *)
+      log "SINOMO_TEST_NETWORK_SATURATION_ORIGIN must name one of: $NODES"
+      return 1
+      ;;
+  esac
+  require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_REQUESTS_PER_TARGET \
+    "$NETWORK_SATURATION_REQUESTS_PER_TARGET" 1 1024 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_WARMUP_REQUESTS_PER_TARGET \
+      "$NETWORK_SATURATION_WARMUP_REQUESTS_PER_TARGET" 0 64 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_CONCURRENCY \
+      "$NETWORK_SATURATION_CONCURRENCY" 1 64 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_TIMEOUT_MS \
+      "$NETWORK_SATURATION_TIMEOUT_MS" 1000 300000 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_REQUEST_BYTES \
+      "$NETWORK_SATURATION_REQUEST_BYTES" 1 67108864 \
+    && require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_RESPONSE_BYTES \
+      "$NETWORK_SATURATION_RESPONSE_BYTES" 1 67108864
+}
+
+validate_formation_observation_config() {
+  case "$FORMATION_ONLY" in
+    0|1) ;;
+    *)
+      log "SINOMO_TEST_FORMATION_ONLY must be 0 or 1, got: $FORMATION_ONLY"
+      return 1
+      ;;
+  esac
+  case "$FORMATION_OBSERVE" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      log "SINOMO_TEST_FORMATION_OBSERVE must be 0 or 1, got: $FORMATION_OBSERVE"
+      return 1
+      ;;
+  esac
+  require_bounded_uint SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS \
+    "$FORMATION_OBSERVE_DURATION_SECONDS" 1 30 \
+    && require_bounded_uint SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ \
+      "$FORMATION_OBSERVE_FREQUENCY_HZ" 10 500 \
+    && require_bounded_uint SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS \
+      "$FORMATION_OBSERVE_MAX_EVENTS" 1 32768
 }
 
 compose() {
@@ -289,9 +415,19 @@ compose_timeout() {
 }
 
 compose_exec_timeout() {
-  local seconds="$1" node="$2" host_seconds
+  local seconds="$1" node="$2" seconds_ms grace_ms host_seconds_ms host_seconds
   shift 2
-  host_seconds=$(( seconds + HOST_TIMEOUT_GRACE ))
+  if ! seconds_ms="$(duration_seconds_to_millis "$seconds")" \
+    || [ "$seconds_ms" -le 0 ]; then
+    log "invalid compose exec timeout: $seconds" >&2
+    return 2
+  fi
+  if ! grace_ms="$(duration_seconds_to_millis "$HOST_TIMEOUT_GRACE")"; then
+    log "invalid host timeout grace: $HOST_TIMEOUT_GRACE" >&2
+    return 2
+  fi
+  host_seconds_ms=$(( seconds_ms + grace_ms ))
+  host_seconds="$(duration_millis_to_seconds "$host_seconds_ms")" || return 2
   timeout --foreground "${host_seconds}s" \
     docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" \
     exec -T "$node" timeout --foreground "${seconds}s" "$@"
@@ -324,11 +460,13 @@ container_network_set() {
   local node="$1" container
   container="$(compose ps -q "$node")"
   [ -n "$container" ] || return 1
+  # `println` plus Docker inspect's own terminator leaves one blank record.
+  # Ignore it so an otherwise valid network set does not gain a leading space.
   docker inspect \
     --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
     "$container" 2>/dev/null \
     | sort \
-    | awk 'BEGIN { separator = "" } { printf "%s%s", separator, $0; separator = " " } END { print "" }'
+    | awk 'BEGIN { separator = "" } NF { printf "%s%s", separator, $0; separator = " " } END { print "" }'
 }
 
 assert_network_realtime_topology() {
@@ -359,64 +497,869 @@ assert_network_realtime_topology() {
   log "  network-realtime topology: node4 -> node3 -> node1 is the only Docker path"
 }
 
-wait_for_network_quiet() {
-  local label="$1" deadline now consecutive=0 stats busy node container
-  local -a containers=()
-  for node in $NODES; do
-    container="$(compose ps -q "$node")"
-    if [ -z "$container" ]; then
-      log "network-quiet/$label: cannot resolve container for $node"
-      return 1
-    fi
-    containers+=("$container")
-  done
-  log "network-quiet/$label: waiting for ${#containers[@]} containers at <=${NETWORK_QUIET_MAX_CPU_PERCENT}% CPU across $NETWORK_QUIET_SAMPLES samples (<=${NETWORK_QUIET_WAIT}s)"
-  deadline=$(( $(date +%s) + NETWORK_QUIET_WAIT ))
-  while :; do
-    if ! stats="$(
-      timeout --foreground "${READINESS_COMMAND_TIMEOUT}s" \
-        docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' "${containers[@]}" \
-          2>/dev/null
-    )"; then
-      busy="docker-stats-unavailable"
-    else
-      busy="$(printf '%s\n' "$stats" | awk \
-        -v expected="${#containers[@]}" \
-        -v limit="$NETWORK_QUIET_MAX_CPU_PERCENT" '
-          NF >= 2 {
-            cpu = $2
-            sub(/%$/, "", cpu)
-            seen++
-            if (cpu !~ /^[0-9]+([.][0-9]+)?$/) {
-              printf "%s=invalid(%s) ", $1, $2
-            } else if ((cpu + 0) > limit) {
-              printf "%s=%s ", $1, $2
-            }
-          }
-          END {
-            if (seen != expected) {
-              printf "sample-count=%d/%d ", seen, expected
-            }
-          }
-        ')"
-    fi
-    if [ -z "$busy" ]; then
-      consecutive=$((consecutive + 1))
-      log "  network-quiet/$label: idle sample $consecutive/$NETWORK_QUIET_SAMPLES"
-      if [ "$consecutive" -ge "$NETWORK_QUIET_SAMPLES" ]; then
-        return 0
+network_quiet_cpu_sample_status() {
+  local value="${1%%%}" limit="$2"
+  if [[ ! "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s\n' invalid
+    return 0
+  fi
+  if awk -v value="$value" -v limit="$limit" \
+    'BEGIN { exit !((value + 0) <= (limit + 0)) }'; then
+    printf '%s\n' within
+  else
+    printf '%s\n' above
+  fi
+}
+
+network_quiet_generation_matches() {
+  [ "$1" = "$2" ]
+}
+
+# Pure state helpers keep the gate's temporal invariant independently
+# testable. A quiet observation retains the first qualifying monotonic instant;
+# every non-quiet outcome (busy CPU, sampling error, or daemon-generation
+# transition) clears it.
+network_quiet_window_start_after_observation() {
+  local current="$1" observed_at="$2" outcome="$3"
+  [[ "$current" =~ ^[0-9]{1,16}$ ]] || return 1
+  [[ "$observed_at" =~ ^[0-9]{1,16}$ ]] || return 1
+  case "$outcome" in
+    quiet)
+      if [ "$((10#$current))" -eq 0 ]; then
+        printf '%s\n' "$observed_at"
+      elif [ "$((10#$observed_at))" -ge "$((10#$current))" ]; then
+        printf '%s\n' "$current"
+      else
+        return 1
       fi
-    else
-      consecutive=0
-      log "  network-quiet/$label: busy ${busy% }"
+      ;;
+    reset)
+      printf '%s\n' 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+network_quiet_elapsed_millis() {
+  local started="$1" now="$2"
+  [[ "$started" =~ ^[0-9]{1,16}$ ]] || return 1
+  [[ "$now" =~ ^[0-9]{1,16}$ ]] || return 1
+  [ "$((10#$started))" -gt 0 ] || return 1
+  [ "$((10#$now))" -ge "$((10#$started))" ] || return 1
+  printf '%s\n' "$((10#$now - 10#$started))"
+}
+
+network_quiet_duration_reached() {
+  local started="$1" now="$2" required="$3" elapsed
+  [[ "$required" =~ ^[0-9]{1,16}$ ]] || return 1
+  [ "$((10#$required))" -gt 0 ] || return 1
+  elapsed="$(network_quiet_elapsed_millis "$started" "$now")" || return 1
+  [ "$((10#$elapsed))" -ge "$((10#$required))" ]
+}
+
+# Portable process scanner used both inside the benchmark containers and by the
+# helper regression below. The process comm check is load-bearing: the scanner
+# itself carries the daemon role literals in its argv and must not identify
+# that observer shell as another daemon.
+NETWORK_QUIET_DAEMON_GENERATION_PROGRAM='
+    proc_root="${1:-/proc}"
+    main_count=0
+    shadow_count=0
+    main_pid=""
+    main_start=""
+    shadow_pid=""
+    shadow_start=""
+    for proc in "$proc_root"/[0-9]*; do
+      [ -r "$proc/comm" ] && [ -r "$proc/cmdline" ] && [ -r "$proc/stat" ] \
+        || continue
+      pid=${proc##*/}
+      IFS= read -r comm < "$proc/comm" || continue
+      [ "$comm" = sinomo ] || continue
+      cmd=$(tr "\000" " " < "$proc/cmdline" 2>/dev/null) || continue
+      case " $cmd " in
+        *" daemon shadow run "*) role=shadow ;;
+        *" daemon run "*) role=main ;;
+        *) continue ;;
+      esac
+      start=$(awk "{print \$22}" "$proc/stat" 2>/dev/null)
+      [ -n "$start" ] || exit 1
+      if [ "$role" = main ]; then
+        main_count=$((main_count + 1))
+        main_pid=$pid
+        main_start=$start
+      else
+        shadow_count=$((shadow_count + 1))
+        shadow_pid=$pid
+        shadow_start=$start
+      fi
+    done
+    [ "$main_count" -eq 1 ] && [ "$shadow_count" -eq 1 ] || exit 1
+    printf "%s\t%s\t%s\t%s\n" \
+      "$main_pid" "$main_start" "$shadow_pid" "$shadow_start"
+  '
+
+# Return the exact main/shadow process generations inside one container. The
+# aggregate container CPU sample remains the quietness authority; these
+# identities only prevent a daemon replacement from resetting its counters or
+# briefly disappearing during a candidate quiet window.
+container_daemon_generation_snapshot() {
+  local container="$1" command_timeout="${2:-${READINESS_COMMAND_TIMEOUT}s}"
+  timeout --foreground "$command_timeout" docker exec "$container" \
+    sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh /proc 2>/dev/null
+}
+
+network_quiet_command_timeout_before_deadline() {
+  local deadline_ms="$1" maximum_seconds="$2" now_ms maximum_ms timeout_ms
+  now_ms="$(monotonic_millis)" || return 1
+  maximum_ms="$(duration_seconds_to_millis "$maximum_seconds")" || return 1
+  timeout_ms="$(
+    bounded_deadline_timeout_millis "$deadline_ms" "$now_ms" "$maximum_ms"
+  )" || return 1
+  duration_millis_to_seconds "$timeout_ms"
+}
+
+network_quiet_generation_snapshot_before_deadline() {
+  local container="$1" deadline_ms="$2" command_timeout
+  command_timeout="$(
+    network_quiet_command_timeout_before_deadline \
+      "$deadline_ms" "$READINESS_COMMAND_TIMEOUT"
+  )" || return 1
+  container_daemon_generation_snapshot "$container" "$command_timeout"
+}
+
+network_quiet_container_for_node_before_deadline() {
+  local node="$1" deadline_ms="$2" command_timeout
+  command_timeout="$(
+    network_quiet_command_timeout_before_deadline \
+      "$deadline_ms" "$READINESS_COMMAND_TIMEOUT"
+  )" || return 1
+  compose_timeout "$command_timeout" ps -q "$node"
+}
+
+network_quiet_container_name_before_deadline() {
+  local container="$1" deadline_ms="$2" command_timeout
+  command_timeout="$(
+    network_quiet_command_timeout_before_deadline \
+      "$deadline_ms" "$READINESS_COMMAND_TIMEOUT"
+  )" || return 1
+  timeout --foreground "$command_timeout" \
+    docker inspect --format '{{.Name}}' "$container" 2>/dev/null
+}
+
+NETWORK_QUIET_STATS_STREAM_FD=""
+NETWORK_QUIET_STATS_STREAM_PID=""
+# Test-only lifecycle evidence for the continuous stats pipeline. Production
+# runs leave this empty and pay no artifact or synchronization cost.
+NETWORK_QUIET_STATS_STREAM_TEST_LIFECYCLE_FILE=""
+NETWORK_QUIET_GROUP_MIN_MS=0
+NETWORK_QUIET_GROUP_MAX_MS=0
+NETWORK_QUIET_GROUP_REASON=""
+NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=0
+declare -A NETWORK_QUIET_GROUP_CPU=()
+declare -A NETWORK_QUIET_GROUP_CPU_STATUS=()
+declare -A NETWORK_QUIET_GROUP_NAME=()
+declare -A NETWORK_QUIET_GROUP_OBSERVED_MS=()
+declare -A NETWORK_QUIET_LAST_OBSERVED_MS=()
+
+network_quiet_stats_stream_worker_cleanup() {
+  local producer_pid="$1" transform_pid="$2"
+  local raw_fifo="$3" clean_fifo="$4" worker_dir="$5"
+  local lifecycle_file="${6:-}" pid
+  for pid in "$producer_pid" "$transform_pid"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  if [ -n "$producer_pid" ]; then
+    wait "$producer_pid" 2>/dev/null || true
+    if [ -n "$lifecycle_file" ]; then
+      printf 'producer_waited=true\n' >> "$lifecycle_file" || true
     fi
-    now="$(date +%s)"
-    if [ "$now" -ge "$deadline" ]; then
-      log "network-quiet/$label: cluster did not become idle before the deadline"
+  fi
+  if [ -n "$transform_pid" ]; then
+    wait "$transform_pid" 2>/dev/null || true
+    if [ -n "$lifecycle_file" ]; then
+      printf 'transform_waited=true\n' >> "$lifecycle_file" || true
+    fi
+  fi
+  rm -f -- "$raw_fifo" "$clean_fifo"
+  rmdir "$worker_dir" 2>/dev/null || true
+  if [ -n "$lifecycle_file" ]; then
+    printf 'cleanup_complete=true\n' >> "$lifecycle_file" || true
+  fi
+}
+
+network_quiet_stats_stream_worker() {
+  local worker_dir raw_fifo clean_fifo producer_pid="" transform_pid="" row
+  local observed_ms
+  local lifecycle_file="$NETWORK_QUIET_STATS_STREAM_TEST_LIFECYCLE_FILE"
+  worker_dir="$(
+    mktemp -d "${TMPDIR:-/tmp}/sinomo-network-quiet-stream.XXXXXX"
+  )" || return 1
+  raw_fifo="$worker_dir/raw.fifo"
+  clean_fifo="$worker_dir/clean.fifo"
+  if ! mkfifo "$raw_fifo" "$clean_fifo"; then
+    rm -f -- "$raw_fifo" "$clean_fifo"
+    rmdir "$worker_dir" 2>/dev/null || true
+    return 1
+  fi
+  trap 'network_quiet_stats_stream_worker_cleanup "$producer_pid" "$transform_pid" "$raw_fifo" "$clean_fifo" "$worker_dir" "$lifecycle_file"' EXIT
+  trap 'exit 143' HUP INT TERM
+
+  docker stats --format '{{.Name}}|{{.CPUPerc}}' "$@" \
+    > "$raw_fifo" 2>/dev/null &
+  producer_pid=$!
+  sed -u $'s/\033\\[[0-9;?]*[[:alpha:]]//g' \
+    < "$raw_fifo" > "$clean_fifo" &
+  transform_pid=$!
+  if [ -n "$lifecycle_file" ]; then
+    {
+      printf 'annotator_pid=%s\n' "$BASHPID"
+      printf 'producer_pid=%s\n' "$producer_pid"
+      printf 'transform_pid=%s\n' "$transform_pid"
+      printf 'children_started=true\n'
+    } > "$lifecycle_file" || return 1
+  fi
+
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    observed_ms="$(monotonic_millis)" || return 1
+    printf '%s|%s\n' "$observed_ms" "$row" || return 1
+  done < "$clean_fifo"
+}
+
+network_quiet_stats_stream_stop() {
+  if [ -n "$NETWORK_QUIET_STATS_STREAM_FD" ]; then
+    exec {NETWORK_QUIET_STATS_STREAM_FD}<&-
+    NETWORK_QUIET_STATS_STREAM_FD=""
+  fi
+  if [ -n "$NETWORK_QUIET_STATS_STREAM_PID" ]; then
+    kill "$NETWORK_QUIET_STATS_STREAM_PID" 2>/dev/null || true
+    wait "$NETWORK_QUIET_STATS_STREAM_PID" 2>/dev/null || true
+    NETWORK_QUIET_STATS_STREAM_PID=""
+  fi
+}
+
+network_quiet_stats_stream_start() {
+  network_quiet_stats_stream_stop
+  NETWORK_QUIET_LAST_OBSERVED_MS=()
+  exec {NETWORK_QUIET_STATS_STREAM_FD}< <(
+    network_quiet_stats_stream_worker "$@"
+  )
+  NETWORK_QUIET_STATS_STREAM_PID=$!
+}
+
+# Read one complete interval group from the continuous Docker stats stream.
+# Every requested container contributes exactly one cumulative CPU interval;
+# duplicates, missing/unknown containers, malformed values, stream stalls, and
+# timestamp regressions are unavailable evidence rather than implicit quiet.
+network_quiet_stats_stream_read_group() {
+  local deadline_ms="$1" expected_count="$2"
+  local row read_timeout observed_ms observed_name observed_cpu extra
+  local node sample_status line_count=0 now_ms interval_ms
+  NETWORK_QUIET_GROUP_MIN_MS=0
+  NETWORK_QUIET_GROUP_MAX_MS=0
+  NETWORK_QUIET_GROUP_REASON=""
+  NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=0
+  NETWORK_QUIET_GROUP_CPU=()
+  NETWORK_QUIET_GROUP_CPU_STATUS=()
+  NETWORK_QUIET_GROUP_NAME=()
+  NETWORK_QUIET_GROUP_OBSERVED_MS=()
+
+  while [ "$line_count" -lt "$expected_count" ]; do
+    read_timeout="$(
+      network_quiet_command_timeout_before_deadline \
+        "$deadline_ms" "$NETWORK_QUIET_STREAM_STALL_SECONDS"
+    )" || {
+      NETWORK_QUIET_GROUP_REASON="quiet-window-deadline-exhausted"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      return 1
+    }
+    if ! IFS= read -r -t "$read_timeout" -u "$NETWORK_QUIET_STATS_STREAM_FD" row; then
+      now_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+      if [ "$((10#$now_ms))" -ge "$((10#$deadline_ms))" ]; then
+        NETWORK_QUIET_GROUP_REASON="quiet-window-deadline-exhausted"
+      elif [ -n "$NETWORK_QUIET_STATS_STREAM_PID" ] \
+        && kill -0 "$NETWORK_QUIET_STATS_STREAM_PID" 2>/dev/null; then
+        NETWORK_QUIET_GROUP_REASON="docker-stats-stream-stalled"
+      else
+        NETWORK_QUIET_GROUP_REASON="docker-stats-stream-exited"
+      fi
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
       return 1
     fi
-    sleep "$NETWORK_QUIET_POLL_SECONDS"
+    line_count=$((line_count + 1))
+    observed_ms=""; observed_name=""; observed_cpu=""; extra=""
+    IFS='|' read -r observed_ms observed_name observed_cpu extra <<< "$row"
+    if [[ ! "$observed_ms" =~ ^[0-9]{1,16}$ ]] \
+      || [ "$((10#$observed_ms))" -le 0 ] \
+      || [ -n "$extra" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }malformed-stream-row"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      continue
+    fi
+    if [ "$NETWORK_QUIET_GROUP_MIN_MS" -eq 0 ] \
+      || [ "$((10#$observed_ms))" -lt "$NETWORK_QUIET_GROUP_MIN_MS" ]; then
+      NETWORK_QUIET_GROUP_MIN_MS="$observed_ms"
+    fi
+    if [ "$((10#$observed_ms))" -gt "$NETWORK_QUIET_GROUP_MAX_MS" ]; then
+      NETWORK_QUIET_GROUP_MAX_MS="$observed_ms"
+    fi
+    node="${node_by_container_name[$observed_name]:-}"
+    if [ -z "$node" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }unexpected-container=$observed_name"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      continue
+    fi
+    if [ -n "${NETWORK_QUIET_GROUP_NAME[$node]:-}" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }duplicate-container=$observed_name"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      continue
+    fi
+    if [ -n "${NETWORK_QUIET_LAST_OBSERVED_MS[$node]:-}" ] \
+      && [ "$((10#$observed_ms))" -le \
+        "$((10#${NETWORK_QUIET_LAST_OBSERVED_MS[$node]}))" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }non-monotonic-container=$observed_name"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+    elif [ -n "${NETWORK_QUIET_LAST_OBSERVED_MS[$node]:-}" ]; then
+      interval_ms=$((
+        10#$observed_ms - 10#${NETWORK_QUIET_LAST_OBSERVED_MS[$node]}
+      ))
+      if [ "$interval_ms" -gt \
+        "$((NETWORK_QUIET_STREAM_STALL_SECONDS * 1000))" ]; then
+        NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }container-interval-gap=${observed_name}:${interval_ms}ms"
+        NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      fi
+    fi
+    NETWORK_QUIET_LAST_OBSERVED_MS[$node]="$observed_ms"
+    NETWORK_QUIET_GROUP_NAME[$node]="$observed_name"
+    NETWORK_QUIET_GROUP_CPU[$node]="$observed_cpu"
+    NETWORK_QUIET_GROUP_OBSERVED_MS[$node]="$observed_ms"
+    sample_status="$(
+      network_quiet_cpu_sample_status \
+        "$observed_cpu" "$NETWORK_QUIET_MAX_CPU_PERCENT"
+    )"
+    NETWORK_QUIET_GROUP_CPU_STATUS[$node]="$sample_status"
+    case "$sample_status" in
+      within) ;;
+      above)
+        NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }$observed_name=$observed_cpu"
+        ;;
+      *)
+        NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }$observed_name=invalid($observed_cpu)"
+        NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+        ;;
+    esac
   done
+
+  for node in $NODES; do
+    if [ -z "${NETWORK_QUIET_GROUP_NAME[$node]:-}" ]; then
+      NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }missing-container=$node"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+    fi
+  done
+  if [ "$NETWORK_QUIET_GROUP_MIN_MS" -le 0 ] \
+    || [ "$NETWORK_QUIET_GROUP_MAX_MS" -lt "$NETWORK_QUIET_GROUP_MIN_MS" ]; then
+    NETWORK_QUIET_GROUP_REASON="${NETWORK_QUIET_GROUP_REASON}${NETWORK_QUIET_GROUP_REASON:+ }invalid-group-timestamps"
+    NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+  fi
+  return 0
+}
+
+network_quiet_coverage_reaches() {
+  local covered_through_ms="$1" target_ms="$2"
+  [[ "$covered_through_ms" =~ ^[0-9]{1,16}$ ]] || return 1
+  [[ "$target_ms" =~ ^[0-9]{1,16}$ ]] || return 1
+  [ "$((10#$covered_through_ms))" -ge "$((10#$target_ms))" ]
+}
+
+network_quiet_write_stats_group_samples() {
+  local path="$1" sample_group="$2" candidate="$3" quiet_elapsed_ms="$4"
+  local group_state="$5" captured_at captured_ms node container_name
+  local observed_cpu sample_status observed_ms
+  captured_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
+  captured_ms="$(wall_clock_millis 2>/dev/null || printf '0')"
+  for node in $NODES; do
+    container_name="${NETWORK_QUIET_GROUP_NAME[$node]:-unavailable}"
+    observed_cpu="${NETWORK_QUIET_GROUP_CPU[$node]:-}"
+    observed_ms="${NETWORK_QUIET_GROUP_OBSERVED_MS[$node]:-0}"
+    sample_status="${NETWORK_QUIET_GROUP_CPU_STATUS[$node]:-invalid}"
+    if [ "$sample_status" = within ]; then
+      sample_status=true
+    else
+      sample_status=false
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$sample_group" "$quiet_elapsed_ms" "$candidate" "$captured_at" \
+      "$captured_ms" "$observed_ms" "$NETWORK_QUIET_GROUP_MIN_MS" \
+      "$NETWORK_QUIET_GROUP_MAX_MS" "$node" "${container_by_node[$node]:-}" \
+      "$container_name" "$observed_cpu" "$NETWORK_QUIET_MAX_CPU_PERCENT" \
+      "$sample_status" "$group_state" >> "$path"
+  done
+}
+
+network_quiet_establish_generation_baseline() {
+  local deadline_ms="$1" generation_epoch="$2" generations_file="$3"
+  local node container snapshot main_pid main_start shadow_pid shadow_start
+  local captured_at captured_ms baseline_ok=1
+  captured_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
+  captured_ms="$(wall_clock_millis 2>/dev/null || printf '0')"
+  generation_baseline=()
+  for node in $NODES; do
+    container="${container_by_node[$node]}"
+    if snapshot="$(
+      network_quiet_generation_snapshot_before_deadline \
+        "$container" "$deadline_ms"
+    )"; then
+      read -r main_pid main_start shadow_pid shadow_start <<< "$snapshot"
+      generation_baseline[$node]="$container|$snapshot"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$generation_epoch" baseline "$captured_at" "$captured_ms" "$node" \
+        "$container" "$main_pid" "$main_start" "$shadow_pid" \
+        "$shadow_start" baseline ok >> "$generations_file"
+    else
+      baseline_ok=0
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$generation_epoch" baseline "$captured_at" "$captured_ms" "$node" \
+        "$container" '' '' '' '' false unavailable >> "$generations_file"
+    fi
+  done
+  [ "$baseline_ok" -eq 1 ]
+}
+
+NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS=0
+network_quiet_verify_generation_baseline() {
+  local deadline_ms="$1" generation_epoch="$2" generations_file="$3"
+  local node current_container current_snapshot
+  local main_pid main_start shadow_pid shadow_start matches=1 sample_status
+  local captured_at captured_ms
+  captured_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
+  captured_ms="$(wall_clock_millis 2>/dev/null || printf '0')"
+  for node in $NODES; do
+    current_container="$(
+      network_quiet_container_for_node_before_deadline "$node" "$deadline_ms" \
+        || true
+    )"
+    current_snapshot=""
+    if [ -n "$current_container" ]; then
+      current_snapshot="$(
+        network_quiet_generation_snapshot_before_deadline \
+          "$current_container" "$deadline_ms" || true
+      )"
+    fi
+    if [ -n "$current_snapshot" ]; then
+      read -r main_pid main_start shadow_pid shadow_start <<< "$current_snapshot"
+    else
+      main_pid=""; main_start=""; shadow_pid=""; shadow_start=""
+    fi
+    if [ -n "$current_container" ] \
+      && network_quiet_generation_matches \
+        "${generation_baseline[$node]:-}" \
+        "$current_container|$current_snapshot"; then
+      sample_status=true
+    else
+      sample_status=false
+      matches=0
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$generation_epoch" verify "$captured_at" "$captured_ms" "$node" \
+      "${current_container:-unavailable}" "$main_pid" "$main_start" \
+      "$shadow_pid" "$shadow_start" "$sample_status" \
+      "$([ "$sample_status" = true ] && printf ok || printf changed)" \
+      >> "$generations_file"
+  done
+  NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS="$(
+    monotonic_millis || printf '%s' "$deadline_ms"
+  )"
+  [ "$((10#$NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS))" \
+    -lt "$((10#$deadline_ms))" ] || return 1
+  [ "$matches" -eq 1 ]
+}
+
+network_quiet_stream_restart_delay() {
+  local deadline_ms="$1" delay
+  delay="$(
+    network_quiet_command_timeout_before_deadline "$deadline_ms" 1
+  )" || return 1
+  sleep "$delay"
+}
+
+write_network_quiet_summary() {
+  local path="$1" label="$2" status="$3" reason="$4"
+  local started_at="$5" finished_at="$6" elapsed="$7" elapsed_ms="$8"
+  local observed_groups="$9" candidate="${10}" qualifying_groups="${11}"
+  local quiet_elapsed_ms="${12}" generation_stable="${13}"
+  local samples_file="${14}" generations_file="${15}"
+  reason="${reason//$'\n'/ }"
+  {
+    printf 'protocol=sinomo.test.network-quiet.v2\n'
+    printf 'label=%s\n' "$label"
+    printf 'status=%s\n' "$status"
+    printf 'reason=%s\n' "$reason"
+    printf 'started_at=%s\n' "$started_at"
+    printf 'finished_at=%s\n' "$finished_at"
+    printf 'elapsed_seconds=%s\n' "$elapsed"
+    printf 'elapsed_milliseconds=%s\n' "$elapsed_ms"
+    printf 'duration_clock=linux-monotonic-uptime\n'
+    printf 'cpu_authority=docker-container-aggregate\n'
+    printf 'container_count=%s\n' "$EXPECTED_MAINS"
+    printf 'max_cpu_percent=%s\n' "$NETWORK_QUIET_MAX_CPU_PERCENT"
+    printf 'required_quiet_duration_seconds=%s\n' "$NETWORK_QUIET_DURATION_SECONDS"
+    printf 'required_quiet_duration_milliseconds=%s\n' \
+      "$((NETWORK_QUIET_DURATION_SECONDS * 1000))"
+    printf 'cpu_sampling=docker-stats-continuous-stream\n'
+    printf 'stream_stall_reset_seconds=%s\n' \
+      "$NETWORK_QUIET_STREAM_STALL_SECONDS"
+    printf 'wait_budget_seconds=%s\n' "$NETWORK_QUIET_WAIT"
+    printf 'observed_sample_groups=%s\n' "$observed_groups"
+    printf 'final_candidate=%s\n' "$candidate"
+    printf 'final_qualifying_sample_groups=%s\n' "$qualifying_groups"
+    printf 'final_quiet_elapsed_milliseconds=%s\n' "$quiet_elapsed_ms"
+    printf 'daemon_generations_stable=%s\n' "$generation_stable"
+    printf 'samples_file=%s\n' "$(basename "$samples_file")"
+    printf 'generations_file=%s\n' "$(basename "$generations_file")"
+    printf '%s\n' 'coverage=continuous cumulative CPU intervals for every process in node1..node6 containers through final generation verification; daemon generations are a stability guard, not the CPU authority'
+  } > "$path"
+}
+
+
+wait_for_network_quiet() {
+  local label="$1" label_slug started_at finished_at
+  local started_monotonic_ms finished_monotonic_ms deadline_ms now_ms
+  local required_quiet_ms wait_budget_ms elapsed_ms elapsed
+  local node container container_name resolution_ok stream_state
+  local sample_group=0 candidate=0 qualifying_groups=0 quiet_elapsed_ms=0
+  local generation_epoch=0
+  local candidate_started_ms=0 baseline_finished_ms=0
+  local generation_stable="unknown" last_reason="" restart_stream
+  local verification_reset verification_target_ms
+  local -a containers=()
+  local -A container_by_node=() node_by_container_name=()
+  local -A generation_baseline=()
+  label_slug="${label//[^a-zA-Z0-9._-]/_}"
+  local samples_file="$ARTIFACTS/network-quiet-$label_slug.samples.tsv"
+  local generations_file="$ARTIFACTS/network-quiet-$label_slug.generations.tsv"
+  local summary_file="$ARTIFACTS/network-quiet-$label_slug.summary.txt"
+
+  started_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
+  if ! started_monotonic_ms="$(monotonic_millis)"; then
+    log "network-quiet/$label: monotonic clock unavailable"
+    return 1
+  fi
+  required_quiet_ms="$(
+    duration_seconds_to_millis "$NETWORK_QUIET_DURATION_SECONDS"
+  )" || return 1
+  wait_budget_ms="$(duration_seconds_to_millis "$NETWORK_QUIET_WAIT")" || return 1
+  deadline_ms=$((10#$started_monotonic_ms + 10#$wait_budget_ms))
+  printf '%s\n' $'sample_group\tquiet_elapsed_ms\tcandidate\tconsumed_at\tconsumed_epoch_ms\tobserved_monotonic_ms\tgroup_min_monotonic_ms\tgroup_max_monotonic_ms\tnode\tcontainer_id\tcontainer_name\tcpu_percent\tmax_cpu_percent\tcpu_within_limit\twindow_state' \
+    > "$samples_file"
+  printf '%s\n' $'generation_epoch\tphase\tcaptured_at\tcaptured_epoch_ms\tnode\tcontainer_id\tmain_pid\tmain_start_ticks\tshadow_pid\tshadow_start_ticks\tmatches_baseline\tstatus' \
+    > "$generations_file"
+
+  log "network-quiet/$label: waiting for $EXPECTED_MAINS whole containers at <=${NETWORK_QUIET_MAX_CPU_PERCENT}% CPU for an uninterrupted ${NETWORK_QUIET_DURATION_SECONDS}s continuous-stream window (absolute ${NETWORK_QUIET_WAIT}s deadline)"
+  log "  network-quiet/$label: samples -> $samples_file"
+  log "  network-quiet/$label: daemon generations -> $generations_file"
+
+  while :; do
+    now_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+    if [ "$((10#$now_ms))" -ge "$deadline_ms" ]; then
+      last_reason="quiet-window-deadline-exhausted"
+      break
+    fi
+
+    containers=()
+    container_by_node=()
+    node_by_container_name=()
+    generation_baseline=()
+    resolution_ok=1
+    for node in $NODES; do
+      container="$(
+        network_quiet_container_for_node_before_deadline "$node" "$deadline_ms" \
+          || true
+      )"
+      if [ -z "$container" ]; then
+        last_reason="cannot-resolve-container=$node"
+        resolution_ok=0
+        break
+      fi
+      container_name="$(
+        network_quiet_container_name_before_deadline "$container" "$deadline_ms" \
+          || true
+      )"
+      container_name="${container_name#/}"
+      if [ -z "$container_name" ] \
+        || [ -n "${node_by_container_name[$container_name]:-}" ]; then
+        last_reason="cannot-resolve-unique-container-name=$node"
+        resolution_ok=0
+        break
+      fi
+      containers+=("$container")
+      container_by_node[$node]="$container"
+      node_by_container_name[$container_name]="$node"
+    done
+    if [ "$resolution_ok" -ne 1 ] \
+      || [ "${#containers[@]}" -ne "$EXPECTED_MAINS" ]; then
+      network_quiet_stats_stream_stop
+      network_quiet_stream_restart_delay "$deadline_ms" || {
+        last_reason="quiet-window-deadline-exhausted"
+        break
+      }
+      continue
+    fi
+
+    if ! network_quiet_stats_stream_start "${containers[@]}"; then
+      last_reason="docker-stats-stream-start-failed"
+      network_quiet_stream_restart_delay "$deadline_ms" || break
+      continue
+    fi
+    generation_epoch=$((generation_epoch + 1))
+
+    # Discard one complete stream group so every later percentage is backed by
+    # a prior sample from this same continuous stream.
+    if ! network_quiet_stats_stream_read_group \
+      "$deadline_ms" "${#containers[@]}"; then
+      last_reason="${NETWORK_QUIET_GROUP_REASON:-docker-stats-stream-unavailable}"
+      network_quiet_stats_stream_stop
+      network_quiet_stream_restart_delay "$deadline_ms" || break
+      continue
+    fi
+    sample_group=$((sample_group + 1))
+    if [ "$NETWORK_QUIET_GROUP_STRUCTURAL_ERROR" -eq 1 ]; then
+      stream_state=stream-warmup-invalid
+    else
+      stream_state=stream-warmup
+    fi
+    network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+      "$candidate" 0 "$stream_state"
+    if [ "$NETWORK_QUIET_GROUP_STRUCTURAL_ERROR" -eq 1 ]; then
+      last_reason="${NETWORK_QUIET_GROUP_REASON:-invalid-stream-warmup}"
+      network_quiet_stats_stream_stop
+      network_quiet_stream_restart_delay "$deadline_ms" || break
+      continue
+    fi
+
+    if ! network_quiet_establish_generation_baseline \
+      "$deadline_ms" "$generation_epoch" "$generations_file"; then
+      last_reason="daemon-generation-unavailable"
+      network_quiet_stats_stream_stop
+      network_quiet_stream_restart_delay "$deadline_ms" || break
+      continue
+    fi
+    baseline_finished_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+    if [ "$((10#$baseline_finished_ms))" -ge "$deadline_ms" ]; then
+      last_reason="quiet-window-deadline-exhausted"
+      network_quiet_stats_stream_stop
+      break
+    fi
+    candidate_started_ms=0
+    quiet_elapsed_ms=0
+    qualifying_groups=0
+    generation_stable="unknown"
+    restart_stream=0
+
+    while :; do
+      if ! network_quiet_stats_stream_read_group \
+        "$deadline_ms" "${#containers[@]}"; then
+        last_reason="${NETWORK_QUIET_GROUP_REASON:-docker-stats-stream-unavailable}"
+        restart_stream=1
+        break
+      fi
+      sample_group=$((sample_group + 1))
+
+      if [ "$NETWORK_QUIET_GROUP_STRUCTURAL_ERROR" -eq 1 ]; then
+        candidate_started_ms=0
+        quiet_elapsed_ms=0
+        qualifying_groups=0
+        last_reason="${NETWORK_QUIET_GROUP_REASON:-invalid-stream-group}"
+        network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+          "$candidate" 0 stream-error
+        restart_stream=1
+        break
+      fi
+
+      # Groups produced while the generation baseline was being captured are
+      # retained as evidence but cannot begin the candidate interval.
+      if [ "$NETWORK_QUIET_GROUP_MIN_MS" -lt "$baseline_finished_ms" ]; then
+        network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+          "$candidate" 0 prebaseline
+        continue
+      fi
+
+      if [ -n "$NETWORK_QUIET_GROUP_REASON" ]; then
+        candidate_started_ms="$(
+          network_quiet_window_start_after_observation \
+            "$candidate_started_ms" "$NETWORK_QUIET_GROUP_MAX_MS" reset
+        )" || candidate_started_ms=0
+        quiet_elapsed_ms=0
+        qualifying_groups=0
+        generation_stable="unknown"
+        last_reason="$NETWORK_QUIET_GROUP_REASON"
+        network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+          "$candidate" 0 busy
+        log "  network-quiet/$label: busy ${NETWORK_QUIET_GROUP_REASON% }"
+        continue
+      fi
+
+      if [ "$candidate_started_ms" -eq 0 ]; then
+        candidate=$((candidate + 1))
+        candidate_started_ms="$(
+          network_quiet_window_start_after_observation \
+            0 "$NETWORK_QUIET_GROUP_MAX_MS" quiet
+        )" || {
+          last_reason="invalid-stream-boundary"
+          restart_stream=1
+          break
+        }
+        quiet_elapsed_ms=0
+        qualifying_groups=1
+        last_reason=""
+        network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+          "$candidate" 0 boundary
+        log "  network-quiet/$label: candidate $candidate continuous CPU boundary established"
+        continue
+      fi
+
+      quiet_elapsed_ms="$(
+        network_quiet_elapsed_millis \
+          "$candidate_started_ms" "$NETWORK_QUIET_GROUP_MIN_MS"
+      )" || {
+        last_reason="non-monotonic-stream-coverage"
+        restart_stream=1
+        break
+      }
+      qualifying_groups=$((qualifying_groups + 1))
+      if ! network_quiet_duration_reached \
+        "$candidate_started_ms" "$NETWORK_QUIET_GROUP_MIN_MS" \
+        "$required_quiet_ms"; then
+        network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+          "$candidate" "$quiet_elapsed_ms" qualifying
+        log "  network-quiet/$label: continuously covered ${quiet_elapsed_ms}ms/${required_quiet_ms}ms across $qualifying_groups interval groups"
+        continue
+      fi
+
+      network_quiet_write_stats_group_samples "$samples_file" "$sample_group" \
+        "$candidate" "$quiet_elapsed_ms" duration-covered
+      if ! network_quiet_verify_generation_baseline \
+        "$deadline_ms" "$generation_epoch" "$generations_file"; then
+        now_ms="$NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS"
+        candidate_started_ms=0
+        quiet_elapsed_ms=0
+        qualifying_groups=0
+        generation_stable=false
+        if [ "$((10#$now_ms))" -ge "$deadline_ms" ]; then
+          last_reason="quiet-window-deadline-exhausted"
+        else
+          last_reason="daemon-generation-changed"
+        fi
+        restart_stream=1
+        break
+      fi
+      verification_target_ms="$NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS"
+      generation_stable=true
+      verification_reset=0
+
+      # The stats producer never stopped while generation identities were read.
+      # Consume all queued intervals and require every container to have a
+      # quiet interval ending after verification completed before accepting.
+      while :; do
+        if ! network_quiet_stats_stream_read_group \
+          "$deadline_ms" "${#containers[@]}"; then
+          last_reason="${NETWORK_QUIET_GROUP_REASON:-docker-stats-stream-unavailable}"
+          restart_stream=1
+          break
+        fi
+        sample_group=$((sample_group + 1))
+        if [ "$NETWORK_QUIET_GROUP_STRUCTURAL_ERROR" -eq 1 ]; then
+          candidate_started_ms=0
+          quiet_elapsed_ms=0
+          qualifying_groups=0
+          generation_stable="unknown"
+          last_reason="${NETWORK_QUIET_GROUP_REASON:-invalid-stream-group}"
+          network_quiet_write_stats_group_samples "$samples_file" \
+            "$sample_group" "$candidate" 0 verification-stream-error
+          restart_stream=1
+          break
+        fi
+        if [ -n "$NETWORK_QUIET_GROUP_REASON" ]; then
+          candidate_started_ms="$(
+            network_quiet_window_start_after_observation \
+              "$candidate_started_ms" "$NETWORK_QUIET_GROUP_MAX_MS" reset
+          )" || candidate_started_ms=0
+          quiet_elapsed_ms=0
+          qualifying_groups=0
+          generation_stable="unknown"
+          last_reason="$NETWORK_QUIET_GROUP_REASON"
+          network_quiet_write_stats_group_samples "$samples_file" \
+            "$sample_group" "$candidate" 0 verification-busy
+          log "  network-quiet/$label: CPU activity during final generation verification reset candidate $candidate: ${NETWORK_QUIET_GROUP_REASON% }"
+          verification_reset=1
+          break
+        fi
+        quiet_elapsed_ms="$(
+          network_quiet_elapsed_millis \
+            "$candidate_started_ms" "$NETWORK_QUIET_GROUP_MIN_MS"
+        )" || {
+          last_reason="non-monotonic-stream-coverage"
+          restart_stream=1
+          break
+        }
+        if network_quiet_coverage_reaches \
+          "$NETWORK_QUIET_GROUP_MIN_MS" "$verification_target_ms"; then
+          network_quiet_write_stats_group_samples "$samples_file" \
+            "$sample_group" "$candidate" "$quiet_elapsed_ms" pass
+          finished_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
+          finished_monotonic_ms="$(
+            monotonic_millis || printf '%s' "$NETWORK_QUIET_GROUP_MIN_MS"
+          )"
+          elapsed_ms=$((10#$finished_monotonic_ms - 10#$started_monotonic_ms))
+          elapsed=$((elapsed_ms / 1000))
+          network_quiet_stats_stream_stop
+          write_network_quiet_summary "$summary_file" "$label" pass \
+            "continuous CPU coverage through stable main/shadow generation verification" \
+            "$started_at" "$finished_at" "$elapsed" "$elapsed_ms" \
+            "$sample_group" "$candidate" "$qualifying_groups" \
+            "$quiet_elapsed_ms" true "$samples_file" "$generations_file"
+          log "  network-quiet/$label: continuously quiet through generation verification (${quiet_elapsed_ms}ms covered)"
+          log "  network-quiet/$label: PASS summary -> $summary_file"
+          return 0
+        fi
+        network_quiet_write_stats_group_samples "$samples_file" \
+          "$sample_group" "$candidate" "$quiet_elapsed_ms" \
+          verification-covering
+      done
+
+      if [ "$restart_stream" -eq 1 ]; then
+        break
+      fi
+      if [ "$verification_reset" -eq 1 ]; then
+        continue
+      fi
+    done
+
+    network_quiet_stats_stream_stop
+    now_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+    if [ "$((10#$now_ms))" -ge "$deadline_ms" ]; then
+      last_reason="quiet-window-deadline-exhausted"
+      break
+    fi
+    network_quiet_stream_restart_delay "$deadline_ms" || {
+      last_reason="quiet-window-deadline-exhausted"
+      break
+    }
+  done
+
+  network_quiet_stats_stream_stop
+  log "network-quiet/$label: cluster did not sustain the hard ${NETWORK_QUIET_DURATION_SECONDS}s continuously observed quiet window before the deadline"
+  finished_at="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
+  finished_monotonic_ms="$(monotonic_millis || printf '%s' "$deadline_ms")"
+  elapsed_ms=$((10#$finished_monotonic_ms - 10#$started_monotonic_ms))
+  elapsed=$((elapsed_ms / 1000))
+  write_network_quiet_summary "$summary_file" "$label" fail \
+    "${last_reason:-quiet-window-deadline-exhausted}" \
+    "$started_at" "$finished_at" "$elapsed" "$elapsed_ms" \
+    "$sample_group" "$candidate" "$qualifying_groups" "$quiet_elapsed_ms" \
+    "$generation_stable" "$samples_file" "$generations_file"
+  log "  network-quiet/$label: FAIL summary -> $summary_file"
+  return 1
 }
 
 deadline_command_timeout() {
@@ -430,6 +1373,448 @@ deadline_command_timeout() {
   else
     printf '%s\n' "$maximum"
   fi
+}
+
+# GNU timeout accepts fractional seconds. Keep conversion in integer
+# milliseconds so the formation hard gate never depends on floating-point
+# shell arithmetic or locale-specific decimal formatting.
+duration_seconds_to_millis() {
+  local value="$1" whole fraction
+  if [[ ! "$value" =~ ^([0-9]{1,9})([.]([0-9]{1,3}))?$ ]]; then
+    return 1
+  fi
+  whole="${BASH_REMATCH[1]}"
+  fraction="${BASH_REMATCH[3]-}000"
+  fraction="${fraction:0:3}"
+  printf '%s\n' "$((10#$whole * 1000 + 10#$fraction))"
+}
+
+duration_millis_to_seconds() {
+  local value="$1" milliseconds
+  if [[ ! "$value" =~ ^[0-9]{1,16}$ ]]; then
+    return 1
+  fi
+  milliseconds=$((10#$value))
+  printf '%d.%03d\n' "$((milliseconds / 1000))" "$((milliseconds % 1000))"
+}
+
+wall_clock_millis() {
+  local now
+  now="$(date +%s%3N)" || return 1
+  [[ "$now" =~ ^[0-9]{13,16}$ ]] || return 1
+  printf '%s\n' "$now"
+}
+
+# Linux uptime is monotonic across wall-clock corrections and is available on
+# every host capable of running this Docker benchmark. Wall-clock timestamps
+# remain in artifacts for correlation only; acceptance timing uses this clock.
+monotonic_millis() {
+  local uptime ignored
+  IFS=' ' read -r uptime ignored < /proc/uptime || return 1
+  duration_seconds_to_millis "$uptime"
+}
+
+bounded_deadline_timeout_millis() {
+  local deadline="$1" now="$2" maximum="$3" remaining
+  [[ "$deadline" =~ ^[0-9]{1,16}$ ]] || return 1
+  [[ "$now" =~ ^[0-9]{1,16}$ ]] || return 1
+  [[ "$maximum" =~ ^[0-9]{1,16}$ ]] || return 1
+  remaining=$((10#$deadline - 10#$now))
+  [ "$remaining" -gt 0 ] || return 1
+  [ "$maximum" -gt 0 ] || return 1
+  if [ "$remaining" -lt "$maximum" ]; then
+    printf '%s\n' "$remaining"
+  else
+    printf '%s\n' "$maximum"
+  fi
+}
+
+formation_deadline_command_timeout() {
+  local deadline_ms="$1" maximum_seconds="$2" now_ms maximum_ms timeout_ms
+  now_ms="$(wall_clock_millis)" || return 1
+  maximum_ms="$(duration_seconds_to_millis "$maximum_seconds")" || return 1
+  timeout_ms="$(
+    bounded_deadline_timeout_millis "$deadline_ms" "$now_ms" "$maximum_ms"
+  )" || return 1
+  duration_millis_to_seconds "$timeout_ms"
+}
+
+# A stalled producer is the hostile cleanup case: the transform is blocked on
+# input and the annotator is blocked on transformed output. Stopping the stream
+# must synchronously reap all three stages before a benchmark can begin.
+network_quiet_stream_ownership_self_test() {
+  local saved_docker saved_lifecycle lifecycle_dir lifecycle_file
+  local annotator_pid="" producer_pid="" transform_pid="" key value
+  local producer_args transform_comm attempt rc=0
+  saved_docker="$(declare -f docker 2>/dev/null || true)"
+  saved_lifecycle="$NETWORK_QUIET_STATS_STREAM_TEST_LIFECYCLE_FILE"
+  lifecycle_dir="$(
+    mktemp -d "${TMPDIR:-/tmp}/sinomo-network-quiet-lifecycle.XXXXXX"
+  )" || return 1
+  lifecycle_file="$lifecycle_dir/worker.lifecycle"
+  NETWORK_QUIET_STATS_STREAM_TEST_LIFECYCLE_FILE="$lifecycle_file"
+  docker() {
+    exec -a sinomo-quiet-stalled-producer sleep 300
+  }
+
+  if ! network_quiet_stats_stream_start stalled-container; then
+    rc=1
+  fi
+  for attempt in $(seq 1 100); do
+    if [ -s "$lifecycle_file" ] \
+      && grep -Fxq 'children_started=true' "$lifecycle_file"; then
+      break
+    fi
+    sleep 0.01
+  done
+  if [ ! -s "$lifecycle_file" ] \
+    || ! grep -Fxq 'children_started=true' "$lifecycle_file"; then
+    rc=1
+  else
+    while IFS='=' read -r key value; do
+      case "$key" in
+        annotator_pid) annotator_pid="$value" ;;
+        producer_pid) producer_pid="$value" ;;
+        transform_pid) transform_pid="$value" ;;
+      esac
+    done < "$lifecycle_file"
+  fi
+  [[ "$annotator_pid" =~ ^[0-9]+$ ]] || rc=1
+  [[ "$producer_pid" =~ ^[0-9]+$ ]] || rc=1
+  [[ "$transform_pid" =~ ^[0-9]+$ ]] || rc=1
+  [ "$annotator_pid" = "$NETWORK_QUIET_STATS_STREAM_PID" ] || rc=1
+  [ -n "$annotator_pid" ] && kill -0 "$annotator_pid" 2>/dev/null || rc=1
+  [ -n "$producer_pid" ] && kill -0 "$producer_pid" 2>/dev/null || rc=1
+  [ -n "$transform_pid" ] && kill -0 "$transform_pid" 2>/dev/null || rc=1
+  producer_args="$(
+    [ -n "$producer_pid" ] \
+      && tr '\0' ' ' < "/proc/$producer_pid/cmdline" 2>/dev/null \
+      || true
+  )"
+  transform_comm=""
+  if [ -n "$transform_pid" ] && [ -r "/proc/$transform_pid/comm" ]; then
+    IFS= read -r transform_comm < "/proc/$transform_pid/comm" || true
+  fi
+  case "$producer_args" in
+    *sinomo-quiet-stalled-producer*) ;;
+    *) rc=1 ;;
+  esac
+  [ "$transform_comm" = sed ] || rc=1
+
+  network_quiet_stats_stream_stop
+  if [ -n "$annotator_pid" ] && [ -e "/proc/$annotator_pid" ]; then
+    rc=1
+  fi
+  [ -z "$producer_pid" ] || [ ! -e "/proc/$producer_pid" ] || rc=1
+  [ -z "$transform_pid" ] || [ ! -e "/proc/$transform_pid" ] || rc=1
+  [ -z "$NETWORK_QUIET_STATS_STREAM_PID" ] || rc=1
+  [ -z "$NETWORK_QUIET_STATS_STREAM_FD" ] || rc=1
+  grep -Fxq 'producer_waited=true' "$lifecycle_file" || rc=1
+  grep -Fxq 'transform_waited=true' "$lifecycle_file" || rc=1
+  grep -Fxq 'cleanup_complete=true' "$lifecycle_file" || rc=1
+
+  NETWORK_QUIET_STATS_STREAM_TEST_LIFECYCLE_FILE="$saved_lifecycle"
+  unset -f docker
+  if [ -n "$saved_docker" ]; then
+    eval "$saved_docker"
+  fi
+  rm -f -- "$lifecycle_file"
+  rmdir "$lifecycle_dir" 2>/dev/null || rc=1
+  return "$rc"
+}
+
+# Exercise the real quiet-gate state loop without Docker. Both regressions put
+# an above-threshold cumulative interval where the old one-shot design had no
+# CPU evidence: first between polls, then while final generations are scanned.
+network_quiet_full_gate_mock_self_test() {
+  local saved_monotonic saved_container saved_container_name saved_start
+  local saved_stop saved_delay saved_baseline saved_verify saved_read saved_log
+  local original_nodes="$NODES" original_expected="$EXPECTED_MAINS"
+  local original_artifacts="$ARTIFACTS" mock_dir rc=0
+  local mock_index=0 mock_verify_index=0
+  local -a mock_times=() mock_cpu=() mock_verify_targets=()
+  saved_monotonic="$(declare -f monotonic_millis)"
+  saved_container="$(declare -f network_quiet_container_for_node_before_deadline)"
+  saved_container_name="$(declare -f network_quiet_container_name_before_deadline)"
+  saved_start="$(declare -f network_quiet_stats_stream_start)"
+  saved_stop="$(declare -f network_quiet_stats_stream_stop)"
+  saved_delay="$(declare -f network_quiet_stream_restart_delay)"
+  saved_baseline="$(declare -f network_quiet_establish_generation_baseline)"
+  saved_verify="$(declare -f network_quiet_verify_generation_baseline)"
+  saved_read="$(declare -f network_quiet_stats_stream_read_group)"
+  saved_log="$(declare -f log)"
+  mock_dir="$(mktemp -d "${TMPDIR:-/tmp}/sinomo-network-quiet-gate.XXXXXX")" \
+    || return 1
+
+  NODES="node1 node2"
+  EXPECTED_MAINS=2
+  log() { :; }
+  monotonic_millis() { printf '%s\n' 100; }
+  network_quiet_container_for_node_before_deadline() {
+    printf 'id-%s\n' "$1"
+  }
+  network_quiet_container_name_before_deadline() {
+    printf 'mock-%s\n' "${1#id-}"
+  }
+  network_quiet_stats_stream_start() { :; }
+  network_quiet_stats_stream_stop() { :; }
+  # Any unexpected restart terminates the mock instead of hiding a failure in
+  # an unbounded synthetic retry loop.
+  network_quiet_stream_restart_delay() { return 1; }
+  network_quiet_establish_generation_baseline() {
+    generation_baseline[node1]="id-node1|10 100 11 101"
+    generation_baseline[node2]="id-node2|10 100 11 101"
+  }
+  network_quiet_verify_generation_baseline() {
+    NETWORK_QUIET_GENERATION_VERIFY_FINISHED_MS="${mock_verify_targets[$mock_verify_index]}"
+    mock_verify_index=$((mock_verify_index + 1))
+  }
+  network_quiet_stats_stream_read_group() {
+    local at cpu node
+    if [ "$mock_index" -ge "${#mock_times[@]}" ]; then
+      NETWORK_QUIET_GROUP_REASON="mock-sequence-exhausted"
+      NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=1
+      return 1
+    fi
+    at="${mock_times[$mock_index]}"
+    cpu="${mock_cpu[$mock_index]}"
+    mock_index=$((mock_index + 1))
+    NETWORK_QUIET_GROUP_MIN_MS="$at"
+    NETWORK_QUIET_GROUP_MAX_MS="$at"
+    NETWORK_QUIET_GROUP_REASON=""
+    NETWORK_QUIET_GROUP_STRUCTURAL_ERROR=0
+    NETWORK_QUIET_GROUP_CPU=()
+    NETWORK_QUIET_GROUP_CPU_STATUS=()
+    NETWORK_QUIET_GROUP_NAME=()
+    NETWORK_QUIET_GROUP_OBSERVED_MS=()
+    for node in $NODES; do
+      NETWORK_QUIET_GROUP_CPU[$node]="$cpu"
+      NETWORK_QUIET_GROUP_NAME[$node]="mock-$node"
+      NETWORK_QUIET_GROUP_OBSERVED_MS[$node]="$at"
+      if [ "$cpu" = 20.00% ]; then
+        NETWORK_QUIET_GROUP_CPU_STATUS[$node]=above
+        NETWORK_QUIET_GROUP_REASON="mock-$node=$cpu"
+      else
+        NETWORK_QUIET_GROUP_CPU_STATUS[$node]=within
+      fi
+    done
+  }
+
+  network_quiet_run_mock_case() {
+    local scenario="$1" summary samples
+    mock_index=0
+    mock_verify_index=0
+    ARTIFACTS="$mock_dir/$scenario"
+    mkdir -p "$ARTIFACTS" || return 1
+    case "$scenario" in
+      former-sleep-gap)
+        mock_times=(1000 2000 12000 17000 18000 48000 50000)
+        mock_cpu=(1.00% 1.00% 1.00% 20.00% 1.00% 1.00% 1.00%)
+        mock_verify_targets=(49000)
+        ;;
+      verification-busy)
+        mock_times=(1000 2000 32000 34000 35000 65000 67000)
+        mock_cpu=(1.00% 1.00% 1.00% 20.00% 1.00% 1.00% 1.00%)
+        mock_verify_targets=(33000 66000)
+        ;;
+      *) return 1 ;;
+    esac
+    wait_for_network_quiet "$scenario" || return 1
+    summary="$ARTIFACTS/network-quiet-$scenario.summary.txt"
+    samples="$ARTIFACTS/network-quiet-$scenario.samples.tsv"
+    grep -Fxq 'status=pass' "$summary" || return 1
+    grep -Fxq 'final_candidate=2' "$summary" || return 1
+    case "$scenario" in
+      former-sleep-gap)
+        awk -F '\t' \
+          '$15 == "busy" && $12 == "20.00%" { found = 1 } END { exit !found }' \
+          "$samples"
+        ;;
+      verification-busy)
+        awk -F '\t' \
+          '$15 == "verification-busy" && $12 == "20.00%" { found = 1 } END { exit !found }' \
+          "$samples"
+        ;;
+    esac
+  }
+
+  network_quiet_run_mock_case former-sleep-gap || rc=1
+  network_quiet_run_mock_case verification-busy || rc=1
+
+  eval "$saved_monotonic"
+  eval "$saved_container"
+  eval "$saved_container_name"
+  eval "$saved_start"
+  eval "$saved_stop"
+  eval "$saved_delay"
+  eval "$saved_baseline"
+  eval "$saved_verify"
+  eval "$saved_read"
+  eval "$saved_log"
+  unset -f network_quiet_run_mock_case
+  NODES="$original_nodes"
+  EXPECTED_MAINS="$original_expected"
+  ARTIFACTS="$original_artifacts"
+  rm -rf -- "$mock_dir"
+  return "$rc"
+}
+
+network_quiet_helpers_self_test() {
+  local actual summary fixture snapshot monotonic_now required_ms rc=0
+  [ "$NETWORK_QUIET_DURATION_SECONDS" = 30 ] || rc=1
+  required_ms="$(duration_seconds_to_millis "$NETWORK_QUIET_DURATION_SECONDS")" \
+    || rc=1
+  [ "$required_ms" = 30000 ] || rc=1
+  actual="$(network_quiet_cpu_sample_status 9.99% 10)"
+  [ "$actual" = within ] || rc=1
+  actual="$(network_quiet_cpu_sample_status 10.00% 10)"
+  [ "$actual" = within ] || rc=1
+  actual="$(network_quiet_cpu_sample_status 10.01% 10)"
+  [ "$actual" = above ] || rc=1
+  actual="$(network_quiet_cpu_sample_status unavailable 10)"
+  [ "$actual" = invalid ] || rc=1
+  network_quiet_generation_matches \
+    $'container-a|10\t100\t11\t101' $'container-a|10\t100\t11\t101' || rc=1
+  if network_quiet_generation_matches \
+    $'container-a|10\t100\t11\t101' $'container-a|12\t102\t11\t101'; then
+    rc=1
+  fi
+
+  # Slow observations do not redefine the acceptance window. The first quiet
+  # instant remains authoritative, 29.999 seconds cannot pass, and 30.000
+  # seconds passes regardless of how few observations fit in that duration.
+  actual="$(network_quiet_window_start_after_observation 0 1000 quiet)" || rc=1
+  [ "$actual" = 1000 ] || rc=1
+  actual="$(
+    network_quiet_window_start_after_observation "$actual" 13250 quiet
+  )" || rc=1
+  [ "$actual" = 1000 ] || rc=1
+  if network_quiet_duration_reached "$actual" 30999 "$required_ms"; then
+    rc=1
+  fi
+  network_quiet_duration_reached "$actual" 31000 "$required_ms" || rc=1
+  network_quiet_duration_reached "$actual" 93000 "$required_ms" || rc=1
+  if network_quiet_coverage_reaches 31999 32000; then
+    rc=1
+  fi
+  network_quiet_coverage_reaches 32000 32000 || rc=1
+
+  # Busy CPU, a sampling error, and a generation transition all use the same
+  # fail-closed reset transition. A later quiet observation starts a new full
+  # 30-second window rather than resuming accumulated time.
+  actual="$(
+    network_quiet_window_start_after_observation "$actual" 32000 reset
+  )" || rc=1
+  [ "$actual" = 0 ] || rc=1
+  actual="$(network_quiet_window_start_after_observation 1000 33000 reset)" \
+    || rc=1
+  [ "$actual" = 0 ] || rc=1
+  actual="$(network_quiet_window_start_after_observation 1000 34000 reset)" \
+    || rc=1
+  [ "$actual" = 0 ] || rc=1
+  actual="$(network_quiet_window_start_after_observation 0 50000 quiet)" || rc=1
+  if network_quiet_duration_reached "$actual" 79999 "$required_ms"; then
+    rc=1
+  fi
+  network_quiet_duration_reached "$actual" 80000 "$required_ms" || rc=1
+
+  # A streamed busy interval that arrives during what used to be the explicit
+  # sleep gap resets the candidate, even if quiet groups on either side would
+  # otherwise span 30 seconds.
+  actual="$(network_quiet_window_start_after_observation 1000 16000 reset)" \
+    || rc=1
+  [ "$actual" = 0 ] || rc=1
+  actual="$(network_quiet_window_start_after_observation "$actual" 17000 quiet)" \
+    || rc=1
+  if network_quiet_duration_reached "$actual" 46999 "$required_ms"; then
+    rc=1
+  fi
+
+  # Final generation verification is inside the CPU coverage interval. A
+  # quiet group ending before verification is insufficient, and activity in
+  # the first group covering through verification resets the candidate.
+  if network_quiet_coverage_reaches 51999 52000; then
+    rc=1
+  fi
+  actual="$(network_quiet_window_start_after_observation 17000 53000 reset)" \
+    || rc=1
+  [ "$actual" = 0 ] || rc=1
+  if network_quiet_window_start_after_observation 50000 49999 quiet >/dev/null; then
+    rc=1
+  fi
+  monotonic_now="$(monotonic_millis)" || rc=1
+  [[ "$monotonic_now" =~ ^[0-9]{1,16}$ ]] || rc=1
+
+  fixture="$(mktemp -d "${TMPDIR:-/tmp}/sinomo-network-quiet-proc.XXXXXX")" \
+    || return 1
+  mkdir "$fixture/1" "$fixture/28" "$fixture/99" || return 1
+  printf '%s\n' sinomo > "$fixture/1/comm"
+  printf '/usr/local/bin/sinomo\0daemon\0shadow\0run\0' > "$fixture/1/cmdline"
+  printf '%s\n' '1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 101' \
+    > "$fixture/1/stat"
+  printf '%s\n' sinomo > "$fixture/28/comm"
+  printf '/usr/local/bin/sinomo\0daemon\0run\0' > "$fixture/28/cmdline"
+  printf '%s\n' '1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 202' \
+    > "$fixture/28/stat"
+  printf '%s\n' sh > "$fixture/99/comm"
+  printf 'sh\0-c\0case daemon shadow run and daemon run\0' > "$fixture/99/cmdline"
+  printf '%s\n' '1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 303' \
+    > "$fixture/99/stat"
+  snapshot="$(
+    sh -c "$NETWORK_QUIET_DAEMON_GENERATION_PROGRAM" sh "$fixture"
+  )" || rc=1
+  [ "$snapshot" = $'28\t202\t1\t101' ] || rc=1
+  rm -f -- \
+    "$fixture/1/comm" "$fixture/1/cmdline" "$fixture/1/stat" \
+    "$fixture/28/comm" "$fixture/28/cmdline" "$fixture/28/stat" \
+    "$fixture/99/comm" "$fixture/99/cmdline" "$fixture/99/stat"
+  rmdir "$fixture/1" "$fixture/28" "$fixture/99" "$fixture"
+  summary="$(mktemp "${TMPDIR:-/tmp}/sinomo-network-quiet-summary.XXXXXX")" || return 1
+  write_network_quiet_summary "$summary" self-test pass complete \
+    2026-01-01T00:00:00.000Z 2026-01-01T00:00:30.000Z 30 30000 \
+    11 1 11 30000 true /tmp/samples.tsv /tmp/generations.tsv
+  grep -Fxq 'protocol=sinomo.test.network-quiet.v2' "$summary" || rc=1
+  grep -Fxq 'status=pass' "$summary" || rc=1
+  grep -Fxq 'cpu_authority=docker-container-aggregate' "$summary" || rc=1
+  grep -Fxq 'required_quiet_duration_seconds=30' "$summary" || rc=1
+  grep -Fxq 'required_quiet_duration_milliseconds=30000' "$summary" || rc=1
+  grep -Fxq 'cpu_sampling=docker-stats-continuous-stream' "$summary" || rc=1
+  grep -Fxq 'stream_stall_reset_seconds=5' "$summary" || rc=1
+  grep -Fxq 'final_qualifying_sample_groups=11' "$summary" || rc=1
+  grep -Fxq 'final_quiet_elapsed_milliseconds=30000' "$summary" || rc=1
+  grep -Fxq 'daemon_generations_stable=true' "$summary" || rc=1
+  grep -Fxq 'samples_file=samples.tsv' "$summary" || rc=1
+  rm -f -- "$summary"
+  network_quiet_stream_ownership_self_test || rc=1
+  network_quiet_full_gate_mock_self_test || rc=1
+  return "$rc"
+}
+
+timing_helpers_self_test() {
+  local actual
+  [ "$FORMATION_WAIT" = 10 ] || return 1
+  [ "$FORMATION_POLL_MILLIS" = 100 ] || return 1
+  [ "$NETWORK_QUIET_DURATION_SECONDS" = 30 ] || return 1
+  [ "$NETWORK_QUIET_MAX_WAIT_SECONDS" = 120 ] || return 1
+  [ "$NETWORK_QUIET_STREAM_STALL_SECONDS" = 5 ] || return 1
+  actual="$(duration_seconds_to_millis 5)" && [ "$actual" = 5000 ] || return 1
+  actual="$(duration_seconds_to_millis 0.125)" && [ "$actual" = 125 ] || return 1
+  actual="$(duration_millis_to_seconds 5000)" && [ "$actual" = 5.000 ] || return 1
+  actual="$(bounded_deadline_timeout_millis 6000 1000 10000)" \
+    && [ "$actual" = 5000 ] || return 1
+  actual="$(bounded_deadline_timeout_millis 6000 1000 1250)" \
+    && [ "$actual" = 1250 ] || return 1
+  actual="$(bounded_deadline_timeout_millis 6000 5950 "$FORMATION_POLL_MILLIS")" \
+    && [ "$actual" = 50 ] || return 1
+  if bounded_deadline_timeout_millis 6000 6000 1000 >/dev/null; then
+    return 1
+  fi
+  if duration_seconds_to_millis 0.0001 >/dev/null; then
+    return 1
+  fi
+  network_quiet_helpers_self_test || return 1
+  formation_health_sample_self_test || return 1
+  log "timing helper self-test passed"
 }
 
 running_other_compose_projects() {
@@ -469,9 +1854,42 @@ doctor_connectivity_warnings() {
   printf '%s\n' "$output" | grep -E "endpoint-unreachable|node-offline" || true
 }
 
+cluster_health_attempt() {
+  local seconds="${1:-$READINESS_COMMAND_TIMEOUT}"
+  compose_exec_timeout "$seconds" node1 sinomo cluster health 2>/dev/null
+}
+
 cluster_health() {
   local seconds="${1:-$READINESS_COMMAND_TIMEOUT}"
-  compose_exec_timeout "$seconds" node1 sinomo cluster health 2>/dev/null || true
+  cluster_health_attempt "$seconds" || true
+}
+
+record_valid_formation_health() {
+  local health="$1" health_file="$2" online
+  [[ "$health" =~ [^[:space:]] ]] || return 1
+  online="$(printf '%s\n' "$health" | grep -c "daemon-main.*online" || true)"
+  printf '%s\n' "$health" > "$health_file" || return 1
+  printf '%s\n' "${online:-0}"
+}
+
+formation_health_sample_self_test() {
+  local sample_file prior sample actual online rc=0
+  sample_file="$(mktemp "${TMPDIR:-/tmp}/sinomo-formation-health.XXXXXX")" || return 1
+  prior="prior valid health"
+  printf '%s\n' "$prior" > "$sample_file" || rc=1
+  if record_valid_formation_health "" "$sample_file" >/dev/null; then
+    rc=1
+  fi
+  actual="$(cat "$sample_file")" || rc=1
+  [ "$actual" = "$prior" ] || rc=1
+
+  sample=$'node\tprocess\thealth\nnode-a\tdaemon-main\tonline\nnode-b\tdaemon-main\tunknown\nnode-c\tdaemon-main\tonline'
+  online="$(record_valid_formation_health "$sample" "$sample_file")" || rc=1
+  [ "$online" = 2 ] || rc=1
+  actual="$(cat "$sample_file")" || rc=1
+  [ "$actual" = "$sample" ] || rc=1
+  rm -f -- "$sample_file"
+  return "$rc"
 }
 
 cluster_local_node_id() {
@@ -497,7 +1915,8 @@ formation_failure_markers() {
 
 report_cluster_readiness_timeout() {
   local label="$1" elapsed="$2" best_online="$3" last_online="$4"
-  local health_file="$5" doctor_file="$6" health_header unresolved
+  local health_file="$5" doctor_file="$6" health_attempt_file="$7"
+  local health_header unresolved
   log "$label: cluster NOT ready after ${elapsed}s (best-online=$best_online, last-online=$last_online)"
   if [ -s "$health_file" ] && grep -q '[^[:space:]]' "$health_file"; then
     unresolved="$(awk '
@@ -511,42 +1930,109 @@ report_cluster_readiness_timeout() {
   else
     log "$label: no cluster health output was captured"
   fi
-  log "$label: last health output: $health_file"
+  log "$label: last valid health output: $health_file"
+  log "$label: last health attempt: $health_attempt_file"
   log "$label: last doctor output: $doctor_file"
 }
 
 wait_for_cluster_ready() {
-  local label="$1" started deadline now elapsed health online warnings command_timeout markers
-  local label_slug health_file doctor_file best_online=0 last_online=0
+  local label="$1" started_ms deadline_ms now_ms elapsed_ms elapsed
+  local health health_rc online warnings command_timeout markers poll_sleep_ms poll_sleep
+  local label_slug health_file health_attempt_file health_attempts_file doctor_file
+  local best_online=0 last_online=0 attempt=0 attempt_outcome
+  local attempt_started_ms attempt_finished_ms attempt_elapsed_ms attempt_start_offset_ms
   label_slug="${label//[^a-zA-Z0-9._-]/_}"
   health_file="$ARTIFACTS/cluster-ready-$label_slug.last-health.txt"
+  health_attempt_file="$ARTIFACTS/cluster-ready-$label_slug.last-health-attempt.txt"
+  health_attempts_file="$ARTIFACTS/cluster-ready-$label_slug.attempts.tsv"
   doctor_file="$ARTIFACTS/cluster-ready-$label_slug.last-doctor.txt"
   : > "$health_file"
+  if [ "$FORMATION_OBSERVE" = 1 ]; then
+    printf '%s\n' $'attempt\tstarted_ms\tstart_offset_ms\tfinished_ms\telapsed_ms\tcommand_timeout_s\texit\toutcome\tonline\toutput_bytes' \
+      > "$health_attempts_file"
+  fi
+  printf '%s\n' "cluster health attempt not run" > "$health_attempt_file"
   printf '%s\n' "doctor not run: health has not reported $EXPECTED_MAINS online main daemons" \
     > "$doctor_file"
   log "$label: waiting for $EXPECTED_MAINS clean main daemons (<=${FORMATION_WAIT}s)"
-  started="$(date +%s)"
-  deadline=$(( started + FORMATION_WAIT ))
+  if ! started_ms="$(wall_clock_millis)"; then
+    log "$label: millisecond wall clock is unavailable"
+    return 1
+  fi
+  deadline_ms=$((10#$started_ms + FORMATION_WAIT * 1000))
   while :; do
-    if ! command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")"; then
-      now="$(date +%s)"
-      elapsed=$(( now - started ))
+    if ! command_timeout="$(
+      formation_deadline_command_timeout "$deadline_ms" "$READINESS_COMMAND_TIMEOUT"
+    )"; then
+      now_ms="$(wall_clock_millis)" || now_ms="$deadline_ms"
+      elapsed_ms=$((10#$now_ms - 10#$started_ms))
+      [ "$elapsed_ms" -ge 0 ] || elapsed_ms=0
+      elapsed="$(duration_millis_to_seconds "$elapsed_ms")"
       report_cluster_readiness_timeout \
-        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
+        "$label" "$elapsed" "$best_online" "$last_online" \
+        "$health_file" "$doctor_file" "$health_attempt_file"
       return 1
     fi
-    health="$(cluster_health "$command_timeout")"
-    printf '%s\n' "$health" > "$health_file"
-    online="$(printf '%s\n' "$health" | grep -c "daemon-main.*online" || true)"
-    last_online="${online:-0}"
-    if [ "${online:-0}" -gt "$best_online" ]; then
-      best_online="$online"
+    health_rc=0
+    attempt=$((attempt + 1))
+    attempt_outcome="completed"
+    if [ "$FORMATION_OBSERVE" = 1 ]; then
+      attempt_started_ms="$(wall_clock_millis)" || attempt_started_ms="$started_ms"
     fi
-    if ! command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")"; then
-      now="$(date +%s)"
-      elapsed=$(( now - started ))
+    if health="$(cluster_health_attempt "$command_timeout")"; then
+      if online="$(record_valid_formation_health "$health" "$health_file")"; then
+        {
+          printf 'cluster health attempt succeeded (command-timeout=%ss)\n' "$command_timeout"
+          printf '%s\n' "$health"
+        } > "$health_attempt_file"
+        last_online="${online:-0}"
+        if [ "${online:-0}" -gt "$best_online" ]; then
+          best_online="$online"
+        fi
+      else
+        online=0
+        attempt_outcome="empty"
+        printf 'cluster health attempt returned no output (command-timeout=%ss)\n' \
+          "$command_timeout" > "$health_attempt_file"
+      fi
+    else
+      health_rc=$?
+      online=0
+      if [ "$health_rc" -eq 124 ]; then
+        attempt_outcome="timed_out"
+      else
+        attempt_outcome="failed"
+      fi
+      {
+        printf 'cluster health attempt failed or timed out (command-timeout=%ss, exit=%s)\n' \
+          "$command_timeout" "$health_rc"
+        if [[ "$health" =~ [^[:space:]] ]]; then
+          printf '%s\n' "$health"
+        fi
+      } > "$health_attempt_file"
+    fi
+    if [ "$FORMATION_OBSERVE" = 1 ]; then
+      attempt_finished_ms="$(wall_clock_millis)" || attempt_finished_ms="$deadline_ms"
+      attempt_elapsed_ms=$((10#$attempt_finished_ms - 10#$attempt_started_ms))
+      [ "$attempt_elapsed_ms" -ge 0 ] || attempt_elapsed_ms=0
+      attempt_start_offset_ms=$((10#$attempt_started_ms - 10#$started_ms))
+      [ "$attempt_start_offset_ms" -ge 0 ] || attempt_start_offset_ms=0
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$attempt" "$attempt_started_ms" "$attempt_start_offset_ms" \
+        "$attempt_finished_ms" "$attempt_elapsed_ms" "$command_timeout" \
+        "$health_rc" "$attempt_outcome" "${online:-0}" "${#health}" \
+        >> "$health_attempts_file"
+    fi
+    if ! command_timeout="$(
+      formation_deadline_command_timeout "$deadline_ms" "$READINESS_COMMAND_TIMEOUT"
+    )"; then
+      now_ms="$(wall_clock_millis)" || now_ms="$deadline_ms"
+      elapsed_ms=$((10#$now_ms - 10#$started_ms))
+      [ "$elapsed_ms" -ge 0 ] || elapsed_ms=0
+      elapsed="$(duration_millis_to_seconds "$elapsed_ms")"
       report_cluster_readiness_timeout \
-        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
+        "$label" "$elapsed" "$best_online" "$last_online" \
+        "$health_file" "$doctor_file" "$health_attempt_file"
       return 1
     fi
     markers="$(formation_failure_markers "$command_timeout")"
@@ -559,7 +2045,9 @@ wait_for_cluster_ready() {
     if [ "${online:-0}" -ge "$EXPECTED_MAINS" ]; then
       # Doctor performs another live health aggregation. Keep it off the hot
       # formation polling path and run it only once all expected mains appear.
-      if command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")"; then
+      if command_timeout="$(
+        formation_deadline_command_timeout "$deadline_ms" "$READINESS_COMMAND_TIMEOUT"
+      )"; then
         if ! warnings="$(doctor_connectivity_warnings "$command_timeout" "$doctor_file")"; then
           warnings="cluster doctor failed or timed out"
         fi
@@ -567,23 +2055,37 @@ wait_for_cluster_ready() {
         warnings="readiness deadline exhausted before doctor completed"
       fi
     fi
-    now="$(date +%s)"
-    elapsed=$(( now - started ))
+    now_ms="$(wall_clock_millis)" || now_ms="$deadline_ms"
+    elapsed_ms=$((10#$now_ms - 10#$started_ms))
+    [ "$elapsed_ms" -ge 0 ] || elapsed_ms=0
+    elapsed="$(duration_millis_to_seconds "$elapsed_ms")"
     if [ "${online:-0}" -ge "$EXPECTED_MAINS" ] && [ -z "$warnings" ]; then
-      if [ "$now" -le "$deadline" ]; then
+      if [ "$now_ms" -le "$deadline_ms" ]; then
         log "$label: cluster ready (${online} main daemons online, ${elapsed}s)"
         return 0
       fi
       report_cluster_readiness_timeout \
-        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
+        "$label" "$elapsed" "$best_online" "$last_online" \
+        "$health_file" "$doctor_file" "$health_attempt_file"
       return 1
     fi
-    if [ "$now" -ge "$deadline" ]; then
+    if [ "$now_ms" -ge "$deadline_ms" ]; then
       report_cluster_readiness_timeout \
-        "$label" "$elapsed" "$best_online" "$last_online" "$health_file" "$doctor_file"
+        "$label" "$elapsed" "$best_online" "$last_online" \
+        "$health_file" "$doctor_file" "$health_attempt_file"
       return 1
     fi
-    sleep "$POLL_INTERVAL"
+    poll_sleep_ms="$(
+      bounded_deadline_timeout_millis \
+        "$deadline_ms" "$now_ms" "$FORMATION_POLL_MILLIS"
+    )" || {
+      report_cluster_readiness_timeout \
+        "$label" "$elapsed" "$best_online" "$last_online" \
+        "$health_file" "$doctor_file" "$health_attempt_file"
+      return 1
+    }
+    poll_sleep="$(duration_millis_to_seconds "$poll_sleep_ms")" || return 1
+    sleep "$poll_sleep"
   done
 }
 
@@ -666,13 +2168,13 @@ dfs_converged_epoch_signature() {
 }
 
 # A clean operational snapshot is stronger than an active shard layout. The
-# retiring layout remains active while a membership handoff is pending, and a
-# completed control-plane handoff can leave the active primary's freshly opened
-# backend lane fenced. Require exact layout, no current pending handoff keys,
-# zero active-primary freezes, and zero configured-replica lag on every local
-# primary. The separate routed-mutation gate below checks the live daemon lanes.
-# Bracket the invariant sweep with layout reads and require two unchanged epoch
-# signatures so a transition completing during either observation cannot pass.
+# retiring layout remains active while a membership handoff is pending, so
+# require exact layout, no current pending handoff keys, and zero
+# configured-replica lag on every local primary. A write fence is process-local
+# backend state, not durable observation evidence: the routed-mutation gate
+# below checks the actual long-lived daemon lanes. Bracket the invariant sweep
+# with layout reads and require two unchanged epoch signatures so a transition
+# completing during either observation cannot pass.
 wait_for_dfs_converged() {
   local deadline probe_log probe_err confirm_log confirm_err pending_log pending_err
   local command_timeout now consecutive node invariants_clean invariant_log invariant_err
@@ -710,10 +2212,8 @@ wait_for_dfs_converged() {
             sinomo test run cluster.dfs.invariants \
               --require-cluster --json --param timeout-seconds=1 \
               >"$invariant_log" 2>"$invariant_err" \
-          || ! jq -e '
-            .status == "passed"
-              and .diagnostics.authoritative_write_frozen_shard_count == 0
-          ' "$invariant_log" >/dev/null 2>>"$invariant_err"; then
+          || ! jq -e '.status == "passed"' \
+            "$invariant_log" >/dev/null 2>>"$invariant_err"; then
           invariants_clean=0
           break
         fi
@@ -763,7 +2263,7 @@ wait_for_dfs_converged() {
       previous_epoch_signature=""
     fi
     if [ "$consecutive" -ge 2 ]; then
-      log "  dfs-converged: exact layout, zero handoffs, unfrozen active primaries, and zero replica lag across two stable epoch probes"
+      log "  dfs-converged: exact layout, zero handoffs, and zero replica lag across two stable epoch probes"
       return 0
     fi
     now="$(date +%s)"
@@ -1004,6 +2504,50 @@ network_payload_baseline() {
       --param "min-payload-bytes-per-second=$NETWORK_PAYLOAD_MIN_BYTES_PER_SEC" || rc=1
   done
   return $rc
+}
+
+network_semantic_attachment_baseline() {
+  local rc=0 node
+  for node in $NODES; do
+    run_probe "$node" cluster.network.semantic-attachment-benchmark \
+      --param "attachment-requests-per-target=$NETWORK_ATTACHMENT_REQUESTS_PER_TARGET" \
+      --param "attachment-warmup-requests-per-target=$NETWORK_ATTACHMENT_WARMUP_REQUESTS_PER_TARGET" \
+      --param "attachment-concurrency=$NETWORK_ATTACHMENT_CONCURRENCY" \
+      --param "attachment-timeout-ms=$NETWORK_ATTACHMENT_TIMEOUT_MS" \
+      --param "attachment-max-failures=0" \
+      --param "attachment-max-p50-ms=0" \
+      --param "attachment-max-p95-ms=0" \
+      --param "attachment-max-p50-us=0" \
+      --param "attachment-max-p95-us=0" \
+      --param "attachment-payload-bytes=$NETWORK_ATTACHMENT_REQUEST_BYTES" \
+      --param "attachment-response-payload-bytes=$NETWORK_ATTACHMENT_RESPONSE_BYTES" \
+      --param "attachment-min-requests-per-second=0" \
+      --param "attachment-min-payload-bytes-per-second=$NETWORK_ATTACHMENT_MIN_BYTES_PER_SEC" || rc=1
+  done
+  return $rc
+}
+
+network_semantic_attachment_saturation_profile() {
+  # Six nodes give the selected origin five remote targets. At the defaults,
+  # 5 * 128 * (64 MiB request + 64 MiB response) is exactly 80 GiB of measured
+  # duplex logical traffic: at least 40 GiB per direction for a multi-second
+  # 100 GbE observation
+  # without raising the route's 64 MiB per-direction bound.
+  run_probe "$NETWORK_SATURATION_ORIGIN" cluster.network.semantic-attachment-benchmark \
+    --param expected-targets=5 \
+    --param "attachment-requests-per-target=$NETWORK_SATURATION_REQUESTS_PER_TARGET" \
+    --param "attachment-warmup-requests-per-target=$NETWORK_SATURATION_WARMUP_REQUESTS_PER_TARGET" \
+    --param "attachment-concurrency=$NETWORK_SATURATION_CONCURRENCY" \
+    --param "attachment-timeout-ms=$NETWORK_SATURATION_TIMEOUT_MS" \
+    --param attachment-max-failures=0 \
+    --param attachment-max-p50-ms=0 \
+    --param attachment-max-p95-ms=0 \
+    --param attachment-max-p50-us=0 \
+    --param attachment-max-p95-us=0 \
+    --param "attachment-payload-bytes=$NETWORK_SATURATION_REQUEST_BYTES" \
+    --param "attachment-response-payload-bytes=$NETWORK_SATURATION_RESPONSE_BYTES" \
+    --param attachment-min-requests-per-second=0 \
+    --param attachment-min-payload-bytes-per-second=0
 }
 
 cluster_kv_quorum_baseline() {
@@ -1296,8 +2840,199 @@ restart_durability() {
     --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+FORMATION_OBSERVATION_COLLECTED=0
+freeze_formation_observation_node() {
+  local observe_dir="$1" node="$2" node_dir="$1/$2" capture
+  local timeline_pid profile_pid trace_pid captured_trace_pid all_trace_pid
+  capture="$(
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" \
+      sed -n '1p' /data/observe/formation/current-capture 2>/dev/null
+  )" || capture=""
+  if [ -z "$capture" ]; then
+    printf '%s\n' "unavailable" > "$node_dir/current-capture"
+    return 0
+  fi
+  printf '%s\n' "$capture" > "$node_dir/current-capture"
+
+  # Capture scheduling is deliberately off the formation dependency path.
+  # At the end of the hard gate, wait briefly for a just-scheduled observer to
+  # finish starting, then freeze all three process-local capture surfaces.
+  compose_exec_timeout 4 "$node" sh -c \
+    "for attempt in \$(seq 1 40); do [ -f /data/observe/formation/$capture.ready ] && exit 0; sleep 0.1; done; exit 1" \
+    >/dev/null 2>&1 || true
+
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+    observe timeline network stop --capture "$capture" --json \
+    > "$node_dir/network-timeline.json" 2> "$node_dir/network-timeline.stderr.log" &
+  timeline_pid=$!
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+    observe profile cpu stop --capture "$capture" --json \
+    > "$node_dir/cpu-profile-stop.json" 2> "$node_dir/cpu-profile-stop.stderr.log" &
+  profile_pid=$!
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+    observe control --clear-capture --expected-capture "$capture" --json \
+    > "$node_dir/trace-control-stop.json" 2> "$node_dir/trace-control-stop.stderr.log" &
+  trace_pid=$!
+  wait "$timeline_pid" "$profile_pid" "$trace_pid" 2>/dev/null || true
+
+  # Trace records are process-local. Read both the capture-tagged subset and
+  # the full ring immediately after clearing the tag, while the daemon
+  # generation frozen above is still available. The latter retains startup
+  # events emitted before the asynchronous capture-id RPC completed.
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+    observe traces --capture "$capture" --limit 4096 --json \
+    > "$node_dir/traces.json" 2> "$node_dir/traces.stderr.log" &
+  captured_trace_pid=$!
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+    observe traces --limit 4096 --json \
+    > "$node_dir/all-process-traces.json" \
+    2> "$node_dir/all-process-traces.stderr.log" &
+  all_trace_pid=$!
+  wait "$captured_trace_pid" "$all_trace_pid" 2>/dev/null || true
+}
+
+collect_formation_observation_node() {
+  local observe_dir="$1" node="$2" node_dir="$1/$2" capture container attempt
+  capture="$(sed -n '1p' "$node_dir/current-capture" 2>/dev/null)" || capture=""
+  if [ -z "$capture" ] || [ "$capture" = "unavailable" ]; then
+    return 0
+  fi
+
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+      observe profile cpu status --json \
+      > "$node_dir/cpu-profile-status.json" 2> "$node_dir/cpu-profile-status.stderr.log" || true
+    if grep -Eq '"state": "(complete|failed|unsupported)"' \
+      "$node_dir/cpu-profile-status.json"; then
+      break
+    fi
+    sleep 0.1
+  done
+  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+    observe metrics --limit 4096 --json \
+    > "$node_dir/metrics.json" 2> "$node_dir/metrics.stderr.log" || true
+
+  container="$(compose ps -q "$node")"
+  if [ -n "$container" ]; then
+    mkdir -p \
+      "$node_dir/profile-artifact" \
+      "$node_dir/profile-artifacts" \
+      "$node_dir/startup" \
+      "$node_dir/network-timeline-artifacts"
+    docker cp "$container:/data/observe/profiles/$capture/." \
+      "$node_dir/profile-artifact/" >/dev/null 2>&1 || true
+    # Identity-changing joins replace the daemon process. Preserve every
+    # profile generation that finalized before the active capture so the
+    # formation flamegraph does not silently omit the joining process.
+    docker cp "$container:/data/observe/profiles/." \
+      "$node_dir/profile-artifacts/" >/dev/null 2>&1 || true
+    docker cp "$container:/data/observe/formation/." \
+      "$node_dir/startup/" >/dev/null 2>&1 || true
+    # A joining daemon exits before the gate-side observer can stop its
+    # process-local timeline. The daemon finalizes explicitly active captures
+    # under this durable root during graceful shutdown; preserve every process
+    # generation rather than only the replacement's live capture.
+    docker cp "$container:/data/observe/timelines/." \
+      "$node_dir/network-timeline-artifacts/" >/dev/null 2>&1 || true
+  fi
+}
+
+render_formation_observation_artifacts() {
+  local observe_dir="$1"
+  local flamegraph_renderer="$SINOMO_ROOT/scripts/debug/render-pprof-flamegraph.py"
+  local timeline_summarizer="$SINOMO_ROOT/scripts/debug/summarize-network-timeline.py"
+  local perfetto_converter="$SINOMO_ROOT/scripts/debug/observe-traces-to-perfetto.py"
+  local node node_dir profile profile_dir persisted_timeline persisted_dir
+
+  # Produce reviewable artifacts while the capture is still next to the exact
+  # profile metadata. Rendering is diagnostic-only: a host without Go/Python
+  # must not change the ten-second formation result.
+  for node in $NODES; do
+    node_dir="$observe_dir/$node"
+    if [ -x "$timeline_summarizer" ] && [ -s "$node_dir/network-timeline.json" ]; then
+      "$timeline_summarizer" "$node_dir/network-timeline.json" \
+        > "$node_dir/network-timeline-summary.txt" \
+        2> "$node_dir/network-timeline-summary.stderr.log" || true
+    fi
+    if [ -x "$perfetto_converter" ] \
+      && [ -s "$node_dir/all-process-traces.json" ] \
+      && [ -s "$node_dir/network-timeline.json" ]; then
+      "$perfetto_converter" --node "$node" \
+        "$node_dir/all-process-traces.json" "$node_dir/network-timeline.json" \
+        -o "$node_dir/formation.perfetto.json" \
+        > "$node_dir/formation.perfetto.stdout.log" \
+        2> "$node_dir/formation.perfetto.stderr.log" || true
+    fi
+    while IFS= read -r -d '' persisted_timeline; do
+      persisted_dir="$(dirname "$persisted_timeline")"
+      if [ -x "$timeline_summarizer" ]; then
+        "$timeline_summarizer" "$persisted_timeline" \
+          > "$persisted_dir/network-timeline-summary.txt" \
+          2> "$persisted_dir/network-timeline-summary.stderr.log" || true
+      fi
+      if [ -x "$perfetto_converter" ]; then
+        "$perfetto_converter" --node "$node" \
+          "$persisted_timeline" \
+          -o "$persisted_dir/formation.perfetto.json" \
+          > "$persisted_dir/formation.perfetto.stdout.log" \
+          2> "$persisted_dir/formation.perfetto.stderr.log" || true
+      fi
+    done < <(find "$node_dir/network-timeline-artifacts" -type f -name timeline.json -print0)
+  done
+
+  [ -x "$flamegraph_renderer" ] || return 0
+  while IFS= read -r -d '' profile; do
+    profile_dir="$(dirname "$profile")"
+    "$flamegraph_renderer" "$profile" -o "$profile_dir/flamegraph.html" \
+      > "$profile_dir/flamegraph.render.log" \
+      2> "$profile_dir/flamegraph.render.stderr.log" || true
+  done < <(find "$observe_dir" -type f -name cpu.pprof.pb -print0)
+}
+
+capture_formation_observation() {
+  [ "$FORMATION_OBSERVE" = 1 ] || return 0
+  [ "$FORMATION_OBSERVATION_COLLECTED" = 0 ] || return 0
+  FORMATION_OBSERVATION_COLLECTED=1
+
+  local observe_dir="$ARTIFACTS/formation-observe"
+  local node node_dir capture worker_pid
+  local -a freeze_workers=() collect_workers=()
+  mkdir -p "$observe_dir"
+  log "freezing bounded formation traces, RPC timelines, and CPU profiles"
+
+  # Freeze every node at the same gate edge. A sequential stop allowed later
+  # joining daemons to replace themselves before their capture was addressed.
+  for node in $NODES; do
+    node_dir="$observe_dir/$node"
+    mkdir -p "$node_dir"
+    freeze_formation_observation_node "$observe_dir" "$node" &
+    freeze_workers+=("$!")
+  done
+  for worker_pid in "${freeze_workers[@]}"; do
+    wait "$worker_pid" 2>/dev/null || true
+  done
+
+  : > "$observe_dir/captures.tsv"
+  for node in $NODES; do
+    capture="$(sed -n '1p' "$observe_dir/$node/current-capture" 2>/dev/null)" || capture=""
+    printf '%s\t%s\n' "$node" "${capture:-unavailable}" >> "$observe_dir/captures.tsv"
+  done
+
+  log "collecting frozen formation observation artifacts"
+  for node in $NODES; do
+    collect_formation_observation_node "$observe_dir" "$node" &
+    collect_workers+=("$!")
+  done
+  for worker_pid in "${collect_workers[@]}"; do
+    wait "$worker_pid" 2>/dev/null || true
+  done
+  log "rendering formation timelines and flamegraphs"
+  render_formation_observation_artifacts "$observe_dir"
+}
+
 capture_failure_context() {
   log "capturing failure context into $ARTIFACTS"
+  capture_formation_observation
   compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
   cluster_health > "$ARTIFACTS/cluster-health.txt" 2>&1 || true
   compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" node1 sinomo cluster doctor \
@@ -1326,6 +3061,7 @@ PROJECT_OWNED=0
 teardown() {
   [ "$TEARDOWN_DONE" = 1 ] && return
   TEARDOWN_DONE=1
+  network_quiet_stats_stream_stop
   [ "$PROJECT_OWNED" = 1 ] || return
   if [ -n "$FAILED_SCENARIOS" ]; then
     capture_failure_context
@@ -1354,7 +3090,14 @@ teardown() {
 
 # --- bring-up -----------------------------------------------------------------
 
+if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" = 1 ]; then
+  timing_helpers_self_test || exit 1
+  exit 0
+fi
+
 validate_network_realtime_gate_config || exit 1
+validate_network_saturation_config || exit 1
+validate_formation_observation_config || exit 1
 require_no_other_compose_projects || exit 1
 trap teardown EXIT
 
@@ -1387,19 +3130,63 @@ if ! verify_network_perf_trace_disabled; then
 fi
 
 if ! wait_for_cluster_ready "formation"; then
+  capture_formation_observation
   cluster_health
   FAILED_SCENARIOS="formation"
   exit 1
+fi
+capture_formation_observation
+if [ "$FORMATION_ONLY" = 1 ]; then
+  log "RESULT: PASS — ten-second formation gate green (observations in $ARTIFACTS/formation-observe)"
+  exit 0
 fi
 if ! wait_for_network_ready; then
   FAILED_SCENARIOS="network-ready"
   exit 1
 fi
 
+# The quiet gate measures the complete service containers, so every control
+# plane that shares those containers must have reached its own stable state
+# first. In particular, a freshly formed cluster can already route RPCs while
+# DFS metadata-shard handoffs are still committing their final placement
+# records. Starting the quiet-window deadline before those handoffs converge
+# would conflate expected formation work with idle control-plane load and make
+# every throughput result depend on a race. These are readiness prerequisites,
+# not part of the Docker-only ten-second cluster-join hard gate above.
+if ! wait_for_dfs_ready; then
+  FAILED_SCENARIOS="pre-benchmark-dfs-ready"
+  exit 1
+fi
+if ! wait_for_dfs_converged; then
+  FAILED_SCENARIOS="pre-benchmark-dfs-converged"
+  exit 1
+fi
+if ! dfs_daemon_mutation_lanes_ready; then
+  FAILED_SCENARIOS="pre-benchmark-dfs-daemon-mutation-lanes"
+  exit 1
+fi
+if ! wait_for_dfs_converged; then
+  FAILED_SCENARIOS="pre-benchmark-dfs-post-daemon-mutation-convergence"
+  exit 1
+fi
+
 scenario "network-realtime-latency-gate" network_realtime_latency_gate
+# Quiet control-plane behavior is a prerequisite for every throughput result
+# below. Fail closed instead of publishing measurements collected after a busy
+# or unobservable interval.
+if [ -n "$FAILED_SCENARIOS" ]; then
+  exit 1
+fi
 scenario "dfs-protocol-codec-baseline" dfs_protocol_codec_baseline
 scenario "network-latency-baseline" network_baseline
 scenario "network-payload-baseline" network_payload_baseline
+scenario "network-semantic-attachment-baseline" network_semantic_attachment_baseline
+if [ "$NETWORK_SATURATION" = 1 ]; then
+  scenario "network-semantic-attachment-saturation" \
+    network_semantic_attachment_saturation_profile
+else
+  log "optional network semantic-attachment saturation profile disabled"
+fi
 scenario "cluster-kv-quorum-baseline" cluster_kv_quorum_baseline
 if [ -n "$FAILED_SCENARIOS" ]; then
   exit 1

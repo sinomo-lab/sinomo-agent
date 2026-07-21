@@ -859,6 +859,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
     ) -> Result<bool, DfsError> {
         self.ensure_metadata_receipt_accepts(object_id, version, replica_node_id, content_hash)?;
+        let repair_maintenance = self
+            .coordinator
+            .claimed_intent_for_target(file_system_id, object_id, version)
+            .is_some_and(|intent| {
+                let replica_already_durable = self
+                    .coordinator
+                    .receipts_for_intent(&intent.intent_id)
+                    .into_iter()
+                    .any(|receipt| {
+                        receipt.replica_node_id == *replica_node_id
+                            && receipt.state == DfsReplicaReceiptState::Durable
+                    });
+                let durable_receipts_after = self
+                    .coordinator
+                    .durable_receipt_count(&intent.intent_id)
+                    .saturating_add(usize::from(!replica_already_durable));
+                durable_receipts_after < intent.policy.desired_replicas
+            });
         let object = self.current_read_object_metadata(object_id).ok();
         let existing_matching_receipt = self
             .backend_receipt_for_replica(object_id, version, replica_node_id)?
@@ -886,6 +904,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 true
             }
         };
+        if inserted {
+            // Receipt insertion is the durable authority boundary. Retain its
+            // exact publication/repair ownership before the visible-location
+            // update below, which is allowed to fail independently.
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                repair_maintenance,
+                namespace_maintenance: false,
+                metadata_replica_progress: false,
+            });
+        }
         match self.mark_repaired_location(object_id, version, replica_node_id, content_hash) {
             Ok(()) | Err(DfsError::UnknownObject { .. }) => {}
             Err(error) => return Err(error),
@@ -2053,6 +2082,7 @@ mod atomic_create_parent_touch_tests {
             file_system_id: sifs_file_system_id(),
             path: "/services/fenced-create.txt".to_string(),
             kind,
+            tombstone_provenance: None,
             owner_node_id: node("node_create_path_fence"),
             current_locations: Vec::new(),
             content_hash: None,

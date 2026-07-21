@@ -354,13 +354,13 @@ mod tests {
             assert_eq!(call.request.route, sinomo_core::kv::CLUSTER_KV_TXN_ROUTE);
             let submitted =
                 sinomo_core::kv::decode_cluster_kv_txn_rpc_request_body(&call.request.body)
-                    .expect("txn request");
+                    .expect("transaction request");
             let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(
                 &sinomo_core::kv::ClusterKvTxnCommitResult {
                     request_id: submitted.request_id,
                     snapshot: sinomo_core::kv::KvSnapshot {
                         revision: KvRevision(7),
-                        compacted_revision: KvRevision(0),
+                        compacted_revision: KvRevision::ZERO,
                         entries: Vec::new(),
                         leases: Vec::new(),
                         events: Vec::new(),

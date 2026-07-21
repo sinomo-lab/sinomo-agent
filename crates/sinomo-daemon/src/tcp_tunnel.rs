@@ -3,7 +3,7 @@ use sinomo_core::cluster::{read_cluster_state_cached_shared, read_cluster_state_
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::__channel_carrier::{
     OBJECT_RPC_CHANNEL_DATA_MAGIC, ObjectRpcChannelDataFrame, ObjectRpcChannelReceiveBufferPool,
-    ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
+    ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async_timed,
     write_object_rpc_channel_transport_frame_async,
     write_object_rpc_channel_transport_frame_async_timed,
 };
@@ -27,19 +27,20 @@ use sinomo_core::network::{
     sign_cluster_tcp_tunnel_handshake_from_data_dir, verify_cluster_tcp_tunnel_handshake,
     write_object_frame_async, write_object_frame_async_timed,
 };
-use sinomo_core::node::NodeId;
+use sinomo_core::node::{ClusterId, NodeId};
 use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterNodeRole,
     ClusterTransportKind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 #[cfg(test)]
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{RwLock, RwLockWriteGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -58,7 +59,7 @@ const TCP_TUNNEL_STREAM_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 /// It remains a useful authenticated per-session stream fallback, but must not
 /// instantiate the incompatible legacy object-RPC channel dialect.
 const TCP_TUNNEL_PRE_FIXED_PROTOCOL_VERSION: u16 = 3;
-const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+const TCP_TUNNEL_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 // Tunnel setup is an opportunistic fast path. Fail quickly so the route layer
 // can use the ordinary direct endpoint within its five-second network budget.
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -97,7 +98,15 @@ enum TcpTunnelStreamEvent {
 }
 
 static TCP_TUNNELS: LazyLock<TcpTunnelRegistry> = LazyLock::new(TcpTunnelRegistry::default);
-static TCP_TUNNEL_MAINTENANCE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+// A few cross-layer tests need an authenticated logical channel without a
+// process-global physical tunnel. Keep those explicit clients outside the
+// production registry so concurrent maintenance tests cannot retire another
+// fixture's channel based on their unrelated cluster snapshot.
+#[cfg(test)]
+static ISOLATED_TEST_OBJECT_RPC_CHANNELS: LazyLock<Mutex<HashMap<NodeId, ObjectRpcChannelClient>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TCP_TUNNEL_MAINTENANCE_SOURCES: LazyLock<TcpTunnelMaintenanceSources> =
+    LazyLock::new(TcpTunnelMaintenanceSources::default);
 #[cfg(test)]
 static TEST_TCP_TUNNEL_REGISTRY_LIFECYCLE: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 
@@ -108,12 +117,71 @@ fn lock_test_tcp_tunnel_registry_lifecycle() -> RwLockWriteGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Wakes tunnel maintenance after connectivity or network-environment changes.
+/// Identifies the source generation that invalidated the tunnel topology.
 ///
-/// `Notify` coalesces bursts into a single permit, so mobile and sensor nodes
-/// can keep their long idle cadence without delaying recovery after a handover.
-pub(crate) fn request_tcp_tunnel_maintenance_refresh() {
-    TCP_TUNNEL_MAINTENANCE_NOTIFY.notify_one();
+/// The maintenance owner consumes these independently so a wake cannot erase
+/// another source's change or reset an unrelated retry class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TcpTunnelMaintenanceReason {
+    IdentityChanged,
+    MembershipChanged,
+    RoleChanged,
+    NetworkEnvironmentChanged,
+    SessionDisconnected,
+    OperatorRefresh,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TcpTunnelMaintenanceSourceGenerations {
+    identity: u64,
+    membership: u64,
+    role: u64,
+    network_environment: u64,
+    session_disconnect: u64,
+    operator: u64,
+}
+
+#[derive(Default)]
+struct TcpTunnelMaintenanceSources {
+    identity: AtomicU64,
+    membership: AtomicU64,
+    role: AtomicU64,
+    network_environment: AtomicU64,
+    session_disconnect: AtomicU64,
+    operator: AtomicU64,
+    notify: Notify,
+}
+
+impl TcpTunnelMaintenanceSources {
+    fn request(&self, reason: TcpTunnelMaintenanceReason) {
+        let generation = match reason {
+            TcpTunnelMaintenanceReason::IdentityChanged => &self.identity,
+            TcpTunnelMaintenanceReason::MembershipChanged => &self.membership,
+            TcpTunnelMaintenanceReason::RoleChanged => &self.role,
+            TcpTunnelMaintenanceReason::NetworkEnvironmentChanged => &self.network_environment,
+            TcpTunnelMaintenanceReason::SessionDisconnected => &self.session_disconnect,
+            TcpTunnelMaintenanceReason::OperatorRefresh => &self.operator,
+        };
+        generation.fetch_add(1, Ordering::Release);
+        // The generation is authoritative; Notify is only the edge that keeps
+        // a quiet owner asleep. A retained permit closes the check/sleep race.
+        self.notify.notify_one();
+    }
+
+    fn generations(&self) -> TcpTunnelMaintenanceSourceGenerations {
+        TcpTunnelMaintenanceSourceGenerations {
+            identity: self.identity.load(Ordering::Acquire),
+            membership: self.membership.load(Ordering::Acquire),
+            role: self.role.load(Ordering::Acquire),
+            network_environment: self.network_environment.load(Ordering::Acquire),
+            session_disconnect: self.session_disconnect.load(Ordering::Acquire),
+            operator: self.operator.load(Ordering::Acquire),
+        }
+    }
+}
+
+pub(crate) fn request_tcp_tunnel_maintenance_refresh(reason: TcpTunnelMaintenanceReason) {
+    TCP_TUNNEL_MAINTENANCE_SOURCES.request(reason);
 }
 
 fn tcp_tunnel_close_signal() -> watch::Sender<Option<String>> {
@@ -154,11 +222,20 @@ impl TcpTunnelRegistry {
         let mut peers = self.peers.lock().ok()?;
         let handle = peers.get(node_id).cloned()?;
         if handle.closing.load(Ordering::Acquire) {
-            if peers
+            let removed = if peers
                 .get(node_id)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle))
             {
                 peers.remove(node_id);
+                true
+            } else {
+                false
+            };
+            drop(peers);
+            if removed {
+                request_tcp_tunnel_maintenance_refresh(
+                    TcpTunnelMaintenanceReason::SessionDisconnected,
+                );
             }
             return None;
         }
@@ -186,6 +263,7 @@ impl TcpTunnelRegistry {
             let detail = format!("retiring v2 tcp tunnel after {channel_detail}");
             tracing::info!(peer_node_id = %node_id, %detail, "sinomo tcp tunnel logical channel retired");
             handle.request_close(detail);
+            request_tcp_tunnel_maintenance_refresh(TcpTunnelMaintenanceReason::SessionDisconnected);
             return None;
         }
         Some(handle)
@@ -279,12 +357,9 @@ impl TcpTunnelRegistry {
             peers.insert(handle.peer_node_id.clone(), handle);
             drop(peers);
             existing.request_close("replaced by canonical tcp tunnel".to_string());
-            request_tcp_tunnel_maintenance_refresh();
             return Ok(());
         }
         peers.insert(handle.peer_node_id.clone(), handle);
-        drop(peers);
-        request_tcp_tunnel_maintenance_refresh();
         Ok(())
     }
 
@@ -305,11 +380,24 @@ impl TcpTunnelRegistry {
         {
             peers.remove(&handle.peer_node_id);
             drop(peers);
-            request_tcp_tunnel_maintenance_refresh();
+            request_tcp_tunnel_maintenance_refresh(TcpTunnelMaintenanceReason::SessionDisconnected);
         }
     }
 
+    #[cfg(test)]
     fn remove(&self, node_id: &NodeId) -> Option<Arc<TcpTunnelHandle>> {
+        self.remove_inner(node_id, true)
+    }
+
+    fn remove_reconciled(&self, node_id: &NodeId) -> Option<Arc<TcpTunnelHandle>> {
+        self.remove_inner(node_id, false)
+    }
+
+    fn remove_inner(
+        &self,
+        node_id: &NodeId,
+        notify_disconnect: bool,
+    ) -> Option<Arc<TcpTunnelHandle>> {
         #[cfg(test)]
         let _lifecycle = lock_test_tcp_tunnel_registry_lifecycle();
         let removed = self
@@ -317,8 +405,8 @@ impl TcpTunnelRegistry {
             .lock()
             .ok()
             .and_then(|mut peers| peers.remove(node_id));
-        if removed.is_some() {
-            request_tcp_tunnel_maintenance_refresh();
+        if notify_disconnect && removed.is_some() {
+            request_tcp_tunnel_maintenance_refresh(TcpTunnelMaintenanceReason::SessionDisconnected);
         }
         removed
     }
@@ -360,16 +448,6 @@ impl TcpTunnelRegistry {
             })
             .unwrap_or(false)
     }
-}
-
-/// Serializes the small number of unit fixtures that need stable entries in
-/// the process-global tunnel registry against unrelated simulated daemon
-/// identity transitions. Production runs one registry lifecycle per process.
-#[cfg(test)]
-pub(crate) fn lease_test_tcp_tunnel_registry() -> RwLockReadGuard<'static, ()> {
-    TEST_TCP_TUNNEL_REGISTRY_LIFECYCLE
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -436,39 +514,29 @@ pub(crate) fn insert_test_tcp_tunnel_object_rpc_channel(node_id: NodeId) -> Obje
 }
 
 #[cfg(test)]
-pub(crate) fn insert_test_tcp_tunnel_object_rpc_channel_client(
-    node_id: NodeId,
-    client: ObjectRpcChannelClient,
-) {
-    let (tx, _rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
-    let (stream_tx, _stream_rx) = mpsc::channel(TCP_TUNNEL_STREAM_OUTBOUND_CAPACITY);
-    let handle = Arc::new(TcpTunnelHandle {
-        peer_node_id: node_id,
-        tx,
-        stream_tx,
-        pending_stream_opens: Arc::new(Mutex::new(HashMap::new())),
-        streams: Arc::new(Mutex::new(HashMap::new())),
-        stream_queued_bytes: Arc::new(Semaphore::new(TCP_TUNNEL_STREAM_QUEUED_BYTES)),
-        next_stream_id: AtomicU64::new(2),
-        local_stream_id_parity: 0,
-        active_streams: AtomicUsize::new(0),
-        closing: AtomicBool::new(false),
-        clean_shutdown: AtomicBool::new(false),
-        close_signal: tcp_tunnel_close_signal(),
-        canonical_direction: true,
-        protocol_version: CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
-        object_rpc_channel_client: Some(client),
-        object_rpc_channel_ingress: None,
-        object_rpc_channel_server: Mutex::new(None),
-    });
-    TCP_TUNNELS.insert(handle);
-}
-
-#[cfg(test)]
 pub(crate) fn remove_test_tcp_tunnel(node_id: &NodeId) {
     if let Some(handle) = TCP_TUNNELS.remove(node_id) {
         handle.request_close("test cleanup".to_string());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn insert_isolated_test_object_rpc_channel_client(
+    node_id: NodeId,
+    client: ObjectRpcChannelClient,
+) {
+    ISOLATED_TEST_OBJECT_RPC_CHANNELS
+        .lock()
+        .expect("isolated test object RPC channel registry")
+        .insert(node_id, client);
+}
+
+#[cfg(test)]
+pub(crate) fn remove_isolated_test_object_rpc_channel_client(node_id: &NodeId) {
+    ISOLATED_TEST_OBJECT_RPC_CHANNELS
+        .lock()
+        .expect("isolated test object RPC channel registry")
+        .remove(node_id);
 }
 
 /// Returns the cloneable logical channel carried by the peer's negotiated v2
@@ -476,6 +544,15 @@ pub(crate) fn remove_test_tcp_tunnel(node_id: &NodeId) {
 pub(crate) fn tcp_tunnel_object_rpc_channel_client(
     peer_node_id: &NodeId,
 ) -> Option<ObjectRpcChannelClient> {
+    #[cfg(test)]
+    if let Some(client) = ISOLATED_TEST_OBJECT_RPC_CHANNELS
+        .lock()
+        .ok()
+        .and_then(|channels| channels.get(peer_node_id).cloned())
+        .filter(|client| !client.is_closed())
+    {
+        return Some(client);
+    }
     TCP_TUNNELS.get(peer_node_id).and_then(|handle| {
         (!handle.closing.load(Ordering::Acquire))
             .then(|| handle.object_rpc_channel_client.clone())
@@ -1123,79 +1200,482 @@ pub(crate) fn start_tcp_tunnel_maintenance_task(
     runtime: tokio::runtime::Handle,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     label: String,
-) -> tokio::task::JoinHandle<()> {
-    runtime.clone().spawn(async move {
+    startup_cluster_id: ClusterId,
+    startup_node_id: NodeId,
+) -> Result<tokio::task::JoinHandle<()>, DaemonError> {
+    // Every live quorum commit and replicated import is materialized through
+    // `observe_cluster_kv_snapshot_write` in this daemon process, which invokes
+    // this post-commit observer. Offline writers are covered by the dirty
+    // startup pass below. This keeps topology wakeups source-driven without a
+    // second file poll or a second durable-watch lifecycle owner.
+    let topology_subscription = subscribe_tcp_tunnel_topology_sources(&paths, &startup_node_id)?;
+    Ok(runtime.clone().spawn(async move {
+        // Retain the path-scoped callback for exactly the maintenance owner's
+        // lifetime.
+        let _topology_subscription = topology_subscription;
+        let sources = &*TCP_TUNNEL_MAINTENANCE_SOURCES;
+        let mut completed_generations = sources.generations();
+        let mut startup_pending = true;
         let mut consecutive_retry_rounds = 0_u32;
+        let mut retry_at = None;
+        let mut local_node_role = ClusterNodeRole::default();
         loop {
             if *shutdown_rx.borrow() {
                 return;
             }
-            let next_interval = match maintain_tcp_tunnels_once(&paths, &runtime).await {
+            if !startup_pending {
+                match wait_for_tcp_tunnel_maintenance_wake(
+                    sources,
+                    completed_generations,
+                    retry_at,
+                    &mut shutdown_rx,
+                )
+                .await
+                {
+                    TcpTunnelMaintenanceWake::SourceChanged
+                    | TcpTunnelMaintenanceWake::RetryDeadline => {}
+                    TcpTunnelMaintenanceWake::Shutdown => return,
+                }
+            }
+            let claimed_generations = sources.generations();
+            let Some(maintenance_result) = wait_for_tcp_tunnel_maintenance_or_shutdown(
+                maintain_tcp_tunnels_once(
+                    &paths,
+                    &runtime,
+                    &startup_cluster_id,
+                    &startup_node_id,
+                ),
+                &mut shutdown_rx,
+            )
+            .await
+            else {
+                return;
+            };
+            // Consume only the generations claimed before this pass. A source
+            // event racing the pass remains greater and forces a follow-up.
+            completed_generations = claimed_generations;
+            startup_pending = false;
+            match maintenance_result {
                 Ok(outcome) => {
-                    if outcome.state == TcpTunnelMaintenanceState::RetryNeeded
-                        && tcp_tunnel_role_uses_idle_backoff(&outcome.local_node_role)
-                    {
+                    if outcome.state == TcpTunnelMaintenanceState::IdentityChanged {
+                        tracing::debug!(
+                            "sinomo {label} tcp tunnel maintenance stopped after daemon identity changed"
+                        );
+                        return;
+                    }
+                    local_node_role = outcome.local_node_role;
+                    if outcome.state == TcpTunnelMaintenanceState::RetryNeeded {
                         consecutive_retry_rounds = consecutive_retry_rounds.saturating_add(1);
+                        retry_at = tcp_tunnel_maintenance_next_deadline(
+                            Instant::now(),
+                            &local_node_role,
+                            outcome.state,
+                            consecutive_retry_rounds,
+                        );
                     } else {
                         consecutive_retry_rounds = 0;
+                        retry_at = None;
                     }
-                    tcp_tunnel_maintenance_interval(
-                        &outcome.local_node_role,
-                        outcome.state,
-                        consecutive_retry_rounds,
-                    )
                 }
                 Err(error) => {
-                    // Preserve the existing fast retry when cluster state cannot be
-                    // read, because the local role is not known reliably yet.
-                    consecutive_retry_rounds = 0;
+                    consecutive_retry_rounds = consecutive_retry_rounds.saturating_add(1);
+                    retry_at = tcp_tunnel_maintenance_retry_at(
+                        Instant::now(),
+                        &local_node_role,
+                        consecutive_retry_rounds,
+                    );
                     tracing::debug!("sinomo {label} tcp tunnel maintenance skipped: {error}");
-                    TCP_TUNNEL_MAINTENANCE_INTERVAL
                 }
-            };
-            let wake = wait_for_tcp_tunnel_maintenance_wake(
-                next_interval,
-                &mut shutdown_rx,
-                &TCP_TUNNEL_MAINTENANCE_NOTIFY,
-            )
-            .await;
-            if wake == TcpTunnelMaintenanceWake::Shutdown {
-                return;
             }
         }
-    })
+    }))
+}
+
+fn subscribe_tcp_tunnel_topology_sources(
+    paths: &DaemonPaths,
+    startup_node_id: &NodeId,
+) -> Result<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription, DaemonError> {
+    let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths)?;
+    let projection = Arc::new(Mutex::new(TcpTunnelTopologyProjection::default()));
+    let callback_projection = Arc::clone(&projection);
+    let local_member_key = sinomo_core::node::cluster_member_key(startup_node_id);
+    let callback_local_member_key = local_member_key.clone();
+    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+        &cluster_paths,
+        move |snapshot| {
+            let changes = callback_projection
+                .lock()
+                .map(|mut projection| projection.observe(snapshot, &callback_local_member_key))
+                .unwrap_or(TcpTunnelTopologyChanges {
+                    membership: true,
+                    role: true,
+                });
+            if changes.membership {
+                request_tcp_tunnel_maintenance_refresh(
+                    TcpTunnelMaintenanceReason::MembershipChanged,
+                );
+            }
+            if changes.role {
+                request_tcp_tunnel_maintenance_refresh(TcpTunnelMaintenanceReason::RoleChanged);
+            }
+        },
+    );
+    // Close the register/read race by seeding only when this snapshot is newer
+    // than one already delivered to the callback. The unconditional startup
+    // pass reconciles the same durable source before the owner first sleeps.
+    match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+        &cluster_paths,
+    ) {
+        Ok(Some(snapshot)) => {
+            if let Ok(mut projection) = projection.lock() {
+                projection.seed_if_newer(&snapshot, &local_member_key);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            "tcp tunnel topology observation started without an initial KV projection: {error}"
+        ),
+    }
+    Ok(subscription)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TcpTunnelEndpointProjection {
+    endpoint_id: sinomo_core::Id,
+    node_id: NodeId,
+    transport: ClusterTransportKind,
+    address: String,
+    source: ClusterEndpointSource,
+    privacy: ClusterEndpointPrivacy,
+    priority: u16,
+}
+
+impl From<&ClusterEndpointRecord> for TcpTunnelEndpointProjection {
+    fn from(endpoint: &ClusterEndpointRecord) -> Self {
+        Self {
+            endpoint_id: endpoint.endpoint_id.clone(),
+            node_id: endpoint.node_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            source: endpoint.source.clone(),
+            privacy: endpoint.privacy.clone(),
+            priority: endpoint.priority,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TcpTunnelMemberProjection {
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    raft_role: sinomo_core::ClusterMemberRole,
+    state: sinomo_core::ClusterMemberState,
+    trust_domain: sinomo_core::TrustDomain,
+    node_public_key: String,
+    certificate_id: Option<sinomo_core::Id>,
+    capabilities: Vec<sinomo_core::CapabilityName>,
+    allowed_capabilities: Vec<sinomo_core::CapabilityName>,
+    endpoints: Vec<TcpTunnelEndpointProjection>,
+    local_role: Option<ClusterNodeRole>,
+}
+
+impl TcpTunnelMemberProjection {
+    fn new(member: &sinomo_core::ClusterMemberRecord, is_local: bool) -> Self {
+        let mut capabilities = member.capabilities.clone();
+        capabilities.sort();
+        let mut allowed_capabilities = member.allowed_capabilities.clone();
+        allowed_capabilities.sort();
+        let mut endpoints = member
+            .endpoints
+            .iter()
+            .map(TcpTunnelEndpointProjection::from)
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| {
+            (&left.node_id, &left.endpoint_id, &left.address).cmp(&(
+                &right.node_id,
+                &right.endpoint_id,
+                &right.address,
+            ))
+        });
+        Self {
+            cluster_id: member.cluster_id.clone(),
+            node_id: member.node_id.clone(),
+            raft_role: member.role.clone(),
+            state: member.state.clone(),
+            trust_domain: member.trust_domain.clone(),
+            node_public_key: member.node_public_key.clone(),
+            certificate_id: member.certificate_id.clone(),
+            capabilities,
+            allowed_capabilities,
+            endpoints,
+            local_role: is_local.then(|| member.node_role.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TcpTunnelCapabilityProjection {
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    capabilities: Vec<sinomo_core::CapabilityName>,
+    allowed_capabilities: Vec<sinomo_core::CapabilityName>,
+}
+
+impl From<&sinomo_core::node::ClusterCapabilityPolicyRecord> for TcpTunnelCapabilityProjection {
+    fn from(policy: &sinomo_core::node::ClusterCapabilityPolicyRecord) -> Self {
+        let mut capabilities = policy.capabilities.clone();
+        capabilities.sort();
+        let mut allowed_capabilities = policy.allowed_capabilities.clone();
+        allowed_capabilities.sort();
+        Self {
+            cluster_id: policy.cluster_id.clone(),
+            node_id: policy.node_id.clone(),
+            capabilities,
+            allowed_capabilities,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TcpTunnelTopologyValue {
+    Member(TcpTunnelMemberProjection),
+    Endpoint(TcpTunnelEndpointProjection),
+    Capability(TcpTunnelCapabilityProjection),
+    Malformed(Vec<u8>),
+}
+
+impl TcpTunnelTopologyValue {
+    fn local_role(&self) -> Option<&ClusterNodeRole> {
+        match self {
+            Self::Member(member) => member.local_role.as_ref(),
+            Self::Endpoint(_) | Self::Capability(_) | Self::Malformed(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TcpTunnelTopologyChanges {
+    membership: bool,
+    role: bool,
+}
+
+#[derive(Debug, Default)]
+struct TcpTunnelTopologyProjection {
+    revision: u64,
+    values: BTreeMap<String, TcpTunnelTopologyValue>,
+}
+
+impl TcpTunnelTopologyProjection {
+    fn seed_if_newer(&mut self, snapshot: &sinomo_core::kv::KvSnapshot, local_member_key: &str) {
+        if snapshot.revision.0 <= self.revision {
+            return;
+        }
+        self.values = tcp_tunnel_topology_projection_from_snapshot(snapshot, local_member_key);
+        self.revision = snapshot.revision.0;
+    }
+
+    fn observe(
+        &mut self,
+        snapshot: &sinomo_core::kv::KvSnapshot,
+        local_member_key: &str,
+    ) -> TcpTunnelTopologyChanges {
+        if snapshot.revision.0 <= self.revision {
+            return TcpTunnelTopologyChanges::default();
+        }
+        if self.revision < snapshot.compacted_revision.0 {
+            let next = tcp_tunnel_topology_projection_from_snapshot(snapshot, local_member_key);
+            let changes = TcpTunnelTopologyChanges {
+                membership: self.values != next,
+                role: tcp_tunnel_projection_local_role(&self.values, local_member_key)
+                    != tcp_tunnel_projection_local_role(&next, local_member_key),
+            };
+            self.values = next;
+            self.revision = snapshot.revision.0;
+            return changes;
+        }
+
+        let first_new = snapshot
+            .events
+            .partition_point(|event| event.revision.0 <= self.revision);
+        let mut before = BTreeMap::new();
+        for event in &snapshot.events[first_new..] {
+            if !tcp_tunnel_topology_key(&event.key) {
+                continue;
+            }
+            before
+                .entry(event.key.clone())
+                .or_insert_with(|| self.values.get(&event.key).cloned());
+            match &event.kind {
+                sinomo_core::kv::KvEventKind::Put { value } => {
+                    self.values.insert(
+                        event.key.clone(),
+                        tcp_tunnel_topology_value(&event.key, value, local_member_key),
+                    );
+                }
+                sinomo_core::kv::KvEventKind::Delete => {
+                    self.values.remove(&event.key);
+                }
+            }
+        }
+        self.revision = snapshot.revision.0;
+        let mut changes = TcpTunnelTopologyChanges::default();
+        for (key, previous) in before {
+            let current = self.values.get(&key).cloned();
+            if previous != current {
+                changes.membership = true;
+                if key == local_member_key
+                    && previous
+                        .as_ref()
+                        .and_then(TcpTunnelTopologyValue::local_role)
+                        != current
+                            .as_ref()
+                            .and_then(TcpTunnelTopologyValue::local_role)
+                {
+                    changes.role = true;
+                }
+            }
+        }
+        changes
+    }
+}
+
+fn tcp_tunnel_projection_local_role<'a>(
+    values: &'a BTreeMap<String, TcpTunnelTopologyValue>,
+    local_member_key: &str,
+) -> Option<&'a ClusterNodeRole> {
+    values
+        .get(local_member_key)
+        .and_then(TcpTunnelTopologyValue::local_role)
+}
+
+fn tcp_tunnel_topology_projection_from_snapshot(
+    snapshot: &sinomo_core::kv::KvSnapshot,
+    local_member_key: &str,
+) -> BTreeMap<String, TcpTunnelTopologyValue> {
+    let mut values = BTreeMap::new();
+    for entry in &snapshot.entries {
+        if tcp_tunnel_topology_key(&entry.key) {
+            values.insert(
+                entry.key.clone(),
+                tcp_tunnel_topology_value(&entry.key, &entry.value, local_member_key),
+            );
+        }
+    }
+    values
+}
+
+fn tcp_tunnel_topology_value(
+    key: &str,
+    value: &[u8],
+    local_member_key: &str,
+) -> TcpTunnelTopologyValue {
+    if key.starts_with("/cluster/members/") {
+        return sinomo_core::kv::decode_kv_value::<sinomo_core::ClusterMemberRecord>(value)
+            .map(|member| {
+                TcpTunnelTopologyValue::Member(TcpTunnelMemberProjection::new(
+                    &member,
+                    key == local_member_key,
+                ))
+            })
+            .unwrap_or_else(|_| TcpTunnelTopologyValue::Malformed(value.to_vec()));
+    }
+    if key.starts_with("/cluster/endpoints/") {
+        return sinomo_core::kv::decode_kv_value::<ClusterEndpointRecord>(value)
+            .map(|endpoint| {
+                TcpTunnelTopologyValue::Endpoint(TcpTunnelEndpointProjection::from(&endpoint))
+            })
+            .unwrap_or_else(|_| TcpTunnelTopologyValue::Malformed(value.to_vec()));
+    }
+    sinomo_core::kv::decode_kv_value::<sinomo_core::node::ClusterCapabilityPolicyRecord>(value)
+        .map(|policy| {
+            TcpTunnelTopologyValue::Capability(TcpTunnelCapabilityProjection::from(&policy))
+        })
+        .unwrap_or_else(|_| TcpTunnelTopologyValue::Malformed(value.to_vec()))
+}
+
+fn tcp_tunnel_topology_key(key: &str) -> bool {
+    key.starts_with("/cluster/members/")
+        || key.starts_with("/cluster/endpoints/")
+        || key.starts_with("/cluster/policy/capabilities/")
+}
+
+async fn wait_for_tcp_tunnel_maintenance_or_shutdown<F>(
+    maintenance: F,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(maintenance);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return None;
+                }
+            }
+            result = &mut maintenance => return Some(result),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TcpTunnelMaintenanceWake {
-    IntervalElapsed,
-    RefreshRequested,
+    SourceChanged,
+    RetryDeadline,
     Shutdown,
 }
 
 async fn wait_for_tcp_tunnel_maintenance_wake(
-    interval: Duration,
+    sources: &TcpTunnelMaintenanceSources,
+    completed_generations: TcpTunnelMaintenanceSourceGenerations,
+    retry_at: Option<Instant>,
     shutdown_rx: &mut watch::Receiver<bool>,
-    refresh_notify: &Notify,
 ) -> TcpTunnelMaintenanceWake {
-    tokio::select! {
-        biased;
-        changed = shutdown_rx.changed() => {
-            if changed.is_err() || *shutdown_rx.borrow() {
-                TcpTunnelMaintenanceWake::Shutdown
-            } else {
-                TcpTunnelMaintenanceWake::RefreshRequested
-            }
+    loop {
+        if *shutdown_rx.borrow() {
+            return TcpTunnelMaintenanceWake::Shutdown;
         }
-        () = refresh_notify.notified() => TcpTunnelMaintenanceWake::RefreshRequested,
-        () = tokio::time::sleep(interval) => TcpTunnelMaintenanceWake::IntervalElapsed,
+        // Register the waiter before sampling generations. Notify retains one
+        // permit, but this ordering also makes the no-lost-wake proof explicit.
+        let notified = sources.notify.notified();
+        tokio::pin!(notified);
+        if sources.generations() != completed_generations {
+            return TcpTunnelMaintenanceWake::SourceChanged;
+        }
+        match retry_at {
+            Some(retry_at) => tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return TcpTunnelMaintenanceWake::Shutdown;
+                    }
+                }
+                () = &mut notified => return TcpTunnelMaintenanceWake::SourceChanged,
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)) => {
+                    return TcpTunnelMaintenanceWake::RetryDeadline;
+                }
+            },
+            None => tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return TcpTunnelMaintenanceWake::Shutdown;
+                    }
+                }
+                () = &mut notified => return TcpTunnelMaintenanceWake::SourceChanged,
+            },
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TcpTunnelMaintenanceState {
-    /// Live user or service traffic keeps the established fast convergence
-    /// cadence. Session progress and the physical reader still own liveness.
+    /// The state file no longer describes the identity captured by this
+    /// process. The replacement daemon owns all target-identity tunnels.
+    IdentityChanged,
+    /// Live user or service traffic owns its own progress and disconnect path.
     Active,
     /// At least one selected peer could not be connected during this round.
     RetryNeeded,
@@ -1211,34 +1691,39 @@ struct TcpTunnelMaintenanceOutcome {
     state: TcpTunnelMaintenanceState,
 }
 
-fn tcp_tunnel_role_uses_idle_backoff(role: &ClusterNodeRole) -> bool {
-    matches!(role, ClusterNodeRole::Mobile | ClusterNodeRole::Sensor)
+fn tcp_tunnel_maintenance_retry_delay(
+    role: &ClusterNodeRole,
+    consecutive_retry_rounds: u32,
+) -> Duration {
+    // Only unresolved connection work owns a timer. Cluster connectivity
+    // probing owns endpoint liveness; tunnel readers own physical disconnects.
+    let shift = consecutive_retry_rounds.saturating_sub(1).min(10);
+    let multiplier = 1_u32.checked_shl(shift).unwrap_or(1024);
+    TCP_TUNNEL_RETRY_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(sinomo_core::network::cluster_network_probe_interval_for_role(role))
 }
 
-fn tcp_tunnel_maintenance_interval(
+fn tcp_tunnel_maintenance_retry_at(
+    now: Instant,
+    role: &ClusterNodeRole,
+    consecutive_retry_rounds: u32,
+) -> Option<Instant> {
+    now.checked_add(tcp_tunnel_maintenance_retry_delay(
+        role,
+        consecutive_retry_rounds,
+    ))
+}
+
+fn tcp_tunnel_maintenance_next_deadline(
+    now: Instant,
     role: &ClusterNodeRole,
     state: TcpTunnelMaintenanceState,
     consecutive_retry_rounds: u32,
-) -> Duration {
-    if !tcp_tunnel_role_uses_idle_backoff(role) || state == TcpTunnelMaintenanceState::Active {
-        // Workstation/server/test behavior is deliberately unchanged. Mobile
-        // nodes also retain fast convergence while a stream is actively used.
-        return TCP_TUNNEL_MAINTENANCE_INTERVAL;
-    }
-
-    let idle_interval = sinomo_core::network::cluster_network_probe_interval_for_role(role);
-    if state != TcpTunnelMaintenanceState::RetryNeeded {
-        return idle_interval;
-    }
-
-    // Retry transient startup and handover failures quickly, then converge on
-    // the role's ordinary network cadence instead of waking every two seconds
-    // forever while a mobile or sensor node is offline.
-    let shift = consecutive_retry_rounds.saturating_sub(1).min(10);
-    let multiplier = 1_u32.checked_shl(shift).unwrap_or(1024);
-    TCP_TUNNEL_MAINTENANCE_INTERVAL
-        .saturating_mul(multiplier)
-        .min(idle_interval)
+) -> Option<Instant> {
+    (state == TcpTunnelMaintenanceState::RetryNeeded)
+        .then(|| tcp_tunnel_maintenance_retry_at(now, role, consecutive_retry_rounds))
+        .flatten()
 }
 
 async fn sign_tcp_tunnel_handshake_proof_async(
@@ -1480,58 +1965,10 @@ fn tcp_tunnel_connectivity_record_is_synthetic(
             .starts_with(TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
 }
 
-async fn ping_tcp_tunnel_peer(
-    local_node_id: &NodeId,
-    peer_node_id: &NodeId,
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Result<(), NetworkError> {
-    let endpoint = tcp_tunnel_synthetic_endpoint(local_node_id, peer_node_id);
-    let request = sinomo_core::cluster::cluster_network_ping_rpc_request(
-        format!("tcp-tunnel-maintenance-{peer_node_id}"),
-        0,
-    )?;
-    let cluster_paths =
-        crate::cluster::cluster_paths_from_daemon_paths(paths).map_err(|source| {
-            NetworkError::Io {
-                operation: "resolve cluster paths for tcp tunnel maintenance ping".to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-    let state = read_cluster_state_cached_shared(&cluster_paths)?;
-    let mut host =
-        crate::client::DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_paths(paths);
-    let result =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &cluster_paths)
-            .call_endpoint(
-                &state,
-                &endpoint,
-                sinomo_core::network::ObjectRpcSessionCall::value(request),
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    DaemonRpcTimeouts::connect_and_idle(TCP_TUNNEL_CONNECT_TIMEOUT),
-                ),
-            )
-            .await?;
-    if !result.body.is_empty() {
-        return Err(NetworkError::Serialization {
-            detail: "tcp tunnel maintenance ping returned an unexpected attachment".to_string(),
-        });
-    }
-    let ping = sinomo_core::cluster::decode_cluster_network_ping_rpc_response(&result.response)?;
-    if ping.responder_node_id != *peer_node_id {
-        return Err(NetworkError::Io {
-            operation: "tcp tunnel maintenance ping".to_string(),
-            detail: format!(
-                "responder mismatch: expected {}, got {}",
-                peer_node_id, ping.responder_node_id
-            ),
-        });
-    }
-    Ok(())
-}
-
 async fn evict_tcp_tunnel_peer(peer_node_id: &NodeId, detail: String) {
-    if let Some(handle) = TCP_TUNNELS.remove(peer_node_id) {
+    // This removal is the maintenance pass's output, not a new source edge.
+    // The claimed membership generation already owns its follow-through.
+    if let Some(handle) = TCP_TUNNELS.remove_reconciled(peer_node_id) {
         handle.request_close(detail);
     }
 }
@@ -1569,6 +2006,14 @@ fn tcp_tunnel_cluster_state_is_settled(state: &sinomo_core::ClusterBootstrapStat
         && !sinomo_core::network::cluster_state_needs_join_registration(state)
 }
 
+fn tcp_tunnel_state_matches_startup_identity(
+    state: &sinomo_core::ClusterBootstrapState,
+    startup_cluster_id: &ClusterId,
+    startup_node_id: &NodeId,
+) -> bool {
+    state.cluster_id == *startup_cluster_id && state.local_node_id == *startup_node_id
+}
+
 fn tcp_tunnel_registry_accepts_cluster_state(
     registry: &TcpTunnelRegistry,
     state: &sinomo_core::ClusterBootstrapState,
@@ -1594,9 +2039,26 @@ fn tcp_tunnel_peer_is_authorized(
 async fn maintain_tcp_tunnels_once(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
+    startup_cluster_id: &ClusterId,
+    startup_node_id: &NodeId,
 ) -> Result<TcpTunnelMaintenanceOutcome, DaemonError> {
     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths)?;
     match read_cluster_state_without_kv(&cluster_paths) {
+        Ok(state)
+            if !tcp_tunnel_state_matches_startup_identity(
+                &state,
+                startup_cluster_id,
+                startup_node_id,
+            ) =>
+        {
+            close_all_tcp_tunnels_for_cluster_transition(
+                "daemon identity changed; retiring prior-identity authenticated tcp tunnels",
+            );
+            return Ok(TcpTunnelMaintenanceOutcome {
+                local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+                state: TcpTunnelMaintenanceState::IdentityChanged,
+            });
+        }
         Ok(state) if tcp_tunnel_registry_accepts_cluster_state(&TCP_TUNNELS, &state) => {}
         Ok(state) => {
             return Ok(TcpTunnelMaintenanceOutcome {
@@ -1624,8 +2086,16 @@ async fn maintain_tcp_tunnels_once(
     // diverge from the bootstrap state file. Use the merged resident snapshot
     // for every peer authorization and route choice in this maintenance pass.
     let state = read_cluster_state_cached_shared(&cluster_paths).map_err(DaemonError::from)?;
+    if !tcp_tunnel_state_matches_startup_identity(&state, startup_cluster_id, startup_node_id) {
+        close_all_tcp_tunnels_for_cluster_transition(
+            "daemon identity changed; retiring prior-identity authenticated tcp tunnels",
+        );
+        return Ok(TcpTunnelMaintenanceOutcome {
+            local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            state: TcpTunnelMaintenanceState::IdentityChanged,
+        });
+    }
     let local_node_role = sinomo_core::network::cluster_local_node_role(&state);
-    prune_stale_tcp_tunnel_connectivity(paths, runtime).await?;
     let selector = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state);
     let mut endpoints =
         selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
@@ -1649,49 +2119,12 @@ async fn maintain_tcp_tunnels_once(
             .await;
             continue;
         }
-        if TCP_TUNNELS
-            .get(&peer_node_id)
-            .is_some_and(|handle| handle.active_streams.load(Ordering::Acquire) > 0)
-        {
-            // A canonical session has its own five-second no-progress policy,
-            // while the physical reader marks disconnects immediately. Do not
-            // enqueue the 1.5-second maintenance ping behind live transfer
-            // traffic and falsely evict an otherwise progressing tunnel.
-            let synthetic = tcp_tunnel_synthetic_endpoint(&state.local_node_id, &peer_node_id);
-            remember_tcp_tunnel_connectivity(
-                paths,
-                &synthetic,
-                sinomo_core::network::ClusterConnectivityState::Healthy,
-                Some(runtime),
-            )
-            .await;
+        if TCP_TUNNELS.get(&peer_node_id).is_some() {
+            // The physical reader owns immediate disconnect detection and each
+            // logical session owns its progress deadline. Cluster connectivity
+            // probing owns endpoint liveness, so a healthy retained carrier
+            // needs no second tunnel ping.
             live_peers.insert(peer_node_id);
-            continue;
-        }
-        match ping_tcp_tunnel_peer(&state.local_node_id, &peer_node_id, paths, runtime).await {
-            Ok(()) => {
-                let synthetic = tcp_tunnel_synthetic_endpoint(&state.local_node_id, &peer_node_id);
-                remember_tcp_tunnel_connectivity(
-                    paths,
-                    &synthetic,
-                    sinomo_core::network::ClusterConnectivityState::Healthy,
-                    Some(runtime),
-                )
-                .await;
-                live_peers.insert(peer_node_id);
-            }
-            Err(error) => {
-                evict_tcp_tunnel_peer(&peer_node_id, format!("maintenance ping failed: {error}"))
-                    .await;
-                let synthetic = tcp_tunnel_synthetic_endpoint(&state.local_node_id, &peer_node_id);
-                remember_tcp_tunnel_connectivity(
-                    paths,
-                    &synthetic,
-                    sinomo_core::network::ClusterConnectivityState::Unreachable,
-                    Some(runtime),
-                )
-                .await;
-            }
         }
     }
     for endpoint in candidate_endpoints {
@@ -1711,10 +2144,10 @@ async fn maintain_tcp_tunnels_once(
     let has_unresolved_candidates = candidate_peers
         .iter()
         .any(|peer_node_id| !live_peers.contains(peer_node_id));
-    let maintenance_state = if has_active_streams {
-        TcpTunnelMaintenanceState::Active
-    } else if has_unresolved_candidates {
+    let maintenance_state = if has_unresolved_candidates {
         TcpTunnelMaintenanceState::RetryNeeded
+    } else if has_active_streams {
+        TcpTunnelMaintenanceState::Active
     } else if has_tunnels {
         TcpTunnelMaintenanceState::IdleConnected
     } else {
@@ -2405,7 +2838,7 @@ where
         let ingress = channel_ingress.ok_or_else(|| NetworkError::Serialization {
             detail: "peer sent fixed channel Data without an active object RPC channel".to_string(),
         })?;
-        let frame = read_object_rpc_channel_transport_frame_async(
+        let (frame, timing) = read_object_rpc_channel_transport_frame_async_timed(
             &mut replay,
             options,
             receive_pool,
@@ -2414,7 +2847,7 @@ where
         .await?;
         return match frame {
             ObjectRpcChannelTransportFrame::Data(frame) => {
-                Ok((TcpTunnelInboundFrame::FixedChannelData(frame), None))
+                Ok((TcpTunnelInboundFrame::FixedChannelData(frame), timing))
             }
             ObjectRpcChannelTransportFrame::Control(_) => Err(NetworkError::Serialization {
                 detail: "SCDF tunnel reader decoded an unexpected control frame".to_string(),
@@ -2618,6 +3051,13 @@ async fn tcp_tunnel_reader_loop(
         };
         match frame {
             TcpTunnelInboundFrame::FixedChannelData(frame) => {
+                if let Some(ingress) = handle.object_rpc_channel_ingress.as_ref() {
+                    ingress.record_data_frame_read_timeline(
+                        &frame.header,
+                        read_timing,
+                        network_timeline_flag::TUNNEL_CARRIER,
+                    );
+                }
                 let receive = handle
                     .object_rpc_channel_ingress
                     .as_ref()
@@ -2826,6 +3266,8 @@ mod tests {
     use super::*;
     use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource};
 
+    static TIMELINE_CAPTURE_TEST: Mutex<()> = Mutex::new(());
+
     fn test_tunnel_handle(
         node_name: &str,
         tx: mpsc::Sender<ClusterTcpTunnelFrame>,
@@ -2935,6 +3377,13 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_v4_mixed_reader_validates_and_delivers_fixed_channel_data() {
+        let _capture_guard = TIMELINE_CAPTURE_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sinomo_core::network::network_timeline_capture_is_active() {
+            let _ = sinomo_core::network::stop_network_timeline_capture();
+        }
+        sinomo_core::network::start_network_timeline_capture(64).expect("start capture");
         let ObjectRpcChannelEndpoint {
             client: _client,
             mut server,
@@ -2948,7 +3397,9 @@ mod tests {
         let call_id = sinomo_core::network::ObjectRpcChannelCallId(1);
         let payload = vec![0x73; 64 * 1024];
         let request = ObjectRpcRequest::encode_body("/test/tunnel-v4/fixed-data", "test", &"head")
-            .expect("request head");
+            .expect("request head")
+            .with_traceparent("00-51515151515151515151515151515151-5252525252525252-01")
+            .with_observe_sampled(true);
         ingress
             .receive_control(ObjectRpcChannelWireFrame::Request {
                 call_id,
@@ -2988,10 +3439,18 @@ mod tests {
         )
         .await
         .expect("read mixed tunnel frame");
-        assert!(timing.is_none(), "fixed Data bypasses SOBJ decode timing");
+        let timing = timing.expect("fixed Data read timing");
+        assert_ne!(timing.capture_generation, 0);
+        assert!(timing.body_read_completed_monotonic_ns >= timing.first_read_monotonic_ns);
+        assert!(timing.decoded_monotonic_ns >= timing.decode_started_monotonic_ns);
         let TcpTunnelInboundFrame::FixedChannelData(frame) = frame else {
             panic!("expected fixed tunnel Data");
         };
+        ingress.record_data_frame_read_timeline(
+            &frame.header,
+            Some(timing),
+            network_timeline_flag::TUNNEL_CARRIER,
+        );
         ingress.receive_data(frame).expect("deliver fixed Data");
         ingress
             .receive_control(ObjectRpcChannelWireFrame::BodyEnd {
@@ -3009,6 +3468,19 @@ mod tests {
             .await
             .expect("collect fixed Data");
         assert_eq!(received, payload);
+        let snapshot = sinomo_core::network::stop_network_timeline_capture().expect("stop capture");
+        for stage in [
+            sinomo_core::network::network_timeline_stage::FRAME_FIRST_READ,
+            sinomo_core::network::network_timeline_stage::FRAME_READ,
+            sinomo_core::network::network_timeline_stage::FRAME_DECODE,
+        ] {
+            assert!(snapshot.events.iter().any(|event| {
+                event.call_id == call_id.0
+                    && event.stage == stage
+                    && event.flags & network_timeline_flag::DATA_FRAME != 0
+                    && event.flags & network_timeline_flag::TUNNEL_CARRIER != 0
+            }));
+        }
     }
 
     #[test]
@@ -3843,117 +4315,246 @@ mod tests {
         assert!(!tcp_tunnel_should_maintain_outbound(&first, &first));
     }
 
+    #[tokio::test]
+    async fn tcp_tunnel_maintenance_consumes_exact_source_generation_before_sleep() {
+        let sources = TcpTunnelMaintenanceSources::default();
+        let completed = sources.generations();
+        sources.request(TcpTunnelMaintenanceReason::MembershipChanged);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let wake = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_tcp_tunnel_maintenance_wake(&sources, completed, None, &mut shutdown_rx),
+        )
+        .await
+        .expect("pre-issued source generation should be retained");
+
+        assert_eq!(wake, TcpTunnelMaintenanceWake::SourceChanged);
+        assert_eq!(sources.generations().membership, completed.membership + 1);
+        assert_eq!(sources.generations().role, completed.role);
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_healthy_idle_has_no_maintenance_deadline() {
+        let sources = TcpTunnelMaintenanceSources::default();
+        let completed = sources.generations();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                wait_for_tcp_tunnel_maintenance_wake(&sources, completed, None, &mut shutdown_rx,)
+            )
+            .await
+            .is_err(),
+            "a healthy tunnel owner must remain asleep without a source edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_maintenance_shutdown_wins_over_pending_refresh() {
+        let sources = TcpTunnelMaintenanceSources::default();
+        let completed = sources.generations();
+        sources.request(TcpTunnelMaintenanceReason::SessionDisconnected);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send_replace(true);
+
+        let wake =
+            wait_for_tcp_tunnel_maintenance_wake(&sources, completed, None, &mut shutdown_rx).await;
+
+        assert_eq!(wake, TcpTunnelMaintenanceWake::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_shutdown_interrupts_inflight_maintenance() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let maintenance = tokio::spawn(async move {
+            wait_for_tcp_tunnel_maintenance_or_shutdown(
+                std::future::pending::<()>(),
+                &mut shutdown_rx,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        shutdown_tx.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(1), maintenance)
+            .await
+            .expect("shutdown must interrupt tunnel maintenance")
+            .expect("maintenance task");
+
+        assert_eq!(result, None);
+    }
+
     #[test]
-    fn tcp_tunnel_workstation_and_server_maintenance_cadence_is_unchanged() {
+    fn tcp_tunnel_maintenance_is_fenced_to_startup_identity() {
+        let cluster_id = ClusterId::from_legacy_named("tcp_tunnel_startup_identity_cluster")
+            .expect("cluster id");
+        let node_id =
+            NodeId::from_legacy_named("tcp_tunnel_startup_identity_node").expect("node id");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "tcp tunnel startup identity",
+            node_id.clone(),
+            "node",
+            "pk-node",
+            time::OffsetDateTime::now_utc(),
+        );
+
+        assert!(tcp_tunnel_state_matches_startup_identity(
+            &state,
+            &cluster_id,
+            &node_id,
+        ));
+        assert!(!tcp_tunnel_state_matches_startup_identity(
+            &state,
+            &ClusterId::from_legacy_named("tcp_tunnel_other_cluster").expect("other cluster"),
+            &node_id,
+        ));
+        assert!(!tcp_tunnel_state_matches_startup_identity(
+            &state,
+            &cluster_id,
+            &NodeId::from_legacy_named("tcp_tunnel_other_node").expect("other node"),
+        ));
+    }
+
+    #[test]
+    fn tcp_tunnel_topology_subscription_setup_failure_is_returned() {
+        let paths = DaemonPaths::with_root(std::path::PathBuf::from("/"));
+        let node_id =
+            NodeId::from_legacy_named("tcp_tunnel_subscription_failure_node").expect("node id");
+
+        let error = subscribe_tcp_tunnel_topology_sources(&paths, &node_id)
+            .expect_err("a daemon root without a data-directory parent must fail setup");
+
+        assert!(matches!(
+            error,
+            DaemonError::Io { detail, .. }
+                if detail == "daemon paths have no data directory parent"
+        ));
+    }
+
+    #[test]
+    fn tcp_tunnel_healthy_states_never_own_a_timer() {
+        let now = Instant::now();
         for role in [
             ClusterNodeRole::Workstation,
+            ClusterNodeRole::Mobile,
             ClusterNodeRole::Server,
+            ClusterNodeRole::Sensor,
             ClusterNodeRole::Test,
         ] {
             for state in [
                 TcpTunnelMaintenanceState::Active,
-                TcpTunnelMaintenanceState::RetryNeeded,
                 TcpTunnelMaintenanceState::IdleConnected,
                 TcpTunnelMaintenanceState::Quiescent,
             ] {
                 assert_eq!(
-                    tcp_tunnel_maintenance_interval(&role, state, 32),
-                    TCP_TUNNEL_MAINTENANCE_INTERVAL,
-                    "unexpected cadence for {role:?} in {state:?}"
+                    tcp_tunnel_maintenance_next_deadline(now, &role, state, 20),
+                    None,
+                    "healthy {role:?}/{state:?} unexpectedly owns a deadline"
                 );
             }
         }
     }
 
-    #[tokio::test]
-    async fn tcp_tunnel_maintenance_consumes_refresh_requested_before_sleep() {
-        let refresh_notify = Notify::new();
-        refresh_notify.notify_one();
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-
-        let wake = tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_tcp_tunnel_maintenance_wake(
-                Duration::from_secs(60),
-                &mut shutdown_rx,
-                &refresh_notify,
-            ),
-        )
-        .await
-        .expect("pre-issued maintenance refresh should be retained");
-
-        assert_eq!(wake, TcpTunnelMaintenanceWake::RefreshRequested);
-    }
-
-    #[tokio::test]
-    async fn tcp_tunnel_maintenance_zero_interval_elapses_without_refresh() {
-        let refresh_notify = Notify::new();
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-
-        let wake =
-            wait_for_tcp_tunnel_maintenance_wake(Duration::ZERO, &mut shutdown_rx, &refresh_notify)
-                .await;
-
-        assert_eq!(wake, TcpTunnelMaintenanceWake::IntervalElapsed);
-    }
-
-    #[tokio::test]
-    async fn tcp_tunnel_maintenance_shutdown_wins_over_pending_refresh() {
-        let refresh_notify = Notify::new();
-        refresh_notify.notify_one();
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        shutdown_tx.send_replace(true);
-
-        let wake = wait_for_tcp_tunnel_maintenance_wake(
-            Duration::from_secs(60),
-            &mut shutdown_rx,
-            &refresh_notify,
-        )
-        .await;
-
-        assert_eq!(wake, TcpTunnelMaintenanceWake::Shutdown);
-    }
-
     #[test]
-    fn tcp_tunnel_low_power_roles_back_off_when_idle_but_not_while_active() {
-        for role in [ClusterNodeRole::Mobile, ClusterNodeRole::Sensor] {
-            let idle_interval =
-                sinomo_core::network::cluster_network_probe_interval_for_role(&role);
-            assert_eq!(
-                tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::IdleConnected, 0),
-                idle_interval
-            );
-            assert_eq!(
-                tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::Quiescent, 0),
-                idle_interval
-            );
-            assert_eq!(
-                tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::Active, 20),
-                TCP_TUNNEL_MAINTENANCE_INTERVAL
-            );
-        }
-    }
-
-    #[test]
-    fn tcp_tunnel_mobile_retry_backoff_is_bounded_by_network_cadence() {
-        let role = ClusterNodeRole::Mobile;
-        let idle_interval = sinomo_core::network::cluster_network_probe_interval_for_role(&role);
-
+    fn tcp_tunnel_retry_backoff_is_bounded_by_role_network_cadence() {
         assert_eq!(
-            tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::RetryNeeded, 1),
+            tcp_tunnel_maintenance_retry_delay(&ClusterNodeRole::Workstation, 1),
             Duration::from_secs(2)
         );
         assert_eq!(
-            tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::RetryNeeded, 2),
+            tcp_tunnel_maintenance_retry_delay(&ClusterNodeRole::Workstation, 2),
             Duration::from_secs(4)
         );
         assert_eq!(
-            tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::RetryNeeded, 8),
+            tcp_tunnel_maintenance_retry_delay(&ClusterNodeRole::Mobile, 8),
             Duration::from_secs(256)
         );
         assert_eq!(
-            tcp_tunnel_maintenance_interval(&role, TcpTunnelMaintenanceState::RetryNeeded, 20),
-            idle_interval
+            tcp_tunnel_maintenance_retry_delay(&ClusterNodeRole::Workstation, 20),
+            sinomo_core::network::cluster_network_probe_interval_for_role(
+                &ClusterNodeRole::Workstation
+            )
+        );
+        assert_eq!(
+            tcp_tunnel_maintenance_retry_delay(&ClusterNodeRole::Sensor, 20),
+            sinomo_core::network::cluster_network_probe_interval_for_role(&ClusterNodeRole::Sensor)
+        );
+    }
+
+    #[test]
+    fn tcp_tunnel_topology_projection_ignores_volatile_member_refreshes() {
+        let cluster_id =
+            ClusterId::from_legacy_named("tcp_tunnel_projection_cluster").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("tcp_tunnel_projection_local").expect("local node id");
+        let peer = NodeId::from_legacy_named("tcp_tunnel_projection_peer").expect("peer node id");
+        let member_key = sinomo_core::node::cluster_member_key(&local);
+        let now = time::OffsetDateTime::now_utc();
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            local,
+            "local",
+            "public-key-a",
+            now,
+        );
+        member.endpoints.push(ClusterEndpointRecord {
+            endpoint_id: sinomo_core::Id::from_legacy_named("tcp_tunnel_projection_endpoint")
+                .expect("endpoint id"),
+            node_id: peer,
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.2:21353".to_string(),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: Some(1),
+        });
+        let mut store = sinomo_core::kv::InProcessKvStore::new();
+        store
+            .put_serde(member_key.clone(), &member, None)
+            .expect("seed member");
+        let mut projection = TcpTunnelTopologyProjection::default();
+        projection.seed_if_newer(&store.snapshot().expect("seed snapshot"), &member_key);
+
+        let mut volatile = member.clone();
+        volatile.display_name = "renamed but same tunnel topology".to_string();
+        volatile.updated_at = now + time::Duration::seconds(30);
+        volatile.endpoints[0].last_observed_latency_ms = Some(999);
+        store
+            .put_serde(member_key.clone(), &volatile, None)
+            .expect("refresh volatile member fields");
+        assert_eq!(
+            projection.observe(&store.snapshot().expect("volatile snapshot"), &member_key,),
+            TcpTunnelTopologyChanges::default(),
+            "timestamps, display metadata, and endpoint latency are not tunnel topology"
+        );
+
+        let mut auth_changed = volatile.clone();
+        auth_changed.node_public_key = "public-key-b".to_string();
+        store
+            .put_serde(member_key.clone(), &auth_changed, None)
+            .expect("change member auth material");
+        assert_eq!(
+            projection.observe(&store.snapshot().expect("auth snapshot"), &member_key),
+            TcpTunnelTopologyChanges {
+                membership: true,
+                role: false,
+            }
+        );
+
+        let mut role_changed = auth_changed;
+        role_changed.node_role = ClusterNodeRole::Server;
+        store
+            .put_serde(member_key.clone(), &role_changed, None)
+            .expect("change local role");
+        assert_eq!(
+            projection.observe(&store.snapshot().expect("role snapshot"), &member_key),
+            TcpTunnelTopologyChanges {
+                membership: true,
+                role: true,
+            }
         );
     }
 

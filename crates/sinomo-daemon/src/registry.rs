@@ -144,7 +144,25 @@ pub fn module_object_rpc_route_descriptor_to_network(
     for permission in &descriptor.required_local_permissions {
         route = route.require_local_permission(permission);
     }
+    route.request_body_mode = native_module_body_mode_to_network(descriptor.request_body_mode);
+    route.response_body_mode = native_module_body_mode_to_network(descriptor.response_body_mode);
     route
+}
+
+fn native_module_body_mode_to_network(
+    mode: sinomo_module_api::NativeModuleBodyMode,
+) -> sinomo_core::network::ObjectRpcBodyMode {
+    match mode {
+        sinomo_module_api::NativeModuleBodyMode::None => {
+            sinomo_core::network::ObjectRpcBodyMode::None
+        }
+        sinomo_module_api::NativeModuleBodyMode::Optional => {
+            sinomo_core::network::ObjectRpcBodyMode::Optional
+        }
+        sinomo_module_api::NativeModuleBodyMode::Required => {
+            sinomo_core::network::ObjectRpcBodyMode::Required
+        }
+    }
 }
 
 pub fn module_registration_object_rpc_route_descriptors(
@@ -295,12 +313,16 @@ pub fn network_module_surfaces() -> sinomo_module::ModuleSurfaces {
         .with_storage_owner(sinomo_core::network::SINOMO_NETWORK_MODULE_OWNER);
 
     for tool in sinomo_core::network::NETWORK_OBJECT_RPC_TOOL_SURFACES {
-        surfaces = surfaces.with_object_rpc_route(sinomo_module::ModuleObjectRpcRoute::new(
-            tool.route,
-            tool.category,
-            tool.operation,
-            module_route_auth(tool.auth),
-        ));
+        surfaces = surfaces.with_object_rpc_route(
+            sinomo_module::ModuleObjectRpcRoute::new(
+                tool.route,
+                tool.category,
+                tool.operation,
+                module_route_auth(tool.auth),
+            )
+            .with_request_body_mode(network_body_mode_to_native_module(tool.request_body_mode))
+            .with_response_body_mode(network_body_mode_to_native_module(tool.response_body_mode)),
+        );
     }
 
     for resource in sinomo_core::network::NETWORK_DECLARATIVE_RESOURCE_SURFACES {
@@ -374,6 +396,22 @@ fn module_route_auth(
         }
         sinomo_core::network::NetworkModuleRouteAuth::Admin => {
             sinomo_module::ModuleRouteAuth::Admin
+        }
+    }
+}
+
+fn network_body_mode_to_native_module(
+    mode: sinomo_core::network::ObjectRpcBodyMode,
+) -> sinomo_module_api::NativeModuleBodyMode {
+    match mode {
+        sinomo_core::network::ObjectRpcBodyMode::None => {
+            sinomo_module_api::NativeModuleBodyMode::None
+        }
+        sinomo_core::network::ObjectRpcBodyMode::Optional => {
+            sinomo_module_api::NativeModuleBodyMode::Optional
+        }
+        sinomo_core::network::ObjectRpcBodyMode::Required => {
+            sinomo_module_api::NativeModuleBodyMode::Required
         }
     }
 }
@@ -672,6 +710,8 @@ mod tests {
             "remote.management.status.read",
             sinomo_module::ModuleRouteAuth::Admin,
         )
+        .with_request_body_mode(sinomo_module_api::NativeModuleBodyMode::Optional)
+        .with_response_body_mode(sinomo_module_api::NativeModuleBodyMode::Required)
         .require_local_permissions(["remote-management", "device:display"])
         .descriptor()
         .expect("module route descriptor");
@@ -681,6 +721,14 @@ mod tests {
         assert_eq!(
             network.required_local_permissions,
             vec!["remote-management", "device:display"]
+        );
+        assert_eq!(
+            network.request_body_mode,
+            sinomo_core::network::ObjectRpcBodyMode::Optional
+        );
+        assert_eq!(
+            network.response_body_mode,
+            sinomo_core::network::ObjectRpcBodyMode::Required
         );
     }
 
@@ -763,6 +811,10 @@ mod tests {
                         && route.category == sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY
                         && route.operation == sinomo_core::network::CLUSTER_NETWORK_PING_CAPABILITY
                         && route.auth == sinomo_module::ModuleRouteAuth::LocalOrClusterMember
+                        && route.request_body_mode
+                            == sinomo_module_api::NativeModuleBodyMode::Optional
+                        && route.response_body_mode
+                            == sinomo_module_api::NativeModuleBodyMode::Optional
                 )
         );
 
@@ -783,6 +835,19 @@ mod tests {
                 )
                 .expect("capability")
             ]
+        );
+        let ping_descriptor = registration
+            .surfaces
+            .object_rpc_route_descriptor(sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE)
+            .expect("network surfaces are valid")
+            .expect("network ping route descriptor");
+        assert_eq!(
+            ping_descriptor.request_body_mode,
+            sinomo_module_api::NativeModuleBodyMode::Optional
+        );
+        assert_eq!(
+            ping_descriptor.response_body_mode,
+            sinomo_module_api::NativeModuleBodyMode::Optional
         );
         assert!(
             registration

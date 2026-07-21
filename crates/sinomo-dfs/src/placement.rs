@@ -4,12 +4,13 @@ use crate::control_plane::DfsPlacementAuthorityPermit;
 use crate::distributed::explain_replicas_best_effort;
 use crate::posix_path::normalize_posix_path;
 use crate::{
-    DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystemConfig, DfsFileSystemId,
-    DfsMessageTransport, DfsNamespaceOperation, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsObjectPage, DfsObjectPageCursor, DfsPlacementScope, DfsReplicaCandidate,
-    DfsReplicaPlacementExplanation, DfsReplicaPlacementRequest, DfsReplicationPolicy, DfsStat,
-    DfsSubtreePolicy, DfsVersion, DfsWriteIntentState, DistributedWriteIntent, NetworkedDfsService,
-    dfs_now_unix_nanos, explain_replicas, validate_replication_plan,
+    DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
+    DfsFileSystemId, DfsMessageTransport, DfsNamespaceOperation, DfsNodeAdvertisement, DfsObjectId,
+    DfsObjectKind, DfsObjectMetadata, DfsObjectPage, DfsObjectPageCursor, DfsPlacementScope,
+    DfsReplicaCandidate, DfsReplicaPlacementExplanation, DfsReplicaPlacementRequest,
+    DfsReplicationPolicy, DfsStat, DfsSubtreePolicy, DfsVersion, DfsWriteIntentState,
+    DistributedWriteIntent, NetworkedDfsService, dfs_now_unix_nanos, explain_replicas,
+    validate_replication_plan,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::{
@@ -196,19 +197,77 @@ pub fn upsert_placement_rule(
     rules: &mut Vec<DfsSubtreePolicy>,
     rule: DfsSubtreePolicy,
 ) -> Option<DfsSubtreePolicy> {
-    if let Some(existing) = rules
+    let previous = if let Some(existing) = rules
         .iter_mut()
         .find(|existing| existing.path_prefix == rule.path_prefix && existing.scope == rule.scope)
     {
-        return Some(std::mem::replace(existing, rule));
-    }
-    rules.push(rule);
+        Some(std::mem::replace(existing, rule))
+    } else {
+        rules.push(rule);
+        None
+    };
+    canonicalize_placement_rule_order(rules);
+    previous
+}
+
+/// Canonicalize only the ordering that placement resolution proves irrelevant.
+///
+/// Different `(path_prefix, scope)` identities have explicit path-depth and
+/// scope precedence, so their input order cannot select a winner. Duplicate
+/// identities are different: legacy data can contain them and the current
+/// exact/tied lookup behavior observes their relative order. `sort_by` is
+/// stable, which gives us a deterministic inter-identity order without
+/// changing that duplicate-rule precedence.
+fn canonicalize_placement_rule_order(rules: &mut [DfsSubtreePolicy]) {
     rules.sort_by(|left, right| {
         left.path_prefix
             .cmp(&right.path_prefix)
             .then_with(|| placement_scope_rank(left.scope).cmp(&placement_scope_rank(right.scope)))
     });
-    None
+}
+
+fn canonical_subtree_policies(rules: &[DfsSubtreePolicy]) -> Vec<DfsSubtreePolicy> {
+    let mut canonical = rules.to_vec();
+    for rule in &mut canonical {
+        // Placement constraints are sets: `DfsReplicationPolicy` sorts and
+        // deduplicates both lists before validation or planning. Mirror that
+        // established consumption semantics when deciding whether metadata
+        // changed, without rewriting the durable rule itself.
+        rule.required_node_ids.sort();
+        rule.required_node_ids.dedup();
+        rule.forbidden_node_ids.sort();
+        rule.forbidden_node_ids.dedup();
+    }
+    canonicalize_placement_rule_order(&mut canonical);
+    canonical
+}
+
+/// Compare filesystem metadata using placement semantics rather than the
+/// incidental order in which distinct subtree rules were discovered.
+///
+/// This deliberately does not normalize path aliases, legacy count defaults,
+/// or the relative order of duplicate `(path_prefix, scope)` rules. Those can
+/// affect current resolution. Required/forbidden node lists are canonicalized
+/// as sets because the placement planner already does so before use.
+pub(crate) fn dfs_file_system_semantically_eq(left: &DfsFileSystem, right: &DfsFileSystem) -> bool {
+    left == right
+        || (left.file_system_id == right.file_system_id
+            && left.display_name == right.display_name
+            && left.owner_node_id == right.owner_node_id
+            && canonical_subtree_policies(&left.subtree_policies)
+                == canonical_subtree_policies(&right.subtree_policies))
+}
+
+pub(crate) fn dfs_file_system_config_semantically_eq(
+    left: &DfsFileSystemConfig,
+    right: &DfsFileSystemConfig,
+) -> bool {
+    left == right
+        || (left.file_system_id == right.file_system_id
+            && left.display_name == right.display_name
+            && left.owner_node_id == right.owner_node_id
+            && canonical_subtree_policies(&left.subtree_policies)
+                == canonical_subtree_policies(&right.subtree_policies))
 }
 
 pub fn remove_placement_rule(
@@ -3183,6 +3242,7 @@ mod tests {
             file_system_id: sifs_file_system_id(),
             path: path.to_string(),
             kind,
+            tombstone_provenance: None,
             owner_node_id,
             current_locations,
             content_hash,
@@ -3219,6 +3279,187 @@ mod tests {
             Some(policy),
             DfsPlacementScope::SelfOnly,
         )
+    }
+
+    #[test]
+    fn filesystem_semantics_ignore_distinct_subtree_rule_discovery_order() {
+        let owner = node("owner");
+        let subtree = DfsSubtreePolicy::legacy("/users/team", DfsObjectPolicy::ReplicatedEventual);
+        let self_only = DfsSubtreePolicy {
+            path_prefix: "/users/team".to_string(),
+            policy: DfsObjectPolicy::ReplicatedConfirmed,
+            scope: DfsPlacementScope::SelfOnly,
+            min_commit_replicas: Some(2),
+            desired_replicas: Some(2),
+            required_node_ids: Vec::new(),
+            forbidden_node_ids: Vec::new(),
+            min_distinct_zones: 0,
+        };
+        let services = DfsSubtreePolicy::legacy("/services", DfsObjectPolicy::ReplicatedEventual);
+        let first = DfsFileSystem {
+            file_system_id: sifs_file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: vec![subtree, self_only, services],
+        };
+        let mut reordered = first.clone();
+        reordered.subtree_policies.reverse();
+
+        assert!(dfs_file_system_semantically_eq(&first, &reordered));
+
+        let first_config = DfsFileSystemConfig::from(&first);
+        let reordered_config = DfsFileSystemConfig::from(&reordered);
+        assert!(dfs_file_system_config_semantically_eq(
+            &first_config,
+            &reordered_config
+        ));
+        for path in ["/users/team", "/users/team/report.md", "/services/api"] {
+            assert_eq!(
+                resolve_placement_policy(
+                    &first_config,
+                    path,
+                    DfsObjectPolicy::ReplicatedEventual,
+                    2,
+                )
+                .expect("first policy"),
+                resolve_placement_policy(
+                    &reordered_config,
+                    path,
+                    DfsObjectPolicy::ReplicatedEventual,
+                    2,
+                )
+                .expect("reordered policy"),
+                "distinct rule discovery order must not change resolution for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_semantics_preserve_duplicate_rule_precedence() {
+        let owner = node("owner");
+        let eventual = DfsSubtreePolicy::legacy("/users/team", DfsObjectPolicy::ReplicatedEventual);
+        let confirmed =
+            DfsSubtreePolicy::legacy("/users/team", DfsObjectPolicy::ReplicatedConfirmed);
+        let first = DfsFileSystem {
+            file_system_id: sifs_file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: vec![eventual.clone(), confirmed.clone()],
+        };
+        let reversed = DfsFileSystem {
+            subtree_policies: vec![confirmed, eventual],
+            ..first.clone()
+        };
+
+        assert!(
+            !dfs_file_system_semantically_eq(&first, &reversed),
+            "duplicate path/scope order remains durable precedence state"
+        );
+        let first_policy = resolve_placement_policy(
+            &DfsFileSystemConfig::from(&first),
+            "/users/team/report.md",
+            DfsObjectPolicy::ReplicatedEventual,
+            2,
+        )
+        .expect("first duplicate ordering");
+        let reversed_policy = resolve_placement_policy(
+            &DfsFileSystemConfig::from(&reversed),
+            "/users/team/report.md",
+            DfsObjectPolicy::ReplicatedEventual,
+            2,
+        )
+        .expect("reversed duplicate ordering");
+        assert_ne!(
+            first_policy.policy.consistency, reversed_policy.policy.consistency,
+            "the fixture must prove why a stable canonical sort preserves duplicate order"
+        );
+    }
+
+    #[test]
+    fn filesystem_semantics_treat_replica_constraints_as_sets() {
+        let owner = node("owner");
+        let first_rule = DfsSubtreePolicy {
+            path_prefix: "/users/team".to_string(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            scope: DfsPlacementScope::Subtree,
+            min_commit_replicas: Some(1),
+            desired_replicas: Some(3),
+            required_node_ids: vec![node("node-b"), node("node-a"), node("node-a")],
+            forbidden_node_ids: vec![node("node-d"), node("node-c")],
+            min_distinct_zones: 0,
+        };
+        let reordered_rule = DfsSubtreePolicy {
+            required_node_ids: vec![node("node-a"), node("node-b")],
+            forbidden_node_ids: vec![node("node-c"), node("node-d"), node("node-d")],
+            ..first_rule.clone()
+        };
+        let first = DfsFileSystem {
+            file_system_id: sifs_file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: vec![first_rule.clone()],
+        };
+        let reordered = DfsFileSystem {
+            subtree_policies: vec![reordered_rule.clone()],
+            ..first.clone()
+        };
+
+        assert!(dfs_file_system_semantically_eq(&first, &reordered));
+        assert_eq!(
+            placement_policy_from_rule(&first_rule, 2)
+                .expect("first policy")
+                .replication_policy(BTreeMap::new())
+                .expect("first replication policy"),
+            placement_policy_from_rule(&reordered_rule, 2)
+                .expect("reordered policy")
+                .replication_policy(BTreeMap::new())
+                .expect("reordered replication policy"),
+            "replica constraints are normalized as sets by the planner"
+        );
+    }
+
+    #[test]
+    fn filesystem_semantics_do_not_assume_path_aliases_are_equivalent() {
+        let owner = node("owner");
+        let canonical = DfsFileSystem {
+            file_system_id: sifs_file_system_id(),
+            display_name: "sifs".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: vec![DfsSubtreePolicy::legacy(
+                "/users/team",
+                DfsObjectPolicy::ReplicatedConfirmed,
+            )],
+        };
+        let aliased = DfsFileSystem {
+            subtree_policies: vec![DfsSubtreePolicy::legacy(
+                "/users//team",
+                DfsObjectPolicy::ReplicatedConfirmed,
+            )],
+            ..canonical.clone()
+        };
+
+        assert!(
+            !dfs_file_system_semantically_eq(&canonical, &aliased),
+            "legacy stored paths remain observable until they are explicitly migrated"
+        );
+        let canonical_policy = resolve_placement_policy(
+            &DfsFileSystemConfig::from(&canonical),
+            "/users/team/report.md",
+            DfsObjectPolicy::ReplicatedEventual,
+            2,
+        )
+        .expect("canonical policy");
+        let aliased_policy = resolve_placement_policy(
+            &DfsFileSystemConfig::from(&aliased),
+            "/users/team/report.md",
+            DfsObjectPolicy::ReplicatedEventual,
+            2,
+        )
+        .expect("aliased policy");
+        assert_ne!(
+            canonical_policy.policy.consistency, aliased_policy.policy.consistency,
+            "the resolver normalizes the lookup path, not historical stored rule paths"
+        );
     }
 
     #[test]

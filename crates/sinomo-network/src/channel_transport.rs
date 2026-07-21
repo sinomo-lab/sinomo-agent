@@ -6,7 +6,8 @@
 
 use crate::channel_wire::{
     ObjectRpcChannelReceiveBufferPool, ObjectRpcChannelTransportFrame,
-    read_object_rpc_channel_transport_frame_async, write_object_rpc_channel_transport_frame_async,
+    read_object_rpc_channel_transport_frame_async_timed,
+    write_object_rpc_channel_transport_frame_async,
     write_object_rpc_channel_transport_frame_async_timed,
 };
 use crate::daemon_auth::{LocalChannelAuthIdentity, LocalChannelProofRole};
@@ -564,7 +565,7 @@ where
         let read = async move {
             let receive_pool = ObjectRpcChannelReceiveBufferPool::default_for_carrier();
             loop {
-                let frame = read_object_rpc_channel_transport_frame_async(
+                let (frame, read_timing) = read_object_rpc_channel_transport_frame_async_timed(
                     &mut reader,
                     ObjectFrameIoOptions::idle_timeout(no_progress_timeout),
                     &receive_pool,
@@ -583,6 +584,11 @@ where
                         read_ingress.receive_control(frame)?;
                     }
                     ObjectRpcChannelTransportFrame::Data(frame) => {
+                        read_ingress.record_data_frame_read_timeline(
+                            &frame.header,
+                            read_timing,
+                            network_timeline_flag::LOCAL_CARRIER,
+                        );
                         read_ingress.receive_data(frame)?;
                     }
                 }
@@ -897,6 +903,11 @@ mod tests {
 
     #[tokio::test]
     async fn local_carrier_streams_raw_scdf_data_in_both_directions() {
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(512).expect("start capture");
         let left = ObjectRpcChannelEndpoint::new(
             ObjectRpcChannelRole::Dialer,
             ObjectRpcChannelConfig::default(),
@@ -941,7 +952,9 @@ mod tests {
         let response_bytes = vec![0xa7; 1024 * 1024 + 31];
         let pending = client
             .call(ObjectRpcSessionCall::new(
-                ObjectRpcRequest::from_encoded_body("/test/scdf", "test", Vec::new()),
+                ObjectRpcRequest::from_encoded_body("/test/scdf", "test", Vec::new())
+                    .with_traceparent("00-31313131313131313131313131313131-3232323232323232-01")
+                    .with_observe_sampled(true),
                 ObjectRpcBodySource::bytes(request_bytes.clone()),
             ))
             .await
@@ -970,6 +983,22 @@ mod tests {
             .await
             .expect("response body");
         assert_eq!(received_response, response_bytes);
+
+        let snapshot = crate::stop_network_timeline_capture().expect("stop capture");
+        for stage in [
+            crate::network_timeline_stage::FRAME_FIRST_READ,
+            crate::network_timeline_stage::FRAME_READ,
+            crate::network_timeline_stage::FRAME_DECODE,
+        ] {
+            assert!(
+                snapshot.events.iter().any(|event| {
+                    event.stage == stage
+                        && event.flags & network_timeline_flag::DATA_FRAME != 0
+                        && event.flags & network_timeline_flag::LOCAL_CARRIER != 0
+                }),
+                "missing local SCDF Data receive stage {stage}"
+            );
+        }
 
         left_transport.close("test complete");
         right_transport.close("test complete");

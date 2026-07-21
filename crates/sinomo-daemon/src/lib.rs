@@ -79,6 +79,11 @@ pub use sinomo_api::{
 };
 
 pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        detail = %args,
+        "cluster join stage"
+    );
     let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));

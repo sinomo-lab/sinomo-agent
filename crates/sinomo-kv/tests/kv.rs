@@ -843,6 +843,242 @@ mod tests {
         );
     }
 
+    fn committed_request_record_for_byte_accounting(
+        log_index: u64,
+        payload_bytes: usize,
+    ) -> KvCommittedRequestRecord {
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        let command_digest = request.digest().expect("barrier digest");
+        KvCommittedRequestRecord {
+            request_id: request.request_id,
+            command_digest,
+            term: 1,
+            log_index,
+            revision: KvRevision::ZERO,
+            txn_response: (payload_bytes != 0).then(|| KvTxnResponse {
+                succeeded: true,
+                revision: KvRevision::ZERO,
+                responses: vec![KvOpResponse::Delete {
+                    key: "x".repeat(payload_bytes),
+                    deleted: false,
+                }],
+            }),
+        }
+    }
+
+    fn measured_committed_request_bytes(snapshot: &KvSnapshot) -> usize {
+        snapshot
+            .committed_requests
+            .iter()
+            .map(|record| {
+                encode_kv_value(record)
+                    .expect("encode committed request")
+                    .len()
+            })
+            .try_fold(0_usize, usize::checked_add)
+            .expect("test committed request byte total")
+    }
+
+    fn assert_committed_request_byte_cache(store: &InProcessKvStore) -> KvSnapshot {
+        let snapshot = store.try_snapshot().expect("snapshot byte-accounted store");
+        assert_eq!(
+            store.committed_request_encoded_bytes,
+            measured_committed_request_bytes(&snapshot),
+            "cached committed-request bytes must exactly match the retained records"
+        );
+        snapshot
+    }
+
+    #[test]
+    fn committed_request_byte_cache_tracks_insert_duplicate_and_overflow() {
+        let mut store = InProcessKvStore::new();
+        let record = committed_request_record_for_byte_accounting(1, 128);
+        let expected_bytes = encode_kv_value(&record)
+            .expect("encode inserted record")
+            .len();
+        store
+            .record_committed_request(record.clone())
+            .expect("insert committed request");
+        assert_eq!(store.committed_request_encoded_bytes, expected_bytes);
+        let inserted = assert_committed_request_byte_cache(&store);
+
+        let mut duplicate = record.clone();
+        duplicate.term = 99;
+        duplicate.log_index = 99;
+        duplicate.txn_response = Some(KvTxnResponse {
+            succeeded: false,
+            revision: KvRevision(99),
+            responses: vec![KvOpResponse::Delete {
+                key: "duplicate response is ignored".to_string(),
+                deleted: true,
+            }],
+        });
+        store
+            .record_committed_request(duplicate)
+            .expect("same-digest duplicate remains idempotent");
+        assert_eq!(
+            assert_committed_request_byte_cache(&store),
+            inserted,
+            "an idempotent duplicate must neither replace nor re-account the original record"
+        );
+
+        let conflicting = KvCommittedRequestRecord {
+            command_digest: kv_command_digest(&KvCommand::Op(KvOp::Delete {
+                key: "/different".to_string(),
+            }))
+            .expect("conflicting digest"),
+            ..record
+        };
+        assert!(matches!(
+            store.record_committed_request(conflicting),
+            Err(KvError::RequestIdConflict { .. })
+        ));
+        assert_eq!(assert_committed_request_byte_cache(&store), inserted);
+
+        let mut overflowed = InProcessKvStore::new();
+        overflowed.committed_request_encoded_bytes = usize::MAX;
+        let overflow_record = committed_request_record_for_byte_accounting(1, 0);
+        let overflow_id = overflow_record.request_id.clone();
+        assert_eq!(
+            overflowed
+                .record_committed_request(overflow_record)
+                .expect_err("cached byte addition must detect overflow"),
+            KvError::ResourceExhausted {
+                operation: "measure committed KV request records".to_string(),
+                requested_bytes: usize::MAX,
+            }
+        );
+        assert!(overflowed.committed_request(&overflow_id).is_none());
+        assert_eq!(overflowed.committed_request_encoded_bytes, usize::MAX);
+    }
+
+    #[test]
+    fn committed_request_byte_cache_tracks_count_eviction() {
+        let mut store = InProcessKvStore::new();
+        let mut request_ids = Vec::new();
+        request_ids
+            .try_reserve(MAX_COMMITTED_KV_REQUESTS.saturating_add(1))
+            .expect("reserve request ids");
+        for log_index in 1..=MAX_COMMITTED_KV_REQUESTS.saturating_add(1) {
+            let record = committed_request_record_for_byte_accounting(log_index as u64, 0);
+            request_ids.push(record.request_id.clone());
+            store
+                .record_committed_request(record)
+                .expect("record count-bounded request");
+        }
+
+        let snapshot = assert_committed_request_byte_cache(&store);
+        assert_eq!(snapshot.committed_requests.len(), MAX_COMMITTED_KV_REQUESTS);
+        assert!(store.request_id_expired(&request_ids[0]));
+        assert!(store.committed_request(&request_ids[0]).is_none());
+        assert!(
+            store
+                .committed_request(request_ids.last().expect("last id"))
+                .is_some()
+        );
+        assert!(store.committed_request_encoded_bytes <= MAX_COMMITTED_KV_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn committed_request_byte_cache_tracks_byte_and_oversized_eviction() {
+        let payload_bytes = MAX_COMMITTED_KV_REQUEST_BYTES / 2;
+        let first = committed_request_record_for_byte_accounting(1, payload_bytes);
+        let second = committed_request_record_for_byte_accounting(2, payload_bytes);
+        let first_id = first.request_id.clone();
+        let second_id = second.request_id.clone();
+        let first_bytes = encode_kv_value(&first).expect("encode first record").len();
+        let second_bytes = encode_kv_value(&second)
+            .expect("encode second record")
+            .len();
+        assert!(first_bytes <= MAX_COMMITTED_KV_REQUEST_BYTES);
+        assert!(second_bytes <= MAX_COMMITTED_KV_REQUEST_BYTES);
+        assert!(
+            first_bytes
+                .checked_add(second_bytes)
+                .expect("two-record byte total")
+                > MAX_COMMITTED_KV_REQUEST_BYTES
+        );
+
+        let mut store = InProcessKvStore::new();
+        store
+            .record_committed_request(first)
+            .expect("record first byte-bounded request");
+        store
+            .record_committed_request(second)
+            .expect("record second byte-bounded request");
+        let snapshot = assert_committed_request_byte_cache(&store);
+        assert_eq!(snapshot.committed_requests.len(), 1);
+        assert_eq!(store.committed_request_encoded_bytes, second_bytes);
+        assert!(store.request_id_expired(&first_id));
+        assert!(store.committed_request(&second_id).is_some());
+
+        let oversized = committed_request_record_for_byte_accounting(
+            1,
+            MAX_COMMITTED_KV_REQUEST_BYTES.saturating_add(1),
+        );
+        let oversized_id = oversized.request_id.clone();
+        assert!(
+            encode_kv_value(&oversized)
+                .expect("encode oversized record")
+                .len()
+                > MAX_COMMITTED_KV_REQUEST_BYTES
+        );
+        let mut oversized_store = InProcessKvStore::new();
+        oversized_store
+            .record_committed_request(oversized)
+            .expect("oversized record is immediately evicted");
+        let oversized_snapshot = assert_committed_request_byte_cache(&oversized_store);
+        assert!(oversized_snapshot.committed_requests.is_empty());
+        assert_eq!(oversized_store.committed_request_encoded_bytes, 0);
+        assert!(oversized_store.request_id_expired(&oversized_id));
+    }
+
+    #[test]
+    fn committed_request_byte_cache_survives_restore_clone_and_snapshot() {
+        let mut store = InProcessKvStore::new();
+        for (log_index, payload_bytes) in [(1, 0), (2, 64), (3, 1024)] {
+            store
+                .record_committed_request(committed_request_record_for_byte_accounting(
+                    log_index,
+                    payload_bytes,
+                ))
+                .expect("record restore source request");
+        }
+        let source_snapshot = assert_committed_request_byte_cache(&store);
+
+        let mut duplicate_snapshot = source_snapshot.clone();
+        duplicate_snapshot
+            .committed_requests
+            .push(source_snapshot.committed_requests[0].clone());
+        let restored =
+            InProcessKvStore::restore(duplicate_snapshot).expect("restore duplicate snapshot");
+        assert_eq!(
+            assert_committed_request_byte_cache(&restored),
+            source_snapshot,
+            "restore must retain the existing last-record-wins canonical snapshot semantics"
+        );
+
+        let mut cloned = restored.clone();
+        assert_eq!(
+            cloned.committed_request_encoded_bytes,
+            restored.committed_request_encoded_bytes
+        );
+        assert_eq!(
+            assert_committed_request_byte_cache(&cloned),
+            source_snapshot
+        );
+        cloned
+            .record_committed_request(committed_request_record_for_byte_accounting(4, 2048))
+            .expect("mutate cloned store");
+        let cloned_snapshot = assert_committed_request_byte_cache(&cloned);
+        assert_eq!(cloned_snapshot.committed_requests.len(), 4);
+        assert_eq!(
+            assert_committed_request_byte_cache(&restored),
+            source_snapshot,
+            "clone mutation must not affect the source records or cached total"
+        );
+    }
+
     #[test]
     fn cluster_raft_rpc_payloads_encode_kv_owned_bodies() {
         let node_id = NodeId::from_legacy_named("node_kv_raft_rpc_payloads").expect("node");
@@ -1532,6 +1768,36 @@ mod tests {
             b"old"
         );
 
+        let mut equal_revision_conflict = cached.clone();
+        equal_revision_conflict
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == "/deferred/a")
+            .expect("deferred conflict entry")
+            .value = b"conflict".to_vec();
+        assert_eq!(equal_revision_conflict.revision, cached.revision);
+        assert!(cluster_kv_snapshot_delta_only_deferable(
+            &cached,
+            &equal_revision_conflict,
+            key_can_defer,
+        ));
+        assert_eq!(
+            write_imported_cluster_kv_snapshot_if_changed(
+                &paths,
+                &equal_revision_conflict,
+                key_can_defer,
+            )
+            .expect_err("equal-revision divergence must not defer"),
+            KvError::ImportedSnapshotRevisionConflict {
+                revision: cached.revision,
+            }
+        );
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&paths).expect("read cache after rejected conflict"),
+            cached,
+            "a deferable-key predicate must not hide an equal-revision conflict"
+        );
+
         let mut durable_store = InProcessKvStore::restore(cached).expect("restore");
         durable_store
             .put("/durable/a", b"new".to_vec(), None)
@@ -1598,6 +1864,10 @@ mod tests {
         let restored_root = temp_raft_root("sinomo-kv-raft-publish-restored");
         let restored_paths = ClusterKvPaths::new(&restored_root);
         let restored_store = restored_paths.raft_store();
+        std::fs::create_dir_all(&restored_paths.root).expect("restored root");
+        std::fs::write(&restored_paths.snapshot, b"corrupt materialized snapshot")
+            .expect("corrupt materialized snapshot");
+        let generation_before = cluster_kv_watch_generation(&restored_paths);
         let outcome = RaftAppendEntriesApplyOutcome {
             response: RaftAppendEntriesResponse {
                 term: 1,
@@ -1612,6 +1882,11 @@ mod tests {
             .publish_append_entries_apply_outcome(&outcome, |_| true)
             .expect("publish restored append outcome");
         assert!(wrote);
+        assert_eq!(
+            cluster_kv_watch_generation(&restored_paths),
+            generation_before.saturating_add(1),
+            "authoritative snapshot restoration must notify local watch readers"
+        );
         let cached =
             read_cluster_kv_cached_snapshot(&restored_paths).expect("read restored snapshot");
         assert_eq!(
@@ -1621,6 +1896,47 @@ mod tests {
                 .value
                 .as_slice(),
             b"a"
+        );
+
+        let mut divergent_materialization = snapshot.clone();
+        divergent_materialization.revision = KvRevision(snapshot.revision.0.saturating_add(7));
+        divergent_materialization.events.clear();
+        let divergent_entry = divergent_materialization
+            .entries
+            .first_mut()
+            .expect("divergent entry");
+        divergent_entry.modify_revision = divergent_materialization.revision;
+        divergent_entry.version = KvVersion(divergent_entry.version.0.saturating_add(1));
+        assert!(kv_snapshot_durable_eq(
+            &divergent_materialization,
+            &snapshot
+        ));
+        assert_ne!(divergent_materialization, snapshot);
+        assert!(
+            write_cluster_kv_materialized_snapshot_if_changed(
+                &restored_paths,
+                &divergent_materialization,
+            )
+            .expect("seed divergent materialized bookkeeping")
+        );
+        let generation_before_exact_restore = cluster_kv_watch_generation(&restored_paths);
+        let wrote = restored_store
+            .publish_append_entries_apply_outcome(&outcome, |_| true)
+            .expect("replace divergent materialization from anchored snapshot");
+        assert!(
+            wrote,
+            "anchored restoration must replace durable-equivalent but non-identical bookkeeping"
+        );
+        assert_eq!(
+            cluster_kv_watch_generation(&restored_paths),
+            generation_before_exact_restore.saturating_add(1),
+            "exact authoritative replacement must wake local watch readers"
+        );
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&restored_paths)
+                .expect("read exact authoritative materialization"),
+            snapshot,
+            "anchored restoration must publish the exact authoritative snapshot"
         );
     }
 
@@ -5557,6 +5873,48 @@ mod tests {
     }
 
     #[test]
+    fn materialized_cache_locked_compare_reuses_full_identity_cache() {
+        let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
+        let root = temp_raft_root("sinomo-kv-locked-materialized-cache-hit");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let cache = paths.local_cache();
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/cached", b"value".to_vec(), None)
+            .expect("seed cache");
+        let snapshot = store.try_snapshot().expect("snapshot");
+        cache
+            .write_snapshot(&snapshot)
+            .expect("write materialized snapshot");
+        let cached = cache.cached_snapshot_arc().expect("read cached arc");
+        let strong_count_before = Arc::strong_count(&cached);
+
+        let compared = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        install_materialized_cache_raft_write_pause_for_test(
+            paths.snapshot.clone(),
+            compared.clone(),
+            resume.clone(),
+        );
+        let writer_cache = cache.clone();
+        let writer_snapshot = snapshot.clone();
+        let writer = std::thread::spawn(move || {
+            writer_cache.write_raft_snapshot_if_changed(&writer_snapshot)
+        });
+        compared.wait();
+        let strong_count_during_locked_compare = Arc::strong_count(&cached);
+        resume.wait();
+        let result = writer.join().expect("join cached writer");
+        clear_materialized_cache_raft_write_pause_for_test(&paths.snapshot);
+
+        assert!(!result.expect("skip durable-equivalent snapshot"));
+        assert!(
+            strong_count_during_locked_compare > strong_count_before,
+            "the locked comparison should retain the identity-validated cached Arc instead of decoding another snapshot"
+        );
+    }
+
+    #[test]
     fn materialized_cache_initial_write_skips_required_snapshot_read() {
         let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-cache-initial-write");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
@@ -5986,6 +6344,455 @@ mod tests {
             follower.store().try_snapshot().expect("follower snapshot"),
             leader_snapshot,
             "replaying indices 1..N must reconstruct the imported state once, not apply it on top of itself"
+        );
+    }
+
+    #[test]
+    fn behind_local_raft_publish_preserves_newer_imported_materialized_snapshot() {
+        let root = temp_raft_root("sinomo-kv-behind-raft-preserves-imported-cache");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let node_id = NodeId::from_legacy_named("node_behind_raft_preserves_import").expect("node");
+        let cache = paths.local_cache();
+
+        let mut imported_store = InProcessKvStore::new();
+        imported_store
+            .put("/imported/a", b"a".to_vec(), None)
+            .expect("seed imported a");
+        imported_store
+            .put("/imported/b", b"b".to_vec(), None)
+            .expect("seed imported b");
+        let imported = imported_store.try_snapshot().expect("imported snapshot");
+        assert!(
+            cache
+                .cache_snapshot_if_newer_than_raft(node_id.clone(), imported.clone())
+                .expect("cache imported snapshot")
+        );
+
+        let local = paths
+            .set_raft_leader_and_write_snapshot_if_changed(&node_id, 1)
+            .expect("publish local raft metadata change");
+        assert_eq!(local.revision, KvRevision::ZERO);
+        assert_eq!(
+            cache.cached_snapshot().expect("read materialized cache"),
+            imported,
+            "a behind local Raft view must not move the imported read model backwards"
+        );
+        let local_read = cache
+            .current_snapshot(node_id.clone())
+            .expect("read local raft view");
+        assert_eq!(local_read.revision, KvRevision::ZERO);
+        assert_eq!(
+            cache.cached_snapshot().expect("read materialized cache"),
+            imported,
+            "refreshing the materialized cache from a behind Raft view must be monotonic"
+        );
+
+        let local = paths
+            .append_kv_command_and_publish(
+                &node_id,
+                KvCommand::Op(KvOp::Put {
+                    key: "/imported/a".to_string(),
+                    value: b"a".to_vec(),
+                    lease_id: None,
+                }),
+                |_| false,
+            )
+            .expect("publish partially caught-up local raft view");
+        assert_eq!(local.revision, KvRevision(1));
+        assert_eq!(
+            cache.cached_snapshot().expect("read materialized cache"),
+            imported,
+            "partial Raft replay must retain the newer imported read model"
+        );
+    }
+
+    #[test]
+    fn out_of_order_imported_snapshots_do_not_regress_materialized_revision() {
+        let root = temp_raft_root("sinomo-kv-out-of-order-imports");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let cache = paths.local_cache();
+        let node_id = NodeId::from_legacy_named("node_out_of_order_imports").expect("node");
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/imported/a", b"a".to_vec(), None)
+            .expect("seed older import");
+        let older = store.try_snapshot().expect("older snapshot");
+        store
+            .put("/imported/b", b"b".to_vec(), None)
+            .expect("seed newer import");
+        let newer = store.try_snapshot().expect("newer snapshot");
+
+        assert!(
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &newer, |_| false)
+                .expect("write newer import")
+        );
+        assert!(
+            !write_imported_cluster_kv_snapshot_if_changed(&paths, &older, |_| false)
+                .expect("reject out-of-order import")
+        );
+        assert!(
+            !write_cluster_kv_snapshot_if_changed(&paths, &older)
+                .expect("reject direct out-of-order import")
+        );
+        assert!(
+            !cache
+                .cache_snapshot_if_newer_than_raft(node_id.clone(), older)
+                .expect("reject out-of-order cache import")
+        );
+
+        let mut equivalent = newer.clone();
+        equivalent.events.clear();
+        assert_ne!(equivalent, newer);
+        assert!(kv_snapshot_durable_eq(&equivalent, &newer));
+        assert!(
+            !write_imported_cluster_kv_snapshot_if_changed(&paths, &equivalent, |_| false)
+                .expect("skip equal-revision durable-equivalent import")
+        );
+
+        let mut conflicting_store = InProcessKvStore::new();
+        conflicting_store
+            .put("/conflicting/a", b"a".to_vec(), None)
+            .expect("seed conflicting a");
+        conflicting_store
+            .put("/conflicting/b", b"b".to_vec(), None)
+            .expect("seed conflicting b");
+        let conflicting = conflicting_store
+            .try_snapshot()
+            .expect("conflicting snapshot");
+        assert_eq!(conflicting.revision, newer.revision);
+        assert_eq!(
+            write_cluster_kv_snapshot_if_changed(&paths, &conflicting)
+                .expect_err("reject equal-revision direct conflict"),
+            KvError::ImportedSnapshotRevisionConflict {
+                revision: newer.revision,
+            }
+        );
+        assert_eq!(
+            cache
+                .cache_snapshot_if_newer_than_raft(node_id, conflicting)
+                .expect_err("reject equal-revision cache conflict"),
+            KvError::ImportedSnapshotRevisionConflict {
+                revision: newer.revision,
+            }
+        );
+        assert_eq!(
+            cache.cached_snapshot().expect("read materialized cache"),
+            newer,
+            "every imported read-model path must retain the highest observed revision"
+        );
+    }
+
+    #[test]
+    fn equal_revision_imports_follow_committed_log_generation() {
+        let source_root = temp_raft_root("sinomo-kv-equal-revision-generation-source");
+        let source_node_id =
+            NodeId::from_legacy_named("node_equal_revision_generation_source").expect("node");
+        let source_paths = KvWalPaths::new(source_root.join("raft"));
+        let (before_barrier, after_barrier) = {
+            let mut node = DurableRaftKvNode::open(source_node_id, source_paths)
+                .expect("open source raft node");
+            let put = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/generation/value".to_string(),
+                        value: b"stable".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append mutating command");
+            node.commit_to(put.index).expect("commit mutating command");
+            let before_barrier = node
+                .store()
+                .try_snapshot()
+                .expect("snapshot before barrier");
+
+            let barrier = node
+                .append_local_command(1, KvCommand::Barrier)
+                .expect("append barrier");
+            node.commit_to(barrier.index).expect("commit barrier");
+            let after_barrier = node.store().try_snapshot().expect("snapshot after barrier");
+            (before_barrier, after_barrier)
+        };
+        assert_eq!(before_barrier.revision, after_barrier.revision);
+        assert!(
+            kv_snapshot_materialized_generation(&before_barrier)
+                < kv_snapshot_materialized_generation(&after_barrier),
+            "a committed no-op must advance the materialized generation"
+        );
+        assert!(!kv_snapshot_durable_eq(&before_barrier, &after_barrier));
+
+        let root = temp_raft_root("sinomo-kv-equal-revision-generation-cache");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        assert!(
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &before_barrier, |_| false)
+                .expect("write pre-barrier snapshot")
+        );
+        assert!(
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &after_barrier, |_| false)
+                .expect("advance equal-revision generation")
+        );
+        assert!(
+            !write_imported_cluster_kv_snapshot_if_changed(&paths, &before_barrier, |_| false)
+                .expect("skip older equal-revision generation")
+        );
+        assert_eq!(
+            paths
+                .local_cache()
+                .cached_snapshot()
+                .expect("read latest generation"),
+            after_barrier
+        );
+    }
+
+    #[test]
+    fn equal_revision_generation_orders_lease_and_request_expiry_changes() {
+        let source_root = temp_raft_root("sinomo-kv-lease-generation-source");
+        let source_node_id =
+            NodeId::from_legacy_named("node_lease_generation_source").expect("node");
+        let source_paths = KvWalPaths::new(source_root.join("raft"));
+        let (before_lease, with_lease, mut with_expired_request) = {
+            let mut node = DurableRaftKvNode::open(source_node_id, source_paths)
+                .expect("open source raft node");
+            let barrier = node
+                .append_local_command(1, KvCommand::Barrier)
+                .expect("append initial barrier");
+            node.commit_to(barrier.index)
+                .expect("commit initial barrier");
+            let before_lease = node.store().try_snapshot().expect("snapshot before lease");
+
+            let lease = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::LeaseGrant {
+                        lease_id: LeaseId(9),
+                        ttl_ticks: 20,
+                    }),
+                )
+                .expect("append lease grant");
+            node.commit_to(lease.index).expect("commit lease grant");
+            let with_lease = node.store().try_snapshot().expect("snapshot with lease");
+
+            let barrier = node
+                .append_local_command(1, KvCommand::Barrier)
+                .expect("append retention barrier");
+            node.commit_to(barrier.index)
+                .expect("commit retention barrier");
+            let with_expired_request = node
+                .store()
+                .try_snapshot()
+                .expect("snapshot before request retention projection");
+            (before_lease, with_lease, with_expired_request)
+        };
+
+        // Request retention evicts the oldest committed record and appends its
+        // id to the tombstone order. The eviction can be triggered by the
+        // same no-op commit that advanced this generation.
+        let oldest = with_expired_request
+            .committed_requests
+            .iter()
+            .min_by_key(|record| record.log_index)
+            .expect("oldest committed request")
+            .request_id
+            .clone();
+        with_expired_request
+            .committed_requests
+            .retain(|record| record.request_id != oldest);
+        with_expired_request.expired_requests.push(oldest);
+
+        assert_eq!(before_lease.revision, with_lease.revision);
+        assert_eq!(with_lease.revision, with_expired_request.revision);
+        assert!(before_lease.leases.is_empty());
+        assert_eq!(with_lease.leases.len(), 1);
+        assert!(with_expired_request.expired_requests.len() == 1);
+        assert!(
+            kv_snapshot_materialized_generation(&before_lease)
+                < kv_snapshot_materialized_generation(&with_lease)
+        );
+        assert!(
+            kv_snapshot_materialized_generation(&with_lease)
+                < kv_snapshot_materialized_generation(&with_expired_request)
+        );
+
+        let root = temp_raft_root("sinomo-kv-lease-generation-cache");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        assert!(
+            write_cluster_kv_snapshot_if_changed(&paths, &before_lease)
+                .expect("write pre-lease generation")
+        );
+        assert!(
+            write_cluster_kv_snapshot_if_changed(&paths, &with_lease)
+                .expect("write lease-only generation")
+        );
+        assert!(
+            write_cluster_kv_snapshot_if_changed(&paths, &with_expired_request)
+                .expect("write request-retention generation")
+        );
+        assert!(
+            !write_cluster_kv_snapshot_if_changed(&paths, &with_lease)
+                .expect("skip older lease generation")
+        );
+        assert_eq!(
+            paths
+                .local_cache()
+                .cached_snapshot()
+                .expect("read request-retention generation"),
+            with_expired_request.canonicalized()
+        );
+    }
+
+    #[test]
+    fn equal_revision_generation_advances_import_past_local_raft_view() {
+        let root = temp_raft_root("sinomo-kv-equal-generation-local-raft");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let node_id = NodeId::from_legacy_named("node_equal_generation_local_raft").expect("node");
+        let local = paths
+            .append_kv_command_and_publish(
+                &node_id,
+                KvCommand::Op(KvOp::Put {
+                    key: "/generation/local".to_string(),
+                    value: b"stable".to_vec(),
+                    lease_id: None,
+                }),
+                |_| false,
+            )
+            .expect("commit local value");
+        let mut imported = local.clone();
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        let command_digest = request.digest().expect("barrier digest");
+        imported.committed_requests.push(KvCommittedRequestRecord {
+            request_id: request.request_id,
+            command_digest,
+            term: 1,
+            log_index: kv_snapshot_materialized_generation(&local)
+                .1
+                .saturating_add(1),
+            revision: local.revision,
+            txn_response: None,
+        });
+        imported.canonicalize();
+
+        assert_eq!(local.revision, imported.revision);
+        assert!(paths.imported_snapshot_advances_current_for_node(&node_id, &imported));
+        assert!(
+            paths
+                .local_cache()
+                .cache_snapshot_if_newer_than_raft(node_id.clone(), imported.clone())
+                .expect("cache equal-revision newer generation")
+        );
+        assert!(
+            !paths
+                .local_cache()
+                .cache_snapshot_if_newer_than_raft(node_id, local)
+                .expect("preserve imported generation over local raft view")
+        );
+        assert_eq!(
+            paths
+                .local_cache()
+                .cached_snapshot()
+                .expect("read imported generation"),
+            imported
+        );
+    }
+
+    #[test]
+    fn corrupt_materialized_cache_blocks_import_and_routine_raft_publication() {
+        let root = temp_raft_root("sinomo-kv-corrupt-materialized-fails-closed");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let node_id =
+            NodeId::from_legacy_named("node_corrupt_materialized_fails_closed").expect("node");
+        let corrupt = b"corrupt materialized snapshot";
+        std::fs::create_dir_all(&paths.root).expect("cluster root");
+        std::fs::write(&paths.snapshot, corrupt).expect("write corrupt cache");
+
+        let mut imported_store = InProcessKvStore::new();
+        imported_store
+            .put("/imported/a", b"a".to_vec(), None)
+            .expect("seed import");
+        let imported = imported_store.try_snapshot().expect("imported snapshot");
+        assert!(matches!(
+            write_cluster_kv_snapshot_if_changed(&paths, &imported)
+                .expect_err("corrupt cache must reject import"),
+            KvError::Serialization { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&paths.snapshot).expect("read cache after rejected import"),
+            corrupt
+        );
+
+        assert!(matches!(
+            paths
+                .set_raft_leader_and_write_snapshot_if_changed(&node_id, 1)
+                .expect_err("corrupt cache must reject routine Raft publication"),
+            KvError::Serialization { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&paths.snapshot).expect("read cache after rejected Raft publication"),
+            corrupt
+        );
+    }
+
+    #[test]
+    fn materialized_cache_serializes_import_against_stale_raft_publication() {
+        let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
+        let root = temp_raft_root("sinomo-kv-materialized-cache-write-race");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let cache = paths.local_cache();
+        let stale = InProcessKvStore::new()
+            .try_snapshot()
+            .expect("stale raft snapshot");
+        let mut imported_store = InProcessKvStore::new();
+        imported_store
+            .put("/imported/a", b"a".to_vec(), None)
+            .expect("seed imported a");
+        imported_store
+            .put("/imported/b", b"b".to_vec(), None)
+            .expect("seed imported b");
+        let imported = imported_store.try_snapshot().expect("imported snapshot");
+
+        let compared = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        install_materialized_cache_raft_write_pause_for_test(
+            paths.snapshot.clone(),
+            compared.clone(),
+            resume.clone(),
+        );
+
+        let stale_cache = cache.clone();
+        let stale_writer =
+            std::thread::spawn(move || stale_cache.write_raft_snapshot_if_changed(&stale));
+        compared.wait();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let imported_cache = cache.clone();
+        let expected = imported.clone();
+        let imported_writer = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal imported writer start");
+            let result = imported_cache.write_imported_snapshot_if_changed(&expected);
+            finished_tx.send(()).expect("signal imported writer finish");
+            result
+        });
+        started_rx.recv().expect("imported writer started");
+        let imported_finished_while_stale_paused =
+            finished_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+
+        resume.wait();
+        let stale_result = stale_writer.join().expect("join stale writer");
+        let imported_result = imported_writer.join().expect("join imported writer");
+        clear_materialized_cache_raft_write_pause_for_test(&paths.snapshot);
+
+        assert!(stale_result.expect("publish stale raft snapshot"));
+        assert!(imported_result.expect("publish imported snapshot"));
+        assert!(
+            !imported_finished_while_stale_paused,
+            "the imported writer must wait for the stale Raft comparison and publication"
+        );
+        assert_eq!(
+            cache.cached_snapshot().expect("read final snapshot"),
+            imported,
+            "an out-of-order stale Raft publication must not overwrite a newer import"
         );
     }
 

@@ -2953,38 +2953,51 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
         ),
     );
     let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
+    let route_graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
     let mut probes = Vec::new();
     for node_id in remote_node_ids {
-        // Direct connectivity is not route availability: a node that cannot
-        // dial the target transport itself may still have a valid multi-hop
-        // route through another cluster member. Keep topology decisions in
-        // sinomo-network and let the bounded RPC probe report the terminal
-        // routing result.
-        probes.push(spawn_dfs_status_probe(
-            &cluster_paths,
-            &state,
-            &node_id,
-            remote_timeout,
-            trace,
-        )?);
+        if let Some(error) =
+            dfs_cluster_status_unavailable_reason(&cluster_paths, &state, &route_graph, &node_id)
+        {
+            probes.push(DfsStatusProbePlan::Unavailable { node_id, error });
+        } else {
+            probes.push(DfsStatusProbePlan::Probe(spawn_dfs_status_probe(
+                &cluster_paths,
+                &state,
+                &node_id,
+                remote_timeout,
+                trace,
+            )?));
+        }
     }
     for probe in probes {
-        let node_id = probe.node_id.clone();
-        nodes.push(match receive_dfs_status_probe(probe, trace, started_at) {
-            Ok(status) => DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: Some("cluster-object-rpc".to_string()),
-                status: Some(status),
-                error: None,
-            },
-            Err(error) => DfsClusterNodeStatus {
+        nodes.push(match probe {
+            DfsStatusProbePlan::Unavailable { node_id, error } => DfsClusterNodeStatus {
                 node_id,
                 local: false,
                 endpoint: None,
                 status: None,
-                error: Some(error.to_string()),
+                error: Some(error),
             },
+            DfsStatusProbePlan::Probe(probe) => {
+                let node_id = probe.node_id.clone();
+                match receive_dfs_status_probe(probe, trace, started_at) {
+                    Ok(status) => DfsClusterNodeStatus {
+                        node_id,
+                        local: false,
+                        endpoint: Some("cluster-object-rpc".to_string()),
+                        status: Some(status),
+                        error: None,
+                    },
+                    Err(error) => DfsClusterNodeStatus {
+                        node_id,
+                        local: false,
+                        endpoint: None,
+                        status: None,
+                        error: Some(error.to_string()),
+                    },
+                }
+            }
         });
     }
     trace_dfs_cluster_status(
@@ -2993,6 +3006,39 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
         format_args!("complete nodes={}", nodes.len()),
     );
     Ok(DfsClusterStatusReport { nodes })
+}
+
+fn dfs_cluster_status_unavailable_reason(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    route_graph: &network::ClusterConnectivityGraph,
+    node_id: &NodeId,
+) -> Option<String> {
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)?;
+    let connectivity =
+        network::cluster_member_main_daemon_connectivity(cluster_paths, state, member);
+    if matches!(
+        connectivity,
+        network::ClusterMemberMainDaemonConnectivity::Healthy
+            | network::ClusterMemberMainDaemonConnectivity::Unknown
+    ) || network::cluster_healthy_route_next_hop(route_graph, &state.local_node_id, node_id)
+        .is_some()
+    {
+        return None;
+    }
+    match connectivity {
+        network::ClusterMemberMainDaemonConnectivity::Degraded => Some(format!(
+            "cluster member {node_id} has no currently healthy main-daemon route"
+        )),
+        network::ClusterMemberMainDaemonConnectivity::Unreachable => {
+            Some(format!("cluster member {node_id} is currently unavailable"))
+        }
+        network::ClusterMemberMainDaemonConnectivity::Healthy
+        | network::ClusterMemberMainDaemonConnectivity::Unknown => None,
+    }
 }
 
 fn dfs_cluster_status_remote_main_node_ids(
@@ -3017,6 +3063,11 @@ struct DfsStatusProbe {
     started_at: std::time::Instant,
     timeout: std::time::Duration,
     receiver: std::sync::mpsc::Receiver<Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError>>,
+}
+
+enum DfsStatusProbePlan {
+    Probe(DfsStatusProbe),
+    Unavailable { node_id: NodeId, error: String },
 }
 
 fn spawn_dfs_status_probe(

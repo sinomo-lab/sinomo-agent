@@ -16,6 +16,21 @@ use crate::metadata_io::{
 use crate::metadata_keys::{key_segment, normalize_path};
 use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectMetadata};
 
+#[cfg(test)]
+thread_local! {
+    static OBJECT_SHARD_INDEX_WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_object_shard_index_write_count() {
+    OBJECT_SHARD_INDEX_WRITE_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn object_shard_index_write_count() -> usize {
+    OBJECT_SHARD_INDEX_WRITE_COUNT.get()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct DfsObjectShardIndexRecord {
     pub(crate) object_id: DfsObjectId,
@@ -42,10 +57,21 @@ pub(crate) fn write_object_shard_index(
     object: &DfsObjectMetadata,
     shard_id: &DfsMetadataShardId,
 ) -> Result<()> {
+    #[cfg(test)]
+    OBJECT_SHARD_INDEX_WRITE_COUNT.set(OBJECT_SHARD_INDEX_WRITE_COUNT.get().saturating_add(1));
     write_sobj_atomic(
         &object_shard_index_path(root, &object.object_id),
         &object_shard_index_record(object, shard_id),
     )
+}
+
+pub(crate) fn object_shard_index_matches(
+    root: &Path,
+    object: &DfsObjectMetadata,
+    shard_id: &DfsMetadataShardId,
+) -> Result<bool> {
+    let desired = object_shard_index_record(object, shard_id);
+    Ok(read_object_shard_index(root, &object.object_id)?.as_ref() == Some(&desired))
 }
 
 pub(crate) fn write_content_commit_object_shard_index(

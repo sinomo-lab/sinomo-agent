@@ -33,6 +33,24 @@ pub enum DfsError {
     ContentStore { message: String },
     #[error("distributed DFS error: {message}")]
     Distributed { message: String },
+    /// A metadata-shard reconfiguration has been durably recorded but cannot
+    /// become active until the retiring authority and every required target
+    /// have produced the exact handoff evidence.
+    ///
+    /// This is a reactive wait state, not a transport or control-plane
+    /// failure. Callers which own reconciliation should park on the handoff,
+    /// shard-authority, completion-proof, and replica-progress generations
+    /// instead of retrying it on a generic failure timer.
+    #[error(
+        "metadata shard {shard_id} membership or primary-role change from epoch {retiring_epoch} to {desired_epoch} is fenced and parked pending exact DFS catch-up of every retiring and desired member"
+    )]
+    MetadataShardMembershipHandoffParked {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        handoff_id: String,
+        retiring_epoch: u64,
+        desired_epoch: u64,
+    },
     #[error("metadata backend error: {message}")]
     Metadata { message: String },
     #[error("invalid DFS replication policy: {message}")]

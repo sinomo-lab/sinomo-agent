@@ -25,6 +25,11 @@ const DAEMON_SIGNING_IDENTITY_MAX_AGE: Duration = Duration::from_secs(1);
 
 static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
     OnceLock::new();
+/// Serializes identity-transition invalidation with cache fills that perform
+/// their filesystem reads outside the cache mutex. Without this generation, a
+/// fill that sampled `node_local` before a join could finish after the join's
+/// explicit invalidation and repopulate the cache with that stale principal.
+static DAEMON_SIGNING_IDENTITY_GENERATION: AtomicU64 = AtomicU64::new(1);
 static DAEMON_AUTH_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -432,30 +437,35 @@ fn cached_daemon_signing_identity(
     data_dir: &SinomoDataDir,
 ) -> Result<CachedDaemonSigningIdentity, NetworkError> {
     let root = data_dir.root();
-    let checked_at = Instant::now();
-    let cached = DAEMON_SIGNING_IDENTITIES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|source| NetworkError::Io {
-            operation: "daemon RPC auth identity cache".to_string(),
-            detail: source.to_string(),
-        })?
-        .get(&root)
-        .cloned();
-    if let Some(cached) = cached.as_ref()
-        && cached.identity_mark.is_some_and(|mark| mark.exists)
-        && cached.cluster_state_mark.is_some_and(|mark| mark.exists)
-        && checked_at.duration_since(cached.checked_at) < DAEMON_SIGNING_IDENTITY_MAX_AGE
-    {
-        return Ok(cached.clone());
-    }
+    loop {
+        let checked_at = Instant::now();
+        let (cached, fill_generation) = {
+            let guard = DAEMON_SIGNING_IDENTITIES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|source| NetworkError::Io {
+                    operation: "daemon RPC auth identity cache".to_string(),
+                    detail: source.to_string(),
+                })?;
+            (
+                guard.get(&root).cloned(),
+                DAEMON_SIGNING_IDENTITY_GENERATION.load(Ordering::Relaxed),
+            )
+        };
+        if let Some(cached) = cached.as_ref()
+            && cached.identity_mark.is_some_and(|mark| mark.exists)
+            && cached.cluster_state_mark.is_some_and(|mark| mark.exists)
+            && checked_at.duration_since(cached.checked_at) < DAEMON_SIGNING_IDENTITY_MAX_AGE
+        {
+            return Ok(cached.clone());
+        }
 
-    let identity_path = NodeIdentityPaths::new(&root).main;
-    let cluster_state_path = ClusterPaths::new(data_dir).state;
-    let identity_mark = crate::file_mark::cluster_file_mark(&identity_path);
-    let cluster_state_mark = crate::file_mark::cluster_file_mark(&cluster_state_path);
-    if let Some(cached) = cached {
-        if identity_mark.is_some()
+        let identity_path = NodeIdentityPaths::new(&root).main;
+        let cluster_state_path = ClusterPaths::new(data_dir).state;
+        let identity_mark = crate::file_mark::cluster_file_mark(&identity_path);
+        let cluster_state_mark = crate::file_mark::cluster_file_mark(&cluster_state_path);
+        if let Some(cached) = cached
+            && identity_mark.is_some()
             && identity_mark == cached.identity_mark
             && cluster_state_mark.is_some()
             && cluster_state_mark == cached.cluster_state_mark
@@ -464,46 +474,68 @@ fn cached_daemon_signing_identity(
                 checked_at,
                 ..cached
             };
-            DAEMON_SIGNING_IDENTITIES
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .map_err(|source| NetworkError::Io {
-                    operation: "daemon RPC auth identity cache".to_string(),
-                    detail: source.to_string(),
-                })?
-                .insert(root, refreshed.clone());
-            return Ok(refreshed);
+            if cache_daemon_signing_identity_if_generation_current(
+                root.clone(),
+                refreshed.clone(),
+                fill_generation,
+            )? {
+                return Ok(refreshed);
+            }
+            continue;
         }
-    }
 
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| NetworkError::Io {
-            operation: "daemon RPC auth data directory".to_string(),
+        data_dir
+            .ensure_root_layout()
+            .map_err(|source| NetworkError::Io {
+                operation: "daemon RPC auth data directory".to_string(),
+                detail: source.to_string(),
+            })?;
+        let identity =
+            load_or_create_main_node_identity(&root).map_err(|source| NetworkError::Io {
+                operation: "daemon RPC auth identity".to_string(),
+                detail: source.to_string(),
+            })?;
+        let node_id = local_cluster_node_id(data_dir).unwrap_or_else(|| "node_local".to_string());
+        let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
+        let key_pair = Arc::new(identity.key_pair().map_err(|source| NetworkError::Io {
+            operation: "daemon RPC auth identity".to_string(),
             detail: source.to_string(),
-        })?;
-    let identity = load_or_create_main_node_identity(&root).map_err(|source| NetworkError::Io {
-        operation: "daemon RPC auth identity".to_string(),
-        detail: source.to_string(),
-    })?;
-    let node_id = local_cluster_node_id(data_dir).unwrap_or_else(|| "node_local".to_string());
-    let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
-    let key_pair = Arc::new(identity.key_pair().map_err(|source| NetworkError::Io {
-        operation: "daemon RPC auth identity".to_string(),
-        detail: source.to_string(),
-    })?);
-    let loaded = CachedDaemonSigningIdentity {
-        node_id,
-        public_key,
-        key_pair,
-        // Retain the marks sampled before the reads. If either file was
-        // replaced concurrently, the next lookup observes the new mark and
-        // refreshes instead of pairing stale contents with a post-read mark.
-        identity_mark,
-        cluster_state_mark,
-        checked_at,
-    };
+        })?);
+        let loaded = CachedDaemonSigningIdentity {
+            node_id,
+            public_key,
+            key_pair,
+            // Retain the marks sampled before the reads. If either file was
+            // replaced concurrently, the next lookup observes the new mark and
+            // refreshes instead of pairing stale contents with a post-read mark.
+            identity_mark,
+            cluster_state_mark,
+            checked_at,
+        };
 
+        if cache_daemon_signing_identity_if_generation_current(
+            root.clone(),
+            loaded.clone(),
+            fill_generation,
+        )? {
+            return Ok(loaded);
+        }
+        tracing::info!(
+            target: "sinomo.cluster.formation",
+            stage = "signing_identity_stale_fill_discarded",
+            sampled_node_id = %loaded.node_id,
+            sampled_generation = fill_generation,
+            current_generation = DAEMON_SIGNING_IDENTITY_GENERATION.load(Ordering::Relaxed),
+            "discarded daemon signing identity sampled across an explicit cluster transition"
+        );
+    }
+}
+
+fn cache_daemon_signing_identity_if_generation_current(
+    root: PathBuf,
+    identity: CachedDaemonSigningIdentity,
+    fill_generation: u64,
+) -> Result<bool, NetworkError> {
     let mut guard = DAEMON_SIGNING_IDENTITIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -511,8 +543,41 @@ fn cached_daemon_signing_identity(
             operation: "daemon RPC auth identity cache".to_string(),
             detail: source.to_string(),
         })?;
-    guard.insert(root, loaded.clone());
-    Ok(loaded)
+    if DAEMON_SIGNING_IDENTITY_GENERATION.load(Ordering::Relaxed) != fill_generation {
+        return Ok(false);
+    }
+    guard.insert(root, identity);
+    Ok(true)
+}
+
+/// Invalidates the process-cached daemon principal for one data directory.
+///
+/// Identity-changing cluster operations call this immediately after replacing
+/// cluster state so the next authenticated transport cannot reuse a principal
+/// sampled during the transition for up to the ordinary cache TTL.
+pub fn invalidate_cached_daemon_signing_identity(
+    data_dir: &SinomoDataDir,
+) -> Result<bool, NetworkError> {
+    let mut identities = DAEMON_SIGNING_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|source| NetworkError::Io {
+            operation: "daemon RPC auth identity cache".to_string(),
+            detail: source.to_string(),
+        })?;
+    let removed = identities.remove(&data_dir.root());
+    let generation = DAEMON_SIGNING_IDENTITY_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    tracing::info!(
+        target: "sinomo.cluster.formation",
+        stage = "signing_identity_cache_invalidated",
+        removed = removed.is_some(),
+        previous_node_id = removed.as_ref().map(|identity| identity.node_id.as_str()),
+        generation,
+        "invalidated cached daemon signing identity for cluster transition"
+    );
+    Ok(removed.is_some())
 }
 
 /// Returns the process-cached main-daemon public key, refreshing identity
@@ -832,6 +897,99 @@ mod tests {
             .decode(&second_auth)
             .expect("decode second envelope");
         assert_eq!(second_envelope.node_id, second_node.to_string());
+    }
+
+    #[test]
+    fn explicit_identity_invalidation_observes_an_immediate_cluster_transition() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-daemon-auth-invalidate");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let cluster_id =
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_auth_invalidate")
+                .expect("cluster id");
+        let first_node =
+            sinomo_node::NodeId::from_legacy_named("node_daemon_auth_invalidate_first")
+                .expect("first node");
+        let second_node =
+            sinomo_node::NodeId::from_legacy_named("node_daemon_auth_invalidate_second")
+                .expect("second node");
+        let now = OffsetDateTime::now_utc();
+        let mut state = sinomo_base::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "auth invalidate",
+            first_node.clone(),
+            "first",
+            "pk-first",
+            now,
+        );
+        crate::object_file_store::write_object_file(&cluster_paths.state, &state)
+            .expect("write first state");
+        let request =
+            ObjectRpcRequest::encode_body("/test/daemon-auth", "test", &()).expect("request");
+        let first_auth =
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("first auth");
+        let first_envelope: SignedDaemonCommand = SinomoObjectCodec::default()
+            .decode(&first_auth)
+            .expect("decode first envelope");
+        assert_eq!(first_envelope.node_id, first_node.to_string());
+
+        state.local_node_id = second_node.clone();
+        state.members[0].node_id = second_node.clone();
+        crate::object_file_store::write_object_file(&cluster_paths.state, &state)
+            .expect("write transitioned state");
+        assert!(
+            invalidate_cached_daemon_signing_identity(&data_dir)
+                .expect("invalidate signing identity"),
+            "the first signing call should have populated the cache"
+        );
+
+        let second_auth =
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("second auth");
+        let second_envelope: SignedDaemonCommand = SinomoObjectCodec::default()
+            .decode(&second_auth)
+            .expect("decode second envelope");
+        assert_eq!(second_envelope.node_id, second_node.to_string());
+    }
+
+    #[test]
+    fn invalidation_rejects_a_cache_fill_started_before_the_transition() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-daemon-auth-stale-fill");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let state = sinomo_base::ClusterBootstrapState::initialized_locally(
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_auth_stale_fill")
+                .expect("cluster id"),
+            "auth stale fill",
+            sinomo_node::NodeId::from_legacy_named("node_daemon_auth_stale_fill").expect("node id"),
+            "stale fill",
+            "pk-stale-fill",
+            OffsetDateTime::now_utc(),
+        );
+        crate::object_file_store::write_object_file(&cluster_paths.state, &state)
+            .expect("write state");
+
+        let stale_identity = cached_daemon_signing_identity(&data_dir).expect("cached identity");
+        let fill_generation = DAEMON_SIGNING_IDENTITY_GENERATION.load(Ordering::Relaxed);
+        assert!(invalidate_cached_daemon_signing_identity(&data_dir).expect("invalidate identity"));
+        assert!(
+            !cache_daemon_signing_identity_if_generation_current(
+                data_dir.root(),
+                stale_identity,
+                fill_generation,
+            )
+            .expect("reject stale cache fill"),
+            "a pre-transition filesystem sample must not repopulate the cache after invalidation"
+        );
+        assert!(
+            fresh_cached_daemon_signing_identity(&data_dir)
+                .expect("read identity cache")
+                .is_none(),
+            "the rejected fill must leave the transitioned data directory uncached"
+        );
     }
 
     #[test]

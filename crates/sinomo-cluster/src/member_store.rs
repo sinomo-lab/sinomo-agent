@@ -125,6 +125,13 @@ pub(crate) fn cluster_state_sync_txn_from_store(
         if validate_config_transition
             && !sinomo_kv::cluster_kv_raft_config_record_stable_eq(&current_config, &new_config)
         {
+            // Generic state publication never owns an established Raft
+            // membership change. Preserve the config validator's more
+            // specific safety evidence when the proposed projection is
+            // invalid, then reject otherwise-valid changes at this ownership
+            // boundary as well so callers must use the durable lifecycle.
+            sinomo_kv::validate_cluster_kv_raft_config_transition(&current_config, &new_config)
+                .map_err(kv_err)?;
             return Err(NetworkError::InvalidClusterCommand {
                 detail: "established Raft membership cannot be changed by generic cluster-state sync; use the explicit config-change lifecycle"
                     .to_string(),

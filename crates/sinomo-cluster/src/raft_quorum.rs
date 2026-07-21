@@ -14,14 +14,14 @@ use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterRaftAppendRequest,
     ClusterRaftAppendResponse,
 };
-use sinomo_kv::{KvCommandRequest, KvEvent, KvSnapshot};
+use sinomo_kv::{KvCommandRequest, KvEvent, KvRequestId, KvSnapshot};
 use sinomo_network::ClusterConnectivityState;
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 type SharedLocalClusterRaftCommandStorage = Arc<Mutex<LocalClusterRaftCommandStorage>>;
 
@@ -78,6 +78,272 @@ fn lock_local_cluster_raft_command_storage<'a>(
         operation: operation.to_string(),
         detail: format!("local cluster Raft command session lock poisoned: {error}"),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cluster_kv_quorum_commit_phase_trace(
+    phase: &'static str,
+    request_id: &KvRequestId,
+    local_node_id: &NodeId,
+    duration: Duration,
+    commit_elapsed: Duration,
+    emission_delay: Duration,
+    term: u64,
+    log_index: u64,
+    revision: u64,
+    outcome: &'static str,
+    detail: std::fmt::Arguments<'_>,
+) {
+    if !cluster_kv_quorum_commit_trace_enabled() {
+        return;
+    }
+    let duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+    let commit_elapsed_us = u64::try_from(commit_elapsed.as_micros()).unwrap_or(u64::MAX);
+    let emission_delay_us = u64::try_from(emission_delay.as_micros()).unwrap_or(u64::MAX);
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        phase,
+        request_id = %request_id,
+        local_node_id = %local_node_id,
+        duration_us,
+        commit_elapsed_us,
+        emission_delay_us,
+        term,
+        log_index,
+        revision,
+        outcome,
+        detail = %detail,
+        "cluster KV quorum commit phase"
+    );
+    if cluster_kv_quorum_commit_stderr_trace_enabled() {
+        eprintln!(
+            "[sinomo cluster join] KV quorum phase={phase} request_id={request_id} local_node={local_node_id} duration_us={duration_us} commit_elapsed_us={commit_elapsed_us} emission_delay_us={emission_delay_us} term={term} log_index={log_index} revision={revision} outcome={outcome}: {detail}"
+        );
+    }
+}
+
+static CLUSTER_JOIN_STDERR_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn cluster_kv_quorum_commit_stderr_trace_enabled() -> bool {
+    *CLUSTER_JOIN_STDERR_TRACE_ENABLED.get_or_init(|| {
+        std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+    })
+}
+
+fn cluster_kv_quorum_commit_trace_enabled() -> bool {
+    tracing::enabled!(target: "sinomo.cluster.formation", tracing::Level::TRACE)
+        || cluster_kv_quorum_commit_stderr_trace_enabled()
+}
+
+const CLUSTER_KV_QUORUM_COMMIT_TRACE_RECORD_LIMIT: usize = 32;
+const CLUSTER_KV_QUORUM_COMMIT_TRACE_DETAIL_LIMIT: usize = 512;
+
+struct ClusterKvQuorumCommitTraceRecord {
+    phase: &'static str,
+    duration: Duration,
+    observed_at: Instant,
+    commit_elapsed: Duration,
+    term: u64,
+    log_index: u64,
+    revision: u64,
+    outcome: &'static str,
+    detail: String,
+}
+
+struct ClusterKvQuorumCommitTraceBuffer {
+    request_id: KvRequestId,
+    local_node_id: NodeId,
+    started: Instant,
+    initial_term: u64,
+    initial_revision: u64,
+    records: Vec<ClusterKvQuorumCommitTraceRecord>,
+    dropped_records: u64,
+}
+
+#[derive(Clone, Default)]
+struct ClusterKvQuorumCommitTrace {
+    inner: Option<Arc<Mutex<ClusterKvQuorumCommitTraceBuffer>>>,
+}
+
+impl ClusterKvQuorumCommitTrace {
+    fn new(request_id: KvRequestId, local_node_id: NodeId, term: u64, revision: u64) -> Self {
+        if !cluster_kv_quorum_commit_trace_enabled() {
+            return Self::default();
+        }
+        Self {
+            inner: Some(Arc::new(Mutex::new(ClusterKvQuorumCommitTraceBuffer {
+                request_id,
+                local_node_id,
+                started: Instant::now(),
+                initial_term: term,
+                initial_revision: revision,
+                records: Vec::with_capacity(CLUSTER_KV_QUORUM_COMMIT_TRACE_RECORD_LIMIT),
+                dropped_records: 0,
+            }))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        phase: &'static str,
+        duration: Duration,
+        term: u64,
+        log_index: u64,
+        revision: u64,
+        outcome: &'static str,
+        detail: std::fmt::Arguments<'_>,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let Ok(mut buffer) = inner.lock() else {
+            return;
+        };
+        if buffer.records.len() >= CLUSTER_KV_QUORUM_COMMIT_TRACE_RECORD_LIMIT {
+            buffer.dropped_records = buffer.dropped_records.saturating_add(1);
+            return;
+        }
+        let observed_at = Instant::now();
+        let commit_elapsed = observed_at.saturating_duration_since(buffer.started);
+        let mut detail = detail.to_string();
+        if detail.len() > CLUSTER_KV_QUORUM_COMMIT_TRACE_DETAIL_LIMIT {
+            let mut truncate_at = CLUSTER_KV_QUORUM_COMMIT_TRACE_DETAIL_LIMIT.saturating_sub(3);
+            while !detail.is_char_boundary(truncate_at) {
+                truncate_at = truncate_at.saturating_sub(1);
+            }
+            detail.truncate(truncate_at);
+            detail.push_str("...");
+        }
+        buffer.records.push(ClusterKvQuorumCommitTraceRecord {
+            phase,
+            duration,
+            observed_at,
+            commit_elapsed,
+            term,
+            log_index,
+            revision,
+            outcome,
+            detail,
+        });
+    }
+
+    fn flush(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let Ok(mut buffer) = inner.lock() else {
+            return;
+        };
+        let request_id = buffer.request_id.clone();
+        let local_node_id = buffer.local_node_id.clone();
+        let initial_term = buffer.initial_term;
+        let initial_revision = buffer.initial_revision;
+        let started = buffer.started;
+        let records = std::mem::take(&mut buffer.records);
+        let dropped_records = std::mem::take(&mut buffer.dropped_records);
+        drop(buffer);
+        for record in records {
+            cluster_kv_quorum_commit_phase_trace(
+                record.phase,
+                &request_id,
+                &local_node_id,
+                record.duration,
+                record.commit_elapsed,
+                record.observed_at.elapsed(),
+                record.term,
+                record.log_index,
+                record.revision,
+                record.outcome,
+                format_args!("{}", record.detail),
+            );
+        }
+        if dropped_records > 0 {
+            cluster_kv_quorum_commit_phase_trace(
+                "trace_buffer",
+                &request_id,
+                &local_node_id,
+                Duration::default(),
+                started.elapsed(),
+                Duration::default(),
+                initial_term,
+                0,
+                initial_revision,
+                "truncated",
+                format_args!(
+                    "dropped {dropped_records} quorum phase records after reaching the bounded buffer limit"
+                ),
+            );
+        }
+    }
+}
+
+struct ClusterKvQuorumCommitSequenceTrace {
+    trace: ClusterKvQuorumCommitTrace,
+    acquired_at: Option<Instant>,
+    term: u64,
+    log_index: u64,
+    revision: u64,
+    completion_outcome: &'static str,
+}
+
+impl ClusterKvQuorumCommitSequenceTrace {
+    fn new(trace: ClusterKvQuorumCommitTrace, term: u64, revision: u64) -> Self {
+        Self {
+            trace,
+            acquired_at: None,
+            term,
+            log_index: 0,
+            revision,
+            completion_outcome: "released",
+        }
+    }
+
+    fn record_acquired(&mut self) {
+        self.acquired_at = Some(Instant::now());
+    }
+
+    fn record_result(&mut self, result: &Result<ClusterKvRaftQuorumCommitResult, NetworkError>) {
+        match result {
+            Ok(commit) => {
+                self.term = commit.authority.term;
+                self.log_index = commit.authority.commit_index;
+                self.revision = commit.authority.revision.0;
+                self.completion_outcome = if commit.replayed_committed_request {
+                    "replayed"
+                } else {
+                    "completed"
+                };
+            }
+            Err(_) => self.completion_outcome = "error",
+        }
+    }
+}
+
+impl Drop for ClusterKvQuorumCommitSequenceTrace {
+    fn drop(&mut self) {
+        let Some(acquired_at) = self.acquired_at else {
+            return;
+        };
+        let outcome = if std::thread::panicking() {
+            "unwound"
+        } else {
+            self.completion_outcome
+        };
+        self.trace.record(
+            "commit_sequence_lock",
+            acquired_at.elapsed(),
+            self.term,
+            self.log_index,
+            self.revision,
+            outcome,
+            format_args!(
+                "released the synchronous cluster KV commit sequence lock after quorum commit outcome {outcome}"
+            ),
+        );
+    }
 }
 
 pub trait ClusterKvQuorumAsyncHost: Send {
@@ -750,6 +1016,9 @@ where
 
 struct DriverRaftQuorumCommitHost<'a, T> {
     storage: LocalClusterRaftCommandStorage,
+    trace: ClusterKvQuorumCommitTrace,
+    initial_term: u64,
+    initial_revision: u64,
     driver: &'a mut ClusterControlPlaneDriver<T>,
 }
 
@@ -774,10 +1043,51 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
         &mut self,
         request: KvCommandRequest,
     ) -> Result<sinomo_kv::KvLogEntry, NetworkError> {
-        sinomo_kv::ClusterKvRaftCommandStorage::append_cluster_raft_request_uncommitted(
-            &mut self.storage,
-            request,
-        )
+        let observed = self.storage.append_uncommitted_observed(request);
+        if observed.log_append_wal_duration.is_some() {
+            self.trace.record(
+                "compare",
+                observed.compare_duration,
+                self.initial_term,
+                0,
+                self.initial_revision,
+                "passed",
+                format_args!("request identity and transaction branch preflight passed"),
+            );
+        } else if let Err(error) = &observed.result {
+            self.trace.record(
+                "compare",
+                observed.compare_duration,
+                self.initial_term,
+                0,
+                self.initial_revision,
+                "error",
+                format_args!("{error}"),
+            );
+        }
+        if let Some(duration) = observed.log_append_wal_duration {
+            match &observed.result {
+                Ok(entry) => self.trace.record(
+                    "log_append_wal",
+                    duration,
+                    entry.term,
+                    entry.index,
+                    entry.revision.0,
+                    "appended",
+                    format_args!("request appended to the local durable Raft log"),
+                ),
+                Err(error) => self.trace.record(
+                    "log_append_wal",
+                    duration,
+                    self.initial_term,
+                    0,
+                    self.initial_revision,
+                    "error",
+                    format_args!("{error}"),
+                ),
+            }
+        }
+        observed.result.map_err(kv_err)
     }
 
     fn record_cluster_raft_request_rejected_before_commit(
@@ -913,11 +1223,26 @@ pub(crate) fn commit_cluster_raft_command_with_control_plane_driver<T>(
 where
     T: ClusterControlPlaneTransport,
 {
+    let request_id = request.request_id.clone();
+    let local_node_id = state.local_node_id.clone();
+    let initial_term = state.term;
+    let initial_revision = state.kv_revision;
+    let trace = ClusterKvQuorumCommitTrace::new(
+        request_id,
+        local_node_id.clone(),
+        initial_term,
+        initial_revision,
+    );
     let mut host = DriverRaftQuorumCommitHost {
-        storage: LocalClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
+        storage: LocalClusterRaftCommandStorage::new(paths, local_node_id.clone()),
+        trace: trace.clone(),
+        initial_term,
+        initial_revision,
         driver,
     };
-    commit_cluster_raft_command_with_quorum_driver(paths, state, request, options, &mut host)
+    commit_cluster_raft_command_with_quorum_driver_and_trace(
+        paths, state, request, options, trace, &mut host,
+    )
 }
 
 pub(crate) fn catch_up_cluster_raft_member_with_control_plane_driver<T>(
@@ -950,6 +1275,7 @@ where
 
 struct NetworkClusterKvRaftQuorumCommitHost<'a, H> {
     paths: &'a ClusterPaths,
+    commit_sequence_trace: ClusterKvQuorumCommitSequenceTrace,
     host: &'a mut H,
 }
 
@@ -997,12 +1323,35 @@ where
     }
 
     fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<std::fs::File>, NetworkError> {
-        sinomo_kv::lock_cluster_kv_commit_sequence(
+        let started = Instant::now();
+        let result = sinomo_kv::lock_cluster_kv_commit_sequence(
             &self.paths.kv_paths(),
             sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
-        )
-        .map(Some)
-        .map_err(kv_err)
+        );
+        match &result {
+            Ok(_) => {
+                self.commit_sequence_trace.record_acquired();
+                self.commit_sequence_trace.trace.record(
+                    "leader_queue",
+                    started.elapsed(),
+                    self.commit_sequence_trace.term,
+                    0,
+                    self.commit_sequence_trace.revision,
+                    "acquired",
+                    format_args!("acquired the synchronous cluster KV commit sequence lock"),
+                );
+            }
+            Err(error) => self.commit_sequence_trace.trace.record(
+                "leader_queue",
+                started.elapsed(),
+                self.commit_sequence_trace.term,
+                0,
+                self.commit_sequence_trace.revision,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        result.map(Some).map_err(kv_err)
     }
 
     fn replay_cluster_raft_request_if_committed(
@@ -1056,7 +1405,31 @@ where
         &mut self,
         index: u64,
     ) -> Result<sinomo_kv::ClusterKvRaftCommitResult, NetworkError> {
-        self.host.commit_cluster_raft_index_with_events(index)
+        let started = Instant::now();
+        let result = self.host.commit_cluster_raft_index_with_events(index);
+        match &result {
+            Ok(commit) => self.commit_sequence_trace.trace.record(
+                "apply",
+                started.elapsed(),
+                commit.committed_request.term,
+                index,
+                commit.committed_request.revision.0,
+                "applied",
+                format_args!(
+                    "committed the local Raft entry and published its materialized result"
+                ),
+            ),
+            Err(error) => self.commit_sequence_trace.trace.record(
+                "apply",
+                started.elapsed(),
+                self.commit_sequence_trace.term,
+                index,
+                self.commit_sequence_trace.revision,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        result
     }
 }
 
@@ -1097,8 +1470,35 @@ where
         target: &Self::Target,
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-        self.host
-            .replicate_cluster_raft_to_node(self.paths, state, target, timeout)
+        let started = Instant::now();
+        let result = self
+            .host
+            .replicate_cluster_raft_to_node(self.paths, state, target, timeout);
+        match &result {
+            Ok(response) => self.commit_sequence_trace.trace.record(
+                "replication",
+                started.elapsed(),
+                response.append.term,
+                response.append.match_index,
+                response.state.kv_revision,
+                if response.accepted {
+                    "accepted"
+                } else {
+                    "rejected"
+                },
+                format_args!("synchronous Raft append to voter {target}"),
+            ),
+            Err(error) => self.commit_sequence_trace.trace.record(
+                "replication",
+                started.elapsed(),
+                state.term,
+                0,
+                state.kv_revision,
+                "error",
+                format_args!("synchronous Raft append to voter {target} failed: {error}"),
+            ),
+        }
+        result
     }
 
     fn record_target_replication_status(
@@ -1144,11 +1544,25 @@ where
         events: Vec<KvEvent>,
         targets: Vec<Self::Target>,
     ) -> Result<(), NetworkError> {
+        let started = Instant::now();
+        let term = state.term;
+        let revision = state.kv_revision;
+        let event_count = events.len();
+        let target_count = targets.len();
         self.host.fan_out_committed_cluster_raft_command(
             self.paths.clone(),
             state,
             events,
             targets,
+        );
+        self.commit_sequence_trace.trace.record(
+            "response",
+            started.elapsed(),
+            term,
+            0,
+            revision,
+            "completed",
+            format_args!("fanned out {event_count} committed events to {target_count} targets"),
         );
         Ok(())
     }
@@ -1160,6 +1574,7 @@ where
     }
 }
 
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub fn commit_cluster_raft_command_with_quorum_driver(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -1167,15 +1582,48 @@ pub fn commit_cluster_raft_command_with_quorum_driver(
     options: ClusterKvRaftQuorumCommitOptions,
     host: &mut impl ClusterRaftQuorumCommitHost,
 ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
+    let trace = ClusterKvQuorumCommitTrace::new(
+        request.request_id.clone(),
+        state.local_node_id.clone(),
+        state.term,
+        state.kv_revision,
+    );
+    commit_cluster_raft_command_with_quorum_driver_and_trace(
+        paths, state, request, options, trace, host,
+    )
+}
+
+fn commit_cluster_raft_command_with_quorum_driver_and_trace(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    request: KvCommandRequest,
+    options: ClusterKvRaftQuorumCommitOptions,
+    trace: ClusterKvQuorumCommitTrace,
+    host: &mut impl ClusterRaftQuorumCommitHost,
+) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
     let mut consensus_state = state.clone();
     project_committed_cluster_raft_config(paths, &mut consensus_state)?;
-    let mut kv_host = NetworkClusterKvRaftQuorumCommitHost { paths, host };
+    let initial_term = consensus_state.term;
+    let initial_revision = consensus_state.kv_revision;
+    let mut kv_host = NetworkClusterKvRaftQuorumCommitHost {
+        paths,
+        commit_sequence_trace: ClusterKvQuorumCommitSequenceTrace::new(
+            trace.clone(),
+            initial_term,
+            initial_revision,
+        ),
+        host,
+    };
     let result = sinomo_kv::commit_cluster_kv_raft_command_with_quorum(
         &mut consensus_state,
         request,
         options,
         &mut kv_host,
-    )?;
+    );
+    kv_host.commit_sequence_trace.record_result(&result);
+    drop(kv_host);
+    trace.flush();
+    let result = result?;
     state.term = state.term.max(consensus_state.term);
     state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
     Ok(result)
@@ -1273,6 +1721,9 @@ struct NetworkClusterKvRaftQuorumCommitAsyncHost<'a, H> {
     paths: &'a ClusterPaths,
     storage: SharedLocalClusterRaftCommandStorage,
     append_options: ClusterRaftAppendReplicationOptions,
+    trace: ClusterKvQuorumCommitTrace,
+    initial_term: u64,
+    initial_revision: u64,
     host: &'a mut H,
 }
 
@@ -1317,8 +1768,12 @@ where
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<std::fs::File>, NetworkError> {
         let runtime = self.runtime;
         let kv_paths = self.paths.kv_paths();
+        let trace = self.trace.clone();
+        let term = self.initial_term;
+        let revision = self.initial_revision;
         Box::pin(async move {
-            runtime
+            let started = Instant::now();
+            let result = runtime
                 .spawn_blocking(move || {
                     sinomo_kv::lock_cluster_kv_commit_sequence(
                         &kv_paths,
@@ -1329,9 +1784,28 @@ where
                 .map_err(|source| NetworkError::Io {
                     operation: "cluster raft commit sequence lock".to_string(),
                     detail: format!("cluster raft commit sequence lock task failed: {source}"),
-                })?
-                .map(Some)
-                .map_err(kv_err)
+                })?;
+            match &result {
+                Ok(_) => trace.record(
+                    "leader_queue",
+                    started.elapsed(),
+                    term,
+                    0,
+                    revision,
+                    "acquired",
+                    format_args!("acquired the cluster KV commit sequence lock"),
+                ),
+                Err(error) => trace.record(
+                    "leader_queue",
+                    started.elapsed(),
+                    term,
+                    0,
+                    revision,
+                    "error",
+                    format_args!("{error}"),
+                ),
+            }
+            result.map(Some).map_err(kv_err)
         })
     }
 
@@ -1369,14 +1843,18 @@ where
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, sinomo_kv::KvLogEntry, NetworkError> {
         let runtime = self.runtime;
         let storage = Arc::clone(&self.storage);
+        let trace = self.trace.clone();
+        let initial_term = self.initial_term;
+        let initial_revision = self.initial_revision;
         Box::pin(async move {
-            runtime
+            let started = Instant::now();
+            let observed = runtime
                 .spawn_blocking(move || {
-                    lock_local_cluster_raft_command_storage(
+                    let mut storage = lock_local_cluster_raft_command_storage(
                         &storage,
                         "append uncommitted cluster Raft request",
-                    )?
-                    .append_uncommitted(request)
+                    )?;
+                    Ok::<_, NetworkError>(storage.append_uncommitted_observed(request))
                 })
                 .await
                 .map_err(|source| NetworkError::Io {
@@ -1384,7 +1862,68 @@ where
                     detail: format!(
                         "cluster raft append uncommitted command task failed: {source}"
                     ),
-                })?
+                })?;
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    trace.record(
+                        "compare",
+                        started.elapsed(),
+                        initial_term,
+                        0,
+                        initial_revision,
+                        "error",
+                        format_args!("storage session failed before request comparison: {error}"),
+                    );
+                    return Err(error);
+                }
+            };
+
+            if observed.log_append_wal_duration.is_some() {
+                trace.record(
+                    "compare",
+                    observed.compare_duration,
+                    initial_term,
+                    0,
+                    initial_revision,
+                    "passed",
+                    format_args!("request identity and transaction branch preflight passed"),
+                );
+            } else if let Err(error) = &observed.result {
+                trace.record(
+                    "compare",
+                    observed.compare_duration,
+                    initial_term,
+                    0,
+                    initial_revision,
+                    "error",
+                    format_args!("{error}"),
+                );
+            }
+
+            if let Some(duration) = observed.log_append_wal_duration {
+                match &observed.result {
+                    Ok(entry) => trace.record(
+                        "log_append_wal",
+                        duration,
+                        entry.term,
+                        entry.index,
+                        entry.revision.0,
+                        "appended",
+                        format_args!("request appended to the local durable Raft log"),
+                    ),
+                    Err(error) => trace.record(
+                        "log_append_wal",
+                        duration,
+                        initial_term,
+                        0,
+                        initial_revision,
+                        "error",
+                        format_args!("{error}"),
+                    ),
+                }
+            }
+            observed.result.map_err(kv_err)
         })
     }
 
@@ -1470,8 +2009,12 @@ where
     {
         let runtime = self.runtime;
         let storage = Arc::clone(&self.storage);
+        let trace = self.trace.clone();
+        let initial_term = self.initial_term;
+        let initial_revision = self.initial_revision;
         Box::pin(async move {
-            runtime
+            let started = Instant::now();
+            let result = match runtime
                 .spawn_blocking(move || {
                     lock_local_cluster_raft_command_storage(&storage, "commit cluster Raft index")?
                         .commit_index_with_events(index)
@@ -1480,7 +2023,33 @@ where
                 .map_err(|source| NetworkError::Io {
                     operation: "cluster raft commit index".to_string(),
                     detail: format!("cluster raft commit index task failed: {source}"),
-                })?
+                }) {
+                Ok(result) => result,
+                Err(error) => Err(error),
+            };
+            match &result {
+                Ok(commit) => trace.record(
+                    "apply",
+                    started.elapsed(),
+                    commit.committed_request.term,
+                    index,
+                    commit.committed_request.revision.0,
+                    "applied",
+                    format_args!(
+                        "committed the local Raft entry and published its materialized result"
+                    ),
+                ),
+                Err(error) => trace.record(
+                    "apply",
+                    started.elapsed(),
+                    initial_term,
+                    index,
+                    initial_revision,
+                    "error",
+                    format_args!("{error}"),
+                ),
+            }
+            result
         })
     }
 
@@ -1563,9 +2132,23 @@ where
         let paths = self.paths;
         let storage = Arc::clone(&self.storage);
         let append_options = self.append_options;
+        let trace = self.trace.clone();
         let host = &mut *self.host;
         Box::pin(async move {
+            let started = Instant::now();
+            let target_count = targets.len();
             if required_remote_acks == 0 || targets.is_empty() {
+                trace.record(
+                    "replication",
+                    started.elapsed(),
+                    state.term,
+                    0,
+                    state.kv_revision,
+                    "quorum",
+                    format_args!(
+                        "replicated to 0 of {required_remote_acks} required remote voters across {target_count} targets"
+                    ),
+                );
                 return Ok(Vec::new());
             }
 
@@ -1789,6 +2372,21 @@ where
                     });
                 }
             }
+            trace.record(
+                "replication",
+                started.elapsed(),
+                state.term,
+                0,
+                state.kv_revision,
+                if accepted >= required_remote_acks {
+                    "quorum"
+                } else {
+                    "incomplete"
+                },
+                format_args!(
+                    "replicated to {accepted} of {required_remote_acks} required remote voters across {target_count} targets"
+                ),
+            );
             Ok(completed)
         })
     }
@@ -1864,10 +2462,40 @@ where
         targets: Vec<Self::Target>,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
         let paths = self.paths.clone();
+        let trace = self.trace.clone();
+        let term = state.term;
+        let revision = state.kv_revision;
+        let event_count = events.len();
+        let target_count = targets.len();
         let host = &mut *self.host;
         Box::pin(async move {
-            host.fan_out_committed_cluster_raft_command_async(paths, state, events, targets)
-                .await
+            let started = Instant::now();
+            let result = host
+                .fan_out_committed_cluster_raft_command_async(paths, state, events, targets)
+                .await;
+            match &result {
+                Ok(()) => trace.record(
+                    "response",
+                    started.elapsed(),
+                    term,
+                    0,
+                    revision,
+                    "completed",
+                    format_args!(
+                        "fanned out {event_count} committed events to {target_count} targets"
+                    ),
+                ),
+                Err(error) => trace.record(
+                    "response",
+                    started.elapsed(),
+                    term,
+                    0,
+                    revision,
+                    "error",
+                    format_args!("{error}"),
+                ),
+            }
+            result
         })
     }
 
@@ -1902,24 +2530,69 @@ where
             operation: "project committed cluster Raft config".to_string(),
             detail: format!("Raft config projection task failed: {source}"),
         })??;
+    let request_id = request.request_id.clone();
+    let local_node_id = consensus_state.local_node_id.clone();
+    let initial_term = consensus_state.term;
+    let initial_revision = consensus_state.kv_revision;
+    let trace = ClusterKvQuorumCommitTrace::new(
+        request_id,
+        local_node_id.clone(),
+        initial_term,
+        initial_revision,
+    );
     let storage = Arc::new(Mutex::new(LocalClusterRaftCommandStorage::new(
         paths,
-        consensus_state.local_node_id.clone(),
+        local_node_id.clone(),
     )));
     let mut kv_host = NetworkClusterKvRaftQuorumCommitAsyncHost {
         runtime,
         paths,
         storage,
         append_options,
+        trace: trace.clone(),
+        initial_term,
+        initial_revision,
         host,
     };
+    let commit_started = Instant::now();
     let result = sinomo_kv::commit_cluster_kv_raft_command_with_quorum_async(
         &mut consensus_state,
         request,
         options,
         &mut kv_host,
     )
-    .await?;
+    .await;
+    match &result {
+        Ok(commit) => trace.record(
+            "commit_complete",
+            commit_started.elapsed(),
+            commit.authority.term,
+            commit.authority.commit_index,
+            commit.authority.revision.0,
+            if commit.replayed_committed_request {
+                "replayed"
+            } else {
+                "completed"
+            },
+            format_args!(
+                "asynchronous quorum commit future returned after releasing its commit sequence lock"
+            ),
+        ),
+        Err(error) => trace.record(
+            "commit_complete",
+            commit_started.elapsed(),
+            initial_term,
+            0,
+            initial_revision,
+            "error",
+            format_args!(
+                "asynchronous quorum commit future returned after releasing its commit sequence lock: {error}"
+            ),
+        ),
+    }
+    drop(kv_host);
+    trace.flush();
+    let result = result?;
     state.term = state.term.max(consensus_state.term);
     state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
     Ok(result)

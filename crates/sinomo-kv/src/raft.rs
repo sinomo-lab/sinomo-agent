@@ -2896,7 +2896,7 @@ impl ClusterKvRaftStore {
         if let Some(snapshot) = snapshot {
             self.paths
                 .local_cache()
-                .write_snapshot_if_changed(&snapshot)?;
+                .write_raft_snapshot_if_changed(&snapshot)?;
             Ok(true)
         } else {
             Ok(false)
@@ -2927,7 +2927,7 @@ impl ClusterKvRaftStore {
         let snapshot = self.set_leader(node_id, term)?;
         self.paths
             .local_cache()
-            .write_snapshot_if_changed(&snapshot)?;
+            .write_raft_snapshot_if_changed(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -2954,7 +2954,7 @@ impl ClusterKvRaftStore {
         let snapshot = self.clear_leader(node_id)?;
         self.paths
             .local_cache()
-            .write_snapshot_if_changed(&snapshot)?;
+            .write_raft_snapshot_if_changed(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -3130,7 +3130,8 @@ impl ClusterKvRaftStore {
         F: FnMut(&str) -> bool,
     {
         if outcome.snapshot_restored {
-            let wrote = write_cluster_kv_snapshot_if_changed(&self.paths, &outcome.snapshot)?;
+            let wrote =
+                write_cluster_kv_authoritative_snapshot_if_changed(&self.paths, &outcome.snapshot)?;
             return Ok(wrote);
         }
         if outcome.committed_events.is_empty() {
@@ -3161,7 +3162,9 @@ impl ClusterKvRaftStore {
         {
             return Ok(false);
         }
-        self.paths.local_cache().write_snapshot_if_changed(snapshot)
+        self.paths
+            .local_cache()
+            .write_raft_snapshot_if_changed(snapshot)
     }
 
     fn materialized_snapshot_is_fresh_enough(&self, snapshot: &KvSnapshot) -> bool {
@@ -3324,7 +3327,10 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
     ) -> Result<(KvSnapshot, bool), KvError> {
         let snapshot = self.discard_uncommitted_tail_and_clear_leader(node_id)?;
-        let wrote = write_cluster_kv_snapshot_if_changed(&self.paths, &snapshot)?;
+        let wrote = self
+            .paths
+            .local_cache()
+            .write_raft_snapshot_if_changed(&snapshot)?;
         Ok((snapshot, wrote))
     }
 
@@ -3442,6 +3448,16 @@ where
     node: Option<DurableRaftKvNode>,
     key_can_defer_materialized_snapshot: F,
     last_snapshot_publish_wrote: Option<bool>,
+}
+
+/// Timing captured while appending one local Raft request before quorum
+/// replication begins. The observation is returned to the caller so emitting
+/// diagnostics remains outside the KV correctness path.
+#[derive(Debug)]
+pub struct ClusterKvRaftObservedAppend {
+    pub result: Result<KvLogEntry, KvError>,
+    pub compare_duration: Duration,
+    pub log_append_wal_duration: Option<Duration>,
 }
 
 impl<F> ClusterKvRaftLocalCommandStorage<F>
@@ -3568,8 +3584,24 @@ where
     }
 
     pub fn append_uncommitted(&mut self, request: KvCommandRequest) -> Result<KvLogEntry, KvError> {
+        self.append_uncommitted_with_timing(request, false).result
+    }
+
+    pub fn append_uncommitted_observed(
+        &mut self,
+        request: KvCommandRequest,
+    ) -> ClusterKvRaftObservedAppend {
+        self.append_uncommitted_with_timing(request, true)
+    }
+
+    fn append_uncommitted_with_timing(
+        &mut self,
+        request: KvCommandRequest,
+        capture_timing: bool,
+    ) -> ClusterKvRaftObservedAppend {
         self.last_snapshot_publish_wrote = None;
-        let preflight = {
+        let compare_started = capture_timing.then(Instant::now);
+        let preflight: Result<(), KvError> = (|| {
             let node = self.node_mut_discarding_uncommitted_tail()?;
             let digest = request.digest()?;
             if node.store().request_id_expired(&request.request_id) {
@@ -3587,16 +3619,34 @@ where
             } else {
                 node.store().preflight_apply_command(&request.command)
             }
-        };
+        })();
+        let compare_duration = compare_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         if let Err(error) = preflight {
             let _ = mark_cluster_kv_request_rejected_before_commit(
                 self.store.paths(),
                 &request,
                 error.to_string(),
             );
-            return Err(error);
+            return ClusterKvRaftObservedAppend {
+                result: Err(error),
+                compare_duration,
+                log_append_wal_duration: None,
+            };
         }
-        mark_cluster_kv_request_submitted(self.store.paths(), &request)?;
+        let log_append_wal_started = capture_timing.then(Instant::now);
+        if let Err(error) = mark_cluster_kv_request_submitted(self.store.paths(), &request) {
+            return ClusterKvRaftObservedAppend {
+                result: Err(error),
+                compare_duration,
+                log_append_wal_duration: Some(
+                    log_append_wal_started
+                        .map(|started| started.elapsed())
+                        .unwrap_or_default(),
+                ),
+            };
+        }
         let request_for_outcome = request.clone();
         let result: Result<KvLogEntry, KvError> = (|| {
             let term = self.node_mut()?.hard_state().current_term.max(1);
@@ -3605,6 +3655,9 @@ where
             store.compact_node_if_needed(self.node_mut()?)?;
             Ok(entry)
         })();
+        let log_append_wal_duration = log_append_wal_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         if let Err(error) = &result {
             let _ = mark_cluster_kv_request_unknown(
                 self.store.paths(),
@@ -3612,7 +3665,11 @@ where
                 error.to_string(),
             );
         }
-        result
+        ClusterKvRaftObservedAppend {
+            result,
+            compare_duration,
+            log_append_wal_duration: Some(log_append_wal_duration),
+        }
     }
 
     pub fn record_rejected_before_commit(
@@ -3645,7 +3702,10 @@ where
             store.compact_node_if_needed(node)?;
             node.store().try_snapshot()?
         };
-        let wrote = write_cluster_kv_snapshot_if_changed(store.paths(), &snapshot)?;
+        let wrote = store
+            .paths()
+            .local_cache()
+            .write_raft_snapshot_if_changed(&snapshot)?;
         self.last_snapshot_publish_wrote = Some(wrote);
         Ok(snapshot)
     }
@@ -3663,7 +3723,7 @@ where
             store
                 .paths()
                 .local_cache()
-                .write_snapshot_if_changed(&snapshot)?;
+                .write_raft_snapshot_if_changed(&snapshot)?;
         }
         Ok(())
     }

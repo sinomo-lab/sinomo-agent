@@ -140,11 +140,16 @@ each transport session authenticates the peer identity used for that route.
 Intermediate hops create fresh outer relay sessions and body-transfer
 descriptors.
 
-Every response carries an Ed25519 identity proof bound to the logical origin
-session. Direct responses verify it against the expected target key. Relays
-preserve that proof unchanged for a delivered response; relay-generated routing
-feedback is classified before it can be treated as target delivery. The proof
-answers who produced the response, not whether the response bytes were altered.
+Canonical responses carry an Ed25519 identity proof bound to their logical
+session. Direct responses verify it against the expected target key, and a
+canonical relay preserves an available final-target proof unchanged. A pooled
+channel instead authenticates its peer once and carries the verified responder
+node id on each call. When a pooled final hop feeds an upstream canonical hop,
+the relay signs that canonical link and the receiver requires both the valid
+link proof and the exact expected final-target id. Relay-generated routing
+feedback is classified before it can be treated as target delivery. These
+proofs answer which authenticated nodes handled the response, not whether the
+response bytes were altered.
 
 Body framing enforces only protocol shape: transfer identity, ordered offsets,
 declared lengths, flow-control windows, and completion byte counts. It does not
@@ -277,10 +282,10 @@ them.
 
 Identity authentication remains in scope. Signed daemon requests establish the
 caller identity and request context, retain freshness and nonce replay checks,
-and response identity proofs establish which target answered the logical
-session. These proofs are authentication contracts, not content-integrity or
-channel-security guarantees. The target service still applies its own domain
-authorization.
+and response identity proofs plus exact pooled-channel responder attestations
+establish which target answered the logical session. These are authentication
+contracts, not content-integrity or channel-security guarantees. The target
+service still applies its own domain authorization.
 
 Relays see only the authority required to forward a packet. They cannot convert
 reachability into membership or impersonate the original requester. Local

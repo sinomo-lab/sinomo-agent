@@ -2,6 +2,103 @@ use crate::internal::*;
 
 pub const CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT: Duration = Duration::from_secs(30);
 
+#[derive(Default)]
+struct CommitSequenceAdmissionState {
+    next_ticket: u64,
+    serving_ticket: u64,
+    cancelled_tickets: BTreeSet<u64>,
+}
+
+#[derive(Default)]
+struct CommitSequenceAdmissionGate {
+    state: Mutex<CommitSequenceAdmissionState>,
+    changed: Condvar,
+}
+
+struct CommitSequenceAdmissionTurn {
+    gate: Arc<CommitSequenceAdmissionGate>,
+    ticket: u64,
+}
+
+static COMMIT_SEQUENCE_ADMISSION_GATES: LazyLock<
+    Mutex<HashMap<PathBuf, std::sync::Weak<CommitSequenceAdmissionGate>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn commit_sequence_admission_gate(lock_path: &Path) -> Arc<CommitSequenceAdmissionGate> {
+    let mut gates = COMMIT_SEQUENCE_ADMISSION_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(gate) = gates.get(lock_path).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let gate = Arc::new(CommitSequenceAdmissionGate::default());
+    gates.insert(lock_path.to_path_buf(), Arc::downgrade(&gate));
+    gate
+}
+
+fn advance_commit_sequence_admission(state: &mut CommitSequenceAdmissionState) {
+    state.serving_ticket = state.serving_ticket.saturating_add(1);
+    while state.cancelled_tickets.remove(&state.serving_ticket) {
+        state.serving_ticket = state.serving_ticket.saturating_add(1);
+    }
+}
+
+impl CommitSequenceAdmissionGate {
+    fn acquire(
+        self: &Arc<Self>,
+        lock_path: &Path,
+        deadline: Instant,
+    ) -> Result<CommitSequenceAdmissionTurn, KvError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.saturating_add(1);
+        loop {
+            if state.serving_ticket == ticket {
+                return Ok(CommitSequenceAdmissionTurn {
+                    gate: Arc::clone(self),
+                    ticket,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.cancelled_tickets.insert(ticket);
+                return Err(KvError::Busy {
+                    path: lock_path.display().to_string(),
+                });
+            }
+            let (next_state, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next_state;
+            if wait.timed_out() && state.serving_ticket != ticket {
+                state.cancelled_tickets.insert(ticket);
+                return Err(KvError::Busy {
+                    path: lock_path.display().to_string(),
+                });
+            }
+        }
+    }
+}
+
+impl Drop for CommitSequenceAdmissionTurn {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert_eq!(state.serving_ticket, self.ticket);
+        advance_commit_sequence_admission(&mut state);
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
 /// Locks the cluster raft commit sequence (append → replicate → commit) against
 /// concurrent committers from other tasks and other processes sharing this data
 /// dir. The quorum commit is a multi-step protocol over separately-locked store
@@ -20,6 +117,15 @@ pub fn lock_cluster_kv_commit_sequence(
         detail: source.to_string(),
     })?;
     let lock_path = paths.raft.join("commit-sequence.lock");
+    let deadline = Instant::now() + wait;
+    // `try_lock_exclusive` is deliberately bounded, but polling it directly is
+    // not fair: a newly-arrived task can acquire between the older waiter's
+    // exponentially-backed-off probes. Admit one waiter per process in ticket
+    // order, then retain the file lock as the cross-process authority. This
+    // keeps timeout and process-death recovery semantics unchanged while
+    // preventing a fresh local mutation from starving an older commit.
+    let admission = commit_sequence_admission_gate(&lock_path);
+    let _turn = admission.acquire(&lock_path, deadline)?;
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -29,7 +135,11 @@ pub fn lock_cluster_kv_commit_sequence(
             path: lock_path.display().to_string(),
             detail: source.to_string(),
         })?;
-    lock_node_exclusive(&lock, &lock_path, wait)?;
+    lock_node_exclusive(
+        &lock,
+        &lock_path,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
     Ok(lock)
 }
 pub fn register_storage_paths(
@@ -46,6 +156,11 @@ pub fn register_storage_paths(
             .field("entries", "Vec<KvEntry>")
             .field("events", "Vec<KvEvent>"),
     )?;
+    layout.register_file(sinomo_storage::StorageFileContract::binary(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/kv-snapshot.sobj.lock",
+    )?)?;
     layout.register_sinomo_object(
         "sinomo-kv",
         StorageRing::R1,
@@ -230,8 +345,11 @@ impl ClusterKvPaths {
         node_id: &NodeId,
         snapshot: &KvSnapshot,
     ) -> bool {
-        match self.current_snapshot_revision_for_node(node_id) {
-            Ok(local_revision) => snapshot.revision > local_revision,
+        match read_cluster_kv_current_snapshot_for_node(self, node_id.clone()) {
+            Ok(local_snapshot) => {
+                kv_snapshot_materialized_generation(snapshot)
+                    > kv_snapshot_materialized_generation(&local_snapshot)
+            }
             Err(_) => true,
         }
     }
@@ -484,5 +602,114 @@ impl ClusterKvPaths {
                 path: self.snapshot.display().to_string(),
                 detail: "cannot append an empty batch of cluster kv operations".to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_for_issued_ticket(gate: &CommitSequenceAdmissionGate, issued: u64) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let next_ticket = gate
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .next_ticket;
+            if next_ticket >= issued {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for admission ticket {issued}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn commit_sequence_admission_is_fifo() {
+        let gate = Arc::new(CommitSequenceAdmissionGate::default());
+        let path = PathBuf::from("commit-sequence.lock");
+        let first = gate
+            .acquire(&path, Instant::now() + Duration::from_secs(1))
+            .expect("first turn");
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let oldest = {
+            let gate = Arc::clone(&gate);
+            let path = path.clone();
+            let order = Arc::clone(&order);
+            thread::spawn(move || {
+                let _turn = gate
+                    .acquire(&path, Instant::now() + Duration::from_secs(1))
+                    .expect("oldest waiting turn");
+                order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("oldest");
+            })
+        };
+        wait_for_issued_ticket(&gate, 2);
+        let newest = {
+            let gate = Arc::clone(&gate);
+            let order = Arc::clone(&order);
+            thread::spawn(move || {
+                let _turn = gate
+                    .acquire(&path, Instant::now() + Duration::from_secs(1))
+                    .expect("newest waiting turn");
+                order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("newest");
+            })
+        };
+        wait_for_issued_ticket(&gate, 3);
+
+        drop(first);
+        oldest.join().expect("oldest waiter");
+        newest.join().expect("newest waiter");
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ["oldest", "newest"]
+        );
+    }
+
+    #[test]
+    fn commit_sequence_admission_skips_timed_out_ticket() {
+        let gate = Arc::new(CommitSequenceAdmissionGate::default());
+        let path = PathBuf::from("commit-sequence.lock");
+        let first = gate
+            .acquire(&path, Instant::now() + Duration::from_secs(1))
+            .expect("first turn");
+        let timed_out = {
+            let gate = Arc::clone(&gate);
+            let path = path.clone();
+            thread::spawn(move || {
+                gate.acquire(&path, Instant::now() + Duration::from_millis(20))
+            })
+        };
+        wait_for_issued_ticket(&gate, 2);
+        assert!(matches!(
+            timed_out.join().expect("timed-out waiter"),
+            Err(KvError::Busy { .. })
+        ));
+
+        let next = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                gate.acquire(&path, Instant::now() + Duration::from_secs(1))
+            })
+        };
+        wait_for_issued_ticket(&gate, 3);
+        drop(first);
+        let turn = next
+            .join()
+            .expect("next waiter")
+            .expect("next turn after cancellation");
+        assert_eq!(turn.ticket, 2);
     }
 }

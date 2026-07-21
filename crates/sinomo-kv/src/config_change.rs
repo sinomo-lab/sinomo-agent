@@ -316,10 +316,27 @@ pub fn record_cluster_kv_raft_peer_progress(
     paths: &ClusterKvPaths,
     progress: ClusterKvRaftPeerProgress,
 ) -> Result<(), KvError> {
+    record_cluster_kv_raft_peer_progress_batch(paths, vec![progress])
+}
+
+/// Persists the soft replication hints produced by one committed fanout wave.
+///
+/// Fanout owns these observations, so it records the whole wave at completion.
+/// Taking the Raft operation lock and rewriting the bounded ledger once avoids
+/// turning one commit into one storage transaction per peer.
+pub fn record_cluster_kv_raft_peer_progress_batch(
+    paths: &ClusterKvPaths,
+    progress: Vec<ClusterKvRaftPeerProgress>,
+) -> Result<(), KvError> {
+    if progress.is_empty() {
+        return Ok(());
+    }
     let _guard = lock_cluster_kv_raft_operation_for_paths(paths)?;
     let mut hints = read_cluster_kv_raft_peer_progress(paths)?;
-    hints.retain(|hint| hint.peer_node_id != progress.peer_node_id);
-    hints.push(progress);
+    for progress in progress {
+        hints.retain(|hint| hint.peer_node_id != progress.peer_node_id);
+        hints.push(progress);
+    }
     hints.sort_by_key(|hint| hint.observed_at);
     if hints.len() > MAX_CLUSTER_KV_RAFT_PEER_PROGRESS_HINTS {
         let excess = hints

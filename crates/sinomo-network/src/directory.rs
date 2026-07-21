@@ -7,8 +7,10 @@
 //! version stamp used to invalidate routing caches. Cluster connectivity is
 //! supplied by this directory when a cluster KV-backed provider is available.
 //! The local connectivity file is only a bootstrap fallback before that graph
-//! can be read, or for the current node's own source-owned probe records until
-//! those records have replicated into the directory graph.
+//! can be read. While the current node has not published any source-owned
+//! record, its accepted local snapshot may also complete a sparse directory
+//! graph with imported relay edges. After that source appears in the directory,
+//! only its own newer observations are overlaid.
 
 use crate::connectivity::ClusterConnectivityRecord;
 use crate::error::NetworkError;
@@ -43,9 +45,10 @@ pub trait ClusterDirectory: Send + Sync {
     ///
     /// Production KV-backed directories return the authoritative cluster
     /// connectivity graph. The local connectivity file is used only when the
-    /// directory graph is unavailable or empty during bootstrap, or for the
-    /// current node's own source-owned records until that source appears in
-    /// the directory graph.
+    /// directory graph is unavailable or empty during bootstrap. Until the
+    /// current node's source first appears there, its accepted local snapshot
+    /// may complete a sparse graph with imported relay edges; afterwards only
+    /// the current node's own newer observations are overlaid.
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
 
     /// Monotonic stamp of the backing store used for routing-cache

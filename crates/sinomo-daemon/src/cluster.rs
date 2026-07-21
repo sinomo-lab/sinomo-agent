@@ -1,4 +1,8 @@
-use crate::dfs::ensure_default_distributed_dfs_async_on_runtime;
+use crate::client::{
+    cancel_cluster_kv_watch_from_endpoint_async, drain_cluster_kv_watch_from_endpoint_async,
+    fetch_cluster_kv_local_snapshot_from_endpoint_async,
+    start_cluster_kv_authoritative_watch_from_endpoint_async,
+};
 #[cfg(test)]
 use crate::status::ensure_daemon_cluster_members;
 #[cfg(test)]
@@ -34,21 +38,24 @@ use sinomo_core::cluster::{
 };
 #[cfg(test)]
 use sinomo_core::kv::InProcessKvStore;
-#[cfg(test)]
-use sinomo_core::kv::KvCommand;
 use sinomo_core::kv::{
     ClusterKvRaftAppendReplicationOutcome, ClusterKvReplicationRequest,
     ClusterKvReplicationResponse, ClusterKvStateAuthorityVoteRequest,
-    ClusterKvStateAuthorityVoteResponse, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
+    ClusterKvStateAuthorityVoteResponse, ClusterKvWatchCancelRequest, ClusterKvWatchDrainRequest,
+    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterKvWatchRegistration,
     ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse,
+    ClusterRaftVoteResponse, KvEventKind, KvRevision,
 };
-use sinomo_core::kv::{KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
+#[cfg(test)]
+use sinomo_core::kv::{KvCommand, KvOp};
+use sinomo_core::kv::{KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::__connectivity_store::LocalClusterConnectivityStoreSnapshot;
 use sinomo_core::network::{
     AsyncMdnsDiscoverySocket, ClusterConnectivityRecord, ClusterConnectivityState,
-    ClusterNetworkInfoRecord, ClusterPaths, MdnsDiscoveryCache, ObjectRpcRequest,
-    ObjectRpcResponse,
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterNetworkInfoRecord,
+    ClusterPaths, MdnsDiscoveryCache, ObjectRpcRequest, ObjectRpcResponse,
+    daemon_loopback_endpoint,
 };
 #[cfg(test)]
 use sinomo_core::network::{ClusterConnectivityProbeState, MdnsDiscoveryAdvertisement};
@@ -56,8 +63,8 @@ use sinomo_core::node::ClusterId;
 #[cfg(test)]
 use sinomo_core::node::{ClusterInviteId, cluster_member_key};
 use sinomo_core::node::{
-    NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
-    shadow_daemon_node_id,
+    DAEMON_MAIN_RUN_CAPABILITY, NodeId, cluster_member_expected_daemon_process,
+    cluster_member_is_local_process, shadow_daemon_node_id,
 };
 use sinomo_core::node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_core::{
@@ -80,6 +87,11 @@ pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT: Duration = CLUSTER_HEALTH_PROBE_TIMEOUT;
+/// A fresh join retires the daemon that performed it, so the accepted
+/// introducer's one-hop graph should cross that handoff synchronously when it
+/// is immediately available. This is a best-effort optimization, not the join
+/// deadline: failure only defers discovery to replacement-daemon maintenance.
+const DAEMON_JOIN_CONNECTIVITY_HANDOFF_TIMEOUT: Duration = Duration::from_millis(250);
 const CLUSTER_HEALTH_ROUTED_PING_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_DIRECT_STATUS_MAX_ENDPOINTS: usize = 4;
@@ -97,15 +109,6 @@ pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs
 /// window (relay routes need connectivity records, which need relayed
 /// publishes — only fast retry breaks the cycle once the bridge publishes).
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(8);
-/// Learner KV snapshot pull cadence. Convergence is event-driven — the voter
-/// pushes committed raft appends to every member on commit — so this pull is
-/// only a recovery net for lost pushes and restarts, deliberately slow to keep
-/// an idle cluster quiet.
-pub const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL: Duration = Duration::from_secs(600);
-const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_BACKOFF: Duration =
-    DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration =
     sinomo_core::network::CLUSTER_NETWORK_DISCOVERY_INTERVAL;
 const DAEMON_CLUSTER_STARTUP_SETTLE_DURATION: Duration = Duration::from_secs(8);
@@ -142,10 +145,6 @@ const CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY: usize = 16;
 const CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(8);
 const CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(10);
-const CLUSTER_NETWORK_PENDING_FORMATION_CONTROL_PLANE_TIMEOUT: Duration =
-    DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT;
-const CLUSTER_NETWORK_PENDING_KV_SNAPSHOT_PULL_TIMEOUT: Duration =
-    CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration =
@@ -156,46 +155,6 @@ const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration =
 // status/member/snapshot/service work after an early connectivity probe.
 const CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE: Duration =
     sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-
-fn cluster_network_pending_connectivity_publish_timeout(use_formation_timeouts: bool) -> Duration {
-    if use_formation_timeouts {
-        CLUSTER_NETWORK_PENDING_FORMATION_CONTROL_PLANE_TIMEOUT
-    } else {
-        CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT
-    }
-}
-
-fn cluster_network_pending_kv_snapshot_pull_timeout(use_formation_timeouts: bool) -> Duration {
-    if use_formation_timeouts {
-        CLUSTER_NETWORK_PENDING_FORMATION_CONTROL_PLANE_TIMEOUT
-    } else {
-        CLUSTER_NETWORK_PENDING_KV_SNAPSHOT_PULL_TIMEOUT
-    }
-}
-
-fn cluster_network_pending_member_publish_timeout(use_formation_timeouts: bool) -> Duration {
-    if use_formation_timeouts {
-        CLUSTER_NETWORK_PENDING_FORMATION_CONTROL_PLANE_TIMEOUT
-    } else {
-        CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT
-    }
-}
-
-fn cluster_network_pending_node_status_timeout(use_formation_timeouts: bool) -> Duration {
-    if use_formation_timeouts {
-        CLUSTER_NETWORK_PENDING_FORMATION_CONTROL_PLANE_TIMEOUT
-    } else {
-        CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT
-    }
-}
-
-fn cluster_network_pending_service_publish_timeout(use_formation_timeouts: bool) -> Duration {
-    if use_formation_timeouts {
-        CLUSTER_NETWORK_PENDING_FORMATION_CONTROL_PLANE_TIMEOUT
-    } else {
-        CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT
-    }
-}
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -275,6 +234,21 @@ struct ClusterConnectivityProbePlan {
 struct ClusterConnectivityProbeExecution {
     records: Vec<ClusterConnectivityRecord>,
     probed_degraded: bool,
+    newly_healthy_target_node_ids: Vec<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterConnectivityProbePendingOutcome {
+    /// Endpoint observations, local persistence, and publication completed.
+    Completed,
+    /// Endpoint observations were durably persisted; only their quorum
+    /// publication remains owned by the connectivity-publication retry.
+    PublicationDeferred,
+    /// A newer topology or source-store generation won before local commit.
+    /// Its owner is rearmed without charging endpoint-probe failure backoff.
+    Superseded,
+    /// The probe generation itself could not be durably persisted.
+    ProbeFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,19 +263,30 @@ pub(crate) struct ClusterConnectivityPendingProbe {
     source_node_id: NodeId,
     state: ClusterBootstrapState,
     plan: ClusterConnectivityProbePlan,
-    use_formation_timeouts: bool,
+    input_generation: u64,
+    local_connectivity_snapshot: LocalClusterConnectivityStoreSnapshot,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct ClusterConnectivityPendingPublish {
     paths: ClusterPaths,
     source_node_id: NodeId,
     state: ClusterBootstrapState,
-    use_formation_timeouts: bool,
+    /// Exact source-owned set read back after its durable local commit.
+    ///
+    /// `None` is used only for ordinary publication planning, where the set
+    /// is captured from the durable store before the first remote await.
+    records: Option<Arc<Vec<ClusterConnectivityRecord>>>,
+    input_generation: u64,
+    local_connectivity_snapshot: LocalClusterConnectivityStoreSnapshot,
 }
 
 #[derive(Default)]
 pub(crate) struct ClusterNetworkMaintenancePendingWork {
-    kv_snapshot_pull: Option<ClusterKvSnapshotPendingPull>,
+    publish_claimed: bool,
+    publish_planning_failed: bool,
+    probe_claimed: bool,
+    connectivity_publish_claimed: bool,
     connectivity_publish: Option<ClusterConnectivityPendingPublish>,
     connectivity_probe: Option<ClusterConnectivityPendingProbe>,
     member_publishes: Vec<ClusterMemberPublishPendingWork>,
@@ -312,7 +297,9 @@ pub(crate) struct ClusterNetworkMaintenancePendingWork {
 
 impl ClusterNetworkMaintenancePendingWork {
     fn is_empty(&self) -> bool {
-        self.kv_snapshot_pull.is_none()
+        !self.publish_claimed
+            && !self.probe_claimed
+            && !self.connectivity_publish_claimed
             && self.connectivity_publish.is_none()
             && self.connectivity_probe.is_none()
             && self.member_publishes.is_empty()
@@ -322,30 +309,37 @@ impl ClusterNetworkMaintenancePendingWork {
     }
 }
 
-struct ClusterKvSnapshotPendingPull {
-    paths: ClusterPaths,
-    state: ClusterBootstrapState,
-    use_formation_timeouts: bool,
-}
-
+#[derive(Clone, Debug)]
 struct ClusterServiceInstancePendingPublish {
     daemon_paths: DaemonPaths,
     local_node_id: NodeId,
-    use_formation_timeouts: bool,
+    snapshot: Arc<sinomo_core::service::ServiceRegistrySnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClusterNetworkMaintenanceDueClaims {
+    publish: bool,
+    probe: bool,
+    discovery: bool,
+    connectivity_publish: bool,
+}
+
+impl ClusterNetworkMaintenanceDueClaims {
+    fn is_empty(self) -> bool {
+        !(self.publish || self.probe || self.discovery || self.connectivity_publish)
+    }
 }
 
 struct ClusterMemberPublishPendingWork {
     paths: ClusterPaths,
     state: ClusterBootstrapState,
     force_kv_snapshot_sync: bool,
-    use_formation_timeouts: bool,
 }
 
 #[derive(Clone)]
 struct ClusterNodeStatusPendingRefresh {
     paths: DaemonPaths,
     label: &'static str,
-    use_formation_timeouts: bool,
 }
 
 static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
@@ -355,8 +349,14 @@ static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusR
 static PUBLISHED_CONNECTIVITY: OnceLock<
     Mutex<BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>>,
 > = OnceLock::new();
-static JOIN_CONNECTIVITY_SYNC_IN_FLIGHT: OnceLock<Mutex<BTreeSet<PublishedConnectivitySourceKey>>> =
-    OnceLock::new();
+// The generation is incremented after every locally recorded join endpoint.
+// A publisher snapshots it before reading the local source set and only
+// retires the entry if the generation is still unchanged after quorum commit.
+// This makes the coalescer lossless: an endpoint recorded while a publish is
+// in flight forces another pass instead of being stranded until maintenance.
+static JOIN_CONNECTIVITY_SYNC_IN_FLIGHT: OnceLock<
+    Mutex<BTreeMap<PublishedConnectivitySourceKey, u64>>,
+> = OnceLock::new();
 
 thread_local! {
     static COMMAND_CONNECTIVITY_SYNC_IN_FLIGHT: std::cell::Cell<bool> =
@@ -928,14 +928,41 @@ fn mark_join_connectivity_sync_in_flight(
 ) -> Option<PublishedConnectivitySourceKey> {
     let source_key = connectivity_cache_source_key(paths, source_node_id);
     let mut guard = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .ok()?;
-    if guard.insert(source_key.clone()) {
-        Some(source_key)
-    } else {
-        None
+    if let Some(generation) = guard.get_mut(&source_key) {
+        *generation = generation.saturating_add(1);
+        return None;
     }
+    guard.insert(source_key.clone(), 1);
+    Some(source_key)
+}
+
+fn join_connectivity_sync_generation(source_key: &PublishedConnectivitySourceKey) -> Option<u64> {
+    JOIN_CONNECTIVITY_SYNC_IN_FLIGHT
+        .get()?
+        .lock()
+        .ok()?
+        .get(source_key)
+        .copied()
+}
+
+fn finish_join_connectivity_sync_generation(
+    source_key: &PublishedConnectivitySourceKey,
+    published_generation: u64,
+) -> bool {
+    let Some(lock) = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT.get() else {
+        return true;
+    };
+    let Ok(mut guard) = lock.lock() else {
+        return false;
+    };
+    if guard.get(source_key).copied() != Some(published_generation) {
+        return false;
+    }
+    guard.remove(source_key);
+    true
 }
 
 fn clear_join_connectivity_sync_in_flight(source_key: &PublishedConnectivitySourceKey) {
@@ -990,49 +1017,82 @@ fn publish_join_connectivity_if_needed(
             "connectivity publish source={source_node_id} target={target_node_id} endpoint={endpoint_id} start"
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
-            &paths,
-            &source_node_id,
-        )
-        .unwrap_or_default();
-        if !records.iter().any(|record| {
-            record.target_node_id == observed_record.target_node_id
-                && record.endpoint_id == observed_record.endpoint_id
-        }) {
-            records.push(observed_record);
-        }
-        let record_count = records.len();
-        let result = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
-            &task_runtime,
-            &paths,
-            &source_node_id,
-            &records,
-        )
-        .await;
-        match result {
-            Ok(()) => {
-                let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
+        loop {
+            // Snapshot the generation before reading. Every caller records its
+            // endpoint before incrementing the generation, so a later change
+            // is either present in this read or forces another loop pass.
+            let Some(generation) = join_connectivity_sync_generation(&source_key) else {
+                return;
+            };
+            let mut records =
+                sinomo_core::network::read_local_cluster_connectivity_records_for_source(
                     &paths,
-                    &state,
-                    &records,
-                    task_runtime.clone(),
-                    true,
+                    &source_node_id,
+                )
+                .unwrap_or_default();
+            if !records.iter().any(|record| {
+                record.target_node_id == observed_record.target_node_id
+                    && record.endpoint_id == observed_record.endpoint_id
+            }) {
+                records.push(observed_record.clone());
+            }
+            let record_count = records.len();
+            let publish_started = Instant::now();
+            crate::cluster_join_trace(format_args!(
+                "connectivity quorum publish source={source_node_id} generation={generation} records={record_count} start"
+            ));
+            let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+                DaemonClusterRpcMode::new(task_runtime.clone()),
+                cluster_control_plane_timeouts(),
+            );
+            let published =
+                sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                    &task_runtime,
+                    &paths,
+                    &source_node_id,
+                    records.clone(),
+                    state.clone(),
+                    &mut publish_host,
                 )
                 .await;
-                crate::cluster_join_trace(format_args!(
-                    "connectivity import source={source_node_id} records={record_count} imported={imported} in {:?}",
-                    started.elapsed()
-                ));
+            let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
+                &paths,
+                &state,
+                &records,
+                task_runtime.clone(),
+            )
+            .await;
+            match published {
+                Ok(snapshot) => {
+                    let revision = snapshot.as_ref().map(|snapshot| snapshot.revision);
+                    crate::cluster_join_trace(format_args!(
+                        "connectivity quorum publish source={source_node_id} generation={generation} records={record_count} revision={revision:?} imported={imported} committed in {:?} total {:?}",
+                        publish_started.elapsed(),
+                        started.elapsed()
+                    ));
+                }
+                Err(error) => {
+                    crate::cluster_join_trace(format_args!(
+                        "connectivity quorum publish source={source_node_id} generation={generation} records={record_count} imported={imported} failed in {:?}: {error}",
+                        publish_started.elapsed()
+                    ));
+                    tracing::warn!(
+                        "sinomo daemon join connectivity quorum publish failed: {error}"
+                    );
+                    clear_join_connectivity_sync_in_flight(&source_key);
+                    crate::control::request_daemon_cluster_maintenance(
+                        crate::control::DaemonClusterMaintenanceReason::JoinConnectivityPublishFailed,
+                    );
+                    return;
+                }
             }
-            Err(error) => {
-                crate::cluster_join_trace(format_args!(
-                    "connectivity import source={source_node_id} records={record_count} failed in {:?}: {error}",
-                    started.elapsed()
-                ));
-                tracing::warn!("sinomo daemon join connectivity local write failed: {error}");
+            if finish_join_connectivity_sync_generation(&source_key, generation) {
+                return;
             }
+            crate::cluster_join_trace(format_args!(
+                "connectivity quorum publish source={source_node_id} generation={generation} draining newer observations"
+            ));
         }
-        clear_join_connectivity_sync_in_flight(&source_key);
     });
 }
 
@@ -1064,7 +1124,7 @@ fn publish_command_connectivity_if_needed_with_policy(
             let runtime = runtime.clone();
             runtime.clone().spawn(async move {
                 let _ = import_peer_connectivity_records_from_reachable_endpoints_async(
-                    &paths, &state, &records, runtime, false,
+                    &paths, &state, &records, runtime,
                 )
                 .await;
             });
@@ -1079,7 +1139,7 @@ fn remember_successful_join_endpoint_connectivity(
     endpoint: &ClusterEndpointRecord,
     runtime: &tokio::runtime::Handle,
 ) {
-    let Ok(record) = sinomo_core::network::record_local_cluster_endpoint_command_connectivity(
+    let Ok(record) = sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
         paths,
         state,
         endpoint,
@@ -1209,7 +1269,7 @@ fn remember_cluster_endpoint_command_connectivity_with_failure_grace(
     allow_failure_grace: bool,
     runtime: Option<&tokio::runtime::Handle>,
 ) {
-    let Ok(record) = sinomo_core::network::record_local_cluster_endpoint_command_connectivity(
+    let Ok(record) = sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
         paths,
         state,
         endpoint,
@@ -2191,6 +2251,717 @@ pub(crate) fn ensure_cluster_directory_installed() {
     INSTALL.call_once(sinomo_core::cluster::install_kv_cluster_directory);
 }
 
+const DAEMON_DESIRED_ROLLOUT_WATCH_START_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_DESIRED_ROLLOUT_WATCH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_DESIRED_ROLLOUT_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(25);
+const DAEMON_DESIRED_ROLLOUT_WATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_DESIRED_ROLLOUT_WATCH_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+// The background task itself has a three-second daemon join budget. Retain
+// cleanup ownership for retries while leaving enough time for its parent to
+// observe completion instead of aborting an unbounded shutdown future.
+const DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_BUDGET: Duration = Duration::from_millis(2500);
+const DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_ATTEMPT: Duration = Duration::from_millis(750);
+const DAEMON_DESIRED_ROLLOUT_RETRY_MIN: Duration = Duration::from_millis(250);
+const DAEMON_DESIRED_ROLLOUT_RETRY_MAX: Duration = Duration::from_secs(5);
+const DAEMON_DESIRED_ROLLOUT_WATCH_RECREATE_AFTER_FAILURES: u32 = 3;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DaemonDesiredRolloutProjection {
+    initialized: bool,
+    revision: Option<KvRevision>,
+    generation: u64,
+    encoded_desired: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDesiredRolloutReconcileWork {
+    generation: u64,
+    desired: Option<sinomo_core::ClusterRolloutDesiredRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonDesiredRolloutActiveWatch {
+    endpoint: ClusterEndpointRecord,
+    registration: ClusterKvWatchRegistration,
+    authority_revision: KvRevision,
+    caught_up: bool,
+    /// Cancellation has been requested and this registration remains owned
+    /// until the authority confirms removal (or confirms it was already
+    /// absent). A replacement must never be registered while this is true.
+    retiring: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonDesiredRolloutWaitOutcome {
+    Work,
+    Stopped,
+}
+
+/// Retained reactor for the shadow daemon's durable rollout intent.
+///
+/// A successful registration performs one quorum barrier, then the reactor
+/// reads the registering node's local snapshot for the initial projection.
+/// The registration starts at the revision after that barrier, so changes
+/// racing the snapshot read remain in the durable watch. Steady state is a
+/// read-only long poll of the exact desired-key prefix; generic network
+/// publication cadence never drives rollout reconciliation.
+#[derive(Debug)]
+pub(crate) struct DaemonDesiredRolloutReactor {
+    projection: DaemonDesiredRolloutProjection,
+    last_reconciled_generation: u64,
+    active_watch: Option<DaemonDesiredRolloutActiveWatch>,
+    watch_failure_streak: u32,
+    watch_retry_at: Option<Instant>,
+    reconcile_failure_streak: u32,
+    reconcile_retry_at: Option<Instant>,
+}
+
+impl DaemonDesiredRolloutReactor {
+    pub(crate) fn new(_cluster_paths: &ClusterPaths) -> Result<Self, DaemonError> {
+        Ok(Self {
+            projection: DaemonDesiredRolloutProjection::default(),
+            last_reconciled_generation: 0,
+            active_watch: None,
+            watch_failure_streak: 0,
+            watch_retry_at: None,
+            reconcile_failure_streak: 0,
+            reconcile_retry_at: None,
+        })
+    }
+
+    pub(crate) async fn run_until_stopped_async(
+        mut self,
+        paths: DaemonPaths,
+        cluster_paths: ClusterPaths,
+        runtime: tokio::runtime::Handle,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            if daemon_desired_rollout_stop_requested(&stop_rx) {
+                break;
+            }
+            if let Err(error) = self.reconcile_pending_async(&paths, &runtime).await {
+                tracing::warn!(
+                    "sinomo shadow desired rollout reconciliation deferred after failure: {error}"
+                );
+            }
+            if daemon_desired_rollout_stop_requested(&stop_rx) {
+                break;
+            }
+            match self
+                .wait_for_work_async(&cluster_paths, &runtime, &mut stop_rx)
+                .await
+            {
+                Ok(DaemonDesiredRolloutWaitOutcome::Work) => {}
+                Ok(DaemonDesiredRolloutWaitOutcome::Stopped) => break,
+                Err(error) => tracing::warn!(
+                    "sinomo shadow durable rollout watch deferred after failure: {error}"
+                ),
+            }
+        }
+        if let Err(error) = self.shutdown_with_retry_async(&runtime).await {
+            tracing::warn!("sinomo shadow could not cancel its durable rollout watch: {error}");
+        }
+    }
+
+    pub(crate) async fn reconcile_pending_async(
+        &mut self,
+        paths: &DaemonPaths,
+        _runtime: &tokio::runtime::Handle,
+    ) -> Result<bool, DaemonError> {
+        let now = Instant::now();
+        if !self.reconcile_is_due(now) {
+            return Ok(false);
+        }
+        let generation = self.projection.generation;
+        let desired = match self
+            .projection
+            .encoded_desired
+            .as_ref()
+            .map(|encoded| sinomo_core::kv::decode_kv_value(encoded))
+            .transpose()
+        {
+            Ok(desired) => desired,
+            Err(error) => {
+                self.record_reconcile_failure(now);
+                return Err(DaemonError::from(error));
+            }
+        };
+        if let Err(error) = reconcile_desired_rollout_record(paths, desired) {
+            self.record_reconcile_failure(now);
+            return Err(error);
+        }
+        // Mark only the generation actually reconciled. A newer desired event
+        // observed before this operation completes therefore remains pending.
+        self.last_reconciled_generation = self.last_reconciled_generation.max(generation);
+        self.reconcile_failure_streak = 0;
+        self.reconcile_retry_at = None;
+        Ok(true)
+    }
+
+    async fn wait_for_work_async(
+        &mut self,
+        cluster_paths: &ClusterPaths,
+        runtime: &tokio::runtime::Handle,
+        stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<DaemonDesiredRolloutWaitOutcome, DaemonError> {
+        loop {
+            if daemon_desired_rollout_stop_requested(stop_rx) {
+                return Ok(DaemonDesiredRolloutWaitOutcome::Stopped);
+            }
+            let now = Instant::now();
+            if self.reconcile_is_due(now) {
+                return Ok(DaemonDesiredRolloutWaitOutcome::Work);
+            }
+            if let Some(retry_at) = self.watch_retry_at.filter(|retry_at| *retry_at > now) {
+                let wake_at = self
+                    .pending_reconcile_retry_at()
+                    .map(|reconcile_at| retry_at.min(reconcile_at))
+                    .unwrap_or(retry_at);
+                tokio::select! {
+                    biased;
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || daemon_desired_rollout_stop_requested(stop_rx) {
+                            return Ok(DaemonDesiredRolloutWaitOutcome::Stopped);
+                        }
+                    }
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+                }
+                continue;
+            }
+
+            if self.active_watch.is_none() {
+                // Do not make registration a disposable future. The server may
+                // have committed the barrier and durable registration before
+                // the response reaches us; allow it to resolve, retain the ID,
+                // then observe stop and cancel it explicitly.
+                if let Err(error) = self.start_watch_async(cluster_paths, runtime).await {
+                    self.record_watch_failure(Instant::now());
+                    return Err(error);
+                }
+                continue;
+            }
+
+            if self
+                .active_watch
+                .as_ref()
+                .is_some_and(|watch| watch.retiring)
+            {
+                if let Err(error) = self.cancel_active_watch_async(runtime).await {
+                    self.record_watch_failure(Instant::now());
+                    return Err(error);
+                }
+                // Cancellation success transfers ownership back to the
+                // authority. Only now may the next loop register a replacement.
+                continue;
+            }
+
+            if !self
+                .active_watch
+                .as_ref()
+                .is_some_and(|watch| watch.caught_up)
+            {
+                let catch_up_result = {
+                    let catch_up = self.catch_up_watch_async(runtime);
+                    tokio::pin!(catch_up);
+                    tokio::select! {
+                        biased;
+                        _ = stop_rx.changed() => None,
+                        result = &mut catch_up => Some(result),
+                    }
+                };
+                let Some(catch_up_result) = catch_up_result else {
+                    return Ok(DaemonDesiredRolloutWaitOutcome::Stopped);
+                };
+                if let Err(error) = catch_up_result {
+                    self.handle_active_watch_failure_async(runtime).await;
+                    return Err(error);
+                }
+                return Ok(DaemonDesiredRolloutWaitOutcome::Work);
+            }
+
+            let watch = self.active_watch.as_ref().expect("active rollout watch");
+            let endpoint = watch.endpoint.clone();
+            let request = ClusterKvWatchDrainRequest {
+                watch_id: watch.registration.watch_id,
+                wait_timeout_millis: DAEMON_DESIRED_ROLLOUT_WATCH_DRAIN_WAIT.as_millis() as u64,
+            };
+            let drain = drain_cluster_kv_watch_from_endpoint_async(
+                &endpoint,
+                &request,
+                DAEMON_DESIRED_ROLLOUT_WATCH_DRAIN_TIMEOUT,
+                runtime,
+            );
+            tokio::pin!(drain);
+            let reconcile_retry_at = self.pending_reconcile_retry_at();
+            let response = tokio::select! {
+                biased;
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || daemon_desired_rollout_stop_requested(stop_rx) {
+                        return Ok(DaemonDesiredRolloutWaitOutcome::Stopped);
+                    }
+                    continue;
+                }
+                _ = daemon_desired_rollout_optional_deadline(reconcile_retry_at) => {
+                    return Ok(DaemonDesiredRolloutWaitOutcome::Work);
+                }
+                response = &mut drain => response,
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    self.handle_active_watch_failure_async(runtime).await;
+                    return Err(error);
+                }
+            };
+            if response.watch_id != request.watch_id {
+                let error = DaemonError::Parse {
+                    detail: format!(
+                        "rollout desired watch {:?} returned response for {:?}",
+                        request.watch_id, response.watch_id
+                    ),
+                };
+                self.handle_active_watch_failure_async(runtime).await;
+                return Err(error);
+            }
+            let previous_next_revision = self
+                .active_watch
+                .as_ref()
+                .expect("active rollout watch")
+                .registration
+                .next_revision;
+            if response.next_revision < previous_next_revision {
+                let error = DaemonError::Parse {
+                    detail: format!(
+                        "rollout desired watch cursor regressed from {:?} to {:?}",
+                        previous_next_revision, response.next_revision
+                    ),
+                };
+                self.handle_active_watch_failure_async(runtime).await;
+                return Err(error);
+            }
+            self.active_watch
+                .as_mut()
+                .expect("active rollout watch")
+                .registration
+                .next_revision = response.next_revision;
+            self.watch_failure_streak = 0;
+            self.watch_retry_at = None;
+            if self.observe_watch_events(&response.events) {
+                return Ok(DaemonDesiredRolloutWaitOutcome::Work);
+            }
+        }
+    }
+
+    async fn shutdown_with_retry_async(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), DaemonError> {
+        if self.active_watch.is_none() {
+            return Ok(());
+        }
+        self.mark_active_watch_retiring();
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_BUDGET)
+            .unwrap_or(started);
+        let mut last_error = None;
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            match self
+                .cancel_active_watch_with_timeout_async(
+                    runtime,
+                    remaining.min(DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_ATTEMPT),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    self.record_watch_failure(Instant::now());
+                }
+            }
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                break;
+            };
+            tokio::time::sleep(remaining.min(DAEMON_DESIRED_ROLLOUT_RETRY_MIN)).await;
+        }
+        Err(last_error.unwrap_or_else(|| DaemonError::Network {
+            address: "cluster rollout desired watch".to_string(),
+            detail: format!(
+                "cancellation did not complete within {}ms",
+                DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_BUDGET.as_millis()
+            ),
+        }))
+    }
+
+    fn mark_active_watch_retiring(&mut self) {
+        if let Some(watch) = self.active_watch.as_mut() {
+            watch.retiring = true;
+        }
+    }
+
+    async fn cancel_active_watch_async(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), DaemonError> {
+        self.cancel_active_watch_with_timeout_async(
+            runtime,
+            DAEMON_DESIRED_ROLLOUT_WATCH_CANCEL_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn cancel_active_watch_with_timeout_async(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        timeout: Duration,
+    ) -> Result<(), DaemonError> {
+        let watch = self
+            .active_watch
+            .as_ref()
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "rollout desired watch cancellation has no owned registration".to_string(),
+            })?;
+        let endpoint = watch.endpoint.clone();
+        let watch_id = watch.registration.watch_id;
+        let result = cancel_cluster_kv_watch_from_endpoint_async(
+            &endpoint,
+            &ClusterKvWatchCancelRequest { watch_id },
+            timeout,
+            runtime,
+        )
+        .await;
+        self.complete_active_watch_cancel(watch_id, result)
+    }
+
+    fn complete_active_watch_cancel(
+        &mut self,
+        expected_watch_id: sinomo_core::kv::WatchId,
+        result: Result<sinomo_core::kv::ClusterKvWatchCancelResponse, DaemonError>,
+    ) -> Result<(), DaemonError> {
+        let response = result?;
+        if response.watch_id != expected_watch_id {
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "rollout desired watch {:?} returned cancellation for {:?}",
+                    expected_watch_id, response.watch_id
+                ),
+            });
+        }
+        if !self
+            .active_watch
+            .as_ref()
+            .is_some_and(|watch| watch.retiring && watch.registration.watch_id == expected_watch_id)
+        {
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "rollout desired watch {:?} cancellation no longer owns the retiring registration",
+                    expected_watch_id
+                ),
+            });
+        }
+        // `cancelled = false` is also authoritative: the server has proved the
+        // registration absent. In either case cleanup ownership can now end.
+        self.active_watch = None;
+        self.watch_failure_streak = 0;
+        self.watch_retry_at = None;
+        Ok(())
+    }
+
+    async fn start_watch_async(
+        &mut self,
+        cluster_paths: &ClusterPaths,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), DaemonError> {
+        let desired_key = sinomo_core::cluster_rollout_desired_key();
+        let targets = daemon_desired_rollout_watch_targets(cluster_paths)?;
+        let mut last_error = None;
+        for endpoint in targets {
+            match start_cluster_kv_authoritative_watch_from_endpoint_async(
+                &endpoint,
+                &desired_key,
+                DAEMON_DESIRED_ROLLOUT_WATCH_START_TIMEOUT,
+                runtime,
+            )
+            .await
+            {
+                Ok(started) => {
+                    if started.value.prefix != desired_key {
+                        let unexpected_prefix = started.value.prefix.clone();
+                        self.active_watch = Some(DaemonDesiredRolloutActiveWatch {
+                            endpoint,
+                            registration: started.value,
+                            authority_revision: started.authority.revision,
+                            caught_up: false,
+                            retiring: true,
+                        });
+                        return Err(DaemonError::Parse {
+                            detail: format!(
+                                "rollout watch registered unexpected prefix {}",
+                                unexpected_prefix
+                            ),
+                        });
+                    }
+                    self.active_watch = Some(DaemonDesiredRolloutActiveWatch {
+                        endpoint,
+                        registration: started.value,
+                        authority_revision: started.authority.revision,
+                        caught_up: false,
+                        retiring: false,
+                    });
+                    self.watch_failure_streak = 0;
+                    self.watch_retry_at = None;
+                    return Ok(());
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| DaemonError::Network {
+            address: "cluster rollout desired watch".to_string(),
+            detail: "no reachable KV authority endpoint can host the watch".to_string(),
+        }))
+    }
+
+    async fn catch_up_watch_async(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), DaemonError> {
+        let watch = self.active_watch.as_ref().expect("active rollout watch");
+        let endpoint = watch.endpoint.clone();
+        let authority_revision = watch.authority_revision;
+        let local = fetch_cluster_kv_local_snapshot_from_endpoint_async(
+            &endpoint,
+            DAEMON_DESIRED_ROLLOUT_WATCH_READ_TIMEOUT,
+            runtime,
+        )
+        .await?;
+        if local.revision < authority_revision {
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "rollout watch authority is at {:?}, but its local snapshot is only {:?}",
+                    authority_revision, local.revision
+                ),
+            });
+        }
+        if self
+            .projection
+            .revision
+            .is_some_and(|revision| local.revision < revision)
+        {
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "rollout watch catch-up snapshot regressed from {:?} to {:?}",
+                    self.projection.revision, local.revision
+                ),
+            });
+        }
+        self.observe_authoritative_snapshot(&local.value);
+        self.active_watch
+            .as_mut()
+            .expect("active rollout watch")
+            .caught_up = true;
+        self.watch_failure_streak = 0;
+        self.watch_retry_at = None;
+        Ok(())
+    }
+
+    fn observe_authoritative_snapshot(&mut self, snapshot: &KvSnapshot) -> bool {
+        let encoded_desired = snapshot
+            .get(&sinomo_core::cluster_rollout_desired_key())
+            .map(|entry| entry.value.clone());
+        let desired_changed =
+            !self.projection.initialized || self.projection.encoded_desired != encoded_desired;
+        self.projection.initialized = true;
+        self.projection.revision = Some(snapshot.revision);
+        if desired_changed {
+            self.projection.encoded_desired = encoded_desired;
+            self.projection.generation = self.projection.generation.saturating_add(1);
+            self.reconcile_failure_streak = 0;
+            self.reconcile_retry_at = None;
+        }
+        desired_changed
+    }
+
+    fn observe_watch_events(&mut self, events: &[KvEvent]) -> bool {
+        let desired_key = sinomo_core::cluster_rollout_desired_key();
+        let mut desired_changed = false;
+        for event in events.iter().filter(|event| event.key == desired_key) {
+            if self
+                .projection
+                .revision
+                .is_some_and(|revision| event.revision <= revision)
+            {
+                continue;
+            }
+            let encoded_desired = match &event.kind {
+                KvEventKind::Put { value } => Some(value.clone()),
+                KvEventKind::Delete => None,
+            };
+            self.projection.revision = Some(event.revision);
+            if self.projection.encoded_desired == encoded_desired {
+                continue;
+            }
+            self.projection.encoded_desired = encoded_desired;
+            self.projection.generation = self.projection.generation.saturating_add(1);
+            self.reconcile_failure_streak = 0;
+            self.reconcile_retry_at = None;
+            desired_changed = true;
+        }
+        desired_changed
+    }
+
+    fn reconcile_is_due(&self, now: Instant) -> bool {
+        self.projection.initialized
+            && self.projection.generation > self.last_reconciled_generation
+            && self
+                .reconcile_retry_at
+                .is_none_or(|retry_at| retry_at <= now)
+    }
+
+    fn pending_reconcile_retry_at(&self) -> Option<Instant> {
+        (self.projection.initialized
+            && self.projection.generation > self.last_reconciled_generation)
+            .then_some(self.reconcile_retry_at)
+            .flatten()
+    }
+
+    fn record_reconcile_failure(&mut self, now: Instant) {
+        self.reconcile_failure_streak = self.reconcile_failure_streak.saturating_add(1);
+        self.reconcile_retry_at = now.checked_add(daemon_desired_rollout_retry_delay(
+            self.reconcile_failure_streak,
+        ));
+    }
+
+    fn record_watch_failure(&mut self, now: Instant) {
+        self.watch_failure_streak = self.watch_failure_streak.saturating_add(1);
+        self.watch_retry_at = now.checked_add(daemon_desired_rollout_retry_delay(
+            self.watch_failure_streak,
+        ));
+    }
+
+    async fn handle_active_watch_failure_async(&mut self, runtime: &tokio::runtime::Handle) {
+        self.record_watch_failure(Instant::now());
+        if self.watch_failure_streak < DAEMON_DESIRED_ROLLOUT_WATCH_RECREATE_AFTER_FAILURES {
+            return;
+        }
+        if self.active_watch.is_none() {
+            return;
+        }
+        self.mark_active_watch_retiring();
+        if let Err(error) = self.cancel_active_watch_async(runtime).await {
+            tracing::warn!(
+                "sinomo shadow retained retiring rollout watch after cancellation failure: {error}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_reconcile_work_for_test(
+        &self,
+    ) -> Result<Option<DaemonDesiredRolloutReconcileWork>, DaemonError> {
+        if !self.projection.initialized
+            || self.projection.generation <= self.last_reconciled_generation
+        {
+            return Ok(None);
+        }
+        let desired = self
+            .projection
+            .encoded_desired
+            .as_ref()
+            .map(|encoded| sinomo_core::kv::decode_kv_value(encoded))
+            .transpose()?;
+        Ok(Some(DaemonDesiredRolloutReconcileWork {
+            generation: self.projection.generation,
+            desired,
+        }))
+    }
+
+    #[cfg(test)]
+    fn mark_reconciled_for_test(&mut self, generation: u64) {
+        self.last_reconciled_generation = self.last_reconciled_generation.max(generation);
+    }
+}
+
+fn daemon_desired_rollout_retry_delay(failure_streak: u32) -> Duration {
+    let shift = failure_streak.saturating_sub(1).min(8);
+    DAEMON_DESIRED_ROLLOUT_RETRY_MIN
+        .saturating_mul(1_u32 << shift)
+        .min(DAEMON_DESIRED_ROLLOUT_RETRY_MAX)
+}
+
+fn daemon_desired_rollout_stop_requested(stop_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *stop_rx.borrow() || stop_rx.has_changed().is_err()
+}
+
+async fn daemon_desired_rollout_optional_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn daemon_desired_rollout_watch_targets(
+    cluster_paths: &ClusterPaths,
+) -> Result<Vec<ClusterEndpointRecord>, DaemonError> {
+    let state = sinomo_core::cluster::read_cluster_state_cached(cluster_paths)?;
+    let known_leader = cluster_paths
+        .kv_paths()
+        .known_raft_voter_leader_id(&state)?;
+    let mut targets = Vec::new();
+    let local_can_host = state.node_is_raft_voter(&state.local_node_id)
+        && known_leader
+            .as_ref()
+            .is_none_or(|leader_id| leader_id == &state.local_node_id);
+    if local_can_host {
+        let data_dir = cluster_paths.root.parent().ok_or_else(|| DaemonError::Io {
+            path: cluster_paths.root.display().to_string(),
+            detail: "cluster paths have no data directory parent".to_string(),
+        })?;
+        let main_options = current_daemon_cluster_options(data_dir)
+            .map(|(main, _)| main)
+            .unwrap_or_default();
+        targets.push(daemon_loopback_endpoint(
+            &state.local_node_id,
+            daemon_connect_address(&main_options.host, main_options.port),
+            0,
+        ));
+    }
+    for endpoint in ClusterEndpointSelector::new(cluster_paths, &state)
+        .try_select(ClusterEndpointSelectionPurpose::ClusterStateAuthority)?
+    {
+        if endpoint.node_id == state.local_node_id
+            || known_leader
+                .as_ref()
+                .is_some_and(|leader_id| leader_id != &endpoint.node_id)
+            || targets.iter().any(|target| {
+                target.node_id == endpoint.node_id && target.address == endpoint.address
+            })
+        {
+            continue;
+        }
+        targets.push(endpoint);
+    }
+    if targets.is_empty() {
+        return Err(DaemonError::Network {
+            address: "cluster rollout desired watch".to_string(),
+            detail: known_leader.map_or_else(
+                || "no KV voter endpoint is currently known".to_string(),
+                |leader_id| format!("known KV leader {leader_id} has no usable endpoint"),
+            ),
+        });
+    }
+    Ok(targets)
+}
+
 #[derive(Debug)]
 pub(crate) struct ClusterNetworkMaintenance {
     pub discovery: Option<AsyncMdnsDiscoverySocket>,
@@ -2205,19 +2976,31 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
     pub publish_failure_streak: u32,
+    pub probe_failure_streak: u32,
+    pub discovery_failure_streak: u32,
+    pub probe_retry_at: Option<Instant>,
+    pub discovery_retry_at: Option<Instant>,
     pub connectivity_publish_failure_streak: u32,
     pub connectivity_publish_retry_at: Option<Instant>,
+    /// Lossless process-local fence for reactive connectivity inputs. Dirty
+    /// notifications are wakes; this generation proves whether an in-flight
+    /// projection actually consumed the newest wake.
+    connectivity_input_generation: u64,
+    /// The exact durable source generation whose idempotent quorum publish is
+    /// still pending. Probe completion replaces this with a newer generation;
+    /// cancellation never discards it.
+    retained_connectivity_publish: Option<ClusterConnectivityPendingPublish>,
     pub connectivity_force_probe: bool,
-    pub kv_snapshot_pull_failure_streak: u32,
-    pub last_kv_snapshot_pull: Instant,
     pub last_publish: Instant,
     pub last_discovery: Instant,
     pub last_probe: Instant,
+    active_due_claims: ClusterNetworkMaintenanceDueClaims,
     pub idle_stats: Arc<IdleStatsAtomics>,
     /// Active service-registry snapshots to publish as cluster service
     /// instances on the publish tick; `None` when the host has no registry
     /// (tests, minimal loops).
     pub service_registry: Option<sinomo_core::service::ServiceRegistrySnapshotStore>,
+    retained_service_instance_publish: Option<ClusterServiceInstancePendingPublish>,
 }
 
 #[cfg(test)]
@@ -2250,339 +3033,80 @@ fn daemon_cluster_publish_interval_on_runtime(
 static DAEMON_CLUSTER_STORAGE_MUTATION_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-/// Daemon-specific maintenance adapter for reconciliation steps that
-/// require process and network-module evidence. Consensus work remains owned by
-/// `ClusterControlPlaneMaintenanceDriver`; these hooks reuse the daemon's
-/// existing quorum-backed node-status and member-publication paths.
-struct DaemonClusterKvMaintenanceDriver<'a> {
-    inner: sinomo_core::cluster::ClusterControlPlaneMaintenanceDriver<
-        'a,
-        DaemonClusterControlPlaneTransport,
-    >,
-    daemon_paths: DaemonPaths,
-    runtime: tokio::runtime::Handle,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonNodeStatusPublishPhase {
+    DaemonStatusRead,
+    ClusterStatusEnsure,
+    ClusterStateRead,
+    RolloutStatusRead,
+    PresenceMatch,
+    NodeStatusCommit,
+    NetworkInfoCommit,
 }
 
-impl<'a> DaemonClusterKvMaintenanceDriver<'a> {
-    fn new(
-        runtime: &tokio::runtime::Handle,
-        daemon_paths: DaemonPaths,
-        driver: &'a mut sinomo_core::cluster::ClusterControlPlaneDriver<
-            DaemonClusterControlPlaneTransport,
-        >,
-    ) -> Self {
+fn daemon_node_status_publish_phase_name(phase: DaemonNodeStatusPublishPhase) -> &'static str {
+    match phase {
+        DaemonNodeStatusPublishPhase::DaemonStatusRead => "daemon_status_read",
+        DaemonNodeStatusPublishPhase::ClusterStatusEnsure => "cluster_status_ensure",
+        DaemonNodeStatusPublishPhase::ClusterStateRead => "cluster_state_read",
+        DaemonNodeStatusPublishPhase::RolloutStatusRead => "rollout_status_read",
+        DaemonNodeStatusPublishPhase::PresenceMatch => "presence_match",
+        DaemonNodeStatusPublishPhase::NodeStatusCommit => "node_status_commit",
+        DaemonNodeStatusPublishPhase::NetworkInfoCommit => "network_info_commit",
+    }
+}
+
+/// Cancellation-safe timing for the sequential node-status publication path.
+///
+/// The maintenance runner cancels this future when its fair-share budget is
+/// exhausted, so an ordinary event after an `.await` cannot identify the
+/// operation that owned the timeout. The guard records `completed = false`
+/// when that cancellation drops the active phase. Ordinary operation pays no
+/// clock-read or formatting cost while the existing maintenance trace target
+/// is disabled.
+struct DaemonNodeStatusPublishPhaseObservation {
+    phase: DaemonNodeStatusPublishPhase,
+    started: Option<Instant>,
+    operation_budget: Duration,
+    completed: bool,
+}
+
+impl DaemonNodeStatusPublishPhaseObservation {
+    fn start(phase: DaemonNodeStatusPublishPhase, operation_budget: Duration) -> Self {
         Self {
-            inner: sinomo_core::cluster::ClusterControlPlaneMaintenanceDriver::new(runtime, driver),
-            daemon_paths,
-            runtime: runtime.clone(),
+            phase,
+            started: tracing::enabled!(
+                target: "sinomo.daemon.node_status_publish",
+                tracing::Level::TRACE
+            )
+            .then(Instant::now),
+            operation_budget,
+            completed: false,
         }
     }
-}
 
-fn daemon_cluster_kv_maintenance_network_error(
-    operation: &str,
-    error: impl std::fmt::Display,
-) -> sinomo_core::network::NetworkError {
-    sinomo_core::network::NetworkError::Io {
-        operation: operation.to_string(),
-        detail: error.to_string(),
+    fn complete(&mut self) {
+        self.completed = true;
     }
 }
 
-fn daemon_cluster_kv_maintenance_timeouts(
-    budget: Duration,
-) -> sinomo_core::cluster::ClusterControlPlaneTimeouts {
-    let budget = budget.max(Duration::from_millis(1));
-    let mut timeouts = cluster_control_plane_timeouts();
-    timeouts.raft_append_timeout = timeouts.raft_append_timeout.min(budget);
-    timeouts.rpc_timeout = timeouts.rpc_timeout.min(budget);
-    timeouts.membership_rpc_timeout = timeouts.membership_rpc_timeout.min(budget);
-    timeouts.raft_campaign_jitter_max = timeouts.raft_campaign_jitter_max.min(budget);
-    timeouts.tcp_command_timeout = timeouts.tcp_command_timeout.min(budget);
-    timeouts.iroh_command_timeout = timeouts.iroh_command_timeout.min(budget);
-    timeouts.tcp_foreground_attempt_timeout = timeouts.tcp_foreground_attempt_timeout.min(budget);
-    timeouts.public_foreground_attempt_timeout =
-        timeouts.public_foreground_attempt_timeout.min(budget);
-    timeouts.iroh_foreground_attempt_timeout = timeouts.iroh_foreground_attempt_timeout.min(budget);
-    timeouts
-}
-
-impl sinomo_core::cluster::ClusterKvMaintenanceHost for DaemonClusterKvMaintenanceDriver<'_> {
-    fn refresh_leader_and_term_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        sinomo_core::cluster::ClusterKvMaintenanceHost::refresh_leader_and_term_async(
-            &mut self.inner,
-            paths,
-            state,
-            budget,
-        )
-    }
-
-    fn heartbeat_and_catch_up_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        sinomo_core::cluster::ClusterKvMaintenanceHost::heartbeat_and_catch_up_async(
-            &mut self.inner,
-            paths,
-            state,
-            budget,
-        )
-    }
-
-    fn refresh_snapshot_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        sinomo_core::cluster::ClusterKvMaintenanceHost::refresh_snapshot_async(
-            &mut self.inner,
-            paths,
-            state,
-            budget,
-        )
-    }
-
-    fn drain_and_fan_out_watches_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        sinomo_core::cluster::ClusterKvMaintenanceHost::drain_and_fan_out_watches_async(
-            &mut self.inner,
-            paths,
-            state,
-            budget,
-        )
-    }
-
-    fn persist_peer_progress_hints_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        sinomo_core::cluster::ClusterKvMaintenanceHost::persist_peer_progress_hints_async(
-            &mut self.inner,
-            paths,
-            state,
-            budget,
-        )
-    }
-
-    fn reconcile_config_changes_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        let runtime = self.runtime.clone();
-        let worker_runtime = runtime.clone();
-        let paths = paths.clone();
-        let mut recovery_state = state.clone();
-        let operation_budget = budget
-            .checked_div(6)
-            .unwrap_or(budget)
-            .max(Duration::from_millis(1));
-        Box::pin(async move {
-            let (next_state, report) = runtime
-                .spawn_blocking(move || {
-                    let mut host = DaemonClusterMemberMutationHost::new_on_runtime_with_timeouts(
-                        &worker_runtime,
-                        daemon_cluster_kv_maintenance_timeouts(operation_budget),
-                    );
-                    let report = sinomo_core::cluster::reconcile_cluster_raft_config_changes_bounded_with_host(
-                        &paths,
-                        &mut recovery_state,
-                        OffsetDateTime::now_utc(),
-                        1,
-                        &mut host,
-                    )?;
-                    Ok::<_, sinomo_core::network::NetworkError>((recovery_state, report))
-                })
-                .await
-                .map_err(|source| sinomo_core::network::NetworkError::Io {
-                    operation: "reactive Raft config lifecycle recovery".to_string(),
-                    detail: format!("config lifecycle recovery task failed: {source}"),
-                })??;
-            *state = next_state;
-            if report.deferred_change_count > 0 {
-                return Err(sinomo_core::network::NetworkError::ClusterReadOnly {
-                    detail: format!(
-                        "reconciled one Raft config lifecycle record; {} remain for a bounded retry",
-                        report.deferred_change_count
-                    ),
-                });
-            }
-            if report.committed_change_ids.is_empty() && report.failed_change_ids.is_empty() {
-                return Ok(
-                    sinomo_core::cluster::ClusterKvMaintenanceActionResult::skipped(
-                        "config_change_recovery_idle",
-                        "no nonterminal Raft config lifecycle records required recovery",
-                    ),
-                );
-            }
-            Ok(
-                sinomo_core::cluster::ClusterKvMaintenanceActionResult::completed(
-                    "config_change_recovery_completed",
-                    format!(
-                        "resumed {}, committed {}, failed {} Raft config lifecycle record(s)",
-                        report.resumed_change_ids.len(),
-                        report.committed_change_ids.len(),
-                        report.failed_change_ids.len()
-                    ),
-                ),
-            )
-        })
-    }
-
-    fn compact_raft_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        sinomo_core::cluster::ClusterKvMaintenanceHost::compact_raft_async(
-            &mut self.inner,
-            paths,
-            state,
-            budget,
-        )
-    }
-
-    fn publish_node_status_async<'a>(
-        &'a mut self,
-        _paths: &'a ClusterPaths,
-        _state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        let daemon_paths = self.daemon_paths.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            let outcome = refresh_daemon_node_status_in_kv_async_with_timeouts(
-                &daemon_paths,
-                runtime,
-                daemon_cluster_kv_maintenance_timeouts(budget),
-            )
-            .await
-            .map_err(|error| {
-                daemon_cluster_kv_maintenance_network_error(
-                    "reactive node status reconciliation",
-                    error,
-                )
-            })?;
-            Ok(
-                sinomo_core::cluster::ClusterKvMaintenanceActionResult::completed(
-                    "node_status_reconciled",
-                    format!(
-                        "network info published: {}; node status published: {}",
-                        outcome.network_info_published, outcome.node_status_published
-                    ),
-                ),
-            )
-        })
-    }
-
-    fn publish_endpoint_observations_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        budget: Duration,
-    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_core::cluster::ClusterKvMaintenanceActionResult,
-    > {
-        let daemon_paths = self.daemon_paths.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            let observation = local_daemon_membership_observation_from_daemon_paths_async(
-                &daemon_paths,
-                state,
-                &runtime,
-            )
-            .await
-            .map_err(|error| {
-                daemon_cluster_kv_maintenance_network_error(
-                    "reactive daemon endpoint observation",
-                    error,
-                )
-            })?;
-            let refresh = sinomo_core::cluster::refresh_local_daemon_membership_from_disk_async(
-                &runtime,
-                paths,
-                state,
-                observation,
-            )
-            .await?;
-            let network_module_endpoints_changed =
-                refresh_local_network_module_endpoints(state, OffsetDateTime::now_utc()).map_err(
-                    |error| {
-                        daemon_cluster_kv_maintenance_network_error(
-                            "reactive network module endpoint observation",
-                            error,
-                        )
-                    },
-                )?;
-            let local_state_changed = refresh.changed() || network_module_endpoints_changed;
-            if local_state_changed {
-                sinomo_core::cluster::write_cluster_state_async(&runtime, paths, state).await?;
-            }
-            let publication = publish_local_members_to_quorum_if_needed_async(
-                paths,
-                state,
-                false,
-                runtime,
-                daemon_cluster_kv_maintenance_timeouts(budget),
-            )
-            .await
-            .map_err(|error| {
-                daemon_cluster_kv_maintenance_network_error(
-                    "reactive endpoint quorum publication",
-                    error,
-                )
-            })?;
-            Ok(
-                sinomo_core::cluster::ClusterKvMaintenanceActionResult::completed(
-                    "endpoint_observations_reconciled",
-                    format!(
-                        "local state changed: {local_state_changed}; quorum publication committed: {}",
-                        publication.is_some()
-                    ),
-                ),
-            )
-        })
+impl Drop for DaemonNodeStatusPublishPhaseObservation {
+    fn drop(&mut self) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let duration_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let operation_budget_us =
+            self.operation_budget.as_micros().min(u128::from(u64::MAX)) as u64;
+        tracing::trace!(
+            target: "sinomo.daemon.node_status_publish",
+            step = "node_status_publish",
+            phase = daemon_node_status_publish_phase_name(self.phase),
+            completed = self.completed,
+            duration_us,
+            operation_budget_us,
+            "cluster KV node status publish phase ended"
+        );
     }
 }
 
@@ -2601,13 +3125,13 @@ impl ClusterNetworkMaintenance {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now
-                .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
-                .unwrap_or(now),
             // Fire the first maintenance cycle immediately instead of after a full
             // interval, so a freshly started/joined node publishes its records and
             // probes its peers right away. Combined with parallel probing this lets
@@ -2621,8 +3145,12 @@ impl ClusterNetworkMaintenance {
             last_probe: now
                 .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
                 .unwrap_or(now),
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             idle_stats,
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
         }
     }
 
@@ -2636,49 +3164,6 @@ impl ClusterNetworkMaintenance {
         self
     }
 
-    pub(crate) async fn run_reactive_cluster_kv_maintenance_async(
-        &mut self,
-        paths: &DaemonPaths,
-        wake: sinomo_core::cluster::ClusterKvMaintenanceWakeBatch,
-        runtime: tokio::runtime::Handle,
-    ) -> Result<Option<sinomo_core::cluster::ClusterKvMaintenanceReport>, DaemonError> {
-        let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-        let state_path = cluster_paths.state.clone();
-        let state_exists = tokio::task::spawn_blocking(move || state_path.exists())
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: cluster_paths.state.display().to_string(),
-                detail: format!("cluster state existence task failed: {source}"),
-            })?;
-        if !state_exists {
-            return Ok(None);
-        }
-
-        // Membership changes and leave quarantine replace these files as one
-        // unit. Reuse the daemon's existing storage mutation boundary so a
-        // reactive pass cannot reopen or commit into a generation being moved.
-        let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.lock().await;
-        let mut state =
-            sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
-                .await
-                .map_err(DaemonError::from)?;
-        let mut driver = daemon_cluster_control_plane_driver_on_runtime(&runtime);
-        let mut maintenance_host =
-            DaemonClusterKvMaintenanceDriver::new(&runtime, paths.clone(), &mut driver);
-        let report = sinomo_core::cluster::run_cluster_kv_maintenance_tick_with_host(
-            &cluster_paths,
-            &mut state,
-            wake,
-            sinomo_core::cluster::ClusterKvMaintenanceOptions {
-                total_budget: Duration::from_secs(6),
-                max_step_budget: Duration::from_millis(750),
-            },
-            &mut maintenance_host,
-        )
-        .await;
-        Ok(Some(report))
-    }
-
     pub async fn tick_async(
         &mut self,
         paths: &DaemonPaths,
@@ -2689,6 +3174,13 @@ impl ClusterNetworkMaintenance {
         self.tick = self.tick.saturating_add(1);
         self.idle_stats.incr_ticks_total();
         let now = Instant::now();
+        // A prior caller that observed an error must normally close the active
+        // claim explicitly. Keep the maintenance owner self-healing for any
+        // alternate caller: an unfinished generation is a failed generation,
+        // never permission to spin the same overdue timestamps again.
+        if !self.active_due_claims.is_empty() {
+            self.record_active_tick_plan_failure(now);
+        }
         // Keep an expired startup-settle deadline as the one-shot marker. The
         // active checks below compare it with `now`, while retaining it stops
         // an unconverged degraded endpoint from re-arming another settle window
@@ -2702,15 +3194,22 @@ impl ClusterNetworkMaintenance {
             now,
             &self.schedule_with_connectivity_publish_backoff(now),
         );
-        let kv_snapshot_pull_retry_due = self
-            .kv_snapshot_pull_retry_due_duration(now)
-            .is_some_and(|duration| duration.is_zero());
         let publish_due = due.publish_due;
-        let probe_due = due.probe_due && !connectivity_publish_retry_waiting;
-        let discovery_due = due.discovery_due;
-        if !(publish_due || kv_snapshot_pull_retry_due || probe_due || discovery_due) {
+        let probe_due = (due.probe_due || self.probe_retry_due(now))
+            && !connectivity_publish_retry_waiting
+            && !self.probe_retry_waiting(now);
+        let discovery_due = (due.discovery_due || self.discovery_retry_due(now))
+            && !self.discovery_retry_waiting(now);
+        if !(publish_due || probe_due || discovery_due || connectivity_publish_retry_due) {
             return Ok(None);
         }
+        self.claim_due_classes(
+            now,
+            publish_due,
+            probe_due,
+            discovery_due,
+            connectivity_publish_retry_due,
+        );
         let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.lock().await;
         let mut pending_work = ClusterNetworkMaintenancePendingWork::default();
 
@@ -2728,7 +3227,6 @@ impl ClusterNetworkMaintenance {
             })?;
         if !state_exists {
             self.solo_cluster_idle = false;
-            self.kv_snapshot_pull_failure_streak = 0;
             self.settle_connectivity_without_publication();
             if publish_due {
                 self.last_publish = now;
@@ -2739,12 +3237,13 @@ impl ClusterNetworkMaintenance {
             if discovery_due {
                 self.last_discovery = now;
             }
+            self.complete_all_active_due_claims();
             return Ok(None);
         }
 
         let mut discovery_already_processed = false;
         if self.solo_cluster_idle
-            && (publish_due || kv_snapshot_pull_retry_due || probe_due || discovery_due)
+            && (publish_due || probe_due || discovery_due || connectivity_publish_retry_due)
         {
             self.idle_stats.incr_disk_reads_cluster_state();
             let mut state =
@@ -2771,9 +3270,12 @@ impl ClusterNetworkMaintenance {
                     .await
                     .map_err(DaemonError::from)?;
                 }
+                // The discovery generation is now fully observed and, when
+                // changed, durably projected. Later publish/probe failures do
+                // not own this claim and must not back it off.
+                self.complete_discovery_claim();
             }
             if !discovered && sinomo_core::network::cluster_is_settled_solo(&state) {
-                self.kv_snapshot_pull_failure_streak = 0;
                 self.settle_connectivity_without_publication();
                 if publish_due {
                     self.last_publish = now;
@@ -2781,6 +3283,7 @@ impl ClusterNetworkMaintenance {
                 if probe_due {
                     self.last_probe = now;
                 }
+                self.complete_all_active_due_claims();
                 return Ok(None);
             }
             self.solo_cluster_idle = false;
@@ -2788,7 +3291,7 @@ impl ClusterNetworkMaintenance {
 
         self.idle_stats.incr_ticks_with_work();
         self.idle_stats.incr_disk_reads_cluster_state();
-        let mut state = if publish_due || kv_snapshot_pull_retry_due || probe_due {
+        let mut state = if publish_due || probe_due || connectivity_publish_retry_due {
             sinomo_core::cluster::read_cluster_state_async(&runtime, &cluster_paths).await
         } else {
             sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
@@ -2797,7 +3300,6 @@ impl ClusterNetworkMaintenance {
         .map_err(DaemonError::from)?;
         self.local_node_role = sinomo_core::network::cluster_local_node_role(&state);
         if sinomo_core::network::cluster_state_needs_join_registration(&state) {
-            self.kv_snapshot_pull_failure_streak = 0;
             if publish_due {
                 self.last_publish = now;
             }
@@ -2809,6 +3311,7 @@ impl ClusterNetworkMaintenance {
             }
             self.settle_connectivity_without_publication();
             self.solo_cluster_idle = false;
+            self.complete_all_active_due_claims();
             return Ok(None);
         }
         if !self.connectivity_converged
@@ -2818,15 +3321,8 @@ impl ClusterNetworkMaintenance {
             self.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
         }
         if daemon_paths_are_shadow(paths) {
-            self.kv_snapshot_pull_failure_streak = 0;
             if publish_due {
                 self.last_publish = now;
-                if let Err(error) = self
-                    .reconcile_desired_rollout(paths, &cluster_paths, &state, &runtime)
-                    .await
-                {
-                    tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
-                }
             }
             if probe_due {
                 self.last_probe = now;
@@ -2836,6 +3332,7 @@ impl ClusterNetworkMaintenance {
             }
             self.settle_connectivity_without_publication();
             self.solo_cluster_idle = sinomo_core::network::cluster_is_settled_solo(&state);
+            self.complete_all_active_due_claims();
             return Ok(None);
         }
         let state_before_maintenance = state.clone();
@@ -2846,10 +3343,26 @@ impl ClusterNetworkMaintenance {
             discovered = self.process_discovery(&mut state);
             if discovered {
                 self.connectivity_converged = false;
+                sinomo_core::cluster::write_cluster_state_async(&runtime, &cluster_paths, &state)
+                    .await
+                    .map_err(DaemonError::from)?;
             }
+            if sinomo_core::network::cluster_network_stable_discovery_announcement_due(
+                self.tick, discovered,
+            ) {
+                self.announce(&state).await;
+            }
+            // Complete discovery before entering any unrelated publication or
+            // probe await. The original state baseline remains available below
+            // so a same-tick publish can still project discovered topology.
+            self.complete_discovery_claim();
         }
+        // Avoid cloning the full bootstrap state on ordinary publish/probe
+        // ticks. A separate post-discovery baseline is needed only when this
+        // generation actually changed and was already written above.
+        let state_after_discovery = discovered.then(|| state.clone());
 
-        if publish_due || probe_due {
+        if publish_due || probe_due || connectivity_publish_retry_due {
             let shadow_options = current_shadow_daemon_options_for_cluster_async(
                 data_dir,
                 DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
@@ -2880,39 +3393,27 @@ impl ClusterNetworkMaintenance {
         }
 
         let cluster_is_solo = sinomo_core::network::cluster_is_settled_solo(&state);
-        sinomo_core::cluster::refresh_cluster_connectivity_environment_async(
-            &runtime,
-            &cluster_paths,
-            &state,
-            &mut self.environment_id,
-            &mut self.connectivity,
-            OffsetDateTime::now_utc(),
-        )
-        .await?;
+        if publish_due || probe_due || connectivity_publish_retry_due {
+            sinomo_core::cluster::refresh_cluster_connectivity_environment_async(
+                &runtime,
+                &cluster_paths,
+                &state,
+                &mut self.environment_id,
+                &mut self.connectivity,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
+        }
 
-        let kv_snapshot_pull_due =
-            self.last_kv_snapshot_pull.elapsed() >= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
-        // Startup settle means connectivity should be probed aggressively,
-        // not that routine publications or learner recovery should inherit a
-        // long formation budget.
-        let use_formation_timeouts = false;
         if publish_due {
             self.last_publish = now;
             let mut publish_failed = false;
+            // Default DFS is derived control-plane state owned by its
+            // committed-snapshot reactor. A generic network publication tick
+            // must never poll or republish DFS state.
             if cluster_is_solo {
                 // no-op: nothing to publish to absent peers
             } else if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
-                    paths,
-                    options,
-                    true,
-                    runtime.clone(),
-                )
-                .await
-                {
-                    tracing::warn!("sinomo daemon distributed DFS control publish failed: {error}");
-                    publish_failed = true;
-                }
                 if !sinomo_core::node::cluster_bootstrap_state_stable_eq(
                     &state_before_maintenance,
                     &state,
@@ -2930,34 +3431,8 @@ impl ClusterNetworkMaintenance {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
                         force_kv_snapshot_sync: false,
-                        use_formation_timeouts,
                     });
-                if daemon_paths_are_shadow(paths)
-                    && let Err(error) = self
-                        .reconcile_desired_rollout(paths, &cluster_paths, &state, &runtime)
-                        .await
-                {
-                    tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
-                }
             } else if !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                // A replica owns its node-local DFS zone advertisement even
-                // though shard/control publication remains authority-only.
-                // Retry it on the durable cluster publication cadence so a
-                // transient startup route failure cannot leave placement
-                // discovery permanently zone-less.
-                if let Err(error) = ensure_default_distributed_dfs_async_on_runtime(
-                    paths,
-                    options,
-                    false,
-                    runtime.clone(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "sinomo daemon local DFS service advertisement publish failed: {error}"
-                    );
-                    publish_failed = true;
-                }
                 self.idle_stats.incr_kv_publish_member();
                 pending_work
                     .member_publishes
@@ -2965,23 +3440,25 @@ impl ClusterNetworkMaintenance {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
                         force_kv_snapshot_sync: false,
-                        use_formation_timeouts,
                     });
             }
             if !cluster_is_solo && !probe_due && !self.connectivity_publish_retry_waiting(now) {
-                pending_work.connectivity_publish = Some(ClusterConnectivityPendingPublish {
-                    paths: cluster_paths.clone(),
-                    source_node_id: state.local_node_id.clone(),
-                    state: state.clone(),
-                    use_formation_timeouts,
-                });
+                pending_work.connectivity_publish =
+                    Some(self.plan_connectivity_publish(&cluster_paths, &state)?);
             }
             if self.service_registry.is_some() {
                 pending_work.service_instance_publish =
-                    Some(ClusterServiceInstancePendingPublish {
-                        daemon_paths: paths.clone(),
-                        local_node_id: state.local_node_id.clone(),
-                        use_formation_timeouts,
+                    self.retained_service_instance_publish.take().or_else(|| {
+                        let snapshot = self
+                            .service_registry
+                            .as_ref()
+                            .expect("checked service registry")
+                            .active_snapshot();
+                        Some(ClusterServiceInstancePendingPublish {
+                            daemon_paths: paths.clone(),
+                            local_node_id: state.local_node_id.clone(),
+                            snapshot,
+                        })
                     });
             }
             if !cluster_is_solo {
@@ -2990,7 +3467,6 @@ impl ClusterNetworkMaintenance {
                     .push(ClusterNodeStatusPendingRefresh {
                         paths: paths.clone(),
                         label: "node status",
-                        use_formation_timeouts,
                     });
                 let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
                 let shadow_status = crate::probe_daemon_status_async(
@@ -3004,41 +3480,12 @@ impl ClusterNetworkMaintenance {
                         ClusterNodeStatusPendingRefresh {
                             paths: shadow_paths,
                             label: "shadow status",
-                            use_formation_timeouts,
                         },
                     );
                 }
             }
             if publish_failed {
-                self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
-                self.last_publish =
-                    sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
-                        now,
-                        sinomo_core::network::cluster_network_publish_interval_for_role(
-                            &self.local_node_role,
-                        ),
-                        self.publish_failure_backoff(),
-                    );
-            } else {
-                self.publish_failure_streak = 0;
-            }
-        }
-
-        // Snapshot pull is the learner recovery net. A retry-only wake-up must
-        // not enqueue the unrelated member, node, connectivity, or service
-        // publications from the regular publish cadence.
-        if publish_due || kv_snapshot_pull_retry_due {
-            if !cluster_is_solo
-                && kv_snapshot_pull_due
-                && !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state)
-            {
-                pending_work.kv_snapshot_pull = Some(ClusterKvSnapshotPendingPull {
-                    paths: cluster_paths.clone(),
-                    state: state.clone(),
-                    use_formation_timeouts,
-                });
-            } else if cluster_is_solo || sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                self.kv_snapshot_pull_failure_streak = 0;
+                pending_work.publish_planning_failed = true;
             }
         }
 
@@ -3046,21 +3493,19 @@ impl ClusterNetworkMaintenance {
             self.last_probe = now;
             if !cluster_is_solo {
                 let plan = self.select_connectivity_probe_plan(&cluster_paths, &state);
-                let use_formation_timeouts = self
-                    .startup_settle_until
-                    .is_some_and(|settle_until| settle_until > now)
-                    || !self.connectivity_converged;
                 match connectivity_probe_plan_action(
                     &plan,
                     publish_due || connectivity_publish_retry_due,
                 ) {
                     ClusterConnectivityProbePlanAction::Probe => {
+                        let local_connectivity_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&cluster_paths)?;
                         pending_work.connectivity_probe = Some(ClusterConnectivityPendingProbe {
                             paths: cluster_paths.clone(),
                             source_node_id: state.local_node_id.clone(),
                             state: state.clone(),
                             plan,
-                            use_formation_timeouts,
+                            input_generation: self.connectivity_input_generation,
+                            local_connectivity_snapshot,
                         });
                     }
                     ClusterConnectivityProbePlanAction::PublishRetained => {
@@ -3068,46 +3513,45 @@ impl ClusterNetworkMaintenance {
                         // observation is due. Retry the retained record set without
                         // running the probe merge/write path again.
                         pending_work.connectivity_publish =
-                            Some(ClusterConnectivityPendingPublish {
-                                paths: cluster_paths.clone(),
-                                source_node_id: state.local_node_id.clone(),
-                                state: state.clone(),
-                                use_formation_timeouts,
-                            });
+                            Some(self.plan_connectivity_publish(&cluster_paths, &state)?);
                     }
                     ClusterConnectivityProbePlanAction::None => {}
                 }
             } else {
-                self.connectivity_converged = true;
-                self.record_connectivity_publish_success();
+                self.finish_connectivity_convergence();
             }
+        } else if connectivity_publish_retry_due && !cluster_is_solo {
+            // Quorum publication has its own generation and deadline. It may
+            // retry while an unrelated endpoint-probe generation is backed
+            // off, without claiming or completing that probe generation.
+            pending_work.connectivity_publish =
+                Some(self.plan_connectivity_publish(&cluster_paths, &state)?);
         }
 
-        let maintenance_changed = discovered
-            || !sinomo_core::node::cluster_bootstrap_state_stable_eq(
-                &state_before_maintenance,
-                &state,
-            );
-        if discovery_due
-            && !discovery_already_processed
-            && sinomo_core::network::cluster_network_stable_discovery_announcement_due(
-                self.tick,
-                maintenance_changed,
-            )
-        {
-            self.announce(&state).await;
-        }
+        let maintenance_changed = !sinomo_core::node::cluster_bootstrap_state_stable_eq(
+            state_after_discovery
+                .as_ref()
+                .unwrap_or(&state_before_maintenance),
+            &state,
+        );
 
         if maintenance_changed {
             self.connectivity_converged = cluster_is_solo;
-            sinomo_core::cluster::write_cluster_state_async(&runtime, &cluster_paths, &state)
-                .await
-                .map_err(DaemonError::from)?;
+            // Discovery and local membership/module refresh each persist their
+            // own mutation before completing above. Do not rewrite the same
+            // bootstrap generation a second time at the shared tail.
         }
         if cluster_is_solo {
             self.settle_connectivity_without_publication();
         }
         self.solo_cluster_idle = cluster_is_solo && !discovered;
+        if self.active_due_claims.discovery {
+            self.complete_discovery_claim();
+        }
+        pending_work.publish_claimed = std::mem::take(&mut self.active_due_claims.publish);
+        pending_work.probe_claimed = std::mem::take(&mut self.active_due_claims.probe);
+        pending_work.connectivity_publish_claimed =
+            std::mem::take(&mut self.active_due_claims.connectivity_publish);
         Ok((!pending_work.is_empty()).then_some(pending_work))
     }
 
@@ -3121,6 +3565,41 @@ impl ClusterNetworkMaintenance {
             last_probe: self.last_probe,
             last_discovery: self.last_discovery,
         }
+    }
+
+    fn plan_connectivity_publish(
+        &self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<ClusterConnectivityPendingPublish, DaemonError> {
+        let local_connectivity_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(paths)?;
+        let retained_records = self
+            .retained_connectivity_publish
+            .as_ref()
+            .filter(|retained| {
+                retained.paths == *paths
+                    && retained.source_node_id == state.local_node_id
+                    && retained.input_generation == self.connectivity_input_generation
+                    && retained.local_connectivity_snapshot == local_connectivity_snapshot
+            })
+            .and_then(|retained| {
+                let records = retained.records.as_ref()?;
+                let current =
+                    sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                        paths,
+                        &state.local_node_id,
+                    )
+                    .ok()?;
+                (current.as_slice() == records.as_slice()).then(|| Arc::clone(records))
+            });
+        Ok(ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: state.local_node_id.clone(),
+            state: state.clone(),
+            records: retained_records,
+            input_generation: self.connectivity_input_generation,
+            local_connectivity_snapshot,
+        })
     }
 
     fn schedule_with_connectivity_publish_backoff(
@@ -3139,155 +3618,257 @@ impl ClusterNetworkMaintenance {
     }
 
     pub fn next_due_duration(&self, now: Instant) -> Duration {
-        let network_due = if self.connectivity_publish_retry_waiting(now) {
-            // While connectivity publication has an independent retry deadline,
-            // the ordinary probe interval must not wake the daemon early. Keep
-            // unrelated publication and discovery cadences live.
-            let mut due = cluster_network_maintenance_interval_remaining(
+        let publish_due = cluster_network_maintenance_interval_remaining(
+            now,
+            self.last_publish,
+            sinomo_core::network::cluster_network_publish_interval_for_role(&self.local_node_role),
+        );
+        let convergence_active = !self.connectivity_converged
+            || self
+                .startup_settle_until
+                .is_some_and(|deadline| now < deadline);
+        let connectivity_retry = self
+            .connectivity_publish_retry_at
+            .map(|retry_at| retry_at.saturating_duration_since(now));
+        let probe_due = if let Some(connectivity_retry) = connectivity_retry {
+            // Publication retry is an independent due class, but endpoint
+            // probing remains suppressed until the retained records have had
+            // their exact retry opportunity.
+            connectivity_retry
+        } else if let Some(retry_at) = self.probe_retry_at {
+            retry_at.saturating_duration_since(now)
+        } else if convergence_active {
+            sinomo_core::network::CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL
+        } else {
+            cluster_network_maintenance_interval_remaining(
                 now,
-                self.last_publish,
-                sinomo_core::network::cluster_network_publish_interval_for_role(
+                self.last_probe,
+                sinomo_core::network::cluster_network_probe_interval_for_role(
                     &self.local_node_role,
                 ),
-            );
-            if self.discovery.is_some() {
-                due = due.min(cluster_network_maintenance_interval_remaining(
-                    now,
-                    self.last_discovery,
-                    sinomo_core::network::cluster_network_discovery_interval_for_role(
-                        &self.local_node_role,
-                    ),
-                ));
-            }
-            due.min(
-                self.connectivity_publish_retry_due_duration(now)
-                    .unwrap_or_default(),
-            )
-        } else {
-            sinomo_core::network::cluster_network_maintenance_next_due_duration(
-                now,
-                &self.schedule(),
             )
         };
-        self.kv_snapshot_pull_retry_due_duration(now)
-            .map_or(network_due, |snapshot_due| network_due.min(snapshot_due))
+        let discovery_due = if self.discovery.is_none() {
+            Duration::MAX
+        } else if let Some(retry_at) = self.discovery_retry_at {
+            retry_at.saturating_duration_since(now)
+        } else if convergence_active && connectivity_retry.is_none() {
+            sinomo_core::network::CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL
+        } else {
+            cluster_network_maintenance_interval_remaining(
+                now,
+                self.last_discovery,
+                sinomo_core::network::cluster_network_discovery_interval_for_role(
+                    &self.local_node_role,
+                ),
+            )
+        };
+        publish_due.min(probe_due).min(discovery_due)
+    }
+
+    fn claim_due_classes(
+        &mut self,
+        now: Instant,
+        publish: bool,
+        probe: bool,
+        discovery: bool,
+        connectivity_publish: bool,
+    ) {
+        self.active_due_claims = ClusterNetworkMaintenanceDueClaims {
+            publish,
+            probe,
+            discovery,
+            connectivity_publish,
+        };
+        if publish {
+            self.last_publish = now;
+        }
+        if probe {
+            self.last_probe = now;
+        }
+        if discovery {
+            self.last_discovery = now;
+        }
+    }
+
+    fn complete_all_active_due_claims(&mut self) {
+        if std::mem::take(&mut self.active_due_claims.publish) {
+            self.record_publish_success();
+        }
+        if std::mem::take(&mut self.active_due_claims.probe) {
+            self.record_probe_success();
+        }
+        if std::mem::take(&mut self.active_due_claims.discovery) {
+            self.record_discovery_success();
+        }
+        if std::mem::take(&mut self.active_due_claims.connectivity_publish) {
+            self.record_connectivity_publish_success();
+        }
+    }
+
+    fn complete_discovery_claim(&mut self) {
+        self.active_due_claims.discovery = false;
+        self.record_discovery_success();
+    }
+
+    pub(crate) fn record_active_tick_plan_failure(&mut self, now: Instant) {
+        let claims = std::mem::take(&mut self.active_due_claims);
+        if claims.publish {
+            self.record_publish_failure_at(now);
+        }
+        if claims.probe {
+            self.record_probe_failure_at(now);
+        }
+        if claims.discovery {
+            self.record_discovery_failure_at(now);
+        }
+        if claims.connectivity_publish {
+            self.record_connectivity_publish_failure_at(now);
+        }
     }
 
     pub(crate) fn request_network_environment_refresh(&mut self, now: Instant) {
-        self.connectivity_converged = false;
-        self.connectivity_publish_failure_streak = 0;
-        self.connectivity_publish_retry_at = None;
-        self.connectivity_force_probe = true;
+        self.request_connectivity_refresh(now);
+        // A genuine interface generation invalidates the previous convergence
+        // result. Re-arm only its bounded settle horizon; failure streaks and
+        // unrelated due classes still belong to their existing generations.
         self.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
+    }
+
+    pub(crate) fn request_publish_refresh(&mut self, now: Instant) {
         let publish_interval =
             sinomo_core::network::cluster_network_publish_interval_for_role(&self.local_node_role);
+        self.last_publish =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                publish_interval,
+                Duration::ZERO,
+            );
+    }
+
+    pub(crate) fn request_connectivity_refresh(&mut self, now: Instant) {
+        self.connectivity_input_generation = self.connectivity_input_generation.wrapping_add(1);
+        self.connectivity_converged = false;
+        self.connectivity_force_probe = true;
+        // A newer connectivity input supersedes only the waiting deadline. Do
+        // not erase the streak: if the new generation fails too, exponential
+        // backoff must continue instead of restarting at its shortest delay.
+        if self.connectivity_publish_retry_at.is_some() {
+            self.connectivity_publish_retry_at = Some(now);
+        }
+        if self.probe_retry_at.is_some() {
+            self.probe_retry_at = Some(now);
+        }
         let probe_interval =
             sinomo_core::network::cluster_network_probe_interval_for_role(&self.local_node_role);
+        self.last_probe =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                probe_interval,
+                Duration::ZERO,
+            );
+    }
+
+    pub(crate) fn request_discovery_refresh(&mut self, now: Instant) {
+        if self.discovery_retry_at.is_some() {
+            self.discovery_retry_at = Some(now);
+        }
         let discovery_interval = sinomo_core::network::cluster_network_discovery_interval_for_role(
             &self.local_node_role,
         );
-        self.last_publish = now.checked_sub(publish_interval).unwrap_or(now);
-        self.last_probe = now.checked_sub(probe_interval).unwrap_or(now);
-        self.last_discovery = now.checked_sub(discovery_interval).unwrap_or(now);
-    }
-
-    async fn reconcile_desired_rollout(
-        &mut self,
-        paths: &DaemonPaths,
-        _cluster_paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-        runtime: &tokio::runtime::Handle,
-    ) -> Result<(), DaemonError> {
-        let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
-        let authoritative =
-            handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
-                paths,
-                &payload.body,
-                true,
-                runtime,
-            )
-            .await?;
-        let Some(desired) =
-            sinomo_rollout::project_cluster_rollout_desired_from_snapshot(&authoritative.value)?
-        else {
-            return Ok(());
-        };
-        if desired.state != "active"
-            || desired.mode.as_deref() != Some("cluster-remote-build")
-            || (desired.source_bundle.is_none() && desired.remote_repo.is_none())
-        {
-            return Ok(());
-        }
-        let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
-            path: paths.root.display().to_string(),
-            detail: "daemon paths have no data directory parent".to_string(),
-        })?;
-        let rollout_paths = SelfRolloutPaths::new(data_dir);
-        let current_status = read_rollout_status(&rollout_paths)?;
-        let now = OffsetDateTime::now_utc();
-        if let Some(status) = current_status.as_ref()
-            && record_desired_rollout_stale_handoff_failure_if_needed(
-                &rollout_paths,
-                status,
-                desired.mode.as_deref(),
-                desired.requested_at.as_deref(),
+        self.last_discovery =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
                 now,
-            )?
-        {
-            return Ok(());
-        }
-        match desired_rollout_reconcile_decision(
-            current_status.as_ref(),
+                discovery_interval,
+                Duration::ZERO,
+            );
+    }
+}
+
+fn reconcile_desired_rollout_record(
+    paths: &DaemonPaths,
+    desired: Option<sinomo_core::ClusterRolloutDesiredRecord>,
+) -> Result<(), DaemonError> {
+    let Some(desired) = desired else {
+        return Ok(());
+    };
+    if desired.state != "active"
+        || desired.mode.as_deref() != Some("cluster-remote-build")
+        || (desired.source_bundle.is_none() && desired.remote_repo.is_none())
+    {
+        return Ok(());
+    }
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    let current_status = read_rollout_status(&rollout_paths)?;
+    let now = OffsetDateTime::now_utc();
+    if let Some(status) = current_status.as_ref()
+        && record_desired_rollout_stale_handoff_failure_if_needed(
+            &rollout_paths,
+            status,
             desired.mode.as_deref(),
             desired.requested_at.as_deref(),
             now,
-        ) {
-            DesiredRolloutReconcileDecision::Complete
-            | DesiredRolloutReconcileDecision::TerminalFailure
-            | DesiredRolloutReconcileDecision::Wait => return Ok(()),
-            DesiredRolloutReconcileDecision::Retry => {}
-        }
-
-        let requested_at = desired.requested_at.clone().unwrap_or_else(|| {
-            OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "unknown".to_string())
-        });
-        let response = handle_daemon_rollout_build_request(
-            paths,
-            ClusterRolloutBuildRequest {
-                source: desired
-                    .source
-                    .unwrap_or_else(|| "cluster desired rollout".to_string()),
-                remote_repo: desired.remote_repo,
-                source_bundle: desired.source_bundle,
-                source_head: desired.source_head,
-                force_source_overwrite: desired.force_source_overwrite,
-                host: desired
-                    .host
-                    .unwrap_or_else(|| SINOMO_DAEMON_DEFAULT_HOST.to_string()),
-                port: desired.port.unwrap_or(SINOMO_DAEMON_DEFAULT_PORT),
-                shadow_port: desired
-                    .shadow_port
-                    .unwrap_or(SINOMO_SHADOW_DAEMON_DEFAULT_PORT),
-                requested_at,
-            },
-        )?;
-        if response.status == "accepted" {
-            tracing::warn!(
-                "sinomo daemon desired rollout accepted: {}",
-                response.detail
-            );
-        } else {
-            tracing::warn!(
-                "sinomo daemon desired rollout {}: {}",
-                response.status,
-                response.detail
-            );
-        }
-        Ok(())
+        )?
+    {
+        return Ok(());
+    }
+    match desired_rollout_reconcile_decision(
+        current_status.as_ref(),
+        desired.mode.as_deref(),
+        desired.requested_at.as_deref(),
+        now,
+    ) {
+        DesiredRolloutReconcileDecision::Complete
+        | DesiredRolloutReconcileDecision::TerminalFailure
+        | DesiredRolloutReconcileDecision::Wait => return Ok(()),
+        DesiredRolloutReconcileDecision::Retry => {}
     }
 
+    let requested_at = desired.requested_at.clone().unwrap_or_else(|| {
+        OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string())
+    });
+    let response = handle_daemon_rollout_build_request(
+        paths,
+        ClusterRolloutBuildRequest {
+            source: desired
+                .source
+                .unwrap_or_else(|| "cluster desired rollout".to_string()),
+            remote_repo: desired.remote_repo,
+            source_bundle: desired.source_bundle,
+            source_head: desired.source_head,
+            force_source_overwrite: desired.force_source_overwrite,
+            host: desired
+                .host
+                .unwrap_or_else(|| SINOMO_DAEMON_DEFAULT_HOST.to_string()),
+            port: desired.port.unwrap_or(SINOMO_DAEMON_DEFAULT_PORT),
+            shadow_port: desired
+                .shadow_port
+                .unwrap_or(SINOMO_SHADOW_DAEMON_DEFAULT_PORT),
+            requested_at,
+        },
+    )?;
+    if response.status == "accepted" {
+        tracing::warn!(
+            "sinomo daemon desired rollout accepted: {}",
+            response.detail
+        );
+    } else {
+        tracing::warn!(
+            "sinomo daemon desired rollout {}: {}",
+            response.status,
+            response.detail
+        );
+    }
+    Ok(())
+}
+
+impl ClusterNetworkMaintenance {
     fn record_node_status_publish(&self, outcome: &NodeStatusPublishOutcome) {
         if outcome.network_info_published {
             self.idle_stats.incr_kv_publish_network_info();
@@ -3355,7 +3936,10 @@ impl ClusterNetworkMaintenance {
         deadline: Option<Instant>,
     ) {
         let ClusterNetworkMaintenancePendingWork {
-            kv_snapshot_pull,
+            publish_claimed,
+            publish_planning_failed,
+            probe_claimed,
+            connectivity_publish_claimed,
             connectivity_publish,
             connectivity_probe,
             member_publishes,
@@ -3363,13 +3947,16 @@ impl ClusterNetworkMaintenance {
             low_priority_node_status_refreshes,
             service_instance_publish,
         } = pending;
+        let mut publish_succeeded = !publish_planning_failed;
+        let mut publish_followup_needed = false;
+        let mut probe_succeeded = true;
         // Fresh local observations must run before graph-dependent publishes.
         // Otherwise stale routes can make those publishes consume the entire
         // phase and starve the probe that would repair the next attempt.
         let connectivity_probe_scheduled = connectivity_probe.is_some();
+        let connectivity_publish_scheduled = connectivity_publish.is_some();
         let connectivity_probe_deadline = if connectivity_probe_scheduled
-            && (kv_snapshot_pull.is_some()
-                || !member_publishes.is_empty()
+            && (!member_publishes.is_empty()
                 || !node_status_refreshes.is_empty()
                 || !low_priority_node_status_refreshes.is_empty()
                 || service_instance_publish.is_some())
@@ -3382,164 +3969,125 @@ impl ClusterNetworkMaintenance {
             deadline
         };
         if let Some(probe) = connectivity_probe {
-            if cluster_network_pending_step_with_deadline(
-                "connectivity probe",
-                CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
-                connectivity_probe_deadline,
-                self.run_pending_connectivity_probe_async(probe, runtime.clone()),
-            )
-            .await
-            .is_none()
-            {
-                self.record_connectivity_probe_failure();
+            let probe_result = self
+                .run_pending_connectivity_probe_async(
+                    probe,
+                    runtime.clone(),
+                    connectivity_probe_deadline,
+                )
+                .await;
+            match probe_result {
+                ClusterConnectivityProbePendingOutcome::Completed
+                | ClusterConnectivityProbePendingOutcome::PublicationDeferred
+                | ClusterConnectivityProbePendingOutcome::Superseded => {}
+                ClusterConnectivityProbePendingOutcome::ProbeFailed => {
+                    // A cancelled/local-persistence probe must rerun. Quorum
+                    // publication failure is deliberately excluded: its exact
+                    // retained-record retry owns that backoff.
+                    self.connectivity_force_probe = true;
+                    probe_succeeded = false;
+                    if connectivity_publish_claimed {
+                        self.record_connectivity_publish_failure();
+                    }
+                }
             }
         }
         // A fresh probe reads and publishes the current record set itself, so a
         // same-tick cached publish would only duplicate work and steal budget
         // from node/member status publication.
         if !connectivity_probe_scheduled && let Some(publish) = connectivity_publish {
-            if cluster_network_pending_step_with_deadline(
-                "connectivity publish",
-                cluster_network_pending_connectivity_publish_timeout(
-                    publish.use_formation_timeouts,
-                ),
-                deadline,
-                self.run_pending_connectivity_publish_async(publish, runtime.clone()),
-            )
-            .await
-            .is_none()
-            {
-                self.record_connectivity_publish_failure();
-            }
+            // Capture the durable source generation before entering the
+            // cancelable remote publication phase.
+            self.run_pending_connectivity_publish_async(publish, runtime.clone(), deadline)
+                .await;
         }
-        if let Some(pull) = kv_snapshot_pull {
-            let pull_deadline = if !member_publishes.is_empty()
-                || !node_status_refreshes.is_empty()
-                || !low_priority_node_status_refreshes.is_empty()
-                || service_instance_publish.is_some()
-            {
-                cluster_network_deadline_with_tail_reserve(
-                    deadline,
-                    CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
-                )
-            } else {
-                deadline
-            };
-            if cluster_network_pending_step_with_deadline(
-                "kv snapshot pull",
-                cluster_network_pending_kv_snapshot_pull_timeout(pull.use_formation_timeouts),
-                pull_deadline,
-                self.run_pending_kv_snapshot_pull_async(pull, runtime.clone()),
-            )
-            .await
-            .is_none()
-            {
-                self.record_kv_snapshot_pull_failure();
-            }
+        if connectivity_publish_claimed
+            && !connectivity_probe_scheduled
+            && !connectivity_publish_scheduled
+        {
+            // A claimed exact retry must never disappear silently if planning
+            // produced no carrier operation.
+            self.record_connectivity_publish_failure();
         }
         for refresh in node_status_refreshes {
-            if cluster_network_pending_step_with_deadline(
+            publish_succeeded &= cluster_network_pending_step_with_deadline(
                 "node status refresh",
-                cluster_network_pending_node_status_timeout(refresh.use_formation_timeouts),
+                CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
                 deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
             .await
-            .is_none()
-            {
-                self.record_publish_failure();
-            }
+                == Some(true);
         }
         for publish in member_publishes {
-            let max_duration =
-                cluster_network_pending_member_publish_timeout(publish.use_formation_timeouts);
-            if cluster_network_pending_step_with_deadline(
+            publish_succeeded &= cluster_network_pending_step_with_deadline(
                 "member publish",
-                max_duration,
+                CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT,
                 deadline,
                 self.run_pending_member_publish_async(publish, runtime.clone()),
             )
             .await
-            .is_none()
-            {
-                self.record_publish_failure();
-            }
+                == Some(true);
         }
         if let Some(publish) = service_instance_publish {
-            if cluster_network_pending_step_with_deadline(
+            let service_succeeded = cluster_network_pending_step_with_deadline(
                 "service instance publish",
-                cluster_network_pending_service_publish_timeout(publish.use_formation_timeouts),
+                CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT,
                 deadline,
-                self.run_pending_service_instance_publish_async(publish, runtime.clone()),
+                self.run_pending_service_instance_publish_async(publish.clone(), runtime.clone()),
             )
             .await
-            .is_none()
-            {
-                self.record_publish_failure();
+                == Some(true);
+            if service_succeeded {
+                if let Some(current) = self
+                    .service_registry
+                    .as_ref()
+                    .map(|store| store.active_snapshot())
+                    && current.version() > publish.snapshot.version()
+                {
+                    self.retained_service_instance_publish =
+                        Some(ClusterServiceInstancePendingPublish {
+                            daemon_paths: publish.daemon_paths,
+                            local_node_id: publish.local_node_id,
+                            snapshot: current,
+                        });
+                    publish_followup_needed = true;
+                }
+            } else {
+                // Retain the exact registry generation. Full-set reconciliation
+                // is idempotent, so an uncertain response can safely replay it.
+                self.retained_service_instance_publish = Some(publish);
+                publish_succeeded = false;
             }
         }
         for refresh in low_priority_node_status_refreshes {
-            if cluster_network_pending_step_with_deadline(
+            publish_succeeded &= cluster_network_pending_step_with_deadline(
                 "low-priority node status refresh",
-                cluster_network_pending_node_status_timeout(refresh.use_formation_timeouts),
+                CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
                 deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
             .await
-            .is_none()
-            {
+                == Some(true);
+        }
+        if publish_claimed {
+            if publish_succeeded {
+                self.record_publish_success();
+                if publish_followup_needed {
+                    self.defer_publish_retry(
+                        Instant::now(),
+                        DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF,
+                    );
+                }
+            } else {
                 self.record_publish_failure();
             }
         }
-    }
-
-    async fn run_pending_kv_snapshot_pull_async(
-        &mut self,
-        pending: ClusterKvSnapshotPendingPull,
-        runtime: tokio::runtime::Handle,
-    ) {
-        let timeouts = if pending.use_formation_timeouts {
-            cluster_formation_control_plane_timeouts()
-        } else {
-            cluster_control_plane_timeouts()
-        };
-        let ClusterKvSnapshotPendingPull { paths, state, .. } = pending;
-        let blocking_runtime = runtime.clone();
-        let result = runtime
-            .spawn_blocking(move || {
-                let transport = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-                    DaemonClusterRpcMode::from_handle(&blocking_runtime),
-                    timeouts,
-                );
-                let mut host = sinomo_core::cluster::ClusterControlPlaneDriver::with_timeouts(
-                    transport, timeouts,
-                );
-                let outcome = sinomo_core::cluster::refresh_current_cluster_kv_store_with_outcome(
-                    &paths,
-                    &state,
-                    timeouts.kv_snapshot_refresh_options(),
-                    &mut host,
-                )?;
-                if outcome.fetched_remote {
-                    Ok(())
-                } else {
-                    Err(sinomo_core::network::NetworkError::ClusterReadOnly {
-                        detail: "KV snapshot pull found only the local snapshot".to_string(),
-                    })
-                }
-            })
-            .await;
-        match result {
-            Ok(Ok(())) => {
-                self.record_kv_snapshot_pull_success();
-            }
-            Ok(Err(error)) => {
-                tracing::warn!("sinomo daemon cluster KV snapshot pull failed: {error}");
-                self.record_kv_snapshot_pull_failure();
-            }
-            Err(error) => {
-                tracing::warn!("sinomo daemon cluster KV snapshot pull task failed: {error}");
-                self.record_kv_snapshot_pull_failure();
+        if probe_claimed {
+            if probe_succeeded {
+                self.record_probe_success();
+            } else {
+                self.record_probe_failure_at(Instant::now());
             }
         }
     }
@@ -3548,33 +4096,37 @@ impl ClusterNetworkMaintenance {
         &mut self,
         pending: ClusterConnectivityPendingPublish,
         runtime: tokio::runtime::Handle,
-    ) {
+        deadline: Option<Instant>,
+    ) -> bool {
         let ClusterConnectivityPendingPublish {
             paths,
             source_node_id,
             state,
-            use_formation_timeouts,
+            records,
+            input_generation,
+            local_connectivity_snapshot,
         } = pending;
-        match sinomo_core::network::prune_local_cluster_connectivity_records_for_state_async(
-            &runtime, &paths, &state,
-        )
-        .await
+        let current_state = match sinomo_core::cluster::read_cluster_state_async(&runtime, &paths)
+            .await
         {
-            Ok(removed) if removed > 0 => {
-                tracing::debug!(
-                    "sinomo daemon pruned {removed} stale local connectivity record(s) before publish"
-                );
-            }
-            Ok(_) => {}
+            Ok(state) => state,
             Err(error) => {
                 tracing::warn!(
-                    "sinomo daemon local connectivity prune before publish failed: {error}"
+                    "sinomo daemon current topology read before connectivity publish failed: {error}"
                 );
+                self.record_connectivity_publish_failure();
+                return false;
             }
+        };
+        if input_generation != self.connectivity_input_generation
+            || !cluster_connectivity_pending_topology_is_current(&paths, &state, &current_state)
+        {
+            self.record_connectivity_topology_superseded();
+            return true;
         }
         let read_paths = paths.clone();
         let read_source_node_id = source_node_id.clone();
-        let records = match runtime
+        let current_records = match runtime
             .spawn_blocking(move || {
                 sinomo_core::network::read_local_cluster_connectivity_records_for_source(
                     &read_paths,
@@ -3589,46 +4141,99 @@ impl ClusterNetworkMaintenance {
                     "sinomo daemon cached connectivity read failed for {source_node_id}: {error}"
                 );
                 self.record_connectivity_publish_failure();
-                return;
+                return false;
             }
             Err(error) => {
                 tracing::warn!(
                     "sinomo daemon cached connectivity read task failed for {source_node_id}: {error}"
                 );
                 self.record_connectivity_publish_failure();
-                return;
+                return false;
             }
         };
-        if records.is_empty() {
-            self.connectivity_converged = true;
-            self.record_connectivity_publish_success();
-            return;
-        }
-        let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-            DaemonClusterRpcMode::new(runtime.clone()),
-            if use_formation_timeouts {
-                cluster_formation_control_plane_timeouts()
-            } else {
-                cluster_control_plane_timeouts()
-            },
-        );
-        match sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+        let records = records
+            .filter(|retained| retained.as_slice() == current_records.as_slice())
+            .unwrap_or_else(|| Arc::new(current_records));
+        let (records, committed_snapshot) = match sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_source_set_if_snapshot_async(
             &runtime,
             &paths,
+            &current_state,
             &source_node_id,
-            records,
-            state,
-            &mut publish_host,
+            records.as_slice(),
+            &local_connectivity_snapshot,
         )
         .await
         {
-            Ok(_) => {
-                self.connectivity_converged = true;
-                self.record_connectivity_publish_success();
+            Ok(sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Committed {
+                records,
+                snapshot,
+                content_changed: _,
+            }) => (Arc::new(records), snapshot),
+            Ok(sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Superseded {
+                records,
+                snapshot,
+            }) => {
+                self.retain_superseding_connectivity_source_generation(
+                    paths,
+                    source_node_id,
+                    current_state,
+                    records,
+                    snapshot,
+                );
+                return true;
             }
             Err(error) => {
+                tracing::warn!(
+                    "sinomo daemon generation-fenced connectivity publish commit failed: {error}"
+                );
+                self.record_connectivity_publish_failure();
+                return false;
+            }
+        };
+        // Retain before the first remote await. A timeout drops only this
+        // attempt; the same durable generation remains the independent retry
+        // owner and full-source reconciliation is idempotent. An empty set is
+        // still a generation: it must delete stale source-owned KV records and
+        // remain fenced against a concurrent topology input.
+        self.retained_connectivity_publish = Some(ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: source_node_id.clone(),
+            state: current_state.clone(),
+            records: Some(Arc::clone(&records)),
+            input_generation,
+            local_connectivity_snapshot: committed_snapshot,
+        });
+        let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime.clone()),
+            cluster_control_plane_timeouts(),
+        );
+        let published = cluster_network_pending_step_with_deadline(
+            "connectivity publish",
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT,
+            deadline,
+            sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                &runtime,
+                &paths,
+                &source_node_id,
+                records.as_ref().clone(),
+                current_state,
+                &mut publish_host,
+            ),
+        )
+        .await;
+        match published {
+            Some(Ok(_)) => {
+                self.finish_connectivity_convergence();
+                true
+            }
+            Some(Err(error)) => {
                 self.record_connectivity_publish_failure();
                 tracing::warn!("sinomo daemon cached connectivity quorum publish failed: {error}");
+                false
+            }
+            None => {
+                self.record_connectivity_publish_failure();
+                false
             }
         }
     }
@@ -3638,26 +4243,19 @@ impl ClusterNetworkMaintenance {
         pending: ClusterNodeStatusPendingRefresh,
         runtime: tokio::runtime::Handle,
     ) -> bool {
-        let timeouts = if pending.use_formation_timeouts {
-            cluster_formation_control_plane_timeouts()
-        } else {
-            cluster_control_plane_timeouts()
-        };
         match refresh_daemon_node_status_in_kv_async_with_timeouts(
             &pending.paths,
             runtime,
-            timeouts,
+            cluster_control_plane_timeouts(),
         )
         .await
         {
             Ok(published) => {
                 self.record_node_status_publish(&published);
-                self.record_publish_success();
                 true
             }
             Err(error) => {
                 tracing::warn!("sinomo daemon {} publish failed: {error}", pending.label);
-                self.record_publish_failure();
                 false
             }
         }
@@ -3667,31 +4265,21 @@ impl ClusterNetworkMaintenance {
         &mut self,
         pending: ClusterMemberPublishPendingWork,
         runtime: tokio::runtime::Handle,
-    ) {
-        let timeouts = if pending.use_formation_timeouts {
-            cluster_formation_control_plane_timeouts()
-        } else {
-            cluster_control_plane_timeouts()
-        };
+    ) -> bool {
         let result = publish_local_members_to_quorum_if_needed_async(
             &pending.paths,
             &pending.state,
             pending.force_kv_snapshot_sync,
             runtime,
-            timeouts,
+            cluster_control_plane_timeouts(),
         )
         .await
         .map(|_| ());
         match result {
-            Ok(()) => {
-                if pending.force_kv_snapshot_sync {
-                    self.record_kv_snapshot_pull_success();
-                }
-                self.record_publish_success();
-            }
+            Ok(()) => true,
             Err(error) => {
                 tracing::warn!("sinomo daemon cluster member publish failed: {error}");
-                self.record_publish_failure();
+                false
             }
         }
     }
@@ -3700,62 +4288,109 @@ impl ClusterNetworkMaintenance {
         &mut self,
         pending: ClusterServiceInstancePendingPublish,
         runtime: tokio::runtime::Handle,
-    ) {
-        let Some(service_registry) = self.service_registry.as_ref() else {
-            return;
-        };
+    ) -> bool {
         let Some(data_dir) = pending.daemon_paths.root.parent() else {
             tracing::warn!(
                 "sinomo daemon service instance publish failed: daemon paths have no data directory parent"
             );
-            return;
+            return false;
         };
         let data_dir = SinomoDataDir::new(data_dir);
-        let cluster_access = if pending.use_formation_timeouts {
-            crate::service_adapter::DaemonClusterAccess::new_with_control_plane_timeouts(
-                pending.daemon_paths.clone(),
-                &data_dir,
-                Some(&runtime),
-                cluster_formation_control_plane_timeouts(),
-            )
-        } else {
-            crate::service_adapter::DaemonClusterAccess::new(
-                pending.daemon_paths.clone(),
-                &data_dir,
-                Some(&runtime),
-            )
-        };
-        let snapshot = service_registry.active_snapshot();
+        let cluster_access = crate::service_adapter::DaemonClusterAccess::new(
+            pending.daemon_paths.clone(),
+            &data_dir,
+            Some(&runtime),
+        );
         if let Err(error) = sinomo_core::service::publish_local_service_instances(
             &cluster_access,
-            snapshot.registry(),
+            pending.snapshot.registry(),
             &pending.local_node_id,
-            snapshot.version(),
+            pending.snapshot.version(),
             OffsetDateTime::now_utc(),
         )
         .await
         {
             tracing::warn!("sinomo daemon service instance publish failed: {error}");
+            return false;
         }
+        true
     }
 
     fn record_publish_failure(&mut self) {
+        self.record_publish_failure_at(Instant::now());
+    }
+
+    fn record_publish_failure_at(&mut self, now: Instant) {
         let delay = self.record_publish_failure_delay();
-        self.defer_publish_retry(Instant::now(), delay);
+        self.defer_publish_retry(now, delay);
+    }
+
+    fn record_probe_failure_at(&mut self, now: Instant) {
+        self.probe_failure_streak = self.probe_failure_streak.saturating_add(1);
+        let delay = cluster_network_due_class_failure_backoff(self.probe_failure_streak);
+        self.probe_retry_at = now.checked_add(delay);
+        self.last_probe =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                sinomo_core::network::cluster_network_probe_interval_for_role(
+                    &self.local_node_role,
+                ),
+                delay,
+            );
+    }
+
+    fn record_discovery_failure_at(&mut self, now: Instant) {
+        self.discovery_failure_streak = self.discovery_failure_streak.saturating_add(1);
+        let delay = cluster_network_due_class_failure_backoff(self.discovery_failure_streak);
+        self.discovery_retry_at = now.checked_add(delay);
+        self.last_discovery =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                sinomo_core::network::cluster_network_discovery_interval_for_role(
+                    &self.local_node_role,
+                ),
+                delay,
+            );
+    }
+
+    fn record_probe_success(&mut self) {
+        self.probe_failure_streak = 0;
+        self.probe_retry_at = None;
+    }
+
+    fn record_discovery_success(&mut self) {
+        self.discovery_failure_streak = 0;
+        self.discovery_retry_at = None;
+    }
+
+    fn probe_retry_waiting(&self, now: Instant) -> bool {
+        self.probe_retry_at.is_some_and(|retry_at| retry_at > now)
+    }
+
+    fn probe_retry_due(&self, now: Instant) -> bool {
+        self.probe_retry_at.is_some_and(|retry_at| retry_at <= now)
+    }
+
+    fn discovery_retry_waiting(&self, now: Instant) -> bool {
+        self.discovery_retry_at
+            .is_some_and(|retry_at| retry_at > now)
+    }
+
+    fn discovery_retry_due(&self, now: Instant) -> bool {
+        self.discovery_retry_at
+            .is_some_and(|retry_at| retry_at <= now)
     }
 
     fn record_connectivity_publish_failure(&mut self) {
+        self.record_connectivity_publish_failure_at(Instant::now());
+    }
+
+    fn record_connectivity_publish_failure_at(&mut self, now: Instant) {
         self.connectivity_converged = false;
         self.connectivity_publish_failure_streak =
             self.connectivity_publish_failure_streak.saturating_add(1);
         let delay = self.connectivity_publish_failure_backoff();
-        let now = Instant::now();
         self.connectivity_publish_retry_at = now.checked_add(delay);
-    }
-
-    fn record_connectivity_probe_failure(&mut self) {
-        self.connectivity_force_probe = true;
-        self.record_connectivity_publish_failure();
     }
 
     fn clear_connectivity_publish_retry(&mut self) {
@@ -3763,42 +4398,82 @@ impl ClusterNetworkMaintenance {
         self.connectivity_publish_retry_at = None;
     }
 
-    fn record_connectivity_publish_success(&mut self) {
+    fn record_connectivity_topology_superseded(&mut self) {
         self.clear_connectivity_publish_retry();
+        self.retained_connectivity_publish = None;
+        self.connectivity_converged = false;
+        self.connectivity_force_probe = true;
+    }
+
+    fn retain_superseding_connectivity_source_generation(
+        &mut self,
+        paths: ClusterPaths,
+        source_node_id: NodeId,
+        state: ClusterBootstrapState,
+        records: Vec<ClusterConnectivityRecord>,
+        local_connectivity_snapshot: LocalClusterConnectivityStoreSnapshot,
+    ) {
+        self.clear_connectivity_publish_retry();
+        self.retained_connectivity_publish = Some(ClusterConnectivityPendingPublish {
+            paths,
+            source_node_id,
+            state,
+            records: Some(Arc::new(records)),
+            input_generation: self.connectivity_input_generation,
+            local_connectivity_snapshot,
+        });
+        self.connectivity_converged = false;
         self.connectivity_force_probe = false;
+        // This is newer durable output, not a failed observation. Give its
+        // idempotent publication an immediate independent turn without probe
+        // or failure backoff.
+        self.connectivity_publish_retry_at = Some(Instant::now());
+    }
+
+    fn record_connectivity_publish_success(&mut self) {
+        let superseded = self
+            .retained_connectivity_publish
+            .as_ref()
+            .map(|retained| {
+                let output_superseded = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(
+                    &retained.paths,
+                )
+                .map(|current_snapshot| {
+                    current_snapshot != retained.local_connectivity_snapshot
+                        || retained.records.as_ref().is_none_or(|records| {
+                            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                                &retained.paths,
+                                &retained.source_node_id,
+                            )
+                            .map(|current| current.as_slice() != records.as_slice())
+                            .unwrap_or(true)
+                        })
+                })
+                .unwrap_or(true);
+                retained.input_generation != self.connectivity_input_generation
+                    || output_superseded
+                    || !cluster_connectivity_probe_inputs_still_current(retained)
+            })
+            .unwrap_or(false);
+        self.clear_connectivity_publish_retry();
+        self.retained_connectivity_publish = None;
+        self.connectivity_force_probe = superseded;
+        if superseded {
+            // A command/join observation committed while this generation was
+            // in flight. Its notification is only a wake; the durable content
+            // generation is the lossless invalidation fence.
+            self.connectivity_converged = false;
+        }
     }
 
     fn settle_connectivity_without_publication(&mut self) {
+        self.finish_connectivity_convergence();
+    }
+
+    fn finish_connectivity_convergence(&mut self) {
         self.connectivity_converged = true;
         self.startup_settle_until = None;
         self.record_connectivity_publish_success();
-    }
-
-    fn record_kv_snapshot_pull_failure(&mut self) {
-        self.kv_snapshot_pull_failure_streak =
-            self.kv_snapshot_pull_failure_streak.saturating_add(1);
-        let delay = self.kv_snapshot_pull_failure_backoff();
-        let now = Instant::now();
-        self.last_kv_snapshot_pull =
-            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
-                now,
-                DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL,
-                delay,
-            );
-    }
-
-    fn record_kv_snapshot_pull_success(&mut self) {
-        self.kv_snapshot_pull_failure_streak = 0;
-        self.last_kv_snapshot_pull = Instant::now();
-    }
-
-    fn kv_snapshot_pull_retry_due_duration(&self, now: Instant) -> Option<Duration> {
-        (self.kv_snapshot_pull_failure_streak > 0).then(|| {
-            let elapsed = now
-                .checked_duration_since(self.last_kv_snapshot_pull)
-                .unwrap_or_default();
-            DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL.saturating_sub(elapsed)
-        })
     }
 
     fn connectivity_publish_retry_waiting(&self, now: Instant) -> bool {
@@ -3847,120 +4522,183 @@ impl ClusterNetworkMaintenance {
             .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
     }
 
-    fn kv_snapshot_pull_failure_backoff(&self) -> Duration {
-        let exponent = self
-            .kv_snapshot_pull_failure_streak
-            .saturating_sub(1)
-            .min(10);
-        DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF
-            .saturating_mul(1_u32 << exponent)
-            .min(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_BACKOFF)
-    }
-
     fn record_publish_success(&mut self) {
         self.publish_failure_streak = 0;
     }
 
-    pub(crate) async fn run_pending_connectivity_probe_async(
+    async fn run_pending_connectivity_probe_async(
         &mut self,
         pending: ClusterConnectivityPendingProbe,
         runtime: tokio::runtime::Handle,
-    ) {
+        deadline: Option<Instant>,
+    ) -> ClusterConnectivityProbePendingOutcome {
         let ClusterConnectivityPendingProbe {
             paths,
             source_node_id,
             state,
             plan,
-            use_formation_timeouts,
+            input_generation,
+            local_connectivity_snapshot,
         } = pending;
         let remaining_due = plan.remaining_due;
         let convergence_active = plan.convergence_active;
-        let execution = self
-            .execute_connectivity_probe_plan_async(&state, plan)
-            .await;
+        // Only endpoint observation is cancelable as the probe phase. Once a
+        // complete batch exists, its source-owned projection must cross the
+        // local durable boundary before any quorum/import await can consume
+        // the remaining maintenance budget.
+        let Some(execution) = cluster_network_pending_step_with_deadline(
+            "connectivity probe",
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
+            deadline,
+            self.execute_connectivity_probe_plan_async(&state, plan),
+        )
+        .await
+        else {
+            return ClusterConnectivityProbePendingOutcome::ProbeFailed;
+        };
+        let newly_healthy_target_node_ids = execution.newly_healthy_target_node_ids.clone();
         let convergence_followup_needed = connectivity_probe_result_needs_followup(
             remaining_due,
             convergence_active,
             execution.probed_degraded,
         );
-        match sinomo_core::network::prune_local_cluster_connectivity_records_for_state_async(
-            &runtime, &paths, &state,
-        )
-        .await
+        let current_state = match sinomo_core::cluster::read_cluster_state_async(&runtime, &paths)
+            .await
         {
-            Ok(removed) if removed > 0 => {
-                tracing::debug!(
-                    "sinomo daemon pruned {removed} stale local connectivity record(s) before probe merge"
-                );
-            }
-            Ok(_) => {}
+            Ok(state) => state,
             Err(error) => {
+                self.connectivity_force_probe = true;
                 tracing::warn!(
-                    "sinomo daemon local connectivity prune before probe merge failed: {error}"
+                    "sinomo daemon current topology read before connectivity commit failed: {error}"
                 );
+                return ClusterConnectivityProbePendingOutcome::ProbeFailed;
             }
+        };
+        if input_generation != self.connectivity_input_generation
+            || !cluster_connectivity_pending_topology_is_current(&paths, &state, &current_state)
+        {
+            self.record_connectivity_topology_superseded();
+            return ClusterConnectivityProbePendingOutcome::Superseded;
         }
         let records = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
             &paths,
             &source_node_id,
             execution.records,
         );
-        let written = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
+        let (persisted_records, committed_snapshot, content_changed) = match sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_source_set_if_snapshot_async(
             &runtime,
             &paths,
+            &current_state,
             &source_node_id,
             &records,
+            &local_connectivity_snapshot,
+        )
+        .await
+        {
+            Ok(sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Committed {
+                records,
+                snapshot,
+                content_changed,
+            }) => (Arc::new(records), snapshot, content_changed),
+            Ok(sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Superseded {
+                records,
+                snapshot,
+            }) => {
+                self.retain_superseding_connectivity_source_generation(
+                    paths,
+                    source_node_id,
+                    current_state,
+                    records,
+                    snapshot,
+                );
+                return ClusterConnectivityProbePendingOutcome::Superseded;
+            }
+            Err(error) => {
+                self.connectivity_force_probe = true;
+                tracing::warn!(
+                    "sinomo daemon generation-fenced connectivity probe commit failed: {error}"
+                );
+                return ClusterConnectivityProbePendingOutcome::ProbeFailed;
+            }
+        };
+        let retained_publish = ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: source_node_id.clone(),
+            state: current_state.clone(),
+            records: Some(Arc::clone(&persisted_records)),
+            input_generation,
+            local_connectivity_snapshot: committed_snapshot,
+        };
+        // Install the retry owner before the first cancelable remote await.
+        self.retained_connectivity_publish = Some(retained_publish);
+        self.connectivity_force_probe = false;
+        if content_changed {
+            self.idle_stats.incr_connectivity_record_sets_written();
+        }
+        spawn_newly_reachable_cluster_raft_member_catch_up(
+            &runtime,
+            paths.clone(),
+            current_state.clone(),
+            newly_healthy_target_node_ids,
+        );
+
+        let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime.clone()),
+            cluster_control_plane_timeouts(),
+        );
+        let published = cluster_network_pending_step_with_deadline(
+            "connectivity publish",
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT,
+            deadline,
+            sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                &runtime,
+                &paths,
+                &source_node_id,
+                persisted_records.as_ref().clone(),
+                current_state.clone(),
+                &mut publish_host,
+            ),
         )
         .await;
-        match written {
-            Ok(()) => {
-                self.connectivity_force_probe = false;
-                self.idle_stats.incr_connectivity_record_sets_written();
-                let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-                    DaemonClusterRpcMode::new(runtime.clone()),
-                    if use_formation_timeouts {
-                        cluster_formation_control_plane_timeouts()
-                    } else {
-                        cluster_control_plane_timeouts()
-                    },
-                );
-                let published =
-                    sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
-                        &runtime,
+        match published {
+            Some(Ok(_)) => {
+                if convergence_followup_needed {
+                    self.connectivity_converged = false;
+                    self.record_connectivity_publish_success();
+                } else {
+                    self.finish_connectivity_convergence();
+                }
+                // Peer import is a derived read-model optimization. It may use
+                // only whatever phase budget remains; source publication has
+                // already crossed both durable boundaries.
+                let imported = cluster_network_pending_step_with_deadline(
+                    "peer connectivity import",
+                    CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
+                    deadline,
+                    import_peer_connectivity_records_from_reachable_endpoints_async(
                         &paths,
-                        &source_node_id,
-                        records.clone(),
-                        state.clone(),
-                        &mut publish_host,
-                    )
-                    .await;
-                let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
-                    &paths,
-                    &state,
-                    &records,
-                    runtime,
-                    use_formation_timeouts,
+                        &current_state,
+                        persisted_records.as_slice(),
+                        runtime,
+                    ),
                 )
-                .await;
+                .await
+                .unwrap_or(0);
                 if imported > 0 {
                     tracing::debug!(
                         "sinomo daemon imported {imported} peer connectivity record set(s)"
                     );
                 }
-                match published {
-                    Ok(_) => {
-                        self.connectivity_converged = !convergence_followup_needed;
-                        self.record_connectivity_publish_success();
-                    }
-                    Err(error) => {
-                        self.record_connectivity_publish_failure();
-                        tracing::warn!("sinomo daemon connectivity quorum publish failed: {error}");
-                    }
-                }
+                ClusterConnectivityProbePendingOutcome::Completed
             }
-            Err(error) => {
-                self.record_connectivity_probe_failure();
-                tracing::warn!("sinomo daemon local connectivity write failed: {error}");
+            Some(Err(error)) => {
+                self.record_connectivity_publish_failure();
+                tracing::warn!("sinomo daemon connectivity quorum publish failed: {error}");
+                ClusterConnectivityProbePendingOutcome::PublicationDeferred
+            }
+            None => {
+                self.record_connectivity_publish_failure();
+                ClusterConnectivityProbePendingOutcome::PublicationDeferred
             }
         }
     }
@@ -3981,10 +4719,13 @@ impl ClusterNetworkMaintenance {
         let probed_degraded = probed
             .iter()
             .any(|(_, record)| record.state == ClusterConnectivityState::Degraded);
+        let newly_healthy_target_node_ids =
+            newly_healthy_connectivity_target_node_ids(&self.connectivity, &probed);
         let records = self.apply_connectivity_probe_plan(plan, probed);
         ClusterConnectivityProbeExecution {
             records,
             probed_degraded,
+            newly_healthy_target_node_ids,
         }
     }
 
@@ -4042,6 +4783,215 @@ impl ClusterNetworkMaintenance {
     }
 }
 
+fn newly_healthy_connectivity_target_node_ids(
+    previous: &BTreeMap<String, sinomo_core::network::ClusterConnectivityProbeState>,
+    probed: &[(String, ClusterConnectivityRecord)],
+) -> Vec<NodeId> {
+    let previously_healthy = previous
+        .values()
+        .filter(|state| state.record.state == ClusterConnectivityState::Healthy)
+        .map(|state| state.record.target_node_id.clone())
+        .collect::<BTreeSet<_>>();
+    probed
+        .iter()
+        .filter(|(_, record)| {
+            record.state == ClusterConnectivityState::Healthy
+                && !previously_healthy.contains(&record.target_node_id)
+        })
+        .map(|(_, record)| record.target_node_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// A reachability transition is the recovery event for a missed committed
+/// fanout. It owns one target-keyed Raft catch-up attempt; there is no periodic
+/// KV pull or retry sweep. Raft append rejection/backtracking remains the only
+/// gap-recovery protocol and naturally falls back to an authoritative snapshot
+/// when the leader has compacted the missing prefix.
+fn spawn_newly_reachable_cluster_raft_member_catch_up(
+    runtime: &tokio::runtime::Handle,
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    target_node_ids: Vec<NodeId>,
+) {
+    if target_node_ids.is_empty() {
+        return;
+    }
+    let worker_runtime = runtime.clone();
+    runtime.spawn(async move {
+        catch_up_newly_reachable_cluster_raft_members_async(
+            paths,
+            state,
+            target_node_ids,
+            worker_runtime,
+        )
+        .await;
+    });
+}
+
+async fn catch_up_newly_reachable_cluster_raft_members_async(
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    target_node_ids: Vec<NodeId>,
+    runtime: tokio::runtime::Handle,
+) {
+    let target_node_ids = target_node_ids
+        .into_iter()
+        .filter(|target_node_id| {
+            *target_node_id != state.local_node_id
+                && state.members.iter().any(|member| {
+                    member.node_id == *target_node_id
+                        && member.state.is_authorized()
+                        && member
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    if target_node_ids.is_empty() {
+        return;
+    }
+
+    let read_paths = paths.clone();
+    let read_state = state.clone();
+    let leader_inputs = runtime
+        .spawn_blocking(move || {
+            if !read_paths
+                .kv_paths()
+                .locked_raft_local_is_leader(&read_state)
+                .map_err(sinomo_core::network::NetworkError::directory)?
+            {
+                return Ok(None);
+            }
+            sinomo_core::kv::read_cluster_kv_watch_events(&read_paths.kv_paths())
+                .map(|read| Some(read.events))
+                .map_err(sinomo_core::network::NetworkError::directory)
+        })
+        .await;
+    let events = match leader_inputs {
+        Ok(Ok(Some(events))) => Arc::new(events),
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "reachable-peer Raft catch-up could not read leader state"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "reachable-peer Raft catch-up leader-state task failed"
+            );
+            return;
+        }
+    };
+
+    let timeouts = cluster_control_plane_timeouts();
+    let fanout_options = timeouts.committed_fanout_options();
+    let mut tasks = tokio::task::JoinSet::new();
+    for target_node_id in target_node_ids {
+        let paths = paths.clone();
+        let state = state.clone();
+        let events = events.clone();
+        let runtime = runtime.clone();
+        tasks.spawn(async move {
+            let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+                DaemonClusterRpcMode::new(runtime),
+                timeouts,
+            );
+            let outcome = sinomo_core::cluster::replicate_cluster_kv_to_node_async_with_host(
+                &paths,
+                &state,
+                &target_node_id,
+                events.as_slice(),
+                timeouts,
+                fanout_options.raft_append_timeout,
+                &mut host,
+            )
+            .await?;
+            if !outcome.response.accepted {
+                return Ok::<_, sinomo_core::network::NetworkError>(None);
+            }
+            if outcome.watch_event_fanout_needed {
+                for event_batch in
+                    sinomo_core::kv::cluster_kv_watch_event_fanout_batches(events.as_slice())
+                {
+                    let request = ClusterKvWatchEventsRequest {
+                        state: state.clone(),
+                        leader_id: state.local_node_id.clone(),
+                        events: event_batch.to_vec(),
+                    };
+                    let response = sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost::send_cluster_kv_watch_events_to_node_async(
+                        &mut host,
+                        &state,
+                        &target_node_id,
+                        &request,
+                        fanout_options.watch_event_timeout,
+                    )
+                    .await;
+                    if !response.is_ok_and(|response| response.accepted) {
+                        break;
+                    }
+                }
+            }
+            let match_index = outcome.response.append.match_index;
+            Ok(Some(sinomo_core::kv::ClusterKvRaftPeerProgress {
+                peer_node_id: target_node_id,
+                term: outcome.response.append.term,
+                next_index: match_index.saturating_add(1),
+                match_index,
+                last_accepted_index: match_index,
+                observed_at: OffsetDateTime::now_utc(),
+            }))
+        });
+    }
+
+    let mut progress = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(Some(hint))) => progress.push(hint),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "reachable-peer Raft catch-up did not complete"
+            ),
+            Err(error) => tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "reachable-peer Raft catch-up task failed"
+            ),
+        }
+    }
+    if progress.is_empty() {
+        return;
+    }
+    let kv_paths = paths.kv_paths();
+    match runtime
+        .spawn_blocking(move || {
+            sinomo_core::kv::record_cluster_kv_raft_peer_progress_batch(&kv_paths, progress)
+        })
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "sinomo.cluster.raft_catch_up",
+            %error,
+            "reachable-peer Raft catch-up could not persist peer progress"
+        ),
+        Err(error) => tracing::warn!(
+            target: "sinomo.cluster.raft_catch_up",
+            %error,
+            "reachable-peer Raft catch-up progress task failed"
+        ),
+    }
+}
+
 fn merge_probe_records_with_unsuperseded_bootstrap_connectivity(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -4079,6 +5029,65 @@ fn connectivity_record_target_endpoint_key(record: &ClusterConnectivityRecord) -
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterConnectivityProbeInputEndpoint {
+    endpoint_id: Id,
+    node_id: NodeId,
+    transport: ClusterTransportKind,
+    address: String,
+    source: ClusterEndpointSource,
+    privacy: ClusterEndpointPrivacy,
+    priority: u16,
+}
+
+fn cluster_connectivity_probe_input_projection(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterConnectivityProbeInputEndpoint>, sinomo_core::network::NetworkError> {
+    ClusterEndpointSelector::new(paths, state)
+        .try_select(ClusterEndpointSelectionPurpose::NetworkProbe)
+        .map(|endpoints| {
+            endpoints
+                .into_iter()
+                .map(|endpoint| ClusterConnectivityProbeInputEndpoint {
+                    endpoint_id: endpoint.endpoint_id,
+                    node_id: endpoint.node_id,
+                    transport: endpoint.transport,
+                    address: endpoint.address,
+                    source: endpoint.source,
+                    privacy: endpoint.privacy,
+                    priority: endpoint.priority,
+                })
+                .collect()
+        })
+}
+
+fn cluster_connectivity_pending_topology_is_current(
+    paths: &ClusterPaths,
+    expected: &ClusterBootstrapState,
+    current: &ClusterBootstrapState,
+) -> bool {
+    expected.cluster_id == current.cluster_id
+        && expected.local_node_id == current.local_node_id
+        && cluster_connectivity_probe_input_projection(paths, expected).is_ok_and(|expected| {
+            cluster_connectivity_probe_input_projection(paths, current)
+                .is_ok_and(|current| current == expected)
+        })
+}
+
+fn cluster_connectivity_probe_inputs_still_current(
+    retained: &ClusterConnectivityPendingPublish,
+) -> bool {
+    let Ok(current_state) = sinomo_core::cluster::read_cluster_state(&retained.paths) else {
+        return false;
+    };
+    cluster_connectivity_pending_topology_is_current(
+        &retained.paths,
+        &retained.state,
+        &current_state,
+    )
+}
+
 fn connectivity_probe_result_needs_followup(
     remaining_due: usize,
     convergence_active: bool,
@@ -4106,6 +5115,13 @@ fn connectivity_probe_plan_action(
     } else {
         ClusterConnectivityProbePlanAction::None
     }
+}
+
+fn cluster_network_due_class_failure_backoff(failure_streak: u32) -> Duration {
+    let exponent = failure_streak.saturating_sub(1).min(10);
+    DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+        .saturating_mul(1_u32 << exponent)
+        .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
 }
 
 fn cluster_network_deadline_with_tail_reserve(
@@ -4151,12 +5167,207 @@ where
     }
 }
 
+fn accepted_join_connectivity_record_groups(
+    state: &ClusterBootstrapState,
+    records: Vec<ClusterConnectivityRecord>,
+    now: OffsetDateTime,
+) -> Result<BTreeMap<NodeId, Vec<ClusterConnectivityRecord>>, sinomo_core::network::NetworkError> {
+    if records.len() > sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
+        return Err(
+            sinomo_core::network::NetworkError::ClusterConnectivitySnapshotRecordLimit {
+                observed_records: records.len(),
+                max_records: sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+            },
+        );
+    }
+    let authorized_main_nodes = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_core::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut newest_by_key = BTreeMap::<
+        (NodeId, NodeId, sinomo_core::network::ClusterEndpointId),
+        ClusterConnectivityRecord,
+    >::new();
+    for record in records {
+        if record.cluster_id != state.cluster_id
+            || record.source_node_id == state.local_node_id
+            || !sinomo_core::network::cluster_network_record_live(record.expires_at, now)
+            || !authorized_main_nodes.contains(&record.source_node_id)
+            || !authorized_main_nodes.contains(&record.target_node_id)
+        {
+            continue;
+        }
+        let key = (
+            record.source_node_id.clone(),
+            record.target_node_id.clone(),
+            record.endpoint_id.clone(),
+        );
+        if newest_by_key
+            .get(&key)
+            .is_some_and(|existing| existing.observed_at > record.observed_at)
+        {
+            continue;
+        }
+        newest_by_key.insert(key, record);
+    }
+
+    let mut groups = BTreeMap::<NodeId, Vec<ClusterConnectivityRecord>>::new();
+    for record in newest_by_key.into_values() {
+        groups
+            .entry(record.source_node_id.clone())
+            .or_default()
+            .push(record);
+    }
+    for (source_node_id, records) in &groups {
+        sinomo_core::network::validate_cluster_connectivity_records_for_source(
+            source_node_id,
+            records,
+        )?;
+    }
+    Ok(groups)
+}
+
+async fn import_accepted_join_connectivity_from_future_async<F>(
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    runtime: tokio::runtime::Handle,
+    fetch: F,
+) -> Result<usize, sinomo_core::network::NetworkError>
+where
+    F: std::future::Future<Output = Result<Vec<ClusterConnectivityRecord>, String>> + Send,
+{
+    tokio::time::timeout(DAEMON_JOIN_CONNECTIVITY_HANDOFF_TIMEOUT, async move {
+        let peer_records =
+            fetch
+                .await
+                .map_err(|detail| sinomo_core::network::NetworkError::Io {
+                    operation: "cold-start join connectivity handoff".to_string(),
+                    detail,
+                })?;
+        let groups = accepted_join_connectivity_record_groups(
+            &state,
+            peer_records,
+            OffsetDateTime::now_utc(),
+        )?;
+        let imported = groups.values().map(Vec::len).sum();
+        sinomo_core::network::write_local_cluster_connectivity_record_groups_async(
+            &runtime, &paths, &groups,
+        )
+        .await?;
+        Ok(imported)
+    })
+    .await
+    .map_err(|_| sinomo_core::network::NetworkError::Io {
+        operation: "cold-start join connectivity handoff".to_string(),
+        detail: format!(
+            "accepted introducer connectivity import timed out after {}ms",
+            DAEMON_JOIN_CONNECTIVITY_HANDOFF_TIMEOUT.as_millis()
+        ),
+    })?
+}
+
+fn complete_accepted_join_connectivity_handoff_on_runtime_with_fetch<F>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    accepted_endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    fetch: F,
+) -> usize
+where
+    F: std::future::Future<Output = Result<Vec<ClusterConnectivityRecord>, String>> + Send,
+{
+    let started = Instant::now();
+    let accepted_source_node_id = accepted_endpoint.node_id.clone();
+    let result = block_on_cluster_network_future_on_owner_runtime(
+        runtime,
+        import_accepted_join_connectivity_from_future_async(
+            paths.clone(),
+            state.clone(),
+            runtime.clone(),
+            fetch,
+        ),
+    );
+    match result {
+        Ok(imported) => {
+            crate::cluster_join_trace(format_args!(
+                "connectivity handoff source={accepted_source_node_id} imported={imported} in {:?}",
+                started.elapsed()
+            ));
+            imported
+        }
+        Err(error) => {
+            crate::cluster_join_trace(format_args!(
+                "connectivity handoff source={accepted_source_node_id} deferred after {:?}: {error}",
+                started.elapsed()
+            ));
+            tracing::debug!(
+                introducer_node_id = %accepted_source_node_id,
+                %error,
+                "sinomo daemon deferred accepted introducer connectivity import to replacement maintenance"
+            );
+            0
+        }
+    }
+}
+
+fn complete_accepted_join_connectivity_handoff_on_runtime(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    accepted_endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+) -> usize {
+    let request = match ObjectRpcRequest::encode_body(
+        sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+        sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+        &(),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "sinomo daemon could not encode accepted introducer connectivity handoff request"
+            );
+            return 0;
+        }
+    };
+    let fetch_paths = paths.clone();
+    let fetch_state = state.clone();
+    let fetch_endpoint = accepted_endpoint.clone();
+    let fetch_runtime = runtime.clone();
+    let fetch = async move {
+        let (_, records) = fetch_peer_connectivity_records_from_endpoint_async(
+            fetch_paths,
+            fetch_state,
+            fetch_endpoint,
+            request,
+            fetch_runtime,
+            DAEMON_JOIN_CONNECTIVITY_HANDOFF_TIMEOUT,
+            PeerConnectivityFetchScope::FullSnapshot,
+        )
+        .await;
+        records
+    };
+    complete_accepted_join_connectivity_handoff_on_runtime_with_fetch(
+        paths,
+        state,
+        accepted_endpoint,
+        runtime,
+        fetch,
+    )
+}
+
 async fn import_peer_connectivity_records_from_reachable_endpoints_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     records: &[ClusterConnectivityRecord],
     runtime: tokio::runtime::Handle,
-    use_formation_timeouts: bool,
 ) -> usize {
     let request = match ObjectRpcRequest::encode_body(
         sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
@@ -4169,11 +5380,7 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
             return 0;
         }
     };
-    let timeouts = if use_formation_timeouts {
-        cluster_formation_control_plane_timeouts()
-    } else {
-        cluster_control_plane_timeouts()
-    };
+    let timeouts = cluster_control_plane_timeouts();
     let import_records = peer_connectivity_import_records_for_reachable_peers(
         state,
         records,
@@ -4211,7 +5418,13 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             let result = fetch_peer_connectivity_records_from_endpoint_async(
-                paths, state, endpoint, request, runtime, timeout,
+                paths,
+                state,
+                endpoint,
+                request,
+                runtime,
+                timeout,
+                PeerConnectivityFetchScope::EndpointSource,
             )
             .await;
             result
@@ -4338,6 +5551,37 @@ fn connectivity_import_timeout_for_endpoint(
     timeout.min(CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerConnectivityFetchScope {
+    EndpointSource,
+    FullSnapshot,
+}
+
+fn filter_peer_connectivity_response_records(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    records: Vec<ClusterConnectivityRecord>,
+    scope: PeerConnectivityFetchScope,
+) -> Result<Vec<ClusterConnectivityRecord>, String> {
+    if records.len() > sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
+        return Err(
+            sinomo_core::network::NetworkError::ClusterConnectivitySnapshotRecordLimit {
+                observed_records: records.len(),
+                max_records: sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+            }
+            .to_string(),
+        );
+    }
+    Ok(records
+        .into_iter()
+        .filter(|record| {
+            record.cluster_id == state.cluster_id
+                && (scope == PeerConnectivityFetchScope::FullSnapshot
+                    || record.source_node_id == endpoint.node_id)
+        })
+        .collect())
+}
+
 async fn fetch_peer_connectivity_records_from_endpoint_async(
     paths: ClusterPaths,
     state: ClusterBootstrapState,
@@ -4345,6 +5589,7 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
     request: ObjectRpcRequest,
     runtime: tokio::runtime::Handle,
     timeout: Duration,
+    scope: PeerConnectivityFetchScope,
 ) -> (
     ClusterEndpointRecord,
     Result<Vec<ClusterConnectivityRecord>, String>,
@@ -4372,17 +5617,10 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
         if let Err(error) = response.response.error_detail() {
             return Err(format!("returned error: {error}"));
         }
-        let peer_records = match response
-            .response
-            .decode_body::<Vec<ClusterConnectivityRecord>>()
-        {
-            Ok(records) => records
-                .into_iter()
-                .filter(|record| {
-                    record.cluster_id == state.cluster_id
-                        && record.source_node_id == endpoint.node_id
-                })
-                .collect::<Vec<_>>(),
+        let peer_records = match response.response.decode_body() {
+            Ok(records) => {
+                filter_peer_connectivity_response_records(&state, &endpoint, records, scope)?
+            }
             Err(error) => return Err(format!("decode failed: {error}")),
         };
         Ok(peer_records)
@@ -4666,10 +5904,14 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
         return Ok(NodeStatusPublishOutcome::default());
     }
     // Publish each record independently so the slow-changing network-info record
-    // is not rewritten on every node-status heartbeat. Node status refreshes on a
-    // ~60s margin; network info on a ~9min margin. Bundling them rewrote the KV
-    // snapshot far more often than necessary.
+    // is not rewritten on every node-status heartbeat. Liveness goes first: if a
+    // bounded caller is interrupted after one quorum commit, the daemon is still
+    // visible and the slower-changing network metadata can converge on retry.
     let mut outcome = NodeStatusPublishOutcome::default();
+    if !publish_matches.node_status_matches {
+        sync_cluster_node_status_to_kv_on_runtime(&cluster_paths, record, runtime)?;
+        outcome.node_status_published = true;
+    }
     if !publish_matches.network_info_matches {
         if let Err(error) =
             sync_cluster_network_info_to_kv_on_runtime(&cluster_paths, network_info, runtime)
@@ -4679,10 +5921,6 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
             outcome.network_info_published = true;
         }
     }
-    if !publish_matches.node_status_matches {
-        sync_cluster_node_status_to_kv_on_runtime(&cluster_paths, record, runtime)?;
-        outcome.node_status_published = true;
-    }
     Ok(outcome)
 }
 
@@ -4691,15 +5929,32 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
     runtime: tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<NodeStatusPublishOutcome, DaemonError> {
+    let operation_budget = timeouts.rpc_timeout;
     let read_paths = paths.clone();
     let read_path = read_paths.root.display().to_string();
-    let mut status = tokio::task::spawn_blocking(move || read_daemon_status(&read_paths))
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: read_path,
-            detail: format!("daemon status read task failed: {source}"),
-        })??;
-    ensure_daemon_status_cluster_async(paths, &mut status, &runtime).await?;
+    let status_result = {
+        let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+            DaemonNodeStatusPublishPhase::DaemonStatusRead,
+            operation_budget,
+        );
+        let result = tokio::task::spawn_blocking(move || read_daemon_status(&read_paths)).await;
+        phase.complete();
+        result
+    };
+    let mut status = status_result.map_err(|source| DaemonError::Io {
+        path: read_path,
+        detail: format!("daemon status read task failed: {source}"),
+    })??;
+    let ensure_result = {
+        let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+            DaemonNodeStatusPublishPhase::ClusterStatusEnsure,
+            operation_budget,
+        );
+        let result = ensure_daemon_status_cluster_async(paths, &mut status, &runtime).await;
+        phase.complete();
+        result
+    };
+    ensure_result?;
     let Some(cluster) = status.cluster.clone() else {
         return Ok(NodeStatusPublishOutcome::default());
     };
@@ -4711,15 +5966,24 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let state_paths = cluster_paths.clone();
     let state_path = state_paths.root.display().to_string();
-    let state = tokio::task::spawn_blocking(move || {
-        sinomo_core::cluster::read_cluster_state_without_kv(&state_paths)
-    })
-    .await
-    .map_err(|source| DaemonError::Io {
-        path: state_path,
-        detail: format!("cluster state read task failed: {source}"),
-    })?
-    .map_err(DaemonError::from)?;
+    let state_result = {
+        let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+            DaemonNodeStatusPublishPhase::ClusterStateRead,
+            operation_budget,
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            sinomo_core::cluster::read_cluster_state_without_kv(&state_paths)
+        })
+        .await;
+        phase.complete();
+        result
+    };
+    let state = state_result
+        .map_err(|source| DaemonError::Io {
+            path: state_path,
+            detail: format!("cluster state read task failed: {source}"),
+        })?
+        .map_err(DaemonError::from)?;
     let network_info = sinomo_core::network::build_cluster_network_info_record(
         &state,
         &cluster.node_id,
@@ -4727,12 +5991,19 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
         CLUSTER_NETWORK_INFO_TTL_SECONDS,
     );
     let rollout_path = rollout_paths.root.display().to_string();
-    let rollout_status = tokio::task::spawn_blocking(move || read_rollout_status(&rollout_paths))
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: rollout_path,
-            detail: format!("rollout status read task failed: {source}"),
-        })??;
+    let rollout_result = {
+        let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+            DaemonNodeStatusPublishPhase::RolloutStatusRead,
+            operation_budget,
+        );
+        let result = tokio::task::spawn_blocking(move || read_rollout_status(&rollout_paths)).await;
+        phase.complete();
+        result
+    };
+    let rollout_status = rollout_result.map_err(|source| DaemonError::Io {
+        path: rollout_path,
+        detail: format!("rollout status read task failed: {source}"),
+    })??;
     let record = cluster_node_status_from_daemon_status(
         &status,
         &cluster,
@@ -4743,8 +6014,12 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
         DaemonClusterRpcMode::new(runtime.clone()),
         timeouts,
     );
-    let publish_matches =
-        sinomo_core::cluster::cluster_node_presence_publish_matches_async_with_host(
+    let publish_matches = {
+        let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+            DaemonNodeStatusPublishPhase::PresenceMatch,
+            operation_budget,
+        );
+        let result = sinomo_core::cluster::cluster_node_presence_publish_matches_async_with_host(
             &runtime,
             &cluster_paths,
             &network_info,
@@ -4752,44 +6027,54 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
             &mut publish_match_host,
         )
         .await;
-    let force_node_status_publish = timeouts == cluster_formation_control_plane_timeouts();
-    if publish_matches.all_match() && !force_node_status_publish {
+        phase.complete();
+        result
+    };
+    if publish_matches.all_match() {
         return Ok(NodeStatusPublishOutcome::default());
     }
 
     let mut outcome = NodeStatusPublishOutcome::default();
+    if !publish_matches.node_status_matches {
+        let publish_result = {
+            let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+                DaemonNodeStatusPublishPhase::NodeStatusCommit,
+                operation_budget,
+            );
+            let result = sync_cluster_node_status_to_kv_async_with_timeouts(
+                &cluster_paths,
+                record,
+                runtime.clone(),
+                timeouts,
+            )
+            .await;
+            phase.complete();
+            result
+        };
+        publish_result?;
+        outcome.node_status_published = true;
+    }
     if !publish_matches.network_info_matches {
-        if let Err(error) = sync_cluster_network_info_to_kv_async_with_timeouts(
-            &cluster_paths,
-            network_info,
-            runtime.clone(),
-            timeouts,
-        )
-        .await
-        {
+        let publish_result = {
+            let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+                DaemonNodeStatusPublishPhase::NetworkInfoCommit,
+                operation_budget,
+            );
+            let result = sync_cluster_network_info_to_kv_async_with_timeouts(
+                &cluster_paths,
+                network_info,
+                runtime,
+                timeouts,
+            )
+            .await;
+            phase.complete();
+            result
+        };
+        if let Err(error) = publish_result {
             tracing::warn!("sinomo daemon network info publish failed: {error}");
         } else {
             outcome.network_info_published = true;
         }
-    }
-    if force_node_status_publish {
-        force_sync_cluster_node_status_to_kv_async_with_timeouts(
-            &cluster_paths,
-            record,
-            runtime,
-            timeouts,
-        )
-        .await?;
-        outcome.node_status_published = true;
-    } else if !publish_matches.node_status_matches {
-        sync_cluster_node_status_to_kv_async_with_timeouts(
-            &cluster_paths,
-            record,
-            runtime,
-            timeouts,
-        )
-        .await?;
-        outcome.node_status_published = true;
     }
     Ok(outcome)
 }
@@ -5254,14 +6539,23 @@ fn member_daemon_status_should_probe_routed_first(
         return false;
     }
     let graph = sinomo_core::network::ClusterConnectivityGraph::read_for_local(paths, state);
-    if !selected_endpoints.iter().all(|endpoint| {
+    let Some(route) =
+        sinomo_core::network::cluster_route_next_hop(&graph, &state.local_node_id, &member.node_id)
+    else {
+        return false;
+    };
+    // A known multi-hop path is stronger evidence than the absence of a local
+    // observation for the target's advertised socket. Prefer that route
+    // immediately instead of spending each endpoint timeout rediscovering the
+    // network segmentation. A direct route still wins unless all of its
+    // selected endpoints are explicitly unreachable.
+    if route.next_hop != member.node_id {
+        return true;
+    }
+    selected_endpoints.iter().all(|endpoint| {
         graph.state_for_endpoint(endpoint)
             == Some(&sinomo_core::network::ClusterConnectivityState::Unreachable)
-    }) {
-        return false;
-    }
-    sinomo_core::network::cluster_route_next_hop(&graph, &state.local_node_id, &member.node_id)
-        .is_some()
+    })
 }
 
 async fn probe_member_routed_ping_status_async(
@@ -5622,12 +6916,16 @@ pub(crate) fn initialize_local_cluster_on_runtime(
 
 /// Default TTL for daemon-issued cluster invites.
 const DAEMON_CLUSTER_CONTROL_INVITE_TTL_SECONDS: i64 = 24 * 60 * 60;
-/// End-to-end per-introducer budget for a daemon-mediated join attempt.
-const DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// End-to-end per-introducer Iroh budget for a daemon-mediated join attempt.
-const DAEMON_CLUSTER_CONTROL_IROH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Network phases use the common five-second transport/no-progress limit;
-/// `timeout` remains the semantic end-to-end budget for this attempt.
+/// End-to-end per-introducer budget for a daemon-mediated join attempt. A join
+/// can legitimately include authority forwarding and a quorum commit, so its
+/// semantic deadline must leave room beyond a single transport no-progress
+/// interval and the normal membership RPC budget.
+const DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Iroh joins have the same semantic work and must not inherit a test-cluster
+/// wall-clock target as their production deadline.
+const DAEMON_CLUSTER_CONTROL_IROH_JOIN_TIMEOUT: Duration = DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT;
+/// Network phases retain their independent transport/no-progress limit;
+/// `timeout` is the semantic end-to-end budget for this attempt.
 fn daemon_cluster_control_rpc_options(
     timeout: Duration,
 ) -> sinomo_core::network::ClusterObjectRpcOptions {
@@ -5704,7 +7002,11 @@ pub(crate) fn handle_daemon_cluster_control_init_on_runtime(
         OffsetDateTime::now_utc(),
         runtime,
     )?;
-    crate::control::request_daemon_cluster_maintenance_refresh();
+    // Wake identity-bound workers only so they can observe the mismatch and
+    // retire. The replacement owns maintenance for the new state.
+    crate::control::request_daemon_cluster_maintenance(
+        crate::control::DaemonClusterMaintenanceReason::LifecycleWake,
+    );
     Ok(ClusterControlInitResponse {
         cluster_id: state.cluster_id,
         node_id: state.local_node_id,
@@ -5874,7 +7176,28 @@ fn daemon_cluster_control_join_fresh_on_runtime(
         });
     }
     sinomo_core::cluster::write_cluster_state(paths, &state)?;
-    crate::control::request_daemon_cluster_maintenance_refresh();
+    // Joining replaces the daemon's authenticated cluster principal. Do not
+    // let the bounded connectivity handoff reuse a `node_local` or pending
+    // identity cached while the state file was being replaced.
+    sinomo_core::network::invalidate_cached_daemon_signing_identity(&SinomoDataDir::new(data_dir))?;
+    if let Some(accepted_endpoint) = reconciliation.accepted_endpoint.as_ref() {
+        // The command handler returns into an identity-changing restart. Import
+        // the introducer's already-observed one-hop graph before that handoff;
+        // otherwise a detached coalesced publisher can be retired with the old
+        // daemon and the replacement starts with only its own introducer edge.
+        // This fetch is independently bounded and intentionally non-fatal.
+        complete_accepted_join_connectivity_handoff_on_runtime(
+            paths,
+            &state,
+            accepted_endpoint,
+            runtime,
+        );
+    }
+    // Wake identity-bound workers so they retire against their captured
+    // startup identity instead of adopting this newly installed state.
+    crate::control::request_daemon_cluster_maintenance(
+        crate::control::DaemonClusterMaintenanceReason::LifecycleWake,
+    );
     Ok(ClusterControlJoinResponse {
         cluster_id: state.cluster_id,
         node_id: state.local_node_id,
@@ -5903,9 +7226,6 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
     timestamp: OffsetDateTime,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterControlJoinResponse, DaemonError> {
-    crate::control::request_daemon_cluster_kv_maintenance(
-        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MigrationOperation,
-    );
     // Serialize against the maintenance tick for the whole freeze -> join ->
     // import window, like the leave handler: the tick must not commit into
     // storage being moved aside (this handler runs on a blocking service
@@ -6036,9 +7356,6 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
                 imported_node_local_config_keys: kv_import.imported_node_local_config_keys.len(),
                 deferred_node_local_config_keys: kv_import.deferred_node_local_config_keys.len(),
             });
-            crate::control::request_daemon_cluster_kv_maintenance(
-                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MigrationOperation,
-            );
             Ok(response)
         }
         Err(error) => {
@@ -6052,9 +7369,6 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
                 &migration,
             );
             sinomo_core::cluster::rollback_cluster_storage_quarantine(&quarantine)?;
-            crate::control::request_daemon_cluster_kv_maintenance(
-                sinomo_core::cluster::ClusterKvMaintenanceWakeSource::MigrationOperation,
-            );
             Err(error)
         }
     }
@@ -6229,7 +7543,9 @@ pub(crate) fn handle_daemon_cluster_control_rename_with_authority_on_runtime(
         &mut host,
     )?;
     if update.changed {
-        crate::control::request_daemon_cluster_maintenance_refresh();
+        crate::control::request_daemon_cluster_maintenance(
+            crate::control::DaemonClusterMaintenanceReason::Rename,
+        );
     }
     Ok(ClusterControlRenameResponse {
         node_id: update.node_id,
@@ -6270,7 +7586,9 @@ pub(crate) fn handle_daemon_cluster_control_role_with_authority_on_runtime(
         &mut host,
     )?;
     if update.changed {
-        crate::control::request_daemon_cluster_maintenance_refresh();
+        crate::control::request_daemon_cluster_maintenance(
+            crate::control::DaemonClusterMaintenanceReason::RoleChanged,
+        );
     }
     Ok(ClusterControlRoleResponse {
         node_id: update.node_id,
@@ -6389,7 +7707,12 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
         runtime,
     ) {
         Ok(state) => {
-            crate::control::request_daemon_cluster_maintenance_refresh();
+            // Leave installs a new process identity. Wake old-identity workers
+            // so they retire; the response-triggered replacement owns the new
+            // identity's maintenance.
+            crate::control::request_daemon_cluster_maintenance(
+                crate::control::DaemonClusterMaintenanceReason::LifecycleWake,
+            );
             Ok(ClusterControlLeaveResponse {
                 previous_cluster_id,
                 new_cluster_id: state.cluster_id,
@@ -7972,49 +9295,6 @@ async fn sync_cluster_node_status_to_kv_async_with_timeouts(
     .map_err(Into::into)
 }
 
-async fn force_sync_cluster_node_status_to_kv_async_with_timeouts(
-    paths: &ClusterPaths,
-    status: ClusterNodeStatusRecord,
-    runtime: tokio::runtime::Handle,
-    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
-) -> Result<KvSnapshot, DaemonError> {
-    let state_paths = paths.clone();
-    let state_path = state_paths.root.display().to_string();
-    let mut state = runtime
-        .spawn_blocking(move || sinomo_core::cluster::read_cluster_state(&state_paths))
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: state_path,
-            detail: format!("cluster state read task failed: {source}"),
-        })?
-        .map_err(DaemonError::from)?;
-    let key = sinomo_core::node::cluster_node_status_key_for_record(&status);
-    let txn = KvTxn {
-        compares: Vec::new(),
-        success: vec![KvOp::put_serde(key, &status, None).map_err(DaemonError::from)?],
-        failure: Vec::new(),
-    };
-    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-        DaemonClusterRpcMode::new(runtime),
-        timeouts,
-    );
-    let snapshot =
-        sinomo_core::cluster::ClusterNodeStatusPublishAsyncHost::commit_cluster_kv_txn_with_quorum_async(
-            &mut host,
-            paths,
-            &mut state,
-            sinomo_core::kv::KvTxnRequest::generated(txn),
-        )
-        .await
-        .map_err(DaemonError::from)?;
-    sinomo_core::cluster::ClusterNodeStatusPublishAsyncHost::remember_published_node_status_async(
-        &mut host, paths, &status,
-    )
-    .await
-    .map_err(DaemonError::from)?;
-    Ok(snapshot)
-}
-
 #[cfg(test)]
 pub(crate) fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
@@ -8396,13 +9676,6 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
             cluster_control_plane_timeouts(),
             move || daemon_cluster_control_plane_driver_on_runtime(&host_runtime),
         );
-        // Local daemon-owned commits do not cross the RPC service boundary.
-        // Deliver their post-commit wake here so DFS, rollout, and other
-        // in-process writers receive the same reactive catch-up behavior as a
-        // client transaction.
-        crate::control::request_daemon_cluster_kv_maintenance(
-            sinomo_core::cluster::ClusterKvMaintenanceWakeSource::RaftProgress,
-        );
     } else {
         let _ = (paths, state, events);
         tracing::warn!(
@@ -8521,16 +9794,6 @@ fn cluster_control_plane_timeouts() -> sinomo_core::cluster::ClusterControlPlane
     sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
 }
 
-fn cluster_formation_control_plane_timeouts() -> sinomo_core::cluster::ClusterControlPlaneTimeouts {
-    let mut timeouts = cluster_control_plane_timeouts();
-    // Formation owns one shorter semantic operation deadline. Transport
-    // connect/idle handling and endpoint fallback stay on sinomo-network's
-    // normal 5s policy instead of being independently shortened here.
-    timeouts.raft_append_timeout = DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT;
-    timeouts.membership_rpc_timeout = DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT;
-    timeouts
-}
-
 #[cfg(test)]
 fn cluster_state_authority_reachability_options()
 -> sinomo_core::cluster::ClusterStateAuthorityReachabilityOptions {
@@ -8547,86 +9810,51 @@ fn cluster_kv_txn_quorum_options(
 mod tests {
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reactive_maintenance_uses_daemon_status_and_endpoint_reconciliation_hooks() {
-        let root = unique_cluster_test_root("sinomo-daemon-reactive-publication-hooks");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data dir");
-        let daemon_paths = DaemonPaths::new(&data_dir);
-        daemon_paths.ensure().expect("daemon paths");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let state = initialize_local_cluster_on_runtime(
-            &cluster_paths,
-            Some(
-                ClusterId::from_legacy_named("cluster_daemon_reactive_publication_hooks")
-                    .expect("cluster"),
-            ),
-            Some(
-                NodeId::from_legacy_named("node_daemon_reactive_publication_hooks").expect("node"),
-            ),
-            "reactive publication hooks".to_string(),
-            "reactive publication hooks".to_string(),
-            ClusterNodeRole::default(),
-            OffsetDateTime::now_utc(),
-            &tokio::runtime::Handle::current(),
-        )
-        .expect("initialize cluster");
-        let cluster = daemon_cluster_status(&state, crate::DaemonClusterProcess::Main)
-            .expect("daemon cluster status");
-        write_daemon_status(
-            &daemon_paths,
-            &crate::DaemonStatus::new(&DaemonRunOptions::default(), &daemon_paths, Some(cluster)),
-        )
-        .expect("write daemon status");
-
-        let mut maintenance =
-            ClusterNetworkMaintenance::with_idle_stats(Arc::new(IdleStatsAtomics::new())).await;
-        let report = maintenance
-            .run_reactive_cluster_kv_maintenance_async(
-                &daemon_paths,
-                sinomo_core::cluster::ClusterKvMaintenanceWakeBatch {
-                    sources: vec![
-                        sinomo_core::cluster::ClusterKvMaintenanceWakeSource::DaemonStartup,
-                    ],
-                    coalesced_wake_count: 1,
-                    saturated_wake_count: 0,
-                },
-                tokio::runtime::Handle::current(),
-            )
-            .await
-            .expect("reactive maintenance")
-            .expect("initialized cluster report");
-
-        for step in [
-            sinomo_core::cluster::ClusterKvMaintenanceStep::NodeStatusPublish,
-            sinomo_core::cluster::ClusterKvMaintenanceStep::EndpointObservationPublish,
-        ] {
-            let evidence = report
-                .evidence
-                .iter()
-                .find(|evidence| evidence.step == step)
-                .expect("publication evidence");
-            assert_eq!(
-                evidence.disposition,
-                sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::Completed,
-                "production daemon hook must reconcile {step:?}: {}",
-                evidence.detail
-            );
-            assert!(!evidence.code.ends_with("hook_unavailable"));
-        }
-        let config_recovery = report
-            .evidence
-            .iter()
-            .find(|evidence| {
-                evidence.step
-                    == sinomo_core::cluster::ClusterKvMaintenanceStep::ConfigChangeReconcile
-            })
-            .expect("config lifecycle recovery evidence");
+    #[test]
+    fn node_status_publish_observation_phase_labels_are_bounded_and_exhaustive() {
+        let phases = [
+            DaemonNodeStatusPublishPhase::DaemonStatusRead,
+            DaemonNodeStatusPublishPhase::ClusterStatusEnsure,
+            DaemonNodeStatusPublishPhase::ClusterStateRead,
+            DaemonNodeStatusPublishPhase::RolloutStatusRead,
+            DaemonNodeStatusPublishPhase::PresenceMatch,
+            DaemonNodeStatusPublishPhase::NodeStatusCommit,
+            DaemonNodeStatusPublishPhase::NetworkInfoCommit,
+        ];
         assert_eq!(
-            config_recovery.disposition,
-            sinomo_core::cluster::ClusterKvMaintenanceStepDisposition::Skipped
+            phases.map(daemon_node_status_publish_phase_name),
+            [
+                "daemon_status_read",
+                "cluster_status_ensure",
+                "cluster_state_read",
+                "rollout_status_read",
+                "presence_match",
+                "node_status_commit",
+                "network_info_commit",
+            ]
         );
-        assert_eq!(config_recovery.code, "config_change_recovery_idle");
+        let labels = phases
+            .map(daemon_node_status_publish_phase_name)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(labels.len(), phases.len());
+    }
+
+    #[test]
+    fn daemon_cluster_join_uses_a_production_semantic_deadline() {
+        assert_eq!(
+            DAEMON_CLUSTER_CONTROL_IROH_JOIN_TIMEOUT, DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT,
+            "transport choice must not change the semantic join budget"
+        );
+        assert!(
+            DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT
+                > sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+            "join reconciliation can include authority forwarding and quorum admission after the initial membership RPC"
+        );
+        assert!(
+            DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT > sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            "a transport no-progress interval must not be the end-to-end join deadline"
+        );
     }
 
     #[test]
@@ -9019,6 +10247,38 @@ mod tests {
         runtime.block_on(maintenance.tick_async(paths, options, runtime.handle().clone()))
     }
 
+    fn cluster_network_scheduler_maintenance_for_test(now: Instant) -> ClusterNetworkMaintenance {
+        ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: BTreeMap::new(),
+            connectivity_cursor: 0,
+            connectivity_converged: true,
+            environment_id: None,
+            local_node_role: ClusterNodeRole::Workstation,
+            solo_cluster_idle: false,
+            startup_settle_until: None,
+            tick: 0,
+            publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            connectivity_publish_failure_streak: 0,
+            connectivity_publish_retry_at: None,
+            connectivity_force_probe: false,
+            last_publish: now,
+            last_discovery: now,
+            last_probe: now,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+            service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
+        }
+    }
+
     fn pending_join_state_for_test(
         paths: &ClusterPaths,
         cluster_id: ClusterId,
@@ -9061,6 +10321,39 @@ mod tests {
         assert!(!cache.contains_key("a"));
         assert_eq!(cache.get("b"), Some(&2));
         assert_eq!(cache.get("c"), Some(&3));
+    }
+
+    #[test]
+    fn join_connectivity_publish_coalescer_does_not_strand_late_observations() {
+        let root = unique_cluster_test_root("join-connectivity-publish-coalescer");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        let node_id =
+            NodeId::from_legacy_named("node_join_connectivity_publish_coalescer").expect("node id");
+        let source_key = mark_join_connectivity_sync_in_flight(&paths, &node_id)
+            .expect("first observation starts publisher");
+        let first_generation =
+            join_connectivity_sync_generation(&source_key).expect("first generation");
+
+        assert!(
+            mark_join_connectivity_sync_in_flight(&paths, &node_id).is_none(),
+            "a concurrent observation must coalesce into the active publisher"
+        );
+        assert!(
+            !finish_join_connectivity_sync_generation(&source_key, first_generation),
+            "the publisher must not retire a source after a newer observation"
+        );
+        let second_generation =
+            join_connectivity_sync_generation(&source_key).expect("newer generation");
+        assert!(second_generation > first_generation);
+        assert!(finish_join_connectivity_sync_generation(
+            &source_key,
+            second_generation
+        ));
+        assert!(
+            mark_join_connectivity_sync_in_flight(&paths, &node_id).is_some(),
+            "a fully drained source must allow a new publisher"
+        );
+        clear_join_connectivity_sync_in_flight(&source_key);
     }
 
     struct CachedHitPublishHost {
@@ -9217,6 +10510,369 @@ mod tests {
     }
 
     #[test]
+    fn generic_network_publish_tick_does_not_run_default_dfs_reconciliation() {
+        let (_root, cluster_paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("network_tick_no_default_dfs");
+        let remote = NodeId::from_legacy_named("node_network_tick_no_default_dfs_remote")
+            .expect("remote node");
+        state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                remote,
+                "remote",
+                "pk-remote",
+                OffsetDateTime::now_utc(),
+            ));
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write multi-member cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync multi-member cluster state");
+
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+        ));
+        maintenance.discovery = None;
+        maintenance.connectivity_converged = true;
+        maintenance.startup_settle_until = None;
+        maintenance.last_publish = Instant::now()
+            .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
+            .expect("due publish timestamp");
+        maintenance.last_probe = Instant::now();
+        maintenance.last_discovery = Instant::now();
+
+        assert_eq!(
+            crate::dfs::daemon_default_dfs_reconciliation_run_count(&daemon_paths),
+            0
+        );
+        run_cluster_network_maintenance_tick_for_test(
+            &mut maintenance,
+            &daemon_paths,
+            &DaemonRunOptions::default(),
+            &runtime,
+        )
+        .expect("network publish tick");
+        assert_eq!(
+            crate::dfs::daemon_default_dfs_reconciliation_run_count(&daemon_paths),
+            0,
+            "network publication owns transport state, not default DFS reconciliation"
+        );
+    }
+
+    #[test]
+    fn shadow_network_publish_ticks_do_not_append_rollout_barriers() {
+        let (_root, cluster_paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("shadow_network_tick_no_barrier");
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+        shadow_paths.ensure().expect("shadow paths");
+        let wal_path = cluster_paths
+            .kv_paths()
+            .raft_wal_paths(&state.local_node_id)
+            .wal;
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+        ));
+        maintenance.discovery = None;
+
+        for _ in 0..2 {
+            maintenance.last_publish = Instant::now()
+                .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
+                .expect("due publish timestamp");
+            let wal_len_before = std::fs::metadata(&wal_path).expect("raft WAL").len();
+
+            run_cluster_network_maintenance_tick_for_test(
+                &mut maintenance,
+                &shadow_paths,
+                &DaemonRunOptions::shadow_default(),
+                &runtime,
+            )
+            .expect("shadow network tick");
+
+            assert_eq!(
+                std::fs::metadata(&wal_path)
+                    .expect("raft WAL after shadow tick")
+                    .len(),
+                wal_len_before,
+                "a generic shadow network publication tick must not append an authoritative rollout barrier"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_desired_rollout_change_reaches_shadow_reactor() {
+        let (_root, cluster_paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("shadow_rollout_reactor_change");
+        let mut reactor =
+            DaemonDesiredRolloutReactor::new(&cluster_paths).expect("rollout reactor");
+        assert_eq!(
+            reactor
+                .pending_reconcile_work_for_test()
+                .expect("pre-catch-up work"),
+            None,
+            "startup is not complete, or consumed, before an authoritative snapshot arrives"
+        );
+
+        let desired = sinomo_core::ClusterRolloutDesiredRecord {
+            cluster_id: state.cluster_id.clone(),
+            state: "active".to_string(),
+            source: Some("test".to_string()),
+            mode: Some("cluster-remote-build".to_string()),
+            source_head: Some("abc123".to_string()),
+            source_bundle: Some(vec![1, 2, 3]),
+            force_source_overwrite: false,
+            remote_repo: None,
+            host: Some("127.0.0.1".to_string()),
+            port: Some(21_353),
+            shadow_port: Some(21_354),
+            requested_at: Some("2026-07-20T00:00:00Z".to_string()),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let snapshot =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+                .expect("current snapshot");
+        let mut store = InProcessKvStore::restore(snapshot).expect("restore snapshot");
+        store
+            .apply_command(KvCommand::Op(
+                sinomo_rollout::build_cluster_rollout_desired_put_op(&desired)
+                    .expect("desired rollout put"),
+            ))
+            .expect("apply desired rollout");
+        let authoritative = store.snapshot().expect("updated snapshot");
+        assert!(reactor.observe_authoritative_snapshot(&authoritative));
+
+        let committed = reactor
+            .pending_reconcile_work_for_test()
+            .expect("committed work")
+            .expect("desired reconciliation");
+        assert_eq!(
+            committed.desired,
+            Some(desired.clone()),
+            "the exact committed desired-key transition must reach rollout reconciliation"
+        );
+        assert_eq!(
+            reactor
+                .pending_reconcile_work_for_test()
+                .expect("unacknowledged work"),
+            Some(committed.clone()),
+            "failed reconciliation must remain pending until successful completion"
+        );
+        reactor.mark_reconciled_for_test(committed.generation);
+
+        assert!(!reactor.observe_watch_events(&[KvEvent {
+            revision: authoritative.revision.next(),
+            key: "/cluster/unrelated".to_string(),
+            kind: KvEventKind::Put { value: vec![9] },
+        }]));
+        assert_eq!(
+            reactor
+                .pending_reconcile_work_for_test()
+                .expect("stable work"),
+            None,
+            "an unrelated committed event must not retrigger rollout reconciliation"
+        );
+
+        assert!(reactor.observe_watch_events(&[KvEvent {
+            revision: KvRevision(authoritative.revision.0.saturating_add(2)),
+            key: sinomo_core::cluster_rollout_desired_key(),
+            kind: KvEventKind::Delete,
+        }]));
+        let deletion = reactor
+            .pending_reconcile_work_for_test()
+            .expect("desired deletion work")
+            .expect("deletion reconciliation");
+        assert_eq!(
+            deletion.desired, None,
+            "deleting durable rollout intent must also reach the reactor"
+        );
+    }
+
+    #[test]
+    fn desired_change_arriving_before_reconcile_completion_remains_pending() {
+        let (_root, cluster_paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("shadow_rollout_reactor_race");
+        let mut reactor =
+            DaemonDesiredRolloutReactor::new(&cluster_paths).expect("rollout reactor");
+        let desired = sinomo_core::ClusterRolloutDesiredRecord {
+            cluster_id: state.cluster_id,
+            state: "active".to_string(),
+            source: Some("first".to_string()),
+            mode: Some("cluster-remote-build".to_string()),
+            source_head: Some("abc123".to_string()),
+            source_bundle: None,
+            force_source_overwrite: false,
+            remote_repo: None,
+            host: None,
+            port: None,
+            shadow_port: None,
+            requested_at: None,
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let snapshot =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+                .expect("current snapshot");
+        let mut store = InProcessKvStore::restore(snapshot).expect("restore snapshot");
+        store
+            .apply_command(KvCommand::Op(
+                sinomo_rollout::build_cluster_rollout_desired_put_op(&desired)
+                    .expect("initial desired put"),
+            ))
+            .expect("apply initial desired");
+        let initial_snapshot = store.snapshot().expect("initial desired snapshot");
+        reactor.observe_authoritative_snapshot(&initial_snapshot);
+        let first = reactor
+            .pending_reconcile_work_for_test()
+            .expect("first work")
+            .expect("first desired");
+
+        let mut updated = desired;
+        updated.source = Some("second".to_string());
+        assert!(reactor.observe_watch_events(&[KvEvent {
+            revision: initial_snapshot.revision.next(),
+            key: sinomo_core::cluster_rollout_desired_key(),
+            kind: KvEventKind::Put {
+                value: sinomo_core::kv::encode_kv_value(&updated).expect("encode updated desired"),
+            },
+        }]));
+        reactor.mark_reconciled_for_test(first.generation);
+
+        let next = reactor
+            .pending_reconcile_work_for_test()
+            .expect("next work")
+            .expect("newer desired remains pending");
+        assert!(next.generation > first.generation);
+        assert_eq!(next.desired, Some(updated));
+    }
+
+    #[test]
+    fn rollout_watch_cancel_failure_retains_cleanup_ownership_until_retry_proves_absent() {
+        assert!(
+            DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_BUDGET
+                >= DAEMON_DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_ATTEMPT * 2
+                    + DAEMON_DESIRED_ROLLOUT_RETRY_MIN,
+            "shutdown budget must permit at least one cancellation retry"
+        );
+        let (_root, cluster_paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("shadow_rollout_cancel_retry");
+        let mut reactor =
+            DaemonDesiredRolloutReactor::new(&cluster_paths).expect("rollout reactor");
+        let watch_id = sinomo_core::kv::WatchId(41);
+        reactor.active_watch = Some(DaemonDesiredRolloutActiveWatch {
+            endpoint: daemon_loopback_endpoint(&state.local_node_id, "127.0.0.1:1".to_string(), 0),
+            registration: ClusterKvWatchRegistration {
+                watch_id,
+                prefix: sinomo_core::cluster_rollout_desired_key(),
+                next_revision: KvRevision(2),
+            },
+            authority_revision: KvRevision(1),
+            caught_up: true,
+            retiring: false,
+        });
+        reactor.watch_failure_streak = 3;
+        reactor.watch_retry_at = Instant::now().checked_add(Duration::from_secs(1));
+        reactor.mark_active_watch_retiring();
+
+        assert!(
+            reactor
+                .complete_active_watch_cancel(
+                    watch_id,
+                    Err(DaemonError::Network {
+                        address: "127.0.0.1:1".to_string(),
+                        detail: "injected cancel failure".to_string(),
+                    }),
+                )
+                .is_err()
+        );
+        let retained = reactor
+            .active_watch
+            .as_ref()
+            .expect("failed cancellation must retain the registration");
+        assert_eq!(retained.registration.watch_id, watch_id);
+        assert!(retained.retiring);
+        assert_eq!(reactor.watch_failure_streak, 3);
+
+        reactor
+            .complete_active_watch_cancel(
+                watch_id,
+                Ok(sinomo_core::kv::ClusterKvWatchCancelResponse {
+                    watch_id,
+                    // A false response proves a prior attempt already removed
+                    // the durable registration, which is equally terminal.
+                    cancelled: false,
+                }),
+            )
+            .expect("retry proves watch absent");
+        assert!(reactor.active_watch.is_none());
+        assert_eq!(reactor.watch_failure_streak, 0);
+        assert_eq!(reactor.watch_retry_at, None);
+    }
+
+    #[test]
+    fn join_connectivity_publisher_commits_local_source_set_to_quorum() {
+        let (_root, paths, mut state) = seeded_single_node_cluster_for_publish_cache_test(
+            "join_connectivity_publisher_commits_quorum",
+        );
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &state.local_node_id,
+            "127.0.0.1:32154".to_string(),
+            10,
+        );
+        state.members[0].endpoints.push(endpoint.clone());
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write endpoint state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync endpoint state to raft");
+        let runtime = daemon_cluster_test_runtime();
+
+        remember_successful_join_endpoint_connectivity(&paths, &state, &endpoint, runtime.handle());
+        let record = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &paths,
+            &state.local_node_id,
+        )
+        .expect("read local join observation")
+        .into_iter()
+        .find(|record| record.endpoint_id == endpoint.endpoint_id)
+        .expect("join observation");
+        let key = sinomo_core::cluster::cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        let source_key = connectivity_cache_source_key(&paths, &state.local_node_id);
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshot =
+                        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths)
+                            .expect("read published snapshot");
+                    if snapshot.get(&key).is_some()
+                        && join_connectivity_sync_generation(&source_key).is_none()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("join connectivity publisher must finish");
+        });
+
+        let snapshot = sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths)
+            .expect("published connectivity snapshot");
+        assert!(
+            snapshot.get(&key).is_some(),
+            "accepted response-path connectivity must cross quorum"
+        );
+    }
+
+    #[test]
     fn node_status_publish_cache_hit_does_not_mask_missing_kv_row() {
         let (_root, paths, state) =
             seeded_single_node_cluster_for_publish_cache_test("publish_cache_status_keepup");
@@ -9344,7 +11000,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_async_noop_publish_commits_barrier_and_warms_cache() {
+    fn connectivity_async_noop_publish_is_read_only_and_warms_cache() {
         let (_root, paths, mut state) =
             seeded_single_node_cluster_for_publish_cache_test("publish_cache_connectivity_noop");
         let now = OffsetDateTime::now_utc();
@@ -9382,9 +11038,29 @@ mod tests {
             vec![record.clone()],
         )
         .expect("seed connectivity in kv");
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            std::slice::from_ref(&record),
+        )
+        .expect("seed local connectivity source generation");
         let seeded = sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths)
             .expect("seeded connectivity snapshot");
+        let content_generation =
+            sinomo_core::network::__connectivity_store::local_cluster_connectivity_content_generation(
+                &paths,
+            );
         let source_node_id = state.local_node_id.clone();
+        let mut first_refresh = record.clone();
+        first_refresh.latency_ms = Some(777);
+        first_refresh.observed_at += time::Duration::seconds(1);
+        first_refresh.expires_at += time::Duration::seconds(1);
+        first_refresh.last_success_at = Some(
+            first_refresh
+                .observed_at
+                .format(&Rfc3339)
+                .expect("first refresh timestamp"),
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9397,22 +11073,56 @@ mod tests {
                     runtime.handle(),
                     &paths,
                     &source_node_id,
-                    vec![record.clone()],
+                    vec![first_refresh.clone()],
                     state.clone(),
                     &mut host,
                 ),
             )
             .expect("first no-op publish");
 
-        assert_eq!(
-            first.as_ref().map(|snapshot| snapshot.revision),
-            Some(seeded.revision),
-            "the quorum barrier must not advance the semantic KV revision"
+        assert!(
+            first.is_none(),
+            "an unchanged source-owned publication is terminal"
         );
-        assert_eq!(host.commits, 1, "a semantic no-op still crosses quorum");
+        assert_eq!(
+            host.commits, 0,
+            "an unchanged publication must not manufacture a barrier transaction"
+        );
+        assert_eq!(
+            host.store.try_snapshot().expect("host snapshot").revision,
+            seeded.revision,
+            "the read-only publication must leave the authoritative revision unchanged"
+        );
         assert_eq!(
             host.remembered_connectivity, 1,
             "verified no-op must warm the process publish cache"
+        );
+        assert_eq!(
+            sinomo_core::network::__connectivity_store::local_cluster_connectivity_content_generation(
+                &paths,
+            ),
+            content_generation,
+            "the first repeated healthy generation must not advance local content"
+        );
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &source_node_id,
+            )
+            .expect("read source after first no-op"),
+            vec![record.clone()],
+            "the local source projection must retain the published evidence"
+        );
+
+        let mut second_refresh = first_refresh;
+        second_refresh.latency_ms = Some(1_500);
+        second_refresh.observed_at += time::Duration::seconds(1);
+        second_refresh.expires_at += time::Duration::seconds(1);
+        second_refresh.last_success_at = Some(
+            second_refresh
+                .observed_at
+                .format(&Rfc3339)
+                .expect("second refresh timestamp"),
         );
 
         let second = runtime
@@ -9421,24 +11131,39 @@ mod tests {
                     runtime.handle(),
                     &paths,
                     &source_node_id,
-                    vec![record],
+                    vec![second_refresh],
                     state,
                     &mut host,
                 ),
             )
             .expect("cached no-op publish");
 
-        assert_eq!(
-            second.as_ref().map(|snapshot| snapshot.revision),
-            Some(seeded.revision)
+        assert!(
+            second.is_none(),
+            "a cached unchanged publish remains terminal"
         );
         assert_eq!(
-            host.commits, 2,
-            "each successful publication needs fresh quorum evidence"
+            host.commits, 0,
+            "cache refresh must remain derived from source state, not a Raft write"
         );
         assert_eq!(
             host.remembered_connectivity, 2,
             "each verified no-op refreshes the process cache from committed state"
+        );
+        assert_eq!(
+            sinomo_core::network::__connectivity_store::local_cluster_connectivity_content_generation(
+                &paths,
+            ),
+            content_generation,
+            "repeated timestamp/latency-only evidence must stay quiet"
+        );
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &source_node_id,
+            )
+            .expect("read source after repeated no-op"),
+            vec![record]
         );
     }
 
@@ -10156,87 +11881,1044 @@ mod tests {
     }
 
     #[test]
-    fn kv_snapshot_pull_backoff_is_independent_from_other_publish_success() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
-            Arc::new(IdleStatsAtomics::new()),
-        ));
+    fn due_class_claim_failure_advances_once_and_backs_off_monotonically() {
+        let first_claimed_at = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(first_claimed_at);
 
-        maintenance.record_kv_snapshot_pull_failure();
-        assert_eq!(maintenance.kv_snapshot_pull_failure_streak, 1);
+        maintenance.claim_due_classes(first_claimed_at, true, true, true, false);
+        assert_eq!(maintenance.last_publish, first_claimed_at);
+        assert_eq!(maintenance.last_probe, first_claimed_at);
+        assert_eq!(maintenance.last_discovery, first_claimed_at);
+        maintenance.record_active_tick_plan_failure(first_claimed_at);
+
+        assert_eq!(maintenance.publish_failure_streak, 1);
+        assert_eq!(maintenance.probe_failure_streak, 1);
+        assert_eq!(maintenance.discovery_failure_streak, 1);
         assert_eq!(
-            maintenance.kv_snapshot_pull_failure_backoff(),
-            DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF
-        );
-        assert!(
-            maintenance
-                .kv_snapshot_pull_retry_due_duration(Instant::now())
-                .is_some_and(|due| {
-                    due <= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF
-                })
+            maintenance.next_due_duration(first_claimed_at),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF,
+            "a failed claimed generation must not collapse into the outer loop's minimum sleep"
         );
 
-        maintenance.publish_failure_streak = 3;
-        maintenance.record_publish_success();
-        assert_eq!(maintenance.publish_failure_streak, 0);
-        assert_eq!(
-            maintenance.kv_snapshot_pull_failure_streak, 1,
-            "an unrelated successful publish must not reset snapshot retry state"
-        );
+        let second_claimed_at = first_claimed_at
+            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF)
+            .expect("second claim");
+        maintenance.claim_due_classes(second_claimed_at, true, true, true, false);
+        maintenance.record_active_tick_plan_failure(second_claimed_at);
 
-        maintenance.record_kv_snapshot_pull_failure();
-        assert_eq!(maintenance.kv_snapshot_pull_failure_streak, 2);
+        assert_eq!(maintenance.publish_failure_streak, 2);
+        assert_eq!(maintenance.probe_failure_streak, 2);
+        assert_eq!(maintenance.discovery_failure_streak, 2);
         assert_eq!(
-            maintenance.kv_snapshot_pull_failure_backoff(),
-            DAEMON_CLUSTER_KV_SNAPSHOT_PULL_FAILURE_INITIAL_BACKOFF * 2
-        );
-
-        maintenance.publish_failure_streak = 3;
-        maintenance.record_kv_snapshot_pull_success();
-        assert_eq!(maintenance.kv_snapshot_pull_failure_streak, 0);
-        assert_eq!(
-            maintenance.publish_failure_streak, 3,
-            "a successful snapshot pull must not reset unrelated publish retry state"
-        );
-        assert!(
-            maintenance
-                .kv_snapshot_pull_retry_due_duration(Instant::now())
-                .is_none(),
-            "a successful pull or force-sync publish must clear snapshot retry state"
+            maintenance.next_due_duration(second_claimed_at),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF * 2,
+            "consecutive failed generations must retain exponential backoff ownership"
         );
     }
 
     #[test]
-    fn formation_timeouts_preserve_network_transport_policy() {
-        let timeouts = cluster_formation_control_plane_timeouts();
-        let defaults = cluster_control_plane_timeouts();
+    fn tick_decode_failure_leaves_claimed_classes_for_one_scoped_backoff() {
+        let runtime = daemon_cluster_test_runtime();
+        let root = unique_cluster_test_root("sinomo-daemon-claimed-tick-decode-failure");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        std::fs::write(&cluster_paths.state, b"not-a-cluster-state")
+            .expect("write invalid cluster state");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.last_publish = now
+            .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
+            .expect("due publish");
+        maintenance.last_probe = now
+            .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
+            .expect("due probe");
 
-        assert_eq!(timeouts.rpc_timeout, defaults.rpc_timeout);
-        assert_eq!(timeouts.tcp_command_timeout, defaults.tcp_command_timeout);
-        assert_eq!(timeouts.iroh_command_timeout, defaults.iroh_command_timeout);
+        let result = runtime.block_on(maintenance.tick_async(
+            &daemon_paths,
+            &DaemonRunOptions::default(),
+            runtime.handle().clone(),
+        ));
+        assert!(
+            result.is_err(),
+            "invalid authoritative state must fail planning"
+        );
+
+        assert!(maintenance.active_due_claims.publish);
+        assert!(maintenance.active_due_claims.probe);
+        assert!(!maintenance.active_due_claims.discovery);
+        let failure_observed_at = Instant::now();
+        maintenance.record_active_tick_plan_failure(failure_observed_at);
+        assert!(maintenance.active_due_claims.is_empty());
+        assert_eq!(maintenance.publish_failure_streak, 1);
+        assert_eq!(maintenance.probe_failure_streak, 1);
+        assert!(
+            maintenance.next_due_duration(failure_observed_at)
+                >= DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF,
+            "decode failure must not leave a due timestamp that spins the daemon loop"
+        );
+    }
+
+    #[test]
+    fn claimed_publish_failure_preserves_unrelated_due_class_state() {
+        let now = Instant::now();
+        let retry_at = now.checked_add(Duration::from_secs(30)).expect("retry");
+        let startup_settle_until = now.checked_add(Duration::from_secs(45));
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.publish_failure_streak = 3;
+        maintenance.probe_failure_streak = 4;
+        maintenance.discovery_failure_streak = 5;
+        maintenance.probe_retry_at = Some(retry_at);
+        maintenance.discovery_retry_at = Some(retry_at);
+        maintenance.connectivity_publish_failure_streak = 6;
+        maintenance.connectivity_publish_retry_at = Some(retry_at);
+        maintenance.connectivity_force_probe = true;
+        maintenance.startup_settle_until = startup_settle_until;
+        let last_probe = maintenance.last_probe;
+        let last_discovery = maintenance.last_discovery;
+
+        maintenance.claim_due_classes(now, true, false, false, false);
+        maintenance.record_active_tick_plan_failure(now);
+
+        assert_eq!(maintenance.publish_failure_streak, 4);
+        assert_eq!(maintenance.probe_failure_streak, 4);
+        assert_eq!(maintenance.discovery_failure_streak, 5);
+        assert_eq!(maintenance.probe_retry_at, Some(retry_at));
+        assert_eq!(maintenance.discovery_retry_at, Some(retry_at));
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 6);
+        assert_eq!(maintenance.connectivity_publish_retry_at, Some(retry_at));
+        assert!(maintenance.connectivity_force_probe);
+        assert_eq!(maintenance.startup_settle_until, startup_settle_until);
+        assert_eq!(maintenance.last_probe, last_probe);
+        assert_eq!(maintenance.last_discovery, last_discovery);
+    }
+
+    #[test]
+    fn completed_discovery_claim_is_not_backed_off_by_later_plan_failure() {
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.discovery_failure_streak = 3;
+        maintenance.claim_due_classes(now, true, true, true, false);
+
+        maintenance.complete_discovery_claim();
+        maintenance.record_active_tick_plan_failure(now);
+
+        assert_eq!(maintenance.publish_failure_streak, 1);
+        assert_eq!(maintenance.probe_failure_streak, 1);
         assert_eq!(
-            timeouts.tcp_foreground_attempt_timeout,
-            defaults.tcp_foreground_attempt_timeout
+            maintenance.discovery_failure_streak, 0,
+            "completion terminalizes discovery before unrelated publish/probe awaits"
+        );
+        assert_eq!(maintenance.discovery_retry_at, None);
+    }
+
+    #[test]
+    fn connectivity_publication_claim_failure_preserves_probe_backoff() {
+        let now = Instant::now();
+        let probe_retry_at = now
+            .checked_add(Duration::from_secs(30))
+            .expect("probe retry");
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.probe_failure_streak = 4;
+        maintenance.probe_retry_at = Some(probe_retry_at);
+        maintenance.connectivity_publish_failure_streak = 2;
+        maintenance.connectivity_publish_retry_at = Some(now);
+
+        maintenance.claim_due_classes(now, false, false, false, true);
+        maintenance.record_active_tick_plan_failure(now);
+
+        let connectivity_delay = DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF * 4;
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 3);
+        assert_eq!(
+            maintenance.connectivity_publish_retry_at,
+            now.checked_add(connectivity_delay)
+        );
+        assert_eq!(maintenance.probe_failure_streak, 4);
+        assert_eq!(maintenance.probe_retry_at, Some(probe_retry_at));
+        assert_eq!(
+            maintenance.next_due_duration(now),
+            connectivity_delay,
+            "the exact connectivity deadline must not wait for unrelated probe backoff"
+        );
+    }
+
+    #[test]
+    fn expired_pending_batch_counts_one_failure_for_its_publish_generation() {
+        let runtime = daemon_cluster_test_runtime();
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.publish_failure_streak = 2;
+        maintenance.probe_failure_streak = 4;
+        maintenance.discovery_failure_streak = 5;
+        let paths = DaemonPaths::with_root(
+            unique_cluster_test_root("sinomo-daemon-expired-publish-batch").join("daemon"),
+        );
+        let pending = ClusterNetworkMaintenancePendingWork {
+            publish_claimed: true,
+            node_status_refreshes: vec![
+                ClusterNodeStatusPendingRefresh {
+                    paths: paths.clone(),
+                    label: "first",
+                },
+                ClusterNodeStatusPendingRefresh {
+                    paths: paths.clone(),
+                    label: "second",
+                },
+                ClusterNodeStatusPendingRefresh {
+                    paths,
+                    label: "third",
+                },
+            ],
+            ..Default::default()
+        };
+        let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+
+        runtime.block_on(maintenance.run_pending_work_until_async(
+            pending,
+            runtime.handle().clone(),
+            expired,
+        ));
+
+        assert_eq!(
+            maintenance.publish_failure_streak, 3,
+            "every queued item belongs to one claimed publish generation"
+        );
+        assert_eq!(maintenance.probe_failure_streak, 4);
+        assert_eq!(maintenance.discovery_failure_streak, 5);
+    }
+
+    #[test]
+    fn connectivity_publication_cancellation_retains_exact_warmed_relay_generation() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, cluster_paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("connectivity_retry_owner");
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_connectivity_retry_owner_remote").expect("remote");
+        let endpoint =
+            test_network_module_relay_endpoint(&remote_node, "connectivity_retry_owner_remote_key");
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write two-node state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync two-node state");
+        let mut record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(
+                observed_now
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        // Exercise a warmed relayed route close enough to expiry that
+        // stable-record publication must not be skipped as a cache hit.
+        record.expires_at = observed_now + time::Duration::seconds(30);
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &cluster_paths,
+            &state.local_node_id,
+            std::slice::from_ref(&record),
+        )
+        .expect("persist source generation");
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.probe_failure_streak = 4;
+        let probe_retry_at = now
+            .checked_add(Duration::from_secs(30))
+            .expect("probe retry");
+        maintenance.probe_retry_at = Some(probe_retry_at);
+        maintenance.connectivity_publish_failure_streak = 2;
+        let pending = ClusterNetworkMaintenancePendingWork {
+            connectivity_publish_claimed: true,
+            connectivity_publish: Some(ClusterConnectivityPendingPublish {
+                paths: cluster_paths.clone(),
+                source_node_id: state.local_node_id.clone(),
+                state: state.clone(),
+                records: None,
+                input_generation: maintenance.connectivity_input_generation,
+                local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&cluster_paths)
+                    .expect("capture local connectivity store"),
+            }),
+            ..Default::default()
+        };
+        let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+
+        runtime.block_on(maintenance.run_pending_work_until_async(
+            pending,
+            runtime.handle().clone(),
+            expired,
+        ));
+
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 3);
+        assert!(maintenance.connectivity_publish_retry_at.is_some());
+        let retained = maintenance
+            .retained_connectivity_publish
+            .as_ref()
+            .expect("cancelled publication retains exact generation");
+        assert_eq!(
+            retained.records.as_ref().map(|records| records.as_slice()),
+            Some(std::slice::from_ref(&record)),
+            "the cancelable remote phase must not lose or reconstruct the committed source set"
         );
         assert_eq!(
-            timeouts.public_foreground_attempt_timeout,
-            defaults.public_foreground_attempt_timeout
+            maintenance.probe_failure_streak, 4,
+            "retained-record publication has an exact retry owner and must not also charge probe backoff"
+        );
+        assert_eq!(maintenance.probe_retry_at, Some(probe_retry_at));
+
+        let warmed_retry = maintenance
+            .plan_connectivity_publish(&cluster_paths, &state)
+            .expect("plan warmed connectivity retry");
+        assert_eq!(
+            warmed_retry
+                .records
+                .as_ref()
+                .map(|records| records.as_slice()),
+            Some(std::slice::from_ref(&record)),
+            "an unchanged durable generation should retry without a cold re-probe or lossy rebuild"
+        );
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_publish_claimed: true,
+                connectivity_publish: Some(warmed_retry),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert!(maintenance.retained_connectivity_publish.is_none());
+        assert!(
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&cluster_paths)
+                .expect("read warmed KV graph")
+                .iter()
+                .any(|published| {
+                    published.source_node_id == state.local_node_id
+                        && published.target_node_id == remote_node
+                        && published.endpoint_id == endpoint.endpoint_id
+                }),
+            "the idempotent warmed retry must publish the still-live near-expiry record"
+        );
+    }
+
+    #[test]
+    fn connectivity_publication_success_cannot_retire_newer_reactive_or_durable_inputs() {
+        let (_root, paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("connectivity_input_fence");
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.connectivity_converged = true;
+        maintenance.retained_connectivity_publish = Some(ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: state.local_node_id.clone(),
+            state: state.clone(),
+            records: Some(Arc::new(Vec::new())),
+            input_generation: maintenance.connectivity_input_generation,
+            local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+                .expect("capture local connectivity store"),
+        });
+
+        maintenance.request_connectivity_refresh(now);
+        maintenance.record_connectivity_publish_success();
+        assert!(!maintenance.connectivity_converged);
+        assert!(maintenance.connectivity_force_probe);
+
+        // A Raft-applied membership generation may be observed without this
+        // process being the join handler. The durable target snapshot is the
+        // second fence, so correctness never depends on receiving that wake.
+        maintenance.connectivity_force_probe = false;
+        maintenance.connectivity_converged = true;
+        let stale_input_generation = maintenance.connectivity_input_generation;
+        maintenance.retained_connectivity_publish = Some(ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: state.local_node_id.clone(),
+            state: state.clone(),
+            records: Some(Arc::new(Vec::new())),
+            input_generation: stale_input_generation,
+            local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+                .expect("capture local connectivity store"),
+        });
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_connectivity_input_fence_remote").expect("remote");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21353".to_string(),
+            10,
+        );
+        let mut current_state = state;
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            current_state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint];
+        current_state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &current_state)
+            .expect("write advanced membership");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &current_state)
+            .expect("sync advanced membership");
+
+        maintenance.record_connectivity_publish_success();
+        assert!(!maintenance.connectivity_converged);
+        assert!(maintenance.connectivity_force_probe);
+    }
+
+    #[test]
+    fn stable_command_observation_does_not_supersede_published_probe_generation() {
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("connectivity_stable_command_fence");
+        let observed_at = OffsetDateTime::now_utc();
+        let remote_node = NodeId::from_legacy_named("node_connectivity_stable_command_remote")
+            .expect("remote node");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21353".to_string(),
+            10,
+        );
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_at,
+        );
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write topology");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync topology");
+
+        let initial = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            Some(observed_at.format(&Rfc3339).expect("timestamp")),
+            None,
+            observed_at,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            std::slice::from_ref(&initial),
+        )
+        .expect("write initial probe generation");
+        let snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+            .expect("capture initial probe generation");
+        let content_generation =
+            sinomo_core::network::__connectivity_store::local_cluster_connectivity_content_generation(
+                &paths,
+            );
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.connectivity_converged = true;
+        maintenance.retained_connectivity_publish = Some(ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: state.local_node_id.clone(),
+            state: state.clone(),
+            records: Some(Arc::new(vec![initial.clone()])),
+            input_generation: maintenance.connectivity_input_generation,
+            local_connectivity_snapshot: snapshot.clone(),
+        });
+
+        let command_observation =
+            sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
+                &paths,
+                &state,
+                &endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(777),
+                true,
+            )
+            .expect("record stable command observation");
+        assert_ne!(
+            command_observation.observed_at, initial.observed_at,
+            "the command path should have produced a genuinely newer observation"
         );
         assert_eq!(
-            timeouts.iroh_foreground_attempt_timeout,
-            defaults.iroh_foreground_attempt_timeout
+            sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+                .expect("capture after stable command observation"),
+            snapshot,
+            "a timestamp/latency-only command observation must not supersede the durable probe generation"
         );
         assert_eq!(
-            timeouts.raft_append_timeout,
-            DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT
+            sinomo_core::network::__connectivity_store::local_cluster_connectivity_content_generation(
+                &paths,
+            ),
+            content_generation,
+            "stable command observations must not manufacture a content wake"
         );
         assert_eq!(
-            timeouts.membership_rpc_timeout,
-            DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id,
+            )
+            .expect("read retained source generation"),
+            vec![initial]
         );
+
+        maintenance.record_connectivity_publish_success();
+        assert!(maintenance.connectivity_converged);
+        assert!(!maintenance.connectivity_force_probe);
+        assert!(maintenance.retained_connectivity_publish.is_none());
+    }
+
+    #[test]
+    fn connectivity_latency_only_refresh_does_not_supersede_probe_inputs() {
+        let (_root, paths, mut expected_state) =
+            seeded_single_node_cluster_for_publish_cache_test("connectivity_latency_fence");
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_connectivity_latency_fence_remote").expect("remote");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21353".to_string(),
+            10,
+        );
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            expected_state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint];
+        expected_state.members.push(remote_member);
+        let mut current_state = expected_state.clone();
+        current_state.members[1].endpoints[0].last_observed_latency_ms = Some(7);
+        sinomo_core::cluster::write_cluster_state(&paths, &current_state)
+            .expect("write latency-refreshed state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &current_state)
+            .expect("sync latency-refreshed state");
+
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.connectivity_converged = true;
+        maintenance.retained_connectivity_publish = Some(ClusterConnectivityPendingPublish {
+            paths: paths.clone(),
+            source_node_id: expected_state.local_node_id.clone(),
+            state: expected_state,
+            records: Some(Arc::new(Vec::new())),
+            input_generation: maintenance.connectivity_input_generation,
+            local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+                .expect("capture local connectivity store"),
+        });
+
+        maintenance.record_connectivity_publish_success();
+
+        assert!(maintenance.connectivity_converged);
+        assert!(!maintenance.connectivity_force_probe);
+        assert!(maintenance.retained_connectivity_publish.is_none());
+    }
+
+    #[test]
+    fn stale_probe_topology_cannot_prune_new_join_observation() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, stale_state) =
+            seeded_single_node_cluster_for_publish_cache_test("stale_probe_join_edge");
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        let expected_store_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+            .expect("capture local connectivity store");
+        let plan = ClusterConnectivityProbePlan {
+            active_keys: Vec::new(),
+            entries: Vec::new(),
+            remaining_due: 0,
+            convergence_active: true,
+            force_probe: true,
+            timestamp: "stale probe".to_string(),
+            now: OffsetDateTime::now_utc(),
+            startup_settle_active: false,
+        };
+        let pending = ClusterNetworkMaintenancePendingWork {
+            probe_claimed: true,
+            connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                paths: paths.clone(),
+                source_node_id: stale_state.local_node_id.clone(),
+                state: stale_state.clone(),
+                plan,
+                input_generation: maintenance.connectivity_input_generation,
+                local_connectivity_snapshot: expected_store_snapshot,
+            }),
+            ..Default::default()
+        };
+
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_stale_probe_join_edge_remote").expect("remote");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21355".to_string(),
+            10,
+        );
+        let mut current_state = stale_state;
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            current_state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        current_state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &current_state)
+            .expect("write advanced join topology");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &current_state)
+            .expect("sync advanced join topology");
+        let join_record = sinomo_core::network::cluster_connectivity_record(
+            &current_state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_records(
+            &paths,
+            &current_state.local_node_id,
+            std::slice::from_ref(&join_record),
+        )
+        .expect("commit newer join observation");
+
+        runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
+
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &current_state.local_node_id,
+            )
+            .expect("read preserved join observation"),
+            vec![join_record]
+        );
+        assert!(maintenance.connectivity_force_probe);
+        assert_eq!(maintenance.probe_failure_streak, 0);
+    }
+
+    #[test]
+    fn stale_empty_cached_publish_cannot_clear_concurrent_source_generation() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("stale_empty_publish");
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_stale_empty_publish_remote").expect("remote");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21356".to_string(),
+            10,
+        );
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write topology");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync topology");
+        let expected_store_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+            .expect("capture local connectivity store");
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        let pending = ClusterNetworkMaintenancePendingWork {
+            connectivity_publish_claimed: true,
+            connectivity_publish: Some(ClusterConnectivityPendingPublish {
+                paths: paths.clone(),
+                source_node_id: state.local_node_id.clone(),
+                state: state.clone(),
+                records: Some(Arc::new(Vec::new())),
+                input_generation: maintenance.connectivity_input_generation,
+                local_connectivity_snapshot: expected_store_snapshot,
+            }),
+            ..Default::default()
+        };
+        let join_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            std::slice::from_ref(&join_record),
+        )
+        .expect("commit concurrent source generation");
+
+        runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
+
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id,
+            )
+            .expect("read preserved source generation"),
+            vec![join_record.clone()]
+        );
+        let retained = maintenance
+            .retained_connectivity_publish
+            .as_ref()
+            .expect("newer source generation owns publication retry");
+        assert_eq!(
+            retained.records.as_deref().map(Vec::as_slice),
+            Some(std::slice::from_ref(&join_record))
+        );
+        assert!(!maintenance.connectivity_force_probe);
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert!(maintenance.connectivity_publish_retry_at.is_some());
+    }
+
+    #[test]
+    fn empty_connectivity_generation_clears_stale_quorum_records() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("connectivity_empty_generation");
+        let observed_now = OffsetDateTime::now_utc();
+        let remote_node =
+            NodeId::from_legacy_named("node_connectivity_empty_generation_remote").expect("remote");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:21354".to_string(),
+            10,
+        );
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write two-node state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync two-node state");
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::cluster::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &state.local_node_id,
+            vec![record],
+        )
+        .expect("seed stale quorum connectivity");
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &[],
+        )
+        .expect("commit empty durable source generation");
+
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_publish_claimed: true,
+                connectivity_publish: Some(ClusterConnectivityPendingPublish {
+                    paths: paths.clone(),
+                    source_node_id: state.local_node_id.clone(),
+                    state: state.clone(),
+                    records: None,
+                    input_generation: maintenance.connectivity_input_generation,
+                    local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+                        .expect("capture local connectivity store"),
+                }),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+
+        assert!(maintenance.retained_connectivity_publish.is_none());
+        assert!(
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&paths)
+                .expect("read cleared KV graph")
+                .iter()
+                .all(|published| published.source_node_id != state.local_node_id),
+            "an empty exact source generation must delete stale quorum records"
+        );
+    }
+
+    #[test]
+    fn completed_probe_generation_is_durable_before_quorum_cancellation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blackhole");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking blackhole");
+        let blackhole_address = listener.local_addr().expect("blackhole address");
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blackhole = std::thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = accepted_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                        drop(stream);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if release_rx.try_recv().is_ok() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("blackhole accept failed: {error}"),
+                }
+            }
+        });
+
+        let runtime = daemon_cluster_test_runtime();
+        let root = unique_cluster_test_root("sinomo-daemon-probe-durable-before-cancel");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let observed_now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_probe_durable_before_cancel").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_probe_durable_before_cancel_local").expect("local");
+        let remote_node =
+            NodeId::from_legacy_named("node_probe_durable_before_cancel_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "probe durable before cancel",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            observed_now,
+        );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            blackhole_address.to_string(),
+            10,
+        );
+        let remote_public_key = sinomo_core::network::daemon_auth_encode_public_key(&[7_u8; 32]);
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            remote_public_key,
+            observed_now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync state");
+
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(
+                observed_now
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            None,
+            observed_now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let key = cluster_connectivity_probe_key(&local_node, &endpoint);
+        let maintenance_now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(maintenance_now);
+        maintenance.connectivity.insert(
+            key.clone(),
+            ClusterConnectivityProbeState {
+                record: record.clone(),
+            },
+        );
+        let plan = ClusterConnectivityProbePlan {
+            active_keys: vec![key],
+            entries: Vec::new(),
+            remaining_due: 0,
+            convergence_active: true,
+            force_probe: true,
+            timestamp: observed_now
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            now: observed_now,
+            startup_settle_active: false,
+        };
+        let pending = ClusterNetworkMaintenancePendingWork {
+            probe_claimed: true,
+            connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                paths: paths.clone(),
+                source_node_id: local_node.clone(),
+                state,
+                plan,
+                input_generation: maintenance.connectivity_input_generation,
+                local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths)
+                    .expect("capture local connectivity store"),
+            }),
+            ..Default::default()
+        };
+
+        runtime.block_on(maintenance.run_pending_work_until_async(
+            pending,
+            runtime.handle().clone(),
+            Instant::now() + Duration::from_millis(250),
+        ));
+        let publication_reached_remote = accepted_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let _ = release_tx.send(());
+        blackhole.join().expect("blackhole thread");
+
+        assert!(
+            publication_reached_remote,
+            "the test must cancel the quorum phase after local probe persistence"
+        );
+        assert_eq!(maintenance.probe_failure_streak, 0);
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 1);
+        assert!(maintenance.connectivity_publish_retry_at.is_some());
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &local_node,
+            )
+            .expect("read durable source generation"),
+            vec![record.clone()],
+            "a completed observation must survive cancellation of its derived quorum projection"
+        );
+        assert_eq!(
+            maintenance
+                .retained_connectivity_publish
+                .as_ref()
+                .and_then(|retained| retained.records.as_ref())
+                .map(|records| records.as_slice()),
+            Some(std::slice::from_ref(&record)),
+            "the exact durable generation must remain owned by the independent publication retry"
+        );
+    }
+
+    #[test]
+    fn timed_out_service_publish_retains_the_exact_registry_generation() {
+        let runtime = daemon_cluster_test_runtime();
+        let now = Instant::now();
+        let store = sinomo_core::service::ServiceRegistrySnapshotStore::default();
+        let snapshot = store.active_snapshot();
+        let mut maintenance =
+            cluster_network_scheduler_maintenance_for_test(now).with_service_registry(store);
+        let pending = ClusterNetworkMaintenancePendingWork {
+            publish_claimed: true,
+            service_instance_publish: Some(ClusterServiceInstancePendingPublish {
+                daemon_paths: DaemonPaths::with_root(
+                    unique_cluster_test_root("sinomo-daemon-retained-service-generation")
+                        .join("daemon"),
+                ),
+                local_node_id: NodeId::from_legacy_named("retained_service_node").expect("node id"),
+                snapshot: Arc::clone(&snapshot),
+            }),
+            ..Default::default()
+        };
+        let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+
+        runtime.block_on(maintenance.run_pending_work_until_async(
+            pending,
+            runtime.handle().clone(),
+            expired,
+        ));
+
+        let retained = maintenance
+            .retained_service_instance_publish
+            .as_ref()
+            .expect("timed-out exact generation must remain owned");
+        assert!(Arc::ptr_eq(&retained.snapshot, &snapshot));
+        assert_eq!(retained.snapshot.version(), snapshot.version());
+        assert_eq!(maintenance.publish_failure_streak, 1);
+    }
+
+    #[test]
+    fn successful_publish_generation_does_not_clear_other_class_failures() {
+        let runtime = daemon_cluster_test_runtime();
+        let now = Instant::now();
+        let retry_at = now.checked_add(Duration::from_secs(30)).expect("retry");
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.publish_failure_streak = 3;
+        maintenance.probe_failure_streak = 4;
+        maintenance.discovery_failure_streak = 5;
+        maintenance.probe_retry_at = Some(retry_at);
+        maintenance.discovery_retry_at = Some(retry_at);
+
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                publish_claimed: true,
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+
+        assert_eq!(maintenance.publish_failure_streak, 0);
+        assert_eq!(maintenance.probe_failure_streak, 4);
+        assert_eq!(maintenance.discovery_failure_streak, 5);
+        assert_eq!(maintenance.probe_retry_at, Some(retry_at));
+        assert_eq!(maintenance.discovery_retry_at, Some(retry_at));
     }
 
     fn desired_rollout_status_for_test(
@@ -10649,6 +13331,9 @@ mod tests {
             .expect("retry deadline");
         let maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: BTreeMap::new(),
@@ -10663,11 +13348,14 @@ mod tests {
             ),
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 10,
             connectivity_publish_retry_at: Some(retry_at),
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             last_publish: now,
             last_discovery: now,
             last_probe: now
@@ -10735,6 +13423,9 @@ mod tests {
         let now = Instant::now();
         let maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -10746,11 +13437,14 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -10776,6 +13470,9 @@ mod tests {
         let now = Instant::now();
         let maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -10787,11 +13484,14 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -10820,6 +13520,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -10832,11 +13535,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .expect("publish instant"),
@@ -10874,6 +13580,9 @@ mod tests {
         let now = Instant::now();
         let maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -10885,11 +13594,14 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL + Duration::from_secs(1))
@@ -10911,6 +13623,9 @@ mod tests {
         let now = Instant::now();
         let maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -10922,11 +13637,14 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now,
             last_discovery: now,
@@ -10942,10 +13660,47 @@ mod tests {
     }
 
     #[test]
+    fn successful_connectivity_convergence_terminalizes_startup_settle_schedule() {
+        let now = Instant::now();
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+        ));
+        maintenance.discovery = None;
+        maintenance.connectivity_converged = false;
+        maintenance.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
+        maintenance.last_publish = now;
+        maintenance.last_probe = now;
+        maintenance.last_discovery = now;
+
+        assert_eq!(
+            maintenance.next_due_duration(now),
+            DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
+            "active startup convergence should retain its short scheduling cadence"
+        );
+
+        maintenance.finish_connectivity_convergence();
+
+        assert!(maintenance.connectivity_converged);
+        assert_eq!(
+            maintenance.startup_settle_until, None,
+            "successful convergence must consume the startup settle deadline"
+        );
+        assert!(
+            maintenance.next_due_duration(now) > DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
+            "a completed convergence must return to the role-aware steady-state schedule"
+        );
+    }
+
+    #[test]
     fn cluster_network_maintenance_network_environment_refresh_forces_reactive_tick() {
         let now = Instant::now();
+        let retry_at = now.checked_add(Duration::from_secs(30)).expect("retry");
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -10956,12 +13711,15 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
-            publish_failure_streak: 0,
-            connectivity_publish_failure_streak: 0,
-            connectivity_publish_retry_at: None,
+            publish_failure_streak: 4,
+            probe_failure_streak: 2,
+            discovery_failure_streak: 3,
+            probe_retry_at: Some(retry_at),
+            discovery_retry_at: Some(retry_at),
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
+            connectivity_publish_failure_streak: 5,
+            connectivity_publish_retry_at: Some(retry_at),
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now,
             last_discovery: now,
@@ -10979,7 +13737,10 @@ mod tests {
 
         let due =
             sinomo_core::network::cluster_network_maintenance_due(now, &maintenance.schedule());
-        assert!(due.publish_due);
+        assert!(
+            !due.publish_due,
+            "an interface change does not invalidate member/status publication"
+        );
         assert!(due.probe_due);
         assert!(!due.discovery_due, "no discovery socket means no mDNS wake");
         assert!(
@@ -10995,6 +13756,17 @@ mod tests {
             maintenance.next_due_duration(now),
             Duration::ZERO,
             "the event-triggered maintenance tick should be due immediately"
+        );
+        assert_eq!(maintenance.publish_failure_streak, 4);
+        assert_eq!(maintenance.probe_failure_streak, 2);
+        assert_eq!(maintenance.discovery_failure_streak, 3);
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 5);
+        assert_eq!(maintenance.probe_retry_at, Some(now));
+        assert_eq!(maintenance.connectivity_publish_retry_at, Some(now));
+        assert_eq!(
+            maintenance.discovery_retry_at,
+            Some(retry_at),
+            "connectivity invalidation must not disturb discovery backoff"
         );
     }
 
@@ -11019,6 +13791,9 @@ mod tests {
         let now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -11033,14 +13808,17 @@ mod tests {
                     .expect("startup settle deadline"),
             ),
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 3,
             connectivity_publish_retry_at: Some(
                 now.checked_sub(Duration::from_millis(1))
                     .expect("expired retry deadline"),
             ),
             connectivity_force_probe: true,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -11349,6 +14127,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -11361,11 +14142,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
@@ -11406,6 +14190,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -11422,6 +14209,11 @@ mod tests {
             ),
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 3,
             connectivity_publish_retry_at: Some(
                 maintenance_now
@@ -11429,8 +14221,6 @@ mod tests {
                     .expect("expired connectivity retry deadline"),
             ),
             connectivity_force_probe: true,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -11549,6 +14339,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -11560,11 +14353,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now
@@ -11771,6 +14567,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -11782,11 +14581,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -11800,12 +14602,13 @@ mod tests {
                 source_node_id: local_node.clone(),
                 state,
                 plan,
-                use_formation_timeouts: false,
+                input_generation: maintenance.connectivity_input_generation,
+                local_connectivity_snapshot: sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&cluster_paths)
+                    .expect("capture local connectivity store"),
             }),
             node_status_refreshes: vec![ClusterNodeStatusPendingRefresh {
                 paths: daemon_paths.clone(),
                 label: "node status after stalled probe",
-                use_formation_timeouts: false,
             }],
             ..ClusterNetworkMaintenancePendingWork::default()
         };
@@ -11927,6 +14730,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -11938,11 +14744,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -12222,6 +15031,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: BTreeMap::new(),
@@ -12233,11 +15045,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -12315,44 +15130,24 @@ mod tests {
     #[test]
     fn cluster_network_pending_publish_timeouts_respect_control_plane_attempt_budget() {
         assert!(
-            cluster_network_pending_connectivity_publish_timeout(false)
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT
                 >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
             "connectivity publish must allow at least one public/manual endpoint attempt"
         );
         assert!(
-            cluster_network_pending_kv_snapshot_pull_timeout(false)
-                >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
-            "snapshot pull needs enough budget for one public endpoint attempt"
-        );
-        assert!(
-            cluster_network_pending_node_status_timeout(false)
+            CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT
                 >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
             "node-status publish needs enough budget for one public endpoint attempt"
         );
         assert!(
-            cluster_network_pending_member_publish_timeout(false)
+            CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT
                 >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
             "member publish needs enough budget for one public endpoint attempt"
-        );
-        assert!(
-            cluster_network_pending_connectivity_publish_timeout(true)
-                >= sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            "formation connectivity publish must allow one default transport attempt"
-        );
-        assert!(
-            cluster_network_pending_node_status_timeout(true)
-                >= sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            "formation node-status publish needs enough budget for one default transport attempt"
-        );
-        assert!(
-            cluster_network_pending_member_publish_timeout(true)
-                >= sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            "formation member publish needs enough budget for one default transport attempt"
         );
     }
 
     #[test]
-    fn cluster_network_maintenance_startup_settle_keeps_publish_timeouts_normal() {
+    fn cluster_network_maintenance_startup_settle_uses_shared_pending_work() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12407,6 +15202,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -12422,11 +15220,14 @@ mod tests {
             ),
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -12444,30 +15245,15 @@ mod tests {
         .expect("maintenance tick")
         .expect("startup settle tick should return pending work");
 
-        assert!(
-            pending
-                .member_publishes
-                .iter()
-                .all(|work| !work.use_formation_timeouts),
-            "routine member publishes must not inherit startup-settle formation timeouts"
-        );
-        assert!(
-            pending
-                .node_status_refreshes
-                .iter()
-                .all(|work| !work.use_formation_timeouts),
-            "routine node-status publishes must not inherit startup-settle formation timeouts"
-        );
+        assert_eq!(pending.member_publishes.len(), 1);
+        assert_eq!(pending.node_status_refreshes.len(), 1);
         assert!(
             pending.connectivity_probe.is_none(),
             "startup settling with no probeable endpoint must not construct an empty probe"
         );
         assert!(
-            pending
-                .connectivity_publish
-                .as_ref()
-                .is_some_and(|work| work.use_formation_timeouts),
-            "the retained connectivity publication keeps startup-settle behavior"
+            pending.connectivity_publish.is_some(),
+            "startup settling should retain cached connectivity publication"
         );
     }
 
@@ -12483,6 +15269,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -12494,21 +15283,24 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
             idle_stats: Arc::new(IdleStatsAtomics::new()),
         };
         let pending = ClusterNetworkMaintenancePendingWork {
+            publish_claimed: true,
             node_status_refreshes: vec![ClusterNodeStatusPendingRefresh {
                 paths: daemon_paths,
                 label: "node status",
-                use_formation_timeouts: false,
             }],
             ..Default::default()
         };
@@ -12609,6 +15401,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -12620,11 +15415,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -12654,6 +15452,20 @@ mod tests {
             statuses.iter().any(|status| status.node_id == local_node
                 && status.availability == ClusterNodeAvailability::Online),
             "pending async status refresh should publish this daemon's node status"
+        );
+
+        let repeat = ClusterNetworkMaintenancePendingWork {
+            node_status_refreshes: vec![ClusterNodeStatusPendingRefresh {
+                paths: daemon_paths,
+                label: "unchanged node status",
+            }],
+            ..Default::default()
+        };
+        runtime.block_on(maintenance.run_pending_work_async(repeat, runtime.handle().clone()));
+        assert_eq!(
+            idle_stats.snapshot().kv_publish_node_status,
+            1,
+            "an unchanged async status refresh must not force another quorum write"
         );
     }
 
@@ -12714,6 +15526,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -12725,11 +15540,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -12763,12 +15581,12 @@ mod tests {
     }
 
     #[test]
-    fn cluster_network_maintenance_retries_only_failed_snapshot_pull_work() {
+    fn cluster_network_maintenance_learner_uses_only_source_owned_publish_work() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        let root = unique_cluster_test_root("sinomo-daemon-snapshot-pull-retry");
+        let root = unique_cluster_test_root("sinomo-daemon-learner-source-publish");
         let data_root = root.join("data");
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("data dir");
@@ -12779,14 +15597,14 @@ mod tests {
 
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            ClusterId::from_legacy_named("cluster_snapshot_pull_retry").expect("cluster");
+            ClusterId::from_legacy_named("cluster_learner_source_publish").expect("cluster");
         let local_node =
-            NodeId::from_legacy_named("node_snapshot_pull_retry_local").expect("local node");
+            NodeId::from_legacy_named("node_learner_source_publish_local").expect("local node");
         let remote_node =
-            NodeId::from_legacy_named("node_snapshot_pull_retry_remote").expect("remote node");
+            NodeId::from_legacy_named("node_learner_source_publish_remote").expect("remote node");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
-            "snapshot pull retry",
+            "learner source publish",
             local_node,
             "local",
             "pk-local",
@@ -12827,11 +15645,11 @@ mod tests {
 
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
-        let stale_snapshot_pull = maintenance_now
-            .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
-            .unwrap_or(maintenance_now);
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -12843,11 +15661,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: stale_snapshot_pull,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -12863,56 +15684,20 @@ mod tests {
             &runtime,
         )
         .expect("maintenance tick")
-        .expect("snapshot pull should produce pending member publish");
+        .expect("regular cadence should produce source-owned publish work");
 
-        assert!(pending.kv_snapshot_pull.is_some());
         assert_eq!(pending.member_publishes.len(), 1);
         assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert_eq!(pending.node_status_refreshes.len(), 1);
-        assert_eq!(
-            maintenance.last_kv_snapshot_pull, stale_snapshot_pull,
-            "still-pending snapshot pulls must remain due for retry"
-        );
-
-        maintenance.record_kv_snapshot_pull_failure();
-        let retry_now = Instant::now();
-        maintenance.last_kv_snapshot_pull = retry_now
-            .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
-            .unwrap_or(retry_now);
-        maintenance.last_publish = retry_now;
-        maintenance.last_probe = retry_now;
-        maintenance.last_discovery = retry_now;
-        maintenance.connectivity_converged = true;
-
-        let retry_pending = run_cluster_network_maintenance_tick_for_test(
-            &mut maintenance,
-            &daemon_paths,
-            &DaemonRunOptions::default(),
-            &runtime,
-        )
-        .expect("snapshot retry maintenance tick")
-        .expect("due snapshot retry should produce pending work");
-
-        assert!(retry_pending.kv_snapshot_pull.is_some());
-        assert!(retry_pending.member_publishes.is_empty());
-        assert!(retry_pending.node_status_refreshes.is_empty());
-        assert!(retry_pending.low_priority_node_status_refreshes.is_empty());
-        assert!(retry_pending.connectivity_publish.is_none());
-        assert!(retry_pending.connectivity_probe.is_none());
-        assert!(retry_pending.service_instance_publish.is_none());
-        assert_eq!(
-            maintenance.last_publish, retry_now,
-            "a retry-only tick must not advance the regular publish cadence"
-        );
     }
 
     #[test]
-    fn cluster_network_maintenance_does_not_pull_snapshot_for_local_voter() {
+    fn cluster_network_maintenance_voter_uses_only_source_owned_publish_work() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        let root = unique_cluster_test_root("sinomo-daemon-voter-snapshot-pull");
+        let root = unique_cluster_test_root("sinomo-daemon-voter-source-publish");
         let data_root = root.join("data");
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("data dir");
@@ -12923,14 +15708,14 @@ mod tests {
 
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            ClusterId::from_legacy_named("cluster_voter_snapshot_pull").expect("cluster");
+            ClusterId::from_legacy_named("cluster_voter_source_publish").expect("cluster");
         let local_node =
-            NodeId::from_legacy_named("node_voter_snapshot_pull_local").expect("local node");
+            NodeId::from_legacy_named("node_voter_source_publish_local").expect("local node");
         let remote_node =
-            NodeId::from_legacy_named("node_voter_snapshot_pull_remote").expect("remote node");
+            NodeId::from_legacy_named("node_voter_source_publish_remote").expect("remote node");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
-            "voter snapshot pull",
+            "voter source publish",
             local_node,
             "local",
             "pk-local",
@@ -12966,11 +15751,11 @@ mod tests {
 
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
-        let stale_snapshot_pull = maintenance_now
-            .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
-            .unwrap_or(maintenance_now);
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -12982,11 +15767,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: stale_snapshot_pull,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -13004,17 +15792,9 @@ mod tests {
         .expect("maintenance tick")
         .expect("voter maintenance should still publish member and status records");
 
-        assert!(
-            pending.kv_snapshot_pull.is_none(),
-            "a local voter owns an authoritative snapshot and must not loop trying to fetch a remote one"
-        );
         assert_eq!(pending.member_publishes.len(), 1);
         assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert_eq!(pending.node_status_refreshes.len(), 1);
-        assert_eq!(
-            maintenance.last_kv_snapshot_pull, stale_snapshot_pull,
-            "skipping an inapplicable voter pull must not pretend a learner recovery pull occurred"
-        );
     }
 
     #[test]
@@ -13043,6 +15823,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -13059,6 +15842,11 @@ mod tests {
             ),
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 3,
             connectivity_publish_retry_at: Some(
                 maintenance_now
@@ -13066,8 +15854,6 @@ mod tests {
                     .expect("expired connectivity retry deadline"),
             ),
             connectivity_force_probe: true,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -13501,7 +16287,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_connectivity_refresh_commits_barrier_without_advancing_revision() {
+    fn stable_connectivity_refresh_is_read_only_without_advancing_revision() {
         let root = unique_cluster_test_root("sinomo-daemon-connectivity-refresh-no-append");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
@@ -13595,25 +16381,27 @@ mod tests {
             ),
             "test record should differ only by non-durable connectivity observations"
         );
-        let snapshot = sync_cluster_connectivity_records_to_kv(
+        let result = sync_cluster_connectivity_records_to_kv(
             &paths,
             &state.local_node_id,
             vec![refreshed_record],
         )
-        .expect("stable connectivity refresh should commit a barrier")
-        .expect("stable connectivity barrier snapshot");
+        .expect("stable connectivity refresh");
 
-        assert_eq!(
-            snapshot.revision, seeded_snapshot.revision,
-            "stable connectivity refreshes must not advance the cluster revision"
-        );
-        assert_eq!(snapshot.get(&key), Some(&seeded_entry));
         assert!(
+            result.is_none(),
+            "a stable source-owned refresh must not produce a transaction result"
+        );
+        let current = sinomo_core::cluster::read_cluster_kv_current_snapshot(&paths)
+            .expect("current connectivity snapshot");
+        assert_eq!(current.revision, seeded_snapshot.revision);
+        assert_eq!(current.get(&key), Some(&seeded_entry));
+        assert_eq!(
             std::fs::metadata(&wal_path)
                 .expect("wal after semantic no-effect")
-                .len()
-                > wal_len_before,
-            "stable connectivity refreshes must append quorum evidence to the Raft WAL"
+                .len(),
+            wal_len_before,
+            "stable connectivity refreshes must not append an empty Raft transaction"
         );
     }
 
@@ -14063,6 +16851,103 @@ mod tests {
     }
 
     #[test]
+    fn raft_catch_up_targets_only_peer_level_healthy_transitions() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_reachable_catch_up").expect("cluster");
+        let source =
+            NodeId::from_legacy_named("node_daemon_reachable_catch_up_source").expect("source");
+        let recovered = NodeId::from_legacy_named("node_daemon_reachable_catch_up_recovered")
+            .expect("recovered");
+        let already_healthy =
+            NodeId::from_legacy_named("node_daemon_reachable_catch_up_healthy").expect("healthy");
+        let newly_observed =
+            NodeId::from_legacy_named("node_daemon_reachable_catch_up_new").expect("new");
+        let still_degraded =
+            NodeId::from_legacy_named("node_daemon_reachable_catch_up_degraded").expect("degraded");
+        let previous = BTreeMap::from([
+            (
+                "recovered-old".to_string(),
+                ClusterConnectivityProbeState {
+                    record: doctor_connectivity_record(
+                        &cluster_id,
+                        &source,
+                        &recovered,
+                        "endpoint_daemon_reachable_catch_up_recovered_old",
+                        "192.0.2.20:21353",
+                        ClusterConnectivityState::Unreachable,
+                    ),
+                },
+            ),
+            (
+                "healthy-old".to_string(),
+                ClusterConnectivityProbeState {
+                    record: doctor_connectivity_record(
+                        &cluster_id,
+                        &source,
+                        &already_healthy,
+                        "endpoint_daemon_reachable_catch_up_healthy_old",
+                        "192.0.2.21:21353",
+                        ClusterConnectivityState::Healthy,
+                    ),
+                },
+            ),
+        ]);
+        let probed = vec![
+            (
+                "recovered-new".to_string(),
+                doctor_connectivity_record(
+                    &cluster_id,
+                    &source,
+                    &recovered,
+                    "endpoint_daemon_reachable_catch_up_recovered_new",
+                    "192.0.2.20:21353",
+                    ClusterConnectivityState::Healthy,
+                ),
+            ),
+            (
+                "healthy-new".to_string(),
+                doctor_connectivity_record(
+                    &cluster_id,
+                    &source,
+                    &already_healthy,
+                    "endpoint_daemon_reachable_catch_up_healthy_new",
+                    "192.0.2.21:21353",
+                    ClusterConnectivityState::Healthy,
+                ),
+            ),
+            (
+                "new".to_string(),
+                doctor_connectivity_record(
+                    &cluster_id,
+                    &source,
+                    &newly_observed,
+                    "endpoint_daemon_reachable_catch_up_new",
+                    "192.0.2.22:21353",
+                    ClusterConnectivityState::Healthy,
+                ),
+            ),
+            (
+                "degraded".to_string(),
+                doctor_connectivity_record(
+                    &cluster_id,
+                    &source,
+                    &still_degraded,
+                    "endpoint_daemon_reachable_catch_up_degraded",
+                    "192.0.2.23:21353",
+                    ClusterConnectivityState::Degraded,
+                ),
+            ),
+        ];
+
+        assert_eq!(
+            newly_healthy_connectivity_target_node_ids(&previous, &probed),
+            BTreeSet::from([recovered, newly_observed])
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn cluster_doctor_suppresses_unreachable_endpoint_when_target_has_healthy_route() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
@@ -14205,7 +17090,7 @@ mod tests {
     }
 
     #[test]
-    fn network_info_publish_cache_hit_does_not_mask_missing_kv_snapshot() {
+    fn network_info_noop_publish_reads_raft_when_materialized_snapshot_is_missing() {
         let (_root, paths, state) =
             seeded_single_node_cluster_for_publish_cache_test("network_info_cache");
         let now = OffsetDateTime::now_utc();
@@ -14218,24 +17103,50 @@ mod tests {
         let seeded = sync_cluster_network_info_to_kv(&paths, info.clone())
             .expect("seed network info")
             .expect("network info commit");
-        let barrier = sync_cluster_network_info_to_kv(&paths, info.clone())
-            .expect("stored match")
-            .expect("matching publish still crosses a quorum barrier");
+        assert!(
+            cached_network_info_matches(&paths, &info),
+            "the committed source value should warm the derived process cache"
+        );
+        let wal_path = paths.kv_paths().raft_wal_paths(&state.local_node_id).wal;
+        let wal_len_after_seed = std::fs::metadata(&wal_path)
+            .expect("wal after network info seed")
+            .len();
+        let unchanged =
+            sync_cluster_network_info_to_kv(&paths, info.clone()).expect("stored match");
+        assert!(
+            unchanged.is_none(),
+            "an unchanged source-owned network-info publish is terminal"
+        );
         assert_eq!(
-            barrier.revision, seeded.revision,
-            "the no-op barrier must not advance the semantic revision"
+            std::fs::metadata(&wal_path)
+                .expect("wal after unchanged network info")
+                .len(),
+            wal_len_after_seed,
+            "an unchanged publish must not append a barrier transaction"
         );
         std::fs::remove_file(&paths.kv_paths().snapshot).expect("remove snapshot");
         let recovered = sync_cluster_network_info_to_kv(&paths, info.clone())
-            .expect("Raft state remains authoritative without the materialized snapshot")
-            .expect("cache hit still establishes a quorum barrier");
-        assert_eq!(recovered.revision, seeded.revision);
+            .expect("Raft state remains authoritative without the materialized snapshot");
+        assert!(
+            recovered.is_none(),
+            "a missing materialized cache does not turn unchanged source state into a write"
+        );
         assert_eq!(
-            recovered
+            std::fs::metadata(&wal_path)
+                .expect("wal after raft-backed no-op")
+                .len(),
+            wal_len_after_seed
+        );
+        assert!(cached_network_info_matches(&paths, &info));
+        let authoritative = sinomo_core::cluster::read_cluster_kv_current_snapshot(&paths)
+            .expect("reconstruct authoritative snapshot from Raft");
+        assert_eq!(authoritative.revision, seeded.revision);
+        assert_eq!(
+            authoritative
                 .get(&cluster_network_info_key(&state.local_node_id))
                 .and_then(|entry| entry.decode::<ClusterNetworkInfoRecord>().ok()),
             Some(info),
-            "the response must come from reconstructed authoritative Raft state"
+            "authoritative Raft state must retain the source-owned record"
         );
     }
 
@@ -14410,6 +17321,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::from([(
@@ -14427,11 +17341,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -14579,7 +17496,7 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
 
-        let record = sinomo_core::network::record_local_cluster_endpoint_command_connectivity(
+        let record = sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
             &paths,
             &state,
             &endpoint,
@@ -14595,6 +17512,9 @@ mod tests {
 
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::from([(
@@ -14610,11 +17530,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: Instant::now(),
             last_publish: Instant::now(),
             last_discovery: Instant::now(),
             last_probe: Instant::now(),
@@ -14708,6 +17631,9 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::from([(
@@ -14725,11 +17651,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -15527,6 +18456,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -15539,11 +18471,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -15654,6 +18589,9 @@ mod tests {
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             service_registry: None,
+            retained_service_instance_publish: None,
+            retained_connectivity_publish: None,
+            connectivity_input_generation: 0,
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::from([(
@@ -15669,11 +18607,14 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            probe_failure_streak: 0,
+            discovery_failure_streak: 0,
+            probe_retry_at: None,
+            discovery_retry_at: None,
+            active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             connectivity_publish_failure_streak: 0,
             connectivity_publish_retry_at: None,
             connectivity_force_probe: false,
-            kv_snapshot_pull_failure_streak: 0,
-            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -16516,7 +19457,7 @@ mod tests {
     }
 
     #[test]
-    fn member_status_probe_prefers_segmented_route_over_unreachable_direct_endpoints() {
+    fn member_status_probe_prefers_known_multihop_route_over_unobserved_direct_endpoint() {
         let root = unique_cluster_test_root("sinomo-daemon-status-segmented-route-first");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -16577,17 +19518,6 @@ mod tests {
         sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync cluster state");
-        let local_to_remote = sinomo_core::network::cluster_connectivity_record(
-            &state,
-            &remote_endpoint,
-            ClusterConnectivityState::Unreachable,
-            None,
-            CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
-            None,
-            Some("different network segment".to_string()),
-            now,
-            CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
-        );
         let local_to_bridge = sinomo_core::network::cluster_connectivity_record(
             &state,
             &bridge_endpoint,
@@ -16614,7 +19544,7 @@ mod tests {
         sinomo_core::cluster::sync_cluster_connectivity_records_to_kv(
             &paths,
             &local_node,
-            vec![local_to_remote, local_to_bridge],
+            vec![local_to_bridge],
         )
         .expect("local connectivity records");
         sinomo_core::cluster::sync_cluster_connectivity_records_to_kv(
@@ -16639,10 +19569,11 @@ mod tests {
                 &remote_member,
                 &direct_endpoints,
             ),
-            "a healthy local-to-bridge-to-target path should be tried before knowingly unreachable direct endpoints"
+            "a healthy local-to-bridge-to-target path should be tried before an unobserved direct endpoint"
         );
 
         let graph = sinomo_core::network::ClusterConnectivityGraph::read_for_local(&paths, &state);
+        assert_eq!(graph.state_for_endpoint(&remote_endpoint), None);
         let route = sinomo_core::network::cluster_route_next_hop(&graph, &local_node, &remote_node)
             .expect("segmented route");
         assert_eq!(route.next_hop, bridge_node);
@@ -16750,15 +19681,291 @@ mod tests {
             connectivity_import_timeout_for_endpoint(&iroh, normal_timeouts),
             CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT
         );
+    }
 
-        let formation_timeouts = cluster_formation_control_plane_timeouts();
-        assert_eq!(
-            connectivity_import_timeout_for_endpoint(&tcp, formation_timeouts),
-            CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT
+    #[test]
+    fn peer_connectivity_fetch_scope_preserves_ordinary_source_filter_and_bounds_snapshot() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_peer_connectivity_fetch_scope").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_peer_connectivity_fetch_scope_local").expect("local");
+        let responder_node =
+            NodeId::from_legacy_named("node_peer_connectivity_fetch_scope_responder")
+                .expect("responder");
+        let upstream_node =
+            NodeId::from_legacy_named("node_peer_connectivity_fetch_scope_upstream")
+                .expect("upstream");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "peer connectivity fetch scope",
+            local_node,
+            "local",
+            "pk-local",
+            now,
         );
+        let responder_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &responder_node,
+            "node4:21353".to_string(),
+            10,
+        );
+        let mut responder_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &responder_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("responder".to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        responder_record.source_node_id = responder_node.clone();
+        let mut upstream_record = responder_record.clone();
+        upstream_record.source_node_id = upstream_node;
+        upstream_record.last_success_at = Some("upstream".to_string());
+
+        let endpoint_only = filter_peer_connectivity_response_records(
+            &state,
+            &responder_endpoint,
+            vec![responder_record.clone(), upstream_record.clone()],
+            PeerConnectivityFetchScope::EndpointSource,
+        )
+        .expect("filter ordinary endpoint source");
+        assert_eq!(endpoint_only, vec![responder_record.clone()]);
+
+        let full = filter_peer_connectivity_response_records(
+            &state,
+            &responder_endpoint,
+            vec![responder_record, upstream_record.clone()],
+            PeerConnectivityFetchScope::FullSnapshot,
+        )
+        .expect("retain full handoff snapshot");
+        assert_eq!(full.len(), 2);
+
+        let oversized = vec![
+            upstream_record;
+            sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS + 1
+        ];
+        let error = filter_peer_connectivity_response_records(
+            &state,
+            &responder_endpoint,
+            oversized,
+            PeerConnectivityFetchScope::EndpointSource,
+        )
+        .expect_err("aggregate cap must apply before endpoint-source filtering");
+        assert!(error.contains("too many cluster connectivity snapshot records"));
+    }
+
+    #[test]
+    fn cold_start_join_handoff_import_bypasses_detached_publish_coalescing() {
+        let root = unique_cluster_test_root("cold-start-join-connectivity-handoff");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cold_start_join_handoff").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_cold_start_join_handoff_local").expect("local");
+        let introducer_node = NodeId::from_legacy_named("node_cold_start_join_handoff_introducer")
+            .expect("introducer");
+        let bridge_node =
+            NodeId::from_legacy_named("node_cold_start_join_handoff_bridge").expect("bridge");
+        let authority_node =
+            NodeId::from_legacy_named("node_cold_start_join_handoff_authority").expect("authority");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "cold start join handoff",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let accepted_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &introducer_node,
+            "node4:21353".to_string(),
+            10,
+        );
+        let bridge_endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&bridge_node, "node3:21353".to_string(), 10);
+        let authority_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &authority_node,
+            "node1:21353".to_string(),
+            10,
+        );
+        for (node_id, name, endpoint) in [
+            (
+                introducer_node.clone(),
+                "introducer",
+                accepted_endpoint.clone(),
+            ),
+            (bridge_node.clone(), "bridge", bridge_endpoint.clone()),
+            (
+                authority_node.clone(),
+                "authority",
+                authority_endpoint.clone(),
+            ),
+        ] {
+            let mut member = ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id,
+                name,
+                format!("pk-{name}"),
+                now,
+            );
+            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = vec![endpoint];
+            state.members.push(member);
+        }
+
+        let local_to_introducer = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &accepted_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("accepted response path".to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_records(
+            &paths,
+            &local_node,
+            std::slice::from_ref(&local_to_introducer),
+        )
+        .expect("seed local accepted response path");
+        let mut introducer_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &bridge_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("accepted introducer evidence".to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        introducer_record.source_node_id = introducer_node.clone();
+        let mut upstream_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &authority_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("upstream authority evidence".to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        upstream_record.source_node_id = bridge_node.clone();
+        let mut local_source_echo = upstream_record.clone();
+        local_source_echo.source_node_id = local_node.clone();
+        local_source_echo.last_success_at = Some("peer echo of local source".to_string());
+
+        // Model the detached publish task still owning its per-source
+        // coalescing marker when the identity-changing command reaches the
+        // handoff. The synchronous import must not wait for that task.
+        let in_flight = mark_join_connectivity_sync_in_flight(&paths, &local_node)
+            .expect("mark detached join publisher in flight");
+        let expected_introducer = introducer_record.clone();
+        let expected_upstream = upstream_record.clone();
+        let runtime = daemon_cluster_test_runtime();
+        let imported = complete_accepted_join_connectivity_handoff_on_runtime_with_fetch(
+            &paths,
+            &state,
+            &accepted_endpoint,
+            runtime.handle(),
+            async move { Ok(vec![introducer_record, upstream_record, local_source_echo]) },
+        );
+        clear_join_connectivity_sync_in_flight(&in_flight);
+
+        assert_eq!(imported, 2);
+        let stored_introducer =
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &introducer_node,
+            )
+            .expect("read imported introducer connectivity");
+        assert_eq!(stored_introducer, vec![expected_introducer]);
+        let stored_upstream =
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &bridge_node,
+            )
+            .expect("read imported upstream connectivity");
+        assert_eq!(stored_upstream, vec![expected_upstream]);
+        let stored_local =
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &local_node,
+            )
+            .expect("read locally owned connectivity");
         assert_eq!(
-            connectivity_import_timeout_for_endpoint(&iroh, formation_timeouts),
-            CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT
+            stored_local,
+            vec![local_to_introducer],
+            "a peer snapshot must never replace or extend locally owned observations"
+        );
+
+        let graph =
+            sinomo_core::network::ClusterConnectivityGraph::try_read_for_local(&paths, &state)
+                .expect("read composed handoff graph");
+        let route =
+            sinomo_core::network::cluster_route_next_hop(&graph, &local_node, &authority_node)
+                .expect("handoff should compose a route to the authority");
+        assert_eq!(route.next_hop, introducer_node);
+        assert_eq!(
+            route.path,
+            vec![local_node, route.next_hop, bridge_node, authority_node]
+        );
+    }
+
+    #[test]
+    fn cold_start_join_handoff_timeout_is_bounded_and_non_fatal() {
+        let root = unique_cluster_test_root("cold-start-join-connectivity-handoff-timeout");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cold_start_handoff_timeout").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_cold_start_handoff_timeout_local").expect("local");
+        let introducer_node =
+            NodeId::from_legacy_named("node_cold_start_handoff_timeout_introducer")
+                .expect("introducer");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "cold start handoff timeout",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let accepted_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &introducer_node,
+            "node4:21353".to_string(),
+            10,
+        );
+        let runtime = daemon_cluster_test_runtime();
+        let started = Instant::now();
+        let imported = complete_accepted_join_connectivity_handoff_on_runtime_with_fetch(
+            &paths,
+            &state,
+            &accepted_endpoint,
+            runtime.handle(),
+            std::future::pending::<Result<Vec<ClusterConnectivityRecord>, String>>(),
+        );
+
+        assert_eq!(
+            imported, 0,
+            "handoff import failure must not fail an already accepted join"
+        );
+        assert!(
+            started.elapsed() < DAEMON_JOIN_CONNECTIVITY_HANDOFF_TIMEOUT + Duration::from_secs(1),
+            "a best-effort handoff must remain independently bounded"
         );
     }
 

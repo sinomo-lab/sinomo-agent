@@ -113,6 +113,14 @@ pub(crate) fn plan_tombstone_compaction(
         if age_nanos < options.min_tombstone_age_nanos {
             report.retained_young_tombstone_count =
                 report.retained_young_tombstone_count.saturating_add(1);
+            let eligible_at = object_timestamp_for_retention(object)
+                .saturating_add(options.min_tombstone_age_nanos);
+            report.next_eligible_at_unix_nanos = Some(
+                report
+                    .next_eligible_at_unix_nanos
+                    .map(|current| current.min(eligible_at))
+                    .unwrap_or(eligible_at),
+            );
             continue;
         }
         if tombstone_has_live_references(tables, &object.object_id) {
@@ -247,6 +255,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: "/docs/deleted.md".to_string(),
             kind: DfsObjectKind::Tombstone,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: Vec::new(),
             content_hash: None,
@@ -301,6 +310,24 @@ mod tests {
         });
 
         assert!(tombstone_has_live_references(&tables, &object.object_id));
+    }
+
+    #[test]
+    fn young_tombstone_projects_exact_retention_deadline() {
+        let mut object = object();
+        object.changed_at_unix_nanos = 80;
+        let mut tables = DfsMetadataTables::default();
+        tables.apply(DfsMetadataTableOp::PutObject { object });
+
+        let plan = plan_tombstone_compaction(
+            &tables,
+            &DfsTombstoneCompactionOptions::dry_run(Duration::from_nanos(50)),
+            100,
+        );
+
+        assert_eq!(plan.report.eligible_tombstone_count, 0);
+        assert_eq!(plan.report.retained_young_tombstone_count, 1);
+        assert_eq!(plan.report.next_eligible_at_unix_nanos, Some(130));
     }
 
     #[test]

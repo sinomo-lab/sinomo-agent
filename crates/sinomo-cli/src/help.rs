@@ -185,10 +185,13 @@ pub(super) fn print_cluster_help() {
         "      First boot only: with no daemon and no cluster state, initializes directly (--cluster-id/--node-id apply only there)."
     );
     println!(
-        "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]"
+        "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>] [--channel-output <introducer>=<path>]"
     );
     println!(
         "      Create a portable join invite through the running daemon (defaults to daemon-advertised introducers)."
+    );
+    println!(
+        "      Repeat --channel-output to write compact invites containing only the exact returned channel for each introducer."
     );
     println!("  sinomo cluster join <invite> [--name <name>]");
     println!(

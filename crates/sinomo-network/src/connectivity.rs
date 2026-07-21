@@ -17,11 +17,33 @@ const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 /// asserts this at compile time) so a full source record set survives a
 /// prefix read.
 pub const MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS: usize = 4096;
+/// Maximum records carried by one private connectivity snapshot RPC or
+/// accepted by one aggregate local-store merge.
+///
+/// This remains equal to the cluster KV whole-prefix range limit without
+/// introducing an R0 network -> KV dependency. A snapshot over this limit is
+/// rejected rather than truncated because an incomplete graph can look valid
+/// while omitting the only route to the state authority.
+pub const MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS: usize = 4096;
 
 /// Whether a network-domain record (connectivity/network-info) is still live
 /// at `now` per its `expires_at` stamp.
 pub fn cluster_network_record_live(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
     expires_at > now
+}
+
+/// Whether durable connectivity evidence is close enough to expiry that an
+/// otherwise stable observation must renew it.
+///
+/// This deliberately matches the probe selection margin. A probe that renews
+/// the local source set must be publishable in the same generation; otherwise
+/// low-frequency mobile/sensor schedules could accept a fresh local expiry
+/// while letting the older cluster-KV evidence lapse before their next tick.
+pub fn cluster_connectivity_record_should_refresh(
+    expires_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    expires_at <= now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS)
 }
 
 pub fn cluster_connectivity_stable_eq(

@@ -20,6 +20,7 @@ pub(crate) fn new_posix_metadata_object(
         file_system_id: sifs_file_system_id(),
         path: path.to_string(),
         kind,
+        tombstone_provenance: None,
         owner_node_id: node_id.clone(),
         current_locations: vec![node_id.clone()],
         content_hash: None,

@@ -141,6 +141,7 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn fan_out_committed_cluster_raft_command_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -288,13 +289,28 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
             metrics::counter!("sinomo.kv.fanout.passes", "outcome" => outcome).increment(1);
             metrics::histogram!("sinomo.kv.fanout.pass.us", "outcome" => outcome)
                 .record(started.elapsed().as_micros().min(u128::from(u64::MAX)) as f64);
-            if let Ok(report) = &result {
-                metrics::histogram!("sinomo.kv.fanout.attempted_nodes")
-                    .record(report.attempted_nodes as f64);
-                metrics::histogram!("sinomo.kv.fanout.replicated_nodes")
-                    .record(report.replicated_nodes.len() as f64);
-                metrics::counter!("sinomo.kv.fanout.watch_event_batches")
-                    .increment(report.watch_event_batches_sent as u64);
+            match result {
+                Ok(report) => {
+                    metrics::histogram!("sinomo.kv.fanout.attempted_nodes")
+                        .record(report.attempted_nodes as f64);
+                    metrics::histogram!("sinomo.kv.fanout.replicated_nodes")
+                        .record(report.replicated_nodes.len() as f64);
+                    metrics::counter!("sinomo.kv.fanout.watch_event_batches")
+                        .increment(report.watch_event_batches_sent as u64);
+                    persist_fanout_peer_progress_hints(
+                        &runtime,
+                        &paths,
+                        report.peer_progress_hints,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target: "sinomo.cluster.raft_fanout",
+                        %error,
+                        "committed Raft fanout wave did not complete"
+                    );
+                }
             }
             if let Some((latest_state, latest_events)) =
                 read_latest_cluster_raft_fanout_inputs_async(&runtime, &paths).await
@@ -321,6 +337,35 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
         if !claimed {
             break;
         }
+    }
+}
+
+async fn persist_fanout_peer_progress_hints(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    hints: Vec<sinomo_kv::ClusterKvRaftPeerProgress>,
+) {
+    if hints.is_empty() {
+        return;
+    }
+    let kv_paths = paths.kv_paths();
+    match runtime
+        .spawn_blocking(move || {
+            sinomo_kv::record_cluster_kv_raft_peer_progress_batch(&kv_paths, hints)
+        })
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "sinomo.cluster.raft_fanout",
+            %error,
+            "committed Raft fanout could not persist peer progress hints"
+        ),
+        Err(error) => tracing::warn!(
+            target: "sinomo.cluster.raft_fanout",
+            %error,
+            "committed Raft fanout peer progress task failed"
+        ),
     }
 }
 

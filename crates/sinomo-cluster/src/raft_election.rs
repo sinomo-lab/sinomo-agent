@@ -403,17 +403,280 @@ pub(crate) fn locked_cluster_raft_local_vote_metadata(
         .map_err(kv_err)
 }
 
-fn lock_cluster_raft_campaign(paths: &ClusterPaths) -> Result<(std::fs::File, bool), NetworkError> {
+struct ClusterRaftCampaignPhaseRecord {
+    phase: &'static str,
+    recorded_at: SystemTime,
+    duration: Duration,
+    target_count: usize,
+    outcome: &'static str,
+    detail: String,
+}
+
+fn cluster_raft_campaign_phase_trace(
+    mode: &'static str,
+    local_node_id: &NodeId,
+    waited_for_campaign_lock: bool,
+    record: &ClusterRaftCampaignPhaseRecord,
+) {
+    let recorded_at_unix_ns = u64::try_from(
+        record
+            .recorded_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX);
+    let duration_us = u64::try_from(record.duration.as_micros()).unwrap_or(u64::MAX);
+    tracing::trace!(
+        target: "sinomo.cluster.formation",
+        mode,
+        phase = record.phase,
+        local_node_id = %local_node_id,
+        waited_for_campaign_lock,
+        recorded_at_unix_ns,
+        duration_us,
+        target_count = record.target_count,
+        outcome = record.outcome,
+        detail = %record.detail,
+        "cluster Raft campaign phase"
+    );
+}
+
+struct ClusterRaftCampaignTraceGuard {
+    lock: Option<std::fs::File>,
+    mode: &'static str,
+    local_node_id: NodeId,
+    waited_for_campaign_lock: bool,
+    acquired_at: Instant,
+    target_count: usize,
+    outcome: &'static str,
+    trace_enabled: bool,
+    phase_records: Vec<ClusterRaftCampaignPhaseRecord>,
+}
+
+impl ClusterRaftCampaignTraceGuard {
+    fn new(
+        lock: std::fs::File,
+        mode: &'static str,
+        local_node_id: NodeId,
+        waited_for_campaign_lock: bool,
+        acquired_at: Instant,
+        acquisition_duration: Duration,
+        trace_enabled: bool,
+    ) -> Self {
+        let mut campaign = Self {
+            lock: Some(lock),
+            mode,
+            local_node_id,
+            waited_for_campaign_lock,
+            acquired_at,
+            target_count: 0,
+            outcome: "dropped_before_completion",
+            trace_enabled,
+            phase_records: if trace_enabled {
+                Vec::with_capacity(5)
+            } else {
+                Vec::new()
+            },
+        };
+        campaign.record_phase(
+            "campaign_lock_acquire",
+            acquisition_duration,
+            "acquired",
+            format_args!("acquired the cluster KV commit-sequence campaign lock"),
+        );
+        campaign
+    }
+
+    fn set_target_count(&mut self, target_count: usize) {
+        self.target_count = target_count;
+    }
+
+    fn record_phase(
+        &mut self,
+        phase: &'static str,
+        duration: Duration,
+        outcome: &'static str,
+        detail: std::fmt::Arguments<'_>,
+    ) {
+        if !self.trace_enabled {
+            return;
+        }
+        self.phase_records.push(ClusterRaftCampaignPhaseRecord {
+            phase,
+            recorded_at: SystemTime::now(),
+            duration,
+            target_count: self.target_count,
+            outcome,
+            detail: detail.to_string(),
+        });
+    }
+
+    fn record_target_selection(&mut self, duration: Duration, voter_count: usize) {
+        self.record_phase(
+            "voter_target_selection",
+            duration,
+            "selected",
+            format_args!("selected targets from {voter_count} durable voters"),
+        );
+    }
+
+    fn record_target_selection_error(
+        &mut self,
+        duration: Duration,
+        error: &impl std::fmt::Display,
+    ) {
+        self.record_phase(
+            "voter_target_selection",
+            duration,
+            "error",
+            format_args!("{error}"),
+        );
+        self.complete("target_selection_error", format_args!("{error}"));
+    }
+
+    fn record_leader_observation_error(
+        &mut self,
+        duration: Duration,
+        error: &impl std::fmt::Display,
+    ) {
+        self.record_phase(
+            "durable_leader_observation",
+            duration,
+            "error",
+            format_args!("{error}"),
+        );
+        self.complete("leader_observation_error", format_args!("{error}"));
+    }
+
+    fn complete(&mut self, outcome: &'static str, detail: std::fmt::Arguments<'_>) {
+        self.outcome = outcome;
+        self.record_phase(
+            "campaign_complete",
+            self.acquired_at.elapsed(),
+            outcome,
+            detail,
+        );
+    }
+
+    fn record_vote_result<E: std::fmt::Display>(
+        &mut self,
+        duration: Duration,
+        result: &Result<bool, E>,
+    ) {
+        match result {
+            Ok(elected) => {
+                let outcome = if *elected { "elected" } else { "not_elected" };
+                self.record_phase(
+                    "vote_phase",
+                    duration,
+                    outcome,
+                    format_args!("Raft election returned {elected}"),
+                );
+                self.complete(outcome, format_args!("Raft election returned {elected}"));
+            }
+            Err(error) => {
+                self.record_phase("vote_phase", duration, "error", format_args!("{error}"));
+                self.complete("vote_error", format_args!("{error}"));
+            }
+        }
+    }
+}
+
+impl Drop for ClusterRaftCampaignTraceGuard {
+    fn drop(&mut self) {
+        // Never run a tracing subscriber while holding the global commit
+        // sequence lock. The observation layer records into a mutex-protected
+        // buffer and may synchronously write formatted logs, so emitting an
+        // event here would perturb the exclusion interval being measured.
+        drop(self.lock.take());
+        let outcome = if std::thread::panicking() {
+            "unwound"
+        } else {
+            self.outcome
+        };
+        self.record_phase(
+            "campaign_lock_drop",
+            self.acquired_at.elapsed(),
+            outcome,
+            format_args!("released the cluster KV commit-sequence campaign lock"),
+        );
+        for record in std::mem::take(&mut self.phase_records) {
+            cluster_raft_campaign_phase_trace(
+                self.mode,
+                &self.local_node_id,
+                self.waited_for_campaign_lock,
+                &record,
+            );
+        }
+    }
+}
+
+fn try_lock_cluster_raft_campaign(
+    paths: &ClusterPaths,
+) -> (Result<std::fs::File, NetworkError>, bool) {
     let kv_paths = paths.kv_paths();
     match sinomo_kv::lock_cluster_kv_commit_sequence(&kv_paths, Duration::ZERO) {
-        Ok(lock) => Ok((lock, false)),
-        Err(KvError::Busy { .. }) => sinomo_kv::lock_cluster_kv_commit_sequence(
-            &kv_paths,
-            sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
-        )
-        .map(|lock| (lock, true))
-        .map_err(kv_err),
-        Err(error) => Err(kv_err(error)),
+        Ok(lock) => (Ok(lock), false),
+        Err(KvError::Busy { .. }) => (
+            sinomo_kv::lock_cluster_kv_commit_sequence(
+                &kv_paths,
+                sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
+            )
+            .map_err(kv_err),
+            true,
+        ),
+        Err(error) => (Err(kv_err(error)), false),
+    }
+}
+
+#[cfg(test)]
+fn lock_cluster_raft_campaign(paths: &ClusterPaths) -> Result<(std::fs::File, bool), NetworkError> {
+    let (result, waited_for_campaign_lock) = try_lock_cluster_raft_campaign(paths);
+    result.map(|lock| (lock, waited_for_campaign_lock))
+}
+
+fn observed_cluster_raft_campaign_lock(
+    paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    mode: &'static str,
+) -> Result<ClusterRaftCampaignTraceGuard, NetworkError> {
+    let trace_enabled =
+        tracing::enabled!(target: "sinomo.cluster.formation", tracing::Level::TRACE);
+    let started = Instant::now();
+    let (result, waited_for_campaign_lock) = try_lock_cluster_raft_campaign(paths);
+    match result {
+        Ok(lock) => {
+            let acquired_at = Instant::now();
+            let acquisition_duration = started.elapsed();
+            Ok(ClusterRaftCampaignTraceGuard::new(
+                lock,
+                mode,
+                local_node_id.clone(),
+                waited_for_campaign_lock,
+                acquired_at,
+                acquisition_duration,
+                trace_enabled,
+            ))
+        }
+        Err(error) => {
+            if trace_enabled {
+                cluster_raft_campaign_phase_trace(
+                    mode,
+                    local_node_id,
+                    waited_for_campaign_lock,
+                    &ClusterRaftCampaignPhaseRecord {
+                        phase: "campaign_lock_acquire",
+                        recorded_at: SystemTime::now(),
+                        duration: started.elapsed(),
+                        target_count: 0,
+                        outcome: "error",
+                        detail: error.to_string(),
+                    },
+                );
+            }
+            Err(error)
+        }
     }
 }
 
@@ -494,8 +757,16 @@ pub fn elect_cluster_raft_leader_with_host(
     // explicitly marks it offline or unreachable. A forwarding failure alone
     // is not enough evidence to preempt an otherwise live leader.
     let observation_before_wait = locked_cluster_raft_leader_observation(paths, state)?;
-    let (_campaign_lock, waited_for_campaign_lock) = lock_cluster_raft_campaign(paths)?;
-    let observation_after_wait = locked_cluster_raft_leader_observation(paths, state)?;
+    let mut campaign = observed_cluster_raft_campaign_lock(paths, &state.local_node_id, "sync")?;
+    let waited_for_campaign_lock = campaign.waited_for_campaign_lock;
+    let leader_observation_started = Instant::now();
+    let observation_after_wait = match locked_cluster_raft_leader_observation(paths, state) {
+        Ok(observation) => observation,
+        Err(error) => {
+            campaign.record_leader_observation_error(leader_observation_started.elapsed(), &error);
+            return Err(error);
+        }
+    };
     let remote_leader_blocks_campaign =
         observed_remote_leader_blocks_campaign(paths, state, &observation_after_wait);
     if let Some(existing_outcome) = cluster_raft_leader_outcome_after_campaign_wait(
@@ -505,26 +776,50 @@ pub fn elect_cluster_raft_leader_with_host(
         &observation_after_wait,
         remote_leader_blocks_campaign,
     ) {
+        campaign.complete(
+            if existing_outcome {
+                "existing_local_leader"
+            } else {
+                "campaign_suppressed"
+            },
+            format_args!("used the durable campaign outcome observed after lock acquisition"),
+        );
         return Ok(existing_outcome);
     }
-    let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
+
+    let target_selection_started = Instant::now();
     let mut remote_vote_targets = Vec::new();
-    if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
-        for node_id in ClusterEndpointSelector::new(paths, state)
-            .select_internal_unique_node_ids(
-                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-            )
-            .into_iter()
-            .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
-        {
-            sinomo_network::try_reserve_vec(
-                &mut remote_vote_targets,
-                1,
-                "collect raft vote targets",
-            )?;
-            remote_vote_targets.push(node_id);
+    let voter_ids = (|| {
+        let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
+        if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
+            for node_id in ClusterEndpointSelector::new(paths, state)
+                .select_internal_unique_node_ids(
+                    ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+                )
+                .into_iter()
+                .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
+            {
+                sinomo_network::try_reserve_vec(
+                    &mut remote_vote_targets,
+                    1,
+                    "collect raft vote targets",
+                )?;
+                remote_vote_targets.push(node_id);
+            }
         }
-    }
+        Ok::<_, NetworkError>(voter_ids)
+    })();
+    campaign.set_target_count(remote_vote_targets.len());
+    let voter_ids = match voter_ids {
+        Ok(voter_ids) => {
+            campaign.record_target_selection(target_selection_started.elapsed(), voter_ids.len());
+            voter_ids
+        }
+        Err(error) => {
+            campaign.record_target_selection_error(target_selection_started.elapsed(), &error);
+            return Err(error);
+        }
+    };
     let remote_vote_target_ids = remote_vote_targets.clone();
     let mut election_host = NetworkClusterKvRaftLeaderElectionHost::new(
         paths,
@@ -533,13 +828,16 @@ pub fn elect_cluster_raft_leader_with_host(
         remote_vote_targets,
         host,
     );
-    sinomo_kv::elect_cluster_kv_raft_leader_with_host(
+    let vote_started = Instant::now();
+    let result = sinomo_kv::elect_cluster_kv_raft_leader_with_host(
         &state.local_node_id,
         voter_ids,
         remote_vote_target_ids,
         options.kv_options(),
         &mut election_host,
-    )
+    );
+    campaign.record_vote_result(vote_started.elapsed(), &result);
+    result
 }
 
 pub(crate) async fn elect_cluster_raft_leader_async_with_host(
@@ -564,14 +862,28 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
     let state = &consensus_state;
     let paths_for_lock = paths.clone();
     let state_for_lock = state.clone();
-    let (_campaign_lock, existing_outcome) = runtime
+    let (mut campaign, existing_outcome) = runtime
         .spawn_blocking(move || {
             let observation_before_wait =
                 locked_cluster_raft_leader_observation(&paths_for_lock, &state_for_lock)?;
-            let (campaign_lock, waited_for_campaign_lock) =
-                lock_cluster_raft_campaign(&paths_for_lock)?;
+            let mut campaign = observed_cluster_raft_campaign_lock(
+                &paths_for_lock,
+                &state_for_lock.local_node_id,
+                "async",
+            )?;
+            let waited_for_campaign_lock = campaign.waited_for_campaign_lock;
+            let leader_observation_started = Instant::now();
             let observation_after_wait =
-                locked_cluster_raft_leader_observation(&paths_for_lock, &state_for_lock)?;
+                match locked_cluster_raft_leader_observation(&paths_for_lock, &state_for_lock) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        campaign.record_leader_observation_error(
+                            leader_observation_started.elapsed(),
+                            &error,
+                        );
+                        return Err(error);
+                    }
+                };
             let remote_leader_blocks_campaign = observed_remote_leader_blocks_campaign(
                 &paths_for_lock,
                 &state_for_lock,
@@ -584,7 +896,7 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
                 &observation_after_wait,
                 remote_leader_blocks_campaign,
             );
-            Ok::<_, NetworkError>((campaign_lock, existing_outcome))
+            Ok::<_, NetworkError>((campaign, existing_outcome))
         })
         .await
         .map_err(|source| NetworkError::Io {
@@ -592,29 +904,54 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
             detail: format!("campaign lock task failed: {source}"),
         })??;
     if let Some(existing_outcome) = existing_outcome {
+        campaign.complete(
+            if existing_outcome {
+                "existing_local_leader"
+            } else {
+                "campaign_suppressed"
+            },
+            format_args!("used the durable campaign outcome observed after lock acquisition"),
+        );
         return Ok(existing_outcome);
     }
-    let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
+    let target_selection_started = Instant::now();
     let mut remote_vote_targets = Vec::new();
-    if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
-        for node_id in ClusterEndpointSelector::select_internal_unique_node_ids_async(
-            runtime,
-            paths,
-            state,
-            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-        )
-        .await?
-        .into_iter()
-        .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
-        {
-            sinomo_network::try_reserve_vec(
-                &mut remote_vote_targets,
-                1,
-                "collect async raft vote targets",
-            )?;
-            remote_vote_targets.push(node_id);
+    let voter_ids = async {
+        let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
+        if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
+            let selected_node_ids = ClusterEndpointSelector::select_internal_unique_node_ids_async(
+                runtime,
+                paths,
+                state,
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+            )
+            .await?;
+            for node_id in selected_node_ids
+                .into_iter()
+                .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
+            {
+                sinomo_network::try_reserve_vec(
+                    &mut remote_vote_targets,
+                    1,
+                    "collect async raft vote targets",
+                )?;
+                remote_vote_targets.push(node_id);
+            }
         }
+        Ok::<_, NetworkError>(voter_ids)
     }
+    .await;
+    campaign.set_target_count(remote_vote_targets.len());
+    let voter_ids = match voter_ids {
+        Ok(voter_ids) => {
+            campaign.record_target_selection(target_selection_started.elapsed(), voter_ids.len());
+            voter_ids
+        }
+        Err(error) => {
+            campaign.record_target_selection_error(target_selection_started.elapsed(), &error);
+            return Err(error);
+        }
+    };
     let remote_vote_target_ids = remote_vote_targets.clone();
     let mut election_host = NetworkClusterKvRaftLeaderElectionAsyncHost::new(
         runtime,
@@ -624,14 +961,17 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
         remote_vote_targets,
         host,
     );
-    sinomo_kv::elect_cluster_kv_raft_leader_async_with_host(
+    let vote_started = Instant::now();
+    let result = sinomo_kv::elect_cluster_kv_raft_leader_async_with_host(
         &state.local_node_id,
         voter_ids,
         remote_vote_target_ids,
         options.kv_options(),
         &mut election_host,
     )
-    .await
+    .await;
+    campaign.record_vote_result(vote_started.elapsed(), &result);
+    result
 }
 
 #[cfg(test)]
@@ -711,8 +1051,10 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-cluster-campaign-lock-contention");
         let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
         paths.ensure().expect("cluster paths");
-        let (first_lock, first_waited) = lock_cluster_raft_campaign(&paths).expect("first lock");
-        assert!(!first_waited);
+        let local_node_id = NodeId::from_legacy_named("campaign_lock_local").expect("node");
+        let first_campaign = observed_cluster_raft_campaign_lock(&paths, &local_node_id, "test")
+            .expect("first lock");
+        assert!(!first_campaign.waited_for_campaign_lock);
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -726,7 +1068,7 @@ mod tests {
         started_rx.recv().expect("queued thread started");
         std::thread::sleep(Duration::from_millis(50));
         assert!(result_rx.try_recv().is_err(), "queued lock must still wait");
-        drop(first_lock);
+        drop(first_campaign);
 
         assert!(
             result_rx
@@ -734,5 +1076,66 @@ mod tests {
                 .expect("queued lock result")
         );
         queued.join().expect("queued thread");
+    }
+
+    #[test]
+    fn campaign_trace_buffers_and_classifies_post_lock_observation_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-campaign-observation-error");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let local_node_id =
+            NodeId::from_legacy_named("campaign_observation_error_local").expect("node");
+        let (lock, waited_for_campaign_lock) =
+            lock_cluster_raft_campaign(&paths).expect("campaign lock");
+        let mut campaign = ClusterRaftCampaignTraceGuard::new(
+            lock,
+            "test",
+            local_node_id,
+            waited_for_campaign_lock,
+            Instant::now(),
+            Duration::from_micros(11),
+            true,
+        );
+        let error = NetworkError::Io {
+            operation: "observe durable leader".to_string(),
+            detail: "injected observation failure".to_string(),
+        };
+
+        campaign.record_leader_observation_error(Duration::from_micros(17), &error);
+
+        assert_eq!(campaign.outcome, "leader_observation_error");
+        assert_eq!(
+            campaign
+                .phase_records
+                .iter()
+                .map(|record| record.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                "campaign_lock_acquire",
+                "durable_leader_observation",
+                "campaign_complete"
+            ]
+        );
+        assert_eq!(
+            campaign.phase_records[0].duration,
+            Duration::from_micros(11)
+        );
+        assert_eq!(
+            campaign.phase_records[1].duration,
+            Duration::from_micros(17)
+        );
+        assert_eq!(campaign.phase_records[1].outcome, "error");
+        assert!(
+            campaign
+                .phase_records
+                .iter()
+                .all(|record| record.recorded_at.duration_since(UNIX_EPOCH).is_ok()),
+            "buffered phases must retain their actual wall-clock timestamp"
+        );
+
+        drop(campaign);
+        let (_next_lock, next_waited) =
+            lock_cluster_raft_campaign(&paths).expect("lock released when campaign guard dropped");
+        assert!(!next_waited);
     }
 }

@@ -72,14 +72,16 @@ when testing rollout-from-source.
 |---|---|---|
 | node1 | `seg_a` | seed |
 | node2 | `seg_a` | joiner |
-| node3 | `seg_a`, `seg_ab` | joiner + **bridge A↔AB** (re-publishes an invite for node4) |
-| node4 | `seg_ab`, `seg_b` | joiner (via node3) + **bridge AB↔B** (re-publishes for node5/6) |
+| node3 | `seg_a`, `seg_ab` | joiner + **bridge A↔AB** |
+| node4 | `seg_ab`, `seg_b` | joiner (via node3) + **bridge AB↔B** |
 | node5 | `seg_b` | joiner |
 | node6 | `seg_b` | joiner |
 
 Docker's embedded DNS only resolves peers on a **shared** network, so the segmentation is
-real: `node1` cannot even resolve/reach `node5`. Each node joins through a *reachable*
-introducer (node2,3→`node1`; node4→`node3`; node5,6→`node4`).
+real: `node1` cannot even resolve/reach `node5`. The seed quorum-publishes one reusable invite
+with all three introducer channels, then writes a compact one-channel reference for each
+segment. Each node therefore joins through a *reachable* introducer (node2,3→`node1`;
+node4→`node3`; node5,6→`node4`) without three serial invitation transactions.
 
 ## iroh is disabled on purpose
 
@@ -104,10 +106,9 @@ the connectivity graph's **healthy** links. So every node integrates into one cl
   directly — they are full members.
 
 Joins are best-effort and time-bounded, so **no node hangs**; each joiner waits for the dev
-harness readiness marker, then runs one cluster join command. The docker gates allow 30
-seconds for clean six-node formation. This covers a complete 5-second transport timeout plus
-deep-segment relay convergence without turning normal startup jitter into a false failure;
-the measured elapsed time is still reported so regressions remain visible.
+harness readiness marker, then runs one cluster join command. Clean six-node formation has a
+non-configurable 10-second hard acceptance gate. Crossing it still indicates a startup, join,
+restart, or relay bug even though benchmark work need not stop to optimize formation below it.
 
 ## Layout
 
@@ -115,8 +116,9 @@ the measured elapsed time is still reported so regressions remain visible.
   used by the root production compose and the single-node smoke compose.
 - `docker/Dockerfile.dev` — thin runtime image for the dev cluster (host binary
   bind-mounted in).
-- `docker/entrypoint.sh` — best-effort multi-hop formation (seed → bridges re-publish
-  invites → joiners), then runs the shadow supervisor (PID 1). Shared by all
+- `docker/entrypoint.sh` — best-effort multi-hop formation (seed publishes per-segment
+  compact invite references → joiners form through the bridges), then runs the shadow supervisor
+  (PID 1). Shared by all
   composes.
 - `docker/docker-compose.dev.yml` — 6 services + 3 bridge networks (`seg_a`,
   `seg_ab`, `seg_b`).
@@ -168,6 +170,93 @@ SINOMO_TEST_BUILD=0 docker/test-cluster.sh   # reuse an existing host binary
 SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
 SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 ```
+
+To diagnose formation without extending or weakening its ten-second gate, enable the
+bounded observation mode and stop after formation:
+
+```bash
+SINOMO_TEST_FORMATION_ONLY=1 \
+SINOMO_TEST_FORMATION_OBSERVE=1 \
+docker/test-cluster.sh
+```
+
+The entrypoint enables the formation trace filter before each observed daemon starts, then
+schedules capture tagging and network timelines independently for every main-daemon PID,
+including identity-changing join replacements. In-process CPU profiling defaults to `node1`
+only (`SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES=node1`); use a comma-separated list or `all`
+explicitly. Keeping the profiler off formation-critical join replacements prevents profiler
+startup from perturbing the lock and RPC timings being diagnosed. It preserves the early
+process-local trace ring instead of clearing it when capture tagging arrives. Observer startup
+runs off the readiness dependency path so a slow local observation RPC cannot delay the next
+bridge. At the end of the hard gate, the harness freezes every node's capture concurrently,
+writes both `traces.json` (capture-tagged) and `all-process-traces.json` (including pre-tag
+startup events), and then copies every daemon generation's `*.startup-traces.json` into the
+node's `startup/` artifact directory. A joining daemon also finalizes its explicitly active
+network timeline during graceful identity replacement, under
+`observe/timelines/<capture>/timeline.json`. Those preserved client-side captures include the
+raw bootstrap open/write/read stages, the propagated trace identity used to correlate the remote
+ingress event, and a stable endpoint correlation ID mapped back to the exact endpoint and node.
+The harness copies and renders every generation under `network-timeline-artifacts/`, instead of
+silently losing the joining process when only its replacement remains reachable. The complete artifacts land in
+`target/cluster-test-artifacts/<run>/formation-observe/`. The harness also renders each copied
+`cpu.pprof.pb` as a sibling `flamegraph.html`, writes a per-node
+`network-timeline-summary.txt`, and combines trace plus network events into
+`formation.perfetto.json`. Health traces include each request's loaded KV revision/member count,
+live-probe batch, peer-query durations, and whether the handler completed or was cancelled. The
+gate-side `cluster-ready-formation.attempts.tsv` records each CLI attempt's absolute and relative
+timing, timeout, exit code, and online count so client cancellation can be aligned with those
+server spans. Rendering is diagnostic-only and never changes the hard-gate result;
+the helpers remain available under `scripts/debug/` for manual rerendering. Shorten
+`SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS` when a joining daemon is expected to exit
+before the default twelve-second profile can finalize.
+
+An observed-formation cluster is diagnostic-only. Its main and shadow processes start with
+the formation trace filter, and selected main daemons also run the in-process sampler. Tear
+that compose project down after collecting the evidence, then form a fresh cluster with
+`SINOMO_TEST_FORMATION_OBSERVE=0` (the default) for network or DFS acceptance measurements.
+Resetting only the reachable main-daemon filters is not equivalent because the shadow
+supervisors are separate processes.
+
+After transport readiness and DFS metadata-shard placement have converged, and before each
+no-load realtime network leg, the benchmark requires one uninterrupted 30-second monotonic
+interval in which every one of the six service containers remains at or below 10 percent CPU.
+DFS convergence is deliberately outside the Docker-only ten-second cluster-formation gate,
+but it is a prerequisite for quietness: otherwise final shard handoff commits can race the
+idle-load measurement. The harness searches for the sustained quiet interval for at most 120
+seconds. One continuous `docker stats` stream supplies cumulative per-container CPU intervals; the harness consumes
+every interval rather than treating time between polls as quiet. A busy interval, malformed or
+missing row, stream exit, or five-second stream stall resets the full duration. Docker's
+aggregate container CPU is the authority, so main daemons, shadow supervisors, entrypoint
+helpers, and any short-lived process inside the container are all charged to the gate. The
+harness snapshots the exact main/shadow PID plus process start tick before and after the
+candidate interval; any unavailable or changed generation resets the complete duration. The
+stats stream remains active during the final generation scan, and the gate cannot pass until a
+quiet cumulative interval for every container covers through the end of that scan. It writes
+every per-container interval, wall-clock timestamp, and monotonic coverage boundary to
+`network-quiet-<leg>.samples.tsv`, the generation evidence to
+`network-quiet-<leg>.generations.tsv`, and the pass/fail decision to
+`network-quiet-<leg>.summary.txt` under the run artifact directory. In-process pprof captures
+and their flamegraphs cover only the daemon process that serves the observe RPC; they do not
+cover shadow or helper processes and are never substituted for the aggregate quiet gate.
+
+The network baseline keeps embedded-SOBJ payload throughput and semantic-attachment
+throughput as separate measurements. The attachment leg uses small request/response SOBJ
+heads plus streamed 8 MiB attachments in each direction, four calls at a time by default.
+It validates the signed head and the declared and delivered byte counts without adding a
+content hash or transport-integrity layer. Tune it with the
+`SINOMO_TEST_NETWORK_ATTACHMENT_*` variables documented at the top of
+`docker/test-cluster.sh`; each direction is capped at 64 MiB by the benchmark route.
+
+For a durable saturation run, set `SINOMO_TEST_NETWORK_SATURATION=1`. This optional
+profile is off by default and runs from one origin (`node1`) to all five peers with
+64 MiB in each direction, 128 measured requests per target, and concurrency 8. That is
+80 GiB of measured aggregate duplex logical traffic: 40 GiB per direction, or
+about 3.4 seconds of ideal 100 Gb/s occupancy per direction (about 6.9 seconds
+if the directions serialize), rather than reporting a short burst. The
+`SINOMO_TEST_NETWORK_SATURATION_ORIGIN`, `_REQUESTS_PER_TARGET`,
+`_WARMUP_REQUESTS_PER_TARGET`, `_CONCURRENCY`, `_TIMEOUT_MS`, `_REQUEST_BYTES`, and
+`_RESPONSE_BYTES` variables tune the profile while retaining the 64 MiB route cap.
+The ordinary all-node 8 MiB attachment leg remains the default acceptance smoke.
 
 Scenarios: per-node DFS invariants, read-your-write roundtrips (both segments),
 cross-segment write→read in both directions plus a routed delete, a

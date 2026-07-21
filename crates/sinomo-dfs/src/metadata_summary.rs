@@ -288,6 +288,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: "/docs/readme.md".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_owner")],
             content_hash: Some("blake3:summary".to_string()),

@@ -348,6 +348,7 @@ mod tests {
             file_system_id: sifs_file_system_id(),
             path: "/prepare-recovery.txt".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: owner.clone(),
             current_locations: vec![owner.clone()],
             content_hash: Some("blake3:old".to_string()),

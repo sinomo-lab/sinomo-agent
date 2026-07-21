@@ -41,7 +41,6 @@ mod raft_quorum;
 #[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;
-mod reactive_maintenance;
 mod state_authority_reachability;
 mod status_publish;
 
@@ -94,15 +93,19 @@ pub use control_routes::{
     decode_cluster_control_role_rpc_response_body,
 };
 pub use health::{
-    ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
+    CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES, ClusterDoctorFinding, ClusterHealthRow,
+    ClusterNetworkPingPayloadMode, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
     ClusterStateAuthorityHealth, ClusterStatusAsyncProbe, ClusterStatusProbe,
     cluster_doctor_findings, cluster_health_rows_with_probe, cluster_health_rpc_request,
     cluster_health_rpc_request_without_peer_views,
     cluster_health_rpc_request_without_recursive_peer_views, cluster_local_health_rpc_request,
-    cluster_network_ping_rpc_request, cluster_network_ping_rpc_request_with_response_payload,
-    cluster_state_authority_health, decode_cluster_health_rpc_response,
+    cluster_network_ping_attachment_rpc_request,
+    cluster_network_ping_attachment_rpc_response_for_node, cluster_network_ping_rpc_request,
+    cluster_network_ping_rpc_request_with_response_payload, cluster_state_authority_health,
+    decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_request,
     decode_cluster_network_ping_rpc_response, handle_cluster_network_ping_rpc_request_for_node,
     handle_current_cluster_health_rpc_request_async, unknown_cluster_node_status,
+    validate_cluster_network_ping_attachment_request,
 };
 pub use invite::{
     ClusterInviteChallengeProof, ClusterInviteChallengeRequest, PENDING_INVITE_CLUSTER_ID,
@@ -134,7 +137,7 @@ pub use join_registration::{
     send_cluster_join_registration_over_membership_rpc,
 };
 pub use kv_local_store::{
-    ClusterKvPathsExt, read_cluster_kv_latest_observed_entry,
+    ClusterKvPathsExt, kv_err, read_cluster_kv_latest_observed_entry,
     read_cluster_kv_latest_observed_prefix_entries, read_cluster_kv_latest_observed_snapshot,
     read_cluster_kv_latest_observed_snapshot_arc_if_present, read_cluster_kv_local_snapshot,
 };
@@ -216,22 +219,14 @@ pub use raft_quorum::{
     ClusterRaftQuorumCommitHost,
 };
 pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
-pub use reactive_maintenance::{
-    ClusterControlPlaneMaintenanceDriver, ClusterKvMaintenanceActionResult,
-    ClusterKvMaintenanceCoordinator, ClusterKvMaintenanceHost, ClusterKvMaintenanceOptions,
-    ClusterKvMaintenancePassOutcome, ClusterKvMaintenanceRaftObservation,
-    ClusterKvMaintenanceReport, ClusterKvMaintenanceStep, ClusterKvMaintenanceStepDisposition,
-    ClusterKvMaintenanceStepEvidence, ClusterKvMaintenanceWakeBatch,
-    ClusterKvMaintenanceWakeDisposition, ClusterKvMaintenanceWakeSource,
-    ClusterKvMaintenanceWorkerDisposition, DEFAULT_CLUSTER_KV_MAINTENANCE_MAX_COALESCED_WAKES,
-    DEFAULT_CLUSTER_KV_MAINTENANCE_RETRY_BACKOFF_BASE,
-    DEFAULT_CLUSTER_KV_MAINTENANCE_RETRY_BACKOFF_MAX, run_cluster_kv_maintenance_tick_with_host,
-};
 pub use state_authority_reachability::{
-    ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
-    ClusterStateAuthorityReachabilityOptions, cluster_has_local_quorum_async_with_host,
-    cluster_has_local_quorum_with_host, cluster_reachable_state_authority_count_async_with_host,
-    cluster_reachable_state_authority_count_with_host, local_cluster_state_authority_member,
+    ClusterStateAuthorityQuorumStatus, ClusterStateAuthorityReachabilityAsyncHost,
+    ClusterStateAuthorityReachabilityHost, ClusterStateAuthorityReachabilityOptions,
+    cluster_has_local_quorum_async_with_host, cluster_has_local_quorum_with_host,
+    cluster_reachable_state_authority_count_async_with_host,
+    cluster_reachable_state_authority_count_with_host,
+    cluster_state_authority_quorum_status_async_with_host,
+    cluster_state_authority_quorum_status_with_host, local_cluster_state_authority_member,
 };
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
@@ -259,6 +254,7 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             .field("local_node_id", "NodeId")
             .field("members", "Vec<ClusterMemberRecord>"),
     )?;
+    layout.register_binary("sinomo-cluster", StorageRing::R1, "cluster/state.sobj.lock")?;
     Ok(())
 }
 
@@ -360,6 +356,8 @@ pub use kv_forward::{
     forward_cluster_kv_txn_to_state_authority_with_host,
 };
 #[cfg(any(test, feature = "test-support"))]
+pub use kv_local_store::write_cluster_kv_snapshot;
+#[cfg(any(test, feature = "test-support"))]
 pub use kv_local_store::{
     LocalClusterRaftCommandStorage, write_imported_cluster_kv_snapshot_if_changed,
 };
@@ -378,8 +376,6 @@ pub use kv_local_store::{
     remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test,
     reset_cluster_kv_cached_snapshot_reads_for_test,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use kv_local_store::{kv_err, write_cluster_kv_snapshot};
 #[cfg(any(test, feature = "test-support"))]
 pub use kv_read_model::{read_cluster_endpoints_from_kv, read_cluster_network_info_from_kv};
 #[cfg(any(test, feature = "test-support"))]

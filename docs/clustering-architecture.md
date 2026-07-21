@@ -285,19 +285,37 @@ See [DFS architecture](dfs-architecture.md) and
 
 ## Reactive Convergence
 
-Cluster activity drives bounded maintenance; Sinomo does not require a
-conventional always-on heartbeat and election loop. Daemon startup, app or CLI
-traffic, status and health requests, rollout and migration work, peer Raft RPCs,
-network changes, and a low-frequency timer while the daemon is already running
-all coalesce into the same maintenance action.
+Cluster KV is fully reactive. It has no generic maintenance task, periodic
+sweep, or process-wide wake that speculatively checks every convergence
+responsibility. Work is owned by the concrete operation or state transition
+that made it necessary:
 
-One action refreshes observed leadership and term, performs an appropriate
-append heartbeat or catch-up attempt, pulls a newer snapshot when necessary,
-applies and compacts durable state within configured bounds, drains watch work,
-and schedules status or endpoint publication. Each step is bounded and records
-completed, deferred, skipped, or failed evidence. These wake signals schedule
-existing Raft actions; they never establish authority or create a second
-consensus path.
+- A successful commit applies and fans out its exact entries, delivers their
+  watch events, and persists peer-progress hints from that fanout result.
+- A mutation or authoritative read owns the leadership and quorum work its
+  contract requires. A membership or Raft-configuration operation reconciles
+  its own durable lifecycle transition.
+- An observed append gap, explicit startup recovery, or restored route to a
+  known-behind peer initiates targeted log or snapshot recovery for that peer.
+- Log, WAL, and snapshot mutations trigger compaction when the owning store's
+  threshold is crossed.
+- A changed local member, endpoint, or connectivity source publishes its typed
+  value. An unchanged source does not send a publication RPC or create a KV
+  mutation.
+- A peer Raft RPC owns its validation, response, and any exact apply or catch-up
+  work exposed by that request.
+
+Local status, health, app, and CLI reads are observational. They do not schedule
+KV writes, authority barriers, snapshot pulls, configuration reconciliation, or
+other convergence work. An authoritative read performs only the barrier that
+the caller explicitly requested. Retries and coalescing remain attached to the
+originating operation or typed, keyed source-change job; they never become an
+untyped maintenance notification.
+
+This ownership keeps the passive cluster model without an always-on Raft loop
+and makes idle behavior an architecture invariant: when inputs and membership
+are stable and no operation is active, the KV control plane is quiet. Tracing
+and metrics describe owned actions but never trigger them.
 
 ## Failure Behavior
 

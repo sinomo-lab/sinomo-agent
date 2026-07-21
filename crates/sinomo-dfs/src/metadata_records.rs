@@ -474,8 +474,7 @@ pub enum DfsMetadataMutation {
 }
 
 impl DfsMetadataMutation {
-    pub(crate) fn affected_object_ids(&self) -> BTreeSet<DfsObjectId> {
-        let mut object_ids = BTreeSet::new();
+    fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {
         match self {
             Self::PutFileSystem { .. } | Self::PutNamespaceJob { .. } => {}
             Self::PutObject { object_id, .. }
@@ -486,30 +485,21 @@ impl DfsMetadataMutation {
             | Self::CommitVisibleVersion { object_id, .. }
             | Self::PutConflict { object_id, .. }
             | Self::PutAdvisoryLockState { object_id, .. } => {
-                object_ids.insert(object_id.clone());
+                visit(object_id);
             }
             Self::ApplyNamespaceTransaction {
                 transaction: Some(transaction),
                 ..
             } => {
-                object_ids.extend(
-                    transaction
-                        .objects
-                        .iter()
-                        .map(|object| object.object_id.clone()),
-                );
-                object_ids.extend(
-                    transaction
-                        .versions
-                        .iter()
-                        .map(|version| version.object_id.clone()),
-                );
-                object_ids.extend(
-                    transaction
-                        .advisory_lock_states
-                        .iter()
-                        .map(|state| state.object_id.clone()),
-                );
+                for object in &transaction.objects {
+                    visit(&object.object_id);
+                }
+                for version in &transaction.versions {
+                    visit(&version.object_id);
+                }
+                for state in &transaction.advisory_lock_states {
+                    visit(&state.object_id);
+                }
             }
             Self::ApplyNamespaceTransaction {
                 transaction: None, ..
@@ -518,23 +508,65 @@ impl DfsMetadataMutation {
                 prepare: Some(prepare),
                 ..
             } => {
-                object_ids.extend(
-                    prepare
-                        .expected_object_versions
-                        .iter()
-                        .map(|expected| expected.object_id.clone()),
-                );
-                object_ids.extend(
-                    prepare
-                        .transaction
-                        .objects
-                        .iter()
-                        .map(|object| object.object_id.clone()),
-                );
+                for expected in &prepare.expected_object_versions {
+                    visit(&expected.object_id);
+                }
+                for object in &prepare.transaction.objects {
+                    visit(&object.object_id);
+                }
             }
             Self::PutNamespacePrepare { prepare: None, .. } => {}
         }
+    }
+
+    pub(crate) fn affected_object_ids(&self) -> BTreeSet<DfsObjectId> {
+        let mut object_ids = BTreeSet::new();
+        self.visit_affected_object_ids(|object_id| {
+            object_ids.insert(object_id.clone());
+        });
         object_ids
+    }
+
+    /// Return the next sorted page of object IDs touched by this one durable
+    /// journal entry without materializing an arbitrarily large transaction's
+    /// complete ID set. The `has_more` bit is exact and lets a durable caller
+    /// checkpoint progress inside one entry rather than rejecting a valid
+    /// transaction that is larger than its per-pass work budget.
+    pub(crate) fn affected_object_ids_page(
+        &self,
+        after_object_id: Option<&DfsObjectId>,
+        max_entries: usize,
+    ) -> (Vec<DfsObjectId>, bool) {
+        if max_entries == 0 {
+            let mut has_more = false;
+            self.visit_affected_object_ids(|object_id| {
+                if after_object_id.is_none_or(|after| object_id > after) {
+                    has_more = true;
+                }
+            });
+            return (Vec::new(), has_more);
+        }
+
+        let mut object_ids = BTreeSet::new();
+        let mut has_more = false;
+        self.visit_affected_object_ids(|object_id| {
+            if after_object_id.is_some_and(|after| object_id <= after) {
+                return;
+            }
+            if object_ids.insert(object_id.clone()) && object_ids.len() > max_entries {
+                object_ids.pop_last();
+                has_more = true;
+            }
+        });
+        (object_ids.into_iter().collect(), has_more)
+    }
+
+    pub(crate) fn affects_object_id(&self, expected: &DfsObjectId) -> bool {
+        let mut affected = false;
+        self.visit_affected_object_ids(|object_id| {
+            affected |= object_id == expected;
+        });
+        affected
     }
 
     pub(crate) fn put_file_system(file_system: &DfsFileSystem) -> Self {
@@ -994,6 +1026,11 @@ pub struct DfsTombstoneCompactionReport {
     pub eligible_tombstone_count: u64,
     pub compacted_tombstone_count: u64,
     pub retained_young_tombstone_count: u64,
+    /// Earliest wall-clock instant at which a currently young tombstone can
+    /// become retention-eligible. This lets reactive schedulers arm one exact
+    /// deadline instead of polling the whole metadata set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_at_unix_nanos: Option<u64>,
     pub retained_referenced_tombstone_count: u64,
     pub retained_limit_tombstone_count: u64,
     pub removed_object_record_count: u64,
@@ -1401,6 +1438,11 @@ impl DfsTombstoneCompactionReport {
         self.retained_young_tombstone_count = self
             .retained_young_tombstone_count
             .saturating_add(other.retained_young_tombstone_count);
+        self.next_eligible_at_unix_nanos = self
+            .next_eligible_at_unix_nanos
+            .into_iter()
+            .chain(other.next_eligible_at_unix_nanos)
+            .min();
         self.retained_referenced_tombstone_count = self
             .retained_referenced_tombstone_count
             .saturating_add(other.retained_referenced_tombstone_count);
@@ -1491,6 +1533,9 @@ pub(crate) fn object_version_record(
 pub(crate) fn normalized_object_metadata(object: &DfsObjectMetadata) -> DfsObjectMetadata {
     let mut object = object.clone();
     normalize_node_locations(&mut object.current_locations);
+    if object.kind != crate::DfsObjectKind::Tombstone {
+        object.tombstone_provenance = None;
+    }
     object
 }
 
@@ -1507,7 +1552,7 @@ pub(crate) fn normalized_namespace_transaction(
 ) -> DfsNamespaceTransaction {
     let mut transaction = transaction.clone();
     for object in &mut transaction.objects {
-        normalize_node_locations(&mut object.current_locations);
+        *object = normalized_object_metadata(object);
     }
     for version in &mut transaction.versions {
         normalize_node_locations(&mut version.locations);
@@ -1578,6 +1623,7 @@ mod tests {
             file_system_id: file_system_id(),
             path: "/docs/mutation.md".to_string(),
             kind: DfsObjectKind::File,
+            tombstone_provenance: None,
             owner_node_id: node("node_owner"),
             current_locations: vec![node("node_owner")],
             content_hash: Some("blake3:mutation".to_string()),
@@ -1744,6 +1790,86 @@ mod tests {
                 visible_version: Some(visible_version),
                 required_replica_node_ids: commit.required_replica_node_ids,
             }
+        );
+    }
+
+    #[test]
+    fn namespace_transaction_affected_object_ids_page_covers_512_ids_in_two_pages() {
+        let mut objects = Vec::with_capacity(512);
+        for index in (0..512).rev() {
+            let mut object = object(version("version_paged_namespace_transaction"));
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_paged_namespace_{index:04}"))
+                    .expect("valid object id");
+            object.path = format!("/docs/paged-namespace-{index:04}.md");
+            objects.push(object);
+        }
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "transaction_paged_namespace_512".to_string(),
+            file_system_id: file_system_id(),
+            objects,
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mutation = DfsMetadataMutation::ApplyNamespaceTransaction {
+            file_system_id: transaction.file_system_id.clone(),
+            transaction_id: transaction.transaction_id.clone(),
+            object_count: transaction.objects.len(),
+            transaction: Some(transaction),
+        };
+        let expected = mutation
+            .affected_object_ids()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 512);
+
+        let (first_page, first_has_more) = mutation.affected_object_ids_page(None, 256);
+        assert_eq!(first_page, expected[..256]);
+        assert!(first_has_more);
+        assert_eq!(
+            mutation.affected_object_ids_page(None, 256),
+            (first_page.clone(), true),
+            "paging the same durable entry must be deterministic"
+        );
+
+        let (second_page, second_has_more) =
+            mutation.affected_object_ids_page(first_page.last(), 256);
+        assert_eq!(second_page, expected[256..]);
+        assert!(!second_has_more);
+
+        let mut paged = first_page;
+        paged.extend(second_page);
+        assert_eq!(
+            paged, expected,
+            "paging must neither lose nor duplicate an object ID"
+        );
+        assert_eq!(paged.into_iter().collect::<BTreeSet<_>>().len(), 512);
+    }
+
+    #[test]
+    fn zero_object_mutation_has_no_affected_object_id_page() {
+        let mutation = DfsMetadataMutation::ApplyNamespaceTransaction {
+            file_system_id: file_system_id(),
+            transaction_id: "transaction_empty_namespace".to_string(),
+            object_count: 0,
+            transaction: Some(DfsNamespaceTransaction {
+                transaction_id: "transaction_empty_namespace".to_string(),
+                file_system_id: file_system_id(),
+                objects: Vec::new(),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            }),
+        };
+
+        assert_eq!(
+            mutation.affected_object_ids_page(None, 256),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            mutation.affected_object_ids_page(None, 0),
+            (Vec::new(), false)
         );
     }
 }

@@ -647,6 +647,32 @@ fn authorize_daemon_signer(
     if request.route == crate::DAEMON_STATUS_ROUTE {
         return Ok(DaemonSignerAuthority::StatusProbe);
     }
+    if let Some(authority) = authorize_connectivity_signer_from_locally_accepted_state(
+        data_dir,
+        envelope,
+        &envelope_public_key,
+        request,
+    ) {
+        // A bridge persists the authority's accepted join response before it
+        // sends that response back to the new member. Its merged KV read model
+        // can still trail that write for a few milliseconds, though, because
+        // non-local members are replaced by the last applied KV snapshot. The
+        // post-join connectivity handoff is read-only and identity-exact, so
+        // admit it from that trusted accepted state instead of blocking on a
+        // fresh quorum snapshot inside the formation gate.
+        crate::cluster_join_trace(format_args!(
+            "connectivity auth accepted signer={} from locally accepted membership while merged KV visibility was pending",
+            envelope.node_id
+        ));
+        tracing::info!(
+            target: "sinomo.cluster.formation",
+            stage = "connectivity_auth_local_accepted_state",
+            signer_node_id = %envelope.node_id,
+            route = %request.route,
+            "authenticated connectivity handoff from locally accepted member state"
+        );
+        return Ok(authority);
+    }
     if let Some(authority) = authorize_daemon_signer_after_membership_refresh(
         data_dir,
         envelope,
@@ -661,6 +687,31 @@ fn authorize_daemon_signer(
         return Ok(authority);
     }
     Err(DaemonError::AuthDenied)
+}
+
+fn authorize_connectivity_signer_from_locally_accepted_state(
+    data_dir: &Path,
+    envelope: &SignedDaemonCommand,
+    envelope_public_key: &str,
+    request: &sinomo_core::network::ObjectRpcRequest,
+) -> Option<DaemonSignerAuthority> {
+    if request.route != sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE {
+        return None;
+    }
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()?;
+    if sinomo_core::network::cluster_state_needs_join_registration(&state) {
+        return None;
+    }
+    state
+        .members
+        .iter()
+        .find(|member| {
+            member.state.is_authorized()
+                && member.node_id.as_str() == envelope.node_id
+                && member.node_public_key == envelope_public_key
+        })
+        .map(signer_authority_for_member)
 }
 
 fn daemon_route_requires_exact_member_identity(route: &str) -> bool {
@@ -1801,6 +1852,97 @@ mod tests {
                 &peer_identity.public_key,
             ),
             Some(DaemonSignerAuthority::Member)
+        );
+    }
+
+    #[test]
+    fn connectivity_handoff_accepts_exact_member_from_locally_accepted_state_only() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-connectivity-handoff");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_daemon_auth_connectivity_handoff",
+        )
+        .expect("cluster id");
+        let local_node = sinomo_core::node::NodeId::from_legacy_named(
+            "node_daemon_auth_connectivity_handoff_local",
+        )
+        .expect("local node");
+        let peer_node = sinomo_core::node::NodeId::from_legacy_named(
+            "node_daemon_auth_connectivity_handoff_peer",
+        )
+        .expect("peer node");
+        let now = OffsetDateTime::now_utc();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity handoff",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut peer = ClusterMemberRecord::pending_learner(
+            cluster_id,
+            peer_node.clone(),
+            "peer",
+            "pk-peer",
+            now,
+        );
+        peer.state = ClusterMemberState::Learner;
+        state.members.push(peer);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write locally accepted state");
+
+        let envelope = SignedDaemonCommand {
+            protocol: DAEMON_AUTH_PROTOCOL.to_string(),
+            node_id: peer_node.to_string(),
+            public_key: Vec::new(),
+            timestamp: now.format(&Rfc3339).expect("timestamp"),
+            nonce: "connectivity-handoff".to_string(),
+            rpc_body_sha256: None,
+            signature: Vec::new(),
+        };
+        let connectivity = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+            &(),
+        )
+        .expect("connectivity request");
+        assert_eq!(
+            authorize_connectivity_signer_from_locally_accepted_state(
+                data_root.path(),
+                &envelope,
+                "pk-peer",
+                &connectivity,
+            ),
+            Some(DaemonSignerAuthority::Member)
+        );
+        assert_eq!(
+            authorize_connectivity_signer_from_locally_accepted_state(
+                data_root.path(),
+                &envelope,
+                "pk-wrong",
+                &connectivity,
+            ),
+            None,
+            "the locally accepted fast path must bind the exact member key"
+        );
+
+        let health = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
+            sinomo_core::network::CLUSTER_HEALTH_RPC_CATEGORY,
+            &(),
+        )
+        .expect("health request");
+        assert_eq!(
+            authorize_connectivity_signer_from_locally_accepted_state(
+                data_root.path(),
+                &envelope,
+                "pk-peer",
+                &health,
+            ),
+            None,
+            "locally accepted state must not widen authorization for other RPC routes"
         );
     }
 

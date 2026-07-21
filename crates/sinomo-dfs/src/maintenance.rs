@@ -19,16 +19,17 @@ use crate::{
     AsyncDfsMetadataNodeTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
     ContentStoreGcReport, ContentStoreScrubReport, ContentStoreStagingGcOptions,
     ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
-    DFS_PENDING_TRANSFER_STALE_AFTER, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
-    DfsMessageSender, DfsMessageTransport, DfsMetadataBackend, DfsMetadataJournalBatchSender,
-    DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
-    DfsMetadataNodeTransport, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState,
-    DfsObjectId, DfsObjectPageCursor, DfsPeerTransport, DfsPlacementReconciliationJob,
-    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion,
-    DistributedRepairJob, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
-    NetworkedDfsServiceEvent, async_dfs_metadata_journal_batch_sender_from_peer_transport,
+    DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker, DfsControlPlaneKvClient,
+    DfsDistributedWriteResult, DfsError, DfsFileSystemId, DfsMessageSender, DfsMessageTransport,
+    DfsMetadataBackend, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport,
+    DfsNodeDetachedSendState, DfsObjectId, DfsObjectPageCursor, DfsPeerTransport,
+    DfsPlacementReconciliationJob, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
+    DfsTransportIdentity, DfsVersion, DistributedRepairJob, LocalDfsMetadataJournalPublisherHost,
+    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    async_dfs_metadata_journal_batch_sender_from_peer_transport,
     async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_metadata_shards,
     cluster_dfs_peer_node_ids, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
@@ -40,6 +41,31 @@ use crate::{
     publish_dfs_metadata_journal_with_host,
     refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
+
+/// Returns true when an authority-side message commit created durable DFS work
+/// which must wake the reactive maintenance classifier.
+///
+/// A routed write requester observes `RemoteWriteCompleted`, but only the
+/// metadata authority serving `RemoteWriteServed` owns the pending intent or
+/// repair jobs. Keeping that distinction here prevents requester-side traffic
+/// from waking broad maintenance while guaranteeing that asynchronous W=1
+/// commits cannot park until an unrelated notification or safety reprobe.
+pub fn dfs_events_should_wake_repair_maintenance(events: &[NetworkedDfsServiceEvent]) -> bool {
+    events.iter().any(|event| {
+        let NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Outcome { outcome },
+            ..
+        } = event
+        else {
+            return false;
+        };
+        match outcome {
+            NetworkedDfsWriteOutcome::Pending { .. } => true,
+            NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => !repair_jobs.is_empty(),
+            NetworkedDfsWriteOutcome::Conflict { .. } => false,
+        }
+    })
+}
 
 #[cfg(test)]
 pub(crate) fn run_cluster_dfs_maintenance_tick(
@@ -128,6 +154,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
         peer_transport,
         None,
         DfsMaintenanceExecutionExclusions::default(),
+        None,
         control_plane,
         options,
     )
@@ -186,6 +213,41 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
         peer_transport,
         Some(detached_send_state),
         execution_exclusions,
+        None,
+        control_plane,
+        options,
+    )
+    .await
+}
+
+/// Run cancellable cluster DFS maintenance while publishing every durable
+/// follow-up edge into caller-retained state.
+///
+/// The tracker outlives the backend-bearing service generation. A caller can
+/// therefore transfer committed work after success, error, or cancellation
+/// without making broad maintenance compete with retained publisher lanes.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: DfsCommittedWorkTracker,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
+        runtime,
+        data_dir,
+        cluster_paths,
+        sync_peer_transport,
+        peer_transport,
+        Some(detached_send_state),
+        execution_exclusions,
+        Some(committed_work_tracker),
         control_plane,
         options,
     )
@@ -201,6 +263,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     detached_send_state: Option<DfsNodeDetachedSendState>,
     execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: Option<DfsCommittedWorkTracker>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
@@ -248,6 +311,9 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
             control_plane,
         )?,
     };
+    if let Some(committed_work_tracker) = committed_work_tracker {
+        service.set_committed_work_tracker(committed_work_tracker);
+    }
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
@@ -1001,6 +1067,10 @@ pub struct DfsMaintenanceTickOptions {
     pub placement_reconciliation_max_objects: usize,
     pub repair_max_jobs: usize,
     pub lifecycle: DfsMaintenanceRunOptions,
+    /// Whether this broad maintenance pass owns metadata-journal publication.
+    /// Reactive runtimes with exact per-shard publishers disable this to keep
+    /// a single durable owner for each replication cursor.
+    pub publish_metadata: bool,
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
 }
 
@@ -1067,6 +1137,7 @@ impl Default for DfsMaintenanceTickOptions {
             placement_reconciliation_max_objects: DEFAULT_DFS_PLACEMENT_RECONCILIATION_MAX_OBJECTS,
             repair_max_jobs: usize::MAX,
             lifecycle: DfsMaintenanceRunOptions::default(),
+            publish_metadata: true,
             metadata_replication: DfsMetadataJournalReplicationOptions::default(),
         }
     }
@@ -1424,14 +1495,20 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     service.observe_repair_maintenance_events(&followup_events);
     let repair_attempts_after = service.active_repair_attempt_records();
     maintenance_host.store_repair_attempt_records(&repair_attempts_after)?;
-    let metadata_replication = publish_dfs_metadata_journal_with_host(
-        file_system_id,
-        local_node_id,
-        metadata_shards.clone(),
-        metadata_publisher_host,
-        metadata_transport,
-        options.metadata_replication,
-    )?;
+    let metadata_replication = if options.publish_metadata {
+        publish_dfs_metadata_journal_with_host(
+            file_system_id,
+            local_node_id,
+            metadata_shards.clone(),
+            metadata_publisher_host,
+            metadata_transport,
+            options.metadata_replication,
+        )?
+    } else {
+        DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        }
+    };
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,
@@ -1550,7 +1627,7 @@ where
         execution_exclusions,
     );
     maintenance_host.store_repair_attempt_records(&repair_attempts_after)?;
-    let metadata_replication =
+    let metadata_replication = if options.publish_metadata {
         crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
             file_system_id,
             local_node_id,
@@ -1561,7 +1638,12 @@ where
             execution_exclusions,
             options.metadata_replication,
         )
-        .await?;
+        .await?
+    } else {
+        DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        }
+    };
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,

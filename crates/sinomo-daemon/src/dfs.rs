@@ -8,7 +8,7 @@ use sinomo_core::ClusterNodeAvailability;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{
-    KvCompare, KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
+    KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion,
 };
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
@@ -19,20 +19,22 @@ use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 use sinomo_dfs::{
-    ContentStoreError, DfsConflictRecord, DfsConflictStatus, DfsDataPlaneHost,
-    DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
-    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
-    DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions, DfsMessageCommand,
-    DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    ContentStoreError, ContentStoreStagingGcOptions, DfsCommittedWorkTracker, DfsConflictRecord,
+    DfsConflictStatus, DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
+    DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
+    DfsFileSystemId, DfsMaintenanceExecutionExclusions, DfsMaintenanceRunOptions,
+    DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
+    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
     DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata,
     DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
     DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    LocalContentStore, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
-    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
+    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
+    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
+    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
+    read_dfs_repair_attempt_snapshot,
 };
 #[cfg(test)]
 use sinomo_dfs::{
@@ -65,16 +67,6 @@ const DAEMON_DFS_PROMOTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
-const DAEMON_DFS_MAINTENANCE_LEASE_KEY: &str = "/dfs/runtime/maintenance-lease";
-const DAEMON_DFS_MAINTENANCE_LEASE_TTL: Duration = Duration::from_secs(60);
-const DAEMON_DFS_MAINTENANCE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
-const DAEMON_DFS_MAINTENANCE_LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
-// The shared wall-clock expiry remains valid beyond the holder's monotonic
-// authority deadline. The two margins tolerate up to 30 seconds of pairwise
-// clock skew and still leave 30 seconds for an expired holder's bounded peer
-// calls to unwind before an ahead claimant can take over.
-const DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
-const DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE: Duration = Duration::from_secs(30);
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 // A replica journal apply is durable WAN work. Give daemon maintenance a larger
 // response budget than the library default while keeping foreground publication
@@ -82,9 +74,17 @@ const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
+const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
 const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
+const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_MAX: Duration = Duration::from_secs(60);
+const DAEMON_DEFAULT_DFS_MEMBER_PREFIX: &str = "/cluster/members/";
+const DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX: &str = "/cluster/endpoints/";
+const DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX: &str = "/cluster/network/connectivity/";
 
 fn daemon_dfs_local_zone() -> Option<String> {
     std::env::var(SINOMO_DFS_ZONE_ENV)
@@ -99,6 +99,37 @@ fn daemon_dfs_local_zone() -> Option<String> {
 static DAEMON_DEFAULT_DFS_LIFECYCLE_GATES: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
+
+#[cfg(test)]
+static DAEMON_DEFAULT_DFS_RECONCILIATION_RUNS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_daemon_default_dfs_reconciliation_run(paths: &DaemonPaths) {
+    let Ok(data_dir) = daemon_data_dir(paths) else {
+        return;
+    };
+    if let Ok(mut runs) = DAEMON_DEFAULT_DFS_RECONCILIATION_RUNS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        let count = runs.entry(data_dir.to_path_buf()).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn daemon_default_dfs_reconciliation_run_count(paths: &DaemonPaths) -> usize {
+    let Ok(data_dir) = daemon_data_dir(paths) else {
+        return 0;
+    };
+    DAEMON_DEFAULT_DFS_RECONCILIATION_RUNS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()
+        .and_then(|runs| runs.get(data_dir).copied())
+        .unwrap_or_default()
+}
 
 type DaemonDfsMessageService = NetworkedDfsService<DfsNodeServedMessageTransport>;
 
@@ -124,7 +155,15 @@ fn daemon_dfs_message_kind(message: &sinomo_dfs::DfsNetworkMessage) -> &'static 
 struct DaemonDfsMessageCommandProcessResult {
     response: DfsMessageResponse,
     attachment: Option<sinomo_dfs::DfsOutboundAttachment>,
-    events: Vec<sinomo_dfs::NetworkedDfsServiceEvent>,
+    committed_edges: DaemonDfsMessageCommittedEdges,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DaemonDfsMessageCommittedEdges {
+    publish_metadata: bool,
+    replica_progress: bool,
+    repair_maintenance: bool,
+    namespace_maintenance: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,17 +192,30 @@ struct DaemonDfsMetadataAuthorityProjection {
 struct DaemonDfsMetadataAuthorityGeneration {
     projection: Mutex<DaemonDfsMetadataAuthorityProjection>,
     generation: AtomicU64,
+    #[cfg(test)]
+    projection_rebuild_count: AtomicU64,
+    publish_wake: Mutex<Option<DaemonDfsMetadataAuthorityPublishWake>>,
     subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonDfsMetadataAuthorityPublishWake {
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    runtime: tokio::runtime::Handle,
 }
 
 impl DaemonDfsMetadataAuthorityGeneration {
     fn new() -> Self {
         Self {
             projection: Mutex::new(DaemonDfsMetadataAuthorityProjection {
-                revision: Some(KvRevision::ZERO),
+                revision: None,
                 entries: Vec::new(),
             }),
             generation: AtomicU64::new(1),
+            #[cfg(test)]
+            projection_rebuild_count: AtomicU64::new(0),
+            publish_wake: Mutex::new(None),
             subscription: OnceLock::new(),
         }
     }
@@ -172,27 +224,96 @@ impl DaemonDfsMetadataAuthorityGeneration {
         self.generation.load(Ordering::Acquire)
     }
 
-    fn observe(&self, snapshot: &KvSnapshot) {
-        let entries = daemon_dfs_metadata_authority_projection(snapshot);
-        let Ok(mut observed) = self.projection.lock() else {
+    #[cfg(test)]
+    fn projection_rebuild_count(&self) -> u64 {
+        self.projection_rebuild_count.load(Ordering::Acquire)
+    }
+
+    fn attach_publish_wake(
+        &self,
+        cluster_paths: &ClusterPaths,
+        runtime: Option<&tokio::runtime::Handle>,
+    ) {
+        let Some(runtime) = runtime else {
             return;
         };
-        if observed
-            .revision
-            .is_some_and(|revision| snapshot.revision < revision)
-        {
+        let Some(data_root) = cluster_paths.root.parent() else {
             return;
+        };
+        if let Ok(mut publish_wake) = self.publish_wake.lock() {
+            *publish_wake = Some(DaemonDfsMetadataAuthorityPublishWake {
+                data_dir: SinomoDataDir::new(data_root),
+                cluster_paths: cluster_paths.clone(),
+                runtime: runtime.clone(),
+            });
         }
-        let initialized = observed.revision.is_some();
-        if initialized && observed.entries != entries {
-            let _ =
-                self.generation
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                        Some(generation.saturating_add(1))
-                    });
+    }
+
+    fn observe(&self, snapshot: &KvSnapshot) {
+        let authority_changed = {
+            let Ok(mut observed) = self.projection.lock() else {
+                return;
+            };
+            let previous_revision = observed.revision;
+            if previous_revision.is_some_and(|revision| snapshot.revision <= revision) {
+                return;
+            }
+            let rebuild = match previous_revision {
+                None => true,
+                Some(revision) if revision < snapshot.compacted_revision => true,
+                Some(revision) => {
+                    let first_new = snapshot
+                        .events
+                        .partition_point(|event| event.revision <= revision);
+                    snapshot.events[first_new..]
+                        .iter()
+                        .any(|event| daemon_dfs_metadata_authority_key_is_exact(&event.key))
+                }
+            };
+            if !rebuild {
+                // Authority consumes only exact shard/configuration keys.
+                // Advance the retained cursor without scanning or cloning the
+                // resident KV image for unrelated commits.
+                observed.revision = Some(snapshot.revision);
+                return;
+            }
+            let entries = daemon_dfs_metadata_authority_projection(snapshot);
+            #[cfg(test)]
+            self.projection_rebuild_count.fetch_add(1, Ordering::AcqRel);
+            // `None` means the retained observer has not seen any committed
+            // authority image yet, not that the authority image is known to
+            // be empty. A first non-empty image is therefore a real semantic
+            // edge: consumers may already have observed the initial
+            // generation while waiting for the cluster snapshot, and local
+            // primary backlog must be discovered without unrelated traffic.
+            let authority_changed = observed.entries != entries;
+            if authority_changed {
+                let _ = self.generation.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |generation| Some(generation.saturating_add(1)),
+                );
+            }
+            observed.revision = Some(snapshot.revision);
+            observed.entries = entries;
+            authority_changed
+        };
+        let wake = authority_changed
+            .then(|| {
+                self.publish_wake
+                    .lock()
+                    .ok()
+                    .and_then(|publish_wake| publish_wake.clone())
+            })
+            .flatten();
+        if let Some(wake) = wake {
+            schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
+                wake.data_dir,
+                wake.cluster_paths,
+                &wake.runtime,
+                None,
+            );
         }
-        observed.revision = Some(snapshot.revision);
-        observed.entries = entries;
     }
 }
 
@@ -245,6 +366,13 @@ struct DaemonDfsMetadataAuthorityGenerationKey {
     snapshot: PathBuf,
     cluster_id: String,
     local_node_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DaemonDfsMetadataPublishLaneKey {
+    data_root: PathBuf,
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
 }
 
 impl DaemonDfsDetachedSendRuntime {
@@ -391,11 +519,35 @@ static DAEMON_DFS_MESSAGE_SERVICE_CACHE: OnceLock<
 #[cfg(test)]
 static DAEMON_DFS_TEST_MESSAGE_SERVICE_LANE_OPENS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
     OnceLock::new();
+#[cfg(test)]
+static DAEMON_DFS_TEST_METADATA_PUBLISH_DISCOVERY_ATTEMPTS: OnceLock<
+    Mutex<BTreeMap<PathBuf, (usize, usize)>>,
+> = OnceLock::new();
+#[cfg(test)]
+static DAEMON_DFS_TEST_METADATA_PUBLISH_LANE_REQUESTS: OnceLock<
+    Mutex<BTreeMap<DaemonDfsMetadataPublishLaneKey, usize>>,
+> = OnceLock::new();
+#[cfg(test)]
+static DAEMON_DFS_TEST_REPAIR_MAINTENANCE_EDGE_REQUESTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
+static DAEMON_DFS_TEST_MESSAGE_COMMITTED_EDGE_HOOKS: OnceLock<
+    Mutex<BTreeMap<String, Arc<DaemonDfsMessageCommittedEdgeTestHook>>>,
+> = OnceLock::new();
 static DAEMON_DFS_MUTATION_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<DaemonDfsMutationScheduler>>>,
 > = OnceLock::new();
+static DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS: OnceLock<
+    Mutex<BTreeMap<DaemonDfsMetadataPublishLaneKey, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
+> = OnceLock::new();
+static DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS: OnceLock<
+    Mutex<BTreeMap<PathBuf, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
+> = OnceLock::new();
 static DAEMON_DFS_MESSAGE_EXECUTION_GATES: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<DaemonDfsMessageExecutionGate>>>,
+> = OnceLock::new();
+static DAEMON_DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
+    Mutex<BTreeMap<PathBuf, Weak<DaemonDefaultDfsReconciliationWake>>>,
 > = OnceLock::new();
 static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
     Mutex<
@@ -413,6 +565,13 @@ static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::n
 static DAEMON_DFS_DATA_OWNER_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<DaemonDataOwnerLock>>>> =
     OnceLock::new();
 static DAEMON_DFS_SMOKE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DaemonDfsMessageCommittedEdgeTestHook {
+    started_tx: std::sync::mpsc::Sender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
 
 /// Publish the process-lifetime main-daemon data lock to DFS blocking work.
 /// The registry stores only a weak reference; the control loop remains the
@@ -476,6 +635,9 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub due_repair_attempt_count: usize,
     pub unattempted_repair_count: usize,
     pub next_repair_retry_unix_nanos: Option<u64>,
+    pub due_time_based_maintenance_count: usize,
+    pub next_time_based_maintenance_unix_nanos: Option<u64>,
+    pub deferred_work_count: usize,
     pub pending_namespace_job_count: usize,
     pub actionable_conflict_count: usize,
     pub actionable_placement_reconciliation_count: usize,
@@ -493,21 +655,35 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.actionable_placement_reconciliation_count > 0
             || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
+            || self.due_time_based_maintenance_count > 0
     }
 
     pub(crate) fn should_trigger_background_maintenance(self) -> bool {
         // Pending repairs can represent unreachable replicas and are expensive
         // to rescan. Trigger the short loop only when a repair is due or has
         // never been attempted; repair backoff snapshots keep unreachable
-        // replicas from hot-looping.
+        // replicas from hot-looping. Metadata replica lag is intentionally not
+        // a broad-maintenance trigger: retained exact-shard publisher lanes own
+        // those durable cursors and their connectivity/backoff wakes.
         self.pending_write_count > 0
             || self.pending_namespace_job_count > 0
             || self.actionable_conflict_count > 0
             || self.actionable_placement_reconciliation_count > 0
-            || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
             || self.due_repair_attempt_count > 0
             || self.unattempted_repair_count > 0
+            || self.due_time_based_maintenance_count > 0
+    }
+
+    pub(crate) fn next_maintenance_deadline_unix_nanos(self) -> Option<u64> {
+        self.next_repair_retry_unix_nanos
+            .into_iter()
+            .chain(self.next_time_based_maintenance_unix_nanos)
+            .min()
+    }
+
+    pub(crate) fn has_deferred_work(self) -> bool {
+        self.deferred_work_count > 0
     }
 }
 
@@ -522,546 +698,33 @@ fn daemon_dfs_duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, Eq, PartialEq)]
-struct DaemonDfsMaintenanceLeaseRecord {
-    holder_node_id: NodeId,
-    owner_token: String,
-    #[serde(default)]
-    renewal_sequence: u64,
-    expires_unix_nanos: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DaemonDfsMaintenanceLeaseAcquire {
-    Acquired(DaemonDfsMaintenanceLeaseRecord),
-    Deferred(Option<DaemonDfsMaintenanceLeaseRecord>),
-}
-
-fn daemon_dfs_maintenance_lease_record(
-    holder_node_id: NodeId,
-    owner_token: String,
-    now_unix_nanos: u64,
-) -> DaemonDfsMaintenanceLeaseRecord {
-    DaemonDfsMaintenanceLeaseRecord {
-        holder_node_id,
-        owner_token,
-        renewal_sequence: 0,
-        expires_unix_nanos: now_unix_nanos
-            .saturating_add(daemon_dfs_duration_nanos(DAEMON_DFS_MAINTENANCE_LEASE_TTL))
-            .saturating_add(daemon_dfs_duration_nanos(
-                DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW,
-            ))
-            .saturating_add(daemon_dfs_duration_nanos(
-                DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE,
-            )),
-    }
-}
-
-async fn acquire_daemon_dfs_maintenance_lease(
-    kv: &mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient,
-    holder_node_id: NodeId,
-    owner_token: String,
-    now_unix_nanos: u64,
-) -> Result<DaemonDfsMaintenanceLeaseAcquire, KvError> {
-    kv.refresh_latest_async().await?;
-    let current = kv.get_async(DAEMON_DFS_MAINTENANCE_LEASE_KEY).await?;
-    let compare = match current.as_ref() {
-        None => KvCompare::Missing {
-            key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-        },
-        Some(entry) => {
-            let record =
-                sinomo_core::kv::decode_kv_value::<DaemonDfsMaintenanceLeaseRecord>(&entry.value)?;
-            if record.expires_unix_nanos > now_unix_nanos {
-                return Ok(DaemonDfsMaintenanceLeaseAcquire::Deferred(Some(record)));
-            }
-            KvCompare::ValueEquals {
-                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-                value: entry.value.clone(),
-            }
-        }
-    };
-    let record = daemon_dfs_maintenance_lease_record(holder_node_id, owner_token, now_unix_nanos);
-    let response = kv
-        .txn_async(KvTxn {
-            compares: vec![compare],
-            success: vec![KvOp::Put {
-                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-                value: sinomo_core::kv::encode_kv_value(&record)?,
-                lease_id: None,
-            }],
-            failure: Vec::new(),
-        })
-        .await?;
-    if response.succeeded {
-        Ok(DaemonDfsMaintenanceLeaseAcquire::Acquired(record))
-    } else {
-        Ok(DaemonDfsMaintenanceLeaseAcquire::Deferred(None))
-    }
-}
-
-async fn renew_daemon_dfs_maintenance_lease(
-    kv: &mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient,
-    current: &DaemonDfsMaintenanceLeaseRecord,
-    now_unix_nanos: u64,
-    minimum_expiry_advance: Duration,
-) -> Result<Option<DaemonDfsMaintenanceLeaseRecord>, KvError> {
-    if current.expires_unix_nanos <= now_unix_nanos {
-        return Ok(None);
-    }
-    let renewal_sequence =
-        current
-            .renewal_sequence
-            .checked_add(1)
-            .ok_or_else(|| KvError::Serialization {
-                detail: "DFS maintenance lease renewal sequence exhausted".to_string(),
-            })?;
-    let renewed = DaemonDfsMaintenanceLeaseRecord {
-        holder_node_id: current.holder_node_id.clone(),
-        owner_token: current.owner_token.clone(),
-        renewal_sequence,
-        expires_unix_nanos: current
-            .expires_unix_nanos
-            .saturating_add(daemon_dfs_duration_nanos(minimum_expiry_advance))
-            .max(
-                now_unix_nanos
-                    .saturating_add(daemon_dfs_duration_nanos(DAEMON_DFS_MAINTENANCE_LEASE_TTL))
-                    .saturating_add(daemon_dfs_duration_nanos(
-                        DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW,
-                    ))
-                    .saturating_add(daemon_dfs_duration_nanos(
-                        DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE,
-                    )),
-            ),
-    };
-    let response = kv
-        .txn_async(KvTxn {
-            compares: vec![KvCompare::ValueEquals {
-                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-                value: sinomo_core::kv::encode_kv_value(current)?,
-            }],
-            success: vec![KvOp::Put {
-                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-                value: sinomo_core::kv::encode_kv_value(&renewed)?,
-                lease_id: None,
-            }],
-            failure: Vec::new(),
-        })
-        .await?;
-    Ok(response.succeeded.then_some(renewed))
-}
-
-async fn release_daemon_dfs_maintenance_lease(
-    kv: &mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient,
-    current: &DaemonDfsMaintenanceLeaseRecord,
-) -> Result<bool, KvError> {
-    let response = kv
-        .txn_async(KvTxn {
-            compares: vec![KvCompare::ValueEquals {
-                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-                value: sinomo_core::kv::encode_kv_value(current)?,
-            }],
-            success: vec![KvOp::Delete {
-                key: DAEMON_DFS_MAINTENANCE_LEASE_KEY.to_string(),
-            }],
-            failure: Vec::new(),
-        })
-        .await?;
-    Ok(response.succeeded)
-}
-
-fn daemon_dfs_maintenance_lease_error(detail: impl Into<String>) -> DaemonError {
-    DaemonError::Network {
-        address: "DFS maintenance lease".to_string(),
-        detail: detail.into(),
-    }
-}
-
-#[derive(Debug)]
-struct DaemonDfsMaintenanceLeaseRenewalState {
-    client: DaemonDfsControlPlaneKvClient,
-    record: DaemonDfsMaintenanceLeaseRecord,
-    loss_detail: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct DaemonDfsMaintenanceLeaseAuthority {
-    deadline: Instant,
-    loss_detail: Option<String>,
-}
-
-#[derive(Debug)]
-struct DaemonDfsMaintenanceLease {
-    stop_tx: tokio::sync::oneshot::Sender<()>,
-    authority_rx: tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
-    renewal_task: tokio::task::JoinHandle<DaemonDfsMaintenanceLeaseRenewalState>,
-}
-
-impl DaemonDfsMaintenanceLease {
-    fn authority_receiver(
-        &self,
-    ) -> tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority> {
-        self.authority_rx.clone()
-    }
-
-    fn ownership_loss_detail(&self) -> Option<String> {
-        let authority = self.authority_rx.borrow();
-        if let Some(detail) = authority.loss_detail.clone() {
-            return Some(detail);
-        }
-        (Instant::now() >= authority.deadline).then(|| {
-            "local authority deadline elapsed before DFS maintenance admission".to_string()
-        })
-    }
-
-    async fn release(self) -> Result<(), DaemonError> {
-        let _ = self.stop_tx.send(());
-        let mut state = self.renewal_task.await.map_err(|source| {
-            daemon_dfs_maintenance_lease_error(format!(
-                "renewal task stopped before release: {source}"
-            ))
-        })?;
-        let released = tokio::time::timeout(
-            DAEMON_DFS_MAINTENANCE_LEASE_RELEASE_TIMEOUT,
-            release_daemon_dfs_maintenance_lease(&mut state.client, &state.record),
-        )
-        .await
-        .map_err(|_| {
-            daemon_dfs_maintenance_lease_error(format!(
-                "timed out releasing owner {} held by {}",
-                state.record.owner_token, state.record.holder_node_id
-            ))
-        })?
-        .map_err(|source| {
-            daemon_dfs_maintenance_lease_error(format!(
-                "failed to release owner {} held by {}: {source}",
-                state.record.owner_token, state.record.holder_node_id
-            ))
-        })?;
-        if let Some(detail) = state.loss_detail {
-            return Err(daemon_dfs_maintenance_lease_error(detail));
-        }
-        if !released {
-            return Err(daemon_dfs_maintenance_lease_error(format!(
-                "owner {} held by {} lost ownership before release",
-                state.record.owner_token, state.record.holder_node_id
-            )));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 struct DaemonDfsMaintenanceAdmission {
-    lease: DaemonDfsMaintenanceLease,
     _lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
     _message_execution_guard: tokio::sync::OwnedSemaphorePermit,
 }
 
-#[derive(Debug)]
-struct DaemonDfsMaintenanceLocalAdmission {
-    lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
-    message_execution_guard: tokio::sync::OwnedSemaphorePermit,
-}
-
-async fn wait_for_daemon_dfs_maintenance_lease_loss(
-    authority_rx: &mut tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
-) -> String {
-    loop {
-        let authority = authority_rx.borrow().clone();
-        if let Some(detail) = authority.loss_detail {
-            return detail;
-        }
-        if Instant::now() >= authority.deadline {
-            return "local authority deadline elapsed while waiting for DFS maintenance lease"
-                .to_string();
-        }
-        let authority_timeout =
-            tokio::time::sleep_until(tokio::time::Instant::from_std(authority.deadline));
-        tokio::pin!(authority_timeout);
-        tokio::select! {
-            biased;
-            _ = &mut authority_timeout => {
-                return "local authority deadline elapsed while waiting for DFS maintenance lease"
-                    .to_string();
-            }
-            changed = authority_rx.changed() => {
-                if changed.is_err() {
-                    return "renewal task stopped without preserving lease ownership".to_string();
-                }
-            }
-        }
-    }
-}
-
-fn daemon_dfs_maintenance_admission_loss(
-    authority_rx: &tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
-) -> Option<String> {
-    let authority = authority_rx.borrow();
-    authority.loss_detail.clone().or_else(|| {
-        (Instant::now() >= authority.deadline).then(|| {
-            "local authority deadline elapsed during DFS maintenance admission".to_string()
-        })
-    })
-}
-
-async fn run_daemon_dfs_maintenance_lease_renewal(
-    mut client: DaemonDfsControlPlaneKvClient,
-    mut record: DaemonDfsMaintenanceLeaseRecord,
-    mut authority_started: Instant,
-    mut authority_deadline: Instant,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-    authority_tx: tokio::sync::watch::Sender<DaemonDfsMaintenanceLeaseAuthority>,
-) -> DaemonDfsMaintenanceLeaseRenewalState {
-    let loss_detail = loop {
-        let renew_at = Instant::now()
-            .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_RENEW_INTERVAL)
-            .unwrap_or(authority_deadline)
-            .min(authority_deadline);
-        let renew_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(renew_at));
-        tokio::pin!(renew_sleep);
-        tokio::select! {
-            biased;
-            _ = &mut stop_rx => break None,
-            _ = &mut renew_sleep => {}
-        }
-        if Instant::now() >= authority_deadline {
-            let detail = format!(
-                "owner {} held by {} reached its local authority deadline",
-                record.owner_token, record.holder_node_id
-            );
-            authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
-                deadline: authority_deadline,
-                loss_detail: Some(detail.clone()),
-            });
-            break Some(detail);
-        }
-        let renewal_started = Instant::now();
-        let minimum_expiry_advance = renewal_started.saturating_duration_since(authority_started);
-        let renewal_result = {
-            let renewal = renew_daemon_dfs_maintenance_lease(
-                &mut client,
-                &record,
-                daemon_dfs_now_unix_nanos(),
-                minimum_expiry_advance,
-            );
-            tokio::pin!(renewal);
-            let authority_timeout =
-                tokio::time::sleep_until(tokio::time::Instant::from_std(authority_deadline));
-            tokio::pin!(authority_timeout);
-            tokio::select! {
-                biased;
-                _ = &mut stop_rx => break None,
-                _ = &mut authority_timeout => {
-                    let detail = format!(
-                        "owner {} held by {} reached its local authority deadline while renewing",
-                        record.owner_token, record.holder_node_id
-                    );
-                    authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
-                        deadline: authority_deadline,
-                        loss_detail: Some(detail.clone()),
-                    });
-                    break Some(detail);
-                }
-                result = &mut renewal => result,
-            }
-        };
-        match renewal_result {
-            Ok(Some(renewed)) => {
-                record = renewed;
-                authority_started = renewal_started;
-                authority_deadline = renewal_started
-                    .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
-                    .unwrap_or(renewal_started);
-                authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
-                    deadline: authority_deadline,
-                    loss_detail: None,
-                });
-            }
-            Ok(None) => {
-                let detail = format!(
-                    "owner {} held by {} expired or lost its compare-and-swap",
-                    record.owner_token, record.holder_node_id
-                );
-                authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
-                    deadline: authority_deadline,
-                    loss_detail: Some(detail.clone()),
-                });
-                break Some(detail);
-            }
-            Err(source) => {
-                let detail = format!(
-                    "owner {} held by {} could not renew: {source}",
-                    record.owner_token, record.holder_node_id
-                );
-                authority_tx.send_replace(DaemonDfsMaintenanceLeaseAuthority {
-                    deadline: authority_deadline,
-                    loss_detail: Some(detail.clone()),
-                });
-                break Some(detail);
-            }
-        }
-    };
-    DaemonDfsMaintenanceLeaseRenewalState {
-        client,
-        record,
-        loss_detail,
-    }
-}
-
-fn start_daemon_dfs_maintenance_lease(
-    client: DaemonDfsControlPlaneKvClient,
-    record: DaemonDfsMaintenanceLeaseRecord,
-    authority_started: Instant,
-) -> DaemonDfsMaintenanceLease {
-    let authority_deadline = authority_started
-        .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
-        .unwrap_or(authority_started);
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    let (authority_tx, authority_rx) =
-        tokio::sync::watch::channel(DaemonDfsMaintenanceLeaseAuthority {
-            deadline: authority_deadline,
-            loss_detail: None,
-        });
-    let renewal_task = tokio::spawn(run_daemon_dfs_maintenance_lease_renewal(
-        client,
-        record,
-        authority_started,
-        authority_deadline,
-        stop_rx,
-        authority_tx,
-    ));
-    DaemonDfsMaintenanceLease {
-        stop_tx,
-        authority_rx,
-        renewal_task,
-    }
-}
-
-async fn acquire_daemon_dfs_maintenance_admission_in_order<Acquire, AcquireFuture, StartLease>(
-    data_dir: &SinomoDataDir,
-    acquire_cluster_lease: Acquire,
-    start_lease: StartLease,
-) -> Result<Option<DaemonDfsMaintenanceLocalAdmission>, DaemonError>
-where
-    Acquire: FnOnce() -> AcquireFuture,
-    AcquireFuture:
-        std::future::Future<Output = Result<DaemonDfsMaintenanceLeaseAcquire, DaemonError>>,
-    StartLease: FnOnce(
-        DaemonDfsMaintenanceLeaseRecord,
-    ) -> tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority>,
-{
-    let record = match acquire_cluster_lease().await? {
-        DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
-        DaemonDfsMaintenanceLeaseAcquire::Deferred(holder) => {
-            if let Some(holder) = holder {
-                tracing::debug!(
-                    target: "sinomo.dfs.maintenance",
-                    holder_node_id = %holder.holder_node_id,
-                    owner_token = %holder.owner_token,
-                    expires_unix_nanos = holder.expires_unix_nanos,
-                    "deferred DFS maintenance to the cluster lease holder"
-                );
-            } else {
-                tracing::debug!(
-                    target: "sinomo.dfs.maintenance",
-                    "deferred DFS maintenance after losing cluster lease acquisition CAS"
-                );
-            }
-            return Ok(None);
-        }
-    };
-
-    // Start renewal immediately after cluster admission, before either local
-    // gate can wait behind an already-running foreground generation.
-    let mut admission_authority_rx = start_lease(record);
-    if let Some(detail) = daemon_dfs_maintenance_admission_loss(&admission_authority_rx) {
-        return Err(daemon_dfs_maintenance_lease_error(detail));
-    }
-    let lifecycle_gate = daemon_default_dfs_lifecycle_gate(&data_dir.root())?;
-    let message_execution_gate = daemon_dfs_message_execution_gate(data_dir)?;
-    let lifecycle_guard = tokio::select! {
-        biased;
-        detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut admission_authority_rx) => {
-            return Err(daemon_dfs_maintenance_lease_error(detail));
-        }
-        guard = lifecycle_gate.lock_owned() => guard,
-    };
-    let message_execution_guard = tokio::select! {
-        biased;
-        detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut admission_authority_rx) => {
-            drop(lifecycle_guard);
-            return Err(daemon_dfs_maintenance_lease_error(detail));
-        }
-        result = Arc::clone(&message_execution_gate.semaphore).acquire_owned() => result.map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate closed".to_string(),
-        })?,
-    };
-    if let Some(detail) = daemon_dfs_maintenance_admission_loss(&admission_authority_rx) {
-        drop(message_execution_guard);
-        drop(lifecycle_guard);
-        return Err(daemon_dfs_maintenance_lease_error(detail));
-    }
-    Ok(Some(DaemonDfsMaintenanceLocalAdmission {
-        lifecycle_guard,
-        message_execution_guard,
-    }))
-}
-
 async fn acquire_daemon_dfs_maintenance_admission(
     data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    runtime: &tokio::runtime::Handle,
-    local_node_id: NodeId,
-) -> Result<Option<DaemonDfsMaintenanceAdmission>, DaemonError> {
-    let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(cluster_paths, runtime);
-    let renewal_client = client.clone();
-    let owner_token = sinomo_core::Id::generate().to_string();
-    let acquisition_started = Instant::now();
-    let mut lease = None;
-    let local_admission = acquire_daemon_dfs_maintenance_admission_in_order(
-        data_dir,
-        || async {
-            acquire_daemon_dfs_maintenance_lease(
-                &mut client,
-                local_node_id,
-                owner_token,
-                daemon_dfs_now_unix_nanos(),
-            )
-            .await
-            .map_err(|source| {
-                daemon_dfs_maintenance_lease_error(format!(
-                    "failed to acquire cluster lease: {source}"
-                ))
-            })
-        },
-        |record| {
-            let started =
-                start_daemon_dfs_maintenance_lease(renewal_client, record, acquisition_started);
-            let authority_rx = started.authority_receiver();
-            lease = Some(started);
-            authority_rx
-        },
-    )
-    .await;
-    let local_admission = match local_admission {
-        Ok(local_admission) => local_admission,
-        Err(error) => {
-            if let Some(lease) = lease {
-                let _ = lease.release().await;
-            }
-            return Err(error);
-        }
-    };
-    let Some(local_admission) = local_admission else {
-        return Ok(None);
-    };
-    Ok(Some(DaemonDfsMaintenanceAdmission {
-        lease: lease.expect("cluster admission starts DFS maintenance lease"),
-        _lifecycle_guard: local_admission.lifecycle_guard,
-        _message_execution_guard: local_admission.message_execution_guard,
-    }))
+) -> Result<DaemonDfsMaintenanceAdmission, DaemonError> {
+    // DFS metadata journals and repair queues are node-local. Cross-node
+    // serialization prevents a primary on another daemon from advancing its
+    // own shard, so admission is intentionally limited to this data root.
+    let lifecycle_guard = daemon_default_dfs_lifecycle_gate(&data_dir.root())?
+        .lock_owned()
+        .await;
+    let message_execution_gate = daemon_dfs_message_execution_gate(data_dir)?;
+    let message_execution_guard = Arc::clone(&message_execution_gate.semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|_| DaemonError::Network {
+            address: "DFS message execution".to_string(),
+            detail: "DFS message execution gate closed".to_string(),
+        })?;
+    Ok(DaemonDfsMaintenanceAdmission {
+        _lifecycle_guard: lifecycle_guard,
+        _message_execution_guard: message_execution_guard,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1193,14 +856,23 @@ pub(crate) fn break_glass_recover_dfs_placement_authority_permit(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+pub(crate) fn recover_prior_process_default_dfs_placement_authority(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
+    recover_prior_process_default_dfs_placement_authority_from_observation(paths, runtime, true)
+}
+
 /// Recover only a prior-process placement permit owned by this main daemon's
 /// local cluster node. Callers are required to hold `DaemonLock` and
 /// `DaemonDataOwnerLock`; the control loop acquires both for its full lifetime
 /// before this helper is reachable. Exact-value CAS in the DFS store prevents
 /// deleting a concurrently replaced holder.
-pub(crate) fn recover_prior_process_default_dfs_placement_authority(
+fn recover_prior_process_default_dfs_placement_authority_from_observation(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
+    refresh_latest: bool,
 ) -> Result<bool, DaemonError> {
     let _data_owner_lock = daemon_dfs_data_owner_lock(paths)?.ok_or_else(|| {
         DaemonError::Parse {
@@ -1220,7 +892,9 @@ pub(crate) fn recover_prior_process_default_dfs_placement_authority(
             .ok_or_else(|| DaemonError::Parse {
                 detail: "main daemon has no DFS placement-authority process identity".to_string(),
             })?;
-    sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut client)?;
+    if refresh_latest {
+        sinomo_dfs::DfsControlPlaneKvClient::refresh_latest(&mut client)?;
+    }
     let recovered = sinomo_dfs::DfsControlPlaneStore::new(&mut client)
         .recover_prior_process_placement_authority_permit_for_local_node(
             &sinomo_dfs::sifs_file_system_id(),
@@ -2127,8 +1801,8 @@ fn daemon_dfs_pending_work_from_records(
     now_unix_nanos: u64,
 ) -> DaemonDfsPendingMaintenanceWork {
     // Keep offline repair state durable, but do not let it select the short
-    // triggered-maintenance cadence. A periodic pass still re-evaluates the
-    // backlog after node status changes.
+    // triggered-maintenance cadence. Reachability changes notify the scheduler,
+    // while the deferred-work projection retains a bounded read-only re-probe.
     let mut receipts_by_version = BTreeMap::<
         (
             &DfsFileSystemId,
@@ -2156,13 +1830,38 @@ fn daemon_dfs_pending_work_from_records(
             )
         })
         .collect::<Vec<_>>();
+    let stale_write_intent_min_age_nanos =
+        daemon_dfs_duration_nanos(sinomo_dfs::DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE);
+    let stale_write_intent_deadlines = active_write_intents
+        .iter()
+        .filter(|intent| intents_without_recovery_source.contains(&intent.intent_id))
+        .map(|intent| {
+            intent
+                .updated_at
+                .unwrap_or(intent.created_at)
+                .unix_timestamp_nanos()
+                .try_into()
+                .unwrap_or(0_u64)
+                .saturating_add(stale_write_intent_min_age_nanos)
+        })
+        .collect::<Vec<_>>();
+    let projected_stale_write_intent_count = stale_write_intent_deadlines.len();
+    let due_stale_write_intent_count = stale_write_intent_deadlines
+        .iter()
+        .filter(|deadline| **deadline <= now_unix_nanos)
+        .count();
+    let next_stale_write_intent_deadline_unix_nanos = stale_write_intent_deadlines
+        .into_iter()
+        .filter(|deadline| *deadline > now_unix_nanos)
+        .min();
     let eligible_pending_write_count = active_write_intents
         .iter()
         .filter(|intent| {
             if intents_without_recovery_source.contains(&intent.intent_id) {
                 // A fresh abandoned intent has no executable short-cadence
                 // action when its object, receipts, and readable hash blob are
-                // all absent. Keep it durable for periodic stale reconciliation.
+                // all absent. Keep it durable until its exact stale-intent
+                // deadline or a state-change notification makes it actionable.
                 return false;
             }
             let desired_replica_node_ids = intent
@@ -2262,6 +1961,31 @@ fn daemon_dfs_pending_work_from_records(
         .flat_map(|status| status.replica_lag.iter())
         .filter(|lag| lag.lag_entries > 0 && !offline_node_ids.contains(&lag.target_node_id))
         .count();
+    let all_metadata_replica_lag_count = metadata_shard_statuses
+        .iter()
+        .filter(|status| status.primary_node_id.as_ref() == Some(local_node_id))
+        .flat_map(|status| status.replica_lag.iter())
+        .filter(|lag| lag.lag_entries > 0)
+        .count();
+    let finite_future_repair_attempt_count = eligible_repair_attempt_records
+        .iter()
+        .filter(|record| {
+            !record.in_flight
+                && record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos > now_unix_nanos
+        })
+        .count();
+    let deferred_work_count = pending_write_count
+        .saturating_sub(eligible_pending_write_count)
+        .saturating_sub(projected_stale_write_intent_count)
+        .saturating_add(
+            pending_repair_count.saturating_sub(
+                due_repair_attempt_count
+                    .saturating_add(unattempted_repair_count)
+                    .saturating_add(finite_future_repair_attempt_count),
+            ),
+        )
+        .saturating_add(all_metadata_replica_lag_count.saturating_sub(metadata_replica_lag_count));
 
     DaemonDfsPendingMaintenanceWork {
         pending_write_count: eligible_pending_write_count,
@@ -2270,6 +1994,9 @@ fn daemon_dfs_pending_work_from_records(
         due_repair_attempt_count,
         unattempted_repair_count,
         next_repair_retry_unix_nanos,
+        due_time_based_maintenance_count: due_stale_write_intent_count,
+        next_time_based_maintenance_unix_nanos: next_stale_write_intent_deadline_unix_nanos,
+        deferred_work_count,
         pending_namespace_job_count,
         actionable_conflict_count,
         actionable_placement_reconciliation_count,
@@ -2296,6 +2023,16 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &cluster_paths,
     )?;
     let summary = metadata.metadata_summary()?;
+    let now_unix_nanos = daemon_dfs_now_unix_nanos();
+    let tombstone_projection = metadata.tombstone_compaction_projection(
+        DfsTombstoneCompactionOptions::dry_run(DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE)
+            .with_now_unix_nanos(now_unix_nanos),
+    )?;
+    let lifecycle_options = DfsMaintenanceRunOptions::default();
+    let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
+    let staging_projection = content.collect_stale_staging(
+        ContentStoreStagingGcOptions::dry_run(lifecycle_options.stale_staging_min_age),
+    )?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
     let metadata_shard_statuses = metadata.metadata_shard_statuses()?;
@@ -2377,7 +2114,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &offline_node_ids,
         &state.local_node_id,
     );
-    Ok(daemon_dfs_pending_work_from_records(
+    let mut work = daemon_dfs_pending_work_from_records(
         summary.pending_write_count,
         summary.pending_repair_count,
         summary.pending_namespace_job_count,
@@ -2393,8 +2130,23 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &offline_node_ids,
         &state.local_node_id,
         pending_local_membership_handoff_count,
-        daemon_dfs_now_unix_nanos(),
-    ))
+        now_unix_nanos,
+    );
+    work.due_time_based_maintenance_count = work
+        .due_time_based_maintenance_count
+        .saturating_add(
+            usize::try_from(tombstone_projection.eligible_tombstone_count).unwrap_or(usize::MAX),
+        )
+        .saturating_add(
+            usize::try_from(staging_projection.eligible_staging_count).unwrap_or(usize::MAX),
+        );
+    work.next_time_based_maintenance_unix_nanos = work
+        .next_time_based_maintenance_unix_nanos
+        .into_iter()
+        .chain(tombstone_projection.next_eligible_at_unix_nanos)
+        .chain(staging_projection.next_eligible_at_unix_nanos)
+        .min();
+    Ok(work)
 }
 
 fn daemon_dfs_message_service_cache()
@@ -2467,6 +2219,180 @@ fn daemon_dfs_mutation_scheduler(
     let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
     schedulers.insert(key, Arc::downgrade(&scheduler));
     Ok(scheduler)
+}
+
+fn daemon_dfs_metadata_publish_lane_scheduler(
+    data_dir: &SinomoDataDir,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Arc<sinomo_dfs::DfsMetadataPublishScheduler>, DaemonError> {
+    let key = DaemonDfsMetadataPublishLaneKey {
+        data_root: data_dir.root(),
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let mut schedulers = DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "DFS metadata publish scheduler".to_string(),
+            detail: "DFS metadata publish scheduler map is poisoned".to_string(),
+        })?;
+    if let Some(scheduler) = schedulers.get(&key).and_then(Weak::upgrade) {
+        return Ok(scheduler);
+    }
+    // The registry is only an index for active lanes. The spawned publisher
+    // owns the strong reference, so a completed lane disappears naturally and
+    // cannot leak one closure per historical shard. Pruning here keeps the
+    // index bounded by live work without aliasing unrelated shards onto a
+    // shared fallback scheduler.
+    schedulers.retain(|_, scheduler| scheduler.strong_count() > 0);
+    let scheduler = Arc::new(sinomo_dfs::DfsMetadataPublishScheduler::new());
+    schedulers.insert(key, Arc::downgrade(&scheduler));
+    Ok(scheduler)
+}
+
+fn daemon_dfs_metadata_publish_discovery_scheduler(
+    data_dir: &SinomoDataDir,
+) -> Result<Arc<sinomo_dfs::DfsMetadataPublishScheduler>, DaemonError> {
+    let key = data_dir.root();
+    let mut schedulers = DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "DFS metadata publish discovery scheduler".to_string(),
+            detail: "DFS metadata publish discovery scheduler map is poisoned".to_string(),
+        })?;
+    if let Some(scheduler) = schedulers.get(&key).and_then(Weak::upgrade) {
+        return Ok(scheduler);
+    }
+    schedulers.retain(|_, scheduler| scheduler.strong_count() > 0);
+    let scheduler = Arc::new(sinomo_dfs::DfsMetadataPublishScheduler::new());
+    schedulers.insert(key, Arc::downgrade(&scheduler));
+    Ok(scheduler)
+}
+
+#[cfg(test)]
+fn record_daemon_dfs_metadata_publish_discovery_attempt(
+    data_root: &std::path::Path,
+    success: bool,
+) {
+    if let Ok(mut attempts) = DAEMON_DFS_TEST_METADATA_PUBLISH_DISCOVERY_ATTEMPTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        let counts = attempts.entry(data_root.to_path_buf()).or_default();
+        counts.0 = counts.0.saturating_add(1);
+        if success {
+            counts.1 = counts.1.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+fn daemon_dfs_metadata_publish_discovery_attempts(data_root: &std::path::Path) -> (usize, usize) {
+    DAEMON_DFS_TEST_METADATA_PUBLISH_DISCOVERY_ATTEMPTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()
+        .and_then(|attempts| attempts.get(data_root).copied())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_daemon_dfs_metadata_publish_lane_request(
+    data_dir: &SinomoDataDir,
+    lane: &DaemonDfsMutationLaneKey,
+) {
+    if let Ok(mut requests) = DAEMON_DFS_TEST_METADATA_PUBLISH_LANE_REQUESTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        let key = DaemonDfsMetadataPublishLaneKey {
+            data_root: data_dir.root(),
+            file_system_id: lane.file_system_id.clone(),
+            shard_id: lane.shard_id.clone(),
+        };
+        let count = requests.entry(key).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+fn daemon_dfs_metadata_publish_lane_request_count(
+    data_dir: &SinomoDataDir,
+    lane: &DaemonDfsMutationLaneKey,
+) -> usize {
+    let key = DaemonDfsMetadataPublishLaneKey {
+        data_root: data_dir.root(),
+        file_system_id: lane.file_system_id.clone(),
+        shard_id: lane.shard_id.clone(),
+    };
+    DAEMON_DFS_TEST_METADATA_PUBLISH_LANE_REQUESTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()
+        .and_then(|requests| requests.get(&key).copied())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_daemon_dfs_repair_maintenance_edge_request(data_dir: &SinomoDataDir) {
+    if let Ok(mut requests) = DAEMON_DFS_TEST_REPAIR_MAINTENANCE_EDGE_REQUESTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        let count = requests.entry(data_dir.root()).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+fn daemon_dfs_repair_maintenance_edge_request_count(data_dir: &SinomoDataDir) -> usize {
+    DAEMON_DFS_TEST_REPAIR_MAINTENANCE_EDGE_REQUESTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()
+        .and_then(|requests| requests.get(&data_dir.root()).copied())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn install_daemon_dfs_message_committed_edge_test_hook(
+    request_id: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    DAEMON_DFS_TEST_MESSAGE_COMMITTED_EDGE_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("message committed-edge test-hook lock")
+        .insert(
+            request_id.to_string(),
+            Arc::new(DaemonDfsMessageCommittedEdgeTestHook {
+                started_tx,
+                release_rx: Mutex::new(release_rx),
+            }),
+        );
+    (started_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_at_daemon_dfs_message_committed_edge_test_hook(request_id: &str) {
+    let hook = DAEMON_DFS_TEST_MESSAGE_COMMITTED_EDGE_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.remove(request_id));
+    let Some(hook) = hook else {
+        return;
+    };
+    let _ = hook.started_tx.send(());
+    let _ = hook
+        .release_rx
+        .lock()
+        .ok()
+        .and_then(|release_rx| release_rx.recv_timeout(Duration::from_secs(5)).ok());
 }
 
 /// Each served-message lane owns a decoded view of every configured metadata
@@ -2677,15 +2603,39 @@ fn daemon_dfs_metadata_authority_key_is_exact(key: &str) -> bool {
     )
 }
 
+fn daemon_dfs_metadata_shard_config_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-shards"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
+}
+
 fn daemon_dfs_metadata_authority_projection(snapshot: &KvSnapshot) -> Vec<(String, Vec<u8>)> {
-    let mut projection = snapshot
-        .entries
-        .iter()
+    // All retained authority keys share this prefix. `prefix_entries` seeks
+    // directly into the canonical snapshot, avoiding an O(total cluster KV)
+    // scan even when a relevant authority generation does change.
+    snapshot
+        .prefix_entries("/dfs/filesystems/")
         .filter(|entry| daemon_dfs_metadata_authority_key_is_exact(&entry.key))
         .map(|entry| (entry.key.clone(), entry.value.clone()))
-        .collect::<Vec<_>>();
-    projection.sort_by(|left, right| left.0.cmp(&right.0));
-    projection
+        .collect()
 }
 
 fn daemon_dfs_metadata_authority_generations() -> &'static Mutex<
@@ -2704,6 +2654,7 @@ fn daemon_dfs_metadata_authority_generation(
         cluster_paths,
         &cluster_state.cluster_id,
         &cluster_state.local_node_id,
+        None,
     )
 }
 
@@ -2711,6 +2662,7 @@ fn daemon_dfs_metadata_authority_generation_for_identity(
     cluster_paths: &ClusterPaths,
     cluster_id: &sinomo_core::Id,
     local_node_id: &NodeId,
+    runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<Arc<DaemonDfsMetadataAuthorityGeneration>, sinomo_dfs::DfsError> {
     let key = DaemonDfsMetadataAuthorityGenerationKey {
         snapshot: cluster_paths.kv_paths().snapshot,
@@ -2723,10 +2675,12 @@ fn daemon_dfs_metadata_authority_generation_for_identity(
             message: "daemon DFS metadata-authority generation lock poisoned".to_string(),
         })?;
     if let Some(generation) = generations.get(&key).and_then(Weak::upgrade) {
+        generation.attach_publish_wake(cluster_paths, runtime);
         return Ok(generation);
     }
 
     let generation = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+    generation.attach_publish_wake(cluster_paths, runtime);
     let weak_generation = Arc::downgrade(&generation);
     let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
         cluster_paths,
@@ -2755,14 +2709,17 @@ fn daemon_dfs_retained_metadata_authority_generation(
     cluster_paths: &ClusterPaths,
     cluster_id: &sinomo_core::Id,
     local_node_id: &NodeId,
+    runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<Arc<DaemonDfsMetadataAuthorityGeneration>, sinomo_dfs::DfsError> {
     if let Some(generation) = detached_send_runtime.metadata_authority_generation.get() {
+        generation.attach_publish_wake(cluster_paths, runtime);
         return Ok(Arc::clone(generation));
     }
     let generation = daemon_dfs_metadata_authority_generation_for_identity(
         cluster_paths,
         cluster_id,
         local_node_id,
+        runtime,
     )?;
     let _ = detached_send_runtime
         .metadata_authority_generation
@@ -3043,6 +3000,7 @@ fn prepare_daemon_dfs_commit_promotion_recovery(
         cluster_paths,
         &cluster_state.cluster_id,
         &cluster_state.local_node_id,
+        Some(runtime),
     )?
     .generation();
     let recovery_scan_required = detached_send_runtime
@@ -3104,7 +3062,7 @@ fn prepare_daemon_dfs_commit_promotion_recovery(
     // Return the worker even when the scan failed: it may have queued valid
     // work before encountering a later corrupt/unavailable record, and retained
     // ready work must not depend on a successful fresh scan. The caller drops
-    // local guards and releases the cluster lease before waking the scheduler.
+    // its local lifecycle and execution guards before waking the scheduler.
     let pending = worker.has_pending()?;
     daemon_dfs_perf_trace(format_args!(
         "commit-promotion-recovery generation={} scanned={} scan_deferred_empty_topology={} scan_ms={} prepared_pending={}",
@@ -3127,6 +3085,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     command: DfsMessageCommand,
     execution_scope: &DfsMessageExecutionScope,
     runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
 ) -> Result<Option<DaemonDfsMessageCommandProcessResult>, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     let ensure_started = Instant::now();
@@ -3190,6 +3149,7 @@ fn process_daemon_dfs_message_command_on_runtime(
                 cluster_paths,
                 &peer_snapshot.cluster_id,
                 &peer_snapshot.local_node_id,
+                Some(runtime),
             )?,
         };
         let signature = DaemonDfsMessageServiceSignature {
@@ -3282,24 +3242,30 @@ fn process_daemon_dfs_message_command_on_runtime(
         hydrate.as_micros(),
         trace_started.elapsed().as_millis()
     ));
-    let DfsMessageProcessResult {
-        response,
-        attachment,
-        events,
-    } = service_lane.service.process_message_command(command)?;
+    let process_report = service_lane.service.process_message_command_report(command);
     let deferred_work = if use_read_lane {
-        None
-    } else if service_lane.service.message_deferred_work_pending()? {
-        Some((
-            Arc::clone(&service_lane_handle.detached_send_runtime),
-            service_lane.service.detach_message_deferred_work(),
-        ))
+        Ok(None)
     } else {
-        None
+        service_lane
+            .service
+            .message_deferred_work_pending()
+            .map(|pending| {
+                pending.then(|| {
+                    (
+                        Arc::clone(&service_lane_handle.detached_send_runtime),
+                        service_lane.service.detach_message_deferred_work(),
+                    )
+                })
+            })
     };
     let process = process_started.elapsed();
+    let (outbound_message_count, event_count) = process_report
+        .outcome
+        .as_ref()
+        .map(|result| (result.response.outbound_messages.len(), result.events.len()))
+        .unwrap_or_default();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} ensure_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} full_hydrate={} hydrate_ms={} hydrate_us={} process_ms={} process_us={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} ensure_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} full_hydrate={} hydrate_ms={} hydrate_us={} process_ms={} process_us={} process_ok={} outbound_messages={} events={} total_ms={}",
         request_id,
         use_read_lane,
         peer_snapshot_ms,
@@ -3315,23 +3281,121 @@ fn process_daemon_dfs_message_command_on_runtime(
         hydrate.as_micros(),
         process.as_millis(),
         process.as_micros(),
-        response.outbound_messages.len(),
-        events.len(),
+        process_report.outcome.is_ok(),
+        outbound_message_count,
+        event_count,
         trace_started.elapsed().as_millis()
     ));
     drop(service_lane);
+    #[cfg(test)]
+    wait_at_daemon_dfs_message_committed_edge_test_hook(&request_id);
+    let committed_edges = emit_daemon_dfs_committed_edges(
+        data_dir,
+        cluster_paths,
+        execution_scope,
+        runtime,
+        traceparent,
+        process_report.committed_work,
+        process_report
+            .outcome
+            .as_ref()
+            .map(|result| result.events.as_slice())
+            .unwrap_or_default(),
+    );
     // Schedule detached convergence before returning across the cancellable
     // async JoinHandle boundary. A disconnected RPC drops its JoinHandle while
     // this blocking task keeps running, so deferring this wake to the caller
     // could leave restored promotion work idle until unrelated later traffic.
-    if let Some((detached_runtime, worker)) = deferred_work {
-        schedule_daemon_dfs_message_deferred_work(runtime, cluster_paths, detached_runtime, worker);
+    let deferred_work_error = match deferred_work {
+        Ok(Some((detached_runtime, worker))) => {
+            schedule_daemon_dfs_message_deferred_work(
+                runtime,
+                cluster_paths,
+                detached_runtime,
+                worker,
+            );
+            None
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let DfsMessageProcessResult {
+        response,
+        attachment,
+        events: _,
+    } = process_report.outcome?;
+    if let Some(error) = deferred_work_error {
+        return Err(error);
     }
     Ok(Some(DaemonDfsMessageCommandProcessResult {
         response,
         attachment,
-        events,
+        committed_edges,
     }))
+}
+
+/// Emit retained work produced by a durably processed DFS mutation scope.
+///
+/// Served-message and maintenance paths invoke this only after releasing their
+/// backend-bearing generation, but before unwrapping the operation outcome. A
+/// caller can abandon an outer `JoinHandle`, or later work can fail after a
+/// durable mutation; transferring a caller-retained receipt here guarantees
+/// committed work cannot depend on unrelated traffic.
+fn emit_daemon_dfs_committed_edges(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    execution_scope: &DfsMessageExecutionScope,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+    committed_work: DfsMessageCommittedWork,
+    events: &[sinomo_dfs::NetworkedDfsServiceEvent],
+) -> DaemonDfsMessageCommittedEdges {
+    let advances_replica = committed_work.metadata_replica_progress
+        || sinomo_dfs::dfs_events_advance_metadata_replica(events);
+    let replica_progress = advances_replica
+        && sinomo_dfs::invalidate_default_cluster_dfs_materialization_for_replica_progress(
+            data_dir,
+        );
+    if replica_progress {
+        // Only a materialization pass which explicitly parked behind exact
+        // replica evidence subscribes to this local edge. Healthy journal
+        // replication therefore cannot wake the default-control reactor.
+        notify_daemon_default_dfs_reconciliation_replica_progress(cluster_paths);
+    }
+
+    let repair_maintenance = committed_work.repair_maintenance
+        || sinomo_dfs::dfs_events_should_wake_repair_maintenance(events);
+    let namespace_maintenance = committed_work.namespace_maintenance;
+    if repair_maintenance || namespace_maintenance {
+        // The serving metadata authority owns the durable pending intent or
+        // resumable namespace job. Wake its coalescing classifier at this
+        // committed edge; requester-side completion events are deliberately
+        // excluded by the event classifier.
+        #[cfg(test)]
+        if repair_maintenance {
+            record_daemon_dfs_repair_maintenance_edge_request(data_dir);
+        }
+        notify_daemon_dfs_maintenance_work();
+    }
+
+    let publish_metadata =
+        committed_work.publish_metadata || sinomo_dfs::dfs_events_should_publish_metadata(events);
+    if publish_metadata {
+        schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
+            data_dir.clone(),
+            cluster_paths.clone(),
+            runtime,
+            traceparent,
+            DaemonDfsMutationLaneKey::from_scope(execution_scope),
+        );
+    }
+
+    DaemonDfsMessageCommittedEdges {
+        publish_metadata,
+        replica_progress,
+        repair_maintenance,
+        namespace_maintenance,
+    }
 }
 
 async fn handle_daemon_dfs_message_async(
@@ -3399,6 +3463,7 @@ async fn handle_daemon_dfs_message_async(
                 command,
                 &process_execution_scope,
                 &process_runtime,
+                process_traceparent.clone(),
             )
         });
         // A blocking task keeps running when its async JoinHandle is dropped.
@@ -3421,22 +3486,12 @@ async fn handle_daemon_dfs_message_async(
     let DaemonDfsMessageCommandProcessResult {
         response,
         attachment,
-        events,
+        committed_edges,
     } = result;
-    let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
-    if should_publish_metadata {
-        notify_daemon_dfs_maintenance_work();
-        schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
-            data_dir,
-            cluster_paths,
-            runtime,
-            traceparent.clone(),
-        );
-    }
     daemon_dfs_perf_trace_with_traceparent(
         traceparent.as_deref(),
         format_args!(
-            "dfs-message-handler request={} scope={} admission_wait_ms={} admission_wait_us={} blocking_queue_ms={} blocking_queue_us={} blocking_work_ms={} blocking_work_us={} spawn_blocking_ms={} spawn_blocking_us={} publish_metadata={} outbound_messages={} total_ms={}",
+            "dfs-message-handler request={} scope={} admission_wait_ms={} admission_wait_us={} blocking_queue_ms={} blocking_queue_us={} blocking_work_ms={} blocking_work_us={} spawn_blocking_ms={} spawn_blocking_us={} publish_metadata={} repair_maintenance={} namespace_maintenance={} outbound_messages={} total_ms={}",
             request_id,
             execution_scope_label,
             admission_wait.as_millis(),
@@ -3447,7 +3502,9 @@ async fn handle_daemon_dfs_message_async(
             blocking_work.as_micros(),
             spawn_blocking.as_millis(),
             spawn_blocking.as_micros(),
-            should_publish_metadata,
+            committed_edges.publish_metadata,
+            committed_edges.repair_maintenance,
+            committed_edges.namespace_maintenance,
             response.outbound_messages.len(),
             trace_started.elapsed().as_millis()
         ),
@@ -3474,6 +3531,7 @@ fn handle_daemon_dfs_message_on_runtime(
         command,
         &execution_scope,
         runtime,
+        None,
     )?;
     let Some(result) = result else {
         return Err(DaemonError::ClusterOrphan);
@@ -3481,40 +3539,1213 @@ fn handle_daemon_dfs_message_on_runtime(
     let DaemonDfsMessageCommandProcessResult {
         response: message_response,
         attachment: _,
-        events,
+        committed_edges: _,
     } = result;
-    sinomo_dfs::run_cluster_dfs_metadata_publish_after_events_with_peer_transport(
-        &data_dir,
-        &cluster_paths,
-        daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime),
-        &events,
-        daemon_dfs_metadata_replication_options(),
-        log_dfs_metadata_replication_report,
-        |error| {
-            tracing::warn!(
-                "sinomo daemon DFS metadata publish after message mutation failed: {error}"
-            );
-        },
-    );
     Ok(message_response)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDefaultDfsPermitGeneration {
+    modify_revision: KvRevision,
+    version: KvVersion,
+    value: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DaemonDefaultDfsReconciliationWake {
+    generation_tx: tokio::sync::watch::Sender<u64>,
+}
+
+fn daemon_default_dfs_reconciliation_wake(
+    cluster_paths: &ClusterPaths,
+) -> Result<Arc<DaemonDefaultDfsReconciliationWake>, DaemonError> {
+    let key = cluster_paths.root.clone();
+    let mut wakes = DAEMON_DEFAULT_DFS_RECONCILIATION_WAKES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "default DFS reconciliation wake".to_string(),
+            detail: "default DFS reconciliation wake registry is poisoned".to_string(),
+        })?;
+    if let Some(wake) = wakes.get(&key).and_then(Weak::upgrade) {
+        return Ok(wake);
+    }
+    let (generation_tx, _) = tokio::sync::watch::channel(0);
+    let wake = Arc::new(DaemonDefaultDfsReconciliationWake { generation_tx });
+    wakes.insert(key, Arc::downgrade(&wake));
+    Ok(wake)
+}
+
+fn notify_daemon_default_dfs_reconciliation_replica_progress(cluster_paths: &ClusterPaths) {
+    let Some(wakes) = DAEMON_DEFAULT_DFS_RECONCILIATION_WAKES.get() else {
+        return;
+    };
+    let Ok(wakes) = wakes.lock() else {
+        return;
+    };
+    let Some(wake) = wakes.get(&cluster_paths.root).and_then(Weak::upgrade) else {
+        return;
+    };
+    let next_generation = (*wake.generation_tx.borrow()).wrapping_add(1);
+    wake.generation_tx.send_replace(next_generation);
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DaemonDefaultDfsReconciliationProjection {
+    revision: Option<KvRevision>,
+    inputs: Vec<(String, Vec<u8>)>,
+    placement_authority_permit: Option<DaemonDefaultDfsPermitGeneration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDefaultDfsReconciliationWork {
+    inputs: Vec<(String, Vec<u8>)>,
+    placement_authority_permit: Option<DaemonDefaultDfsPermitGeneration>,
+    local_generation: u64,
+    reconcile_defaults: bool,
+    recover_prior_process_permit: bool,
+    refresh_before_recovery: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDefaultDfsParkedHandoff {
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    handoff_id: String,
+    retiring_epoch: u64,
+    desired_epoch: u64,
+    wake_keys: [String; 4],
+}
+
+impl DaemonDefaultDfsParkedHandoff {
+    fn new(
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        handoff_id: String,
+        retiring_epoch: u64,
+        desired_epoch: u64,
+    ) -> Self {
+        let shard = shard_id.as_str();
+        let wake_keys = [
+            sinomo_dfs::metadata_shard_key(&file_system_id, shard),
+            sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, shard),
+            sinomo_dfs::metadata_shard_membership_handoff_proof_key(&file_system_id, shard),
+            sinomo_dfs::metadata_shard_head_watermark_key(&file_system_id, shard),
+        ];
+        Self {
+            file_system_id,
+            shard_id: DfsMetadataShardId::new(shard_id),
+            handoff_id,
+            retiring_epoch,
+            desired_epoch,
+            wake_keys,
+        }
+    }
+
+    fn owns_key(&self, key: &str) -> bool {
+        self.wake_keys.iter().any(|owned| owned == key)
+    }
+
+    fn wake_inputs(&self, inputs: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+        inputs
+            .iter()
+            .filter(|(key, _)| self.wake_keys.iter().any(|owned| owned == key))
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDefaultDfsParkedGeneration {
+    handoff: DaemonDefaultDfsParkedHandoff,
+    wake_inputs: Vec<(String, Vec<u8>)>,
+    local_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDefaultDfsExactRetryGeneration {
+    inputs: Vec<(String, Vec<u8>)>,
+    placement_authority_permit: Option<DaemonDefaultDfsPermitGeneration>,
+    local_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonDefaultDfsReconciliationStep {
+    Idle,
+    Progress,
+    Parked,
+    IdentityChanged,
+}
+
+/// Main-daemon owner for the derived default-DFS control-plane state.
+///
+/// One dirty startup pass covers state committed while this process was down.
+/// Afterwards only semantic changes to the exact inputs consumed by default
+/// DFS reconciliation wake the reactor. Derived service advertisements remain
+/// in that semantic projection so deletion or corruption self-heals, while
+/// their refresh-only `updated_at` field is excluded so a correct publication
+/// cannot create a feedback loop.
+pub(crate) struct DaemonDefaultDfsReconciliationReactor {
+    _projection_tx: tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+    projection_rx: tokio::sync::watch::Receiver<DaemonDefaultDfsReconciliationProjection>,
+    _subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
+    _metadata_authority_generation: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
+    _local_wake: Arc<DaemonDefaultDfsReconciliationWake>,
+    local_wake_rx: tokio::sync::watch::Receiver<u64>,
+    parked_subscription: Arc<Mutex<Option<DaemonDefaultDfsParkedHandoff>>>,
+    reconciled_inputs: Option<Vec<(String, Vec<u8>)>>,
+    reconciled_local_generation: Option<u64>,
+    recovered_placement_authority_permit: Option<Option<DaemonDefaultDfsPermitGeneration>>,
+    parked_generation: Option<DaemonDefaultDfsParkedGeneration>,
+}
+
+impl std::fmt::Debug for DaemonDefaultDfsReconciliationReactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonDefaultDfsReconciliationReactor")
+            .field(
+                "startup_reconciliation_pending",
+                &self.reconciled_inputs.is_none(),
+            )
+            .field(
+                "startup_recovery_pending",
+                &self.recovered_placement_authority_permit.is_none(),
+            )
+            .field(
+                "local_replica_progress_pending",
+                &self.reconciled_local_generation.is_none(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl DaemonDefaultDfsReconciliationReactor {
+    #[cfg(test)]
+    pub(crate) fn new(
+        cluster_paths: &ClusterPaths,
+        local_node_id: &NodeId,
+    ) -> Result<Self, DaemonError> {
+        Self::new_with_runtime(cluster_paths, local_node_id, None)
+    }
+
+    pub(crate) fn new_on_runtime(
+        cluster_paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, DaemonError> {
+        Self::new_with_runtime(cluster_paths, local_node_id, Some(runtime))
+    }
+
+    fn new_with_runtime(
+        cluster_paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        runtime: Option<&tokio::runtime::Handle>,
+    ) -> Result<Self, DaemonError> {
+        let local_wake = daemon_default_dfs_reconciliation_wake(cluster_paths)?;
+        let local_wake_rx = local_wake.generation_tx.subscribe();
+        let (projection_tx, projection_rx) =
+            tokio::sync::watch::channel(DaemonDefaultDfsReconciliationProjection::default());
+        let parked_subscription = Arc::new(Mutex::new(None));
+        let observer_tx = projection_tx.clone();
+        let observer_local_node_id = local_node_id.clone();
+        let observer_data_dir = cluster_paths
+            .root
+            .parent()
+            .map(SinomoDataDir::new)
+            .ok_or_else(|| DaemonError::Network {
+                address: "default DFS committed projection".to_string(),
+                detail: "cluster root has no owning data directory".to_string(),
+            })?;
+        let projection_observer = Arc::new(Mutex::new(
+            DaemonDefaultDfsCommittedProjectionObserver::new_with_parked_subscription(
+                observer_data_dir,
+                Arc::clone(&parked_subscription),
+            ),
+        ));
+        let subscription_observer = Arc::clone(&projection_observer);
+        let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+            cluster_paths,
+            move |snapshot| {
+                let mut observer = subscription_observer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                observer.observe(&observer_tx, &observer_local_node_id, snapshot);
+            },
+        );
+        // Subscribe before sampling the resident snapshot. If a newer commit
+        // wins the race, the projection's monotonic revision rejects this
+        // older sample instead of regressing the reactor.
+        if let Some(snapshot) =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+                cluster_paths,
+            )?
+        {
+            projection_observer
+                .lock()
+                .map_err(|_| DaemonError::Network {
+                    address: "default DFS committed projection".to_string(),
+                    detail: "default DFS committed projection observer is poisoned".to_string(),
+                })?
+                .observe(&projection_tx, local_node_id, snapshot.as_ref());
+        }
+        let metadata_authority_generation = runtime
+            .map(|runtime| {
+                let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)?;
+                daemon_dfs_metadata_authority_generation_for_identity(
+                    cluster_paths,
+                    &state.cluster_id,
+                    local_node_id,
+                    Some(runtime),
+                )
+                .map_err(DaemonError::from)
+            })
+            .transpose()?;
+        Ok(Self {
+            _projection_tx: projection_tx,
+            projection_rx,
+            _subscription: subscription,
+            _metadata_authority_generation: metadata_authority_generation,
+            _local_wake: local_wake,
+            local_wake_rx,
+            parked_subscription,
+            // `None` is the dirty startup generation. A successful startup
+            // pass records even an empty projection as `Some(Vec::new())`.
+            reconciled_inputs: None,
+            reconciled_local_generation: None,
+            // The nested option distinguishes "startup recovery has not run"
+            // from "startup recovery observed no permit".
+            recovered_placement_authority_permit: None,
+            parked_generation: None,
+        })
+    }
+
+    pub(crate) async fn changed(&mut self) {
+        loop {
+            if self.pending_work().is_some() {
+                return;
+            }
+            self.changed_signal().await;
+            // A notification can race the transition into a parked state, or
+            // a watch sender can conservatively publish a generation which is
+            // irrelevant to the exact parked handoff. Consume those hints
+            // here without re-entering DFS lifecycle work.
+            if self.pending_work().is_some() {
+                return;
+            }
+        }
+    }
+
+    async fn changed_signal(&mut self) {
+        tokio::select! {
+            _ = self.projection_rx.changed() => {}
+            _ = self.local_wake_rx.changed() => {}
+        }
+    }
+
+    fn exact_retry_generation(&self) -> DaemonDefaultDfsExactRetryGeneration {
+        let current = self.projection_rx.borrow().clone();
+        DaemonDefaultDfsExactRetryGeneration {
+            inputs: current
+                .inputs
+                .into_iter()
+                .filter(|(key, _)| daemon_default_dfs_reconciliation_exact_retry_key(key))
+                .collect(),
+            placement_authority_permit: current.placement_authority_permit,
+            local_generation: *self.local_wake_rx.borrow(),
+        }
+    }
+
+    /// Completes the dirty startup generation before a settled solo daemon
+    /// begins serving. The same retained reactor is then moved into the
+    /// background task, so startup and committed-change handling share one
+    /// ownership boundary and one observed generation.
+    pub(crate) async fn reconcile_startup_until_idle_async(
+        &mut self,
+        paths: &DaemonPaths,
+        options: &DaemonRunOptions,
+        expected_cluster_id: &sinomo_core::Id,
+        expected_node_id: &NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), DaemonError> {
+        loop {
+            match self
+                .reconcile_pending_async(
+                    paths,
+                    options,
+                    expected_cluster_id,
+                    expected_node_id,
+                    runtime,
+                )
+                .await?
+            {
+                DaemonDefaultDfsReconciliationStep::Progress => continue,
+                DaemonDefaultDfsReconciliationStep::Parked => return Ok(()),
+                DaemonDefaultDfsReconciliationStep::Idle => return Ok(()),
+                DaemonDefaultDfsReconciliationStep::IdentityChanged => {
+                    return Err(DaemonError::ClusterOrphan);
+                }
+            }
+        }
+    }
+
+    fn pending_work(&mut self) -> Option<DaemonDefaultDfsReconciliationWork> {
+        let current = self.projection_rx.borrow_and_update().clone();
+        let local_generation = *self.local_wake_rx.borrow_and_update();
+        let parked_wake_inputs = self
+            .parked_generation
+            .as_ref()
+            .map(|parked| parked.handoff.wake_inputs(&current.inputs))
+            .unwrap_or_default();
+        let reconcile_defaults = match self.parked_generation.as_ref() {
+            Some(parked) => {
+                parked.wake_inputs != parked_wake_inputs
+                    || parked.local_generation != local_generation
+            }
+            None => {
+                self.reconciled_inputs.as_ref() != Some(&current.inputs)
+                    || self.reconciled_local_generation != Some(local_generation)
+            }
+        };
+        let recover_prior_process_permit = self.recovered_placement_authority_permit.as_ref()
+            != Some(&current.placement_authority_permit);
+        (reconcile_defaults || recover_prior_process_permit).then_some(
+            DaemonDefaultDfsReconciliationWork {
+                inputs: current.inputs,
+                placement_authority_permit: current.placement_authority_permit,
+                local_generation,
+                reconcile_defaults,
+                recover_prior_process_permit,
+                refresh_before_recovery: self.recovered_placement_authority_permit.is_none(),
+            },
+        )
+    }
+
+    fn complete_default_reconciliation(&mut self, work: &DaemonDefaultDfsReconciliationWork) {
+        self.reconciled_inputs = Some(work.inputs.clone());
+        self.reconciled_local_generation = Some(work.local_generation);
+        self.parked_generation = None;
+        if let Ok(mut parked) = self.parked_subscription.lock() {
+            *parked = None;
+        }
+    }
+
+    fn park_default_reconciliation(
+        &mut self,
+        work: &DaemonDefaultDfsReconciliationWork,
+        handoff: DaemonDefaultDfsParkedHandoff,
+    ) {
+        let wake_inputs = handoff.wake_inputs(&work.inputs);
+        self.reconciled_inputs = Some(work.inputs.clone());
+        self.reconciled_local_generation = Some(work.local_generation);
+        self.parked_generation = Some(DaemonDefaultDfsParkedGeneration {
+            handoff: handoff.clone(),
+            wake_inputs,
+            local_generation: work.local_generation,
+        });
+        if let Ok(mut parked) = self.parked_subscription.lock() {
+            *parked = Some(handoff);
+        }
+    }
+
+    fn complete_prior_process_recovery(&mut self, work: &DaemonDefaultDfsReconciliationWork) {
+        self.recovered_placement_authority_permit = Some(work.placement_authority_permit.clone());
+    }
+
+    async fn reconcile_pending_async(
+        &mut self,
+        paths: &DaemonPaths,
+        options: &DaemonRunOptions,
+        expected_cluster_id: &sinomo_core::Id,
+        expected_node_id: &NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<DaemonDefaultDfsReconciliationStep, DaemonError> {
+        let Some(work) = self.pending_work() else {
+            return Ok(DaemonDefaultDfsReconciliationStep::Idle);
+        };
+        let Some(publish_cluster_control) = daemon_default_dfs_reconciliation_local_is_voter(
+            paths,
+            expected_cluster_id,
+            expected_node_id,
+            runtime,
+        )
+        .await?
+        else {
+            return Ok(DaemonDefaultDfsReconciliationStep::IdentityChanged);
+        };
+
+        let mut deferred_recovery_error = None;
+        if work.recover_prior_process_permit {
+            match recover_prior_process_default_dfs_placement_authority_async_on_runtime(
+                paths,
+                runtime,
+                work.refresh_before_recovery,
+            )
+            .await
+            {
+                Ok(_) => self.complete_prior_process_recovery(&work),
+                Err(error) if publish_cluster_control => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "sinomo.dfs.placement",
+                        "prior-process SIFS placement authority recovery deferred: {error}"
+                    );
+                    deferred_recovery_error = Some(error);
+                }
+            }
+        }
+
+        if work.reconcile_defaults {
+            match ensure_default_distributed_dfs_outcome_async_on_runtime(
+                paths,
+                options,
+                publish_cluster_control,
+                runtime.clone(),
+            )
+            .await?
+            {
+                DaemonDefaultDfsLifecycleOutcome::Completed => {
+                    self.complete_default_reconciliation(&work);
+                }
+                DaemonDefaultDfsLifecycleOutcome::Parked(handoff) => {
+                    self.park_default_reconciliation(&work, handoff);
+                    if let Some(error) = deferred_recovery_error {
+                        return Err(error);
+                    }
+                    return Ok(DaemonDefaultDfsReconciliationStep::Parked);
+                }
+            }
+        }
+        if let Some(error) = deferred_recovery_error {
+            return Err(error);
+        }
+        Ok(DaemonDefaultDfsReconciliationStep::Progress)
+    }
+}
+
+fn daemon_default_dfs_reconciliation_exact_input_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let mut keys = BTreeSet::new();
+        keys.insert(sinomo_core::kv::cluster_kv_raft_config_key());
+        keys.insert(sinomo_dfs::file_system_config_key(&file_system_id));
+        for shard_id in ["root", "services", "users"] {
+            keys.insert(sinomo_dfs::metadata_shard_key(&file_system_id, shard_id));
+            keys.insert(sinomo_dfs::metadata_shard_membership_handoff_key(
+                &file_system_id,
+                shard_id,
+            ));
+            keys.insert(sinomo_dfs::metadata_shard_membership_handoff_proof_key(
+                &file_system_id,
+                shard_id,
+            ));
+        }
+        keys
+    })
+}
+
+fn daemon_default_dfs_reconciliation_head_watermark_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        ["root", "services", "users"]
+            .into_iter()
+            .map(|shard_id| {
+                sinomo_dfs::metadata_shard_head_watermark_key(&file_system_id, shard_id)
+            })
+            .collect()
+    })
+}
+
+fn daemon_default_dfs_reconciliation_exact_retry_key(key: &str) -> bool {
+    let file_system_id = sinomo_dfs::sifs_file_system_id();
+    key == sinomo_dfs::placement_authority_permit_key(&file_system_id)
+        || daemon_default_dfs_reconciliation_head_watermark_keys().contains(key)
+        || ["root", "services", "users"].into_iter().any(|shard_id| {
+            key == sinomo_dfs::metadata_shard_key(&file_system_id, shard_id)
+                || key
+                    == sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, shard_id)
+                || key
+                    == sinomo_dfs::metadata_shard_membership_handoff_proof_key(
+                        &file_system_id,
+                        shard_id,
+                    )
+        })
+}
+
+#[derive(serde::Serialize)]
+struct DaemonDefaultDfsEndpointTopologyProjection<'a> {
+    endpoint_id: &'a sinomo_core::Id,
+    node_id: &'a NodeId,
+    transport: &'a sinomo_core::ClusterTransportKind,
+    address: &'a str,
+    source: &'a sinomo_core::ClusterEndpointSource,
+    privacy: &'a sinomo_core::ClusterEndpointPrivacy,
+    priority: u16,
+}
+
+impl<'a> From<&'a sinomo_core::ClusterEndpointRecord>
+    for DaemonDefaultDfsEndpointTopologyProjection<'a>
+{
+    fn from(endpoint: &'a sinomo_core::ClusterEndpointRecord) -> Self {
+        Self {
+            endpoint_id: &endpoint.endpoint_id,
+            node_id: &endpoint.node_id,
+            transport: &endpoint.transport,
+            address: &endpoint.address,
+            source: &endpoint.source,
+            privacy: &endpoint.privacy,
+            priority: endpoint.priority,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DaemonDefaultDfsMemberProjection<'a> {
+    cluster_id: &'a sinomo_core::Id,
+    node_id: &'a NodeId,
+    role: &'a sinomo_core::ClusterMemberRole,
+    state: &'a sinomo_core::ClusterMemberState,
+    endpoints: Vec<DaemonDefaultDfsEndpointTopologyProjection<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct DaemonDefaultDfsConnectivityProjection<'a> {
+    cluster_id: &'a sinomo_core::Id,
+    source_node_id: &'a NodeId,
+    target_node_id: &'a NodeId,
+    endpoint_id: &'a sinomo_core::network::ClusterEndpointId,
+    transport: &'a sinomo_core::ClusterTransportKind,
+    address: &'a str,
+    state: &'a sinomo_core::network::ClusterConnectivityState,
+    failure_reason: &'a Option<sinomo_core::network::ClusterConnectivityFailureReason>,
+}
+
+#[derive(serde::Serialize)]
+struct DaemonDefaultDfsAdvertisementProjection<'a> {
+    node_id: &'a NodeId,
+    capacity_weight: u32,
+    accepts_metadata: bool,
+    accepts_content: bool,
+    zone: &'a Option<String>,
+}
+
+fn daemon_default_dfs_reconciliation_input_value(entry: &KvEntry) -> Vec<u8> {
+    if entry.key.starts_with(DAEMON_DEFAULT_DFS_MEMBER_PREFIX)
+        && let Ok(member) = entry.decode::<sinomo_core::ClusterMemberRecord>()
+    {
+        let mut endpoints = member
+            .endpoints
+            .iter()
+            .map(DaemonDefaultDfsEndpointTopologyProjection::from)
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| left.endpoint_id.cmp(right.endpoint_id));
+        // DFS placement consumes membership eligibility/order and the stable
+        // endpoint topology used to filter its connectivity graph. Exclude
+        // liveness timestamps and observed latency so refresh-only commits do
+        // not wake the reactor.
+        let value = sinomo_core::kv::encode_kv_value(&DaemonDefaultDfsMemberProjection {
+            cluster_id: &member.cluster_id,
+            node_id: &member.node_id,
+            role: &member.role,
+            state: &member.state,
+            endpoints,
+        })
+        .unwrap_or_else(|_| entry.value.clone());
+        return value;
+    }
+    if entry.key.starts_with(DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX)
+        && let Ok(endpoint) = entry.decode::<sinomo_core::ClusterEndpointRecord>()
+    {
+        // This intentionally overlaps the endpoint projection embedded in a
+        // member record. Route construction consumes both the bootstrap member
+        // image and independently updated normalized endpoint KV entries; a
+        // topology change in either representation must invalidate placement.
+        let value = sinomo_core::kv::encode_kv_value(
+            &DaemonDefaultDfsEndpointTopologyProjection::from(&endpoint),
+        )
+        .unwrap_or_else(|_| entry.value.clone());
+        return value;
+    }
+    if entry
+        .key
+        .starts_with(DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX)
+        && let Ok(record) = entry.decode::<sinomo_core::network::ClusterConnectivityRecord>()
+    {
+        // Match `cluster_connectivity_stable_eq`: expiry, observations and
+        // latency refreshes do not change the healthy-route existence used by
+        // default metadata-primary failover.
+        let value = sinomo_core::kv::encode_kv_value(&DaemonDefaultDfsConnectivityProjection {
+            cluster_id: &record.cluster_id,
+            source_node_id: &record.source_node_id,
+            target_node_id: &record.target_node_id,
+            endpoint_id: &record.endpoint_id,
+            transport: &record.transport,
+            address: &record.address,
+            state: &record.state,
+            failure_reason: &record.failure_reason,
+        })
+        .unwrap_or_else(|_| entry.value.clone());
+        return value;
+    }
+    if (entry
+        .key
+        .starts_with(sinomo_dfs::metadata_services_prefix())
+        || entry.key.starts_with(sinomo_dfs::content_services_prefix()))
+        && let Ok(advertisement) = entry.decode::<sinomo_dfs::DfsNodeAdvertisement>()
+    {
+        // Advertisements are derived state, but excluding them entirely means
+        // deletion or semantic corruption has no committed edge that can
+        // repair it. `updated_at` is deliberately excluded: a refresh of an
+        // already-correct advertisement is not control-plane work.
+        return sinomo_core::kv::encode_kv_value(&DaemonDefaultDfsAdvertisementProjection {
+            node_id: &advertisement.node_id,
+            capacity_weight: advertisement.capacity_weight,
+            accepts_metadata: advertisement.accepts_metadata,
+            accepts_content: advertisement.accepts_content,
+            zone: &advertisement.zone,
+        })
+        .unwrap_or_else(|_| entry.value.clone());
+    }
+    entry.value.clone()
+}
+
+fn daemon_default_dfs_reconciliation_projection(
+    snapshot: &KvSnapshot,
+    _local_node_id: &NodeId,
+    watch_replica_watermarks: bool,
+) -> (
+    Vec<(String, Vec<u8>)>,
+    Option<DaemonDefaultDfsPermitGeneration>,
+) {
+    let exact_keys = daemon_default_dfs_reconciliation_exact_input_keys();
+    let permit_key = sinomo_dfs::placement_authority_permit_key(&sinomo_dfs::sifs_file_system_id());
+    let mut inputs = Vec::new();
+    for key in exact_keys {
+        if let Some(entry) = snapshot.get(key) {
+            inputs.push((
+                entry.key.clone(),
+                daemon_default_dfs_reconciliation_input_value(entry),
+            ));
+        }
+    }
+    if watch_replica_watermarks {
+        for key in daemon_default_dfs_reconciliation_head_watermark_keys() {
+            if let Some(entry) = snapshot.get(key) {
+                inputs.push((
+                    entry.key.clone(),
+                    daemon_default_dfs_reconciliation_input_value(entry),
+                ));
+            }
+        }
+    }
+    // `KvSnapshot` is canonical, so prefix iterators jump to the first key by
+    // binary search. The committed-snapshot callback therefore scales with
+    // the bounded relevant projection rather than scanning unrelated KV data.
+    for prefix in [
+        DAEMON_DEFAULT_DFS_MEMBER_PREFIX,
+        DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX,
+        DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX,
+        sinomo_dfs::metadata_services_prefix(),
+        sinomo_dfs::content_services_prefix(),
+    ] {
+        for entry in snapshot.prefix_entries(prefix) {
+            inputs.push((
+                entry.key.clone(),
+                daemon_default_dfs_reconciliation_input_value(entry),
+            ));
+        }
+    }
+    inputs.sort_by(|left, right| left.0.cmp(&right.0));
+    let placement_authority_permit =
+        snapshot
+            .get(&permit_key)
+            .map(|entry| DaemonDefaultDfsPermitGeneration {
+                modify_revision: entry.modify_revision,
+                version: entry.version,
+                value: entry.value.clone(),
+            });
+    (inputs, placement_authority_permit)
+}
+
+#[cfg(test)]
+fn observe_daemon_default_dfs_reconciliation(
+    projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+    local_node_id: &NodeId,
+    snapshot: &KvSnapshot,
+) {
+    observe_daemon_default_dfs_reconciliation_with_replica_subscription(
+        projection_tx,
+        local_node_id,
+        snapshot,
+        true,
+        None,
+    );
+}
+
+fn observe_daemon_default_dfs_reconciliation_with_replica_subscription(
+    projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+    local_node_id: &NodeId,
+    snapshot: &KvSnapshot,
+    watch_replica_watermarks: bool,
+    parked_handoff: Option<&DaemonDefaultDfsParkedHandoff>,
+) {
+    let (inputs, placement_authority_permit) = daemon_default_dfs_reconciliation_projection(
+        snapshot,
+        local_node_id,
+        watch_replica_watermarks,
+    );
+    projection_tx.send_if_modified(|observed| {
+        if observed
+            .revision
+            .is_some_and(|revision| snapshot.revision < revision)
+        {
+            return false;
+        }
+        let changed = match parked_handoff {
+            Some(parked) => {
+                parked.wake_inputs(&observed.inputs) != parked.wake_inputs(&inputs)
+                    || observed.placement_authority_permit != placement_authority_permit
+            }
+            None => {
+                observed.inputs != inputs
+                    || observed.placement_authority_permit != placement_authority_permit
+            }
+        };
+        observed.revision = Some(snapshot.revision);
+        if changed {
+            observed.inputs.clone_from(&inputs);
+            observed
+                .placement_authority_permit
+                .clone_from(&placement_authority_permit);
+        }
+        changed
+    });
+}
+
+fn daemon_default_dfs_reconciliation_key_is_relevant(
+    key: &str,
+    watch_replica_watermarks: bool,
+) -> bool {
+    daemon_default_dfs_reconciliation_exact_input_keys().contains(key)
+        || (watch_replica_watermarks
+            && daemon_default_dfs_reconciliation_head_watermark_keys().contains(key))
+        || key == sinomo_dfs::placement_authority_permit_key(&sinomo_dfs::sifs_file_system_id())
+        || key.starts_with(DAEMON_DEFAULT_DFS_MEMBER_PREFIX)
+        || key.starts_with(DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX)
+        || key.starts_with(DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX)
+        || key.starts_with(sinomo_dfs::metadata_services_prefix())
+        || key.starts_with(sinomo_dfs::content_services_prefix())
+}
+
+/// Incremental committed-snapshot observer for the default DFS reactor.
+///
+/// The resident snapshot is rebuilt only at startup/compaction or when an
+/// event touches the bounded semantic projection. Revisions containing only
+/// unrelated KV work advance the cursor without decoding, cloning, sorting,
+/// or reconstructing connectivity inputs.
+#[derive(Debug, Default)]
+struct DaemonDefaultDfsCommittedProjectionObserver {
+    revision: Option<KvRevision>,
+    data_dir: Option<SinomoDataDir>,
+    parked_subscription: Option<Arc<Mutex<Option<DaemonDefaultDfsParkedHandoff>>>>,
+    #[cfg(test)]
+    rebuild_count: usize,
+}
+
+impl DaemonDefaultDfsCommittedProjectionObserver {
+    #[cfg(test)]
+    fn new(data_dir: SinomoDataDir) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            ..Self::default()
+        }
+    }
+
+    fn new_with_parked_subscription(
+        data_dir: SinomoDataDir,
+        parked_subscription: Arc<Mutex<Option<DaemonDefaultDfsParkedHandoff>>>,
+    ) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            parked_subscription: Some(parked_subscription),
+            ..Self::default()
+        }
+    }
+
+    fn parked_handoff(&self) -> Option<DaemonDefaultDfsParkedHandoff> {
+        self.parked_subscription
+            .as_ref()
+            .and_then(|parked| parked.lock().ok()?.clone())
+    }
+
+    fn observe(
+        &mut self,
+        projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+        local_node_id: &NodeId,
+        snapshot: &KvSnapshot,
+    ) {
+        let Some(previous_revision) = self.revision else {
+            self.rebuild(projection_tx, local_node_id, snapshot);
+            return;
+        };
+        if snapshot.revision <= previous_revision {
+            return;
+        }
+        if previous_revision < snapshot.compacted_revision {
+            self.rebuild(projection_tx, local_node_id, snapshot);
+            return;
+        }
+
+        let first_new = snapshot
+            .events
+            .partition_point(|event| event.revision <= previous_revision);
+        let parked_handoff = self.parked_handoff();
+        let watch_replica_watermarks = parked_handoff.is_some()
+            || self.data_dir.as_ref().is_some_and(|data_dir| {
+                sinomo_dfs::default_cluster_dfs_materialization_awaits_replica_progress(data_dir)
+            });
+        let relevant_change = snapshot.events[first_new..].iter().any(|event| {
+            parked_handoff.as_ref().map_or_else(
+                || {
+                    daemon_default_dfs_reconciliation_key_is_relevant(
+                        &event.key,
+                        watch_replica_watermarks,
+                    )
+                },
+                |parked| {
+                    parked.owns_key(&event.key)
+                        || event.key
+                            == sinomo_dfs::placement_authority_permit_key(
+                                &sinomo_dfs::sifs_file_system_id(),
+                            )
+                },
+            )
+        });
+        self.revision = Some(snapshot.revision);
+        if relevant_change {
+            self.rebuild_projection(projection_tx, local_node_id, snapshot);
+        } else if let Some(parked) = parked_handoff.as_ref() {
+            self.apply_parked_projection_deltas(
+                projection_tx,
+                snapshot,
+                first_new,
+                parked,
+                watch_replica_watermarks,
+            );
+        } else {
+            projection_tx.send_if_modified(|observed| {
+                if observed
+                    .revision
+                    .is_some_and(|revision| snapshot.revision <= revision)
+                {
+                    return false;
+                }
+                observed.revision = Some(snapshot.revision);
+                false
+            });
+        }
+    }
+
+    fn apply_parked_projection_deltas(
+        &self,
+        projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+        snapshot: &KvSnapshot,
+        first_new: usize,
+        parked: &DaemonDefaultDfsParkedHandoff,
+        watch_replica_watermarks: bool,
+    ) {
+        let permit_key =
+            sinomo_dfs::placement_authority_permit_key(&sinomo_dfs::sifs_file_system_id());
+        projection_tx.send_if_modified(|observed| {
+            if observed
+                .revision
+                .is_some_and(|revision| snapshot.revision <= revision)
+            {
+                return false;
+            }
+            let previous_wake_inputs = parked.wake_inputs(&observed.inputs);
+            let previous_permit = observed.placement_authority_permit.clone();
+            for event in &snapshot.events[first_new..] {
+                if event.key == permit_key {
+                    observed.placement_authority_permit =
+                        snapshot
+                            .get(&permit_key)
+                            .map(|entry| DaemonDefaultDfsPermitGeneration {
+                                modify_revision: entry.modify_revision,
+                                version: entry.version,
+                                value: entry.value.clone(),
+                            });
+                    continue;
+                }
+                if !daemon_default_dfs_reconciliation_key_is_relevant(
+                    &event.key,
+                    watch_replica_watermarks,
+                ) {
+                    continue;
+                }
+                let position = observed
+                    .inputs
+                    .binary_search_by(|(key, _)| key.as_str().cmp(event.key.as_str()));
+                match snapshot.get(&event.key) {
+                    Some(entry) => {
+                        let value = daemon_default_dfs_reconciliation_input_value(entry);
+                        match position {
+                            Ok(index) => observed.inputs[index].1 = value,
+                            Err(index) => observed.inputs.insert(index, (event.key.clone(), value)),
+                        }
+                    }
+                    None => {
+                        if let Ok(index) = position {
+                            observed.inputs.remove(index);
+                        }
+                    }
+                }
+            }
+            observed.revision = Some(snapshot.revision);
+            previous_wake_inputs != parked.wake_inputs(&observed.inputs)
+                || previous_permit != observed.placement_authority_permit
+        });
+    }
+
+    fn rebuild(
+        &mut self,
+        projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+        local_node_id: &NodeId,
+        snapshot: &KvSnapshot,
+    ) {
+        self.revision = Some(snapshot.revision);
+        self.rebuild_projection(projection_tx, local_node_id, snapshot);
+    }
+
+    fn rebuild_projection(
+        &mut self,
+        projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+        local_node_id: &NodeId,
+        snapshot: &KvSnapshot,
+    ) {
+        #[cfg(test)]
+        {
+            self.rebuild_count = self.rebuild_count.saturating_add(1);
+        }
+        let parked_handoff = self.parked_handoff();
+        let watch_replica_watermarks = parked_handoff.is_some()
+            || self.data_dir.as_ref().is_some_and(|data_dir| {
+                sinomo_dfs::default_cluster_dfs_materialization_awaits_replica_progress(data_dir)
+            });
+        observe_daemon_default_dfs_reconciliation_with_replica_subscription(
+            projection_tx,
+            local_node_id,
+            snapshot,
+            watch_replica_watermarks,
+            parked_handoff.as_ref(),
+        );
+    }
+}
+
+async fn daemon_default_dfs_reconciliation_local_is_voter(
+    paths: &DaemonPaths,
+    expected_cluster_id: &sinomo_core::Id,
+    expected_node_id: &NodeId,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<bool>, DaemonError> {
+    let task_paths = paths.clone();
+    let expected_cluster_id = expected_cluster_id.clone();
+    let expected_node_id = expected_node_id.clone();
+    runtime
+        .spawn_blocking(move || {
+            let data_dir = SinomoDataDir::new(daemon_data_dir(&task_paths)?);
+            let cluster_paths = ClusterPaths::new(&data_dir);
+            let state = sinomo_core::cluster::read_cluster_consensus_state(&cluster_paths)?;
+            if state.cluster_id != expected_cluster_id || state.local_node_id != expected_node_id {
+                return Ok(None);
+            }
+            Ok(Some(sinomo_core::kv::cluster_kv_raft_local_is_voter(
+                &state,
+            )))
+        })
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: "default DFS reconciliation identity".to_string(),
+            detail: format!("default DFS identity task failed: {source}"),
+        })?
+}
+
+async fn recover_prior_process_default_dfs_placement_authority_async_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    refresh_latest: bool,
+) -> Result<bool, DaemonError> {
+    let task_paths = paths.clone();
+    let task_runtime = runtime.clone();
+    runtime
+        .spawn_blocking(move || {
+            recover_prior_process_default_dfs_placement_authority_from_observation(
+                &task_paths,
+                &task_runtime,
+                refresh_latest,
+            )
+        })
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: "default DFS placement-authority recovery".to_string(),
+            detail: format!("default DFS recovery task failed: {source}"),
+        })?
+}
+
+fn daemon_default_dfs_reconciliation_retry_delay(failure_streak: u32) -> Duration {
+    let shift = failure_streak.saturating_sub(1).min(6);
+    DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_INITIAL
+        .saturating_mul(1_u32.checked_shl(shift).unwrap_or(64))
+        .min(DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_MAX)
+}
+
+pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
+    mut reactor: DaemonDefaultDfsReconciliationReactor,
+    paths: DaemonPaths,
+    options: DaemonRunOptions,
+    expected_cluster_id: sinomo_core::Id,
+    expected_node_id: NodeId,
+    runtime: tokio::runtime::Handle,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut failure_streak = 0_u32;
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        match reactor
+            .reconcile_pending_async(
+                &paths,
+                &options,
+                &expected_cluster_id,
+                &expected_node_id,
+                &runtime,
+            )
+            .await
+        {
+            Ok(DaemonDefaultDfsReconciliationStep::Progress) => {
+                failure_streak = 0;
+                continue;
+            }
+            Ok(DaemonDefaultDfsReconciliationStep::Parked) => {
+                failure_streak = 0;
+                // A durable handoff is waiting on exact state owners, not a
+                // failed reconciliation attempt. It has no retry timer: only
+                // the handoff/proof/shard generation or subscribed replica
+                // progress can make the parked work runnable again.
+                tokio::select! {
+                    _ = reactor.changed() => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(DaemonDefaultDfsReconciliationStep::Idle) => {
+                failure_streak = 0;
+                tokio::select! {
+                    _ = reactor.changed() => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(DaemonDefaultDfsReconciliationStep::IdentityChanged) => {
+                tracing::info!(
+                    target: "sinomo.dfs.maintenance",
+                    "default DFS reconciliation stopped after daemon identity changed"
+                );
+                return;
+            }
+            Err(error) => {
+                failure_streak = failure_streak.saturating_add(1);
+                let retry_delay = daemon_default_dfs_reconciliation_retry_delay(failure_streak);
+                tracing::warn!(
+                    target: "sinomo.dfs.maintenance",
+                    failure_streak,
+                    retry_delay_ms = retry_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "default DFS reconciliation failed; retrying after source change or backoff: {error}"
+                );
+                // A timer exists only while real work is failing. Preserve its
+                // absolute deadline across ordinary placement/connectivity
+                // churn: only an exact handoff, proof, shard-authority, permit,
+                // or subscribed replica generation can make the failed work
+                // runnable before that deadline.
+                let failed_generation = reactor.exact_retry_generation();
+                let retry_deadline = tokio::time::Instant::now() + retry_delay;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(retry_deadline) => break,
+                        _ = reactor.changed_signal() => {
+                            if reactor.exact_retry_generation() != failed_generation {
+                                break;
+                            }
+                        }
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaemonDefaultDfsLifecycleOutcome {
+    Completed,
+    Parked(DaemonDefaultDfsParkedHandoff),
+}
+
+#[cfg(test)]
 pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
     publish_cluster_control: bool,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
+    match ensure_default_distributed_dfs_outcome_async_on_runtime(
+        paths,
+        options,
+        publish_cluster_control,
+        runtime,
+    )
+    .await?
+    {
+        DaemonDefaultDfsLifecycleOutcome::Completed => Ok(()),
+        DaemonDefaultDfsLifecycleOutcome::Parked(handoff) => {
+            Err(sinomo_dfs::DfsError::MetadataShardMembershipHandoffParked {
+                file_system_id: handoff.file_system_id,
+                shard_id: handoff.shard_id.0,
+                handoff_id: handoff.handoff_id,
+                retiring_epoch: handoff.retiring_epoch,
+                desired_epoch: handoff.desired_epoch,
+            }
+            .into())
+        }
+    }
+}
+
+async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
+    paths: &DaemonPaths,
+    options: &DaemonRunOptions,
+    publish_cluster_control: bool,
+    runtime: tokio::runtime::Handle,
+) -> Result<DaemonDefaultDfsLifecycleOutcome, DaemonError> {
+    #[cfg(test)]
+    record_daemon_default_dfs_reconciliation_run(paths);
     let data_dir = daemon_data_dir(paths)?;
     let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
-    let Ok(lifecycle_guard) = lifecycle_gate.try_lock_owned() else {
-        tracing::debug!(
-            target: "sinomo.dfs.maintenance",
-            data_dir = %data_dir.display(),
-            "coalesced default DFS reconciliation with active lifecycle pass"
-        );
-        return Ok(());
-    };
+    // The dedicated reactor is the sole owner of default reconciliation. Wait
+    // behind an active backend-bearing maintenance pass instead of treating
+    // overlap as success and losing a committed input generation.
+    let lifecycle_guard = lifecycle_gate.lock_owned().await;
     let message_execution_gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(data_dir))?;
     let message_execution_guard = Arc::clone(&message_execution_gate.semaphore)
         .acquire_owned()
@@ -3524,14 +4755,13 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
             detail: "DFS message execution gate closed".to_string(),
         })?;
     // Own the permit inside the blocking task that polls the complete lifecycle
-    // future. Cluster phase timeouts drop their JoinHandle but cannot cancel a
-    // running blocking task, so synchronous metadata recovery cannot outlive
-    // either guard and overlap another backend-bearing DFS path.
+    // future. Dropping the JoinHandle cannot cancel a running blocking task, so
+    // neither guard can be released while backend-bearing DFS work still runs.
     let task_paths = paths.clone();
     let task_options = options.clone();
     let task_runtime = runtime.clone();
     let task_data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
-    runtime
+    let lifecycle_result = runtime
         .spawn_blocking(move || {
             let _data_owner_lock = task_data_owner_lock;
             let _lifecycle_guard = lifecycle_guard;
@@ -3547,7 +4777,27 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
         .map_err(|source| DaemonError::Network {
             address: "default DFS lifecycle".to_string(),
             detail: format!("default DFS lifecycle task failed: {source}"),
-        })?
+        })?;
+    let lifecycle_outcome = lifecycle_result?;
+
+    if matches!(
+        lifecycle_outcome,
+        DaemonDefaultDfsLifecycleOutcome::Parked(_)
+    ) {
+        return Ok(lifecycle_outcome);
+    }
+
+    let data_dir = SinomoDataDir::new(data_dir);
+    if sinomo_dfs::take_default_cluster_dfs_materialization_immediate_retry(&data_dir) {
+        notify_daemon_default_dfs_reconciliation_replica_progress(&ClusterPaths::new(&data_dir));
+    }
+
+    // Default materialization and completed handoff activation append directly
+    // to local primary journals rather than passing through a served-message
+    // event. Wake the node-local replication lanes after their lifecycle guards
+    // have been released so those entries do not depend on broad maintenance.
+    schedule_daemon_dfs_metadata_publish_on_runtime(paths, &runtime, None)?;
+    Ok(lifecycle_outcome)
 }
 
 async fn ensure_default_distributed_dfs_lifecycle_inner(
@@ -3555,24 +4805,15 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
     _options: &DaemonRunOptions,
     publish_cluster_control: bool,
     runtime: tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
+) -> Result<DaemonDefaultDfsLifecycleOutcome, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    // Startup attempts this before accepting control traffic. Retrying here is
-    // safe under the same process-lifetime data-owner lock and lets recovery
-    // converge once cluster quorum becomes reachable after startup.
-    if let Err(error) = recover_prior_process_default_dfs_placement_authority(paths, &runtime) {
-        tracing::warn!(
-            target: "sinomo.dfs.placement",
-            "prior-process SIFS placement authority recovery deferred: {error}"
-        );
-    }
     let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
         &cluster_paths,
         &runtime,
     ));
-    sinomo_dfs::ensure_default_cluster_dfs_async(
+    match sinomo_dfs::ensure_default_cluster_dfs_async(
         data_dir,
         cluster_paths,
         control_plane,
@@ -3582,13 +4823,31 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
             local_zone: daemon_dfs_local_zone(),
         },
     )
-    .await?;
-    Ok(())
+    .await
+    {
+        Ok(_) => Ok(DaemonDefaultDfsLifecycleOutcome::Completed),
+        Err(sinomo_dfs::DfsError::MetadataShardMembershipHandoffParked {
+            file_system_id,
+            shard_id,
+            handoff_id,
+            retiring_epoch,
+            desired_epoch,
+        }) => Ok(DaemonDefaultDfsLifecycleOutcome::Parked(
+            DaemonDefaultDfsParkedHandoff::new(
+                file_system_id,
+                shard_id,
+                handoff_id,
+                retiring_epoch,
+                desired_epoch,
+            ),
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonDfsMaintenanceTickOutcome {
-    Completed,
+    Completed { reached_limit: bool },
     Deferred,
 }
 
@@ -3628,7 +4887,9 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     if !cluster_paths.state.exists() {
-        return Ok(DaemonDfsMaintenanceTickOutcome::Completed);
+        return Ok(DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: false,
+        });
     }
     let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
@@ -3639,46 +4900,25 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     // to yield once its current synchronous poll reaches an await boundary.
     let foreground_preemption =
         daemon_dfs_message_execution_gate(&data_dir)?.begin_maintenance_interest();
-    let Some(admission) = acquire_daemon_dfs_maintenance_admission(
-        &data_dir,
-        &cluster_paths,
-        runtime,
-        cluster_state.local_node_id.clone(),
-    )
-    .await?
-    else {
-        return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
-    };
+    let admission = acquire_daemon_dfs_maintenance_admission(&data_dir).await?;
     let DaemonDfsMaintenanceAdmission {
-        lease,
         _lifecycle_guard: lifecycle_guard,
         _message_execution_guard: message_execution_guard,
     } = admission;
-    if let Some(detail) = lease.ownership_loss_detail() {
-        drop(message_execution_guard);
-        drop(lifecycle_guard);
-        let _ = lease.release().await;
-        return Err(daemon_dfs_maintenance_lease_error(detail));
-    }
-    let mut authority_rx = lease.authority_receiver();
     let mut deferred_work = None;
+    let committed_work_tracker = DfsCommittedWorkTracker::new();
     let maintenance_result =
         run_daemon_dfs_maintenance_until_foreground_waits(&foreground_preemption, async {
-            let mut maintenance = Box::pin(run_daemon_dfs_maintenance_tick_with_admission(
-                data_dir,
+            run_daemon_dfs_maintenance_tick_with_admission(
+                data_dir.clone(),
                 cluster_paths.clone(),
                 cluster_state,
                 execution_exclusions,
                 runtime,
+                committed_work_tracker.clone(),
                 &mut deferred_work,
-            ));
-            tokio::select! {
-                biased;
-                detail = wait_for_daemon_dfs_maintenance_lease_loss(&mut authority_rx) => {
-                    Err(daemon_dfs_maintenance_lease_error(detail))
-                },
-                result = &mut maintenance => result,
-            }
+            )
+            .await
         })
         .await;
     // The preemption helper has already dropped the entire maintenance future
@@ -3689,7 +4929,6 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     drop(message_execution_guard);
     drop(lifecycle_guard);
     drop(foreground_preemption);
-    let lease_release_result = lease.release().await;
     if let Some((detached_runtime, worker)) = deferred_work {
         schedule_daemon_dfs_message_deferred_work(
             runtime,
@@ -3698,11 +4937,23 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
             worker,
         );
     }
-    lease_release_result?;
+    // The tracker is owned outside the cancellable maintenance future and is
+    // updated at each durable mutation boundary. Transfer those exact bits
+    // only after destroying the backend-bearing generation and dropping its
+    // guards, even when a later maintenance step failed or was preempted.
+    emit_daemon_dfs_committed_edges(
+        &data_dir,
+        &cluster_paths,
+        &DfsMessageExecutionScope::GlobalExclusive,
+        runtime,
+        None,
+        committed_work_tracker.take(),
+        &[],
+    );
     match maintenance_result {
         DaemonDfsMaintenancePreemptionOutcome::Finished(result) => {
-            result?;
-            Ok(DaemonDfsMaintenanceTickOutcome::Completed)
+            let reached_limit = result?;
+            Ok(DaemonDfsMaintenanceTickOutcome::Completed { reached_limit })
         }
         DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
             Ok(DaemonDfsMaintenanceTickOutcome::Deferred)
@@ -3716,8 +4967,9 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     cluster_state: sinomo_core::ClusterBootstrapState,
     execution_exclusions: DfsMaintenanceExecutionExclusions,
     runtime: &tokio::runtime::Handle,
+    committed_work_tracker: DfsCommittedWorkTracker,
     deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     evict_daemon_dfs_message_service_cache(&data_dir)?;
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
@@ -3733,13 +4985,15 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         &cluster_paths,
         &cluster_state.cluster_id,
         &cluster_state.local_node_id,
+        Some(runtime),
     )
     .map_err(DaemonError::from)?;
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
+    let options = daemon_dfs_maintenance_tick_options();
     let maintenance_result =
-        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions(
+        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker(
             runtime,
             data_dir.clone(),
             cluster_paths.clone(),
@@ -3747,8 +5001,9 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
             async_peer_transport,
             detached_send_runtime.state.clone(),
             execution_exclusions,
+            committed_work_tracker,
             daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
-            daemon_dfs_maintenance_tick_options(),
+            options,
         )
         .await
         .map_err(DaemonError::from);
@@ -3801,8 +5056,9 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     ));
     let report = maintenance_result?;
     let Some(report) = report else {
-        return Ok(());
+        return Ok(false);
     };
+    let reached_limit = daemon_dfs_maintenance_report_reached_limit(&report);
     let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
     tracing::debug!(
         target: "sinomo.dfs.maintenance",
@@ -3815,6 +5071,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         followup_event_count = report.followup_events.len(),
         namespace_jobs_scanned = report.namespace_jobs.scanned_job_count,
         namespace_jobs_resumed = report.namespace_jobs.resumed_job_count,
+        bounded_continuation = reached_limit,
         "DFS maintenance tick completed"
     );
     if let Some(stats) = crate::process_idle_stats() {
@@ -3825,7 +5082,64 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     for line in observations.notice_lines {
         tracing::warn!("sinomo daemon {line}");
     }
-    Ok(())
+    Ok(reached_limit)
+}
+
+/// Whether this pass itself proved that it stopped with bounded, immediately
+/// continuable work.
+///
+/// Hitting a scan count is not enough: an exact-sized workload and a newly
+/// arrived record are indistinguishable from counts alone. Likewise, a
+/// running namespace job may have made no progress while waiting on external
+/// state. Only durable cursors or explicit retained-limit reports, paired with
+/// evidence that this pass advanced, may bypass the ordinary maintenance gate.
+fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -> bool {
+    let terminal_namespace_jobs = report
+        .namespace_jobs
+        .completed_job_count
+        .saturating_add(report.namespace_jobs.failed_job_count);
+    let resumed_namespace_jobs_still_running = report
+        .namespace_jobs
+        .resumed_job_count
+        .saturating_sub(terminal_namespace_jobs);
+    let skipped_namespace_jobs = report
+        .namespace_jobs
+        .remaining_running_job_count
+        .saturating_sub(resumed_namespace_jobs_still_running);
+    let namespace_job_limit_reached = terminal_namespace_jobs > 0 && skipped_namespace_jobs > 0;
+
+    let placement_page_remaining = report.placement_reconciliation.as_ref().is_some_and(|job| {
+        job.last_error.is_none()
+            && job.cursor.is_some()
+            && matches!(
+                job.state,
+                DfsPlacementReconciliationState::Scanning
+                    | DfsPlacementReconciliationState::Repairing
+            )
+    });
+
+    let lifecycle_limit_reached = report.lifecycle_reports.iter().any(|lifecycle| {
+        lifecycle
+            .stale_staging_gc
+            .as_ref()
+            .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_staging_count > 0)
+            || lifecycle
+                .version_gc
+                .as_ref()
+                .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_version_count > 0)
+            || lifecycle
+                .orphan_gc
+                .as_ref()
+                .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_orphan_count > 0)
+            || lifecycle
+                .tombstone_compaction
+                .as_ref()
+                .is_some_and(|compaction| {
+                    compaction.max_compactions_reached && compaction.compacted_tombstone_count > 0
+                })
+    });
+
+    namespace_job_limit_reached || placement_page_remaining || lifecycle_limit_reached
 }
 
 /// Run the complete DFS maintenance future from Tokio's blocking pool.
@@ -3861,6 +5175,10 @@ fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     options.lifecycle.tombstone_compaction_min_age = DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE;
     options.lifecycle.tombstone_compaction_max_records =
         DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS;
+    // Metadata cursor ownership belongs exclusively to retained exact-shard
+    // publisher lanes. A broad maintenance pass must not race those lanes or
+    // duplicate their outbound RPCs.
+    options.publish_metadata = false;
     options.metadata_replication = daemon_dfs_metadata_replication_options();
     options
 }
@@ -3894,6 +5212,15 @@ fn daemon_dfs_metadata_publish_schedule_options() -> DfsMetadataPublishScheduleO
     DfsMetadataPublishScheduleOptions {
         max_retry_rounds: DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS,
         retry_delay: DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
+        max_retry_delay: DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY,
+    }
+}
+
+fn daemon_dfs_metadata_publish_discovery_schedule_options() -> DfsMetadataPublishScheduleOptions {
+    DfsMetadataPublishScheduleOptions {
+        max_retry_rounds: DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS,
+        retry_delay: DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL,
+        max_retry_delay: DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX,
     }
 }
 
@@ -3916,6 +5243,7 @@ pub(crate) fn schedule_daemon_dfs_metadata_publish_on_runtime(
             cluster_paths,
             runtime,
             traceparent,
+            None,
         ),
     )
 }
@@ -3925,46 +5253,269 @@ fn schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
     cluster_paths: ClusterPaths,
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
+    exact_lane: Option<DaemonDfsMutationLaneKey>,
 ) -> DfsMetadataPublishScheduleStart {
-    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
-    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
-    let publish_data_dir = data_dir.clone();
-    let publish_cluster_paths = cluster_paths.clone();
+    // A served mutation already carries its authoritative filesystem/shard
+    // identity. Mark that exact lane dirty before any fallible topology read;
+    // planning inside the retained publisher will retry transient state or KV
+    // projection failures without losing the committed journal edge.
+    if let Some(lane) = exact_lane {
+        return schedule_daemon_dfs_metadata_publish_lane_on_runtime(
+            data_dir,
+            cluster_paths,
+            runtime,
+            traceparent,
+            lane,
+        );
+    }
+
+    // Namespace/global operations and lifecycle materialization can append to
+    // several shards. Retain the discovery edge before reading fallible
+    // cluster state or topology; a transient read failure therefore retries
+    // from this per-root lane without needing another DFS mutation.
+    schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
+        data_dir,
+        cluster_paths,
+        runtime,
+        traceparent,
+    )
+}
+
+fn daemon_dfs_metadata_publish_discovery_lanes(
+    cluster_paths: &ClusterPaths,
+) -> Result<Vec<DaemonDfsMutationLaneKey>, String> {
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .map_err(|error| format!("DFS metadata lanes lack cluster state: {error}"))?;
+    let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        "/dfs/filesystems/",
+    )
+    .map_err(|error| format!("DFS metadata lanes lack shard topology: {error}"))?;
+    let mut lanes = entries
+        .into_iter()
+        .filter(|entry| daemon_dfs_metadata_shard_config_key_is_exact(&entry.key))
+        .map(|entry| {
+            entry
+                .decode::<sinomo_dfs::DfsMetadataShardConfig>()
+                .map_err(|error| format!("DFS metadata shard topology is malformed: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|shard| shard.primary_node_id == state.local_node_id)
+        .map(|shard| DaemonDfsMutationLaneKey {
+            file_system_id: shard.file_system_id,
+            shard_id: DfsMetadataShardId::new(shard.shard_id),
+        })
+        .collect::<Vec<_>>();
+    lanes.sort();
+    lanes.dedup();
+    Ok(lanes)
+}
+
+fn schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+) -> DfsMetadataPublishScheduleStart {
+    let scheduler = match daemon_dfs_metadata_publish_discovery_scheduler(&data_dir) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!("sinomo daemon DFS metadata discovery could not be scheduled: {error}");
+            return DfsMetadataPublishScheduleStart::AlreadyRunning;
+        }
+    };
+    let publish_data_dir = data_dir;
+    let publish_cluster_paths = cluster_paths;
+    let publish_runtime = runtime.clone();
     let report_traceparent = traceparent.clone();
     let error_traceparent = traceparent;
-    sinomo_dfs::schedule_default_dfs_metadata_publish_async_on_runtime(
+    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+        scheduler,
+        runtime.clone(),
+        daemon_dfs_metadata_publish_discovery_schedule_options(),
+        move || {
+            let data_dir = publish_data_dir.clone();
+            let cluster_paths = publish_cluster_paths.clone();
+            let runtime = publish_runtime.clone();
+            async move {
+                let planning_paths = cluster_paths.clone();
+                let discovered = tokio::task::spawn_blocking(move || {
+                    daemon_dfs_metadata_publish_discovery_lanes(&planning_paths)
+                })
+                .await
+                .map_err(|error| format!("DFS metadata lane discovery task failed: {error}"))?;
+                #[cfg(test)]
+                record_daemon_dfs_metadata_publish_discovery_attempt(
+                    &data_dir.root(),
+                    discovered.is_ok(),
+                );
+                let lanes = discovered?;
+                for lane in lanes {
+                    schedule_daemon_dfs_metadata_publish_lane_on_runtime(
+                        data_dir.clone(),
+                        cluster_paths.clone(),
+                        &runtime,
+                        None,
+                        lane,
+                    );
+                }
+                Ok(DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                })
+            }
+        },
+        move |report| {
+            daemon_dfs_perf_trace_with_traceparent(
+                report_traceparent.as_deref(),
+                format_args!(
+                    "dfs-metadata-publish-discovery-complete outcomes={}",
+                    report.outcomes.len()
+                ),
+            );
+        },
+        move |error| {
+            daemon_dfs_perf_trace_with_traceparent(
+                error_traceparent.as_deref(),
+                format_args!("dfs-metadata-publish-discovery-failed error={error}"),
+            );
+            tracing::warn!("sinomo daemon DFS metadata lane discovery failed: {error}");
+        },
+    )
+}
+
+/// Re-dirty only publisher lanes that are currently retained by durable
+/// backlog/failure state for this data root. Connectivity owns the route
+/// generation and calls this edge when its semantic projection changes; no
+/// DFS-wide scan or steady-state timer is involved.
+pub(crate) fn notify_daemon_dfs_metadata_publish_route_generation_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<usize, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let data_root = data_dir.root();
+    let lanes = {
+        let mut schedulers = DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "DFS metadata publish scheduler".to_string(),
+                detail: "DFS metadata publish scheduler map is poisoned".to_string(),
+            })?;
+        schedulers.retain(|_, scheduler| scheduler.strong_count() > 0);
+        schedulers
+            .keys()
+            .filter(|key| key.data_root == data_root)
+            .map(|key| DaemonDfsMutationLaneKey {
+                file_system_id: key.file_system_id.clone(),
+                shard_id: key.shard_id.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    for lane in &lanes {
+        schedule_daemon_dfs_metadata_publish_lane_on_runtime(
+            data_dir.clone(),
+            cluster_paths.clone(),
+            runtime,
+            None,
+            lane.clone(),
+        );
+    }
+    Ok(lanes.len())
+}
+
+fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+    lane: DaemonDfsMutationLaneKey,
+) -> DfsMetadataPublishScheduleStart {
+    let scheduler = match daemon_dfs_metadata_publish_lane_scheduler(
+        &data_dir,
+        &lane.file_system_id,
+        &lane.shard_id,
+    ) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(
+                file_system_id = %lane.file_system_id,
+                shard_id = %lane.shard_id.0,
+                "sinomo daemon DFS metadata lane could not be scheduled: {error}"
+            );
+            return DfsMetadataPublishScheduleStart::AlreadyRunning;
+        }
+    };
+    let Some(data_owner_lock) =
+        DaemonDfsControlPlaneKvClient::discover_data_owner_lock(&cluster_paths)
+    else {
+        tracing::warn!(
+            file_system_id = %lane.file_system_id,
+            shard_id = %lane.shard_id.0,
+            "sinomo daemon DFS metadata lane lacks the live data-owner capability"
+        );
+        return DfsMetadataPublishScheduleStart::AlreadyRunning;
+    };
+    #[cfg(test)]
+    record_daemon_dfs_metadata_publish_lane_request(&data_dir, &lane);
+    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
+    let publish_data_dir = data_dir;
+    let publish_cluster_paths = cluster_paths;
+    let publish_file_system_id = lane.file_system_id.clone();
+    let publish_shard_id = lane.shard_id.clone();
+    let publish_runtime = runtime.clone();
+    let report_lane = lane.clone();
+    let error_lane = lane;
+    let report_traceparent = traceparent.clone();
+    let error_traceparent = traceparent;
+    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+        scheduler,
         runtime.clone(),
         daemon_dfs_metadata_publish_schedule_options(),
         move || {
             let data_dir = publish_data_dir.clone();
             let cluster_paths = publish_cluster_paths.clone();
             let exclusion_paths = cluster_paths.clone();
+            let file_system_id = publish_file_system_id.clone();
+            let shard_id = publish_shard_id.clone();
             let peer_transport = Arc::clone(&peer_transport);
             let async_peer_transport = Arc::clone(&async_peer_transport);
+            let runtime = publish_runtime.clone();
+            let data_owner_lock = Arc::clone(&data_owner_lock);
             async move {
-                // Recompute for every retry/coalesced publish. Read failures
-                // stay fail-open; an older reachability view never becomes
-                // durable DFS state or suppression.
-                let execution_exclusions = tokio::task::spawn_blocking(move || {
-                    sinomo_core::cluster::read_cluster_state_without_kv(&exclusion_paths)
-                        .map(|state| {
-                            daemon_dfs_maintenance_execution_exclusions(&exclusion_paths, &state)
-                        })
-                        .unwrap_or_default()
+                // The scheduler task can be cancelled during runtime shutdown,
+                // while a blocking planner or transport task keeps running.
+                // Own the daemon's OS-backed data capability in the outer
+                // blocking closure for the complete publish future so an old
+                // authority generation cannot overlap its replacement.
+                tokio::task::spawn_blocking(move || {
+                    let _data_owner_lock = data_owner_lock;
+                    let execution_exclusions =
+                        sinomo_core::cluster::read_cluster_state_without_kv(&exclusion_paths)
+                            .map(|state| {
+                                daemon_dfs_maintenance_execution_exclusions(
+                                    &exclusion_paths,
+                                    &state,
+                                )
+                            })
+                            .unwrap_or_default();
+                    runtime.block_on(
+                        sinomo_dfs::publish_cluster_dfs_metadata_shard_with_peer_transports_async_and_execution_exclusions(
+                            &data_dir,
+                            &cluster_paths,
+                            peer_transport,
+                            async_peer_transport,
+                            file_system_id,
+                            shard_id,
+                            &execution_exclusions,
+                            daemon_dfs_metadata_replication_options(),
+                        ),
+                    )
                 })
                 .await
-                .map_err(|source| {
-                    format!("DFS metadata reachability projection task failed: {source}")
-                })?;
-                sinomo_dfs::publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions(
-                    &data_dir,
-                    &cluster_paths,
-                    peer_transport,
-                    async_peer_transport,
-                    &execution_exclusions,
-                    daemon_dfs_metadata_replication_options(),
-                )
-                .await
+                .map_err(|source| format!("DFS metadata publish task failed: {source}"))?
                 .map_err(|error| error.to_string())
             }
         },
@@ -3972,7 +5523,9 @@ fn schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
             daemon_dfs_perf_trace_with_traceparent(
                 report_traceparent.as_deref(),
                 format_args!(
-                    "dfs-metadata-publish-complete outcomes={}",
+                    "dfs-metadata-publish-complete filesystem={} shard={} outcomes={}",
+                    report_lane.file_system_id,
+                    report_lane.shard_id.0,
                     report.outcomes.len()
                 ),
             );
@@ -3981,9 +5534,16 @@ fn schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
         move |error| {
             daemon_dfs_perf_trace_with_traceparent(
                 error_traceparent.as_deref(),
-                format_args!("dfs-metadata-publish-failed error={error}"),
+                format_args!(
+                    "dfs-metadata-publish-failed filesystem={} shard={} error={error}",
+                    error_lane.file_system_id, error_lane.shard_id.0
+                ),
             );
-            tracing::warn!("sinomo daemon DFS scheduled metadata publish failed: {error}");
+            tracing::warn!(
+                file_system_id = %error_lane.file_system_id,
+                shard_id = %error_lane.shard_id.0,
+                "sinomo daemon DFS scheduled metadata publish failed: {error}"
+            );
         },
     )
 }
@@ -4081,7 +5641,6 @@ mod tests {
     use super::*;
     use sinomo_core::DfsWriteReceipt;
     use sinomo_core::events::EventId;
-    use sinomo_core::kv::InProcessKvStore;
     use sinomo_core::network::{
         ClusterConnectivityRecord, ClusterConnectivityState, ClusterEndpointId,
         cluster_route_next_hop,
@@ -4100,6 +5659,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
+
+    // Restart recovery deliberately keeps the permit record private. Tests
+    // encode the durable shape directly to model residue from a dead process;
+    // `inspect_dfs_placement_authority_permit` below proves it remains
+    // compatible with the production decoder before recovery runs.
+    #[derive(serde::Serialize)]
+    struct TestPlacementAuthorityPermitRecord {
+        job_id: String,
+        holder_id: String,
+        holder_cluster_id: Option<String>,
+        holder_node_id: Option<NodeId>,
+        holder_session_id: Option<String>,
+    }
 
     #[test]
     fn daemon_dfs_blocking_owner_clone_retains_exclusive_data_lock() {
@@ -4318,6 +5890,85 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_two_node_maintenance_rpc_waits_make_foreground_progress() {
+        let first_root = temp_root("simultaneous-maintenance-first-node");
+        let second_root = temp_root("simultaneous-maintenance-second-node");
+        let first_gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(first_root.path()))
+            .expect("first message gate");
+        let second_gate =
+            daemon_dfs_message_execution_gate(&SinomoDataDir::new(second_root.path()))
+                .expect("second message gate");
+        let runtime = daemon_test_runtime("simultaneous-two-node-maintenance-rpc-waits");
+        runtime.block_on(async {
+            let first_interest = first_gate.begin_maintenance_interest();
+            let second_interest = second_gate.begin_maintenance_interest();
+            let first_permit = Arc::clone(&first_gate.semaphore)
+                .acquire_owned()
+                .await
+                .expect("first maintenance permit");
+            let second_permit = Arc::clone(&second_gate.semaphore)
+                .acquire_owned()
+                .await
+                .expect("second maintenance permit");
+            let (first_waiting_tx, first_waiting_rx) = tokio::sync::oneshot::channel();
+            let (second_waiting_tx, second_waiting_rx) = tokio::sync::oneshot::channel();
+
+            let first_maintenance = tokio::spawn(async move {
+                let outcome = run_daemon_dfs_maintenance_until_foreground_waits(
+                    &first_interest,
+                    async move {
+                        first_waiting_tx.send(()).expect("first waiting signal");
+                        std::future::pending::<()>().await;
+                    },
+                )
+                .await;
+                drop(first_permit);
+                outcome
+            });
+            let second_maintenance = tokio::spawn(async move {
+                let outcome = run_daemon_dfs_maintenance_until_foreground_waits(
+                    &second_interest,
+                    async move {
+                        second_waiting_tx.send(()).expect("second waiting signal");
+                        std::future::pending::<()>().await;
+                    },
+                )
+                .await;
+                drop(second_permit);
+                outcome
+            });
+
+            // Both nodes now hold local maintenance admission while awaiting
+            // an outbound peer response. Simultaneous reciprocal inbound RPCs
+            // must request foreground admission and cancel both replay-safe
+            // maintenance futures before either network timeout is needed.
+            first_waiting_rx.await.expect("first outbound wait");
+            second_waiting_rx.await.expect("second outbound wait");
+            let (first_foreground, second_foreground) =
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::join!(
+                        acquire_daemon_dfs_foreground_message_execution(&first_gate),
+                        acquire_daemon_dfs_foreground_message_execution(&second_gate),
+                    )
+                })
+                .await
+                .expect("reciprocal inbound RPCs must make progress without timeout");
+            let first_foreground = first_foreground.expect("first foreground permit");
+            let second_foreground = second_foreground.expect("second foreground permit");
+            assert!(matches!(
+                first_maintenance.await.expect("first maintenance task"),
+                DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting
+            ));
+            assert!(matches!(
+                second_maintenance.await.expect("second maintenance task"),
+                DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting
+            ));
+            drop(first_foreground);
+            drop(second_foreground);
+        });
+    }
+
+    #[test]
     fn mandatory_default_dfs_lifecycle_is_single_flight_per_data_dir() {
         let first_root = temp_root("lifecycle-single-flight-first");
         let second_root = temp_root("lifecycle-single-flight-second");
@@ -4342,302 +5993,308 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_maintenance_lease_acquires_defers_renews_and_releases_with_cas() {
-        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-cas");
-        runtime.block_on(async {
-            let mut kv = InProcessKvStore::new();
-            let first_node = NodeId::generate();
-            let second_node = NodeId::generate();
-            let acquired = acquire_daemon_dfs_maintenance_lease(
-                &mut kv,
-                first_node.clone(),
-                "first-owner".to_string(),
-                1_000,
-            )
-            .await
-            .expect("acquire first lease");
-            let DaemonDfsMaintenanceLeaseAcquire::Acquired(first) = acquired else {
-                panic!("first lease must be acquired");
-            };
-            assert_eq!(
-                first.expires_unix_nanos.saturating_sub(1_000),
-                daemon_dfs_duration_nanos(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
-                    .saturating_add(daemon_dfs_duration_nanos(
-                        DAEMON_DFS_MAINTENANCE_LEASE_MAX_CLOCK_SKEW,
-                    ))
-                    .saturating_add(daemon_dfs_duration_nanos(
-                        DAEMON_DFS_MAINTENANCE_LEASE_UNWIND_GRACE,
-                    ))
-            );
-
-            assert_eq!(
-                acquire_daemon_dfs_maintenance_lease(
-                    &mut kv,
-                    second_node.clone(),
-                    "second-owner".to_string(),
-                    2_000,
-                )
-                .await
-                .expect("defer second lease"),
-                DaemonDfsMaintenanceLeaseAcquire::Deferred(Some(first.clone()))
-            );
-
-            let renewed = renew_daemon_dfs_maintenance_lease(
-                &mut kv,
-                &first,
-                3_000,
-                Duration::from_nanos(2_000),
-            )
-            .await
-            .expect("renew first lease")
-            .expect("first lease still owned");
-            assert!(renewed.expires_unix_nanos > first.expires_unix_nanos);
-            assert_eq!(renewed.renewal_sequence, first.renewal_sequence + 1);
-            assert!(
-                release_daemon_dfs_maintenance_lease(&mut kv, &renewed)
-                    .await
-                    .expect("release first lease")
-            );
-            assert!(matches!(
-                acquire_daemon_dfs_maintenance_lease(
-                    &mut kv,
-                    second_node,
-                    "second-owner".to_string(),
-                    4_000,
-                )
-                .await
-                .expect("acquire released lease"),
-                DaemonDfsMaintenanceLeaseAcquire::Acquired(_)
-            ));
-        });
-    }
-
-    #[test]
-    fn daemon_dfs_maintenance_lease_allows_expired_takeover_without_stale_release() {
-        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-expiry");
-        runtime.block_on(async {
-            let mut kv = InProcessKvStore::new();
-            let first = match acquire_daemon_dfs_maintenance_lease(
-                &mut kv,
-                NodeId::generate(),
-                "expired-owner".to_string(),
-                10_000,
-            )
-            .await
-            .expect("acquire expiring lease")
-            {
-                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
-                other => panic!("unexpected acquisition: {other:?}"),
-            };
-            let replacement = match acquire_daemon_dfs_maintenance_lease(
-                &mut kv,
-                NodeId::generate(),
-                "replacement-owner".to_string(),
-                first.expires_unix_nanos,
-            )
-            .await
-            .expect("take over expired lease")
-            {
-                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
-                other => panic!("unexpected takeover: {other:?}"),
-            };
-            assert_ne!(replacement.owner_token, first.owner_token);
-            assert!(
-                !release_daemon_dfs_maintenance_lease(&mut kv, &first)
-                    .await
-                    .expect("stale release CAS")
-            );
-            assert!(
-                release_daemon_dfs_maintenance_lease(&mut kv, &replacement)
-                    .await
-                    .expect("replacement release")
-            );
-        });
-    }
-
-    #[test]
-    fn daemon_dfs_maintenance_lease_renewal_advances_through_backward_wall_clock_step() {
-        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-clock-regression");
-        runtime.block_on(async {
-            let mut kv = InProcessKvStore::new();
-            let current = match acquire_daemon_dfs_maintenance_lease(
-                &mut kv,
-                NodeId::generate(),
-                "clock-owner".to_string(),
-                50_000,
-            )
-            .await
-            .expect("acquire lease")
-            {
-                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
-                other => panic!("unexpected acquisition: {other:?}"),
-            };
-            let monotonic_advance = Duration::from_secs(10);
-            let renewed =
-                renew_daemon_dfs_maintenance_lease(&mut kv, &current, 1_000, monotonic_advance)
-                    .await
-                    .expect("renew after backward clock step")
-                    .expect("lease remains owned");
-            assert_eq!(
-                renewed.expires_unix_nanos,
-                current
-                    .expires_unix_nanos
-                    .saturating_add(daemon_dfs_duration_nanos(monotonic_advance))
-            );
-            assert_eq!(renewed.renewal_sequence, current.renewal_sequence + 1);
-            assert!(
-                release_daemon_dfs_maintenance_lease(&mut kv, &renewed)
-                    .await
-                    .expect("release renewed lease")
-            );
-        });
-    }
-
-    #[test]
-    fn daemon_dfs_maintenance_lease_waiter_enforces_deadline_without_renewer_signal() {
-        let runtime = daemon_test_runtime("daemon-dfs-maintenance-lease-local-deadline");
-        runtime.block_on(async {
-            let (_authority_tx, mut authority_rx) =
-                tokio::sync::watch::channel(DaemonDfsMaintenanceLeaseAuthority {
-                    deadline: Instant::now()
-                        .checked_add(Duration::from_millis(10))
-                        .expect("test authority deadline"),
-                    loss_detail: None,
-                });
-            let detail = tokio::time::timeout(
-                Duration::from_secs(1),
-                wait_for_daemon_dfs_maintenance_lease_loss(&mut authority_rx),
-            )
-            .await
-            .expect("local authority deadline must wake the waiter");
-            assert!(detail.contains("local authority deadline elapsed"));
-        });
-    }
-
-    #[test]
-    fn daemon_dfs_maintenance_cluster_admission_precedes_local_message_gate() {
-        let root = temp_root("daemon-dfs-maintenance-admission-order");
+    fn metadata_publish_schedulers_are_independent_per_shard() {
+        let root = temp_root("metadata-publish-shard-lanes");
         let data_dir = SinomoDataDir::new(root.path());
-        let lifecycle_gate =
-            daemon_default_dfs_lifecycle_gate(&data_dir.root()).expect("lifecycle gate");
-        let message_gate = daemon_dfs_message_execution_gate(&data_dir).expect("message gate");
-        let runtime = daemon_test_runtime("daemon-dfs-maintenance-admission-order");
-        runtime.block_on(async {
-            let held_lifecycle_gate = lifecycle_gate.clone().lock_owned().await;
-            let held_message_gate = message_gate
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("hold local message gate");
-            let mut kv = InProcessKvStore::new();
-            let first = match acquire_daemon_dfs_maintenance_lease(
-                &mut kv,
-                NodeId::generate(),
-                "node-a-owner".to_string(),
-                100,
-            )
-            .await
-            .expect("node A lease")
-            {
-                DaemonDfsMaintenanceLeaseAcquire::Acquired(record) => record,
-                other => panic!("unexpected node A admission: {other:?}"),
-            };
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("metadata-publish-lane-fs").expect("filesystem id");
+        let root_shard = DfsMetadataShardId::new("root");
+        let services_shard = DfsMetadataShardId::new("services");
+        let first =
+            daemon_dfs_metadata_publish_lane_scheduler(&data_dir, &file_system_id, &root_shard)
+                .expect("root publish lane");
+        let same =
+            daemon_dfs_metadata_publish_lane_scheduler(&data_dir, &file_system_id, &root_shard)
+                .expect("same root publish lane");
+        let other =
+            daemon_dfs_metadata_publish_lane_scheduler(&data_dir, &file_system_id, &services_shard)
+                .expect("services publish lane");
 
-            let deferred_admission = tokio::time::timeout(
-                Duration::from_millis(50),
-                acquire_daemon_dfs_maintenance_admission_in_order(
-                    &data_dir,
-                    || async {
-                        acquire_daemon_dfs_maintenance_lease(
-                            &mut kv,
-                            NodeId::generate(),
-                            "node-b-deferred-owner".to_string(),
-                            200,
-                        )
-                        .await
-                        .map_err(DaemonError::from)
-                    },
-                    |_| -> tokio::sync::watch::Receiver<DaemonDfsMaintenanceLeaseAuthority> {
-                        panic!("a deferred cluster lease must not start local admission")
-                    },
-                ),
-            )
-            .await
-            .expect("cluster lease denial must not wait for the held local gate")
-            .expect("node B admission decision");
-            assert!(deferred_admission.is_none());
-
-            assert!(
-                release_daemon_dfs_maintenance_lease(&mut kv, &first)
-                    .await
-                    .expect("release node A lease")
-            );
-            drop(held_lifecycle_gate);
-            let mut second = None;
-            let mut admission_authority_tx = None;
-            let (lease_started_tx, mut lease_started_rx) = tokio::sync::oneshot::channel();
-            let mut admitted_future = Box::pin(acquire_daemon_dfs_maintenance_admission_in_order(
-                &data_dir,
-                || async {
-                    acquire_daemon_dfs_maintenance_lease(
-                        &mut kv,
-                        NodeId::generate(),
-                        "node-b-owner".to_string(),
-                        300,
-                    )
-                    .await
-                    .map_err(DaemonError::from)
-                },
-                |record| {
-                    second = Some(record);
-                    lease_started_tx
-                        .send(())
-                        .expect("signal lease renewal start");
-                    let (authority_tx, authority_rx) =
-                        tokio::sync::watch::channel(DaemonDfsMaintenanceLeaseAuthority {
-                            deadline: Instant::now()
-                                .checked_add(DAEMON_DFS_MAINTENANCE_LEASE_TTL)
-                                .expect("test authority deadline"),
-                            loss_detail: None,
-                        });
-                    admission_authority_tx = Some(authority_tx);
-                    authority_rx
-                },
-            ));
-            tokio::time::timeout(Duration::from_millis(50), async {
-                tokio::select! {
-                    result = &mut admitted_future => {
-                        panic!("admission returned before the held message gate: {result:?}")
-                    }
-                    result = &mut lease_started_rx => result.expect("lease start signal"),
-                }
-            })
-            .await
-            .expect("lease renewal must start before waiting for the local message gate");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(10), &mut admitted_future)
-                    .await
-                    .is_err(),
-                "admission must remain blocked while the local message gate is held"
-            );
-            drop(held_message_gate);
-            let admitted = tokio::time::timeout(Duration::from_millis(50), admitted_future)
-                .await
-                .expect("released local gate must admit node B")
-                .expect("node B admission")
-                .expect("node B admitted");
-            drop(admitted);
-            drop(admission_authority_tx);
-            let second = second.expect("node B lease record");
-            assert!(
-                release_daemon_dfs_maintenance_lease(&mut kv, &second)
-                    .await
-                    .expect("release node B lease")
-            );
-        });
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a blocked replica for one shard must not occupy another shard's reactor lane"
+        );
     }
 
+    #[test]
+    fn committed_work_emitter_is_quiet_for_noop_and_retains_publish_edge() {
+        let root = temp_root("committed-work-publish-edge");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("committed-work-publish-edge");
+        let initial = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+
+        emit_daemon_dfs_committed_edges(
+            &data_dir,
+            &cluster_paths,
+            &DfsMessageExecutionScope::GlobalExclusive,
+            runtime.handle(),
+            None,
+            DfsMessageCommittedWork::default(),
+            &[],
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()),
+            initial,
+            "an empty committed-work receipt must not wake discovery"
+        );
+
+        emit_daemon_dfs_committed_edges(
+            &data_dir,
+            &cluster_paths,
+            &DfsMessageExecutionScope::GlobalExclusive,
+            runtime.handle(),
+            None,
+            DfsMessageCommittedWork {
+                publish_metadata: true,
+                ..DfsMessageCommittedWork::default()
+            },
+            &[],
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 == initial.0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 > initial.0,
+            "a committed metadata edge must remain owned even when discovery cannot yet read cluster topology"
+        );
+    }
+
+    #[test]
+    fn metadata_publish_discovery_retains_global_edge_across_planning_failure() {
+        let root = temp_root("metadata-publish-discovery-retry");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let paths = DaemonPaths::new(&data_dir);
+        let control_owner = Arc::new(
+            DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"),
+        );
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner capability");
+        let runtime = daemon_test_runtime("metadata-publish-discovery-retry");
+
+        assert_eq!(
+            schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
+                data_dir.clone(),
+                cluster_paths.clone(),
+                runtime.handle(),
+                None,
+                None,
+            ),
+            DfsMetadataPublishScheduleStart::Started,
+            "the discovery lane must be retained before cluster planning succeeds"
+        );
+        let first_deadline = Instant::now() + Duration::from_secs(2);
+        while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 == 0
+            && Instant::now() < first_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (failed_attempts, successes) =
+            daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+        assert!(failed_attempts > 0);
+        assert_eq!(successes, 0, "cluster state is intentionally absent");
+
+        let local = NodeId::from_legacy_named("node_dfs_discovery_retry").expect("node");
+        write_test_cluster_state(&data_root, &local);
+        let file_system = distributed_sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &shard,
+                        None,
+                    )
+                    .expect("metadata shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("install recovered topology");
+
+        let recovery_deadline = Instant::now() + Duration::from_secs(5);
+        while daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).1 == 0
+            && Instant::now() < recovery_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (attempts, successes) =
+            daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+        assert!(attempts >= 2, "the retained edge must retry planning");
+        assert_eq!(
+            successes, 1,
+            "topology recovery alone must drain the retained discovery edge"
+        );
+    }
+
+    #[test]
+    fn metadata_publish_missing_route_wakes_on_semantic_route_generation() {
+        let root = temp_root("metadata-publish-route-generation");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let control_owner = Arc::new(
+            DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"),
+        );
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner capability");
+        let runtime = daemon_test_runtime("metadata-publish-route-generation");
+        let file_system_id = DfsFileSystemId::from_legacy_named("metadata-route-generation-fs")
+            .expect("filesystem id");
+        let shard_id = DfsMetadataShardId::new("services");
+        let lane = DaemonDfsMutationLaneKey {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+        };
+        let scheduler =
+            daemon_dfs_metadata_publish_lane_scheduler(&data_dir, &file_system_id, &shard_id)
+                .expect("publish lane");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let route_available = Arc::new(AtomicBool::new(false));
+        let publish_attempts = Arc::clone(&attempts);
+        let publish_route_available = Arc::clone(&route_available);
+        let target = NodeId::from_legacy_named("node_metadata_route_generation_target")
+            .expect("target node");
+        let publish_shard = shard_id.clone();
+        assert_eq!(
+            sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+                scheduler,
+                runtime.handle().clone(),
+                DfsMetadataPublishScheduleOptions {
+                    max_retry_rounds: 1,
+                    retry_delay: Duration::from_secs(60 * 60),
+                    max_retry_delay: Duration::from_secs(60 * 60),
+                },
+                move || {
+                    let attempts = Arc::clone(&publish_attempts);
+                    let route_available = Arc::clone(&publish_route_available);
+                    let target = target.clone();
+                    let shard_id = publish_shard.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::AcqRel);
+                        let outcomes = if route_available.load(Ordering::Acquire) {
+                            Vec::new()
+                        } else {
+                            vec![DfsMetadataJournalReplicationOutcome::MissingRoute {
+                                target_node_id: target,
+                                shard_id,
+                                after_sequence: 0,
+                            }]
+                        };
+                        Ok::<_, String>(DfsMetadataJournalReplicationReport { outcomes })
+                    }
+                },
+                |_| {},
+                |error| panic!("unexpected publish error: {error}"),
+            ),
+            DfsMetadataPublishScheduleStart::Started
+        );
+
+        let first_deadline = Instant::now() + Duration::from_secs(2);
+        while attempts.load(Ordering::Acquire) == 0 && Instant::now() < first_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            1,
+            "the safety reprobe must remain sparse while the route is unavailable"
+        );
+
+        route_available.store(true, Ordering::Release);
+        assert_eq!(
+            notify_daemon_dfs_metadata_publish_route_generation_on_runtime(
+                &paths,
+                runtime.handle(),
+            )
+            .expect("route generation wake"),
+            1,
+            "only the retained exact lane should be re-dirtied"
+        );
+        let recovery_deadline = Instant::now() + Duration::from_secs(2);
+        while attempts.load(Ordering::Acquire) < 2 && Instant::now() < recovery_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            2,
+            "route recovery must wake immediately without another DFS mutation"
+        );
+
+        // Keep the key in scope to make the test's exact-lane identity clear.
+        assert_eq!(lane.shard_id, shard_id);
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_admission_is_node_local_and_per_data_root() {
+        let first_root = temp_root("daemon-dfs-maintenance-admission-first");
+        let second_root = temp_root("daemon-dfs-maintenance-admission-second");
+        let first_data_dir = SinomoDataDir::new(first_root.path());
+        let second_data_dir = SinomoDataDir::new(second_root.path());
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-admission-node-local");
+        runtime.block_on(async {
+            let first_admission = acquire_daemon_dfs_maintenance_admission(&first_data_dir)
+                .await
+                .expect("first data root admission");
+
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    acquire_daemon_dfs_maintenance_admission(&first_data_dir),
+                )
+                .await
+                .is_err(),
+                "one data root must serialize its lifecycle and metadata mutation generation"
+            );
+
+            let second_admission = tokio::time::timeout(
+                Duration::from_secs(1),
+                acquire_daemon_dfs_maintenance_admission(&second_data_dir),
+            )
+            .await
+            .expect("a different node-local data root must not wait for unrelated maintenance")
+            .expect("second data root admission");
+
+            drop(second_admission);
+            drop(first_admission);
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                acquire_daemon_dfs_maintenance_admission(&first_data_dir),
+            )
+            .await
+            .expect("released data-root admission must become available")
+            .expect("reacquire first data root");
+        });
+    }
     #[test]
     fn mandatory_default_dfs_lifecycle_guard_survives_dropped_blocking_join() {
         let root = temp_root("lifecycle-cancel-safety");
@@ -4738,6 +6395,7 @@ mod tests {
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
+            tombstone_provenance: None,
         };
         let message = DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
             request_id: format!("daemon_dfs_write_{frame_id}"),
@@ -4839,6 +6497,7 @@ mod tests {
             cluster_state,
             execution_exclusions,
             runtime.handle(),
+            DfsCommittedWorkTracker::new(),
             &mut deferred_work,
         ));
         if let Some((detached_runtime, worker)) = deferred_work {
@@ -4849,7 +6508,7 @@ mod tests {
                 worker,
             );
         }
-        result
+        result.map(|_| ())
     }
 
     fn daemon_dfs_test_execution_scope(
@@ -5221,6 +6880,10 @@ mod tests {
                 .tombstone_compaction_max_records,
             DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS
         );
+        assert!(
+            !daemon_dfs_maintenance_tick_options().publish_metadata,
+            "broad maintenance must not race retained exact-shard publishers"
+        );
         assert_eq!(
             daemon_dfs_metadata_replication_options().attempt_timeout,
             DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT
@@ -5238,6 +6901,72 @@ mod tests {
             daemon_dfs_metadata_publish_schedule_options().retry_delay,
             DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
         );
+        assert_eq!(
+            daemon_dfs_metadata_publish_schedule_options().max_retry_delay,
+            DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_continuation_requires_explicit_progress_and_remainder() {
+        fn empty_report() -> DfsMaintenanceTickReport {
+            DfsMaintenanceTickReport {
+                namespace_jobs: Default::default(),
+                conflicts: Default::default(),
+                write_intents: Default::default(),
+                placement_reconciliation: None,
+                lifecycle_reports: Vec::new(),
+                scheduled_repairs: Vec::new(),
+                followup_events: Vec::new(),
+                repair_attempts_before: Vec::new(),
+                repair_attempts_after: Vec::new(),
+                metadata_replication: DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                },
+            }
+        }
+
+        let mut no_progress_namespace = empty_report();
+        no_progress_namespace.namespace_jobs.resumed_job_count = 1;
+        no_progress_namespace
+            .namespace_jobs
+            .remaining_running_job_count = 1;
+        assert!(
+            !daemon_dfs_maintenance_report_reached_limit(&no_progress_namespace),
+            "a still-running job is not evidence that its successful pass advanced"
+        );
+
+        let mut bounded_namespace = empty_report();
+        bounded_namespace.namespace_jobs.resumed_job_count = 1;
+        bounded_namespace.namespace_jobs.completed_job_count = 1;
+        bounded_namespace.namespace_jobs.remaining_running_job_count = 1;
+        assert!(
+            daemon_dfs_maintenance_report_reached_limit(&bounded_namespace),
+            "a completed bounded job plus an explicitly skipped running job owns continuation"
+        );
+
+        let mut no_progress_compaction = empty_report();
+        no_progress_compaction
+            .lifecycle_reports
+            .push(sinomo_dfs::DfsLifecycleMaintenanceReport {
+                tombstone_compaction: Some(sinomo_dfs::DfsTombstoneCompactionReport {
+                    max_compactions_reached: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        assert!(
+            !daemon_dfs_maintenance_report_reached_limit(&no_progress_compaction),
+            "a zero-progress retained-limit report must keep ordinary backoff"
+        );
+        no_progress_compaction.lifecycle_reports[0]
+            .tombstone_compaction
+            .as_mut()
+            .expect("compaction report")
+            .compacted_tombstone_count = 1;
+        assert!(daemon_dfs_maintenance_report_reached_limit(
+            &no_progress_compaction
+        ));
     }
 
     fn test_default_cluster_bootstrap_host(
@@ -5938,6 +7667,7 @@ mod tests {
             actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
+            ..DaemonDfsPendingMaintenanceWork::default()
         };
 
         assert!(pending.has_work());
@@ -6162,6 +7892,7 @@ mod tests {
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
+            tombstone_provenance: None,
         }
     }
 
@@ -6438,6 +8169,60 @@ mod tests {
     }
 
     #[test]
+    fn source_less_write_intent_projects_exact_stale_deadline() {
+        let local_node_id =
+            NodeId::from_legacy_named("node_pending_stale_local").expect("local node");
+        let intent = pending_write_intent_for_test(
+            "intent-pending-stale",
+            sinomo_dfs::sifs_file_system_id(),
+            DfsObjectId::from_legacy_named("object_pending_stale").expect("object"),
+            DfsVersion::from_legacy_named("version_pending_stale").expect("version"),
+            local_node_id.clone(),
+            vec![local_node_id.clone()],
+            1,
+        );
+        let source_less = BTreeSet::from([intent.intent_id.clone()]);
+        let stale_at =
+            daemon_dfs_duration_nanos(sinomo_dfs::DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE);
+        let project = |now_unix_nanos| {
+            daemon_dfs_pending_work_from_records(
+                1,
+                0,
+                0,
+                0,
+                0,
+                std::slice::from_ref(&intent),
+                &[],
+                &[],
+                &[],
+                &[],
+                &source_less,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &local_node_id,
+                0,
+                now_unix_nanos,
+            )
+        };
+
+        let future = project(stale_at.saturating_sub(1));
+        assert_eq!(future.pending_write_count, 0);
+        assert_eq!(
+            future.next_time_based_maintenance_unix_nanos,
+            Some(stale_at)
+        );
+        assert!(!future.should_trigger_background_maintenance());
+        assert!(
+            !future.has_deferred_work(),
+            "an exact stale deadline is scheduled work, not parked work"
+        );
+
+        let due = project(stale_at);
+        assert_eq!(due.due_time_based_maintenance_count, 1);
+        assert!(due.should_trigger_background_maintenance());
+    }
+
+    #[test]
     fn daemon_dfs_offline_only_receipt_below_quorum_is_not_executable_work() {
         let root = temp_root("pending-offline-only-source");
         let data_dir = SinomoDataDir::new(root.path());
@@ -6561,6 +8346,7 @@ mod tests {
                 policy: DfsObjectPolicy::ReplicatedEventual,
                 created_by_event_id: None,
                 last_modified_by_event_id: None,
+                tombstone_provenance: None,
             })
             .expect("repair object");
         let repairs_without_recovery_source = daemon_dfs_repairs_without_recovery_source(
@@ -6966,6 +8752,7 @@ mod tests {
             actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
+            ..DaemonDfsPendingMaintenanceWork::default()
         };
 
         assert!(pending.has_work());
@@ -6986,6 +8773,7 @@ mod tests {
             actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
+            ..DaemonDfsPendingMaintenanceWork::default()
         };
 
         assert!(pending.has_work());
@@ -7006,6 +8794,7 @@ mod tests {
             actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 0,
             pending_local_membership_handoff_count: 0,
+            ..DaemonDfsPendingMaintenanceWork::default()
         };
 
         assert!(pending.has_work());
@@ -7013,7 +8802,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_metadata_replica_lag_forces_triggered_loop() {
+    fn daemon_dfs_metadata_replica_lag_stays_owned_by_exact_lane() {
         let pending = DaemonDfsPendingMaintenanceWork {
             pending_write_count: 0,
             pending_repair_count: 0,
@@ -7026,10 +8815,11 @@ mod tests {
             actionable_placement_reconciliation_count: 0,
             metadata_replica_lag_count: 1,
             pending_local_membership_handoff_count: 0,
+            ..DaemonDfsPendingMaintenanceWork::default()
         };
 
         assert!(pending.has_work());
-        assert!(pending.should_trigger_background_maintenance());
+        assert!(!pending.should_trigger_background_maintenance());
     }
 
     #[test]
@@ -7190,6 +8980,7 @@ mod tests {
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
+            tombstone_provenance: None,
         };
         {
             let content =
@@ -7372,7 +9163,10 @@ mod tests {
         assert_eq!(pending.pending_namespace_job_count, 0);
         assert_eq!(pending.metadata_replica_lag_count, 2);
         assert_eq!(pending.pending_local_membership_handoff_count, 0);
-        assert!(pending.should_trigger_background_maintenance());
+        assert!(
+            !pending.should_trigger_background_maintenance(),
+            "metadata lag is observable here but owned by retained exact-shard publishers"
+        );
         let DaemonDfsInspectionResponse::FileSystem {
             file_system: Some(file_system_view),
         } = sinomo_dfs::inspect_cluster_aware_dfs(
@@ -8383,6 +10177,302 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_daemon_dfs_rpc_retains_committed_work_edges() {
+        let root = temp_root("daemon-dfs-cancelled-rpc-retains-publish-edge");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let control_owner = Arc::new(
+            DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"),
+        );
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner capability");
+        let local =
+            NodeId::from_legacy_named("node_dfs_cancelled_publish_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_cancelled_publish_remote").expect("remote node");
+        let missing_replica =
+            NodeId::from_legacy_named("node_dfs_cancelled_publish_missing").expect("missing node");
+        write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+        let mut cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("read test cluster state");
+        let local_member = cluster_state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == local)
+            .expect("local test member");
+        local_member.capabilities = sinomo_core::node::main_daemon_capabilities(&local_member.role);
+        local_member.allowed_capabilities = local_member.capabilities.clone();
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
+            .expect("write voter-capable test cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
+            &cluster_paths,
+            &cluster_state,
+        )
+        .expect("sync test voter membership to KV");
+
+        let file_system = distributed_sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &shard,
+                        None,
+                    )
+                    .expect("metadata shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("write DFS control plane");
+        let mut backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            default_dfs_metadata_root(&data_dir),
+        )
+        .expect("metadata backend");
+        backend
+            .put_file_system(&file_system)
+            .expect("filesystem metadata");
+        for object in distributed_sifs_bootstrap_objects(local.clone()) {
+            backend.put_object(&object).expect("bootstrap object");
+        }
+        drop(backend);
+
+        let request_id = "dfs_message_cancelled_publish_edge";
+        let frame_id = 90_101;
+        let object_id = DfsObjectId::from_legacy_named(format!("obj_daemon_dfs_write_{frame_id}"))
+            .expect("object id");
+        let mut routed_message = test_dfs_write_routed_message(
+            &remote,
+            &local,
+            frame_id,
+            "/services/cancelled-publish-edge.txt",
+        );
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &mut routed_message.message else {
+            panic!("distributed write request");
+        };
+        write.desired_replica_nodes = vec![local.clone(), missing_replica];
+        write.policy = DfsReplicationPolicy::new(1, 2).expect("W=1, N=2 policy");
+        write
+            .object_metadata
+            .as_mut()
+            .expect("write object metadata")
+            .current_locations = vec![local.clone()];
+        let command = test_dfs_message_command(request_id, routed_message);
+        let lane = DaemonDfsMutationLaneKey {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let initial_requests = daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane);
+        let initial_repair_edges = daemon_dfs_repair_maintenance_edge_request_count(&data_dir);
+        let (committed_rx, release_tx) =
+            install_daemon_dfs_message_committed_edge_test_hook(request_id);
+        let runtime = daemon_test_runtime("daemon-dfs-cancelled-rpc-publish-edge");
+        let task_paths = paths.clone();
+        let task_runtime = runtime.handle().clone();
+        let rpc = runtime.handle().spawn(async move {
+            handle_daemon_dfs_message_async(&task_paths, command, None, &task_runtime).await
+        });
+
+        committed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("durable message mutation reached committed-edge boundary");
+        assert!(
+            LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("root"),
+                default_dfs_metadata_root(&data_dir),
+            )
+            .expect("reopen metadata backend")
+            .get_object(&object_id)
+            .expect("read committed object")
+            .is_some(),
+            "the mutation must be durable before the cancellable RPC boundary"
+        );
+        assert_eq!(
+            LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("root"),
+                default_dfs_metadata_root(&data_dir),
+            )
+            .expect("reopen metadata backend for repair summary")
+            .metadata_summary()
+            .expect("read repair summary")
+            .pending_repair_count,
+            1,
+            "the authority must durably own one repair before edge delivery"
+        );
+        rpc.abort();
+        let cancelled = runtime
+            .block_on(rpc)
+            .expect_err("RPC task must be cancelled");
+        assert!(cancelled.is_cancelled());
+        release_tx
+            .send(())
+            .expect("release non-cancellable committed-edge delivery");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) == initial_requests
+            || daemon_dfs_repair_maintenance_edge_request_count(&data_dir) == initial_repair_edges)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) > initial_requests,
+            "a cancelled RPC must still dirty the exact retained publisher lane"
+        );
+        assert!(
+            daemon_dfs_repair_maintenance_edge_request_count(&data_dir) > initial_repair_edges,
+            "a cancelled RPC must still wake the authority's repair classifier"
+        );
+    }
+
+    #[test]
+    fn cancelled_daemon_dfs_rpc_retains_subscribed_replica_progress_edge() {
+        let root = temp_root("daemon-dfs-cancelled-rpc-retains-replica-progress");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let control_owner = Arc::new(
+            DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"),
+        );
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner capability");
+        let primary =
+            NodeId::from_legacy_named("node_dfs_cancelled_replica_primary").expect("primary");
+        let replica =
+            NodeId::from_legacy_named("node_dfs_cancelled_replica_local").expect("replica");
+        let file_system = distributed_sifs(primary.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        install_test_metadata_replica_shard(
+            &cluster_paths,
+            "cluster_daemon_dfs_cancelled_replica_progress",
+            &replica,
+            &shard,
+        );
+        let object = distributed_sifs_bootstrap_objects(primary.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        let mut source = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.join("source-metadata"),
+        )
+        .expect("source backend");
+        source.put_file_system(&file_system).expect("filesystem");
+        source.put_object(&object).expect("object");
+        let mut subscription = source.subscribe(0);
+        let batch = source
+            .poll_subscription(&mut subscription)
+            .expect("source journal batch");
+
+        sinomo_dfs::test_establish_default_cluster_dfs_replica_progress_subscription(&data_dir);
+        assert!(
+            sinomo_dfs::take_default_cluster_dfs_materialization_immediate_retry(&data_dir),
+            "test subscription establishes and consumes its verification generation"
+        );
+        let reconciliation_wake = daemon_default_dfs_reconciliation_wake(&cluster_paths)
+            .expect("default DFS reconciliation wake");
+        let mut reconciliation_rx = reconciliation_wake.generation_tx.subscribe();
+        let _ = reconciliation_rx.borrow_and_update();
+
+        let request_id = "dfs_message_cancelled_replica_progress";
+        let command = test_dfs_message_command(
+            request_id,
+            DfsRoutedMessage {
+                source_node_id: primary.clone(),
+                target_node_id: replica,
+                frame_id: 90_102,
+                message_id: 90_102,
+                message: DfsNetworkMessage::MetadataJournalBatch(DfsMetadataJournalBatchCommand {
+                    request_id: "dfs_metadata_cancelled_replica_progress".to_string(),
+                    source_node_id: Some(primary),
+                    file_system_id: Some(file_system.file_system_id.clone()),
+                    authority_epoch: Some(shard.epoch),
+                    verify_prefix_only: false,
+                    prefix_probe: None,
+                    authority_probe: None,
+                    batch,
+                }),
+            },
+        );
+        let (committed_rx, release_tx) =
+            install_daemon_dfs_message_committed_edge_test_hook(request_id);
+        let runtime = daemon_test_runtime("daemon-dfs-cancelled-rpc-replica-progress");
+        let task_paths = paths.clone();
+        let task_runtime = runtime.handle().clone();
+        let rpc = runtime.handle().spawn(async move {
+            handle_daemon_dfs_message_async(&task_paths, command, None, &task_runtime).await
+        });
+
+        committed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("replica mutation reached committed-edge boundary");
+        assert_eq!(
+            LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("root"),
+                default_dfs_metadata_root(&data_dir),
+            )
+            .expect("reopen replica backend")
+            .get_object(&object.object_id)
+            .expect("read replicated object"),
+            Some(object),
+            "the replica journal batch must be durable before RPC cancellation"
+        );
+        rpc.abort();
+        let cancelled = runtime
+            .block_on(rpc)
+            .expect_err("RPC task must be cancelled");
+        assert!(cancelled.is_cancelled());
+        release_tx
+            .send(())
+            .expect("release non-cancellable replica-progress delivery");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !reconciliation_rx
+            .has_changed()
+            .expect("reconciliation wake channel remains open")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            reconciliation_rx
+                .has_changed()
+                .expect("reconciliation wake channel remains open"),
+            "a cancelled RPC must still emit the subscribed replica-progress generation"
+        );
+    }
+
+    #[test]
     fn daemon_dfs_message_processes_stage_blob_and_returns_response() {
         let root = temp_root("daemon_dfs_message_stage_blob");
         let data_root = root.join("data");
@@ -8452,6 +10542,7 @@ mod tests {
             policy: DfsObjectPolicy::ReplicatedEventual,
             created_by_event_id: None,
             last_modified_by_event_id: None,
+            tombstone_provenance: None,
         };
         let message = DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
             request_id: "dfs_stage_rpc_1".to_string(),
@@ -8818,6 +10909,11 @@ mod tests {
         let generation =
             daemon_dfs_metadata_authority_generation(&cluster_paths).expect("generation");
         let initial = generation.generation();
+        let initial_rebuilds = generation.projection_rebuild_count();
+        assert!(
+            initial_rebuilds > 0,
+            "the resident snapshot must initialize once"
+        );
 
         let append = |key: &str, value: &[u8]| {
             append_cluster_raft_command(
@@ -8834,15 +10930,32 @@ mod tests {
         append("/cluster/unrelated", b"one");
         append("/cluster/unrelated", b"two");
         assert_eq!(generation.generation(), initial);
+        assert_eq!(
+            generation.projection_rebuild_count(),
+            initial_rebuilds,
+            "unrelated commits must advance the cursor without rebuilding the authority projection"
+        );
 
         let file_system_id = sinomo_dfs::sifs_file_system_id();
         let shard_key = metadata_shard_key(&file_system_id, "root");
         append(&shard_key, b"shard-v1");
         let after_shard = generation.generation();
         assert_eq!(after_shard, initial + 1);
+        let after_shard_rebuilds = generation.projection_rebuild_count();
+        assert_eq!(after_shard_rebuilds, initial_rebuilds + 1);
         append(&shard_key, b"shard-v1");
+        let after_identical_shard_rebuilds = generation.projection_rebuild_count();
+        assert_eq!(
+            after_identical_shard_rebuilds, after_shard_rebuilds,
+            "an idempotent put produces no committed authority generation"
+        );
         append("/dfs/filesystems/unrelated/config", b"config-churn");
         assert_eq!(generation.generation(), after_shard);
+        assert_eq!(
+            generation.projection_rebuild_count(),
+            after_identical_shard_rebuilds,
+            "nearby but non-authority DFS keys must not rebuild the projection"
+        );
 
         append(
             &sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, "root"),
@@ -8865,6 +10978,7 @@ mod tests {
             &cluster_paths,
             &cluster_state.cluster_id,
             &cluster_state.local_node_id,
+            None,
         )
         .expect("retained authority observer");
         assert!(Arc::ptr_eq(&generation, &retained));
@@ -8879,6 +10993,7 @@ mod tests {
             &cluster_paths,
             &cluster_state.cluster_id,
             &cluster_state.local_node_id,
+            None,
         )
         .expect("authority observer retained without a message cache lane");
         assert_eq!(Arc::as_ptr(&retained_after_change), retained_pointer);
@@ -8886,6 +11001,119 @@ mod tests {
             retained_after_change.generation(),
             before_no_cache_change + 1,
             "a no-read daemon must observe topology changes from the retained subscription"
+        );
+    }
+
+    #[test]
+    fn metadata_authority_change_schedules_inherited_local_primary_backlog() {
+        let root = temp_root("daemon-dfs-authority-inherited-backlog");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_inherited_backlog_local").expect("node");
+        let remote = NodeId::from_legacy_named("node_dfs_inherited_backlog_remote").expect("node");
+        write_test_cluster_state(&data_root, &local);
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("cluster state");
+        let file_system = distributed_sifs(local.clone());
+        let mut shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: remote.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &shard,
+                        None,
+                    )
+                    .expect("remote-primary shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("initial remote authority");
+        let mut inherited = sinomo_dfs::open_local_metadata_shard_backend(
+            &data_dir,
+            DfsMetadataShardId::new("root"),
+        )
+        .expect("local replica backend");
+        inherited
+            .put_file_system(&file_system)
+            .expect("replica filesystem");
+        let inherited_object = distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("inherited object");
+        inherited
+            .put_object(&inherited_object)
+            .expect("inherited journal entry");
+        drop(inherited);
+
+        let runtime = daemon_test_runtime("daemon-dfs-authority-inherited-backlog");
+        let paths = DaemonPaths::new(&data_dir);
+        let control_owner = Arc::new(
+            DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"),
+        );
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner capability");
+        let generation = daemon_dfs_metadata_authority_generation_for_identity(
+            &cluster_paths,
+            &state.cluster_id,
+            &local,
+            Some(runtime.handle()),
+        )
+        .expect("authority observer");
+        let initial_generation = generation.generation();
+        let lane = DaemonDfsMutationLaneKey {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let initial_requests = daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane);
+
+        shard.primary_node_id = local.clone();
+        shard.replica_node_ids = vec![remote];
+        shard.epoch = 2;
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("local-primary shard op"),
+            ),
+        )
+        .expect("transfer authority to local node");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) == initial_requests
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(generation.generation(), initial_generation + 1);
+        assert!(
+            daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) > initial_requests,
+            "the authority edge must publish an inherited journal without another DFS mutation"
         );
     }
 
@@ -8933,6 +11161,966 @@ mod tests {
         assert!(!Arc::ptr_eq(&original, &changed_local));
     }
 
+    fn default_dfs_reactor_test_snapshot(
+        revision: u64,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> KvSnapshot {
+        let mut entries = entries
+            .into_iter()
+            .map(|(key, value)| KvEntry {
+                key,
+                value,
+                create_revision: KvRevision(revision),
+                modify_revision: KvRevision(revision),
+                version: sinomo_core::kv::KvVersion(1),
+                lease_id: None,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        KvSnapshot {
+            revision: KvRevision(revision),
+            compacted_revision: KvRevision::ZERO,
+            entries,
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_dfs_projection_skips_unrelated_commits_incrementally() {
+        let local = NodeId::from_legacy_named("node_default_dfs_incremental").expect("node");
+        let config_key = sinomo_dfs::file_system_config_key(&sinomo_dfs::sifs_file_system_id());
+        let (projection_tx, mut projection_rx) =
+            tokio::sync::watch::channel(DaemonDefaultDfsReconciliationProjection::default());
+        let mut observer = DaemonDefaultDfsCommittedProjectionObserver::default();
+
+        let initial = default_dfs_reactor_test_snapshot(1, vec![(config_key.clone(), vec![1])]);
+        observer.observe(&projection_tx, &local, &initial);
+        assert_eq!(observer.rebuild_count, 1);
+        let _ = projection_rx.borrow_and_update();
+
+        let mut unrelated = default_dfs_reactor_test_snapshot(
+            2,
+            vec![
+                (config_key.clone(), vec![1]),
+                ("/unrelated/application/state".to_string(), vec![9]),
+            ],
+        );
+        unrelated.events.push(sinomo_core::kv::KvEvent {
+            revision: KvRevision(2),
+            key: "/unrelated/application/state".to_string(),
+            kind: sinomo_core::kv::KvEventKind::Put { value: vec![9] },
+        });
+        observer.observe(&projection_tx, &local, &unrelated);
+        assert_eq!(
+            observer.rebuild_count, 1,
+            "an unrelated commit must not reconstruct the default DFS projection"
+        );
+        assert!(
+            !projection_rx
+                .has_changed()
+                .expect("projection channel open"),
+            "unrelated commits must not wake the reactor"
+        );
+        assert_eq!(projection_tx.borrow().revision, Some(KvRevision(2)));
+
+        let mut relevant =
+            default_dfs_reactor_test_snapshot(3, vec![(config_key.clone(), vec![2])]);
+        relevant.events.push(sinomo_core::kv::KvEvent {
+            revision: KvRevision(3),
+            key: config_key,
+            kind: sinomo_core::kv::KvEventKind::Put { value: vec![2] },
+        });
+        observer.observe(&projection_tx, &local, &relevant);
+        assert_eq!(observer.rebuild_count, 2);
+        assert!(
+            projection_rx
+                .has_changed()
+                .expect("projection channel open"),
+            "relevant commits must wake the reactor"
+        );
+        let _ = projection_rx.borrow_and_update();
+
+        let mut compacted = default_dfs_reactor_test_snapshot(
+            4,
+            vec![("/unrelated/application/state".to_string(), vec![10])],
+        );
+        compacted.compacted_revision = KvRevision(4);
+        observer.observe(&projection_tx, &local, &compacted);
+        assert_eq!(
+            observer.rebuild_count, 3,
+            "compaction must rebuild from the resident snapshot"
+        );
+    }
+
+    #[test]
+    fn default_dfs_replica_subscription_handshake_covers_pre_subscription_watermark() {
+        let root = temp_root("default-dfs-replica-subscription-handshake");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_subscription_handshake")
+            .expect("local node");
+        let watermark_key = sinomo_dfs::metadata_shard_head_watermark_key(
+            &sinomo_dfs::sifs_file_system_id(),
+            "services",
+        );
+        let (projection_tx, mut projection_rx) =
+            tokio::sync::watch::channel(DaemonDefaultDfsReconciliationProjection::default());
+        let mut observer = DaemonDefaultDfsCommittedProjectionObserver::new(data_dir.clone());
+
+        observer.observe(
+            &projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, Vec::new()),
+        );
+        let _ = projection_rx.borrow_and_update();
+
+        // Commit the only watermark generation after materialization sampled
+        // the old resident image but before it published its dependency. The
+        // production observer must ignore it while the consumer is genuinely
+        // unsubscribed, which is the false-to-true handoff under test.
+        let mut committed_before_subscription =
+            default_dfs_reactor_test_snapshot(2, vec![(watermark_key.clone(), vec![2])]);
+        committed_before_subscription
+            .events
+            .push(sinomo_core::kv::KvEvent {
+                revision: KvRevision(2),
+                key: watermark_key.clone(),
+                kind: sinomo_core::kv::KvEventKind::Put { value: vec![2] },
+            });
+        observer.observe(&projection_tx, &local, &committed_before_subscription);
+        assert_eq!(observer.rebuild_count, 1);
+        assert!(
+            !projection_rx
+                .has_changed()
+                .expect("projection channel remains open"),
+            "ordinary watermark traffic must stay quiet before an exact consumer subscribes"
+        );
+
+        let local_wake =
+            daemon_default_dfs_reconciliation_wake(&cluster_paths).expect("default DFS local wake");
+        let mut local_wake_rx = local_wake.generation_tx.subscribe();
+        let _ = local_wake_rx.borrow_and_update();
+        sinomo_dfs::test_establish_default_cluster_dfs_replica_progress_subscription(&data_dir);
+        assert!(
+            sinomo_dfs::take_default_cluster_dfs_materialization_immediate_retry(&data_dir),
+            "entering the dependency must preserve the ignored committed generation via a verification edge"
+        );
+        notify_daemon_default_dfs_reconciliation_replica_progress(&cluster_paths);
+        assert!(
+            local_wake_rx
+                .has_changed()
+                .expect("local wake channel remains open"),
+            "the verification edge must schedule a resident-snapshot resample"
+        );
+
+        // Once the dependency is visible, the same production observer tracks
+        // future exact watermark generations directly.
+        let mut committed_after_subscription =
+            default_dfs_reactor_test_snapshot(3, vec![(watermark_key.clone(), vec![3])]);
+        committed_after_subscription
+            .events
+            .push(sinomo_core::kv::KvEvent {
+                revision: KvRevision(3),
+                key: watermark_key,
+                kind: sinomo_core::kv::KvEventKind::Put { value: vec![3] },
+            });
+        observer.observe(&projection_tx, &local, &committed_after_subscription);
+        assert_eq!(observer.rebuild_count, 2);
+        assert!(
+            projection_rx
+                .has_changed()
+                .expect("projection channel open")
+        );
+    }
+
+    #[test]
+    fn settled_default_dfs_projection_ignores_ordinary_head_watermarks() {
+        let local = NodeId::from_legacy_named("node_default_dfs_settled_head").expect("node");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let config_key = sinomo_dfs::file_system_config_key(&file_system_id);
+        let watermark_key =
+            sinomo_dfs::metadata_shard_head_watermark_key(&file_system_id, "services");
+        let (projection_tx, mut projection_rx) =
+            tokio::sync::watch::channel(DaemonDefaultDfsReconciliationProjection::default());
+        // No materialization wait is registered for this observer, matching a
+        // settled production data root.
+        let mut observer = DaemonDefaultDfsCommittedProjectionObserver::default();
+        let initial = default_dfs_reactor_test_snapshot(1, vec![(config_key.clone(), vec![1])]);
+        observer.observe(&projection_tx, &local, &initial);
+        let _ = projection_rx.borrow_and_update();
+
+        let mut watermark = default_dfs_reactor_test_snapshot(
+            2,
+            vec![(config_key, vec![1]), (watermark_key.clone(), vec![9])],
+        );
+        watermark.events.push(sinomo_core::kv::KvEvent {
+            revision: KvRevision(2),
+            key: watermark_key,
+            kind: sinomo_core::kv::KvEventKind::Put { value: vec![9] },
+        });
+        observer.observe(&projection_tx, &local, &watermark);
+
+        assert_eq!(
+            observer.rebuild_count, 1,
+            "ordinary replica heads must not rebuild settled default reconciliation"
+        );
+        assert!(
+            !projection_rx
+                .has_changed()
+                .expect("projection channel open"),
+            "ordinary replica heads must not wake a settled default reactor"
+        );
+        assert_eq!(projection_tx.borrow().revision, Some(KvRevision(2)));
+    }
+
+    #[test]
+    fn default_dfs_reactor_starts_dirty_and_coalesces_snapshot_inputs() {
+        let root = temp_root("default-dfs-reactor-coalesces-inputs");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_coalesce").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+
+        let startup = reactor.pending_work().expect("dirty startup work");
+        assert!(startup.reconcile_defaults);
+        assert!(startup.recover_prior_process_permit);
+        assert!(startup.refresh_before_recovery);
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+        assert_eq!(reactor.pending_work(), None);
+
+        let config_key = sinomo_dfs::file_system_config_key(&sinomo_dfs::sifs_file_system_id());
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, vec![(config_key.clone(), vec![1])]),
+        );
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(2, vec![(config_key, vec![2])]),
+        );
+
+        let changed = reactor.pending_work().expect("coalesced input change");
+        assert!(changed.reconcile_defaults);
+        assert!(!changed.recover_prior_process_permit);
+        assert!(!changed.refresh_before_recovery);
+        assert!(changed.inputs.iter().any(|(_, value)| value == &vec![2]));
+        reactor.complete_default_reconciliation(&changed);
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "the latest committed input generation must reconcile exactly once"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_consumes_local_replica_progress_once() {
+        let root = temp_root("default-dfs-reactor-local-replica-progress");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_local_progress").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+        assert_eq!(reactor.pending_work(), None);
+
+        notify_daemon_default_dfs_reconciliation_replica_progress(&cluster_paths);
+        let progress = reactor.pending_work().expect("local replica progress");
+        assert!(progress.reconcile_defaults);
+        assert!(!progress.recover_prior_process_permit);
+        reactor.complete_default_reconciliation(&progress);
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "one local replica generation must reconcile exactly once"
+        );
+    }
+
+    #[test]
+    fn default_dfs_parked_handoff_ignores_unowned_inputs_and_completes_once() {
+        let root = temp_root("default-dfs-reactor-parked-handoff");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_parked").expect("local node");
+        let replica =
+            NodeId::from_legacy_named("node_default_dfs_parked_replica").expect("replica node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            primary_node_id: replica.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 2,
+            ..retiring.clone()
+        };
+        let handoff = DfsMetadataShardMembershipHandoff {
+            handoff_id: "handoff-default-dfs-parked".to_string(),
+            retiring_shard: retiring.clone(),
+            desired_shard: desired.clone(),
+            required_prepared_sequence: 7,
+            required_head_watermark: None,
+            retiring_primary_fence: None,
+        };
+        let shard_key = sinomo_dfs::metadata_shard_key(&file_system_id, "root");
+        let handoff_key =
+            sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, "root");
+        let proof_key =
+            sinomo_dfs::metadata_shard_membership_handoff_proof_key(&file_system_id, "root");
+        let unrelated_key =
+            format!("{DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX}{local}/{replica}/test-endpoint");
+        let parked_entries = vec![
+            (
+                shard_key.clone(),
+                sinomo_core::kv::encode_kv_value(&retiring).expect("retiring shard"),
+            ),
+            (
+                handoff_key.clone(),
+                sinomo_core::kv::encode_kv_value(&handoff).expect("handoff"),
+            ),
+            (unrelated_key.clone(), vec![1]),
+        ];
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, parked_entries.clone()),
+        );
+        let work = reactor.pending_work().expect("handoff input generation");
+        let parked = DaemonDefaultDfsParkedHandoff::new(
+            file_system_id.clone(),
+            "root".to_string(),
+            handoff.handoff_id.clone(),
+            retiring.epoch,
+            desired.epoch,
+        );
+        reactor.park_default_reconciliation(&work, parked);
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "recording the durable wait must consume the attempted generation without a failure loop"
+        );
+
+        let mut unrelated_entries = parked_entries;
+        unrelated_entries
+            .iter_mut()
+            .find(|(key, _)| key == &unrelated_key)
+            .expect("unrelated input")
+            .1 = vec![2];
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(2, unrelated_entries),
+        );
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "connectivity/source churn cannot own a parked handoff retry"
+        );
+
+        let proof = sinomo_dfs::DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff.handoff_id,
+            retiring_shard: retiring,
+            desired_shard: desired.clone(),
+            journal_sequence: 7,
+            state_fingerprint: "blake3:default-dfs-parked".to_string(),
+            acknowledged_node_ids: vec![local.clone(), replica],
+        };
+        let completed_entries = vec![
+            (
+                shard_key,
+                sinomo_core::kv::encode_kv_value(&desired).expect("active shard"),
+            ),
+            (
+                proof_key,
+                sinomo_core::kv::encode_kv_value(&proof).expect("completion proof"),
+            ),
+            (unrelated_key, vec![2]),
+        ];
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(3, completed_entries.clone()),
+        );
+        let completion = reactor
+            .pending_work()
+            .expect("proof and authority completion generation");
+        reactor.complete_default_reconciliation(&completion);
+        assert_eq!(reactor.pending_work(), None);
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(4, completed_entries),
+        );
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "the same completed handoff generation must not activate or clear twice"
+        );
+    }
+
+    #[test]
+    fn parked_default_dfs_projection_rebuilds_only_for_exact_wake_owners() {
+        let root = temp_root("default-dfs-projection-parked-owners");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let local =
+            NodeId::from_legacy_named("node_default_dfs_projection_parked").expect("local node");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let parked = DaemonDefaultDfsParkedHandoff::new(
+            file_system_id.clone(),
+            "services".to_string(),
+            "handoff-projection-parked".to_string(),
+            4,
+            5,
+        );
+        let parked_subscription = Arc::new(Mutex::new(Some(parked)));
+        let mut observer =
+            DaemonDefaultDfsCommittedProjectionObserver::new_with_parked_subscription(
+                data_dir,
+                parked_subscription,
+            );
+        let (projection_tx, mut projection_rx) =
+            tokio::sync::watch::channel(DaemonDefaultDfsReconciliationProjection::default());
+        let shard_key = sinomo_dfs::metadata_shard_key(&file_system_id, "services");
+        let proof_key =
+            sinomo_dfs::metadata_shard_membership_handoff_proof_key(&file_system_id, "services");
+        let connectivity_key =
+            format!("{DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX}source/target/endpoint");
+
+        let initial = default_dfs_reactor_test_snapshot(
+            1,
+            vec![
+                (shard_key.clone(), vec![1]),
+                (connectivity_key.clone(), vec![1]),
+            ],
+        );
+        observer.observe(&projection_tx, &local, &initial);
+        assert_eq!(observer.rebuild_count, 1);
+        let _ = projection_rx.borrow_and_update();
+
+        let mut unrelated = default_dfs_reactor_test_snapshot(
+            2,
+            vec![
+                (shard_key.clone(), vec![1]),
+                (connectivity_key.clone(), vec![2]),
+            ],
+        );
+        unrelated.events.push(sinomo_core::kv::KvEvent {
+            revision: KvRevision(2),
+            key: connectivity_key.clone(),
+            kind: sinomo_core::kv::KvEventKind::Put { value: vec![2] },
+        });
+        observer.observe(&projection_tx, &local, &unrelated);
+        assert_eq!(
+            observer.rebuild_count, 1,
+            "a parked projection consumes deltas without reopening/rebuilding resident state for unrelated connectivity"
+        );
+        assert!(!projection_rx.has_changed().expect("projection open"));
+        assert!(
+            projection_tx
+                .borrow()
+                .inputs
+                .iter()
+                .any(|(key, value)| key == &connectivity_key && value == &vec![2]),
+            "the ignored wake must still update the resident projection for the generation after handoff completion"
+        );
+
+        let mut proof = default_dfs_reactor_test_snapshot(
+            3,
+            vec![(shard_key, vec![1]), (proof_key.clone(), vec![9])],
+        );
+        proof.events.push(sinomo_core::kv::KvEvent {
+            revision: KvRevision(3),
+            key: proof_key,
+            kind: sinomo_core::kv::KvEventKind::Put { value: vec![9] },
+        });
+        observer.observe(&projection_tx, &local, &proof);
+        assert_eq!(observer.rebuild_count, 2);
+        assert!(
+            projection_rx.has_changed().expect("projection open"),
+            "the exact completion proof must wake the parked owner"
+        );
+    }
+
+    #[test]
+    fn default_dfs_failure_retry_generation_excludes_unrelated_projection_wakes() {
+        let root = temp_root("default-dfs-failure-retry-generation");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local =
+            NodeId::from_legacy_named("node_default_dfs_failure_generation").expect("local node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let shard_key = sinomo_dfs::metadata_shard_key(&file_system_id, "users");
+        let connectivity_key =
+            format!("{DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX}failure/source/target");
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                1,
+                vec![
+                    (shard_key.clone(), vec![1]),
+                    (connectivity_key.clone(), vec![1]),
+                ],
+            ),
+        );
+        let failed_generation = reactor.exact_retry_generation();
+
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                2,
+                vec![(shard_key.clone(), vec![1]), (connectivity_key, vec![2])],
+            ),
+        );
+        assert_eq!(
+            reactor.exact_retry_generation(),
+            failed_generation,
+            "an unrelated source wake must preserve the existing failure backoff deadline"
+        );
+
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(3, vec![(shard_key, vec![2])]),
+        );
+        assert_ne!(
+            reactor.exact_retry_generation(),
+            failed_generation,
+            "a committed shard-authority generation may wake before the failure deadline"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_endpoint_topology_ignores_observed_latency() {
+        let root = temp_root("default-dfs-reactor-endpoint-topology");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_endpoint").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let mut endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_default_dfs_topology")
+                .expect("endpoint"),
+            node_id: local.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.1:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: Some(1),
+        };
+        let endpoint_key = format!(
+            "{DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX}{}/{}",
+            local, endpoint.endpoint_id
+        );
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                1,
+                vec![(
+                    endpoint_key.clone(),
+                    sinomo_core::kv::encode_kv_value(&endpoint).expect("endpoint value"),
+                )],
+            ),
+        );
+        let published = reactor.pending_work().expect("endpoint generation");
+        reactor.complete_default_reconciliation(&published);
+
+        endpoint.last_observed_latency_ms = Some(250);
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                2,
+                vec![(
+                    endpoint_key.clone(),
+                    sinomo_core::kv::encode_kv_value(&endpoint).expect("refreshed endpoint"),
+                )],
+            ),
+        );
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "latency observations are not DFS placement topology"
+        );
+
+        endpoint.address = "10.0.0.2:21353".to_string();
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                3,
+                vec![(
+                    endpoint_key,
+                    sinomo_core::kv::encode_kv_value(&endpoint).expect("moved endpoint"),
+                )],
+            ),
+        );
+        assert!(
+            reactor
+                .pending_work()
+                .is_some_and(|work| work.reconcile_defaults),
+            "endpoint address changes must rebuild failover placement"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_always_watches_consulted_head_watermarks() {
+        let root = temp_root("default-dfs-reactor-head-transition");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_head").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let shard_key = sinomo_dfs::metadata_shard_key(&file_system_id, "root");
+        let watermark_key = sinomo_dfs::metadata_shard_head_watermark_key(&file_system_id, "root");
+        let handoff_key =
+            sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, "root");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut watermark = sinomo_dfs::DfsMetadataShardHeadWatermark {
+            file_system_id,
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            epoch: 1,
+            journal_sequence: 1,
+            state_fingerprint: "blake3:head-one".to_string(),
+            acknowledged_node_ids: vec![local.clone()],
+        };
+        let snapshot_entries = |watermark: &sinomo_dfs::DfsMetadataShardHeadWatermark,
+                                handoff: bool| {
+            let mut entries = vec![
+                (
+                    shard_key.clone(),
+                    sinomo_core::kv::encode_kv_value(&shard).expect("shard"),
+                ),
+                (
+                    watermark_key.clone(),
+                    sinomo_core::kv::encode_kv_value(watermark).expect("watermark"),
+                ),
+            ];
+            if handoff {
+                entries.push((handoff_key.clone(), vec![1]));
+            }
+            entries
+        };
+
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, snapshot_entries(&watermark, false)),
+        );
+        let stable = reactor.pending_work().expect("initial shard generation");
+        reactor.complete_default_reconciliation(&stable);
+        watermark.journal_sequence = 2;
+        watermark.state_fingerprint = "blake3:head-two".to_string();
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(2, snapshot_entries(&watermark, false)),
+        );
+        let head_progress = reactor
+            .pending_work()
+            .expect("consulted head watermark generation");
+        assert!(
+            head_progress.reconcile_defaults,
+            "steady-state cross-primary migration consumes exact head evidence"
+        );
+        reactor.complete_default_reconciliation(&head_progress);
+
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(3, snapshot_entries(&watermark, true)),
+        );
+        let pending = reactor.pending_work().expect("handoff generation");
+        reactor.complete_default_reconciliation(&pending);
+        watermark.journal_sequence = 3;
+        watermark.state_fingerprint = "blake3:head-three".to_string();
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(4, snapshot_entries(&watermark, true)),
+        );
+        assert!(
+            reactor
+                .pending_work()
+                .is_some_and(|work| work.reconcile_defaults),
+            "a pending handoff must consume exact head progress"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_preserves_both_replica_watermark_arrival_orders() {
+        let root = temp_root("default-dfs-reactor-replica-watermark-orders");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_ordering").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let watermark_key = sinomo_dfs::metadata_shard_head_watermark_key(
+            &sinomo_dfs::sifs_file_system_id(),
+            "services",
+        );
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, vec![(watermark_key.clone(), vec![1])]),
+        );
+        let initial = reactor.pending_work().expect("initial watermark");
+        reactor.complete_default_reconciliation(&initial);
+
+        // Replica batch first, then the committed primary watermark.
+        notify_daemon_default_dfs_reconciliation_replica_progress(&cluster_paths);
+        let batch_first = reactor.pending_work().expect("batch-first local edge");
+        reactor.complete_default_reconciliation(&batch_first);
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(2, vec![(watermark_key.clone(), vec![2])]),
+        );
+        let watermark_second = reactor.pending_work().expect("watermark-second KV edge");
+        reactor.complete_default_reconciliation(&watermark_second);
+
+        // Watermark first, then the local replica batch/floor evidence.
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(3, vec![(watermark_key, vec![3])]),
+        );
+        let watermark_first = reactor.pending_work().expect("watermark-first KV edge");
+        reactor.complete_default_reconciliation(&watermark_first);
+        notify_daemon_default_dfs_reconciliation_replica_progress(&cluster_paths);
+        let batch_second = reactor.pending_work().expect("batch-second local edge");
+        reactor.complete_default_reconciliation(&batch_second);
+
+        assert_eq!(reactor.pending_work(), None);
+    }
+
+    #[test]
+    fn default_dfs_reactor_repairs_semantic_advertisement_drift_without_refresh_loop() {
+        let root = temp_root("default-dfs-reactor-semantic-advertisement");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_output").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let metadata = sinomo_dfs::DfsNodeAdvertisement::metadata(local.clone());
+        let content = sinomo_dfs::DfsNodeAdvertisement::content(local.clone());
+        let snapshot = default_dfs_reactor_test_snapshot(
+            1,
+            vec![
+                (
+                    sinomo_dfs::metadata_service_key(&local),
+                    sinomo_core::kv::encode_kv_value(&metadata).expect("metadata ad"),
+                ),
+                (
+                    sinomo_dfs::content_service_key(&local),
+                    sinomo_core::kv::encode_kv_value(&content).expect("content ad"),
+                ),
+            ],
+        );
+        observe_daemon_default_dfs_reconciliation(&reactor._projection_tx, &local, &snapshot);
+        let published = reactor
+            .pending_work()
+            .expect("semantic advertisement generation");
+        assert!(published.reconcile_defaults);
+        reactor.complete_default_reconciliation(&published);
+
+        let mut refreshed_metadata = metadata.clone();
+        refreshed_metadata.updated_at += time::Duration::seconds(30);
+        let mut refreshed_content = content.clone();
+        refreshed_content.updated_at += time::Duration::seconds(30);
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                2,
+                vec![
+                    (
+                        sinomo_dfs::metadata_service_key(&local),
+                        sinomo_core::kv::encode_kv_value(&refreshed_metadata)
+                            .expect("refreshed metadata ad"),
+                    ),
+                    (
+                        sinomo_dfs::content_service_key(&local),
+                        sinomo_core::kv::encode_kv_value(&refreshed_content)
+                            .expect("refreshed content ad"),
+                    ),
+                ],
+            ),
+        );
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "updated_at-only advertisement refreshes must remain quiet"
+        );
+
+        refreshed_metadata.accepts_metadata = false;
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                3,
+                vec![
+                    (
+                        sinomo_dfs::metadata_service_key(&local),
+                        sinomo_core::kv::encode_kv_value(&refreshed_metadata)
+                            .expect("invalid metadata ad"),
+                    ),
+                    (
+                        sinomo_dfs::content_service_key(&local),
+                        sinomo_core::kv::encode_kv_value(&refreshed_content).expect("content ad"),
+                    ),
+                ],
+            ),
+        );
+        let corrupted = reactor
+            .pending_work()
+            .expect("semantic advertisement corruption");
+        assert!(
+            corrupted.reconcile_defaults,
+            "semantic advertisement corruption must request repair"
+        );
+        reactor.complete_default_reconciliation(&corrupted);
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(4, Vec::new()),
+        );
+        assert!(
+            reactor
+                .pending_work()
+                .is_some_and(|work| work.reconcile_defaults),
+            "advertisement deletion must request self-healing publication"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_permit_change_requests_only_exact_recovery() {
+        let root = temp_root("default-dfs-reactor-permit-change");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_permit").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let permit_key =
+            sinomo_dfs::placement_authority_permit_key(&sinomo_dfs::sifs_file_system_id());
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, vec![(permit_key.clone(), vec![9])]),
+        );
+        let changed = reactor.pending_work().expect("permit change work");
+        assert!(!changed.reconcile_defaults);
+        assert!(changed.recover_prior_process_permit);
+        assert!(
+            !changed.refresh_before_recovery,
+            "a committed exact-key observation is already the refresh edge"
+        );
+        reactor.complete_prior_process_recovery(&changed);
+
+        // A watch channel may coalesce these two committed snapshots before
+        // the reactor runs. Value-only tracking would mistake the final permit
+        // for the already-recovered generation and skip exact recovery.
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(2, Vec::new()),
+        );
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(3, vec![(permit_key, vec![9])]),
+        );
+        let reinserted = reactor
+            .pending_work()
+            .expect("identical reinsert is a new exact generation");
+        assert!(!reinserted.reconcile_defaults);
+        assert!(reinserted.recover_prior_process_permit);
+        assert_eq!(
+            reinserted
+                .placement_authority_permit
+                .as_ref()
+                .map(|permit| permit.modify_revision),
+            Some(KvRevision(3))
+        );
+    }
+
     #[test]
     fn daemon_dfs_metadata_authority_observer_is_scoped_to_cluster_incarnation() {
         let root = temp_root("daemon_dfs_authority_observer_cluster_incarnation");
@@ -8957,7 +12145,13 @@ mod tests {
                 lease_id: None,
             }],
             leases: Vec::new(),
-            events: Vec::new(),
+            events: vec![sinomo_core::kv::KvEvent {
+                revision: KvRevision(revision),
+                key: shard_key.clone(),
+                kind: sinomo_core::kv::KvEventKind::Put {
+                    value: value.to_vec(),
+                },
+            }],
             committed_requests: Vec::new(),
             expired_requests: Vec::new(),
         };
@@ -8970,6 +12164,7 @@ mod tests {
             &cluster_paths,
             &old_cluster,
             &local,
+            None,
         )
         .expect("old observer");
         old_observer.observe(&snapshot(100, b"old topology"));
@@ -8989,6 +12184,7 @@ mod tests {
             &cluster_paths,
             &new_cluster,
             &local,
+            None,
         )
         .expect("new observer");
         assert!(
@@ -9848,10 +13044,143 @@ mod tests {
     }
 
     #[test]
+    fn default_dfs_reactor_propagates_mandatory_recovery_failure() {
+        let root = temp_root("default-dfs-bootstrap-recovery-required");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_recovery_required").expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_recovery_required").expect("node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs recovery required",
+            local.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync cluster state");
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-recovery-required");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+
+        let error = runtime
+            .block_on(reactor.reconcile_startup_until_idle_async(
+                &paths,
+                &DaemonRunOptions::default(),
+                &cluster_id,
+                &local,
+                runtime.handle(),
+            ))
+            .expect_err("authoritative startup must propagate recovery failure");
+
+        assert!(
+            matches!(&error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+            "unexpected recovery error: {error}"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_recovers_prior_process_permit_on_multi_member_startup() {
+        let root = temp_root("default-dfs-bootstrap-recovers-prior-process-permit");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_dfs_bootstrap_recovers_prior_process_permit",
+        )
+        .expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_dfs_bootstrap_recovery_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_bootstrap_recovery_remote").expect("remote node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs bootstrap recovers prior process permit",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                remote,
+                "remote",
+                "pk-remote",
+                now,
+            ));
+        assert!(!sinomo_core::network::cluster_is_settled_solo(&state));
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let permit_key = seed_test_prior_process_placement_permit(
+            &cluster_paths,
+            &local,
+            &cluster_id,
+            "recoverable",
+        );
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+
+        let data_owner_lock =
+            Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("main daemon data-owner lock"));
+        register_daemon_dfs_data_owner_lock(&paths, &data_owner_lock)
+            .expect("register main daemon data-owner lock");
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-recovers-prior-process-permit");
+        assert!(
+            inspect_dfs_placement_authority_permit(&paths, runtime.handle(), &file_system_id,)
+                .expect("inspect seeded permit")
+                .is_some(),
+            "test must seed a decodable prior-process permit"
+        );
+
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        runtime
+            .block_on(reactor.reconcile_startup_until_idle_async(
+                &paths,
+                &DaemonRunOptions::default(),
+                &cluster_id,
+                &local,
+                runtime.handle(),
+            ))
+            .expect("run multi-member default DFS lifecycle");
+
+        assert!(
+            sinomo_core::cluster::read_cluster_kv_latest_observed_entry(
+                &cluster_paths,
+                &permit_key,
+            )
+            .expect("read recovered permit")
+            .is_none(),
+            "multi-member lifecycle must exact-CAS clear its local prior-process permit"
+        );
+    }
+
+    #[test]
     fn default_distributed_dfs_bootstrap_migrates_legacy_services_metadata_before_publish() {
         let root = temp_root("default_distributed_dfs_bootstrap_migrates_services");
         let data_root = root.join("data");
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_owner_lock =
+            Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("main daemon data-owner lock"));
+        register_daemon_dfs_data_owner_lock(&paths, &data_owner_lock)
+            .expect("register main daemon data-owner lock");
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("data dir");
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -9946,7 +13275,7 @@ mod tests {
     }
 
     #[test]
-    fn default_distributed_dfs_bootstrap_does_not_append_metadata_on_non_primary() {
+    fn default_dfs_reactor_defers_recovery_failure_on_non_voter() {
         let root = temp_root("default_distributed_dfs_bootstrap_non_primary");
         let data_root = root.join("data");
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
@@ -9971,28 +13300,68 @@ mod tests {
             "pk-local",
             now,
         );
+        state.members[0].role = sinomo_core::ClusterMemberRole::Learner;
+        state.members[0].state = sinomo_core::ClusterMemberState::Learner;
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Learner);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         state
             .members
             .push(sinomo_core::ClusterMemberRecord::local_voter(
-                cluster_id,
+                cluster_id.clone(),
                 primary,
                 "primary",
                 "pk-primary",
                 now,
             ));
+        let voter_capabilities =
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        state.members[1].capabilities = voter_capabilities.clone();
+        state.members[1].allowed_capabilities = voter_capabilities;
         assert_ne!(sinomo_dfs::default_cluster_sifs_owner(&state), local);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
             .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync cluster state");
+        let permit_key = seed_test_prior_process_placement_permit(
+            &cluster_paths,
+            &local,
+            &cluster_id,
+            "deferred",
+        );
 
         let runtime = daemon_test_runtime("default-dfs-bootstrap-non-primary");
-        runtime
-            .block_on(ensure_default_distributed_dfs_async_on_runtime(
+        let recovery_error =
+            recover_prior_process_default_dfs_placement_authority(&paths, runtime.handle())
+                .expect_err("test intentionally omits the main daemon data-owner lock");
+        assert!(
+            matches!(&recovery_error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+            "unexpected recovery error: {recovery_error}"
+        );
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let reactor_error = runtime
+            .block_on(reactor.reconcile_pending_async(
                 &paths,
                 &DaemonRunOptions::default(),
-                false,
-                runtime.handle().clone(),
+                &cluster_id,
+                &local,
+                runtime.handle(),
             ))
-            .expect("bootstrap dfs");
+            .expect_err("non-voter recovery failure remains pending for retry");
+        assert!(
+            matches!(&reactor_error, DaemonError::Parse { detail } if detail.contains("without a live exclusive main-daemon data-owner lock")),
+            "unexpected reactor error: {reactor_error}"
+        );
+        assert!(
+            sinomo_core::cluster::read_cluster_kv_latest_observed_entry(
+                &cluster_paths,
+                &permit_key,
+            )
+            .expect("read deferred permit")
+            .is_some(),
+            "failed best-effort recovery must leave placement fenced"
+        );
 
         let backend = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("root"),
@@ -10013,6 +13382,10 @@ mod tests {
         let root = temp_root("daemon_dfs_smoke_single_node");
         let data_root = root.join("data");
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_owner_lock =
+            Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("main daemon data-owner lock"));
+        register_daemon_dfs_data_owner_lock(&paths, &data_owner_lock)
+            .expect("register main daemon data-owner lock");
         let data_dir = SinomoDataDir::new(&data_root);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
@@ -10081,6 +13454,33 @@ mod tests {
 
     fn write_test_cluster_state(data_root: &std::path::Path, node_id: &NodeId) {
         write_test_cluster_state_with_members(data_root, node_id, Vec::new());
+    }
+
+    fn seed_test_prior_process_placement_permit(
+        cluster_paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        cluster_id: &ClusterId,
+        case: &str,
+    ) -> String {
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let permit_key = format!("/dfs/filesystems/{file_system_id}/placement-authority-permit-v1");
+        let permit = TestPlacementAuthorityPermitRecord {
+            job_id: format!("prior-process-{case}-job"),
+            holder_id: format!("prior-process-{case}-holder"),
+            holder_cluster_id: Some(cluster_id.to_string()),
+            holder_node_id: Some(local_node_id.clone()),
+            holder_session_id: Some(format!("prior-process-{case}-session")),
+        };
+        append_cluster_raft_command(
+            cluster_paths,
+            local_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(permit_key.clone(), &permit, None)
+                    .expect("encode prior-process permit"),
+            ),
+        )
+        .expect("seed prior-process permit");
+        permit_key
     }
 
     fn write_test_cluster_state_with_remote_endpoint(

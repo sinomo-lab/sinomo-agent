@@ -107,13 +107,6 @@ fn journal_head_next_sequence(root: &Path) -> Result<Option<u64>> {
     )
 }
 
-fn journal_has_entries_after_head(root: &Path, after_sequence: u64) -> Result<bool> {
-    let Some(next_sequence) = journal_head_next_sequence(root)? else {
-        return Ok(true);
-    };
-    Ok(after_sequence < next_sequence.saturating_sub(1))
-}
-
 fn max_segmented_journal_sequence(root: &Path) -> Result<u64> {
     let Some(path) = highest_segmented_journal_path(root)? else {
         return Ok(0);
@@ -400,6 +393,17 @@ pub(crate) fn journal_entries_since_limited_with_next_sequence(
     segmented_journal_entries_since_limited(root, after_sequence, max_entries, Some(next_sequence))
 }
 
+/// Read the durable segmented tail without trusting an in-memory or deferred
+/// journal-head hint. Bounded migration uses this to replay object IDs changed
+/// after its ordered catalog cursor advanced.
+pub(crate) fn durable_journal_entries_since_limited(
+    root: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    segmented_journal_entries_since_limited(root, after_sequence, max_entries, None)
+}
+
 pub(crate) fn bounded_metadata_journal_batch(
     shard_id: DfsMetadataShardId,
     after_sequence: u64,
@@ -566,7 +570,12 @@ fn segmented_journal_entries_since_limited(
     let has_entries = if let Some(next_sequence) = known_next_sequence {
         after_sequence < next_sequence.saturating_sub(1)
     } else {
-        journal_has_entries_after_head(root, after_sequence)?
+        // The durable-tail path is specifically used to observe appends made
+        // by another retained backend instance. `head.sobj` is a deferred
+        // hint and may lag a fully durable segment append, so it cannot prove
+        // this scan is empty. Listing the sequence-selected segment is the
+        // bounded source-of-truth check.
+        true
     };
     if !has_entries {
         return Ok(Vec::new());

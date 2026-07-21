@@ -11,6 +11,10 @@ include = ["**/*.rs", "Cargo.toml", "README.md"]
 [package.metadata.sinomo]
 ring = "r1"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 blake3.workspace = true
 fs2.workspace = true

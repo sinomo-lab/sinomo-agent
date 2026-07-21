@@ -9,7 +9,10 @@ use sinomo_kv::ClusterKvRaftConfigRecord;
 use sinomo_kv::{KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::{ClusterConnectivityRecord, cluster_connectivity_stable_eq};
+use sinomo_network::{
+    ClusterConnectivityRecord, cluster_connectivity_record_should_refresh,
+    cluster_connectivity_stable_eq,
+};
 use sinomo_network::{
     ClusterNetworkInfoRecord, cluster_network_info_stable_eq, cluster_network_record_should_refresh,
 };
@@ -246,7 +249,7 @@ fn cluster_connectivity_put_no_effect_response(
         },
         |existing, record| {
             cluster_connectivity_stable_eq(existing, record)
-                && !cluster_network_record_should_refresh(existing.expires_at, now)
+                && !cluster_connectivity_record_should_refresh(existing.expires_at, now)
         },
     ))
 }
