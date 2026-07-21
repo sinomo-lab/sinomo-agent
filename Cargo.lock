@@ -8675,11 +8675,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
+ "sinomo-cli",
  "sinomo-dfs-fuse",
  "sinomo-lm",
  "sinomo-pytorch",
  "sinomo-runtime",
  "thiserror 2.0.19",
+ "time",
 ]
 
 [[package]]

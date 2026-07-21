@@ -209,6 +209,44 @@ class LongMemEvalDataTests(unittest.TestCase):
 
 
 class LongMemEvalScoringAndTraceTests(unittest.TestCase):
+    def test_memory_tool_queries_are_bounded_distinct_and_deterministic(self) -> None:
+        question = "Which launch color was selected, and which COLOR replaced it?"
+
+        self.assertEqual(
+            RUNNER.memory_tool_queries(question, 3),
+            ["launch", "color", "selected"],
+        )
+        self.assertEqual(
+            RUNNER.memory_tool_queries(question, 3),
+            RUNNER.memory_tool_queries(question, 3),
+        )
+
+    def test_memory_tools_input_and_result_keep_gold_out_of_band(self) -> None:
+        case = parsed_case()
+        with tempfile.TemporaryDirectory(prefix="sinomo-memory-tools-input-") as temp:
+            case_path = Path(temp) / "case.json"
+            queries = RUNNER.render_memory_tools_input(case, case_path, 4, 50)
+            rendered = case_path.read_text(encoding="utf-8")
+
+        self.assertEqual(queries, ["question-only-secret", "launch", "color", "selected"])
+        self.assertIn("We selected cobalt", rendered)
+        self.assertNotIn("GOLD-ONLY-SECRET", rendered)
+        self.assertNotIn("has_answer", rendered)
+        ranking = {
+            "ranked_session_ids": ["raw-session-secret-a"],
+            "ranked_turn_ids": ["raw-session-secret-a::turn-000000"],
+        }
+        payload = {
+            "schema": RUNNER.MEMORY_TOOLS_OUTPUT_SCHEMA,
+            "case_id": case.question_id,
+            "rankings": {
+                "combined": ranking,
+                "session_history_search": ranking,
+                "memory_search": ranking,
+            },
+        }
+        self.assertEqual(RUNNER.parse_memory_tools_result(payload, case), payload)
+
     def test_ranking_metrics_match_upstream_longmemeval_discount(self) -> None:
         metrics = RUNNER.ranking_metrics(
             ["noise", "gold-b", "gold-a", "gold-b"],
@@ -316,6 +354,7 @@ class LongMemEvalScoringAndTraceTests(unittest.TestCase):
             scratch = base / "scratch"
             operational.mkdir()
             args = argparse.Namespace(
+                retriever="indexed-files",
                 reader="none",
                 scratch_root=scratch,
                 config_source_data_dir=operational,
@@ -326,6 +365,8 @@ class LongMemEvalScoringAndTraceTests(unittest.TestCase):
                 max_records=10,
                 max_bytes=4096,
                 sinomo_bin=Path("/unused/sinomo"),
+                memory_tools_bin=Path("/unused/sinomo-memory-tools-bench"),
+                max_query_terms=8,
                 command_timeout_seconds=10.0,
                 model_timeout_seconds=10.0,
             )

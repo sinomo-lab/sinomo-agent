@@ -273,6 +273,7 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 mod agent_history;
+pub use agent_history::register_agent_history_search_tool_with_vfs;
 mod chat_activity;
 mod error;
 mod help;

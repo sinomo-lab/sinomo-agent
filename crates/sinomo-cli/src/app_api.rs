@@ -1539,7 +1539,8 @@ impl SifsAgentChannelStore {
 
     /// Load authoritative channel metadata without message or turn bodies.
     /// This ordinary loader may repair the materialized metadata cache; bounded
-    /// history authorization uses [`Self::load_channel_metadata_for_history`].
+    /// history authorization uses
+    /// [`Self::load_channel_metadata_for_history_from_vfs`].
     pub fn load_channel_metadata_only(
         &self,
         channel_id: &SessionId,
@@ -1560,8 +1561,23 @@ impl SifsAgentChannelStore {
     /// immutable metadata records, whose transcripts are cleared at write
     /// time. If the proof does not fit, it returns an incomplete projection
     /// with no channel and the caller must skip it.
+    #[cfg(test)]
     pub(crate) fn load_channel_metadata_for_history(
         &self,
+        history_vfs: &VfsHandle,
+        channel_id: &SessionId,
+        max_items: usize,
+        max_bytes: u64,
+    ) -> Result<AgentChannelHistoryMetadataRead, AgentChannelStoreError> {
+        Self::load_channel_metadata_for_history_from_vfs(
+            history_vfs,
+            channel_id,
+            max_items,
+            max_bytes,
+        )
+    }
+
+    pub(crate) fn load_channel_metadata_for_history_from_vfs(
         history_vfs: &VfsHandle,
         channel_id: &SessionId,
         max_items: usize,
@@ -1983,6 +1999,7 @@ impl SifsAgentChannelStore {
     /// an agent history search must never turn a bounded request into an
     /// unbounded legacy transcript read. The supplied VFS cursor bounds both
     /// directory metadata and selected body reads.
+    #[cfg(test)]
     pub(crate) fn load_immutable_message_record_page(
         &self,
         history_vfs: &VfsHandle,
@@ -1991,6 +2008,50 @@ impl SifsAgentChannelStore {
         record_offset: usize,
         limit: usize,
         max_serialized_bytes: u64,
+    ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
+        Self::load_immutable_message_record_page_with_observer(
+            history_vfs,
+            channel_id,
+            after,
+            record_offset,
+            limit,
+            max_serialized_bytes,
+            &|| {
+                #[cfg(test)]
+                self.message_record_body_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+        )
+    }
+
+    pub(crate) fn load_immutable_message_record_page_from_vfs(
+        history_vfs: &VfsHandle,
+        channel_id: &SessionId,
+        after: Option<&VfsDirectoryCursor>,
+        record_offset: usize,
+        limit: usize,
+        max_serialized_bytes: u64,
+    ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
+        Self::load_immutable_message_record_page_with_observer(
+            history_vfs,
+            channel_id,
+            after,
+            record_offset,
+            limit,
+            max_serialized_bytes,
+            &|| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_immutable_message_record_page_with_observer(
+        history_vfs: &VfsHandle,
+        channel_id: &SessionId,
+        after: Option<&VfsDirectoryCursor>,
+        record_offset: usize,
+        limit: usize,
+        max_serialized_bytes: u64,
+        body_read_observer: &dyn Fn(),
     ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
         let dir = Self::message_records_dir(channel_id);
         let page = history_vfs
@@ -2029,9 +2090,7 @@ impl SifsAgentChannelStore {
             // Directory metadata is only a discovery hint. Bound the actual
             // body read as well, then require the immutable record to still
             // have exactly the advertised size before deserializing it.
-            #[cfg(test)]
-            self.message_record_body_reads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            body_read_observer();
             let read = history_vfs
                 .read_range_beneath_no_links(&entry.path, 0, serialized_bytes)
                 .map_err(|source| channel_store_io(&entry.path, source.to_string()))?;
@@ -2088,8 +2147,7 @@ impl SifsAgentChannelStore {
     /// a chunk is opened, its exact object/version is bound into the cursor so
     /// a continuation cannot mix bytes from a replacement object.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_legacy_message_record_page(
-        &self,
+    pub(crate) fn load_legacy_message_record_page_from_vfs(
         history_vfs: &VfsHandle,
         channel_id: &SessionId,
         after: Option<&VfsDirectoryCursor>,
