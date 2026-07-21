@@ -298,15 +298,18 @@ pub use object::{
 pub use object::{write_object_frame_async, write_object_frame_async_timed};
 // Unconditional since stage C: see read_object_frame_async above.
 pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
-/// Pre-production Stage A object-RPC contract and conformance entry points.
+/// Pre-production stream-native object-RPC contract and conformance entry points.
 /// Production delivery must not call these until the matching legacy carrier
 /// is deleted in the same bounded migration slice.
 #[doc(hidden)]
 pub mod __object_rpc_stream_contract {
     pub use super::object_rpc_stream::{
-        OBJECT_RPC_STREAM_MAX_HEAD_BYTES, ObjectRpcStreamCall, ObjectRpcStreamReply,
-        RpcDeliveryOutcome, RpcPeerContext, RpcPeerIdentity, call_object_rpc_stream,
-        serve_object_rpc_stream,
+        OBJECT_RPC_STREAM_INLINE_BODY_BYTES, OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES,
+        OBJECT_RPC_STREAM_MAX_HEAD_BYTES, OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES,
+        ObjectRpcBodyVerification, ObjectRpcStreamBody, ObjectRpcStreamBodyVerifier,
+        ObjectRpcStreamCall, ObjectRpcStreamIncomingBody, ObjectRpcStreamIncomingCall,
+        ObjectRpcStreamReply, ObjectRpcStreamResponse, RpcDeliveryOutcome, RpcPeerContext,
+        RpcPeerIdentity, call_object_rpc_stream, serve_object_rpc_stream,
     };
 }
 pub use paths::ClusterPaths;
