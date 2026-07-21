@@ -33,21 +33,21 @@ use sui::WindowEvent;
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
     CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView, Constraints,
-    ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, EventPhase, Flex,
-    FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState, Label,
-    LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, NumberInput, Observable, PaintCtx,
-    PanelSection, PlacementBadge, PlacementBadgePaint, Popover, PopoverAlignment, RadioButton,
-    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, SegmentedControl,
-    SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx,
-    SemanticsNode, SemanticsRole, Separator, SideSheet, SideSheetPlacement, Size, SizedBox,
-    SplitView, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
-    SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint, TextSurface, TextWrap, ToggleState,
-    Tooltip, TooltipPlacement, TrailingSlotRow, VirtualCollectionModel, VirtualList,
-    VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
-    VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, paint_checkbox_indicator, paint_leading_label_cell,
-    paint_placement_badge_with, paint_text_cell,
+    ContextMenu, ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx,
+    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState,
+    Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, MenuItem, NumberInput,
+    Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Point, PointerButton,
+    PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect, RichText,
+    ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion,
+    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator,
+    SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack, StackHostOptions, StatusBadge,
+    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint,
+    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow,
+    VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable,
+    VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
+    VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, paint_checkbox_indicator,
+    paint_leading_label_cell, paint_placement_badge_with, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -3682,6 +3682,19 @@ impl FilesState {
             self.request_selected_details();
         }
         changed
+    }
+
+    /// Select the row targeted by a context click. A click outside the marked set starts a new
+    /// single-item context, while clicking a marked row preserves the batch operation target.
+    fn select_context_entry(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        let cleared_marks = !self.entry_marked(index) && !self.marked_entries.is_empty();
+        if cleared_marks {
+            self.clear_marked_entries();
+        }
+        self.select_entry(index) || cleared_marks
     }
 
     fn open_action_prompt(&mut self, kind: FileActionPromptKind) {
@@ -10705,6 +10718,209 @@ fn files_list_body_rebuild(
     })
 }
 
+/// Transparent event target around the virtual table. The table owns primary-click selection;
+/// this wrapper handles the secondary-click counterpart before the parent [`ContextMenu`] opens.
+struct FileListContextTarget {
+    shared: Shared,
+    table_state: VirtualTableState,
+    child: WidgetPod,
+}
+
+impl FileListContextTarget {
+    fn new<W>(shared: Shared, table_state: VirtualTableState, child: W) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            shared,
+            table_state,
+            child: WidgetPod::new(child),
+        }
+    }
+
+    fn row_at_position(&self, bounds: Rect, position: Point) -> Option<usize> {
+        let theme = self.shared.theme();
+        let padding = theme.metrics.data_viewport_padding;
+        let header_height = theme.metrics.table_header_height;
+        let header_gap = theme.metrics.select_menu_gap;
+        let body = Rect::new(
+            bounds.x() + padding.left,
+            bounds.y() + padding.top + header_height + header_gap,
+            (bounds.width() - padding.left - padding.right).max(0.0),
+            (bounds.height() - padding.top - padding.bottom - header_height - header_gap).max(0.0),
+        );
+        if !body.contains(position) {
+            return None;
+        }
+        let row_height = theme.metrics.table_row_height.max(1.0);
+        let scroll_y = self.table_state.scroll_state().current_offset().y;
+        let index = ((position.y - body.y() + scroll_y) / row_height).floor() as usize;
+        (index < self.shared.files().entries.len()).then_some(index)
+    }
+}
+
+impl Widget for FileListContextTarget {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() != EventPhase::Capture
+            && let Event::Pointer(pointer) = event
+            && pointer.kind == PointerEventKind::Down
+            && pointer.button == Some(PointerButton::Secondary)
+        {
+            if let Some(index) = self.row_at_position(ctx.bounds(), pointer.position) {
+                self.shared.files_mut().select_context_entry(index);
+                ctx.request_paint();
+                ctx.request_semantics();
+            } else {
+                // Do not let the parent menu open over the table header or unused body space.
+                ctx.set_handled();
+            }
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+fn files_context_menu_item(label: impl Into<String>, enabled: bool) -> MenuItem {
+    let item = MenuItem::new(label);
+    if enabled { item } else { item.disabled() }
+}
+
+fn files_context_menu_items(files: &FilesState) -> Vec<MenuItem> {
+    let Some(entry) = files.selected_entry() else {
+        return Vec::new();
+    };
+    let batch = files.marked_count() > 0;
+    let can_modify = files.can_modify_current_location();
+    let mut items = vec![MenuItem::new("Open")];
+    if !entry.is_dir {
+        items.push(MenuItem::new("Attach to current chat"));
+    }
+    items.push(
+        files_context_menu_item(
+            if batch { "Copy selected to" } else { "Copy to" },
+            can_modify,
+        )
+        .separator_before(),
+    );
+    items.push(files_context_menu_item(
+        if batch { "Move selected to" } else { "Move to" },
+        can_modify,
+    ));
+    items.push(files_context_menu_item(
+        match (files.source, batch) {
+            (FilesSourceKind::Local, false) => "Copy to SIFS",
+            (FilesSourceKind::Local, true) => "Copy selected to SIFS",
+            (FilesSourceKind::Sifs, false) => "Download",
+            (FilesSourceKind::Sifs, true) => "Download selected",
+        },
+        can_modify,
+    ));
+    items.push(files_context_menu_item("Rename", can_modify));
+    items.push(
+        files_context_menu_item(if batch { "Delete selected" } else { "Delete" }, can_modify)
+            .destructive()
+            .separator_before(),
+    );
+    items
+}
+
+fn activate_files_context_menu_item(shared: &Shared, label: &str, ctx: &mut EventCtx) {
+    match label {
+        "Open" => {
+            if let Some(index) = shared.files().selected {
+                shared.files_mut().activate_row(index);
+            }
+        }
+        "Attach to current chat" => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_attach_selected(waker);
+        }
+        "Copy to" | "Copy selected to" => {
+            let kind = if shared.files().marked_count() > 0 {
+                FileActionPromptKind::CopySelected
+            } else {
+                FileActionPromptKind::Copy
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        "Move to" | "Move selected to" => {
+            let kind = if shared.files().marked_count() > 0 {
+                FileActionPromptKind::MoveSelected
+            } else {
+                FileActionPromptKind::Move
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        "Copy to SIFS" | "Download" => {
+            let kind = match shared.files().source {
+                FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
+                FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        "Copy selected to SIFS" | "Download selected" => {
+            shared
+                .files_mut()
+                .open_action_prompt(FileActionPromptKind::TransferSelected);
+        }
+        "Rename" => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::Rename),
+        "Delete" | "Delete selected" => {
+            let kind = if shared.files().marked_count() > 0 {
+                FileActionPromptKind::DeleteSelected
+            } else {
+                FileActionPromptKind::Delete
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        _ => return,
+    }
+    request_files_overlay_rebuild(ctx);
+}
+
+fn files_table_with_context_menu<W>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    table_state: &VirtualTableState,
+    table: W,
+) -> ContextMenu
+where
+    W: Widget + 'static,
+{
+    let target = FileListContextTarget::new(shared.clone(), table_state.clone(), table);
+    let items_shared = shared.clone();
+    let action_shared = shared.clone();
+    ContextMenu::new("files-list-context-menu", target)
+        .theme_when(clone_reader(reader))
+        .items_when(move || files_context_menu_items(&items_shared.files()))
+        .on_activate_with_ctx(move |ctx, _index, item| {
+            activate_files_context_menu_item(&action_shared, item.label(), ctx);
+        })
+}
+
 fn files_list_body_table(
     shared: &Shared,
     reader: &ThemeReader,
@@ -10766,7 +10982,7 @@ fn files_list_body_table(
                     .sort_direction(sort_mode.meta_sort_direction()),
             );
         }
-        VirtualTable::new("files-listing")
+        let table = VirtualTable::new("files-listing")
             .state(table_state.clone())
             .columns(columns)
             .collection_window(CollectionWindow::loaded(
@@ -10855,7 +11071,8 @@ fn files_list_body_table(
                     let waker = { page_s.borrow().waker.clone() };
                     page_s.files_mut().request_more_entries(waker);
                 }
-            })
+            });
+        files_table_with_context_menu(shared, reader, table_state, table)
     };
 
     let compact_table = build_table(false);
@@ -23998,6 +24215,168 @@ mod tests {
 
         assert_eq!(shared.files().selected, Some(1));
 
+        Ok(())
+    }
+
+    #[test]
+    fn file_context_menu_adapts_to_sifs_and_marked_batches() {
+        let mut files = FilesState::new(&Backend::local_fallback());
+        files.source = FilesSourceKind::Sifs;
+        files.loaded = true;
+        files.loading = false;
+        files.error = None;
+        files.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        files.selected = Some(0);
+
+        let labels = files_context_menu_items(&files)
+            .into_iter()
+            .map(|item| item.label().to_string())
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label == "Download"));
+        assert!(!labels.iter().any(|label| label == "Copy to SIFS"));
+
+        files.marked_entries.insert(0);
+        let labels = files_context_menu_items(&files)
+            .into_iter()
+            .map(|item| item.label().to_string())
+            .collect::<Vec<_>>();
+        for label in [
+            "Copy selected to",
+            "Move selected to",
+            "Download selected",
+            "Delete selected",
+        ] {
+            assert!(labels.iter().any(|item| item == label));
+        }
+    }
+
+    #[test]
+    fn file_list_right_click_selects_target_and_exposes_common_operations() -> sui::Result<()> {
+        use sui::{PointerButtons, PointerEvent};
+
+        let root = files_test_temp_dir("context-menu");
+        let first_path = root.join("first.txt");
+        let second_path = root.join("second.txt");
+        fs::write(&first_path, b"first").expect("write first file");
+        fs::write(&second_path, b"second").expect("write second file");
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.path = root.to_string_lossy().into_owned();
+            files.entries = vec![
+                SifsEntry {
+                    name: "first.txt".to_string(),
+                    path: first_path.to_string_lossy().into_owned(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(5),
+                },
+                SifsEntry {
+                    name: "second.txt".to_string(),
+                    path: second_path.to_string_lossy().into_owned(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(6),
+                },
+            ];
+            files.entries_total_count = 2;
+            files.selected = Some(0);
+            files.marked_entries.insert(0);
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files context menu").root(
+                    SizedBox::new()
+                        .width(760.0)
+                        .height(640.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let row = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("second.txt")
+            })
+            .expect("second file row semantics");
+        let position = Point::new(
+            row.bounds.x() + row.bounds.width() * 0.5,
+            row.bounds.y() + row.bounds.height() * 0.5,
+        );
+        let window_root = window.root();
+        let mut down = PointerEvent::new(PointerEventKind::Down, position);
+        down.pointer_id = 1;
+        down.button = Some(PointerButton::Secondary);
+        down.buttons = PointerButtons::new(2);
+        window_root.dispatch_event(Event::Pointer(down))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, position);
+        up.pointer_id = 1;
+        up.button = Some(PointerButton::Secondary);
+        window_root.dispatch_event(Event::Pointer(up))?;
+        app.run_until_idle()?;
+
+        assert_eq!(shared.files().selected, Some(1));
+        assert_eq!(
+            shared.files().marked_count(),
+            0,
+            "context-clicking outside the marked set should target only the clicked row"
+        );
+        let menu_labels = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .filter(|node| node.role == SemanticsRole::MenuItem)
+            .filter_map(|node| node.name)
+            .collect::<Vec<_>>();
+        for label in [
+            "Open",
+            "Attach to current chat",
+            "Copy to",
+            "Move to",
+            "Copy to SIFS",
+            "Rename",
+            "Delete",
+        ] {
+            assert!(
+                menu_labels.iter().any(|item| item == label),
+                "file context menu should contain {label}; got {menu_labels:?}"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::MenuItem)
+            .with_name("Rename")
+            .click()?;
+        app.run_until_idle()?;
+        let files = shared.files();
+        let prompt = files.action_prompt.as_ref().expect("rename prompt");
+        assert_eq!(prompt.kind, FileActionPromptKind::Rename);
+        assert_eq!(
+            prompt.target_path.as_deref(),
+            Some(second_path.to_string_lossy().as_ref())
+        );
+
+        drop(files);
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
