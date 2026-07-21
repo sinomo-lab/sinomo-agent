@@ -21,6 +21,7 @@ default = false
 [features]
 default = []
 env-bench = []
+memory-tools-bench = ["dep:sinomo-cli", "dep:time"]
 sifs-fuse-bench = ["dep:blake3", "dep:libc", "dep:sinomo-dfs-fuse"]
 
 [lib]
@@ -31,6 +32,11 @@ name = "sinomo-sifs-fuse-bench"
 path = "src/bin/sinomo-sifs-fuse-bench.rs"
 required-features = ["sifs-fuse-bench"]
 
+[[bin]]
+name = "sinomo-memory-tools-bench"
+path = "src/bin/sinomo-memory-tools-bench.rs"
+required-features = ["memory-tools-bench"]
+
 [dependencies]
 blake3 = { workspace = true, optional = true }
 libc = { version = "0.2.186", optional = true }
@@ -38,7 +44,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sinomo-agent = { path = "../../../crates/sinomo-agent" }
+sinomo-cli = { path = "../../../crates/sinomo-cli", default-features = false, optional = true }
 sinomo-dfs-fuse = { path = "../../../crates/sinomo-dfs-fuse", features = ["fuse"], optional = true }
 sinomo-lm = { path = "../../../crates/sinomo-lm" }
 sinomo-pytorch = { path = "../../../crates/sinomo-pytorch" }
 sinomo-runtime = { path = "../../../crates/sinomo-runtime" }
+time = { workspace = true, optional = true }

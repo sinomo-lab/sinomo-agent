@@ -1191,25 +1191,55 @@ impl VfsBackend for LocalVfsBackend {
 
 #[derive(Clone, Debug)]
 pub struct MemoryVfsBackend {
-    inner: Arc<Mutex<BTreeMap<String, MemoryNode>>>,
+    inner: Arc<Mutex<MemoryVfsState>>,
 }
 
 #[derive(Clone, Debug)]
 enum MemoryNode {
-    File(Vec<u8>),
-    Directory,
+    File {
+        bytes: Vec<u8>,
+        object_id: u64,
+        version: u64,
+    },
+    Directory {
+        object_id: u64,
+        version: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct MemoryVfsState {
+    nodes: BTreeMap<String, MemoryNode>,
+    next_object_id: u64,
+    next_version: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MemoryDirectoryCursor {
+    directory_version: u64,
+    after_path: String,
 }
 
 impl MemoryVfsBackend {
     pub fn new() -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert("/".to_string(), MemoryNode::Directory);
+        nodes.insert(
+            "/".to_string(),
+            MemoryNode::Directory {
+                object_id: 1,
+                version: 1,
+            },
+        );
         Self {
-            inner: Arc::new(Mutex::new(nodes)),
+            inner: Arc::new(Mutex::new(MemoryVfsState {
+                nodes,
+                next_object_id: 2,
+                next_version: 2,
+            })),
         }
     }
 
-    fn lock(&self, path: &str) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, MemoryNode>>> {
+    fn lock(&self, path: &str) -> Result<std::sync::MutexGuard<'_, MemoryVfsState>> {
         self.inner.lock().map_err(|_| VfsError::Backend {
             backend: self.backend_name().to_string(),
             path: path.to_string(),
@@ -1230,18 +1260,24 @@ impl VfsBackend for MemoryVfsBackend {
     }
 
     fn stat(&self, path: &str) -> Result<VfsMetadata> {
-        let nodes = self.lock(path)?;
-        let node = nodes.get(path).ok_or_else(|| VfsError::NotFound {
+        let state = self.lock(path)?;
+        let node = state.nodes.get(path).ok_or_else(|| VfsError::NotFound {
             path: path.to_string(),
         })?;
         Ok(memory_metadata(path, node))
     }
 
+    fn stat_beneath_no_links(&self, root: &str, path: &str) -> Result<VfsMetadata> {
+        let state = self.lock(path)?;
+        let node = memory_node_beneath(&state, root, path)?;
+        Ok(memory_metadata(path, node))
+    }
+
     fn list(&self, path: &str) -> Result<Vec<VfsDirEntry>> {
-        let nodes = self.lock(path)?;
-        match nodes.get(path) {
-            Some(MemoryNode::Directory) => {}
-            Some(MemoryNode::File(_)) => {
+        let state = self.lock(path)?;
+        match state.nodes.get(path) {
+            Some(MemoryNode::Directory { .. }) => {}
+            Some(MemoryNode::File { .. }) => {
                 return Err(VfsError::NotDirectory {
                     path: path.to_string(),
                 });
@@ -1252,31 +1288,77 @@ impl VfsBackend for MemoryVfsBackend {
                 });
             }
         }
-        let mut entries = Vec::new();
-        for (candidate, node) in nodes.iter() {
-            if candidate == path {
-                continue;
-            }
-            if parent_vfs_path(candidate).as_deref() == Some(path) {
-                entries.push(VfsDirEntry {
-                    name: file_name(candidate).unwrap_or_default().to_string(),
-                    path: candidate.clone(),
-                    kind: memory_kind(node),
-                    size_bytes: match node {
-                        MemoryNode::File(bytes) => Some(bytes.len() as u64),
-                        MemoryNode::Directory => None,
-                    },
-                });
-            }
-        }
-        Ok(entries)
+        Ok(memory_directory_entries(&state, path))
+    }
+
+    fn list_page_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        after: Option<&[u8]>,
+        max_entries: usize,
+    ) -> Result<VfsBackendDirectoryPage> {
+        let state = self.lock(path)?;
+        let node = memory_node_beneath(&state, root, path)?;
+        let MemoryNode::Directory { version, .. } = node else {
+            return Err(VfsError::NotDirectory {
+                path: path.to_string(),
+            });
+        };
+        let after_path = after
+            .map(|cursor| {
+                let cursor: MemoryDirectoryCursor =
+                    serde_json::from_slice(cursor).map_err(|source| VfsError::InvalidCursor {
+                        detail: format!("invalid memory directory cursor: {source}"),
+                    })?;
+                if cursor.directory_version != *version {
+                    return Err(VfsError::InvalidCursor {
+                        detail: "memory directory changed while paging".to_string(),
+                    });
+                }
+                Ok(cursor.after_path)
+            })
+            .transpose()?;
+        let entries = memory_directory_entries(&state, path);
+        let start = after_path
+            .as_deref()
+            .map(|after| entries.partition_point(|entry| entry.path.as_str() <= after))
+            .unwrap_or(0);
+        let end = start.saturating_add(max_entries).min(entries.len());
+        let selected = entries[start..end].to_vec();
+        let next_cursor = if end < entries.len() {
+            let after_path = selected
+                .last()
+                .map(|entry| entry.path.clone())
+                .ok_or_else(|| VfsError::InvalidCursor {
+                    detail: "memory directory page did not advance".to_string(),
+                })?;
+            Some(
+                serde_json::to_vec(&MemoryDirectoryCursor {
+                    directory_version: *version,
+                    after_path,
+                })
+                .map_err(|source| VfsError::Backend {
+                    backend: self.backend_name().to_string(),
+                    path: path.to_string(),
+                    detail: format!("cannot encode memory directory cursor: {source}"),
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(VfsBackendDirectoryPage {
+            directory_metadata: Some(memory_metadata(path, node)),
+            entries: selected,
+            next_cursor,
+        })
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let nodes = self.lock(path)?;
-        match nodes.get(path) {
-            Some(MemoryNode::File(bytes)) => Ok(bytes.clone()),
-            Some(MemoryNode::Directory) => Err(VfsError::IsDirectory {
+        let state = self.lock(path)?;
+        match state.nodes.get(path) {
+            Some(MemoryNode::File { bytes, .. }) => Ok(bytes.clone()),
+            Some(MemoryNode::Directory { .. }) => Err(VfsError::IsDirectory {
                 path: path.to_string(),
             }),
             None => Err(VfsError::NotFound {
@@ -1286,16 +1368,16 @@ impl VfsBackend for MemoryVfsBackend {
     }
 
     fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead> {
-        let nodes = self.lock(path)?;
-        match nodes.get(path) {
-            Some(MemoryNode::File(bytes)) => {
+        let state = self.lock(path)?;
+        match state.nodes.get(path) {
+            Some(MemoryNode::File { bytes, .. }) => {
                 let len = bytes.len().min(max_bytes as usize);
                 Ok(VfsFileRead {
                     bytes: bytes[..len].to_vec(),
                     truncated: bytes.len() as u64 > max_bytes,
                 })
             }
-            Some(MemoryNode::Directory) => Err(VfsError::IsDirectory {
+            Some(MemoryNode::Directory { .. }) => Err(VfsError::IsDirectory {
                 path: path.to_string(),
             }),
             None => Err(VfsError::NotFound {
@@ -1304,34 +1386,140 @@ impl VfsBackend for MemoryVfsBackend {
         }
     }
 
-    fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
-        let mut nodes = self.lock(path)?;
-        enforce_memory_create_mode(&nodes, path, options)?;
-        let parent = parent_vfs_path(path).ok_or_else(|| VfsError::InvalidPath {
+    fn read_prefix_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        self.read_range_beneath_no_links(root, path, 0, max_bytes)
+    }
+
+    fn read_range_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        let state = self.lock(path)?;
+        let node = memory_node_beneath(&state, root, path)?;
+        let MemoryNode::File { bytes, .. } = node else {
+            return Err(VfsError::IsDirectory {
+                path: path.to_string(),
+            });
+        };
+        let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidPath {
             path: path.to_string(),
-            detail: "cannot write root as a file".to_string(),
+            detail: "memory read offset does not fit this platform".to_string(),
         })?;
-        match nodes.get(&parent) {
-            Some(MemoryNode::Directory) => {}
-            Some(MemoryNode::File(_)) => {
-                return Err(VfsError::NotDirectory { path: parent });
-            }
-            None => {
-                return Err(VfsError::NotFound { path: parent });
-            }
+        if offset > bytes.len() {
+            return Err(VfsError::InvalidPath {
+                path: path.to_string(),
+                detail: "memory read offset is beyond end of file".to_string(),
+            });
         }
-        nodes.insert(path.to_string(), MemoryNode::File(bytes.to_vec()));
+        let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let end = offset.saturating_add(max_bytes).min(bytes.len());
+        Ok(VfsOpenedFileRead {
+            metadata: memory_metadata(path, node),
+            bytes: bytes[offset..end].to_vec(),
+            truncated: end < bytes.len(),
+        })
+    }
+
+    fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
+        let mut state = self.lock(path)?;
+        memory_write_locked(&mut state, path, bytes, options)?;
         Ok(())
     }
 
+    fn create_new_versioned(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let mut state = self.lock(path)?;
+        let mut create_options = options.clone();
+        create_options.create_mode = VfsCreateMode::CreateNew;
+        memory_write_locked(&mut state, path, bytes, &create_options)?;
+        Ok(memory_metadata(
+            path,
+            state.nodes.get(path).expect("created memory file"),
+        ))
+    }
+
+    fn create_new_versioned_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        bytes: &[u8],
+        options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let mut state = self.lock(path)?;
+        memory_parent_beneath(&state, root, path)?;
+        let mut create_options = options.clone();
+        create_options.create_mode = VfsCreateMode::CreateNew;
+        memory_write_locked(&mut state, path, bytes, &create_options)?;
+        Ok(memory_metadata(
+            path,
+            state.nodes.get(path).expect("created memory file"),
+        ))
+    }
+
+    fn replace_if_version(
+        &self,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let mut state = self.lock(path)?;
+        memory_replace_locked(
+            &mut state,
+            path,
+            expected_object_id,
+            expected_version,
+            bytes,
+        )
+    }
+
+    fn replace_if_version_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        bytes: &[u8],
+        _options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        let mut state = self.lock(path)?;
+        memory_node_beneath(&state, root, path)?;
+        memory_replace_locked(
+            &mut state,
+            path,
+            expected_object_id,
+            expected_version,
+            bytes,
+        )
+    }
+
     fn append(&self, path: &str, bytes: &[u8], options: &VfsAppendOptions) -> Result<()> {
-        let mut nodes = self.lock(path)?;
-        match nodes.get_mut(path) {
-            Some(MemoryNode::File(existing)) => {
+        let mut state = self.lock(path)?;
+        let next_version = memory_take_version(&mut state);
+        match state.nodes.get_mut(path) {
+            Some(MemoryNode::File {
+                bytes: existing,
+                version,
+                ..
+            }) => {
                 existing.extend_from_slice(bytes);
+                *version = next_version;
                 return Ok(());
             }
-            Some(MemoryNode::Directory) => {
+            Some(MemoryNode::Directory { .. }) => {
                 return Err(VfsError::IsDirectory {
                     path: path.to_string(),
                 });
@@ -1343,50 +1531,26 @@ impl VfsBackend for MemoryVfsBackend {
             }
             None => {}
         }
-        let parent = parent_vfs_path(path).ok_or_else(|| VfsError::InvalidPath {
-            path: path.to_string(),
-            detail: "cannot append to root as a file".to_string(),
-        })?;
-        match nodes.get(&parent) {
-            Some(MemoryNode::Directory) => {}
-            Some(MemoryNode::File(_)) => {
-                return Err(VfsError::NotDirectory { path: parent });
-            }
-            None => {
-                return Err(VfsError::NotFound { path: parent });
-            }
-        }
-        nodes.insert(path.to_string(), MemoryNode::File(bytes.to_vec()));
+        let options = VfsWriteOptions::default().create_new();
+        memory_write_locked(&mut state, path, bytes, &options)?;
         Ok(())
+    }
+
+    fn create_dir_all_beneath_no_links(&self, root: &str, path: &str) -> Result<()> {
+        let mut state = self.lock(path)?;
+        memory_require_beneath(root, path)?;
+        memory_node_beneath(&state, root, root)?;
+        memory_create_dir_all_locked(&mut state, path)
     }
 
     fn create_dir_all(&self, path: &str) -> Result<()> {
-        let mut nodes = self.lock(path)?;
-        let mut current = "/".to_string();
-        for segment in path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-        {
-            current = join_vfs_path(&current, segment);
-            match nodes.get(&current) {
-                Some(MemoryNode::Directory) => {}
-                Some(MemoryNode::File(_)) => {
-                    return Err(VfsError::NotDirectory {
-                        path: current.clone(),
-                    });
-                }
-                None => {
-                    nodes.insert(current.clone(), MemoryNode::Directory);
-                }
-            }
-        }
-        Ok(())
+        let mut state = self.lock(path)?;
+        memory_create_dir_all_locked(&mut state, path)
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let mut nodes = self.lock(from)?;
-        if !nodes.contains_key(from) {
+        let mut state = self.lock(from)?;
+        if !state.nodes.contains_key(from) {
             return Err(VfsError::NotFound {
                 path: from.to_string(),
             });
@@ -1395,14 +1559,15 @@ impl VfsBackend for MemoryVfsBackend {
             path: to.to_string(),
             detail: "cannot rename onto root".to_string(),
         })?;
-        match nodes.get(&parent) {
-            Some(MemoryNode::Directory) => {}
-            Some(MemoryNode::File(_)) => {
+        match state.nodes.get(&parent) {
+            Some(MemoryNode::Directory { .. }) => {}
+            Some(MemoryNode::File { .. }) => {
                 return Err(VfsError::NotDirectory { path: parent });
             }
             None => return Err(VfsError::NotFound { path: parent }),
         }
-        let moving = nodes
+        let moving = state
+            .nodes
             .iter()
             .filter(|(path, _)| *path == from || path.starts_with(&format!("{from}/")))
             .map(|(path, node)| (path.clone(), node.clone()))
@@ -1413,31 +1578,38 @@ impl VfsBackend for MemoryVfsBackend {
             });
         }
         for (path, _) in &moving {
-            nodes.remove(path);
+            state.nodes.remove(path);
         }
         for (path, node) in moving {
             let suffix = path.strip_prefix(from).unwrap_or_default();
-            nodes.insert(format!("{to}{suffix}"), node);
+            state.nodes.insert(format!("{to}{suffix}"), node);
+        }
+        if let Some(parent) = parent_vfs_path(from) {
+            memory_touch_directory(&mut state, &parent);
+        }
+        if let Some(parent) = parent_vfs_path(to) {
+            memory_touch_directory(&mut state, &parent);
         }
         Ok(())
     }
 
     fn remove(&self, path: &str, options: &VfsRemoveOptions) -> Result<()> {
-        let mut nodes = self.lock(path)?;
-        match nodes.get(path) {
-            Some(MemoryNode::Directory) if !options.directory => {
+        let mut state = self.lock(path)?;
+        match state.nodes.get(path) {
+            Some(MemoryNode::Directory { .. }) if !options.directory => {
                 return Err(VfsError::IsDirectory {
                     path: path.to_string(),
                 });
             }
-            Some(MemoryNode::File(_)) if options.directory => {
+            Some(MemoryNode::File { .. }) if options.directory => {
                 return Err(VfsError::NotDirectory {
                     path: path.to_string(),
                 });
             }
-            Some(MemoryNode::Directory) => {
+            Some(MemoryNode::Directory { .. }) => {
                 let child_prefix = format!("{}/", path.trim_end_matches('/'));
-                if nodes
+                if state
+                    .nodes
                     .keys()
                     .any(|candidate| candidate.starts_with(&child_prefix))
                 {
@@ -1446,7 +1618,7 @@ impl VfsBackend for MemoryVfsBackend {
                     });
                 }
             }
-            Some(MemoryNode::File(_)) => {}
+            Some(MemoryNode::File { .. }) => {}
             None if options.missing_ok => return Ok(()),
             None => {
                 return Err(VfsError::NotFound {
@@ -1454,7 +1626,10 @@ impl VfsBackend for MemoryVfsBackend {
                 });
             }
         }
-        nodes.remove(path);
+        state.nodes.remove(path);
+        if let Some(parent) = parent_vfs_path(path) {
+            memory_touch_directory(&mut state, &parent);
+        }
         Ok(())
     }
 }
@@ -1857,11 +2032,11 @@ fn enforce_local_create_mode(
 }
 
 fn enforce_memory_create_mode(
-    nodes: &BTreeMap<String, MemoryNode>,
+    state: &MemoryVfsState,
     path: &str,
     options: &VfsWriteOptions,
 ) -> Result<()> {
-    enforce_create_mode(path, nodes.contains_key(path), options)
+    enforce_create_mode(path, state.nodes.contains_key(path), options)
 }
 
 fn enforce_create_mode(path: &str, exists: bool, options: &VfsWriteOptions) -> Result<()> {
@@ -1878,23 +2053,247 @@ fn enforce_create_mode(path: &str, exists: bool, options: &VfsWriteOptions) -> R
 
 fn memory_kind(node: &MemoryNode) -> VfsObjectKind {
     match node {
-        MemoryNode::File(_) => VfsObjectKind::File,
-        MemoryNode::Directory => VfsObjectKind::Directory,
+        MemoryNode::File { .. } => VfsObjectKind::File,
+        MemoryNode::Directory { .. } => VfsObjectKind::Directory,
     }
 }
 
 fn memory_metadata(path: &str, node: &MemoryNode) -> VfsMetadata {
+    let (object_id, version) = match node {
+        MemoryNode::File {
+            object_id, version, ..
+        }
+        | MemoryNode::Directory {
+            object_id, version, ..
+        } => (*object_id, *version),
+    };
     VfsMetadata {
         path: path.to_string(),
         kind: memory_kind(node),
-        object_id: None,
+        object_id: Some(format!("memory-object-{object_id}")),
         size_bytes: match node {
-            MemoryNode::File(bytes) => Some(bytes.len() as u64),
-            MemoryNode::Directory => None,
+            MemoryNode::File { bytes, .. } => Some(bytes.len() as u64),
+            MemoryNode::Directory { .. } => None,
         },
         content_hash: None,
-        version: None,
+        version: Some(format!("memory-version-{version}")),
     }
+}
+
+fn memory_directory_entries(state: &MemoryVfsState, path: &str) -> Vec<VfsDirEntry> {
+    let mut entries = state
+        .nodes
+        .iter()
+        .filter(|(candidate, _)| {
+            candidate.as_str() != path && parent_vfs_path(candidate).as_deref() == Some(path)
+        })
+        .map(|(candidate, node)| VfsDirEntry {
+            name: file_name(candidate).unwrap_or_default().to_string(),
+            path: candidate.clone(),
+            kind: memory_kind(node),
+            size_bytes: match node {
+                MemoryNode::File { bytes, .. } => Some(bytes.len() as u64),
+                MemoryNode::Directory { .. } => None,
+            },
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
+}
+
+fn memory_node_beneath<'a>(
+    state: &'a MemoryVfsState,
+    root: &str,
+    path: &str,
+) -> Result<&'a MemoryNode> {
+    memory_require_beneath(root, path)?;
+    let mut current = root.to_string();
+    match state.nodes.get(&current) {
+        Some(MemoryNode::Directory { .. }) => {}
+        Some(MemoryNode::File { .. }) => {
+            return Err(VfsError::NotDirectory { path: current });
+        }
+        None => return Err(VfsError::NotFound { path: current }),
+    }
+    let suffix = path
+        .strip_prefix(root)
+        .unwrap_or_default()
+        .trim_matches('/');
+    for segment in suffix.split('/').filter(|segment| !segment.is_empty()) {
+        current = join_vfs_path(&current, segment);
+        let node = state
+            .nodes
+            .get(&current)
+            .ok_or_else(|| VfsError::NotFound {
+                path: current.clone(),
+            })?;
+        if current != path && !matches!(node, MemoryNode::Directory { .. }) {
+            return Err(VfsError::NotDirectory { path: current });
+        }
+    }
+    state.nodes.get(path).ok_or_else(|| VfsError::NotFound {
+        path: path.to_string(),
+    })
+}
+
+fn memory_require_beneath(root: &str, path: &str) -> Result<()> {
+    if path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/'))) {
+        return Ok(());
+    }
+    Err(VfsError::OutsideScope {
+        root: root.to_string(),
+        path: path.to_string(),
+    })
+}
+
+fn memory_parent_beneath<'a>(
+    state: &'a MemoryVfsState,
+    root: &str,
+    path: &str,
+) -> Result<&'a MemoryNode> {
+    let parent = parent_vfs_path(path).ok_or_else(|| VfsError::InvalidPath {
+        path: path.to_string(),
+        detail: "root cannot be used as a file".to_string(),
+    })?;
+    memory_node_beneath(state, root, &parent)
+}
+
+fn memory_take_object_id(state: &mut MemoryVfsState) -> u64 {
+    let object_id = state.next_object_id;
+    state.next_object_id = state.next_object_id.saturating_add(1);
+    object_id
+}
+
+fn memory_take_version(state: &mut MemoryVfsState) -> u64 {
+    let version = state.next_version;
+    state.next_version = state.next_version.saturating_add(1);
+    version
+}
+
+fn memory_touch_directory(state: &mut MemoryVfsState, path: &str) {
+    let next_version = memory_take_version(state);
+    if let Some(MemoryNode::Directory { version, .. }) = state.nodes.get_mut(path) {
+        *version = next_version;
+    }
+}
+
+fn memory_write_locked(
+    state: &mut MemoryVfsState,
+    path: &str,
+    bytes: &[u8],
+    options: &VfsWriteOptions,
+) -> Result<()> {
+    enforce_memory_create_mode(state, path, options)?;
+    let parent = parent_vfs_path(path).ok_or_else(|| VfsError::InvalidPath {
+        path: path.to_string(),
+        detail: "cannot write root as a file".to_string(),
+    })?;
+    match state.nodes.get(&parent) {
+        Some(MemoryNode::Directory { .. }) => {}
+        Some(MemoryNode::File { .. }) => {
+            return Err(VfsError::NotDirectory { path: parent });
+        }
+        None => return Err(VfsError::NotFound { path: parent }),
+    }
+    let version = memory_take_version(state);
+    match state.nodes.get_mut(path) {
+        Some(MemoryNode::File {
+            bytes: existing,
+            version: existing_version,
+            ..
+        }) => {
+            *existing = bytes.to_vec();
+            *existing_version = version;
+        }
+        Some(MemoryNode::Directory { .. }) => {
+            return Err(VfsError::IsDirectory {
+                path: path.to_string(),
+            });
+        }
+        None => {
+            let object_id = memory_take_object_id(state);
+            state.nodes.insert(
+                path.to_string(),
+                MemoryNode::File {
+                    bytes: bytes.to_vec(),
+                    object_id,
+                    version,
+                },
+            );
+            memory_touch_directory(state, &parent);
+        }
+    }
+    Ok(())
+}
+
+fn memory_replace_locked(
+    state: &mut MemoryVfsState,
+    path: &str,
+    expected_object_id: &str,
+    expected_version: &str,
+    bytes: &[u8],
+) -> Result<VfsMetadata> {
+    let current = state.nodes.get(path).ok_or_else(|| VfsError::NotFound {
+        path: path.to_string(),
+    })?;
+    if !matches!(current, MemoryNode::File { .. }) {
+        return Err(VfsError::IsDirectory {
+            path: path.to_string(),
+        });
+    }
+    let metadata = memory_metadata(path, current);
+    if metadata.object_id.as_deref() != Some(expected_object_id)
+        || metadata.version.as_deref() != Some(expected_version)
+    {
+        return Err(VfsError::Conflict {
+            path: path.to_string(),
+            detail: "memory object identity or version changed".to_string(),
+        });
+    }
+    let version = memory_take_version(state);
+    if let Some(MemoryNode::File {
+        bytes: existing,
+        version: existing_version,
+        ..
+    }) = state.nodes.get_mut(path)
+    {
+        *existing = bytes.to_vec();
+        *existing_version = version;
+    }
+    Ok(memory_metadata(
+        path,
+        state.nodes.get(path).expect("replaced memory file"),
+    ))
+}
+
+fn memory_create_dir_all_locked(state: &mut MemoryVfsState, path: &str) -> Result<()> {
+    let mut current = "/".to_string();
+    for segment in path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        let parent = current.clone();
+        current = join_vfs_path(&current, segment);
+        match state.nodes.get(&current) {
+            Some(MemoryNode::Directory { .. }) => {}
+            Some(MemoryNode::File { .. }) => {
+                return Err(VfsError::NotDirectory {
+                    path: current.clone(),
+                });
+            }
+            None => {
+                let object_id = memory_take_object_id(state);
+                let version = memory_take_version(state);
+                state.nodes.insert(
+                    current.clone(),
+                    MemoryNode::Directory { object_id, version },
+                );
+                memory_touch_directory(state, &parent);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1919,7 +2318,10 @@ mod tests {
 
     #[test]
     fn no_link_beneath_primitives_fail_closed_on_unsupported_backends() {
-        let handle = VfsHandle::memory().scoped("/scope").unwrap();
+        let handle = VfsHandle::local(std::env::temp_dir())
+            .unwrap()
+            .scoped("/scope")
+            .unwrap();
         assert!(matches!(
             handle.stat_beneath_no_links("note.md"),
             Err(VfsError::Unsupported { .. })
@@ -1969,6 +2371,77 @@ mod tests {
         assert!(matches!(
             handle.stat_beneath_no_links("/outside/note.md"),
             Err(VfsError::OutsideScope { .. })
+        ));
+    }
+
+    #[test]
+    fn memory_backend_supports_guarded_versioned_operations() {
+        let root = VfsHandle::memory();
+        root.create_dir_all("/scope").unwrap();
+        let handle = root.scoped("/scope").unwrap();
+        handle.create_dir_all_beneath_no_links("nested").unwrap();
+        let created = handle
+            .create_new_versioned_beneath_no_links(
+                "nested/note.md",
+                b"alpha beta",
+                VfsWriteOptions::default().create_new(),
+            )
+            .unwrap();
+        assert!(created.object_id.is_some());
+        assert!(created.version.is_some());
+
+        let first = handle
+            .read_range_beneath_no_links("nested/note.md", 6, 4)
+            .unwrap();
+        assert_eq!(first.bytes, b"beta");
+        assert!(!first.truncated);
+        assert_eq!(first.metadata, created);
+
+        let page = handle
+            .list_page_beneath_no_links("nested", None, 1)
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.directory_metadata.is_some());
+
+        let replaced = handle
+            .replace_if_version_beneath_no_links(
+                "nested/note.md",
+                created.object_id.as_deref().unwrap(),
+                created.version.as_deref().unwrap(),
+                b"updated",
+                VfsWriteOptions::default().replace_existing(),
+            )
+            .unwrap();
+        assert_eq!(created.object_id, replaced.object_id);
+        assert_ne!(created.version, replaced.version);
+        assert!(matches!(
+            handle.replace_if_version_beneath_no_links(
+                "nested/note.md",
+                created.object_id.as_deref().unwrap(),
+                created.version.as_deref().unwrap(),
+                b"stale",
+                VfsWriteOptions::default().replace_existing(),
+            ),
+            Err(VfsError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn memory_guarded_directory_cursor_is_generation_bound() {
+        let root = VfsHandle::memory();
+        root.create_dir_all("/scope").unwrap();
+        let handle = root.scoped("/scope").unwrap();
+        handle.write("a.md", b"a").unwrap();
+        handle.write("b.md", b"b").unwrap();
+
+        let first = handle.list_page_beneath_no_links("", None, 1).unwrap();
+        assert_eq!(first.entries.len(), 1);
+        let cursor = first.next_cursor.expect("another directory page");
+        handle.write("c.md", b"c").unwrap();
+
+        assert!(matches!(
+            handle.list_page_beneath_no_links("", Some(&cursor), 1),
+            Err(VfsError::InvalidCursor { .. })
         ));
     }
 

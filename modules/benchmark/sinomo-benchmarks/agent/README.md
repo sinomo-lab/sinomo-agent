@@ -1,11 +1,12 @@
 # Agent memory benchmarks
 
-The agent benchmark package contains two complementary memory evaluations:
+The agent benchmark package contains complementary memory evaluations:
 
 - `run_memory_eval.py` is the small, checked-in synthetic evaluation. It is
   useful for fast fixture checks and model-facing prompt behavior.
-- `run_longmemeval_s.py` runs the cleaned LongMemEval-S corpus through Sinomo's
-  real indexed-file catalog, index, query, and optional agent-reader path.
+- `run_longmemeval_s.py` runs the cleaned LongMemEval-S corpus through either
+  Sinomo's indexed-file path or the explicit history-search and memory-note
+  tools, with an optional agent reader for the indexed-file path.
 
 LongMemEval-S is an external dataset and is not vendored in this repository.
 Benchmark outputs belong under the gitignored `benchmark-results/` directory.
@@ -112,9 +113,39 @@ every gold session in the cleaned dataset. The harness does not infer missing
 turn labels from session labels. As in the upstream benchmark, abstention
 questions are excluded from retrieval scoring.
 
-The default retrieval budget is 50 records and 1 MiB. Use `--max-records` and
-`--max-bytes` to create a separately named operating point; record those values
-when comparing results.
+The default indexed-file retrieval budget is 50 records and 1 MiB. Use
+`--max-records` and `--max-bytes` to create a separately named operating point;
+record those values when comparing results. The memory-tools baseline uses the
+same `--max-records` value to bound each reported ranking; `--max-bytes` is
+specific to indexed-file evidence.
+
+### Memory-tools baseline
+
+The memory-tools baseline uses the same cases, gold labels, development subset,
+and retrieval metrics. It seeds one typed background activity per turn and one
+Markdown note per session, then calls the production `session_history_search`,
+`memory_write`, and `memory_search` tools. All storage is a fresh in-memory VFS,
+so this baseline does not require DFS, SIFS, a daemon, or operator state.
+
+```bash
+cargo build --release -p sinomo-benchmarks \
+  --features memory-tools-bench \
+  --bin sinomo-memory-tools-bench
+python3 modules/benchmark/sinomo-benchmarks/agent/run_longmemeval_s.py \
+  --mode run \
+  --retriever memory-tools \
+  --dataset benchmark-results/datasets/longmemeval_s_cleaned.json \
+  --reader none \
+  --subset development
+```
+
+The driver derives a bounded deterministic set of query terms from each
+question. Reports retain separate history-search and memory-search rankings as
+well as a combined ranking ordered by query-term coverage, source coverage, and
+reciprocal-rank fusion. Use the combined ranking for the direct indexed-file
+comparison, and the per-source rankings to diagnose which tool contributed.
+The memory-tools path is retrieval-only; `--reader sinomo` is intentionally
+rejected because that reader consumes indexed-file evidence.
 
 ### Optional Sinomo reader
 
@@ -175,6 +206,10 @@ outputs, so concurrent or comparative runs must use distinct output paths.
 and the remaining cases continue. A `passed` run status means the harness
 completed without execution or data-contract failures; retrieval quality is
 reported as metrics and is not converted into an arbitrary pass threshold.
+With `--retriever memory-tools`, the default directory is
+`benchmark-results/agent-memory/memory-tools-longmemeval-s/` and the detailed
+records additionally contain per-tool rankings, query terms, call counts, and
+seeded-object counts.
 
 ## Containment contract
 
