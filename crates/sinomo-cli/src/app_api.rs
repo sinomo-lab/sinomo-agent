@@ -6898,6 +6898,13 @@ pub struct SifsEntryMetadata {
     pub modified_at_unix_nanos: u64,
     pub policy: String,
     pub current_locations: Vec<String>,
+    pub placement: Option<SifsEntryPlacement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsEntryPlacement {
+    pub agent_state: String,
+    pub desired_replicas: usize,
 }
 
 /// SIFS metadata for a selected object.
@@ -7984,6 +7991,13 @@ fn sifs_entry_metadata_from_rpc(
         modified_at_unix_nanos: metadata.modified_at_unix_nanos,
         policy: sifs_policy_label(&metadata.policy).to_string(),
         current_locations: metadata.current_locations.clone(),
+        placement: metadata
+            .placement
+            .as_ref()
+            .map(|placement| SifsEntryPlacement {
+                agent_state: sifs_agent_state_label(&placement.agent_state).to_string(),
+                desired_replicas: placement.desired_replicas,
+            }),
     })
 }
 

@@ -2585,6 +2585,7 @@ impl DaemonDfsBrowserBackend {
                     .into_iter()
                     .map(|node_id| node_id.to_string())
                     .collect(),
+                placement: None,
             });
             crate::DaemonDfsBrowserEntry {
                 name: entry.name,
@@ -2599,10 +2600,20 @@ impl DaemonDfsBrowserBackend {
         let total_count = entries.len();
         let offset = request.offset.min(total_count);
         let limit = request.limit;
-        let entries = match limit {
+        let mut entries: Vec<crate::DaemonDfsBrowserEntry> = match limit {
             Some(limit) => entries.into_iter().skip(offset).take(limit).collect(),
             None => entries.into_iter().skip(offset).collect(),
         };
+        if include_metadata {
+            for entry in &mut entries {
+                let placement = entry.metadata.as_ref().and_then(|metadata| {
+                    daemon_dfs_browser_entry_placement(&mut service, &entry.path, metadata)
+                });
+                if let Some(metadata) = entry.metadata.as_mut() {
+                    metadata.placement = placement;
+                }
+            }
+        }
         Ok(crate::DaemonDfsBrowserListResponse {
             node_id: service.node_id().to_string(),
             entries,
@@ -4274,6 +4285,35 @@ fn daemon_dfs_browser_object_health(
         open_conflict_count: view.conflicts.len(),
         pending_repair_count: view.repairs.len(),
         missing_replica_nodes,
+    })
+}
+
+fn daemon_dfs_browser_entry_placement(
+    service: &mut sinomo_dfs::MountedSifsService,
+    path: &str,
+    metadata: &crate::DaemonDfsBrowserEntryMetadata,
+) -> Option<crate::DaemonDfsBrowserEntryPlacement> {
+    let object_id = sinomo_dfs::DfsObjectId::new(&metadata.object_id).ok()?;
+    let current_replicas = metadata.current_locations.len();
+    let desired_replicas = service
+        .resolved_placement_policy_for_path(path, metadata.policy.clone(), current_replicas.max(1))
+        .map(|placement| placement.policy.desired_replicas)
+        .unwrap_or_else(|_| current_replicas.max(1))
+        .max(1);
+    let agent_state = daemon_dfs_browser_object_health(service, &object_id)
+        .map(|health| health.agent_state)
+        .unwrap_or_else(|| {
+            if current_replicas == 0 {
+                sinomo_dfs::DfsAgentObjectState::MetadataOnly
+            } else if current_replicas < desired_replicas {
+                sinomo_dfs::DfsAgentObjectState::PendingRepair
+            } else {
+                sinomo_dfs::DfsAgentObjectState::Current
+            }
+        });
+    Some(crate::DaemonDfsBrowserEntryPlacement {
+        agent_state,
+        desired_replicas,
     })
 }
 
@@ -8431,6 +8471,15 @@ mod tests {
         assert_eq!(metadata.modified_at_unix_nanos, stat.modified_at_unix_nanos);
         assert_eq!(metadata.policy, stat.policy);
         assert_eq!(metadata.current_locations, stat.current_locations);
+        let placement = metadata
+            .placement
+            .as_ref()
+            .expect("live row placement snapshot");
+        assert_eq!(
+            placement.agent_state,
+            sinomo_dfs::DfsAgentObjectState::Current
+        );
+        assert_eq!(placement.desired_replicas, 1);
     }
 
     #[test]
