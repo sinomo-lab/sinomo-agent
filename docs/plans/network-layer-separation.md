@@ -72,12 +72,19 @@ they already satisfy them.
    they replace.
 2. A migrated service method cannot retain payload-size or fallback branches
    into the old carrier.
-3. Compatibility code lives at the edge of an old protocol, not in the pure
-   planner, connectivity model, routed-stream API, or new object-RPC protocol.
+3. No compatibility shim, legacy adapter, deprecated alias, dual-protocol
+   negotiation, or old-to-new translation path is introduced or retained.
+   Producers and consumers move to the new contract together in one bounded
+   migration slice.
 4. Each stage adds boundary tests before migrating another service family.
-5. Old code is deleted in the same stage that removes its final production
-   caller. It is not retained for hypothetical fallback.
-6. Protocol numbers do not change merely because the implementation is being
+5. Old code may remain only while it has a named production caller. Removing
+   the final caller deletes the complete superseded path in the same change,
+   including unused modules, exports, configuration, feature flags, tests,
+   fixtures, and documentation. Dead code is not retained for hypothetical
+   fallback or rollback.
+6. Rollback uses source-control revert or a corrected forward change, never a
+   dormant runtime switch to the old implementation.
+7. Protocol numbers do not change merely because the implementation is being
    refactored.
 
 ## Stage A: Contracts and Conformance Harness
@@ -238,7 +245,8 @@ Each slice must:
 - prove authorization at the final service boundary;
 - define retry and idempotency behavior;
 - add nonzero latency and throughput gates where performance is material; and
-- delete that service's old delivery path.
+- delete that service's old delivery path and every test, export, branch, or
+  helper made unused by the migration.
 
 There is no whole-workspace fallback toggle. Rollback is performed by reverting
 a bounded migration change, not by maintaining two production carriers for the
@@ -252,7 +260,12 @@ After the final production caller migrates:
 - delete the persistent object-RPC channel carrier;
 - delete RPC-aware relay envelopes and carrier selection;
 - delete duplicate network service-method catalogs;
-- remove legacy message-routing exports and their unused tests;
+- delete every compatibility shim, legacy adapter, deprecated alias,
+  superseded protocol negotiation branch, and fallback selector;
+- remove legacy message-routing exports and all tests and fixtures that cover
+  only removed behavior;
+- remove unused configuration keys, environment variables, feature flags,
+  metrics, error variants, documentation, and public re-exports;
 - remove network-owned application-body spool files; and
 - reduce the `sinomo-network` public facade to deliberate exports backed by the
   one remaining implementation.
@@ -268,6 +281,8 @@ Exit criteria:
 - exactly one object-RPC protocol implementation exists;
 - exactly one service-method registry exists;
 - no payload-size branch selects a transport or RPC carrier;
+- no compatibility, legacy, fallback, deprecated, or dead-code path remains;
+- no removed protocol version is accepted, negotiated, documented, or tested;
 - no RPC or SOBJ type appears in the routing module;
 - no `NodeId` route planning appears in the object-RPC module; and
 - the current carrier-only sections of the network data-path reference are

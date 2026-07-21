@@ -460,9 +460,11 @@ contracts evolve independently:
 
 Capabilities, limits, and optional fields are negotiated as capabilities when
 backward-compatible. A version changes only for an incompatible contract
-change, not for an implementation refactor or tuning adjustment. Compatibility
-adapters live at protocol boundaries and never cause routing to choose an RPC
-protocol based on payload shape.
+change, not for an implementation refactor or tuning adjustment. This
+replacement retains no adapter between superseded internal protocols. A wire
+contract change migrates every producer and consumer as one coordinated change,
+then deletes the old parser, negotiation branch, framing, tests, and
+documentation. Routing never chooses an RPC protocol based on payload shape.
 
 The current consolidated implementation protocol v1 described in the
 [data-path reference](developer/network-data-path.md) predates this separation.
@@ -547,6 +549,9 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
     implementation milestones.
 16. Target services re-check domain authority and node-local consent at the
     final effect boundary.
+17. No superseded internal protocol, compatibility shim, legacy adapter,
+    deprecated alias, fallback selector, unused export, dead test, fixture,
+    configuration, or documentation remains after its final caller migrates.
 
 The [clustering architecture](clustering-architecture.md) defines directory
 authority. The [Sinomo Object format](sinomo-object-format.md) defines the
