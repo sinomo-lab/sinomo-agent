@@ -239,8 +239,11 @@ pub use route_graph_read_model::{
 };
 pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routed_stream_pool::{
-    RoutedStreamAcceptor, accept_routed_stream_carrier, open_pooled_routed_stream,
-    retire_pooled_routed_streams,
+    RoutedStreamAcceptor, accept_local_object_rpc_stream_carrier, accept_routed_stream_carrier,
+    local_object_rpc_carrier_prelude_prefix_matches, open_pooled_local_object_rpc_stream,
+    open_pooled_routed_stream, read_local_object_rpc_carrier_prelude, retire_pooled_routed_streams,
+    serve_local_object_rpc_stream_carrier, serve_routed_stream_carrier,
+    write_local_object_rpc_carrier_prelude,
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
@@ -265,7 +268,7 @@ pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_v
 pub use object::{read_object_frame_async, read_object_frame_async_with_max_bytes};
 pub use object_rpc_stream::{
     RpcPeerContext, RpcPeerIdentity, local_object_rpc_stream_prelude_prefix_matches,
-    read_local_object_rpc_stream_prelude,
+    read_local_object_rpc_stream_prelude, write_local_object_rpc_stream_prelude,
 };
 pub use paths::ClusterPaths;
 pub use peer::{

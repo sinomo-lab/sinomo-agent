@@ -28,6 +28,7 @@ static CLUSTER_DIRECTORY_PROJECTIONS: LazyLock<
 
 #[derive(Clone)]
 struct ClusterDirectoryProjection {
+    routing_version: sinomo_network::DirectoryVersion,
     members: Vec<ClusterMemberRecord>,
     endpoints: Vec<ClusterEndpointRecord>,
     connectivity_records: Vec<ClusterConnectivityRecord>,
@@ -76,8 +77,37 @@ fn cluster_directory_projection_mark(snapshot: &KvSnapshot) -> Result<blake3::Ha
             }
             hasher.update(&(entry.key.len() as u64).to_le_bytes());
             hasher.update(entry.key.as_bytes());
-            hasher.update(&(entry.value.len() as u64).to_le_bytes());
-            hasher.update(&entry.value);
+            if prefix == "/cluster/network/connectivity/" {
+                let record: ClusterConnectivityRecord = entry.decode().map_err(kv_err)?;
+                for value in [
+                    record.cluster_id.as_str(),
+                    record.source_node_id.as_str(),
+                    record.target_node_id.as_str(),
+                    record.endpoint_id.as_str(),
+                    record.address.as_str(),
+                ] {
+                    hasher.update(&(value.len() as u64).to_le_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                hasher.update(&[match record.transport {
+                    sinomo_base::ClusterTransportKind::InProcess => 1,
+                    sinomo_base::ClusterTransportKind::Loopback => 2,
+                    sinomo_base::ClusterTransportKind::LanTcp => 3,
+                    sinomo_base::ClusterTransportKind::LanQuic => 4,
+                    sinomo_base::ClusterTransportKind::Iroh => 5,
+                    sinomo_base::ClusterTransportKind::WebRtc => 6,
+                    sinomo_base::ClusterTransportKind::TurnRelay => 7,
+                    sinomo_base::ClusterTransportKind::HttpsRelay => 8,
+                }]);
+                hasher.update(&[match record.state {
+                    sinomo_network::ClusterConnectivityState::Healthy => 1,
+                    sinomo_network::ClusterConnectivityState::Degraded => 2,
+                    sinomo_network::ClusterConnectivityState::Unreachable => 3,
+                }]);
+            } else {
+                hasher.update(&(entry.value.len() as u64).to_le_bytes());
+                hasher.update(&entry.value);
+            }
         }
     }
     Ok(hasher.finalize())
@@ -109,21 +139,23 @@ fn read_cluster_directory_projection(
         return Ok(Arc::clone(&entry.projection));
     }
 
-    let projection = Arc::new(ClusterDirectoryProjection {
-        members: read_cluster_members_from_snapshot(snapshot.as_ref())?,
-        endpoints: read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
-            .into_values()
-            .flatten()
-            .collect(),
+    let members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
+    let endpoints = read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
+        .into_values()
+        .flatten()
+        .collect();
+    let connectivity_records =
         // Keep the decoded records, not their time-dependent live view. Route
         // capture filters lease expiry on every call below.
-        connectivity_records: read_all_cluster_connectivity_records_from_snapshot(
-            snapshot.as_ref(),
-        )?,
-    });
+        read_all_cluster_connectivity_records_from_snapshot(snapshot.as_ref())?;
 
     let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() else {
-        return Ok(projection);
+        return Ok(Arc::new(ClusterDirectoryProjection {
+            routing_version: sinomo_network::DirectoryVersion(snapshot.revision.0),
+            members,
+            endpoints,
+            connectivity_records,
+        }));
     };
     // Another reader may have populated this exact generation while the
     // projection was decoded outside the cache lock. Reuse its allocation.
@@ -134,6 +166,25 @@ fn read_cluster_directory_projection(
         entry.last_used = cluster_directory_projection_cache_tick();
         return Ok(Arc::clone(&entry.projection));
     }
+    let routing_version = cache
+        .get(&paths.root)
+        .map(|entry| {
+            sinomo_network::DirectoryVersion(
+                entry
+                    .projection
+                    .routing_version
+                    .0
+                    .saturating_add(1)
+                    .max(snapshot.revision.0),
+            )
+        })
+        .unwrap_or(sinomo_network::DirectoryVersion(snapshot.revision.0));
+    let projection = Arc::new(ClusterDirectoryProjection {
+        routing_version,
+        members,
+        endpoints,
+        connectivity_records,
+    });
     if !cache.contains_key(&paths.root)
         && cache.len() >= MAX_CLUSTER_DIRECTORY_PROJECTION_CACHE_ENTRIES
         && let Some(eviction_path) = cache
@@ -478,14 +529,21 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
                 Vec::new(),
             ));
         };
-        let version = sinomo_network::DirectoryVersion(snapshot.revision.0);
         let projection = read_cluster_directory_projection(&self.paths, snapshot)?;
         Ok(sinomo_network::DirectoryRoutingRecordsSnapshot::new(
-            version,
+            projection.routing_version,
             projection.members.clone(),
             projection.endpoints.clone(),
             projection.live_connectivity_records(OffsetDateTime::now_utc()),
         ))
+    }
+
+    fn routing_version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
+        let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.paths)?
+        else {
+            return Ok(sinomo_network::DirectoryVersion(0));
+        };
+        Ok(read_cluster_directory_projection(&self.paths, snapshot)?.routing_version)
     }
 }
 
@@ -559,6 +617,7 @@ mod tests {
         let second = read_cluster_directory_projection(&paths, Arc::clone(&snapshot))
             .expect("cached projection");
         assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.routing_version, second.routing_version);
 
         let replacement = Arc::new((*snapshot).clone());
         let same_route =
@@ -578,6 +637,7 @@ mod tests {
             Arc::ptr_eq(&first, &unrelated_revision),
             "an unrelated KV revision should reuse the decoded route projection"
         );
+        assert_eq!(first.routing_version, unrelated_revision.routing_version);
 
         let another_node =
             NodeId::from_legacy_named("node_kv_read_model_cache_changed").expect("another node");
@@ -598,6 +658,7 @@ mod tests {
             !Arc::ptr_eq(&first, &rebuilt),
             "a route-relevant KV change must invalidate the decoded projection"
         );
+        assert!(rebuilt.routing_version > first.routing_version);
     }
 
     #[test]
@@ -625,6 +686,7 @@ mod tests {
             expires_at: now + time::Duration::seconds(1),
         };
         let projection = ClusterDirectoryProjection {
+            routing_version: sinomo_network::DirectoryVersion(1),
             members: Vec::new(),
             endpoints: Vec::new(),
             connectivity_records: vec![record.clone()],

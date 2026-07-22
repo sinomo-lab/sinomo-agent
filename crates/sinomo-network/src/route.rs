@@ -6,11 +6,92 @@ use crate::{
     NetworkDeliveryState, NetworkDuplexStream, NetworkError, NetworkHealthPolicy,
     NetworkTimeoutPhase, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResult,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+
+const PREPARED_ROUTE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PreparedRouteCacheKey {
+    cluster_root: PathBuf,
+    local_node_id: NodeId,
+    directory_generation: u64,
+    connect_timeout: Duration,
+    no_progress_timeout: Duration,
+}
+
+struct PreparedRouteCacheEntry {
+    connector: Arc<crate::MultiHopRoutedConnector>,
+    valid_until: Instant,
+}
+
+static PREPARED_ROUTE_CACHE: LazyLock<
+    Mutex<BTreeMap<PreparedRouteCacheKey, PreparedRouteCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn prepared_route_cache_get(
+    key: &PreparedRouteCacheKey,
+) -> Option<Arc<crate::MultiHopRoutedConnector>> {
+    let now = Instant::now();
+    let mut cache = PREPARED_ROUTE_CACHE.lock().ok()?;
+    cache.retain(|_, entry| entry.valid_until > now);
+    cache.get(key).map(|entry| Arc::clone(&entry.connector))
+}
+
+fn prepared_route_cache_insert(
+    key: PreparedRouteCacheKey,
+    connector: Arc<crate::MultiHopRoutedConnector>,
+) {
+    let Ok(mut cache) = PREPARED_ROUTE_CACHE.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    cache.retain(|candidate, entry| {
+        entry.valid_until > now
+            && (candidate.cluster_root != key.cluster_root
+                || candidate.local_node_id != key.local_node_id
+                || candidate.directory_generation >= key.directory_generation)
+    });
+    cache.insert(
+        key,
+        PreparedRouteCacheEntry {
+            connector,
+            valid_until: now + PREPARED_ROUTE_CACHE_TTL,
+        },
+    );
+}
+
+fn record_routed_rpc_timeline_stage(
+    trace: Option<crate::NetworkTimelineTraceContext>,
+    stage: u16,
+    started_ns: u64,
+    success: bool,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    crate::record_network_timeline_event_now(crate::NetworkTimelineEvent::new(
+        trace,
+        stage,
+        crate::network_timeline_flag::REQUEST
+            | if success {
+                crate::network_timeline_flag::SUCCESS
+            } else {
+                0
+            },
+        0,
+        0,
+        0,
+        0,
+        0,
+        crate::network_timeline_monotonic_ns().saturating_sub(started_ns),
+    ));
+}
 
 pub(crate) fn network_perf_trace_elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -810,12 +891,37 @@ where
             deadline,
         )
         .await?;
-        let mut stream = self
-            .host
-            .open_object_rpc_stream_async(&endpoint, policy.health)
-            .await?;
-        let context =
-            crate::object_rpc_stream::write_local_object_rpc_stream_prelude(&mut *stream).await?;
+        let connect_timeout = match deadline.checked_remaining() {
+            Some(Some(remaining)) => remaining.min(policy.health.connect_timeout),
+            Some(None) => policy.health.connect_timeout,
+            None => {
+                return Err(deadline.timeout_error(
+                    "establish local object RPC carrier",
+                    NetworkTimeoutPhase::Overall,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                ));
+            }
+        };
+        let establish = async {
+            let mut stream = self
+                .host
+                .open_object_rpc_stream_async(&endpoint, policy.health)
+                .await?;
+            let context =
+                crate::routed_stream_pool::write_local_object_rpc_carrier_prelude(&mut *stream)
+                    .await?;
+            Ok((stream, context))
+        };
+        let stream = crate::open_pooled_local_object_rpc_stream(
+            format!("{address}:{endpoint_node_id}"),
+            connect_timeout,
+            establish,
+        )
+        .await?;
+        let context = crate::object_rpc_stream::RpcPeerContext::unauthenticated_local(
+            stream.session_id.clone(),
+            stream.channel_binding,
+        );
         let result = crate::service_rpc_stream::call_service_rpc_stream(
             stream,
             &context,
@@ -897,60 +1003,114 @@ where
             });
         }
         let policy = options.call_policy();
-        let request_auth = cluster_object_rpc_sign_with_deadline(
+        let trace = crate::network_timeline_trace_context_for_request(&call.request);
+        let sign_started_ns = trace
+            .map(|_| crate::network_timeline_monotonic_ns())
+            .unwrap_or(0);
+        let request_auth_result = cluster_object_rpc_sign_with_deadline(
             self.host.sign_object_rpc_request_async(&call.request),
             deadline,
         )
-        .await?;
+        .await;
+        record_routed_rpc_timeline_stage(
+            trace,
+            crate::network_timeline_stage::REQUEST_SIGN,
+            sign_started_ns,
+            request_auth_result.is_ok(),
+        );
+        let request_auth = request_auth_result?;
         let directory = crate::cluster_directory_with_bootstrap_state(
             crate::cluster_directory_for(paths),
             state,
         );
-        let (directory_version, members, endpoints, directory_connectivity) =
-            directory.routing_records_snapshot()?.into_parts();
-        let directory_snapshot =
-            crate::DirectorySnapshot::try_from_records(directory_version, members, endpoints)?;
-        if !directory_snapshot.is_authorized(&state.local_node_id) {
-            return Err(NetworkError::UnauthorizedNode {
-                node_id: state.local_node_id.clone(),
-            });
-        }
-        if !directory_snapshot.is_authorized(target_node_id) {
-            return Err(NetworkError::UnauthorizedNode {
-                node_id: target_node_id.clone(),
-            });
-        }
-        let connectivity = crate::connectivity_snapshot_from_directory_records(
-            &directory_snapshot,
-            crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
-                paths,
-                state,
-                &directory_snapshot,
-                directory_connectivity,
-            )?,
-            OffsetDateTime::now_utc(),
-        )?;
-        let connectivity = Arc::new(crate::ConnectivityTracker::new(connectivity));
-        let data_dir = cluster_paths_data_dir(Some(paths))?;
-        let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
-            crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), data_dir)?,
+        let snapshot_started_ns = trace
+            .map(|_| crate::network_timeline_monotonic_ns())
+            .unwrap_or(0);
+        let routing_version_result = directory.routing_version();
+        record_routed_rpc_timeline_stage(
+            trace,
+            crate::network_timeline_stage::ROUTE_SNAPSHOT,
+            snapshot_started_ns,
+            routing_version_result.is_ok(),
         );
-        let provider: Arc<dyn crate::LinkProvider> = Arc::new(crate::ClusterLinkProvider::new(
-            state.local_node_id.clone(),
-            Arc::clone(&identity),
-            policy.health,
-        )?);
-        let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
-        let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
-        let directory_generation = directory_snapshot.version().0;
-        let connector = crate::MultiHopRoutedConnector::from_snapshot(
-            state.local_node_id.clone(),
-            directory_snapshot,
-            connectivity_view,
-            failure_sink,
-            provider,
-            identity,
-        )?;
+        let routing_version = routing_version_result?;
+        let initial_cache_key = PreparedRouteCacheKey {
+            cluster_root: paths.root.clone(),
+            local_node_id: state.local_node_id.clone(),
+            directory_generation: routing_version.0,
+            connect_timeout: policy.health.connect_timeout,
+            no_progress_timeout: policy.health.no_progress_timeout,
+        };
+        let prepare_started_ns = trace
+            .map(|_| crate::network_timeline_monotonic_ns())
+            .unwrap_or(0);
+        let prepared = if let Some(connector) = prepared_route_cache_get(&initial_cache_key) {
+            Ok((connector, routing_version.0))
+        } else {
+            (|| {
+                let (directory_version, members, endpoints, directory_connectivity) =
+                    directory.routing_records_snapshot()?.into_parts();
+                let directory_snapshot = crate::DirectorySnapshot::try_from_records(
+                    directory_version,
+                    members,
+                    endpoints,
+                )?;
+                if !directory_snapshot.is_authorized(&state.local_node_id) {
+                    return Err(NetworkError::UnauthorizedNode {
+                        node_id: state.local_node_id.clone(),
+                    });
+                }
+                if !directory_snapshot.is_authorized(target_node_id) {
+                    return Err(NetworkError::UnauthorizedNode {
+                        node_id: target_node_id.clone(),
+                    });
+                }
+                let connectivity = crate::connectivity_snapshot_from_directory_records(
+                    &directory_snapshot,
+                    crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
+                        paths,
+                        state,
+                        &directory_snapshot,
+                        directory_connectivity,
+                    )?,
+                    OffsetDateTime::now_utc(),
+                )?;
+                let connectivity = Arc::new(crate::ConnectivityTracker::new(connectivity));
+                let data_dir = cluster_paths_data_dir(Some(paths))?;
+                let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
+                    crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), data_dir)?,
+                );
+                let provider: Arc<dyn crate::LinkProvider> =
+                    Arc::new(crate::ClusterLinkProvider::new(
+                        state.local_node_id.clone(),
+                        Arc::clone(&identity),
+                        policy.health,
+                    )?);
+                let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
+                let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
+                let connector = Arc::new(crate::MultiHopRoutedConnector::from_snapshot(
+                    state.local_node_id.clone(),
+                    directory_snapshot,
+                    connectivity_view,
+                    failure_sink,
+                    provider,
+                    identity,
+                )?);
+                let cache_key = PreparedRouteCacheKey {
+                    directory_generation: directory_version.0,
+                    ..initial_cache_key
+                };
+                prepared_route_cache_insert(cache_key, Arc::clone(&connector));
+                Ok((connector, directory_version.0))
+            })()
+        };
+        record_routed_rpc_timeline_stage(
+            trace,
+            crate::network_timeline_stage::ROUTE_PREPARE,
+            prepare_started_ns,
+            prepared.is_ok(),
+        );
+        let (connector, directory_generation) = prepared?;
         let connect_timeout = match deadline.checked_remaining() {
             Some(Some(remaining)) => remaining.min(policy.health.connect_timeout),
             Some(None) => policy.health.connect_timeout,
@@ -963,7 +1123,10 @@ where
             }
         };
         let constraints = stream_native_service_route_constraints();
-        let stream = crate::open_pooled_routed_stream(
+        let open_started_ns = trace
+            .map(|_| crate::network_timeline_monotonic_ns())
+            .unwrap_or(0);
+        let stream_result = crate::open_pooled_routed_stream(
             state.cluster_id.to_string(),
             directory_generation,
             constraints,
@@ -971,7 +1134,7 @@ where
             target_node_id.clone(),
             connect_timeout,
             crate::RoutedConnector::connect(
-                &connector,
+                connector.as_ref(),
                 target_node_id.clone(),
                 crate::ConnectOptions {
                     constraints,
@@ -979,13 +1142,23 @@ where
                 },
             ),
         )
-        .await?;
+        .await;
+        record_routed_rpc_timeline_stage(
+            trace,
+            crate::network_timeline_stage::ENDPOINT_OPEN,
+            open_started_ns,
+            stream_result.is_ok(),
+        );
+        let stream = stream_result?;
         let context = crate::object_rpc_stream::RpcPeerContext::authenticated(
             stream.local_node_id.clone(),
             stream.peer_node_id.clone(),
             stream.session_id.clone(),
             stream.channel_binding,
         )?;
+        let exchange_started_ns = trace
+            .map(|_| crate::network_timeline_monotonic_ns())
+            .unwrap_or(0);
         let result = crate::service_rpc_stream::call_service_rpc_stream(
             stream,
             &context,
@@ -993,7 +1166,14 @@ where
             request_auth,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )
-        .await?;
+        .await;
+        record_routed_rpc_timeline_stage(
+            trace,
+            crate::network_timeline_stage::RPC_EXCHANGE,
+            exchange_started_ns,
+            result.is_ok(),
+        );
+        let result = result?;
         result.response.error_detail()?;
         Ok(result)
     }

@@ -234,8 +234,9 @@ NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_WARMUP_REQUESTS_PER_TA
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-16}"
 NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
 NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
-# Every stream-native service call authenticates a fresh duplex stream. This
-# loaded gate runs sixteen such handshakes concurrently across five targets;
+# Every stream-native service call authenticates a fresh logical duplex stream
+# over a persistent routed carrier. This loaded gate runs sixteen such calls
+# concurrently across five targets;
 # keep its latency ceiling distinct from the tighter, concurrency-one direct
 # and one-forward realtime gates below.
 NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-60000}"

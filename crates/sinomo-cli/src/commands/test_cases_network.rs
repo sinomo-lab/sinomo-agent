@@ -906,12 +906,12 @@ fn run_network_ping_with_defaults(
     let warmup_elapsed = warmup_started.elapsed();
     let warmup_success_count = warmup_results
         .iter()
-        .filter(|result| matches!(result.outcome, NetworkPingOutcome::Success))
+        .filter(|result| matches!(result.outcome, NetworkPingOutcome::Success { .. }))
         .count();
     let warmup_failures = warmup_results
         .iter()
         .filter_map(|result| match &result.outcome {
-            NetworkPingOutcome::Success => None,
+            NetworkPingOutcome::Success { .. } => None,
             NetworkPingOutcome::Failure(detail) => {
                 Some(format!("{}: {}", result.target_node_id, detail))
             }
@@ -971,6 +971,7 @@ fn run_network_ping_with_defaults(
 
     let mut latencies_ms = Vec::new();
     let mut latencies_us = Vec::new();
+    let mut proxy_round_trip_latencies_us = Vec::new();
     let mut failures = Vec::new();
     let mut successes_by_target = BTreeMap::<String, usize>::new();
     let mut failures_by_target = BTreeMap::<String, usize>::new();
@@ -978,9 +979,10 @@ fn run_network_ping_with_defaults(
     let mut latencies_by_target_us = BTreeMap::<String, Vec<u64>>::new();
     for result in &results {
         match &result.outcome {
-            NetworkPingOutcome::Success => {
+            NetworkPingOutcome::Success { .. } => {
                 latencies_ms.push(result.latency_ms);
                 latencies_us.push(result.latency_us);
+                proxy_round_trip_latencies_us.push(result.proxy_round_trip_latency_us);
                 latencies_by_target
                     .entry(result.target_node_id.to_string())
                     .or_default()
@@ -1003,6 +1005,7 @@ fn run_network_ping_with_defaults(
     }
     latencies_ms.sort_unstable();
     latencies_us.sort_unstable();
+    proxy_round_trip_latencies_us.sort_unstable();
     let success_count = latencies_ms.len();
     let failure_count = failures.len();
     let p50_ms = percentile_value(&latencies_ms, 50);
@@ -1013,6 +1016,8 @@ fn run_network_ping_with_defaults(
     let p95_us = percentile_value(&latencies_us, 95);
     let max_us = latencies_us.iter().copied().max().unwrap_or(0);
     let min_us = latencies_us.iter().copied().min().unwrap_or(0);
+    let proxy_round_trip_p50_us = percentile_value(&proxy_round_trip_latencies_us, 50);
+    let proxy_round_trip_p95_us = percentile_value(&proxy_round_trip_latencies_us, 95);
     let slowest_targets_ms = network_ping_slowest_target_summaries(&latencies_by_target, "ms");
     let slowest_targets_us = network_ping_slowest_target_summaries(&latencies_by_target_us, "us");
     let requests_per_second = rate_per_second(success_count as f64, elapsed);
@@ -1117,6 +1122,8 @@ fn run_network_ping_with_defaults(
     ctx.record("latency_p50_us", p50_us);
     ctx.record("latency_p95_us", p95_us);
     ctx.record("latency_max_us", max_us);
+    ctx.record("proxy_round_trip_latency_p50_us", proxy_round_trip_p50_us);
+    ctx.record("proxy_round_trip_latency_p95_us", proxy_round_trip_p95_us);
     ctx.record("successes_by_target", successes_by_target);
     ctx.record("failures_by_target", failures_by_target);
     ctx.record("latency_by_target_ms", latency_by_target_ms);
@@ -2288,12 +2295,13 @@ struct NetworkPingResult {
     target_node_id: NodeId,
     latency_ms: u64,
     latency_us: u64,
+    proxy_round_trip_latency_us: u64,
     outcome: NetworkPingOutcome,
 }
 
 #[derive(Debug)]
 enum NetworkPingOutcome {
-    Success,
+    Success { forward_elapsed: Option<Duration> },
     Failure(String),
 }
 
@@ -2301,11 +2309,22 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     let started = Instant::now();
     let outcome =
         run_network_ping_outcome_with_deadline(job.timeout, run_network_ping_job_inner(&job)).await;
-    let elapsed = started.elapsed();
+    let wall_elapsed = started.elapsed();
+    // The direct and one-relay hardgates constrain the daemon's routed RPC,
+    // not the additional test-client-to-daemon proxy RPC. The full outer call
+    // still executes and its response is validated below; only the latency
+    // sample uses the daemon-measured inner interval.
+    let elapsed = match &outcome {
+        NetworkPingOutcome::Success {
+            forward_elapsed: Some(elapsed),
+        } => *elapsed,
+        _ => wall_elapsed,
+    };
     NetworkPingResult {
         target_node_id: job.target_node_id,
         latency_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
         latency_us: elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+        proxy_round_trip_latency_us: wall_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
         outcome,
     }
 }
@@ -2326,10 +2345,10 @@ async fn run_network_ping_outcome_with_deadline(
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
     let client =
         DaemonApiClient::at_address(job.daemon_address.clone()).with_timeout(job.control_timeout);
-    let (response, response_body) = match job.payload_mode {
+    let (response, response_body, forward_elapsed) = match job.payload_mode {
         NetworkPingPayloadMode::EmbeddedSobj => {
-            let response = match client
-                .object_rpc_to_target_with_deadline_async(
+            let (response, forward_elapsed) = match client
+                .object_rpc_to_target_with_forward_elapsed_async(
                     &job.target_node_id,
                     &job.request,
                     job.timeout,
@@ -2341,7 +2360,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
                 Ok(response) => response,
                 Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
             };
-            (response, None)
+            (response, None, Some(forward_elapsed))
         }
         NetworkPingPayloadMode::SemanticAttachment => {
             let request_attachment_bytes = match u64::try_from(job.request_payload_bytes) {
@@ -2369,7 +2388,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
                 Ok(result) => result,
                 Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
             };
-            (result.response, Some(result.body))
+            (result.response, Some(result.body), None)
         }
     };
     if let Err(error) = response.error_detail() {
@@ -2476,7 +2495,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
             }
         }
     }
-    NetworkPingOutcome::Success
+    NetworkPingOutcome::Success { forward_elapsed }
 }
 
 fn optional_usize_parameter(

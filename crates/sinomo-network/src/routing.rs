@@ -243,7 +243,6 @@ const ROUTED_SESSION_WIRE_PREFIX: [u8; 4] = *b"SRT1";
 const ROUTED_SESSION_OPEN_FRAME: u8 = 1;
 const ROUTED_SESSION_ACCEPT_FRAME: u8 = 2;
 const MAX_ROUTED_SESSION_FRAME_BYTES: usize = 64 * 1024;
-const ROUTED_SESSION_CRYPTO_PIPE_BYTES: usize = 256 * 1024;
 const ROUTED_SESSION_DATA_FRAME_BYTES: usize = 64 * 1024;
 const ROUTED_SESSION_RELAY_BUFFER_BYTES: usize = 64 * 1024;
 const ROUTED_SESSION_DATA_WIRE_PREFIX: [u8; 4] = *b"SRE1";
@@ -514,144 +513,463 @@ fn routed_session_data_io(operation: &str, detail: impl std::fmt::Display) -> st
     std::io::Error::other(format!("{operation}: {detail}"))
 }
 
-async fn encrypt_routed_session_data<R, W>(
-    mut plaintext: R,
-    mut ciphertext: W,
-    key: [u8; 32],
+struct EncryptedRoutedSessionStream {
+    io: Option<BoxedNetworkStream>,
+    sealing_key: ring::aead::LessSafeKey,
+    opening_key: ring::aead::LessSafeKey,
     session_id: Id,
     channel_binding: [u8; 32],
-    direction: u8,
-) -> Result<(), std::io::Error>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let unbound = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &key)
-        .map_err(|_| routed_session_data_io("create routed-session sealing key", "invalid key"))?;
-    let key = ring::aead::LessSafeKey::new(unbound);
-    let mut sequence = 0_u64;
-    let max_sealed_bytes =
-        ROUTED_SESSION_DATA_FRAME_BYTES.saturating_add(ring::aead::CHACHA20_POLY1305.tag_len());
-    let mut frame = vec![0_u8; max_sealed_bytes];
-    loop {
-        let read = plaintext
-            .read(&mut frame[..ROUTED_SESSION_DATA_FRAME_BYTES])
-            .await?;
-        let plaintext_bytes = u32::try_from(read).expect("bounded routed data frame");
-        let aad = routed_session_data_aad(
-            &session_id,
-            &channel_binding,
-            direction,
-            sequence,
-            plaintext_bytes,
-        );
-        frame.truncate(read);
-        key.seal_in_place_append_tag(
-            routed_session_data_nonce(direction, sequence),
-            ring::aead::Aad::from(aad),
-            &mut frame,
-        )
-        .map_err(|_| routed_session_data_io("encrypt routed-session data", "AEAD failure"))?;
-        let mut header = [0_u8; 16];
-        header[..4].copy_from_slice(&ROUTED_SESSION_DATA_WIRE_PREFIX);
-        header[4..12].copy_from_slice(&sequence.to_be_bytes());
-        header[12..].copy_from_slice(&plaintext_bytes.to_be_bytes());
-        ciphertext.write_all(&header).await?;
-        ciphertext.write_all(&frame).await?;
-        if read == 0 {
-            ciphertext.shutdown().await?;
-            return Ok(());
-        }
-        frame.resize(max_sealed_bytes, 0);
-        sequence = sequence.checked_add(1).ok_or_else(|| {
-            routed_session_data_io("encrypt routed-session data", "sequence exhausted")
-        })?;
-    }
+    outgoing_direction: u8,
+    incoming_direction: u8,
+    outgoing_sequence: u64,
+    incoming_sequence: u64,
+    outgoing_wire: Vec<u8>,
+    outgoing_offset: usize,
+    outgoing_final_queued: bool,
+    write_closed: bool,
+    incoming_header: [u8; 16],
+    incoming_header_filled: usize,
+    incoming_ciphertext: Vec<u8>,
+    incoming_ciphertext_filled: usize,
+    incoming_plaintext_bytes: Option<usize>,
+    incoming_plaintext: Vec<u8>,
+    incoming_plaintext_offset: usize,
+    read_closed: bool,
 }
 
-async fn decrypt_routed_session_data<R, W>(
-    mut ciphertext: R,
-    mut plaintext: W,
-    key: [u8; 32],
-    session_id: Id,
-    channel_binding: [u8; 32],
-    direction: u8,
-) -> Result<(), std::io::Error>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let unbound = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &key)
-        .map_err(|_| routed_session_data_io("create routed-session opening key", "invalid key"))?;
-    let key = ring::aead::LessSafeKey::new(unbound);
-    let mut expected_sequence = 0_u64;
-    let mut frame = vec![
-        0_u8;
-        ROUTED_SESSION_DATA_FRAME_BYTES
-            .saturating_add(ring::aead::CHACHA20_POLY1305.tag_len())
-    ];
-    loop {
-        let mut header = [0_u8; 16];
-        let first = ciphertext.read(&mut header[..1]).await?;
-        if first == 0 {
-            return Err(routed_session_data_io(
-                "decrypt routed-session data",
-                "missing authenticated final frame",
-            ));
+impl EncryptedRoutedSessionStream {
+    fn new(
+        io: BoxedNetworkStream,
+        outgoing_key: [u8; 32],
+        incoming_key: [u8; 32],
+        session_id: Id,
+        channel_binding: [u8; 32],
+        outgoing_direction: u8,
+        incoming_direction: u8,
+    ) -> Self {
+        let sealing_key =
+            ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &outgoing_key)
+                .expect("derived routed-session sealing key has the algorithm key length");
+        let opening_key =
+            ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &incoming_key)
+                .expect("derived routed-session opening key has the algorithm key length");
+        Self {
+            io: Some(io),
+            sealing_key: ring::aead::LessSafeKey::new(sealing_key),
+            opening_key: ring::aead::LessSafeKey::new(opening_key),
+            session_id,
+            channel_binding,
+            outgoing_direction,
+            incoming_direction,
+            outgoing_sequence: 0,
+            incoming_sequence: 0,
+            outgoing_wire: Vec::with_capacity(
+                16_usize
+                    .saturating_add(ROUTED_SESSION_DATA_FRAME_BYTES)
+                    .saturating_add(ring::aead::CHACHA20_POLY1305.tag_len()),
+            ),
+            outgoing_offset: 0,
+            outgoing_final_queued: false,
+            write_closed: false,
+            incoming_header: [0; 16],
+            incoming_header_filled: 0,
+            incoming_ciphertext: Vec::new(),
+            incoming_ciphertext_filled: 0,
+            incoming_plaintext_bytes: None,
+            incoming_plaintext: Vec::new(),
+            incoming_plaintext_offset: 0,
+            read_closed: false,
         }
-        ciphertext.read_exact(&mut header[1..]).await?;
-        if header[..4] != ROUTED_SESSION_DATA_WIRE_PREFIX {
+    }
+
+    fn queue_outgoing_frame(&mut self, plaintext: &[u8]) -> Result<(), std::io::Error> {
+        debug_assert_eq!(self.outgoing_offset, self.outgoing_wire.len());
+        let plaintext_bytes = u32::try_from(plaintext.len()).map_err(|_| {
+            routed_session_data_io("encrypt routed-session data", "oversized frame")
+        })?;
+        let aad = routed_session_data_aad(
+            &self.session_id,
+            &self.channel_binding,
+            self.outgoing_direction,
+            self.outgoing_sequence,
+            plaintext_bytes,
+        );
+        let mut ciphertext = Vec::with_capacity(
+            plaintext
+                .len()
+                .saturating_add(ring::aead::CHACHA20_POLY1305.tag_len()),
+        );
+        ciphertext.extend_from_slice(plaintext);
+        self.sealing_key
+            .seal_in_place_append_tag(
+                routed_session_data_nonce(self.outgoing_direction, self.outgoing_sequence),
+                ring::aead::Aad::from(aad),
+                &mut ciphertext,
+            )
+            .map_err(|_| routed_session_data_io("encrypt routed-session data", "AEAD failure"))?;
+        self.outgoing_wire.clear();
+        self.outgoing_wire
+            .extend_from_slice(&ROUTED_SESSION_DATA_WIRE_PREFIX);
+        self.outgoing_wire
+            .extend_from_slice(&self.outgoing_sequence.to_be_bytes());
+        self.outgoing_wire
+            .extend_from_slice(&plaintext_bytes.to_be_bytes());
+        self.outgoing_wire.extend_from_slice(&ciphertext);
+        self.outgoing_offset = 0;
+        if plaintext.is_empty() {
+            self.outgoing_final_queued = true;
+        } else {
+            self.outgoing_sequence = self.outgoing_sequence.checked_add(1).ok_or_else(|| {
+                routed_session_data_io("encrypt routed-session data", "sequence exhausted")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn poll_drain_outgoing(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        while self.outgoing_offset < self.outgoing_wire.len() {
+            let Self {
+                io,
+                outgoing_wire,
+                outgoing_offset,
+                ..
+            } = self;
+            let io = io.as_mut().expect("encrypted routed-session transport");
+            match Pin::new(&mut **io).poll_write(context, &outgoing_wire[*outgoing_offset..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(routed_session_data_io(
+                        "write encrypted routed-session data",
+                        "write returned zero bytes",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => *outgoing_offset += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.outgoing_wire.clear();
+        self.outgoing_offset = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_fill_incoming_header(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        while self.incoming_header_filled < self.incoming_header.len() {
+            let Self {
+                io,
+                incoming_header,
+                incoming_header_filled,
+                ..
+            } = self;
+            let io = io.as_mut().expect("encrypted routed-session transport");
+            let mut buffer = ReadBuf::new(&mut incoming_header[*incoming_header_filled..]);
+            match Pin::new(&mut **io).poll_read(context, &mut buffer) {
+                Poll::Ready(Ok(())) => {
+                    let read = buffer.filled().len();
+                    if read == 0 {
+                        return Poll::Ready(Err(routed_session_data_io(
+                            "decrypt routed-session data",
+                            "missing authenticated final frame",
+                        )));
+                    }
+                    *incoming_header_filled += read;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn prepare_incoming_ciphertext(&mut self) -> Result<(), std::io::Error> {
+        if self.incoming_plaintext_bytes.is_some() {
+            return Ok(());
+        }
+        if self.incoming_header[..4] != ROUTED_SESSION_DATA_WIRE_PREFIX {
             return Err(routed_session_data_io(
                 "decrypt routed-session data",
                 "invalid frame prefix",
             ));
         }
         let sequence = u64::from_be_bytes(
-            header[4..12]
+            self.incoming_header[4..12]
                 .try_into()
                 .expect("routed data sequence header"),
         );
-        if sequence != expected_sequence {
+        if sequence != self.incoming_sequence {
             return Err(routed_session_data_io(
                 "decrypt routed-session data",
                 "non-monotonic frame sequence",
             ));
         }
-        let plaintext_bytes =
-            u32::from_be_bytes(header[12..].try_into().expect("routed data length header"));
-        let plaintext_len = usize::try_from(plaintext_bytes).expect("u32 fits usize");
-        if plaintext_len > ROUTED_SESSION_DATA_FRAME_BYTES {
+        let plaintext_bytes = u32::from_be_bytes(
+            self.incoming_header[12..]
+                .try_into()
+                .expect("routed data length header"),
+        );
+        let plaintext_bytes = usize::try_from(plaintext_bytes).expect("u32 fits usize");
+        if plaintext_bytes > ROUTED_SESSION_DATA_FRAME_BYTES {
             return Err(routed_session_data_io(
                 "decrypt routed-session data",
                 "oversized encrypted frame",
             ));
         }
-        let frame_len = plaintext_len.saturating_add(ring::aead::CHACHA20_POLY1305.tag_len());
-        ciphertext.read_exact(&mut frame[..frame_len]).await?;
-        let aad = routed_session_data_aad(
-            &session_id,
-            &channel_binding,
-            direction,
-            sequence,
-            plaintext_bytes,
+        self.incoming_ciphertext.resize(
+            plaintext_bytes.saturating_add(ring::aead::CHACHA20_POLY1305.tag_len()),
+            0,
         );
-        let opened = key
+        self.incoming_ciphertext_filled = 0;
+        self.incoming_plaintext_bytes = Some(plaintext_bytes);
+        Ok(())
+    }
+
+    fn poll_fill_incoming_ciphertext(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        while self.incoming_ciphertext_filled < self.incoming_ciphertext.len() {
+            let Self {
+                io,
+                incoming_ciphertext,
+                incoming_ciphertext_filled,
+                ..
+            } = self;
+            let io = io.as_mut().expect("encrypted routed-session transport");
+            let mut buffer = ReadBuf::new(&mut incoming_ciphertext[*incoming_ciphertext_filled..]);
+            match Pin::new(&mut **io).poll_read(context, &mut buffer) {
+                Poll::Ready(Ok(())) => {
+                    let read = buffer.filled().len();
+                    if read == 0 {
+                        return Poll::Ready(Err(routed_session_data_io(
+                            "decrypt routed-session data",
+                            "truncated encrypted frame",
+                        )));
+                    }
+                    *incoming_ciphertext_filled += read;
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn open_incoming_frame(&mut self) -> Result<(), std::io::Error> {
+        let plaintext_bytes = self
+            .incoming_plaintext_bytes
+            .take()
+            .expect("prepared routed-session ciphertext length");
+        let plaintext_bytes_u32 = u32::try_from(plaintext_bytes).expect("bounded plaintext length");
+        let aad = routed_session_data_aad(
+            &self.session_id,
+            &self.channel_binding,
+            self.incoming_direction,
+            self.incoming_sequence,
+            plaintext_bytes_u32,
+        );
+        self.opening_key
             .open_in_place(
-                routed_session_data_nonce(direction, sequence),
+                routed_session_data_nonce(self.incoming_direction, self.incoming_sequence),
                 ring::aead::Aad::from(aad),
-                &mut frame[..frame_len],
+                &mut self.incoming_ciphertext,
             )
             .map_err(|_| {
                 routed_session_data_io("decrypt routed-session data", "authentication failed")
             })?;
-        if plaintext_len == 0 {
-            plaintext.shutdown().await?;
+        self.incoming_header_filled = 0;
+        self.incoming_ciphertext_filled = 0;
+        if plaintext_bytes == 0 {
+            self.incoming_ciphertext.clear();
+            self.read_closed = true;
             return Ok(());
         }
-        plaintext.write_all(opened).await?;
-        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+        self.incoming_sequence = self.incoming_sequence.checked_add(1).ok_or_else(|| {
             routed_session_data_io("decrypt routed-session data", "sequence exhausted")
         })?;
+        self.incoming_ciphertext.truncate(plaintext_bytes);
+        self.incoming_plaintext = std::mem::take(&mut self.incoming_ciphertext);
+        self.incoming_plaintext_offset = 0;
+        Ok(())
+    }
+}
+
+impl AsyncRead for EncryptedRoutedSessionStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if self.incoming_plaintext_offset < self.incoming_plaintext.len() {
+                let available = &self.incoming_plaintext[self.incoming_plaintext_offset..];
+                let copied = available.len().min(buffer.remaining());
+                buffer.put_slice(&available[..copied]);
+                self.incoming_plaintext_offset += copied;
+                if self.incoming_plaintext_offset == self.incoming_plaintext.len() {
+                    self.incoming_plaintext.clear();
+                    self.incoming_plaintext_offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if self.read_closed {
+                return Poll::Ready(Ok(()));
+            }
+            match self.poll_fill_incoming_header(context) {
+                Poll::Ready(Ok(())) => {}
+                other => return other,
+            }
+            if let Err(error) = self.prepare_incoming_ciphertext() {
+                return Poll::Ready(Err(error));
+            }
+            match self.poll_fill_incoming_ciphertext(context) {
+                Poll::Ready(Ok(())) => {}
+                other => return other,
+            }
+            if let Err(error) = self.open_incoming_frame() {
+                return Poll::Ready(Err(error));
+            }
+        }
+    }
+}
+
+impl AsyncWrite for EncryptedRoutedSessionStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if self.write_closed || self.outgoing_final_queued {
+            return Poll::Ready(Err(routed_session_data_io(
+                "encrypt routed-session data",
+                "write direction is closed",
+            )));
+        }
+        match self.poll_drain_outgoing(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if buffer.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let written = buffer.len().min(ROUTED_SESSION_DATA_FRAME_BYTES);
+        if let Err(error) = self.queue_outgoing_frame(&buffer[..written]) {
+            return Poll::Ready(Err(error));
+        }
+        match self.poll_drain_outgoing(context) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(written)),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.poll_drain_outgoing(context) {
+            Poll::Ready(Ok(())) => Pin::new(
+                &mut **self
+                    .io
+                    .as_mut()
+                    .expect("encrypted routed-session transport"),
+            )
+            .poll_flush(context),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if self.write_closed {
+            return Poll::Ready(Ok(()));
+        }
+        match self.poll_drain_outgoing(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error))
+                if self.outgoing_final_queued
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                self.write_closed = true;
+                return Poll::Ready(Ok(()));
+            }
+            other => return other,
+        }
+        if !self.outgoing_final_queued {
+            if let Err(error) = self.queue_outgoing_frame(&[]) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        match self.poll_drain_outgoing(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                self.write_closed = true;
+                return Poll::Ready(Ok(()));
+            }
+            other => return other,
+        }
+        match Pin::new(
+            &mut **self
+                .io
+                .as_mut()
+                .expect("encrypted routed-session transport"),
+        )
+        .poll_shutdown(context)
+        {
+            Poll::Ready(Ok(())) => {
+                self.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                self.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for EncryptedRoutedSessionStream {
+    fn drop(&mut self) {
+        if self.read_closed {
+            return;
+        }
+        let Some(mut io) = self.io.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // A caller may finish its write half after receiving its application
+        // response and then drop without reading the peer's authenticated
+        // final frame. Keep draining the already-authorized routed carrier so
+        // relays can observe an orderly EOF instead of an artificial reset.
+        runtime.spawn(async move {
+            let _ = io.shutdown().await;
+            let _ = tokio::io::copy(&mut io, &mut tokio::io::sink()).await;
+        });
     }
 }
 
@@ -662,38 +980,21 @@ fn encrypted_routed_session_stream(
     channel_binding: [u8; 32],
     source_side: bool,
 ) -> BoxedNetworkStream {
-    let (application, crypto) = tokio::io::duplex(ROUTED_SESSION_CRYPTO_PIPE_BYTES);
-    let (application_read, application_write) = tokio::io::split(crypto);
-    let (network_read, network_write) = tokio::io::split(io);
     let outgoing_direction = if source_side { 0 } else { 1 };
     let incoming_direction = if source_side { 1 } else { 0 };
     let outgoing_key =
         routed_session_data_key(&shared_secret, &channel_binding, outgoing_direction);
     let incoming_key =
         routed_session_data_key(&shared_secret, &channel_binding, incoming_direction);
-    let outgoing_session_id = session_id.clone();
-    tokio::spawn(async move {
-        let outgoing = encrypt_routed_session_data(
-            application_read,
-            network_write,
-            outgoing_key,
-            outgoing_session_id,
-            channel_binding,
-            outgoing_direction,
-        );
-        let incoming = decrypt_routed_session_data(
-            network_read,
-            application_write,
-            incoming_key,
-            session_id,
-            channel_binding,
-            incoming_direction,
-        );
-        if let Err(error) = tokio::try_join!(outgoing, incoming) {
-            tracing::debug!(%error, "encrypted routed-session stream stopped");
-        }
-    });
-    Box::new(application)
+    Box::new(EncryptedRoutedSessionStream::new(
+        io,
+        outgoing_key,
+        incoming_key,
+        session_id,
+        channel_binding,
+        outgoing_direction,
+        incoming_direction,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2404,7 +2705,14 @@ mod tests {
             buf: &[u8],
         ) -> Poll<Result<usize, std::io::Error>> {
             let mut altered = Vec::new();
-            let write = if self.encrypted_payload_pending
+            let write = if buf.starts_with(&ROUTED_SESSION_DATA_WIRE_PREFIX)
+                && buf.len() > 16
+                && self.tamper_next_data_frame.swap(false, Ordering::SeqCst)
+            {
+                altered.extend_from_slice(buf);
+                altered[16] ^= 1;
+                &altered[..]
+            } else if self.encrypted_payload_pending
                 && self.tamper_next_data_frame.swap(false, Ordering::SeqCst)
                 && !buf.is_empty()
             {
@@ -2418,7 +2726,8 @@ mod tests {
                 Poll::Ready(Ok(written)) => {
                     if self.encrypted_payload_pending && written > 0 {
                         self.encrypted_payload_pending = false;
-                    } else if written == buf.len()
+                    } else if written == 16
+                        && buf.len() == 16
                         && buf.starts_with(&ROUTED_SESSION_DATA_WIRE_PREFIX)
                     {
                         self.encrypted_payload_pending = true;

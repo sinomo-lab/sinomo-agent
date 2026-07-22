@@ -30,7 +30,10 @@ pub mod network_timeline_stage {
     pub const FORWARD_DECODE: u16 = 15;
     pub const FORWARD_ENCODE: u16 = 16;
     pub const REQUEST_SIGN: u16 = 19;
+    pub const ROUTE_SNAPSHOT: u16 = 20;
     pub const ENDPOINT_OPEN: u16 = 21;
+    pub const ROUTE_PREPARE: u16 = 22;
+    pub const RPC_EXCHANGE: u16 = 23;
     pub const FRAME_READ: u16 = 27;
     pub const FRAME_SOCKET_WRITE: u16 = 29;
 }
@@ -49,7 +52,10 @@ pub const fn network_timeline_stage_name(stage: u16) -> &'static str {
         network_timeline_stage::FORWARD_DECODE => "forward.decode",
         network_timeline_stage::FORWARD_ENCODE => "forward.encode",
         network_timeline_stage::REQUEST_SIGN => "auth.request-sign",
+        network_timeline_stage::ROUTE_SNAPSHOT => "route.snapshot",
         network_timeline_stage::ENDPOINT_OPEN => "route.endpoint-open",
+        network_timeline_stage::ROUTE_PREPARE => "route.prepare",
+        network_timeline_stage::RPC_EXCHANGE => "rpc.exchange",
         network_timeline_stage::FRAME_READ => "frame.read",
         network_timeline_stage::FRAME_SOCKET_WRITE => "frame.socket-write",
         _ => "unknown",

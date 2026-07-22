@@ -195,6 +195,7 @@ pub(crate) async fn forward_object_rpc_call_from_daemon_control(
     // the outer daemon-forward proof into the inner object-RPC call (or vice
     // versa).
     let call = ObjectRpcCall::from_forwarded_body(payload.request, request_body);
+    let forward_started = std::time::Instant::now();
     match crate::client::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
         paths,
         &payload.target_node_id,
@@ -212,13 +213,27 @@ pub(crate) async fn forward_object_rpc_call_from_daemon_control(
             // attachment of the proxy envelope.
             let (response, _) = result.into_parts();
             Ok((
-                crate::DaemonObjectRpcForwardResponse::Success { response },
+                crate::DaemonObjectRpcForwardResponse::Success {
+                    response,
+                    forward_elapsed_micros: forward_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX))
+                        as u64,
+                },
                 ObjectRpcBodySource::empty(),
             ))
         }
         Ok(result) => match result.into_forwarded_response() {
             Ok(ObjectRpcOutgoingResponse { response, body }) => Ok((
-                crate::DaemonObjectRpcForwardResponse::Success { response },
+                crate::DaemonObjectRpcForwardResponse::Success {
+                    response,
+                    forward_elapsed_micros: forward_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX))
+                        as u64,
+                },
                 body,
             )),
             Err(error) => Ok((
@@ -11403,7 +11418,7 @@ mod tests {
                 .response
                 .decode_body()
                 .expect("forward response envelope");
-            let crate::DaemonObjectRpcForwardResponse::Success { response } = envelope else {
+            let crate::DaemonObjectRpcForwardResponse::Success { response, .. } = envelope else {
                 panic!(
                     "forward returned a network error: {envelope:?}; local={local_node} target={target_node}"
                 );

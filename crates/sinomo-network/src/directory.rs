@@ -274,6 +274,14 @@ pub trait ClusterDirectory: Send + Sync {
     /// invalidation.
     fn version(&self) -> Result<DirectoryVersion, NetworkError>;
 
+    /// Monotonic generation of route-relevant membership, endpoint,
+    /// capability, and connectivity inputs. Transactional providers should
+    /// keep this stable across unrelated KV revisions so active carriers and
+    /// prepared route state are not discarded by application writes.
+    fn routing_version(&self) -> Result<DirectoryVersion, NetworkError> {
+        self.version()
+    }
+
     /// Captures raw membership and endpoint records from one directory
     /// generation.
     ///
@@ -375,6 +383,19 @@ struct BootstrapAwareClusterDirectory {
 }
 
 impl BootstrapAwareClusterDirectory {
+    fn routing_merge_version(&self, inner: DirectoryVersion) -> DirectoryVersion {
+        // The bootstrap revision is a safe generation only before the
+        // route-specific KV projection exists. Once the provider exposes a
+        // nonzero routing generation, replacing it with the full cluster KV
+        // revision would invalidate routes for every unrelated application
+        // write and defeat persistent carrier reuse.
+        if inner.0 == 0 {
+            inner.max(self.bootstrap_version)
+        } else {
+            inner
+        }
+    }
+
     fn merge_records(
         &self,
         version: DirectoryVersion,
@@ -453,6 +474,10 @@ impl ClusterDirectory for BootstrapAwareClusterDirectory {
         Ok(self.inner.version()?.max(self.bootstrap_version))
     }
 
+    fn routing_version(&self) -> Result<DirectoryVersion, NetworkError> {
+        Ok(self.routing_merge_version(self.inner.routing_version()?))
+    }
+
     fn records_snapshot(&self) -> Result<DirectoryRecordsSnapshot, NetworkError> {
         let (version, members, endpoints) = self.records()?;
         Ok(DirectoryRecordsSnapshot::new(version, members, endpoints))
@@ -461,9 +486,10 @@ impl ClusterDirectory for BootstrapAwareClusterDirectory {
     fn routing_records_snapshot(&self) -> Result<DirectoryRoutingRecordsSnapshot, NetworkError> {
         let (version, members, endpoints, connectivity_records) =
             self.inner.routing_records_snapshot()?.into_parts();
-        let (version, members, endpoints) = self.merge_records(version, members, endpoints);
+        let routing_version = self.routing_merge_version(version);
+        let (_, members, endpoints) = self.merge_records(version, members, endpoints);
         Ok(DirectoryRoutingRecordsSnapshot::new(
-            version,
+            routing_version,
             members,
             endpoints,
             connectivity_records,
@@ -606,6 +632,10 @@ mod tests {
             panic!("transactional routing version must not be read separately")
         }
 
+        fn routing_version(&self) -> Result<DirectoryVersion, NetworkError> {
+            Ok(self.0.version)
+        }
+
         fn routing_records_snapshot(
             &self,
         ) -> Result<DirectoryRoutingRecordsSnapshot, NetworkError> {
@@ -730,6 +760,94 @@ mod tests {
                 .any(|member| member.node_id == target.node_id)
         );
         assert!(connectivity.is_empty());
+    }
+
+    #[test]
+    fn materialized_routing_generation_ignores_unrelated_bootstrap_revision() {
+        let cluster_id = id("directory-materialized-routing-cluster");
+        let local = member(
+            &cluster_id,
+            "directory-materialized-routing-local",
+            "local-key",
+        );
+        let mut state = bootstrap_state(99, vec![local.clone()]);
+        let directory = cluster_directory_with_bootstrap_state(
+            Arc::new(TransactionalRoutingOnlyDirectory(
+                DirectoryRoutingRecordsSnapshot::new(
+                    DirectoryVersion(7),
+                    vec![local],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )),
+            &state,
+        );
+
+        assert_eq!(
+            directory.routing_version().expect("routing version"),
+            DirectoryVersion(7)
+        );
+        assert_eq!(
+            directory
+                .routing_records_snapshot()
+                .expect("routing snapshot")
+                .version,
+            DirectoryVersion(7)
+        );
+
+        state.kv_revision = 100;
+        let refreshed = cluster_directory_with_bootstrap_state(
+            Arc::new(TransactionalRoutingOnlyDirectory(
+                DirectoryRoutingRecordsSnapshot::new(
+                    DirectoryVersion(7),
+                    state.members.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )),
+            &state,
+        );
+        assert_eq!(
+            refreshed.routing_version().expect("stable routing version"),
+            DirectoryVersion(7),
+            "an unrelated cluster KV revision must not invalidate routing"
+        );
+    }
+
+    #[test]
+    fn bootstrap_revision_versions_routes_until_projection_materializes() {
+        let cluster_id = id("directory-bootstrap-routing-cluster");
+        let local = member(
+            &cluster_id,
+            "directory-bootstrap-routing-local",
+            "local-key",
+        );
+        let state = bootstrap_state(11, vec![local]);
+        let directory = cluster_directory_with_bootstrap_state(
+            Arc::new(TransactionalRoutingOnlyDirectory(
+                DirectoryRoutingRecordsSnapshot::new(
+                    DirectoryVersion(0),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )),
+            &state,
+        );
+
+        assert_eq!(
+            directory
+                .routing_version()
+                .expect("bootstrap routing version"),
+            DirectoryVersion(11)
+        );
+        assert_eq!(
+            directory
+                .routing_records_snapshot()
+                .expect("bootstrap routing snapshot")
+                .version,
+            DirectoryVersion(11)
+        );
     }
 
     #[test]

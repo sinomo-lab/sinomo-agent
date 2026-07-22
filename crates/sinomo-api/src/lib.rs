@@ -180,6 +180,10 @@ pub enum DaemonObjectRpcForwardDeliveryState {
 pub enum DaemonObjectRpcForwardResponse {
     Success {
         response: sinomo_core::network::ObjectRpcResponse,
+        /// Time spent inside the daemon on the routed object-RPC call. This
+        /// excludes the caller-to-daemon loopback proxy RPC.
+        #[serde(default)]
+        forward_elapsed_micros: u64,
     },
     NetworkError {
         detail: String,

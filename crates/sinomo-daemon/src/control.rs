@@ -2788,6 +2788,16 @@ pub(crate) async fn handle_daemon_connection_async(
         )
         .await;
     }
+    if daemon_control_stream_uses_local_object_rpc_carrier(&stream).await? {
+        return handle_daemon_local_object_rpc_carrier_async(
+            stream,
+            paths,
+            service_host,
+            service_runtime,
+            stream_address,
+        )
+        .await;
+    }
     if daemon_control_stream_uses_object_rpc_call(&stream).await? {
         return handle_daemon_object_rpc_call_async(
             stream,
@@ -3135,71 +3145,31 @@ async fn handle_daemon_routed_stream_carrier_async(
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
 ) -> Result<bool, DaemonError> {
-    let mut acceptor = sinomo_core::network::accept_routed_stream_carrier(carrier);
-    let mut handlers = tokio::task::JoinSet::new();
-    let mut carrier_open = true;
-    while carrier_open || !handlers.is_empty() {
-        if !carrier_open {
-            let Some(joined) = handlers.join_next().await else {
-                break;
-            };
-            match joined {
-                Ok(Ok(true)) => return Ok(true),
-                Ok(Ok(false)) => continue,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "routed logical service RPC failed");
-                    continue;
-                }
+    sinomo_core::network::serve_routed_stream_carrier(carrier, move |stream| {
+        let handler_directory = directory.clone();
+        let handler_paths = paths.clone();
+        let handler_host = service_host.clone();
+        let handler_runtime = service_runtime.clone();
+        async move {
+            match handle_daemon_stream_native_service_rpc_async(
+                stream,
+                handler_directory,
+                handler_paths,
+                handler_host,
+                handler_runtime,
+            )
+            .await
+            {
+                Ok(stop) => Ok(stop),
                 Err(error) => {
-                    tracing::warn!(%error, "routed logical service RPC task failed");
-                    continue;
+                    tracing::warn!(%error, "routed logical service RPC failed");
+                    Ok(false)
                 }
             }
         }
-
-        tokio::select! {
-            accepted = acceptor.accept() => {
-                match accepted? {
-                    Some(stream) => {
-                        let handler_directory = directory.clone();
-                        let handler_paths = paths.clone();
-                        let handler_host = service_host.clone();
-                        let handler_runtime = service_runtime.clone();
-                        handlers.spawn(async move {
-                            handle_daemon_stream_native_service_rpc_async(
-                                stream,
-                                handler_directory,
-                                handler_paths,
-                                handler_host,
-                                handler_runtime,
-                            )
-                            .await
-                        });
-                    }
-                    None => carrier_open = false,
-                }
-            }
-            joined = handlers.join_next(), if !handlers.is_empty() => {
-                let Some(joined) = joined else {
-                    continue;
-                };
-                match joined {
-                    Ok(Ok(true)) => {
-                        handlers.abort_all();
-                        return Ok(true);
-                    }
-                    Ok(Ok(false)) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "routed logical service RPC failed");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "routed logical service RPC task failed");
-                    }
-                }
-            }
-        }
-    }
-    Ok(false)
+    })
+    .await
+    .map_err(DaemonError::from)
 }
 
 async fn daemon_control_stream_uses_object_rpc_call(
@@ -3235,6 +3205,82 @@ async fn daemon_control_stream_uses_object_rpc_call(
     }
 }
 
+async fn daemon_control_stream_uses_local_object_rpc_carrier(
+    stream: &sinomo_core::network::AsyncDaemonControlStream,
+) -> Result<bool, DaemonError> {
+    let mut prefix = [0_u8; 4];
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let available = tokio::time::timeout_at(deadline, stream.peek_prefix(&mut prefix))
+            .await
+            .map_err(|_| {
+                DaemonError::from(sinomo_core::network::NetworkError::timeout(
+                    "peek daemon local object RPC carrier protocol",
+                    sinomo_core::network::NetworkTimeoutPhase::Idle,
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                ))
+            })??;
+        if available == 0 {
+            return Ok(false);
+        }
+        if available >= prefix.len() {
+            return Ok(
+                sinomo_core::network::local_object_rpc_carrier_prelude_prefix_matches(&prefix),
+            );
+        }
+        if !sinomo_core::network::local_object_rpc_carrier_prelude_prefix_matches(
+            &prefix[..available],
+        ) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn handle_daemon_local_object_rpc_carrier_async(
+    stream: sinomo_core::network::AsyncDaemonControlStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    stream_address: String,
+) -> Result<bool, DaemonError> {
+    if !stream.peer_addr()?.ip().is_loopback() {
+        return Err(DaemonError::AuthDenied);
+    }
+    let mut stream = stream.into_inner();
+    let context = sinomo_core::network::read_local_object_rpc_carrier_prelude(&mut stream).await?;
+    sinomo_core::network::serve_local_object_rpc_stream_carrier(
+        Box::new(stream),
+        &context,
+        move |stream| {
+            let handler_paths = paths.clone();
+            let handler_host = service_host.clone();
+            let handler_runtime = service_runtime.clone();
+            let handler_address = stream_address.clone();
+            async move {
+                match handle_daemon_pooled_local_stream_native_service_rpc_async(
+                    stream,
+                    handler_paths,
+                    handler_host,
+                    handler_runtime,
+                    handler_address,
+                )
+                .await
+                {
+                    Ok(stop) => Ok(stop),
+                    Err(error) => {
+                        tracing::warn!(%error, "local logical service RPC failed");
+                        Ok(false)
+                    }
+                }
+            }
+        },
+    )
+    .await
+    .map_err(DaemonError::from)
+}
+
 async fn handle_daemon_object_rpc_call_async(
     stream: sinomo_core::network::AsyncDaemonControlStream,
     paths: DaemonPaths,
@@ -3242,8 +3288,11 @@ async fn handle_daemon_object_rpc_call_async(
     service_runtime: tokio::runtime::Handle,
     stream_address: String,
 ) -> Result<bool, DaemonError> {
+    if !stream.peer_addr()?.ip().is_loopback() {
+        return Err(DaemonError::AuthDenied);
+    }
     handle_daemon_local_stream_native_service_rpc_async(
-        stream.into_inner(),
+        Box::new(stream.into_inner()),
         paths,
         service_host,
         service_runtime,
@@ -3253,19 +3302,54 @@ async fn handle_daemon_object_rpc_call_async(
 }
 
 async fn handle_daemon_local_stream_native_service_rpc_async(
-    mut stream: tokio::net::TcpStream,
+    mut stream: sinomo_core::network::BoxedNetworkStream,
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
     _stream_address: String,
 ) -> Result<bool, DaemonError> {
-    if !stream
-        .peer_addr()
-        .is_ok_and(|address| address.ip().is_loopback())
-    {
-        return Err(DaemonError::AuthDenied);
-    }
     let context = sinomo_core::network::read_local_object_rpc_stream_prelude(&mut stream).await?;
+    handle_daemon_local_stream_native_service_rpc_with_context_async(
+        stream,
+        context,
+        paths,
+        service_host,
+        service_runtime,
+        _stream_address,
+    )
+    .await
+}
+
+async fn handle_daemon_pooled_local_stream_native_service_rpc_async(
+    stream: sinomo_core::network::PeerStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    stream_address: String,
+) -> Result<bool, DaemonError> {
+    let context = sinomo_core::network::RpcPeerContext::unauthenticated_local(
+        stream.session_id.clone(),
+        stream.channel_binding,
+    );
+    handle_daemon_local_stream_native_service_rpc_with_context_async(
+        stream.into_inner(),
+        context,
+        paths,
+        service_host,
+        service_runtime,
+        stream_address,
+    )
+    .await
+}
+
+async fn handle_daemon_local_stream_native_service_rpc_with_context_async(
+    stream: sinomo_core::network::BoxedNetworkStream,
+    context: sinomo_core::network::RpcPeerContext,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+    _stream_address: String,
+) -> Result<bool, DaemonError> {
     let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
     let local_public_key = sinomo_core::network::cached_daemon_signing_public_key(&data_dir)
         .map_err(DaemonError::from)?;
