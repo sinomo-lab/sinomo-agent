@@ -15,6 +15,10 @@ use crate::backend::modules::{
 
 pub const REMOTE_MANAGEMENT_ALLOW_COMMAND: &str = "sinomo node permissions allow remote-management";
 pub const REMOTE_MANAGEMENT_DENY_COMMAND: &str = "sinomo node permissions deny remote-management";
+pub const EXTERNAL_INTEGRATIONS_ALLOW_COMMAND: &str =
+    "sinomo node permissions allow external-integrations";
+pub const EXTERNAL_INTEGRATIONS_DENY_COMMAND: &str =
+    "sinomo node permissions deny external-integrations";
 
 pub struct RemoteManagementPermissionMutation {
     pub permissions: LocalNodePermissions,
@@ -25,6 +29,7 @@ pub struct RemoteManagementPermissionMutation {
 pub struct RemoteManagementSettingsSnapshot {
     pub permission_loading: bool,
     pub permission_enabled: bool,
+    pub external_integrations_enabled: bool,
     pub permission_error: Option<String>,
     pub resource_exposure_count: usize,
     pub resource_operation_count: usize,
@@ -44,6 +49,7 @@ impl Default for RemoteManagementSettingsSnapshot {
         Self {
             permission_loading: true,
             permission_enabled: false,
+            external_integrations_enabled: false,
             permission_error: None,
             resource_exposure_count: 0,
             resource_operation_count: 0,
@@ -64,6 +70,7 @@ impl RemoteManagementSettingsSnapshot {
     pub fn replace_permission_state(&mut self, source: &Self) {
         self.permission_loading = source.permission_loading;
         self.permission_enabled = source.permission_enabled;
+        self.external_integrations_enabled = source.external_integrations_enabled;
         self.permission_error.clone_from(&source.permission_error);
         self.resource_exposure_count = source.resource_exposure_count;
         self.resource_operation_count = source.resource_operation_count;
@@ -72,6 +79,7 @@ impl RemoteManagementSettingsSnapshot {
     pub fn replace_permission_document(&mut self, permissions: &LocalNodePermissions) {
         self.permission_loading = false;
         self.permission_enabled = permissions.remote_management_enabled();
+        self.external_integrations_enabled = permissions.external_integrations_enabled();
         self.permission_error = None;
         self.resource_exposure_count = permissions.resource_exposures().len();
         self.resource_operation_count = permissions
@@ -113,6 +121,7 @@ impl Backend {
             ),
             Err(error) => self.remote_management_snapshot_from_parts(
                 false,
+                false,
                 Some(error.to_string()),
                 0,
                 0,
@@ -128,6 +137,7 @@ impl Backend {
     ) -> RemoteManagementSettingsSnapshot {
         self.remote_management_snapshot_from_parts(
             permissions.remote_management_enabled(),
+            permissions.external_integrations_enabled(),
             None,
             permissions.resource_exposures().len(),
             permissions
@@ -155,6 +165,22 @@ impl Backend {
             .map_err(|error| error.to_string())
     }
 
+    pub fn set_local_external_integrations_permission(
+        &self,
+        enabled: bool,
+    ) -> Result<RemoteManagementPermissionMutation, String> {
+        let store = LocalNodePermissionStore::new(self.data_dir.root());
+        store
+            .mutate(|permissions| Ok(permissions.set_external_integrations_enabled(enabled)))
+            .map(
+                |(permissions, changed)| RemoteManagementPermissionMutation {
+                    permissions,
+                    changed,
+                },
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn set_local_remote_management_module_override(
         &self,
         enabled: Option<bool>,
@@ -165,6 +191,7 @@ impl Backend {
     fn remote_management_snapshot_from_parts(
         &self,
         permission_enabled: bool,
+        external_integrations_enabled: bool,
         permission_error: Option<String>,
         resource_exposure_count: usize,
         resource_operation_count: usize,
@@ -198,6 +225,7 @@ impl Backend {
         RemoteManagementSettingsSnapshot {
             permission_loading: false,
             permission_enabled,
+            external_integrations_enabled,
             permission_error,
             resource_exposure_count,
             resource_operation_count,
@@ -261,6 +289,38 @@ mod tests {
         let denied = backend.remote_management_settings_snapshot();
         assert!(!denied.permission_enabled);
         assert_eq!(denied.resource_operation_count, 1);
+    }
+
+    #[test]
+    fn external_integrations_permission_is_live_and_independent() {
+        let backend = Backend::local_fallback();
+
+        let initial = backend.remote_management_settings_snapshot();
+        assert!(!initial.external_integrations_enabled);
+        assert!(!initial.permission_enabled);
+
+        let mutation = backend
+            .set_local_external_integrations_permission(true)
+            .expect("allow external integrations");
+        assert!(mutation.changed);
+        assert!(mutation.permissions.external_integrations_enabled());
+        assert!(!mutation.permissions.remote_management_enabled());
+
+        let allowed = backend.remote_management_settings_snapshot();
+        assert!(allowed.external_integrations_enabled);
+        assert!(!allowed.permission_enabled);
+
+        assert!(
+            backend
+                .set_local_external_integrations_permission(false)
+                .expect("deny external integrations")
+                .changed
+        );
+        assert!(
+            !backend
+                .remote_management_settings_snapshot()
+                .external_integrations_enabled
+        );
     }
 
     #[test]

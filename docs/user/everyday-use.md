@@ -50,6 +50,12 @@ sinomo models help
 Do not place provider credentials in cluster KV. Authenticate on the node that
 will use the provider with `sinomo providers auth <provider>`.
 
+The graphical app's **Settings > Providers** page shows each account's API and
+tool capabilities, including Responses, realtime voice, hosted search/image
+tools, MCP, and local model discovery. Ollama and LM Studio can be added there
+without credentials; their endpoint and model remain editable, and connection
+testing discovers the locally served model catalog.
+
 ## Agents and Durable Sessions
 
 Run the built-in agent or select an imported package:
@@ -71,6 +77,17 @@ sinomo agent inspect
 sinomo agent validate
 sinomo agent readiness
 ```
+
+In the graphical app, open **Settings > Agents** to manage the same package
+surface. The tool picker includes provider-backed web search and image
+generation, and lists whether every packaged tool works in chat, realtime
+voice, or both. Its **External integrations** area manages per-agent Streamable
+HTTP MCP servers. MCP credentials are environment-variable references rather
+than stored secret values. Granting or revoking the required node-local
+permission is an explicit, confirmed action in the same area; after saving an
+agent, **Test readiness** connects to enabled servers and reports the discovered
+tool names. Realtime voice can also hand coding, research, or longer work to the
+same regular agent and bring the result back into the live conversation.
 
 Live sessions expose explicit control commands:
 
