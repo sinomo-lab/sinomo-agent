@@ -342,37 +342,30 @@ struct ClusterNodeStatusPendingRefresh {
     label: &'static str,
 }
 
-/// Owns the separately scheduled node-presence publication.
-///
-/// Remote quorum commits traverse the complete stream-native service stack.
-/// Polling that future inline beneath the maintenance state machine leaves too
-/// little of Tokio's normal worker stack for response validation in debug
-/// builds. A task boundary starts that path from a clean worker stack. Abort on
-/// drop keeps deadline cancellation from detaching an uncertain KV mutation.
-struct OwnedNodeStatusPublishTask {
-    task: Option<tokio::task::JoinHandle<Result<NodeStatusPublishOutcome, DaemonError>>>,
+/// Owns a separately scheduled daemon operation and aborts it when its caller
+/// is cancelled. This keeps task boundaries from detaching uncertain cluster
+/// mutations when an enclosing deadline expires.
+struct OwnedDaemonTask<T> {
+    task: Option<tokio::task::JoinHandle<T>>,
 }
 
-impl OwnedNodeStatusPublishTask {
-    fn new(task: tokio::task::JoinHandle<Result<NodeStatusPublishOutcome, DaemonError>>) -> Self {
+impl<T> OwnedDaemonTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
         Self { task: Some(task) }
     }
 
-    async fn join(&mut self) -> Result<NodeStatusPublishOutcome, DaemonError> {
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
         let result = self
             .task
             .as_mut()
-            .expect("node-status publish task is joined once")
+            .expect("owned daemon task is joined once")
             .await;
         self.task.take();
-        result.map_err(|source| DaemonError::Network {
-            address: "cluster node-status publish task".to_string(),
-            detail: source.to_string(),
-        })?
+        result
     }
 }
 
-impl Drop for OwnedNodeStatusPublishTask {
+impl<T> Drop for OwnedDaemonTask<T> {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -1549,20 +1542,31 @@ pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_asyn
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::KvAuthoritativeRead<KvSnapshot>, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let body = body.to_vec();
     let timeouts = cluster_control_plane_timeouts();
-    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-        DaemonClusterRpcMode::from_handle(runtime),
-        timeouts,
-    );
-    sinomo_core::cluster::handle_cluster_kv_authoritative_snapshot_request_async_with_host(
-        runtime,
-        &cluster_paths,
-        body,
-        timeouts.kv_txn_quorum_options(allow_forwarding),
-        &mut host,
-    )
-    .await
-    .map_err(Into::into)
+    let task_runtime = runtime.clone();
+    // A learner serves a local authoritative read by forwarding it over the
+    // complete routed stream stack. Keep that outbound protocol stack in an
+    // owned task instead of nesting it beneath the inbound service dispatcher.
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::from_handle(&task_runtime),
+            timeouts,
+        );
+        sinomo_core::cluster::handle_cluster_kv_authoritative_snapshot_request_async_with_host(
+            &task_runtime,
+            &cluster_paths,
+            &body,
+            timeouts.kv_txn_quorum_options(allow_forwarding),
+            &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "cluster KV authoritative read task".to_string(),
+        detail: source.to_string(),
+    })?
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
@@ -1635,14 +1639,25 @@ async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
-        &cluster_paths,
-        request,
-        allow_forwarding,
-        runtime,
-        timeouts,
-    )
-    .await
+    let task_runtime = runtime.clone();
+    // The same boundary is required for learner writes: a local service call
+    // may forward through routed object RPC before returning to the inbound
+    // dispatcher. Abort-on-drop preserves cancellation ownership for the
+    // potentially mutating operation.
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
+            &cluster_paths,
+            request,
+            allow_forwarding,
+            &task_runtime,
+            timeouts,
+        )
+        .await
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "cluster KV quorum commit task".to_string(),
+        detail: source.to_string(),
+    })?
 }
 
 pub(crate) fn handle_cluster_kv_txn_request_with_cluster_paths_on_runtime(
@@ -4286,7 +4301,7 @@ impl ClusterNetworkMaintenance {
     ) -> bool {
         let label = pending.label;
         let task_runtime = runtime.clone();
-        let mut task = OwnedNodeStatusPublishTask::new(runtime.spawn(async move {
+        let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
             refresh_daemon_node_status_in_kv_async_with_timeouts(
                 &pending.paths,
                 task_runtime,
@@ -4295,12 +4310,16 @@ impl ClusterNetworkMaintenance {
             .await
         }));
         match task.join().await {
-            Ok(published) => {
+            Ok(Ok(published)) => {
                 self.record_node_status_publish(&published);
                 true
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!("sinomo daemon {label} publish failed: {error}");
+                false
+            }
+            Err(error) => {
+                tracing::warn!("sinomo daemon {label} publish task failed: {error}");
                 false
             }
         }
