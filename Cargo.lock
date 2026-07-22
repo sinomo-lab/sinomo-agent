@@ -8670,6 +8670,7 @@ dependencies = [
 name = "sinomo-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "libc",
  "serde",
@@ -8682,6 +8683,7 @@ dependencies = [
  "sinomo-runtime",
  "thiserror 2.0.19",
  "time",
+ "tokio",
 ]
 
 [[package]]

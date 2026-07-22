@@ -1,0 +1,16 @@
+{
+  "schema": "sinomo.benchmark.tau3-voice-suite.v1",
+  "name": "tau3-voice-development-12",
+  "upstream_revision": "f0927a4b9cdfa7b374269efaa29ff7fdac90d8fc",
+  "task_split": "base",
+  "domains": {
+    "airline": ["0", "1", "3", "4"],
+    "retail": ["0", "1", "2", "3"],
+    "telecom": [
+      "[mms_issue]airplane_mode_on|bad_network_preference|bad_wifi_calling|break_apn_mms_setting|break_app_both_permissions|data_mode_off|data_usage_exceeded|unseat_sim_card|user_abroad_roaming_disabled_off[PERSONA:Hard]",
+      "[mms_issue]airplane_mode_on|bad_network_preference|bad_wifi_calling|break_apn_mms_setting|break_app_both_permissions|data_mode_off|data_usage_exceeded|unseat_sim_card|user_abroad_roaming_disabled_on[PERSONA:Hard]",
+      "[mms_issue]airplane_mode_on|bad_network_preference|bad_wifi_calling|break_apn_mms_setting|break_app_sms_permission|data_mode_off|data_usage_exceeded|unseat_sim_card|user_abroad_roaming_enabled_off[PERSONA:None]",
+      "[mms_issue]airplane_mode_on|bad_network_preference|bad_wifi_calling|break_apn_mms_setting|break_app_storage_permission|data_mode_off|data_usage_exceeded|unseat_sim_card[PERSONA:Easy]"
+    ]
+  }
+}

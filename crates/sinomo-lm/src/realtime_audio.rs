@@ -183,16 +183,31 @@ const fn default_video_max_dimension() -> Option<u32> {
     Some(DEFAULT_VIDEO_MAX_DIMENSION)
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RealtimeAudioTurnDetection {
+    #[default]
     Manual,
+    ServerVad,
     SemanticVad,
 }
 
-impl Default for RealtimeAudioTurnDetection {
-    fn default() -> Self {
-        Self::Manual
+/// Provider-neutral function tool exposed to a realtime audio model.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RealtimeAudioToolDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+impl RealtimeAudioToolDefinition {
+    pub fn new(name: impl Into<String>, parameters: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            parameters,
+        }
     }
 }
 
@@ -219,6 +234,10 @@ pub struct RealtimeAudioSessionConfig {
     pub output_format: RealtimeAudioSampleFormat,
     #[serde(default)]
     pub turn_detection: RealtimeAudioTurnDetection,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<RealtimeAudioToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +283,8 @@ impl RealtimeAudioSessionConfig {
             input_format,
             output_format,
             turn_detection: RealtimeAudioTurnDetection::Manual,
+            tools: Vec::new(),
+            tool_choice: None,
             connect_timeout_ms: None,
             receive_timeout_ms: None,
         }
@@ -303,6 +324,21 @@ impl RealtimeAudioSessionConfig {
     }
 
     pub fn validate(&self) -> Result<(), RealtimeAudioError> {
+        for tool in &self.tools {
+            if tool.name.trim().is_empty() {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: "realtime function tool names must not be empty".to_string(),
+                });
+            }
+            if !tool.parameters.is_object() {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: format!(
+                        "realtime function tool `{}` parameters must be a JSON object schema",
+                        tool.name
+                    ),
+                });
+            }
+        }
         if let Some(video) = &self.input_video {
             if !(1..=100).contains(&video.encoding_quality) {
                 return Err(RealtimeAudioError::InvalidConfig {
@@ -332,6 +368,11 @@ impl RealtimeAudioSessionConfig {
                 }
             }
             RealtimeAudioProvider::MiniCpmO => {
+                if !self.tools.is_empty() {
+                    return Err(RealtimeAudioError::InvalidConfig {
+                        detail: "MiniCPM-o realtime function tools are not supported".to_string(),
+                    });
+                }
                 if self.input_format != RealtimeAudioSampleFormat::F32Le {
                     return Err(RealtimeAudioError::InvalidConfig {
                         detail: "MiniCPM-o realtime audio input must be float32 PCM little-endian"
@@ -471,17 +512,61 @@ pub enum RealtimeAudioEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kv_cache_length: Option<u64>,
     },
-    InputSpeechStarted,
-    InputSpeechStopped,
+    InputSpeechStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_start_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
+    InputSpeechStopped {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_end_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
     OutputAudioDelta {
         text: String,
         audio: Vec<u8>,
         end_of_turn: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         kv_cache_length: Option<u64>,
     },
     OutputTranscriptDelta {
         delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
+    ToolCallStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        call_id: String,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        delta: String,
+    },
+    ToolCallCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    ResponseCancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+    },
+    OutputTruncated {
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_end_ms: Option<u64>,
     },
     ResponseDone,
     Closed {
@@ -526,6 +611,11 @@ pub enum RealtimeAudioError {
     Timeout { timeout_ms: u128 },
     #[error("realtime audio protocol error: {detail}")]
     Protocol { detail: String },
+    #[error("realtime audio operation `{operation}` is not supported by provider `{provider}`")]
+    UnsupportedOperation {
+        operation: &'static str,
+        provider: &'static str,
+    },
     #[error("realtime audio JSON error: {detail}")]
     Json { detail: String },
     #[error("invalid realtime video frame: {detail}")]
@@ -695,6 +785,45 @@ impl RealtimeAudioSession {
             .await
     }
 
+    /// Adds a function call result to the conversation and optionally asks the
+    /// model to continue its response.
+    pub async fn send_tool_result(
+        &mut self,
+        call_id: &str,
+        output: &str,
+        request_response: bool,
+    ) -> Result<(), RealtimeAudioError> {
+        self.require_openai("send_tool_result")?;
+        self.send_json(openai_tool_result_payload(call_id, output))
+            .await?;
+        if request_response {
+            self.request_response().await?;
+        }
+        Ok(())
+    }
+
+    /// Cancels the response currently being generated, if any.
+    pub async fn cancel_response(&mut self) -> Result<(), RealtimeAudioError> {
+        self.require_openai("cancel_response")?;
+        self.send_json(openai_response_cancel_payload()).await
+    }
+
+    /// Removes unplayed audio from a model item after an interruption.
+    pub async fn truncate_output(
+        &mut self,
+        item_id: &str,
+        content_index: u64,
+        audio_end_ms: u64,
+    ) -> Result<(), RealtimeAudioError> {
+        self.require_openai("truncate_output")?;
+        self.send_json(openai_output_truncate_payload(
+            item_id,
+            content_index,
+            audio_end_ms,
+        ))
+        .await
+    }
+
     pub async fn close(&mut self) -> Result<(), RealtimeAudioError> {
         match self.config.provider {
             RealtimeAudioProvider::OpenAi => {
@@ -779,6 +908,17 @@ impl RealtimeAudioSession {
                 detail: source.to_string(),
             })
     }
+
+    fn require_openai(&self, operation: &'static str) -> Result<(), RealtimeAudioError> {
+        if self.config.provider == RealtimeAudioProvider::OpenAi {
+            Ok(())
+        } else {
+            Err(RealtimeAudioError::UnsupportedOperation {
+                operation,
+                provider: self.config.provider.provider_id(),
+            })
+        }
+    }
 }
 
 pub fn openai_realtime_ws_url(base_url: &str, model: &str) -> Result<String, RealtimeAudioError> {
@@ -856,14 +996,83 @@ pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> ser
             "effort": "low"
         }
     });
-    if config.turn_detection == RealtimeAudioTurnDetection::SemanticVad {
-        session["audio"]["input"]["turn_detection"] = serde_json::json!({
-            "type": "semantic_vad"
-        });
+    match config.turn_detection {
+        RealtimeAudioTurnDetection::Manual => {
+            session["audio"]["input"]["turn_detection"] = serde_json::Value::Null;
+        }
+        RealtimeAudioTurnDetection::ServerVad => {
+            session["audio"]["input"]["turn_detection"] = serde_json::json!({
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
+                "create_response": true,
+                "interrupt_response": true
+            });
+        }
+        RealtimeAudioTurnDetection::SemanticVad => {
+            session["audio"]["input"]["turn_detection"] = serde_json::json!({
+                "type": "semantic_vad"
+            });
+        }
+    }
+    if !config.tools.is_empty() {
+        session["tools"] = serde_json::Value::Array(
+            config
+                .tools
+                .iter()
+                .map(|tool| {
+                    let mut value = serde_json::json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "parameters": tool.parameters
+                    });
+                    if let Some(description) = tool.description.as_deref() {
+                        value["description"] = serde_json::json!(description);
+                    }
+                    value
+                })
+                .collect(),
+        );
+        session["tool_choice"] = serde_json::json!(
+            config
+                .tool_choice
+                .as_deref()
+                .filter(|choice| !choice.trim().is_empty())
+                .unwrap_or("auto")
+        );
     }
     serde_json::json!({
         "type": "session.update",
         "session": session
+    })
+}
+
+pub fn openai_tool_result_payload(call_id: &str, output: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output
+        }
+    })
+}
+
+pub fn openai_response_cancel_payload() -> serde_json::Value {
+    serde_json::json!({ "type": "response.cancel" })
+}
+
+pub fn openai_output_truncate_payload(
+    item_id: &str,
+    content_index: u64,
+    audio_end_ms: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "conversation.item.truncate",
+        "item_id": item_id,
+        "content_index": content_index,
+        "audio_end_ms": audio_end_ms
     })
 }
 
@@ -1138,8 +1347,18 @@ pub fn realtime_audio_event_from_value(
                 .get("kv_cache_length")
                 .and_then(serde_json::Value::as_u64),
         },
-        "input_audio_buffer.speech_started" => RealtimeAudioEvent::InputSpeechStarted,
-        "input_audio_buffer.speech_stopped" => RealtimeAudioEvent::InputSpeechStopped,
+        "input_audio_buffer.speech_started" => RealtimeAudioEvent::InputSpeechStarted {
+            audio_start_ms: value
+                .get("audio_start_ms")
+                .and_then(serde_json::Value::as_u64),
+            item_id: optional_string(&value, "item_id"),
+        },
+        "input_audio_buffer.speech_stopped" => RealtimeAudioEvent::InputSpeechStopped {
+            audio_end_ms: value
+                .get("audio_end_ms")
+                .and_then(serde_json::Value::as_u64),
+            item_id: optional_string(&value, "item_id"),
+        },
         "response.output_audio.delta" | "response.audio.delta" => {
             output_audio_delta(provider, &value)?
         }
@@ -1149,6 +1368,92 @@ pub fn realtime_audio_event_from_value(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            item_id: optional_string(&value, "item_id"),
+        },
+        "response.output_item.added"
+            if value
+                .pointer("/item/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("function_call") =>
+        {
+            RealtimeAudioEvent::ToolCallStarted {
+                item_id: value
+                    .pointer("/item/id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                call_id: value
+                    .pointer("/item/call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: value
+                    .pointer("/item/name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        }
+        "response.function_call_arguments.delta" => RealtimeAudioEvent::ToolCallArgumentsDelta {
+            item_id: optional_string(&value, "item_id"),
+            call_id: value
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: optional_string(&value, "name"),
+            delta: value
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "response.function_call_arguments.done" => RealtimeAudioEvent::ToolCallCompleted {
+            item_id: optional_string(&value, "item_id"),
+            call_id: value
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: value
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "response.cancelled" => RealtimeAudioEvent::ResponseCancelled {
+            response_id: value
+                .get("response_id")
+                .or_else(|| value.pointer("/response/id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        },
+        "response.done"
+            if value
+                .pointer("/response/status")
+                .and_then(serde_json::Value::as_str)
+                == Some("cancelled") =>
+        {
+            RealtimeAudioEvent::ResponseCancelled {
+                response_id: value
+                    .pointer("/response/id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            }
+        }
+        "conversation.item.truncated" => RealtimeAudioEvent::OutputTruncated {
+            item_id: value
+                .get("item_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            audio_end_ms: value
+                .get("audio_end_ms")
+                .and_then(serde_json::Value::as_u64),
         },
         "response.output_audio.done" | "response.done" => RealtimeAudioEvent::ResponseDone,
         "session.closed" => RealtimeAudioEvent::Closed {
@@ -1176,6 +1481,13 @@ pub fn realtime_audio_event_from_value(
         _ => RealtimeAudioEvent::Raw { event_type, value },
     };
     Ok(event)
+}
+
+fn optional_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn output_audio_delta(
@@ -1210,6 +1522,7 @@ fn output_audio_delta(
             .get("end_of_turn")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        item_id: optional_string(value, "item_id"),
         kv_cache_length: value
             .get("kv_cache_length")
             .and_then(serde_json::Value::as_u64),
@@ -1258,6 +1571,106 @@ mod tests {
         assert_eq!(
             payload["session"]["audio"]["input"]["turn_detection"]["type"],
             "semantic_vad"
+        );
+    }
+
+    #[test]
+    fn openai_session_update_configures_tau_compatible_tools_and_server_vad() {
+        let mut config =
+            RealtimeAudioSessionConfig::new(RealtimeAudioProvider::OpenAi, "gpt-realtime-2");
+        config.turn_detection = RealtimeAudioTurnDetection::ServerVad;
+        let mut tool = RealtimeAudioToolDefinition::new(
+            "lookup_order",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"]
+            }),
+        );
+        tool.description = Some("Look up an order".to_string());
+        config.tools.push(tool);
+
+        let payload = openai_session_update_payload(&config);
+
+        assert_eq!(
+            payload["session"]["audio"]["input"]["turn_detection"],
+            serde_json::json!({
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
+                "create_response": true,
+                "interrupt_response": true
+            })
+        );
+        assert_eq!(payload["session"]["tools"][0]["type"], "function");
+        assert_eq!(payload["session"]["tools"][0]["name"], "lookup_order");
+        assert_eq!(payload["session"]["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn openai_tool_control_payloads_preserve_call_and_playback_identity() {
+        assert_eq!(
+            openai_tool_result_payload("call_123", r#"{"ok":true}"#),
+            serde_json::json!({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": r#"{"ok":true}"#
+                }
+            })
+        );
+        assert_eq!(
+            openai_response_cancel_payload(),
+            serde_json::json!({"type": "response.cancel"})
+        );
+        assert_eq!(
+            openai_output_truncate_payload("item_123", 0, 1500),
+            serde_json::json!({
+                "type": "conversation.item.truncate",
+                "item_id": "item_123",
+                "content_index": 0,
+                "audio_end_ms": 1500
+            })
+        );
+    }
+
+    #[test]
+    fn parses_tau_realtime_tool_and_interruption_events() {
+        assert_eq!(
+            realtime_audio_event_from_value(
+                RealtimeAudioProvider::OpenAi,
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "item_tool",
+                    "call_id": "call_123",
+                    "name": "lookup_order",
+                    "arguments": "{\"order_id\":\"A-42\"}"
+                }),
+            )
+            .expect("tool event"),
+            RealtimeAudioEvent::ToolCallCompleted {
+                item_id: Some("item_tool".to_string()),
+                call_id: "call_123".to_string(),
+                name: "lookup_order".to_string(),
+                arguments: "{\"order_id\":\"A-42\"}".to_string(),
+            }
+        );
+        assert_eq!(
+            realtime_audio_event_from_value(
+                RealtimeAudioProvider::OpenAi,
+                serde_json::json!({
+                    "type": "input_audio_buffer.speech_started",
+                    "audio_start_ms": 825,
+                    "item_id": "item_audio"
+                }),
+            )
+            .expect("speech event"),
+            RealtimeAudioEvent::InputSpeechStarted {
+                audio_start_ms: Some(825),
+                item_id: Some("item_audio".to_string()),
+            }
         );
     }
 
@@ -1469,6 +1882,7 @@ mod tests {
                 text: "hello".to_string(),
                 audio: vec![0, 1, 2, 3],
                 end_of_turn: false,
+                item_id: None,
                 kv_cache_length: None,
             }
         );
@@ -1494,6 +1908,7 @@ mod tests {
                 text: "hello".to_string(),
                 audio: vec![0, 1, 2, 3],
                 end_of_turn: true,
+                item_id: None,
                 kv_cache_length: Some(42),
             }
         );
