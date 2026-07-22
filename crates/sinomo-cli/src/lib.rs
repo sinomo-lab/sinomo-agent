@@ -331,6 +331,9 @@ struct CliClusterStateAuthorityReachabilityHost {
     daemon: Option<Box<dyn CliDaemonTargetRpc>>,
 }
 
+const CLI_STATE_AUTHORITY_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const CLI_STATE_AUTHORITY_PROBE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 impl CliClusterStateAuthorityReachabilityHost {
     fn new(daemon: Option<&DaemonStatus>) -> Self {
         Self {
@@ -369,20 +372,42 @@ impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthority
         };
         // A CLI process does not own cluster transports. Ask the already
         // authenticated local daemon to route the read-only authority probe so
-        // admission reuses its persistent channels and transport lifecycle.
-        // The reachability scan supplies a total per-target budget; preserve it
-        // as an overall deadline instead of reinterpreting a no-progress limit
-        // as the operation deadline.
-        daemon
-            .object_rpc_to_target_with_deadline(
-                target_node_id,
-                &request,
-                timeout,
-                Some(timeout),
-                false,
-            )
-            .and_then(|response| response.error_detail().map_err(|_| ()))
-            .is_ok()
+        // admission uses its process-owned routing state and transport
+        // lifecycle. The reachability scan supplies a total per-target budget;
+        // bounded attempts share that deadline instead of turning any one
+        // transport's no-progress limit into the operation deadline.
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let attempt_timeout = remaining.min(CLI_STATE_AUTHORITY_PROBE_ATTEMPT_TIMEOUT);
+            if daemon
+                .object_rpc_to_target_with_deadline(
+                    target_node_id,
+                    &request,
+                    attempt_timeout,
+                    Some(attempt_timeout),
+                    false,
+                )
+                .and_then(|response| response.error_detail().map_err(|_| ()))
+                .is_ok()
+            {
+                return true;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            // The routed daemon rebuilds its immutable directory and
+            // connectivity snapshots for each attempt. A short bounded pause
+            // lets a just-materialized KV snapshot and its connectivity
+            // generation converge without extending the caller's total
+            // foreground deadline.
+            std::thread::sleep(remaining.min(CLI_STATE_AUTHORITY_PROBE_RETRY_BACKOFF));
+        }
     }
 }
 

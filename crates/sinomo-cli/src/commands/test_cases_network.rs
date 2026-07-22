@@ -28,9 +28,11 @@ use time::OffsetDateTime;
 // 50 req/s acceptance gate. With two targets this yields 200 measured RPCs,
 // while still completing comfortably inside the cluster acceptance budget.
 const DEFAULT_REQUESTS_PER_TARGET: usize = 100;
-// Warm the authenticated route and connection pools before starting the timed
-// window, but keep that untimed work explicitly bounded instead of coupling it
-// to the larger measurement sample.
+// Warm the authenticated route, directory, and daemon execution paths before
+// starting the timed window, but keep that untimed work explicitly bounded
+// instead of coupling it to the larger measurement sample. Stage E uses one
+// independent logical stream per call; this warmup must not imply or select the
+// legacy persistent object-RPC carrier.
 const DEFAULT_WARMUP_REQUESTS_PER_TARGET: usize = 20;
 // Keep the acceptance default below the daemon's saturation point so the
 // latency gates measure healthy interactive RPC service rather than queueing
@@ -634,6 +636,8 @@ fn run_network_ping_with_defaults(
     let timeout_ms = optional_u64_parameter(ctx, &timeout_name, defaults.timeout_ms)?;
     let expected_targets =
         optional_usize_parameter(ctx, "expected-targets", defaults.expected_targets)?;
+    let include_unobserved_targets =
+        optional_bool_parameter(ctx, "include-unobserved-targets", false)?;
     let max_failures = optional_usize_parameter(ctx, &max_failures_name, defaults.max_failures)?;
     let max_p50_ms = optional_u64_parameter(ctx, &max_p50_ms_name, defaults.max_p50_ms)?;
     let max_p95_ms = optional_u64_parameter(ctx, &max_p95_ms_name, defaults.max_p95_ms)?;
@@ -724,12 +728,21 @@ fn run_network_ping_with_defaults(
         cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
-    let targets = filter_network_test_targets(
-        ctx,
-        &cluster_state,
-        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?,
-    )?;
+    let discovered_targets = if include_unobserved_targets {
+        super::test::authorized_remote_main_test_targets(&data_dir, &cluster_state)?
+    } else {
+        super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?
+    };
+    let targets = filter_network_test_targets(ctx, &cluster_state, discovered_targets)?;
     let target_count = targets.len();
+    ctx.record(
+        "target_selection",
+        if include_unobserved_targets {
+            "authorized-membership"
+        } else {
+            "live-online"
+        },
+    );
     ctx.record("target_count", target_count);
     ctx.record(
         "targets",
