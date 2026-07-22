@@ -1,6 +1,6 @@
 //! Diagnostic lower bound for one-frame Sinomo object RPC over TCP.
 //!
-//! This intentionally omits routing, authentication, canonical sessions, and
+//! This intentionally omits routing, authentication, routed streams, and
 //! application dispatch. It measures the real object-frame codec and kernel
 //! TCP path either directly or through one decode/forward relay. Both fresh
 //! and persistent connections use the exact same request/response wire.

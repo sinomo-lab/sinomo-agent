@@ -440,19 +440,6 @@ where
     )
 }
 
-pub(crate) fn read_cluster_connectivity_graph_for_state(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    read_cluster_connectivity_graph_with_bootstrap_and_query(
-        paths,
-        Some(&state.cluster_id),
-        Some(&state.local_node_id),
-        Some(state),
-        &crate::connectivity::DirectoryConnectivityRecordQuery,
-    )
-}
-
 /// Builds the connectivity graph against membership, endpoints, and KV
 /// evidence captured from one directory generation.
 ///

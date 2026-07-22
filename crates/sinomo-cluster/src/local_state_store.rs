@@ -449,7 +449,6 @@ pub async fn read_cluster_state_async(
 
 fn finish_cluster_state_write(paths: &ClusterPaths, state: &ClusterBootstrapState) {
     invalidate_cluster_state_cache(paths);
-    sinomo_network::invalidate_cluster_delivery_routing_table_cache(paths);
     record_current_cluster_kv_reader_node_id_cache(paths, state.local_node_id.clone());
 }
 
@@ -729,7 +728,6 @@ pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkErr
     invalidate_cluster_kv_reader_node_id_cache(&paths.state);
     remove_optional_file(&paths.kv_paths().snapshot)?;
     invalidate_cluster_state_cache(paths);
-    sinomo_network::invalidate_cluster_delivery_routing_table_cache(paths);
     Ok(())
 }
 

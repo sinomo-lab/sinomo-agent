@@ -83,7 +83,7 @@ pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuil
 mod tests {
     use super::*;
     use sinomo_core::local::SinomoDataDir;
-    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
@@ -93,7 +93,7 @@ mod tests {
     }
 
     impl ResponseSink for VecSink {
-        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+        fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
             if !response.body.is_empty() {
                 return Err(ServiceError::Service(
                     "rollout test sink received an unexpected response body".to_string(),

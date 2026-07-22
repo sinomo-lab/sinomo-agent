@@ -22,7 +22,7 @@ fn direct_link_does_not_import_higher_network_layers() {
             "crate::routing",
             "crate::object_rpc_stream",
             "crate::rpc",
-            "crate::session",
+            "crate::rpc_body",
         ],
     );
 }

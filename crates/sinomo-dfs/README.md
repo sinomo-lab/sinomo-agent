@@ -156,7 +156,7 @@ Replica-side commands are authorized against object ownership, metadata-shard pr
 Repair is restart-aware. On service hydration, persisted intents and receipts rebuild coordinator state and missing-replica jobs. Repair retries have backoff-like scheduling, and a recovered coordinator that no longer has local blob bytes can fetch the blob from another durable replica before repairing a missing node.
 
 Reader- and file-backed data-plane operations attach their semantic byte bodies
-to the canonical `sinomo-network` object-RPC session at every size. DFS heads
+to the canonical `sinomo-network` object-RPC call at every size. DFS heads
 retain object/version identity, declared size, and content hashes, while the
 network layer owns framing, flow control, health timeouts, and replay-safe
 retries. DFS does not expose transport chunk indexes, windows, or resume routes.

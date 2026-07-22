@@ -1,4 +1,4 @@
-/// Canonical object-RPC session transport for one same-shard namespace transaction.
+/// Object-RPC call body transport for one same-shard namespace transaction.
 ///
 /// Evidence class: core-algorithm composition refinement for carrying an
 /// encoded `DfsNamespaceTransaction` through the authenticated object-RPC
@@ -16,15 +16,15 @@
 ///
 /// Concrete SOBJ field sizes, transfer-frame chunking, relay authentication,
 /// retry policy, flow-window scheduling, resource exhaustion, and
-/// metadata-backend recovery are outside this slice. Existing session and
+/// metadata-backend recovery are outside this slice. Existing routed-stream and
 /// namespace-transaction models own those contracts; this model covers their
 /// composition boundary.
 module dfs_namespace_transaction_body_transport {
   import common.* from "../../lib/common"
 
-  type NamespaceSessionPhase =
+  type NamespaceCallPhase =
     | TransactionReady
-    | CanonicalSessionPrepared
+    | ObjectRpcCallPrepared
     | AttachmentReceiving
     | AttachmentValidated
     | TransactionReconstructed
@@ -53,9 +53,9 @@ module dfs_namespace_transaction_body_transport {
     | SecondFileRecord
     | ParentRecord
 
-  type NamespaceSessionTransition =
-    | SessionTransportInitialized
-    | CanonicalSessionCallPrepared
+  type NamespaceCallTransition =
+    | CallTransportInitialized
+    | ObjectRpcCallPreparedTransition
     | CanonicalAttachmentAccepted
     | ExactAttachmentValidated
     | ExactTransactionReconstructed
@@ -65,12 +65,12 @@ module dfs_namespace_transaction_body_transport {
     | ValidatedTransactionDispatched
     | AtomicTransactionApplied
     | DuplicateApplicationSuppressed
-    | SessionTransportStuttered
+    | CallTransportStuttered
 
-  type NamespaceSessionTransportState = {
-    phase: NamespaceSessionPhase,
+  type NamespaceCallTransportState = {
+    phase: NamespaceCallPhase,
     attachmentIntegrity: NamespaceAttachmentIntegrity,
-    sessionCount: int,
+    callCount: int,
     attachmentRole: NamespaceAttachmentRole,
     reconstructedRecordCount: int,
     reconstructedTransactionId: NamespaceTransactionId,
@@ -79,15 +79,15 @@ module dfs_namespace_transaction_body_transport {
     reconstructedThird: NamespaceTransactionRecord,
     transactionApplyCount: int,
     visibleRecordCount: int,
-    lastTransition: NamespaceSessionTransition,
+    lastTransition: NamespaceCallTransition,
   }
 
   pure val TransactionRecordCount: int = 3
 
-  pure val initialState: NamespaceSessionTransportState = {
+  pure val initialState: NamespaceCallTransportState = {
     phase: TransactionReady,
     attachmentIntegrity: AttachmentNotChecked,
-    sessionCount: 0,
+    callCount: 0,
     attachmentRole: AttachmentRoleUnset,
     reconstructedRecordCount: 0,
     reconstructedTransactionId: TransactionNotReconstructed,
@@ -96,29 +96,29 @@ module dfs_namespace_transaction_body_transport {
     reconstructedThird: RecordNotReconstructed,
     transactionApplyCount: 0,
     visibleRecordCount: 0,
-    lastTransition: SessionTransportInitialized,
+    lastTransition: CallTransportInitialized,
   }
 
-  var namespaceSessionTransport: NamespaceSessionTransportState
+  var namespaceCallTransport: NamespaceCallTransportState
 
-  action init = namespaceSessionTransport' = initialState
+  action init = namespaceCallTransport' = initialState
 
-  /// Every encoded namespace transaction enters the same object-RPC session
+  /// Every encoded namespace transaction enters the same object-RPC call
   /// contract with one semantic attachment. No size predicate selects this
   /// action or another transport API.
-  action prepareCanonicalSessionCall = all {
-    namespaceSessionTransport.phase == TransactionReady,
-    namespaceSessionTransport' = namespaceSessionTransport
-      .with("phase", CanonicalSessionPrepared)
-      .with("sessionCount", 1)
+  action prepareObjectRpcCall = all {
+    namespaceCallTransport.phase == TransactionReady,
+    namespaceCallTransport' = namespaceCallTransport
+      .with("phase", ObjectRpcCallPrepared)
+      .with("callCount", 1)
       .with("attachmentRole", NamespaceTransactionAttachment)
-      .with("lastTransition", CanonicalSessionCallPrepared),
+      .with("lastTransition", ObjectRpcCallPreparedTransition),
   }
 
   action acceptCanonicalAttachment = all {
-    namespaceSessionTransport.phase == CanonicalSessionPrepared,
-    namespaceSessionTransport.attachmentRole == NamespaceTransactionAttachment,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == ObjectRpcCallPrepared,
+    namespaceCallTransport.attachmentRole == NamespaceTransactionAttachment,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", AttachmentReceiving)
       .with("lastTransition", CanonicalAttachmentAccepted),
   }
@@ -126,8 +126,8 @@ module dfs_namespace_transaction_body_transport {
   /// Length, digest, and complete SOBJ validation form one abstract gate. No
   /// transaction row is reconstructed while this gate is in progress.
   action validateExactAttachment = all {
-    namespaceSessionTransport.phase == AttachmentReceiving,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == AttachmentReceiving,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", AttachmentValidated)
       .with("attachmentIntegrity", AttachmentExact)
       .with("lastTransition", ExactAttachmentValidated),
@@ -136,9 +136,9 @@ module dfs_namespace_transaction_body_transport {
   /// Reconstruction is enabled only by the exact-attachment gate and restores
   /// the original transaction identity and file/file/parent ordering at once.
   action reconstructValidatedTransaction = all {
-    namespaceSessionTransport.phase == AttachmentValidated,
-    namespaceSessionTransport.attachmentIntegrity == AttachmentExact,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == AttachmentValidated,
+    namespaceCallTransport.attachmentIntegrity == AttachmentExact,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", TransactionReconstructed)
       .with("reconstructedRecordCount", TransactionRecordCount)
       .with("reconstructedTransactionId", OriginalTransaction)
@@ -149,32 +149,32 @@ module dfs_namespace_transaction_body_transport {
   }
 
   action rejectCorruptAttachment = all {
-    namespaceSessionTransport.phase == AttachmentReceiving,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == AttachmentReceiving,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", AttachmentRejected)
       .with("attachmentIntegrity", AttachmentCorrupt)
       .with("lastTransition", CorruptAttachmentRejected),
   }
 
   action rejectTruncatedAttachment = all {
-    namespaceSessionTransport.phase == AttachmentReceiving,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == AttachmentReceiving,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", AttachmentRejected)
       .with("attachmentIntegrity", AttachmentTruncated)
       .with("lastTransition", TruncatedAttachmentRejected),
   }
 
   action rejectCancelledAttachment = all {
-    namespaceSessionTransport.phase == AttachmentReceiving,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == AttachmentReceiving,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", AttachmentRejected)
       .with("attachmentIntegrity", AttachmentCancelled)
       .with("lastTransition", CancelledAttachmentRejected),
   }
 
   action dispatchValidatedTransaction = all {
-    namespaceSessionTransport.phase == TransactionReconstructed,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == TransactionReconstructed,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", TransactionDispatched)
       .with("lastTransition", ValidatedTransactionDispatched),
   }
@@ -182,9 +182,9 @@ module dfs_namespace_transaction_body_transport {
   /// The metadata backend applies the reconstructed transaction atomically;
   /// no transfer frame becomes an independently visible namespace row.
   action applyAtomicTransaction = all {
-    namespaceSessionTransport.phase == TransactionDispatched,
-    namespaceSessionTransport.transactionApplyCount == 0,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == TransactionDispatched,
+    namespaceCallTransport.transactionApplyCount == 0,
+    namespaceCallTransport' = namespaceCallTransport
       .with("phase", TransactionApplied)
       .with("transactionApplyCount", 1)
       .with("visibleRecordCount", TransactionRecordCount)
@@ -192,20 +192,20 @@ module dfs_namespace_transaction_body_transport {
   }
 
   /// A repeated delivery or local completion attempt cannot apply the same
-  /// canonical session call twice.
+  /// object-RPC call twice.
   action suppressDuplicateApplication = all {
-    namespaceSessionTransport.phase == TransactionApplied,
-    namespaceSessionTransport.transactionApplyCount == 1,
-    namespaceSessionTransport' = namespaceSessionTransport
+    namespaceCallTransport.phase == TransactionApplied,
+    namespaceCallTransport.transactionApplyCount == 1,
+    namespaceCallTransport' = namespaceCallTransport
       .with("lastTransition", DuplicateApplicationSuppressed),
   }
 
   action stutter =
-    namespaceSessionTransport' = namespaceSessionTransport
-      .with("lastTransition", SessionTransportStuttered)
+    namespaceCallTransport' = namespaceCallTransport
+      .with("lastTransition", CallTransportStuttered)
 
   action step = any {
-    prepareCanonicalSessionCall,
+    prepareObjectRpcCall,
     acceptCanonicalAttachment,
     validateExactAttachment,
     reconstructValidatedTransaction,

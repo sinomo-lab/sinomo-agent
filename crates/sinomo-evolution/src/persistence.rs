@@ -2764,10 +2764,10 @@ impl DfsPeerTransport for EvolutionSifsPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        call: network::ObjectRpcSessionCall,
+        call: network::ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<network::ObjectRpcSessionResult, DfsPeerTransportError> {
-        sinomo_runtime::daemon::send_object_rpc_session_to_target_with_options(
+    ) -> Result<network::ObjectRpcResult, DfsPeerTransportError> {
+        sinomo_runtime::daemon::send_object_rpc_call_to_target_with_options(
             target_node_id,
             call,
             options.cluster_rpc_options(),
@@ -2781,10 +2781,9 @@ impl AsyncDfsPeerTransport for EvolutionSifsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        call: network::ObjectRpcSessionCall,
+        call: network::ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcSessionResult, DfsPeerTransportError>>
-    {
+    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResult, DfsPeerTransportError>> {
         Box::pin(async move {
             <Self as DfsPeerTransport>::call_object_rpc(self, target_node_id, call, options)
         })

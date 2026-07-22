@@ -2,13 +2,13 @@
 //!
 //! The normal DFS data plane uses framed [`DfsNetworkMessage`] traffic. Direct
 //! read is the optimized read-only path: its response value carries status and
-//! integrity metadata, while found content uses the canonical object-RPC
+//! integrity metadata, while found content uses the stream-native object-RPC
 //! attachment carried by `sinomo-network`.
 
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     NetworkError, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcSessionResult,
+    ObjectRpcResult,
 };
 
 use crate::DfsError;
@@ -222,12 +222,12 @@ fn ensure_dfs_direct_read_root_layout(data_dir: &SinomoDataDir) -> Result<(), Df
 }
 
 #[cfg(test)]
-pub(crate) fn dfs_direct_read_rpc_session_result(
+pub(crate) fn dfs_direct_read_rpc_result(
     response: DfsReadResponse,
-) -> Result<ObjectRpcSessionResult, NetworkError> {
+) -> Result<ObjectRpcResult, NetworkError> {
     let mut response = encode_dfs_direct_read_rpc_response(response)?;
     let attachment = ObjectRpcIncomingBody::bytes(std::mem::take(&mut response.body));
-    Ok(ObjectRpcSessionResult::new(response, attachment))
+    Ok(ObjectRpcResult::new(response, attachment))
 }
 
 fn dfs_direct_read_rpc_response(
@@ -298,10 +298,10 @@ fn encode_dfs_direct_read_rpc_response(
     Ok(rpc_response)
 }
 
-pub fn dfs_direct_read_response_from_rpc_session_result(
-    session_result: ObjectRpcSessionResult,
+pub fn dfs_direct_read_response_from_rpc_result(
+    rpc_result: ObjectRpcResult,
 ) -> Result<DfsDirectReadClientResponse, NetworkError> {
-    let (response, attachment) = session_result.into_parts();
+    let (response, attachment) = rpc_result.into_parts();
     response.error_detail()?;
     let status = dfs_direct_read_metadata(&response, DFS_DIRECT_READ_STATUS_METADATA_KEY)?;
     let request_id =

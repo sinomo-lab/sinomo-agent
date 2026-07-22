@@ -2126,7 +2126,7 @@ mod tests {
         ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvEntry,
         KvLocalRead, KvRevision, KvSnapshot, KvTxnResponse, KvVersion,
     };
-    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
     use sinomo_core::service::ResponseSink;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3102,7 +3102,7 @@ mod tests {
     }
 
     impl ResponseSink for VecSink {
-        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+        fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
             if !response.body.is_empty() {
                 return Err(ServiceError::Service(
                     "config test sink received an unexpected response body".to_string(),

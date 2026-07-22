@@ -10,9 +10,7 @@ use sinomo_network::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
 use sinomo_network::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
-use sinomo_network::{
-    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
-};
+use sinomo_network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcResult};
 use sinomo_node::NodeId;
 use std::future::Future;
 use std::time::{Duration, Instant as StdInstant};
@@ -196,7 +194,7 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
     };
     let mut failures = Vec::new();
     let mut operation_may_have_applied = false;
-    let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
+    let mut client = ClusterObjectRpcClient::routed(host, paths);
     for target in &state_authority_targets {
         let Some(options) = deadline.rpc_options() else {
             return Err(deadline.timeout_error(
@@ -218,7 +216,7 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
             client.call_target(
                 state,
                 &target.node_id,
-                ObjectRpcSessionCall::value(request.clone()),
+                ObjectRpcCall::value(request.clone()),
                 options,
             ),
         )
@@ -290,7 +288,7 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
                 direct_client.call_endpoint(
                     state,
                     target,
-                    ObjectRpcSessionCall::value(request.clone()),
+                    ObjectRpcCall::value(request.clone()),
                     options,
                 ),
             )
@@ -344,7 +342,7 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_timeout(
 }
 
 fn membership_forward_value_response(
-    result: ObjectRpcSessionResult,
+    result: ObjectRpcResult,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let (response, body) = result.into_parts();
     if !body.is_empty() {

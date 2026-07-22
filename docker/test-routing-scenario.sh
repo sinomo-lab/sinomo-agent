@@ -16,8 +16,6 @@ DFS_READY_WAIT="${SINOMO_SCENARIO_DFS_READY_WAIT:-120}"
 EXPECT_TIMEOUT="${SINOMO_SCENARIO_EXPECT_TIMEOUT:-90}"
 POLL_INTERVAL="${SINOMO_SCENARIO_POLL_INTERVAL:-1}"
 PUBLIC_PORT="${SINOMO_SCENARIO_PUBLIC_PORT:-32166}"
-TUNNEL_STALL_PORT="${SINOMO_SCENARIO_TUNNEL_STALL_PORT:-32167}"
-NODE3_DIRECT_PORT="${SINOMO_SCENARIO_NODE3_DIRECT_PORT:-32168}"
 DIRECT_STALL_PORT="${SINOMO_SCENARIO_DIRECT_STALL_PORT:-32169}"
 NETWORK_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_REQUESTS_PER_TARGET:-4}"
 NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_WARMUP_REQUESTS_PER_TARGET:-2}"
@@ -41,7 +39,6 @@ ARTIFACT_COMMAND_TIMEOUT="${SINOMO_SCENARIO_ARTIFACT_COMMAND_TIMEOUT:-10}"
 PROBE_COMMAND_TIMEOUT="${SINOMO_SCENARIO_PROBE_COMMAND_TIMEOUT:-300}"
 HOST_TIMEOUT_GRACE="${SINOMO_SCENARIO_HOST_TIMEOUT_GRACE:-5}"
 ENDPOINT_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_ENDPOINT_FALLBACK_TIMEOUT_MS:-5000}"
-TUNNEL_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_TUNNEL_STALE_FALLBACK_TIMEOUT_MS:-5000}"
 DIRECT_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_DIRECT_STALE_FALLBACK_TIMEOUT_MS:-5000}"
 DIRECT_STALE_FOLLOWUP_MAX_MS="${SINOMO_SCENARIO_DIRECT_STALE_FOLLOWUP_MAX_MS:-750}"
 LARGE_BYTES="${SINOMO_SCENARIO_LARGE_BYTES:-16777216}"
@@ -55,7 +52,6 @@ EXPECTED_MAINS=3
 NODES="node1 node2 node3"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_SCENARIO_ARTIFACTS:-$SINOMO_ROOT/target/routing-scenario-artifacts/$RUN_ID}"
-TUNNEL_STALL_PROXY_PID=""
 DIRECT_STALL_PROXY_PID=""
 PROJECT_OWNED=0
 
@@ -136,7 +132,6 @@ collect_artifacts() {
 
 cleanup() {
   local rc="$?"
-  stop_tunnel_stall_proxy || true
   stop_direct_stall_proxy || true
   if [ "$PROJECT_OWNED" != 1 ]; then
     exit "$rc"
@@ -176,7 +171,6 @@ doctor_connectivity_warnings() {
   printf '%s\n' "$output" \
     | grep -E "endpoint-unreachable|node-offline" \
     | grep -Fv "foreign:21353" \
-    | grep -Fv "host.docker.internal:$TUNNEL_STALL_PORT" \
     | grep -Fv "host.docker.internal:$DIRECT_STALL_PORT" || true
 }
 
@@ -533,53 +527,6 @@ assert_endpoint_error_fallback() {
     --param "timeout-ms=$ENDPOINT_FALLBACK_TIMEOUT_MS"
 }
 
-start_tunnel_stall_proxy() {
-  local proxy_log started deadline
-  if [ -n "$TUNNEL_STALL_PROXY_PID" ] && kill -0 "$TUNNEL_STALL_PROXY_PID" 2>/dev/null; then
-    return 0
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    log "python3 is required for the tcp tunnel stall proxy"
-    return 1
-  fi
-  proxy_log="$ARTIFACTS/tcp-tunnel-stall-proxy.log"
-  log "starting tcp tunnel stall proxy on 0.0.0.0:$TUNNEL_STALL_PORT -> 127.0.0.1:$NODE3_DIRECT_PORT"
-  python3 "$SINOMO_DOCKER_DIR/tcp_tunnel_stall_proxy.py" \
-    --listen-host 0.0.0.0 \
-    --listen-port "$TUNNEL_STALL_PORT" \
-    --target-host 127.0.0.1 \
-    --target-port "$NODE3_DIRECT_PORT" \
-    >"$proxy_log" 2>&1 &
-  TUNNEL_STALL_PROXY_PID="$!"
-  started="$(date +%s)"
-  deadline=$(( started + 10 ))
-  while :; do
-    if (exec 9<>"/dev/tcp/127.0.0.1/$TUNNEL_STALL_PORT") 2>/dev/null; then
-      exec 9>&- 2>/dev/null || true
-      return 0
-    fi
-    if ! kill -0 "$TUNNEL_STALL_PROXY_PID" 2>/dev/null; then
-      log "tcp tunnel stall proxy exited early"
-      sed 's/^/[routing-scenario]   /' "$proxy_log" || true
-      return 1
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      log "tcp tunnel stall proxy did not start"
-      sed 's/^/[routing-scenario]   /' "$proxy_log" || true
-      return 1
-    fi
-    sleep 0.1
-  done
-}
-
-stop_tunnel_stall_proxy() {
-  if [ -n "$TUNNEL_STALL_PROXY_PID" ] && kill -0 "$TUNNEL_STALL_PROXY_PID" 2>/dev/null; then
-    kill "$TUNNEL_STALL_PROXY_PID" 2>/dev/null || true
-    wait "$TUNNEL_STALL_PROXY_PID" 2>/dev/null || true
-  fi
-  TUNNEL_STALL_PROXY_PID=""
-}
-
 start_direct_stall_proxy() {
   local proxy_log started deadline
   if [ -n "$DIRECT_STALL_PROXY_PID" ] && kill -0 "$DIRECT_STALL_PROXY_PID" 2>/dev/null; then
@@ -591,10 +538,9 @@ start_direct_stall_proxy() {
   fi
   proxy_log="$ARTIFACTS/direct-stall-proxy.log"
   log "starting direct stall proxy on 0.0.0.0:$DIRECT_STALL_PORT"
-  python3 "$SINOMO_DOCKER_DIR/tcp_tunnel_stall_proxy.py" \
+  python3 "$SINOMO_DOCKER_DIR/direct_stall_proxy.py" \
     --listen-host 0.0.0.0 \
     --listen-port "$DIRECT_STALL_PORT" \
-    --stall-direct \
     >"$proxy_log" 2>&1 &
   DIRECT_STALL_PROXY_PID="$!"
   started="$(date +%s)"
@@ -624,19 +570,6 @@ stop_direct_stall_proxy() {
     wait "$DIRECT_STALL_PROXY_PID" 2>/dev/null || true
   fi
   DIRECT_STALL_PROXY_PID=""
-}
-
-assert_tcp_tunnel_stale_fallback() {
-  local rc
-  log "checking direct RPC fallback after stalled persistent TCP tunnel"
-  start_tunnel_stall_proxy
-  rc=0
-  run_probe node1 cluster.network.tcp-tunnel-stale-fallback \
-    --param target-name=node3 \
-    --param "stall-endpoint-address=host.docker.internal:$TUNNEL_STALL_PORT" \
-    --param "timeout-ms=$TUNNEL_STALE_FALLBACK_TIMEOUT_MS" || rc="$?"
-  stop_tunnel_stall_proxy
-  return "$rc"
 }
 
 assert_stale_direct_demotes_after_timeout() {
@@ -893,7 +826,6 @@ wait_for_cluster_ready
 assert_forwarded_endpoint_configured
 wait_for_network_ready
 assert_endpoint_error_fallback
-assert_tcp_tunnel_stale_fallback
 assert_stale_direct_demotes_after_timeout
 wait_for_network_ready
 run_network_probe node1

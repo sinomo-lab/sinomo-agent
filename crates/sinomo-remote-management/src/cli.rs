@@ -7,9 +7,7 @@ use sinomo_cli_registry::{
     CliCommandMetadata, CliCommandPolicy, CliParseError,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{
-    ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResult,
-};
+use sinomo_core::network::{ObjectRpcBodySource, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResult};
 use sinomo_core::node::{LocalNodePermissionStore, LocalNodePermissions};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,9 +30,9 @@ static TRANSFER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// `None` selects the receiving/local node. A concrete node ID asks the
 /// composition root to route the request to that node.
 pub type RemoteManagementCliRpcFuture =
-    Pin<Box<dyn Future<Output = Result<ObjectRpcSessionResult, String>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<ObjectRpcResult, String>> + Send + 'static>>;
 pub type RemoteManagementCliRpc =
-    Arc<dyn Fn(Option<String>, ObjectRpcSessionCall) -> RemoteManagementCliRpcFuture + Send + Sync>;
+    Arc<dyn Fn(Option<String>, ObjectRpcCall) -> RemoteManagementCliRpcFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct RemoteManagementCliCommandHandler {
@@ -53,8 +51,8 @@ impl fmt::Debug for RemoteManagementCliCommandHandler {
 /// function. The handler contains no direct host-management fallback.
 pub fn remote_cli_command_handler<F, Fut>(rpc: F) -> RemoteManagementCliCommandHandler
 where
-    F: Fn(Option<String>, ObjectRpcSessionCall) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<ObjectRpcSessionResult, String>> + Send + 'static,
+    F: Fn(Option<String>, ObjectRpcCall) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ObjectRpcResult, String>> + Send + 'static,
 {
     RemoteManagementCliCommandHandler {
         rpc: Arc::new(move |target, call| Box::pin(rpc(target, call))),
@@ -1394,7 +1392,7 @@ fn run_remote_get(
     let remote_path = options.remote_path.clone();
     let transfer_path = temp_path.path().to_path_buf();
     let (expected_len, expected_hash, actual_hash) = run_remote_session(async {
-        let result = rpc(target, ObjectRpcSessionCall::value(head))
+        let result = rpc(target, ObjectRpcCall::value(head))
             .await
             .map_err(|error| {
                 format!("remote RPC {REMOTE_MANAGEMENT_FS_READ_ROUTE} failed: {error}")
@@ -1518,7 +1516,7 @@ fn run_remote_put(
     let target = options.common.target.clone();
     let remote_path = options.remote_path.clone();
     let written = run_remote_session(async {
-        let result = rpc(target, ObjectRpcSessionCall::new(head, body))
+        let result = rpc(target, ObjectRpcCall::new(head, body))
             .await
             .map_err(|error| {
                 format!("remote RPC {REMOTE_MANAGEMENT_FS_WRITE_ROUTE} failed: {error}")
@@ -1729,7 +1727,7 @@ where
     })?;
     let target = target.map(str::to_string);
     run_remote_session(async {
-        let result = rpc(target, ObjectRpcSessionCall::value(head))
+        let result = rpc(target, ObjectRpcCall::value(head))
             .await
             .map_err(|error| format!("remote RPC {route} failed: {error}"))?;
         let (response, body) = result.into_parts();
@@ -1998,7 +1996,7 @@ mod tests {
                     }
                     route => return Err(format!("unexpected route {route}")),
                 };
-                Ok(ObjectRpcSessionResult::value(response))
+                Ok(ObjectRpcResult::value(response))
             }
         });
 
@@ -2078,7 +2076,7 @@ mod tests {
                 ),
             )
             .map_err(|error| error.to_string())?;
-            Ok(ObjectRpcSessionResult::value(response))
+            Ok(ObjectRpcResult::value(response))
         });
 
         let (stdout, _) = run_handler(
@@ -2125,7 +2123,7 @@ mod tests {
                     },
                 )
                 .map_err(|error| error.to_string())?;
-                Ok(ObjectRpcSessionResult::value(response))
+                Ok(ObjectRpcResult::value(response))
             }
         });
 
@@ -2163,8 +2161,7 @@ mod tests {
 
     fn transfer_rpc(
         state: Arc<Mutex<FakeTransferState>>,
-    ) -> impl Fn(Option<String>, ObjectRpcSessionCall) -> RemoteManagementCliRpcFuture + Send + Sync
-    {
+    ) -> impl Fn(Option<String>, ObjectRpcCall) -> RemoteManagementCliRpcFuture + Send + Sync {
         move |_target, call| {
             let state = Arc::clone(&state);
             Box::pin(async move {
@@ -2204,7 +2201,7 @@ mod tests {
                             ),
                         )
                         .map_err(|error| error.to_string())?;
-                        Ok(ObjectRpcSessionResult::value(response))
+                        Ok(ObjectRpcResult::value(response))
                     }
                     REMOTE_MANAGEMENT_FS_READ_ROUTE => {
                         let read: RemoteManagementFileReadRequest =
@@ -2229,7 +2226,7 @@ mod tests {
                             ),
                         )
                         .map_err(|error| error.to_string())?;
-                        Ok(ObjectRpcSessionResult::new(
+                        Ok(ObjectRpcResult::new(
                             response,
                             ObjectRpcIncomingBody::bytes(bytes),
                         ))

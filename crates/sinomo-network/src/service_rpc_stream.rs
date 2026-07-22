@@ -1,19 +1,20 @@
-//! Service-catalog adapter for stream-native object RPC.
+//! Typed service-head adapter for stream-native object RPC.
 //!
 //! The service registry continues to own typed [`ObjectRpcRequest`] and
 //! [`ObjectRpcResponse`] values. This module moves that head across the opaque
-//! application-head slot of one Stage-E call and preserves whether the single
+//! application-head slot of one call and preserves whether the single
 //! streamed body is a typed value or a semantic attachment. Routing and the
 //! stream protocol never inspect either service type.
 
 use crate::object_rpc_stream::{
     ObjectRpcStreamBody, ObjectRpcStreamCall, ObjectRpcStreamIncomingBody,
     ObjectRpcStreamIncomingCall, ObjectRpcStreamReply, ObjectRpcStreamResponse, RpcDeliveryOutcome,
-    RpcPeerContext, call_object_rpc_stream, serve_object_rpc_stream,
+    RpcPeerContext, RpcResponseConsumption, call_object_rpc_stream_with_consumption,
+    serve_object_rpc_stream,
 };
-use crate::session::{
-    ObjectRpcIncomingBody, ObjectRpcSessionBodyRole, ObjectRpcSessionCall, ObjectRpcSessionRequest,
-    ObjectRpcSessionResponse, ObjectRpcSessionResult,
+use crate::rpc_body::{
+    ObjectRpcBodyRole, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcIncomingRequest,
+    ObjectRpcOutgoingResponse, ObjectRpcResult,
 };
 use crate::{
     NetworkDeliveryState, NetworkError, ObjectFrameIoOptions, ObjectRpcRequest, ObjectRpcResponse,
@@ -24,20 +25,20 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::io::{AsyncReadExt, AsyncWrite};
 
-const SERVICE_RPC_STREAM_PROTOCOL: &str = "sinomo.service-rpc.stream.v1";
+const SERVICE_RPC_HEAD_SCHEMA: &str = "sinomo.service-rpc.head.v1";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ServiceRequestHead {
-    protocol: String,
+    schema: String,
     request: ObjectRpcRequest,
-    body_role: ObjectRpcSessionBodyRole,
+    body_role: ObjectRpcBodyRole,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ServiceResponseHead {
-    protocol: String,
+    schema: String,
     response: ObjectRpcResponse,
-    body_role: ObjectRpcSessionBodyRole,
+    body_role: ObjectRpcBodyRole,
 }
 
 fn encode_service_head<T: Serialize>(head: &T) -> Result<Vec<u8>, NetworkError> {
@@ -46,9 +47,9 @@ fn encode_service_head<T: Serialize>(head: &T) -> Result<Vec<u8>, NetworkError> 
 
 fn decode_service_request_head(bytes: &[u8]) -> Result<ServiceRequestHead, NetworkError> {
     let head: ServiceRequestHead = SinomoObjectCodec::network_frame().decode(bytes)?;
-    if head.protocol != SERVICE_RPC_STREAM_PROTOCOL {
+    if head.schema != SERVICE_RPC_HEAD_SCHEMA {
         return Err(NetworkError::Serialization {
-            detail: format!("unsupported service RPC stream protocol {}", head.protocol),
+            detail: format!("unsupported service RPC head schema {}", head.schema),
         });
     }
     Ok(head)
@@ -56,29 +57,27 @@ fn decode_service_request_head(bytes: &[u8]) -> Result<ServiceRequestHead, Netwo
 
 fn decode_service_response_head(bytes: &[u8]) -> Result<ServiceResponseHead, NetworkError> {
     let head: ServiceResponseHead = SinomoObjectCodec::network_frame().decode(bytes)?;
-    if head.protocol != SERVICE_RPC_STREAM_PROTOCOL {
+    if head.schema != SERVICE_RPC_HEAD_SCHEMA {
         return Err(NetworkError::Serialization {
-            detail: format!("unsupported service RPC stream protocol {}", head.protocol),
+            detail: format!("unsupported service RPC head schema {}", head.schema),
         });
     }
     Ok(head)
 }
 
 fn validate_service_body_role(
-    role: ObjectRpcSessionBodyRole,
+    role: ObjectRpcBodyRole,
     total_bytes: Option<u64>,
 ) -> Result<(), NetworkError> {
     match (role, total_bytes) {
-        (ObjectRpcSessionBodyRole::None, Some(0))
-        | (ObjectRpcSessionBodyRole::None, None)
-        | (ObjectRpcSessionBodyRole::Value | ObjectRpcSessionBodyRole::Attachment, None)
-        | (ObjectRpcSessionBodyRole::Value | ObjectRpcSessionBodyRole::Attachment, Some(1..)) => {
-            Ok(())
-        }
-        (ObjectRpcSessionBodyRole::None, Some(length)) => Err(NetworkError::Serialization {
+        (ObjectRpcBodyRole::None, Some(0))
+        | (ObjectRpcBodyRole::None, None)
+        | (ObjectRpcBodyRole::Value | ObjectRpcBodyRole::Attachment, None)
+        | (ObjectRpcBodyRole::Value | ObjectRpcBodyRole::Attachment, Some(1..)) => Ok(()),
+        (ObjectRpcBodyRole::None, Some(length)) => Err(NetworkError::Serialization {
             detail: format!("service RPC none body declared {length} bytes"),
         }),
-        (ObjectRpcSessionBodyRole::Value | ObjectRpcSessionBodyRole::Attachment, Some(0)) => {
+        (ObjectRpcBodyRole::Value | ObjectRpcBodyRole::Attachment, Some(0)) => {
             Err(NetworkError::Serialization {
                 detail: "service RPC non-empty body role declared an empty body".to_string(),
             })
@@ -114,7 +113,7 @@ fn bridge_stream_body(body: ObjectRpcStreamIncomingBody) -> ObjectRpcIncomingBod
                 })?;
                 if !sender.send(Bytes::copy_from_slice(&buffer[..read])).await? {
                     // The public consumer has gone away. Keep draining the
-                    // Stage-E body so its authenticated finish and the peer's
+                    // incoming body so its authenticated finish and the peer's
                     // response lifecycle can still complete.
                 }
             }
@@ -129,31 +128,37 @@ fn bridge_stream_body(body: ObjectRpcStreamIncomingBody) -> ObjectRpcIncomingBod
 
 async fn service_request_from_stream(
     incoming: ObjectRpcStreamIncomingCall,
-) -> Result<ObjectRpcSessionRequest, NetworkError> {
+) -> Result<ObjectRpcIncomingRequest, NetworkError> {
     let ObjectRpcStreamIncomingCall {
+        request_id: _,
         method,
         operation_id,
+        metadata,
         application_head,
         body,
-        ..
     } = incoming;
+    if !metadata.is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: "service RPC outer request metadata must be empty".to_string(),
+        });
+    }
     let mut head = decode_service_request_head(&application_head)?;
     if head.request.route != method || head.request.operation_id() != operation_id.as_deref() {
         return Err(NetworkError::AuthDenied);
     }
     validate_service_body_role(head.body_role, body.total_bytes())?;
     match head.body_role {
-        ObjectRpcSessionBodyRole::None => Ok(ObjectRpcSessionRequest::value(head.request)),
-        ObjectRpcSessionBodyRole::Value => {
+        ObjectRpcBodyRole::None => Ok(ObjectRpcIncomingRequest::value(head.request)),
+        ObjectRpcBodyRole::Value => {
             if !head.request.body.is_empty() {
                 return Err(NetworkError::Serialization {
                     detail: "service RPC value is present in both head and stream".to_string(),
                 });
             }
             head.request.body = body.collect_to_vec(usize::MAX).await?;
-            Ok(ObjectRpcSessionRequest::value(head.request))
+            Ok(ObjectRpcIncomingRequest::value(head.request))
         }
-        ObjectRpcSessionBodyRole::Attachment => Ok(ObjectRpcSessionRequest::new(
+        ObjectRpcBodyRole::Attachment => Ok(ObjectRpcIncomingRequest::new(
             head.request,
             bridge_stream_body(body),
         )),
@@ -162,11 +167,11 @@ async fn service_request_from_stream(
 
 fn service_reply_to_stream(
     request_id: sinomo_base::Id,
-    response: ObjectRpcSessionResponse,
+    response: ObjectRpcOutgoingResponse,
 ) -> Result<ObjectRpcStreamReply, NetworkError> {
     let (response, body_role, body) = response.into_stream_native_parts();
     let application_head = encode_service_head(&ServiceResponseHead {
-        protocol: SERVICE_RPC_STREAM_PROTOCOL.to_string(),
+        schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
         response,
         body_role,
     })?;
@@ -181,39 +186,51 @@ fn service_reply_to_stream(
 async fn service_result_from_stream(
     expected_route: String,
     response: ObjectRpcStreamResponse,
-) -> Result<ObjectRpcSessionResult, NetworkError> {
-    let mut head = decode_service_response_head(&response.application_head)?;
+) -> Result<RpcResponseConsumption<ObjectRpcResult>, NetworkError> {
+    let ObjectRpcStreamResponse {
+        metadata,
+        application_head,
+        body,
+    } = response;
+    if !metadata.is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: "service RPC outer response metadata must be empty".to_string(),
+        });
+    }
+    let mut head = decode_service_response_head(&application_head)?;
     if head.response.route != expected_route {
         return Err(NetworkError::AuthDenied);
     }
-    validate_service_body_role(head.body_role, response.body.total_bytes())?;
+    validate_service_body_role(head.body_role, body.total_bytes())?;
     match head.body_role {
-        ObjectRpcSessionBodyRole::None => Ok(ObjectRpcSessionResult::value(head.response)),
-        ObjectRpcSessionBodyRole::Value => {
+        ObjectRpcBodyRole::None => Ok(RpcResponseConsumption::Complete(ObjectRpcResult::value(
+            head.response,
+        ))),
+        ObjectRpcBodyRole::Value => {
             if !head.response.body.is_empty() {
                 return Err(NetworkError::Serialization {
                     detail: "service RPC response value is present in both head and stream"
                         .to_string(),
                 });
             }
-            head.response.body = response.body.collect_to_vec(usize::MAX).await?;
-            Ok(ObjectRpcSessionResult::value(head.response))
+            head.response.body = body.collect_to_vec(usize::MAX).await?;
+            Ok(RpcResponseConsumption::Complete(ObjectRpcResult::value(
+                head.response,
+            )))
         }
-        ObjectRpcSessionBodyRole::Attachment => Ok(ObjectRpcSessionResult::new(
-            head.response,
-            bridge_stream_body(response.body),
+        ObjectRpcBodyRole::Attachment => Ok(RpcResponseConsumption::Streaming(
+            ObjectRpcResult::new(head.response, bridge_stream_body(body)),
         )),
     }
 }
 
-#[doc(hidden)]
-pub async fn call_service_rpc_stream<S>(
+pub(crate) async fn call_service_rpc_stream<S>(
     stream: S,
     context: &RpcPeerContext,
-    call: ObjectRpcSessionCall,
+    call: ObjectRpcCall,
     request_auth: Vec<u8>,
     options: ObjectFrameIoOptions,
-) -> Result<ObjectRpcSessionResult, NetworkError>
+) -> Result<ObjectRpcResult, NetworkError>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -222,7 +239,7 @@ where
     let (mut request, body_role, body) = call.into_stream_native_parts();
     request.auth = Some(request_auth);
     let application_head = encode_service_head(&ServiceRequestHead {
-        protocol: SERVICE_RPC_STREAM_PROTOCOL.to_string(),
+        schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
         request,
         body_role,
     })?;
@@ -234,9 +251,13 @@ where
         application_head,
         body: ObjectRpcStreamBody::source(body),
     };
-    match call_object_rpc_stream(stream, context, stream_call, options, move |response| {
-        service_result_from_stream(route, response)
-    })
+    match call_object_rpc_stream_with_consumption(
+        stream,
+        context,
+        stream_call,
+        options,
+        move |response| service_result_from_stream(route, response),
+    )
     .await
     {
         RpcDeliveryOutcome::Completed(result) => Ok(result),
@@ -268,7 +289,6 @@ where
     }
 }
 
-#[doc(hidden)]
 pub async fn serve_service_rpc_stream<S, F, Fut>(
     stream: S,
     context: &RpcPeerContext,
@@ -277,8 +297,8 @@ pub async fn serve_service_rpc_stream<S, F, Fut>(
 ) -> Result<(), NetworkError>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(ObjectRpcSessionRequest, RpcPeerContext) -> Fut,
-    Fut: Future<Output = Result<ObjectRpcSessionResponse, NetworkError>>,
+    F: FnOnce(ObjectRpcIncomingRequest, RpcPeerContext) -> Fut,
+    Fut: Future<Output = Result<ObjectRpcOutgoingResponse, NetworkError>>,
 {
     serve_object_rpc_stream(stream, context, options, move |incoming, peer| async move {
         let request_id = incoming.request_id.clone();
@@ -326,7 +346,7 @@ mod tests {
     async fn round_trip(
         request_bytes: usize,
         response_bytes: usize,
-    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+    ) -> Result<ObjectRpcResult, NetworkError> {
         let (client, server) = tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
         let client_context = local_context();
         let server_context = client_context.clone();
@@ -342,7 +362,7 @@ mod tests {
                         "/test/service-stream",
                         vec![9; response_bytes],
                     )
-                    .pipe(ObjectRpcSessionResponse::value)
+                    .pipe(ObjectRpcOutgoingResponse::value)
                     .pipe(Ok)
                 },
             )
@@ -356,7 +376,7 @@ mod tests {
         let result = call_service_rpc_stream(
             client,
             &client_context,
-            ObjectRpcSessionCall::value(request),
+            ObjectRpcCall::value(request),
             b"test-auth".to_vec(),
             ObjectFrameIoOptions::default(),
         )
@@ -439,7 +459,7 @@ mod tests {
                         .await
                         .expect("read request attachment");
                     assert_eq!(attachment, vec![3; bytes]);
-                    Ok(ObjectRpcSessionResponse::new(
+                    Ok(ObjectRpcOutgoingResponse::new(
                         ObjectRpcResponse::from_encoded_body(
                             "/test/service-attachment",
                             b"typed-response-head".to_vec(),
@@ -453,7 +473,7 @@ mod tests {
         let result = call_service_rpc_stream(
             client,
             &client_context,
-            ObjectRpcSessionCall::new(
+            ObjectRpcCall::new(
                 ObjectRpcRequest::from_encoded_body(
                     "/test/service-attachment",
                     "test.service-attachment",
@@ -495,6 +515,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_service_attachment_reports_a_terminal_digest_failure() {
+        let bytes = crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES + 1;
+        let (client, server) = tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
+        let client_context = local_context();
+        let server_context = client_context.clone();
+        let server_task = tokio::spawn(async move {
+            serve_object_rpc_stream(
+                server,
+                &server_context,
+                ObjectFrameIoOptions::default(),
+                move |incoming, _| async move {
+                    let application_head = encode_service_head(&ServiceResponseHead {
+                        schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
+                        response: ObjectRpcResponse::from_encoded_body(
+                            "/test/service-corrupt-attachment",
+                            b"typed-response-head".to_vec(),
+                        ),
+                        body_role: ObjectRpcBodyRole::Attachment,
+                    })?;
+                    let body = ObjectRpcStreamBody::known(
+                        crate::ObjectRpcBodySource::bytes(vec![5; bytes]),
+                        [7; 32],
+                    )?;
+                    Ok(ObjectRpcStreamReply {
+                        request_id: incoming.request_id,
+                        metadata: Default::default(),
+                        application_head,
+                        body,
+                    })
+                },
+            )
+            .await
+        });
+
+        let result = call_service_rpc_stream(
+            client,
+            &client_context,
+            ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
+                "/test/service-corrupt-attachment",
+                "test.service-corrupt-attachment",
+                b"typed-request-head".to_vec(),
+            )),
+            b"origin-auth".to_vec(),
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect("response head is available before attachment completion");
+        let error = result
+            .body
+            .collect_to_vec(bytes)
+            .await
+            .expect_err("corrupt response attachment must fail while streaming");
+        assert!(
+            error.to_string().contains("body reader ended")
+                || error
+                    .to_string()
+                    .contains("changed after its authenticated descriptor")
+                || error.to_string().contains("early eof"),
+            "unexpected attachment verification failure: {error}"
+        );
+        assert!(
+            server_task
+                .await
+                .expect("server task")
+                .expect_err("server must reject its mismatched declared digest")
+                .to_string()
+                .contains("changed after its authenticated descriptor")
+        );
+    }
+
+    #[tokio::test]
     async fn stream_native_service_proxy_preserves_declared_attachment_lengths() {
         let request_bytes =
             crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES * 3 + 17;
@@ -524,7 +615,7 @@ mod tests {
                         .await
                         .expect("read proxied request attachment");
                     assert_eq!(received, vec![0; request_bytes]);
-                    Ok(ObjectRpcSessionResponse::new(
+                    Ok(ObjectRpcOutgoingResponse::new(
                         ObjectRpcResponse::from_encoded_body(
                             "/test/service-proxy-attachment",
                             b"proxied-response-head".to_vec(),
@@ -543,7 +634,7 @@ mod tests {
                 ObjectFrameIoOptions::default(),
                 move |request, _| async move {
                     assert_eq!(request.body.total_bytes(), Some(request_bytes as u64));
-                    let call = ObjectRpcSessionCall::from_relay_body(request.request, request.body);
+                    let call = ObjectRpcCall::from_forwarded_body(request.request, request.body);
                     let result = call_service_rpc_stream(
                         proxy_outgoing,
                         &downstream_proxy_context,
@@ -553,7 +644,7 @@ mod tests {
                     )
                     .await?;
                     assert_eq!(result.body.total_bytes(), Some(response_bytes as u64));
-                    result.into_relay_response()
+                    result.into_forwarded_response()
                 },
             )
             .await
@@ -562,7 +653,7 @@ mod tests {
         let result = call_service_rpc_stream(
             client,
             &upstream_client_context,
-            ObjectRpcSessionCall::new(
+            ObjectRpcCall::new(
                 ObjectRpcRequest::from_encoded_body(
                     "/test/service-proxy-attachment",
                     "test.service-proxy-attachment",

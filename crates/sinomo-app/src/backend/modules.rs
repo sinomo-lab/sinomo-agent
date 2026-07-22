@@ -497,7 +497,7 @@ impl Backend {
         let inner = ObjectRpcRequest::encode_body(route, CONFIG_RPC_CATEGORY, body)
             .map_err(|error| error.to_string())?;
         let response = DaemonApiClient::at_address(address)
-            .relay_signed_request_to_node_from_data_dir(
+            .object_rpc_to_target_from_data_dir(
                 self.data_dir.as_ref(),
                 &target_node_id,
                 inner,

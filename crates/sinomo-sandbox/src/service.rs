@@ -485,7 +485,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use sinomo_core::local::SinomoDataDir;
-    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
+    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
 
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
 
@@ -495,7 +495,7 @@ mod tests {
     }
 
     impl ResponseSink for CollectingSink {
-        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+        fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
             if !response.body.is_empty() {
                 return Err(ServiceError::Service(
                     "sandbox test sink received an unexpected response body".to_string(),

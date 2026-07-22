@@ -14,11 +14,11 @@
 //! [`set_network_module_registry`] (same pattern as the cluster directory
 //! provider in `directory.rs`).
 
+use crate::NetworkHealthPolicy;
 use crate::direct_link::{
     AuthenticatedLink, AuthenticatedTransportMetadata, DirectLinkFuture, LinkProvider,
 };
 use crate::error::NetworkError;
-use crate::transfer::NetworkHealthPolicy;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_base::{ClusterEndpointRecord, ClusterTransportKind};
@@ -28,57 +28,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
-
-/// Daemon object-RPC route listing registered network modules and their
-/// enabled state ([`NetworkModuleListResponse`]).
-pub const NETWORK_MODULES_LIST_ROUTE: &str = "/network/modules";
-/// Daemon object-RPC route toggling one network module at runtime
-/// ([`NetworkModuleSetEnabledRequest`] -> [`NetworkModuleSetEnabledResponse`]).
-pub const NETWORK_MODULES_SET_ENABLED_ROUTE: &str = "/network/modules/set-enabled";
-/// Wire category shared by the network-module control routes.
-pub const NETWORK_MODULES_RPC_CATEGORY: &str = "network.modules";
-/// Capability tag advertised for network-module administration.
-pub const NETWORK_MODULES_ADMIN_CAPABILITY: &str = "network.modules.admin";
-
-/// Every network-module control object-RPC route.
-pub const NETWORK_MODULES_RPC_ROUTES: &[&str] = &[
-    NETWORK_MODULES_LIST_ROUTE,
-    NETWORK_MODULES_SET_ENABLED_ROUTE,
-];
-
-/// Auth policy for one network-module control route; same shape as
-/// `sinomo_cluster::ClusterControlRoutePolicy` so the daemon can build its
-/// service routes uniformly.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NetworkModuleRoutePolicy {
-    pub route: &'static str,
-    pub category: &'static str,
-    pub auth: crate::NetworkModuleRouteAuth,
-    pub required_capabilities: &'static [&'static str],
-}
-
-const fn network_modules_admin_policy(route: &'static str) -> NetworkModuleRoutePolicy {
-    NetworkModuleRoutePolicy {
-        route,
-        category: NETWORK_MODULES_RPC_CATEGORY,
-        auth: crate::NetworkModuleRouteAuth::Admin,
-        required_capabilities: &[NETWORK_MODULES_ADMIN_CAPABILITY],
-    }
-}
-
-/// Auth policy table: module listing and toggling are administrative
-/// operations (local daemon identity or a cluster raft voter).
-pub const NETWORK_MODULES_RPC_ROUTE_POLICIES: &[NetworkModuleRoutePolicy] = &[
-    network_modules_admin_policy(NETWORK_MODULES_LIST_ROUTE),
-    network_modules_admin_policy(NETWORK_MODULES_SET_ENABLED_ROUTE),
-];
-
-/// Looks up the auth policy for a network-module control route.
-pub fn network_modules_rpc_route_policy(route: &str) -> Option<&'static NetworkModuleRoutePolicy> {
-    NETWORK_MODULES_RPC_ROUTE_POLICIES
-        .iter()
-        .find(|policy| policy.route == route)
-}
 
 /// Boxed future returned by network-module dial operations. `'static` so the
 /// host can spawn or hold the dial without borrowing the module call site.
@@ -264,8 +213,7 @@ struct NetworkModuleEntry {
     started: bool,
 }
 
-/// Descriptor + runtime state, as reported by [`NetworkModuleRegistry::snapshot`]
-/// and the `/network/modules` route.
+/// Descriptor + runtime state reported by [`NetworkModuleRegistry::snapshot`].
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NetworkModuleStatus {
     pub descriptor: NetworkModuleDescriptor,
@@ -275,26 +223,6 @@ pub struct NetworkModuleStatus {
     /// a cluster identity stays `started: false` until a context arrives.
     #[serde(default)]
     pub started: bool,
-}
-
-/// Response payload of [`NETWORK_MODULES_LIST_ROUTE`].
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NetworkModuleListResponse {
-    pub modules: Vec<NetworkModuleStatus>,
-}
-
-/// Request payload of [`NETWORK_MODULES_SET_ENABLED_ROUTE`].
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NetworkModuleSetEnabledRequest {
-    /// Network module id ([`NetworkModuleDescriptor::id`]).
-    pub id: String,
-    pub enabled: bool,
-}
-
-/// Response payload of [`NETWORK_MODULES_SET_ENABLED_ROUTE`].
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NetworkModuleSetEnabledResponse {
-    pub module: NetworkModuleStatus,
 }
 
 /// Registry of runtime network modules keyed by module id.
@@ -519,7 +447,7 @@ impl NetworkModuleRegistry {
     }
 
     /// Enabled dialer module claiming this endpoint by transport or address
-    /// scheme. Scheme dispatch remains useful for module-defined carriers
+    /// scheme. Scheme dispatch remains useful for module-defined transports
     /// represented by a generic transport kind.
     pub fn module_for_endpoint(
         &self,

@@ -25,138 +25,33 @@ pub const NETWORK_TIMELINE_MAX_ENDPOINT_IDENTITIES: usize = 256;
 /// translated to names only after a capture has stopped.
 pub mod network_timeline_stage {
     pub const CALL_PREPARE: u16 = 1;
-    pub const CALL_ADMISSION: u16 = 2;
-    pub const TX_QUEUE_WAIT: u16 = 3;
-    pub const FRAME_WRITE: u16 = 4;
     pub const FRAME_INGRESS: u16 = 5;
-    pub const SERVER_QUEUE_WAIT: u16 = 6;
-    pub const PRINCIPAL_VALIDATE: u16 = 7;
-    pub const ROUTE_AUTHORIZE: u16 = 8;
-    pub const HANDLER_DISPATCH: u16 = 9;
-    pub const RESPONSE_PREPARE: u16 = 10;
-    pub const PENDING_RESOLVE: u16 = 11;
     pub const CALL_COMPLETE: u16 = 12;
-    pub const ROUTE_PLAN: u16 = 13;
-    pub const CHANNEL_LOOKUP: u16 = 14;
     pub const FORWARD_DECODE: u16 = 15;
     pub const FORWARD_ENCODE: u16 = 16;
-    pub const ROUTE_NEXT_HOP_KEY: u16 = 17;
-    pub const ROUTE_TARGET_HINTS: u16 = 18;
     pub const REQUEST_SIGN: u16 = 19;
-    pub const RELAY_PREPARE: u16 = 20;
     pub const ENDPOINT_OPEN: u16 = 21;
-    pub const REQUEST_VERIFY: u16 = 22;
-    pub const BODY_BIND: u16 = 23;
-    pub const ROUTE_POLICY: u16 = 24;
-    pub const CHANNEL_CLOSE: u16 = 25;
-    /// Timestamp marker at the receiver's first successful physical read for
-    /// a frame. Its duration is always zero; pair it with the sender's socket
-    /// write completion to isolate kernel delivery and runtime wakeup.
-    pub const FRAME_FIRST_READ: u16 = 26;
-    /// Time from the first successful physical read through complete object
-    /// frame body read and its bounded allocation.
     pub const FRAME_READ: u16 = 27;
-    /// SOBJ frame encoding and allocation before the physical write begins.
-    pub const FRAME_ENCODE: u16 = 28;
-    /// Physical frame write/flush after SOBJ encoding has completed.
     pub const FRAME_SOCKET_WRITE: u16 = 29;
-    /// SOBJ decode after the complete encoded frame body has been read.
-    pub const FRAME_DECODE: u16 = 30;
-    /// Time between Tokio's I/O readiness Waker firing for the persistent
-    /// carrier and the carrier task next polling its first frame read. This is
-    /// the receiver-local runnable scheduling delay; it deliberately excludes
-    /// kernel delivery and the subsequent read syscall.
-    pub const FRAME_READY_TO_POLL: u16 = 31;
-    /// Synchronous routing-table cache lookup, including validation of a
-    /// cached entry. `aux == 1` denotes a cache hit and `aux == 0` a miss.
-    pub const ROUTE_CACHE_LOOKUP: u16 = 32;
-    /// Time from submitting an uncached route calculation to Tokio's blocking
-    /// pool until the blocking worker starts running it.
-    pub const ROUTE_BLOCKING_QUEUE: u16 = 33;
-    /// Wall time spent rebuilding an uncached cluster delivery routing table
-    /// on a Tokio blocking worker.
-    pub const ROUTE_TABLE_BUILD: u16 = 34;
-    /// Wall time spent selecting a route from a freshly built routing table
-    /// on a Tokio blocking worker.
-    pub const ROUTE_TABLE_PLAN: u16 = 35;
-    /// Total wall time spent attempting to reuse the relay envelope's planned
-    /// path. `aux == 1` denotes a usable plan and `aux == 0` a fallback.
-    pub const ROUTE_RELAY_PLANNED_PATH: u16 = 36;
-    /// Wall time spent reading the local connectivity graph while selecting
-    /// relay endpoints from a planned path or target hint.
-    pub const ROUTE_RELAY_CONNECTIVITY_READ: u16 = 37;
-    /// Total wall time spent attempting the dynamic routing-table fallback.
-    /// `aux == 1` denotes a usable plan and `aux == 0` a further fallback.
-    pub const ROUTE_RELAY_DYNAMIC_FALLBACK: u16 = 38;
-    /// Total wall time spent attempting the relay envelope's target endpoint
-    /// hints. `aux == 1` denotes a usable plan and `aux == 0` no route.
-    pub const ROUTE_RELAY_TARGET_HINT_FALLBACK: u16 = 39;
 }
 
 pub mod network_timeline_flag {
     pub const REQUEST: u16 = 1 << 0;
     pub const RESPONSE: u16 = 1 << 1;
-    pub const LOCAL_CARRIER: u16 = 1 << 2;
-    pub const TUNNEL_CARRIER: u16 = 1 << 3;
     pub const SUCCESS: u16 = 1 << 4;
-    pub const CONTROL_FRAME: u16 = 1 << 5;
-    pub const DATA_FRAME: u16 = 1 << 6;
-}
-
-/// Stable `aux` values for `route.channel-lookup` events. The event's
-/// `connection_id` identifies an available/closed logical channel and its
-/// `bytes` field retains the call-site attempt/context counter.
-pub mod network_timeline_channel_lookup_outcome {
-    pub const INCOMPATIBLE: u32 = 0;
-    pub const AVAILABLE: u32 = 1;
-    pub const ABSENT: u32 = 2;
-    pub const CLOSED: u32 = 3;
-    pub const ERROR: u32 = 4;
 }
 
 pub const fn network_timeline_stage_name(stage: u16) -> &'static str {
     match stage {
         network_timeline_stage::CALL_PREPARE => "call.prepare",
-        network_timeline_stage::CALL_ADMISSION => "call.admission",
-        network_timeline_stage::TX_QUEUE_WAIT => "channel.tx-queue-wait",
-        network_timeline_stage::FRAME_WRITE => "frame.write",
         network_timeline_stage::FRAME_INGRESS => "frame.ingress",
-        network_timeline_stage::SERVER_QUEUE_WAIT => "server.queue-wait",
-        network_timeline_stage::PRINCIPAL_VALIDATE => "auth.principal-validate",
-        network_timeline_stage::ROUTE_AUTHORIZE => "auth.route-authorize",
-        network_timeline_stage::HANDLER_DISPATCH => "handler.dispatch",
-        network_timeline_stage::RESPONSE_PREPARE => "response.prepare",
-        network_timeline_stage::PENDING_RESOLVE => "pending.resolve",
         network_timeline_stage::CALL_COMPLETE => "call.complete",
-        network_timeline_stage::ROUTE_PLAN => "route.plan",
-        network_timeline_stage::CHANNEL_LOOKUP => "route.channel-lookup",
         network_timeline_stage::FORWARD_DECODE => "forward.decode",
         network_timeline_stage::FORWARD_ENCODE => "forward.encode",
-        network_timeline_stage::ROUTE_NEXT_HOP_KEY => "route.next-hop-key",
-        network_timeline_stage::ROUTE_TARGET_HINTS => "route.target-hints",
         network_timeline_stage::REQUEST_SIGN => "auth.request-sign",
-        network_timeline_stage::RELAY_PREPARE => "forward.prepare",
         network_timeline_stage::ENDPOINT_OPEN => "route.endpoint-open",
-        network_timeline_stage::REQUEST_VERIFY => "auth.request-verify",
-        network_timeline_stage::BODY_BIND => "body.bind-signed-inner",
-        network_timeline_stage::ROUTE_POLICY => "auth.route-policy",
-        network_timeline_stage::CHANNEL_CLOSE => "channel.close",
-        network_timeline_stage::FRAME_FIRST_READ => "frame.first-read",
         network_timeline_stage::FRAME_READ => "frame.read",
-        network_timeline_stage::FRAME_ENCODE => "frame.encode",
         network_timeline_stage::FRAME_SOCKET_WRITE => "frame.socket-write",
-        network_timeline_stage::FRAME_DECODE => "frame.decode",
-        network_timeline_stage::FRAME_READY_TO_POLL => "frame.ready-to-poll",
-        network_timeline_stage::ROUTE_CACHE_LOOKUP => "route.cache-lookup",
-        network_timeline_stage::ROUTE_BLOCKING_QUEUE => "route.blocking-queue",
-        network_timeline_stage::ROUTE_TABLE_BUILD => "route.table-build",
-        network_timeline_stage::ROUTE_TABLE_PLAN => "route.table-plan",
-        network_timeline_stage::ROUTE_RELAY_PLANNED_PATH => "route.relay-planned-path",
-        network_timeline_stage::ROUTE_RELAY_CONNECTIVITY_READ => "route.relay-connectivity-read",
-        network_timeline_stage::ROUTE_RELAY_DYNAMIC_FALLBACK => "route.relay-dynamic-fallback",
-        network_timeline_stage::ROUTE_RELAY_TARGET_HINT_FALLBACK => {
-            "route.relay-target-hint-fallback"
-        }
         _ => "unknown",
     }
 }
@@ -496,17 +391,6 @@ pub fn network_timeline_capture_is_active() -> bool {
     CAPTURE_STATE.load(Ordering::Relaxed) == CAPTURE_ACTIVE
 }
 
-/// Returns a non-zero token for the currently active capture. Readiness probes
-/// retain this token across a socket wake so a stopped capture cannot leak a
-/// timestamp into a later capture.
-#[inline]
-pub(crate) fn network_timeline_capture_generation() -> u64 {
-    if CAPTURE_STATE.load(Ordering::Relaxed) != CAPTURE_ACTIVE {
-        return 0;
-    }
-    CAPTURE_GENERATION.load(Ordering::Acquire)
-}
-
 pub fn start_network_timeline_capture(
     max_events: usize,
 ) -> Result<(), NetworkTimelineCaptureError> {
@@ -727,60 +611,12 @@ mod tests {
     #[test]
     fn traceparent_parser_extracts_ids_and_rejects_invalid_ids() {
         assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::FRAME_FIRST_READ),
-            "frame.first-read"
-        );
-        assert_eq!(
             network_timeline_stage_name(network_timeline_stage::FRAME_READ),
             "frame.read"
         );
         assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::FRAME_ENCODE),
-            "frame.encode"
-        );
-        assert_eq!(
             network_timeline_stage_name(network_timeline_stage::FRAME_SOCKET_WRITE),
             "frame.socket-write"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::FRAME_DECODE),
-            "frame.decode"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::FRAME_READY_TO_POLL),
-            "frame.ready-to-poll"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_CACHE_LOOKUP),
-            "route.cache-lookup"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_BLOCKING_QUEUE),
-            "route.blocking-queue"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_TABLE_BUILD),
-            "route.table-build"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_TABLE_PLAN),
-            "route.table-plan"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_RELAY_PLANNED_PATH),
-            "route.relay-planned-path"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_RELAY_CONNECTIVITY_READ),
-            "route.relay-connectivity-read"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_RELAY_DYNAMIC_FALLBACK),
-            "route.relay-dynamic-fallback"
-        );
-        assert_eq!(
-            network_timeline_stage_name(network_timeline_stage::ROUTE_RELAY_TARGET_HINT_FALLBACK),
-            "route.relay-target-hint-fallback"
         );
         let parsed = parse_network_timeline_traceparent(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",

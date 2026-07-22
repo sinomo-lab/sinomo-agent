@@ -8,7 +8,7 @@
 ///
 /// It intentionally consumes lower-level DFS facts: content hashes are abstract
 /// values, request routing is outside the model, and repair transfer correctness
-/// is covered by the repair/content model and the network session contract.
+/// is covered by the repair/content model and the routed-stream contract.
 module dfs_anti_entropy {
   import common.* from "../../lib/common"
 

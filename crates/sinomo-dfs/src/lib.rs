@@ -166,12 +166,11 @@ pub use default_cluster::{
 pub(crate) use direct_read::dfs_direct_read_request_from_read_request;
 #[cfg(test)]
 pub(crate) use direct_read::{
-    DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY,
-    dfs_direct_read_rpc_session_result,
+    DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY, dfs_direct_read_rpc_result,
 };
 pub use direct_read::{
     DfsDirectReadAttachmentResponse, DfsDirectReadClientData, DfsDirectReadClientResponse,
-    DfsDirectReadClientResult, dfs_direct_read_response_from_rpc_session_result,
+    DfsDirectReadClientResult, dfs_direct_read_response_from_rpc_result,
     dfs_direct_read_rpc_request, handle_dfs_direct_read_rpc_request,
 };
 pub use discovery::{
@@ -386,8 +385,8 @@ pub(crate) use node_transport::{
 pub use node_transport::{
     AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
     DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture, dfs_message_response_from_rpc_session_result,
-    dfs_message_response_from_rpc_session_result_sync, dfs_routed_call_rpc_session_call,
+    DfsPeerTransportError, DfsPeerTransportFuture, dfs_message_response_from_rpc_result,
+    dfs_message_response_from_rpc_result_sync, dfs_routed_call_rpc_call,
 };
 pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
 #[cfg(test)]

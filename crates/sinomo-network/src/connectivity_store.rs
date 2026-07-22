@@ -89,7 +89,8 @@ fn bump_local_cluster_connectivity_content_generation(paths: &ClusterPaths) {
 /// all: the store retains its current evidence until expiry renewal is due or
 /// a material reachability/topology field changes. Delivery routing tables
 /// therefore remain stable across ordinary probe and command-RPC success.
-pub(crate) fn local_cluster_connectivity_routing_generation(paths: &ClusterPaths) -> u64 {
+#[cfg(test)]
+fn local_cluster_connectivity_routing_generation(paths: &ClusterPaths) -> u64 {
     LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATIONS
         .lock()
         .ok()
@@ -759,8 +760,8 @@ pub async fn prune_local_cluster_connectivity_records_for_state_async(
 
 /// Result of an atomic topology-prune plus source-set replacement.
 ///
-/// This is an internal carrier between the daemon's reactive projection owner
-/// and the local connectivity store. A superseded result is read-only and
+/// This is the internal contract between the daemon's reactive projection
+/// owner and the local connectivity store. A superseded result is read-only and
 /// returns the newer source snapshot that prevented the stale mutation.
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1191,9 +1192,6 @@ impl LocalConnectivityTopology {
         {
             return false;
         }
-        if local_connectivity_record_is_synthetic_tcp_tunnel(record) {
-            return true;
-        }
         self.endpoints
             .get(&record.endpoint_id)
             .is_some_and(|endpoint| {
@@ -1202,14 +1200,6 @@ impl LocalConnectivityTopology {
                     && endpoint.address == record.address
             })
     }
-}
-
-fn local_connectivity_record_is_synthetic_tcp_tunnel(record: &ClusterConnectivityRecord) -> bool {
-    record.transport == ClusterTransportKind::LanTcp
-        && record
-            .address
-            .strip_prefix(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
-            == Some(record.target_node_id.as_str())
 }
 
 fn local_cluster_connectivity_cache_tick() -> u64 {
@@ -3208,34 +3198,10 @@ mod tests {
             now,
             CLUSTER_CONNECTIVITY_TTL_SECONDS,
         );
-        let tunnel = ClusterConnectivityRecord {
-            cluster_id: state.cluster_id.clone(),
-            source_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            endpoint_id: ClusterEndpointId::derived(
-                "sinomo.test.connectivity.prune.tunnel",
-                b"tunnel",
-            ),
-            transport: ClusterTransportKind::LanTcp,
-            address: format!(
-                "{}{}",
-                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
-                remote.as_str()
-            ),
-            state: ClusterConnectivityState::Healthy,
-            latency_ms: Some(0),
-            consecutive_failures: 0,
-            last_success_at: Some("tunnel".to_string()),
-            last_failure_at: None,
-            failure_reason: None,
-            observed_at: now,
-            expires_at: now + time::Duration::seconds(CLUSTER_CONNECTIVITY_TTL_SECONDS),
-        };
-
         write_local_cluster_connectivity_record_set(
             &paths,
             &local,
-            &[current.clone(), dirty, removed_record, tunnel.clone()],
+            &[current.clone(), dirty, removed_record],
         )
         .expect("seed local connectivity");
 
@@ -3245,9 +3211,8 @@ mod tests {
         assert_eq!(removed_count, 2);
         let records =
             read_local_cluster_connectivity_records(&paths).expect("read pruned connectivity");
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 1);
         assert!(records.contains(&current));
-        assert!(records.contains(&tunnel));
     }
 
     #[test]

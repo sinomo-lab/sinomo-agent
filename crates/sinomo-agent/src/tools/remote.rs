@@ -6,8 +6,7 @@ use crate::{AgentToolKind, AgentToolSpec};
 use serde::Deserialize;
 use sinomo_runtime::module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
 use sinomo_runtime::network::{
-    ObjectRpcBodySource, ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcSessionCall,
-    ObjectRpcSessionResult,
+    ObjectRpcBodySource, ObjectRpcCall, ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResult,
 };
 use sinomo_runtime::remote_management::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SEARCH_ROUTE,
@@ -40,12 +39,12 @@ const REMOTE_FILE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 static REMOTE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub type AgentRemoteObjectRpcFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ObjectRpcSessionResult, String>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<ObjectRpcResult, String>> + Send + 'a>>;
 
 pub trait AgentRemoteObjectRpcTransport: Send + Sync {
-    /// Calls one canonical object-RPC session using the transport's default
-    /// target. Request and response attachments share this same session.
-    fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a>;
+    /// Calls one stream-native object-RPC operation using the transport's
+    /// default target. Request and response attachments share the same stream.
+    fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a>;
 
     /// Calls an object-RPC route using explicit cluster-routing hints.
     ///
@@ -57,7 +56,7 @@ pub trait AgentRemoteObjectRpcTransport: Send + Sync {
         &'a self,
         target_node_id: Option<String>,
         route_key: Option<String>,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
     ) -> AgentRemoteObjectRpcFuture<'a> {
         if target_node_id.is_some() || route_key.is_some() {
             return Box::pin(async {
@@ -71,7 +70,7 @@ pub trait AgentRemoteObjectRpcTransport: Send + Sync {
     }
 }
 
-/// Adapts an owned, asynchronous, target-aware object-RPC session closure.
+/// Adapts an owned, asynchronous, target-aware object-RPC call closure.
 pub struct TargetAwareAgentRemoteObjectRpcTransport<F> {
     call: F,
 }
@@ -84,15 +83,11 @@ impl<F> TargetAwareAgentRemoteObjectRpcTransport<F> {
 
 impl<F> AgentRemoteObjectRpcTransport for TargetAwareAgentRemoteObjectRpcTransport<F>
 where
-    F: Fn(
-            Option<String>,
-            Option<String>,
-            ObjectRpcSessionCall,
-        ) -> AgentRemoteObjectRpcFuture<'static>
+    F: Fn(Option<String>, Option<String>, ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'static>
         + Send
         + Sync,
 {
-    fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+    fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
         (self.call)(None, None, call)
     }
 
@@ -100,7 +95,7 @@ where
         &'a self,
         target_node_id: Option<String>,
         route_key: Option<String>,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
     ) -> AgentRemoteObjectRpcFuture<'a> {
         (self.call)(target_node_id, route_key, call)
     }
@@ -637,7 +632,7 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
                 let result = run_agent_remote_session(cancel_transport.call_targeted(
                     cancel_target_node_id.clone(),
                     cancel_route_key.clone(),
-                    ObjectRpcSessionCall::value(cancel),
+                    ObjectRpcCall::value(cancel),
                 ));
                 match result {
                     Ok(result) => match result.response.error_detail() {
@@ -728,7 +723,7 @@ fn execute_remote_tool(
     match run_agent_remote_session(transport.call_targeted(
         target_node_id,
         route_key,
-        ObjectRpcSessionCall::value(rpc),
+        ObjectRpcCall::value(rpc),
     )) {
         Ok(response) => remote_rpc_tool_result(tool, response, cancellation_requested),
         Err(detail) => remote_transport_error(tool, detail, cancellation_requested),
@@ -786,7 +781,7 @@ fn execute_remote_file_get(
     let remote_path = input.remote_path.clone();
     let transfer = match run_agent_remote_future(async {
         let result = transport
-            .call_targeted(target_node_id, route_key, ObjectRpcSessionCall::value(rpc))
+            .call_targeted(target_node_id, route_key, ObjectRpcCall::value(rpc))
             .await?;
         let (response, mut body) = result.into_parts();
         validate_agent_response_route(&response, REMOTE_MANAGEMENT_FS_READ_ROUTE)?;
@@ -928,11 +923,7 @@ fn execute_remote_file_put(
     let remote_path = input.remote_path.clone();
     let written = match run_agent_remote_future(async {
         let result = transport
-            .call_targeted(
-                target_node_id,
-                route_key,
-                ObjectRpcSessionCall::new(rpc, body),
-            )
+            .call_targeted(target_node_id, route_key, ObjectRpcCall::new(rpc, body))
             .await?;
         let (response, body) = result.into_parts();
         validate_agent_response_route(&response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
@@ -979,7 +970,7 @@ fn execute_remote_file_put(
 
 fn run_agent_remote_session(
     future: AgentRemoteObjectRpcFuture<'_>,
-) -> Result<ObjectRpcSessionResult, String> {
+) -> Result<ObjectRpcResult, String> {
     run_agent_remote_future(future)
 }
 
@@ -1254,7 +1245,7 @@ fn remote_request_payload(input: &serde_json::Value) -> serde_json::Value {
 
 fn remote_rpc_tool_result(
     tool: &str,
-    result: ObjectRpcSessionResult,
+    result: ObjectRpcResult,
     cancellation_requested: &AtomicBool,
 ) -> AgentToolResult {
     let (response, body) = result.into_parts();
@@ -1364,7 +1355,7 @@ mod tests {
     }
 
     impl AgentRemoteObjectRpcTransport for FakeRemoteTransport {
-        fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+        fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
             Box::pin(async move {
                 assert!(call.body.is_empty());
                 let request = call.request;
@@ -1407,7 +1398,7 @@ mod tests {
                     }
                     other => return Err(format!("unexpected route {other}")),
                 };
-                Ok(ObjectRpcSessionResult::value(response))
+                Ok(ObjectRpcResult::value(response))
             })
         }
 
@@ -1415,7 +1406,7 @@ mod tests {
             &'a self,
             target_node_id: Option<String>,
             route_key: Option<String>,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
         ) -> AgentRemoteObjectRpcFuture<'a> {
             let target = Some((target_node_id, route_key));
             match call.request.route.as_str() {
@@ -1440,7 +1431,7 @@ mod tests {
     }
 
     impl AgentRemoteObjectRpcTransport for FakeFileTransferTransport {
-        fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+        fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
             Box::pin(async move {
                 let request = call.request;
                 match request.route.as_str() {
@@ -1483,7 +1474,7 @@ mod tests {
                             ),
                         )
                         .map_err(|error| error.to_string())?;
-                        Ok(ObjectRpcSessionResult::value(response))
+                        Ok(ObjectRpcResult::value(response))
                     }
                     REMOTE_MANAGEMENT_FS_READ_ROUTE => {
                         assert!(call.body.is_empty());
@@ -1502,7 +1493,7 @@ mod tests {
                             ),
                         )
                         .map_err(|error| error.to_string())?;
-                        Ok(ObjectRpcSessionResult::new(
+                        Ok(ObjectRpcResult::new(
                             response,
                             ObjectRpcIncomingBody::bytes(bytes),
                         ))
@@ -1516,7 +1507,7 @@ mod tests {
             &'a self,
             target_node_id: Option<String>,
             route_key: Option<String>,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
         ) -> AgentRemoteObjectRpcFuture<'a> {
             assert_eq!(target_node_id.as_deref(), Some("node.files"));
             assert!(route_key.is_none());
@@ -1682,7 +1673,7 @@ mod tests {
         let transport = TargetAwareAgentRemoteObjectRpcTransport::new(
             move |target_node_id: Option<String>,
                   route_key: Option<String>,
-                  call: ObjectRpcSessionCall| {
+                  call: ObjectRpcCall| {
                 let received = Arc::clone(&received_for_transport);
                 Box::pin(async move {
                     *received.lock().expect("received lock") =
@@ -1692,7 +1683,7 @@ mod tests {
                         &serde_json::json!({ "ok": true }),
                     )
                     .map_err(|error| error.to_string())?;
-                    Ok(ObjectRpcSessionResult::value(response))
+                    Ok(ObjectRpcResult::value(response))
                 }) as AgentRemoteObjectRpcFuture<'static>
             },
         );
@@ -1700,7 +1691,7 @@ mod tests {
             transport.call_targeted(
                 Some("node.targeted".to_string()),
                 Some("route.targeted".to_string()),
-                ObjectRpcSessionCall::value(
+                ObjectRpcCall::value(
                     ObjectRpcRequest::encode_body(
                         "/remote/tool/immediate",
                         "remote.tool",
@@ -1856,7 +1847,7 @@ mod tests {
 
         let outcome = remote_rpc_tool_result(
             "remote_module_immediate",
-            ObjectRpcSessionResult::value(response),
+            ObjectRpcResult::value(response),
             &AtomicBool::new(false),
         );
 
@@ -1892,7 +1883,7 @@ mod tests {
 
         let outcome = remote_rpc_tool_result(
             "remote_shell",
-            ObjectRpcSessionResult::value(response),
+            ObjectRpcResult::value(response),
             &AtomicBool::new(false),
         );
 
@@ -1928,7 +1919,7 @@ mod tests {
             TargetAwareAgentRemoteObjectRpcTransport::new(
                 move |_target_node_id: Option<String>,
                       _route_key: Option<String>,
-                      call: ObjectRpcSessionCall| {
+                      call: ObjectRpcCall| {
                     let received = Arc::clone(&received_for_transport);
                     Box::pin(async move {
                         assert!(call.body.is_empty());
@@ -1958,7 +1949,7 @@ mod tests {
                             &RemoteManagementSystemObserveResponse::success(observation),
                         )
                         .map_err(|error| error.to_string())?;
-                        Ok(ObjectRpcSessionResult::value(response))
+                        Ok(ObjectRpcResult::value(response))
                     }) as AgentRemoteObjectRpcFuture<'static>
                 },
             ),

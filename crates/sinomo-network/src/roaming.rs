@@ -203,7 +203,7 @@ impl WebRtcKvExchange {
     }
 }
 
-/// Opens the transport-neutral byte stream used by the canonical object-RPC
+/// Opens the transport-neutral byte stream used by stream-native object RPC.
 /// session engine. Endpoint selection and retry stay in `route`; transports do
 /// not see object heads or transfer frames.
 pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
@@ -212,16 +212,6 @@ pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
 ) -> Result<Box<dyn NetworkDuplexStream>, NetworkError> {
     match endpoint.transport {
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            if endpoint
-                .address
-                .starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
-            {
-                return Err(NetworkError::Io {
-                    operation: "open object RPC session stream".to_string(),
-                    detail: "v1 multiplexed TCP-tunnel endpoints expose object RPC channels, not canonical byte streams"
-                        .to_string(),
-                });
-            }
             let stream = crate::AsyncDaemonControlStream::connect_with_options(
                 &endpoint.address,
                 health.into(),
@@ -230,7 +220,7 @@ pub async fn open_daemon_rpc_stream_to_cluster_endpoint_async(
             Ok(Box::new(stream.into_inner()))
         }
         _ => Err(NetworkError::Io {
-            operation: format!("open object RPC session to {}", endpoint.address),
+            operation: format!("open object RPC call to {}", endpoint.address),
             detail: format!(
                 "transport {:?} requires the node-addressed routed connector",
                 endpoint.transport

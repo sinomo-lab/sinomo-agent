@@ -149,11 +149,8 @@ fn directory_contains_endpoint(
 
 /// Deterministically plans executable directed paths from immutable inputs.
 ///
-/// This replaces the planning responsibility of
-/// `cluster_delivery_route_plan`; it performs no dialing, persistence,
-/// probing, retries, or RPC. Module-backed direct delivery now consumes this
-/// contract; remaining service families stay on their named carrier until a
-/// bounded migration can replace and delete that path in the same slice.
+/// It performs no dialing, persistence, probing, retries, or RPC. The single
+/// routed-stream executor consumes this contract for direct and relayed paths.
 pub fn plan_routes(
     directory: &DirectorySnapshot,
     connectivity: &ConnectivitySnapshot,

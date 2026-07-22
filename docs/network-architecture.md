@@ -6,10 +6,10 @@ with one-way dependencies, all implemented inside the single `sinomo-network`
 crate. The separation is architectural and internal; it does not create new
 workspace crates.
 
-The current carrier formats and tuning bounds are recorded in the developer
-[network data-path reference](developer/network-data-path.md). The work required
-to replace that implementation without creating another parallel path is tracked
-in the [network layer separation plan](plans/network-layer-separation.md).
+The current implementation map and resource bounds are recorded in the
+developer [network data-path reference](developer/network-data-path.md). The
+completed migration stages and deletion criteria are recorded in the
+[network layer separation plan](plans/network-layer-separation.md).
 
 ## Purpose
 
@@ -496,8 +496,8 @@ graph:
 | Object RPC | SOBJ RPC over authenticated duplex streams. |
 | Public facade | Stable exports and composition types without a second implementation path. |
 
-The exact file layout may evolve while the migration is in progress, but the
-dependency direction is fixed. Object RPC cannot import routing or
+The exact file layout may evolve, but the dependency direction is fixed.
+Object RPC cannot import routing or
 connectivity. Routing cannot import object RPC, SOBJ request types, or service
 catalogs. Connectivity cannot import route execution or RPC. Direct-link
 modules cannot import any higher network layer.
@@ -555,6 +555,6 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
 
 The [clustering architecture](clustering-architecture.md) defines directory
 authority. The [Sinomo Object format](sinomo-object-format.md) defines the
-binary object representation. Current implementation gaps and deletion gates
-are tracked in the
+binary object representation. The completed implementation stages and deletion
+gates are recorded in the
 [network layer separation plan](plans/network-layer-separation.md).

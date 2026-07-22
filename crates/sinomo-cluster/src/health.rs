@@ -431,7 +431,7 @@ pub fn cluster_network_ping_rpc_request_with_response_payload(
 
 /// Builds the small SOBJ request head for a ping whose bulk bytes travel as a
 /// semantic attachment. The caller supplies the attachment separately through
-/// [`sinomo_network::ObjectRpcSessionCall`].
+/// [`sinomo_network::ObjectRpcCall`].
 pub fn cluster_network_ping_attachment_rpc_request(
     nonce: impl Into<String>,
     request_attachment_bytes: u64,

@@ -9,7 +9,7 @@
 
 use crate::error::NetworkError;
 use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
-use crate::session::ObjectRpcBodySource;
+use crate::rpc_body::ObjectRpcBodySource;
 use bytes::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -129,8 +129,8 @@ pub fn local_object_rpc_stream_prelude_prefix_matches(prefix: &[u8]) -> bool {
         && LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC.starts_with(prefix)
 }
 
-/// Starts the explicit loopback-only Stage-F shortcut. The daemon listener
-/// must independently prove socket locality and authorize the signed service
+/// Starts the loopback-only stream prelude. The daemon listener must
+/// independently prove socket locality and authorize the signed service
 /// request; this prelude only supplies a unique transcript binding shared by
 /// the two protocol endpoints.
 pub async fn write_local_object_rpc_stream_prelude<S>(
@@ -294,7 +294,11 @@ impl ObjectRpcStreamBody {
     /// Supplies a producer-computed digest for a source with a known length.
     /// This avoids a replayable pre-pass and lets a one-pass producer use a
     /// known descriptor when its domain already owns a stable content digest.
-    pub fn known(source: ObjectRpcBodySource, digest: [u8; 32]) -> Result<Self, NetworkError> {
+    #[cfg(test)]
+    pub(crate) fn known(
+        source: ObjectRpcBodySource,
+        digest: [u8; 32],
+    ) -> Result<Self, NetworkError> {
         if source.total_bytes().is_none() {
             return Err(serialization_error(
                 "a known object RPC stream body digest requires a known length",
@@ -306,14 +310,16 @@ impl ObjectRpcStreamBody {
         })
     }
 
-    pub fn one_pass_reader<R>(reader: R, total_bytes: Option<u64>) -> Self
+    #[cfg(test)]
+    fn one_pass_reader<R>(reader: R, total_bytes: Option<u64>) -> Self
     where
         R: io::Read + Send + 'static,
     {
         Self::source(ObjectRpcBodySource::from_reader(reader, total_bytes))
     }
 
-    pub fn one_pass_async_reader<R>(reader: R, total_bytes: Option<u64>) -> Self
+    #[cfg(test)]
+    fn one_pass_async_reader<R>(reader: R, total_bytes: Option<u64>) -> Self
     where
         R: AsyncRead + Send + 'static,
     {
@@ -336,7 +342,8 @@ pub struct ObjectRpcStreamCall {
 }
 
 impl ObjectRpcStreamCall {
-    pub fn new(method: impl Into<String>, body: ObjectRpcStreamBody) -> Self {
+    #[cfg(test)]
+    fn new(method: impl Into<String>, body: ObjectRpcStreamBody) -> Self {
         Self {
             request_id: Id::generate(),
             method: method.into(),
@@ -345,21 +352,6 @@ impl ObjectRpcStreamCall {
             application_head: Vec::new(),
             body,
         }
-    }
-
-    pub fn encode_body<T: Serialize + ?Sized>(
-        method: impl Into<String>,
-        operation_id: Option<String>,
-        body: &T,
-    ) -> Result<Self, NetworkError> {
-        Ok(Self {
-            request_id: Id::generate(),
-            method: method.into(),
-            operation_id,
-            metadata: BTreeMap::new(),
-            application_head: Vec::new(),
-            body: ObjectRpcStreamBody::bytes(SinomoObjectCodec::network_frame().encode(body)?),
-        })
     }
 
     fn validate(&self) -> Result<(), NetworkError> {
@@ -383,16 +375,6 @@ pub struct ObjectRpcStreamIncomingCall {
     pub body: ObjectRpcStreamIncomingBody,
 }
 
-impl ObjectRpcStreamIncomingCall {
-    pub async fn decode_body<T: serde::de::DeserializeOwned>(
-        self,
-        max_bytes: usize,
-    ) -> Result<T, NetworkError> {
-        let bytes = self.body.collect_to_vec(max_bytes).await?;
-        SinomoObjectCodec::network_frame().decode(&bytes)
-    }
-}
-
 /// Server-produced response head and streaming body source.
 #[derive(Debug)]
 pub struct ObjectRpcStreamReply {
@@ -403,7 +385,8 @@ pub struct ObjectRpcStreamReply {
 }
 
 impl ObjectRpcStreamReply {
-    pub fn new(request_id: Id, body: ObjectRpcStreamBody) -> Self {
+    #[cfg(test)]
+    fn new(request_id: Id, body: ObjectRpcStreamBody) -> Self {
         Self {
             request_id,
             metadata: BTreeMap::new(),
@@ -411,35 +394,14 @@ impl ObjectRpcStreamReply {
             body,
         }
     }
-
-    pub fn encode_body<T: Serialize + ?Sized>(
-        request_id: Id,
-        body: &T,
-    ) -> Result<Self, NetworkError> {
-        Ok(Self::new(
-            request_id,
-            ObjectRpcStreamBody::bytes(SinomoObjectCodec::network_frame().encode(body)?),
-        ))
-    }
 }
 
 /// Client-visible authenticated response head and incremental body.
 #[derive(Debug)]
 pub struct ObjectRpcStreamResponse {
-    pub request_id: Id,
     pub metadata: BTreeMap<String, String>,
     pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamIncomingBody,
-}
-
-impl ObjectRpcStreamResponse {
-    pub async fn decode_body<T: serde::de::DeserializeOwned>(
-        self,
-        max_bytes: usize,
-    ) -> Result<T, NetworkError> {
-        let bytes = self.body.collect_to_vec(max_bytes).await?;
-        SinomoObjectCodec::network_frame().decode(&bytes)
-    }
 }
 
 #[derive(Debug)]
@@ -448,6 +410,11 @@ pub enum RpcDeliveryOutcome<T> {
     Rejected { detail: String },
     PossiblyApplied { error: NetworkError },
     Completed(T),
+}
+
+pub(crate) enum RpcResponseConsumption<T> {
+    Complete(T),
+    Streaming(T),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1769,11 +1736,15 @@ async fn send_request<W: AsyncWrite + Unpin>(
     result
 }
 
-/// Executes one call over one authenticated duplex stream. The response
-/// consumer receives an incremental body; the function returns `Completed`
-/// only after the authenticated response finish record has verified. It never
-/// reconnects, reroutes, or automatically resends a possibly applied call.
-pub async fn call_object_rpc_stream<S, F, Fut, T>(
+/// Executes one call over one authenticated duplex stream.
+///
+/// A complete consumer keeps the delivery outcome pending until the
+/// authenticated response finish verifies. A streaming consumer transfers the
+/// incremental body to its caller immediately; the body retains the verifier,
+/// and any terminal authentication or transport failure is delivered by its
+/// read path. This function never reconnects, reroutes, or automatically
+/// resends a possibly applied call.
+pub(crate) async fn call_object_rpc_stream_with_consumption<S, F, Fut, T>(
     stream: S,
     context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
@@ -1783,7 +1754,7 @@ pub async fn call_object_rpc_stream<S, F, Fut, T>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(ObjectRpcStreamResponse) -> Fut,
-    Fut: Future<Output = Result<T, NetworkError>>,
+    Fut: Future<Output = Result<RpcResponseConsumption<T>, NetworkError>>,
 {
     if let Err(error) = call.validate() {
         return RpcDeliveryOutcome::NotSent { error };
@@ -1916,13 +1887,26 @@ where
             inline_body,
         },
     );
-    let consumer_result = response_consumer(ObjectRpcStreamResponse {
-        request_id,
+    let consumer_result = match response_consumer(ObjectRpcStreamResponse {
         metadata,
         application_head,
         body,
     })
-    .await;
+    .await
+    {
+        Ok(RpcResponseConsumption::Complete(value)) => Ok(value),
+        Ok(RpcResponseConsumption::Streaming(value)) => {
+            tokio::spawn(async move {
+                if request_send_completed {
+                    let _ = receive_task.await;
+                } else {
+                    let _ = tokio::join!(receive_task, send_task);
+                }
+            });
+            return RpcDeliveryOutcome::Completed(value);
+        }
+        Err(error) => Err(error),
+    };
     let terminal = match receive_task.await {
         Ok(Ok(terminal)) => terminal,
         Ok(Err(error)) => return RpcDeliveryOutcome::PossiblyApplied { error },
@@ -1954,6 +1938,33 @@ where
             Err(error) => RpcDeliveryOutcome::PossiblyApplied { error },
         },
     }
+}
+
+#[cfg(test)]
+async fn call_object_rpc_stream<S, F, Fut, T>(
+    stream: S,
+    context: &RpcPeerContext,
+    call: ObjectRpcStreamCall,
+    options: ObjectFrameIoOptions,
+    response_consumer: F,
+) -> RpcDeliveryOutcome<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(ObjectRpcStreamResponse) -> Fut,
+    Fut: Future<Output = Result<T, NetworkError>>,
+{
+    call_object_rpc_stream_with_consumption(
+        stream,
+        context,
+        call,
+        options,
+        move |response| async move {
+            response_consumer(response)
+                .await
+                .map(RpcResponseConsumption::Complete)
+        },
+    )
+    .await
 }
 
 async fn write_rejection<W: AsyncWrite + Unpin>(

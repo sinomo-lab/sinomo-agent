@@ -120,7 +120,6 @@ pub(crate) enum DaemonClusterMaintenanceReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DaemonClusterMaintenanceRequestPlan {
     dirty: u8,
-    tunnel_reason: Option<crate::tcp_tunnel::TcpTunnelMaintenanceReason>,
 }
 
 const fn daemon_cluster_maintenance_request_plan(
@@ -129,47 +128,32 @@ const fn daemon_cluster_maintenance_request_plan(
     use DaemonClusterMaintenanceReason as Reason;
 
     match reason {
-        Reason::LifecycleWake => DaemonClusterMaintenanceRequestPlan {
-            dirty: 0,
-            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::IdentityChanged),
-        },
+        Reason::LifecycleWake => DaemonClusterMaintenanceRequestPlan { dirty: 0 },
         Reason::NetworkEnvironmentChanged => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
                 | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
-            tunnel_reason: Some(
-                crate::tcp_tunnel::TcpTunnelMaintenanceReason::NetworkEnvironmentChanged,
-            ),
         },
         Reason::JoinConnectivityPublishFailed => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
-            tunnel_reason: None,
         },
         Reason::JoinAccepted => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
                 | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
-            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::MembershipChanged),
         },
         Reason::CommittedConnectivityTopologyChanged => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
-            // The tunnel owner has its own path-scoped projection over the
-            // same committed snapshots. Do not couple its generation to the
-            // connectivity observer or publish duplicate tunnel wakeups.
-            tunnel_reason: None,
         },
         Reason::Rename => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
-            tunnel_reason: None,
         },
         Reason::RoleChanged => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
-            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::RoleChanged),
         },
         Reason::ManualBroad => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
                 | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
                 | DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY
                 | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
-            tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::OperatorRefresh),
         },
     }
 }
@@ -218,9 +202,6 @@ pub(crate) fn request_daemon_cluster_maintenance(reason: DaemonClusterMaintenanc
     let plan = daemon_cluster_maintenance_request_plan(reason);
     if plan.dirty != 0 {
         DAEMON_CLUSTER_MAINTENANCE_DIRTY.fetch_or(plan.dirty, Ordering::Release);
-    }
-    if let Some(reason) = plan.tunnel_reason {
-        crate::tcp_tunnel::request_tcp_tunnel_maintenance_refresh(reason);
     }
     daemon_cluster_maintenance_notify().notify_one();
 }
@@ -1535,23 +1516,6 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         runtime_tasks.push(("network module context", task));
     }
 
-    if startup_cluster_runtime_enabled {
-        let startup_cluster = cluster
-            .as_ref()
-            .expect("clustered startup has captured daemon identity");
-        runtime_tasks.push((
-            "tcp tunnel maintenance",
-            crate::tcp_tunnel::start_tcp_tunnel_maintenance_task(
-                paths.clone(),
-                daemon_runtime_handle.clone(),
-                shutdown_rx.clone(),
-                label.to_string(),
-                startup_cluster.cluster_id.clone(),
-                startup_cluster.node_id.clone(),
-            )?,
-        ));
-    }
-
     let mut default_dfs_reconciliation =
         if daemon_role_owns_default_dfs(label) && startup_cluster_runtime_enabled {
             let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
@@ -2824,24 +2788,8 @@ pub(crate) async fn handle_daemon_connection_async(
         )
         .await;
     }
-    if daemon_control_stream_uses_local_object_rpc_channel(&stream).await? {
-        let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
-        let accepted =
-            sinomo_core::network::accept_local_object_rpc_channel_async(stream, &data_dir).await?;
-        let sinomo_core::network::AcceptedLocalObjectRpcChannel { server, transport } = accepted;
-        let result = handle_daemon_object_rpc_channel_async(
-            server,
-            paths,
-            service_host,
-            service_runtime,
-            DaemonObjectRpcChannelPeer::Loopback,
-        )
-        .await;
-        transport.close("local daemon object RPC channel dispatch ended");
-        return result;
-    }
-    if daemon_control_stream_uses_object_rpc_session(&stream).await? {
-        return handle_daemon_object_rpc_session_async(
+    if daemon_control_stream_uses_object_rpc_call(&stream).await? {
+        return handle_daemon_object_rpc_call_async(
             stream,
             paths,
             service_host,
@@ -2945,42 +2893,12 @@ pub(crate) async fn handle_daemon_connection_async(
         return Ok(stop);
     }
 
-    if request.route != sinomo_core::network::CLUSTER_TCP_TUNNEL_OPEN_ROUTE {
-        tracing::debug!(
-            route = %request.route,
-            category = %request.category,
-            "rejecting raw object frame; ordinary object RPC requires a canonical session"
-        );
-        let _ = stream.shutdown().await;
-        return Ok(false);
-    }
-
-    let authenticated =
-        match crate::service_adapter::authenticate_daemon_control_request_via_registry(
-            &paths,
-            &request,
-            &service_host,
-        ) {
-            Ok(authenticated) => authenticated,
-            Err(_) => {
-                if let Ok(response) = sinomo_core::network::ObjectRpcResponse::encode_error(
-                    request.route.clone(),
-                    DaemonError::AuthDenied.to_string(),
-                ) {
-                    let _ = write_daemon_rpc_response_frame_async(&mut stream, response).await;
-                }
-                let _ = stream.shutdown().await;
-                return Ok(false);
-            }
-        };
-    crate::tcp_tunnel::accept_tcp_tunnel_connection_async(
-        stream,
-        paths,
-        service_runtime,
-        authenticated,
-        request,
-    )
-    .await?;
+    tracing::debug!(
+        route = %request.route,
+        category = %request.category,
+        "rejecting raw object frame; ordinary object RPC requires a stream-native call"
+    );
+    let _ = stream.shutdown().await;
     Ok(false)
 }
 
@@ -3210,37 +3128,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
     }
 }
 
-async fn daemon_control_stream_uses_local_object_rpc_channel(
-    stream: &sinomo_core::network::AsyncDaemonControlStream,
-) -> Result<bool, DaemonError> {
-    let mut prefix = [0_u8; 4];
-    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    loop {
-        let available = tokio::time::timeout_at(deadline, stream.peek_prefix(&mut prefix))
-            .await
-            .map_err(|_| {
-                DaemonError::from(sinomo_core::network::NetworkError::timeout(
-                    "peek daemon object RPC channel protocol",
-                    sinomo_core::network::NetworkTimeoutPhase::Idle,
-                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-                ))
-            })??;
-        if available == 0 {
-            return Ok(false);
-        }
-        if available >= prefix.len() {
-            return Ok(sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&prefix));
-        }
-        if !sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&prefix[..available])
-        {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
-
-async fn daemon_control_stream_uses_object_rpc_session(
+async fn daemon_control_stream_uses_object_rpc_call(
     stream: &sinomo_core::network::AsyncDaemonControlStream,
 ) -> Result<bool, DaemonError> {
     let mut prefix = [0_u8; 4];
@@ -3260,634 +3148,34 @@ async fn daemon_control_stream_uses_object_rpc_session(
             return Ok(false);
         }
         if available >= prefix.len() {
-            return Ok(sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix)
-                || sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(&prefix));
+            return Ok(
+                sinomo_core::network::local_object_rpc_stream_prelude_prefix_matches(&prefix),
+            );
         }
-        // Wait only while the bytes received so far can still be the canonical
-        // session prefix. Any mismatch is a direct object frame.
-        if !sinomo_core::network::object_rpc_session_wire_prefix_matches(&prefix[..available])
-            && !sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(&prefix[..available])
-        {
+        if !sinomo_core::network::local_object_rpc_stream_prelude_prefix_matches(
+            &prefix[..available],
+        ) {
             return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
-async fn handle_daemon_object_rpc_session_async(
+async fn handle_daemon_object_rpc_call_async(
     stream: sinomo_core::network::AsyncDaemonControlStream,
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
     stream_address: String,
 ) -> Result<bool, DaemonError> {
-    let mut prefix = [0_u8; 4];
-    let available = stream.peek_prefix(&mut prefix).await?;
-    if available == prefix.len()
-        && sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(&prefix)
-    {
-        return handle_daemon_local_stream_native_service_rpc_async(
-            stream.into_inner(),
-            paths,
-            service_host,
-            service_runtime,
-            stream_address,
-        )
-        .await;
-    }
-    handle_daemon_object_rpc_stream_async(
-        Box::new(stream.into_inner()),
+    handle_daemon_local_stream_native_service_rpc_async(
+        stream.into_inner(),
         paths,
         service_host,
         service_runtime,
+        stream_address,
     )
     .await
-}
-
-/// Identity fixed when a persistent object-RPC channel is accepted. Logical
-/// requests inherit this principal unless they carry an origin-signed inner
-/// relay request, which is verified separately at the final node.
-#[derive(Clone, Debug)]
-pub(crate) enum DaemonObjectRpcChannelPeer {
-    Loopback,
-    ClusterNode(NodeId),
-}
-
-#[derive(Clone)]
-struct DaemonObjectRpcChannelPrincipal {
-    signer: DaemonSignerAuthority,
-    signer_node_id: String,
-    signer_public_key: String,
-}
-
-impl DaemonObjectRpcChannelPrincipal {
-    fn for_route(&self, route: String) -> AuthenticatedDaemonCommand {
-        AuthenticatedDaemonCommand {
-            route,
-            signer: self.signer.clone(),
-            signer_node_id: self.signer_node_id.clone(),
-            signer_public_key: self.signer_public_key.clone(),
-        }
-    }
-}
-
-/// Resolves the origin asserted by a request that arrived over an already
-/// authenticated cluster channel. Cluster transport is the trust boundary on
-/// this fast path; canonical stream fallback still verifies the carried
-/// signature and nonce in full.
-fn daemon_object_rpc_channel_delegated_origin_principal(
-    paths: &DaemonPaths,
-    link_principal: &DaemonObjectRpcChannelPrincipal,
-    request: &sinomo_core::network::ObjectRpcRequest,
-) -> Result<Option<DaemonObjectRpcChannelPrincipal>, DaemonError> {
-    if link_principal.signer == DaemonSignerAuthority::Local
-        || request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE
-    {
-        return Ok(None);
-    }
-    let Some(origin_node_id) = request
-        .metadata
-        .get(sinomo_core::network::CLUSTER_RELAY_ORIGIN_NODE_ID_METADATA_KEY)
-    else {
-        return Ok(None);
-    };
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let state = sinomo_core::cluster::read_cluster_state_cached_shared(&cluster_paths)
-        .map_err(DaemonError::from)?;
-    let member = state
-        .members
-        .iter()
-        .find(|member| member.node_id.as_str() == origin_node_id && member.state.is_authorized())
-        .ok_or(DaemonError::AuthDenied)?;
-    Ok(Some(DaemonObjectRpcChannelPrincipal {
-        signer: if member.has_raft_vote() {
-            DaemonSignerAuthority::Voter
-        } else {
-            DaemonSignerAuthority::Member
-        },
-        signer_node_id: member.node_id.to_string(),
-        signer_public_key: member.node_public_key.clone(),
-    }))
-}
-
-fn daemon_object_rpc_channel_principal(
-    paths: &DaemonPaths,
-    peer: &DaemonObjectRpcChannelPeer,
-) -> Result<(DaemonObjectRpcChannelPrincipal, Option<Arc<str>>), DaemonError> {
-    match peer {
-        DaemonObjectRpcChannelPeer::Loopback => {
-            let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(paths)?);
-            let public_key = sinomo_core::network::cached_daemon_signing_public_key(&data_dir)
-                .map_err(DaemonError::from)?;
-            let responder_node_id = cluster_paths_from_daemon_paths(paths)
-                .ok()
-                .and_then(|cluster_paths| {
-                    sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
-                })
-                .map(|state| Arc::<str>::from(state.local_node_id.as_str()));
-            let signer_node_id = responder_node_id
-                .as_deref()
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    NodeId::derived("sinomo.network.local-object-rpc-session", &public_key)
-                        .to_string()
-                });
-            Ok((
-                DaemonObjectRpcChannelPrincipal {
-                    signer: DaemonSignerAuthority::Local,
-                    signer_node_id,
-                    signer_public_key: sinomo_core::network::daemon_auth_encode_public_key(
-                        &public_key,
-                    ),
-                },
-                responder_node_id,
-            ))
-        }
-        DaemonObjectRpcChannelPeer::ClusterNode(peer_node_id) => {
-            let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-            let state = sinomo_core::cluster::read_cluster_state_cached_shared(&cluster_paths)
-                .map_err(DaemonError::from)?;
-            let member = state
-                .members
-                .iter()
-                .find(|member| member.node_id == *peer_node_id && member.state.is_authorized())
-                .ok_or(DaemonError::AuthDenied)?;
-            let responder_node_id = Arc::<str>::from(state.local_node_id.as_str());
-            Ok((
-                DaemonObjectRpcChannelPrincipal {
-                    signer: if member.has_raft_vote() {
-                        DaemonSignerAuthority::Voter
-                    } else {
-                        DaemonSignerAuthority::Member
-                    },
-                    signer_node_id: member.node_id.to_string(),
-                    signer_public_key: member.node_public_key.clone(),
-                },
-                Some(responder_node_id),
-            ))
-        }
-    }
-}
-
-fn validate_daemon_object_rpc_channel_principal(
-    paths: &DaemonPaths,
-    principal: &DaemonObjectRpcChannelPrincipal,
-) -> Result<(), DaemonError> {
-    if principal.signer == DaemonSignerAuthority::Local {
-        return Ok(());
-    }
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    // The shared state cache has a short syscall-free lease and immediate
-    // in-process invalidation. Rechecking it per logical call prevents a
-    // removed member, rotated key, or demoted voter from retaining the
-    // authority captured when its long-lived physical channel was accepted.
-    let state = sinomo_core::cluster::read_cluster_state_cached_shared(&cluster_paths)
-        .map_err(DaemonError::from)?;
-    let Some(member) = state.members.iter().find(|member| {
-        member.state.is_authorized()
-            && member.node_id.as_str() == principal.signer_node_id
-            && member.node_public_key == principal.signer_public_key
-    }) else {
-        return Err(DaemonError::AuthDenied);
-    };
-    let current_authority = if member.has_raft_vote() {
-        DaemonSignerAuthority::Voter
-    } else {
-        DaemonSignerAuthority::Member
-    };
-    if principal.signer == current_authority {
-        Ok(())
-    } else {
-        Err(DaemonError::AuthDenied)
-    }
-}
-
-/// Drives all logical calls accepted on one physically authenticated channel.
-/// Per-call work is polled concurrently on this connection task. The channel's
-/// fixed 64-call permit and byte budget bound the future set and queued memory.
-pub(crate) async fn handle_daemon_object_rpc_channel_async(
-    server: sinomo_core::network::ObjectRpcChannelServer,
-    paths: DaemonPaths,
-    service_host: crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: tokio::runtime::Handle,
-    peer: DaemonObjectRpcChannelPeer,
-) -> Result<bool, DaemonError> {
-    // Peer admission and the local responder identity must come from the same
-    // state snapshot. In particular, a cluster peer is never allowed to start
-    // a logical channel whose responses cannot identify this daemon.
-    let (principal, responder_node_id) = daemon_object_rpc_channel_principal(&paths, &peer)?;
-    drive_daemon_object_rpc_channel_async(
-        server,
-        paths,
-        service_host,
-        service_runtime,
-        principal,
-        responder_node_id,
-    )
-    .await
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DaemonObjectRpcChannelRequestDisposition {
-    Continue,
-    RetireChannel,
-    StopDaemon,
-}
-
-async fn drive_daemon_object_rpc_channel_async(
-    mut server: sinomo_core::network::ObjectRpcChannelServer,
-    paths: DaemonPaths,
-    service_host: crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: tokio::runtime::Handle,
-    principal: DaemonObjectRpcChannelPrincipal,
-    responder_node_id: Option<Arc<str>>,
-) -> Result<bool, DaemonError> {
-    let mut calls = DaemonObjectRpcChannelCallSet::new();
-    loop {
-        let inbound = if calls.is_empty() {
-            server.accept().await
-        } else {
-            tokio::select! {
-                biased;
-                result = calls.next_completed() => {
-                    match result {
-                        Ok(DaemonObjectRpcChannelRequestDisposition::StopDaemon) => {
-                            return Ok(true);
-                        }
-                        Ok(DaemonObjectRpcChannelRequestDisposition::RetireChannel) => {
-                            return Ok(false);
-                        }
-                        Ok(DaemonObjectRpcChannelRequestDisposition::Continue) => {}
-                        Err(error) => {
-                            tracing::debug!(
-                                "multiplexed daemon object RPC call stopped: {error}"
-                            );
-                        }
-                    }
-                    continue;
-                }
-                inbound = server.accept() => inbound,
-            }
-        };
-        let Some(inbound) = inbound else {
-            return Ok(false);
-        };
-        calls.push(handle_daemon_object_rpc_channel_request_async(
-            inbound,
-            paths.clone(),
-            service_host.clone(),
-            service_runtime.clone(),
-            principal.clone(),
-            responder_node_id.clone(),
-        ));
-    }
-}
-
-type DaemonObjectRpcChannelCallFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<DaemonObjectRpcChannelRequestDisposition, DaemonError>,
-            > + Send
-            + 'static,
-    >,
->;
-
-/// Small connection-local future set. Polling request futures inline avoids a
-/// scheduler enqueue/dequeue and wakeup for every small RPC while retaining
-/// independent progress for concurrent logical calls.
-struct DaemonObjectRpcChannelCallSet {
-    calls: Vec<DaemonObjectRpcChannelCallFuture>,
-    next_poll: usize,
-}
-
-impl DaemonObjectRpcChannelCallSet {
-    fn new() -> Self {
-        Self {
-            calls: Vec::with_capacity(sinomo_core::network::OBJECT_RPC_CHANNEL_MAX_CALLS),
-            next_poll: 0,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.calls.is_empty()
-    }
-
-    fn push(
-        &mut self,
-        call: impl std::future::Future<
-            Output = Result<DaemonObjectRpcChannelRequestDisposition, DaemonError>,
-        > + Send
-        + 'static,
-    ) {
-        debug_assert!(self.calls.len() < sinomo_core::network::OBJECT_RPC_CHANNEL_MAX_CALLS);
-        self.calls.push(Box::pin(call));
-    }
-
-    async fn next_completed(
-        &mut self,
-    ) -> Result<DaemonObjectRpcChannelRequestDisposition, DaemonError> {
-        std::future::poll_fn(|context| self.poll_next_completed(context)).await
-    }
-
-    fn poll_next_completed(
-        &mut self,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<DaemonObjectRpcChannelRequestDisposition, DaemonError>> {
-        debug_assert!(!self.calls.is_empty());
-        if self.calls.is_empty() {
-            return std::task::Poll::Pending;
-        }
-
-        let call_count = self.calls.len();
-        let first = self.next_poll % call_count;
-        for offset in 0..call_count {
-            let index = (first + offset) % call_count;
-            if let std::task::Poll::Ready(result) =
-                std::future::Future::poll(self.calls[index].as_mut(), context)
-            {
-                drop(self.calls.swap_remove(index));
-                self.next_poll = if self.calls.is_empty() {
-                    0
-                } else {
-                    index % self.calls.len()
-                };
-                return std::task::Poll::Ready(result);
-            }
-        }
-        // Rotate the first poll position so a frequently woken call cannot
-        // make the same sibling pay the tail position on every scan.
-        self.next_poll = (first + 1) % call_count;
-        std::task::Poll::Pending
-    }
-}
-
-async fn handle_daemon_object_rpc_channel_request_async(
-    inbound: sinomo_core::network::ObjectRpcChannelInboundRequest,
-    paths: DaemonPaths,
-    service_host: crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: tokio::runtime::Handle,
-    principal: DaemonObjectRpcChannelPrincipal,
-    responder_node_id: Option<Arc<str>>,
-) -> Result<DaemonObjectRpcChannelRequestDisposition, DaemonError> {
-    let timeline = inbound.timeline_context();
-    let timeline_connection_id = inbound.connection_id();
-    let timeline_call_id = inbound.call_id().0;
-    let responder = inbound.responder();
-    let mut cancellation = inbound.cancellation();
-    let mut request = inbound.request;
-    let route = request.request.route.clone();
-    let principal_started_ns = timeline
-        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
-        .unwrap_or(0);
-    let principal_validation = validate_daemon_object_rpc_channel_principal(&paths, &principal);
-    record_daemon_channel_timeline_stage(
-        timeline,
-        sinomo_core::network::network_timeline_stage::PRINCIPAL_VALIDATE,
-        principal_started_ns,
-        timeline_connection_id,
-        timeline_call_id,
-        principal_validation.is_ok(),
-    );
-    let retire_channel = principal_validation.is_err();
-    let dispatch = async {
-        let prepared = async {
-            principal_validation?;
-            let authorize_started_ns = timeline
-                .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
-                .unwrap_or(0);
-            let authorization = async {
-                let authenticated = if request.request.auth.is_some() {
-                    let verify_started_ns = timeline
-                        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
-                        .unwrap_or(0);
-                    let delegated_principal = daemon_object_rpc_channel_delegated_origin_principal(
-                        &paths,
-                        &principal,
-                        &request.request,
-                    )?;
-                    let authenticated_result = if let Some(delegated_principal) =
-                        delegated_principal
-                    {
-                        let authenticated = delegated_principal.for_route(route.clone());
-                        crate::service_adapter::authorize_daemon_channel_request_via_registry(
-                            &paths,
-                            &authenticated,
-                            &service_host,
-                        )
-                        .map(|()| authenticated)
-                    } else {
-                        crate::service_adapter::authenticate_daemon_control_request_via_registry(
-                            &paths,
-                            &request.request,
-                            &service_host,
-                        )
-                    };
-                    record_daemon_channel_timeline_stage(
-                        timeline,
-                        sinomo_core::network::network_timeline_stage::REQUEST_VERIFY,
-                        verify_started_ns,
-                        timeline_connection_id,
-                        timeline_call_id,
-                        authenticated_result.is_ok(),
-                    );
-                    let authenticated = authenticated_result?;
-                    let signed_request = request.request.clone();
-                    let bind_started_ns = timeline
-                        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
-                        .unwrap_or(0);
-                    let bound_request = request
-                        .bind_signed_inner_request_on_authenticated_channel(signed_request)
-                        .await
-                        .map_err(DaemonError::from);
-                    record_daemon_channel_timeline_stage(
-                        timeline,
-                        sinomo_core::network::network_timeline_stage::BODY_BIND,
-                        bind_started_ns,
-                        timeline_connection_id,
-                        timeline_call_id,
-                        bound_request.is_ok(),
-                    );
-                    request = bound_request?;
-                    authenticated
-                } else {
-                    let authenticated = principal.for_route(route.clone());
-                    let policy_started_ns = timeline
-                        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
-                        .unwrap_or(0);
-                    let policy_result =
-                        crate::service_adapter::authorize_daemon_channel_request_via_registry(
-                            &paths,
-                            &authenticated,
-                            &service_host,
-                        );
-                    record_daemon_channel_timeline_stage(
-                        timeline,
-                        sinomo_core::network::network_timeline_stage::ROUTE_POLICY,
-                        policy_started_ns,
-                        timeline_connection_id,
-                        timeline_call_id,
-                        policy_result.is_ok(),
-                    );
-                    policy_result?;
-                    authenticated
-                };
-                Ok::<_, DaemonError>((authenticated, request))
-            }
-            .await;
-            record_daemon_channel_timeline_stage(
-                timeline,
-                sinomo_core::network::network_timeline_stage::ROUTE_AUTHORIZE,
-                authorize_started_ns,
-                timeline_connection_id,
-                timeline_call_id,
-                authorization.is_ok(),
-            );
-            authorization
-        }
-        .await;
-        match prepared {
-            Ok((authenticated, request)) => {
-                let dispatch_started_ns = timeline
-                    .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
-                    .unwrap_or(0);
-                let response = dispatch_daemon_object_rpc_session_request_async(
-                    &paths,
-                    &service_host,
-                    &service_runtime,
-                    &authenticated,
-                    request,
-                )
-                .await;
-                record_daemon_channel_timeline_stage(
-                    timeline,
-                    sinomo_core::network::network_timeline_stage::HANDLER_DISPATCH,
-                    dispatch_started_ns,
-                    timeline_connection_id,
-                    timeline_call_id,
-                    response.is_ok(),
-                );
-                response
-            }
-            Err(error) => Err(error),
-        }
-    };
-    let dispatch = tokio::select! {
-        biased;
-        () = daemon_object_rpc_channel_cancellation(&mut cancellation) => {
-            return Ok(DaemonObjectRpcChannelRequestDisposition::Continue);
-        }
-        dispatch = dispatch => dispatch,
-    };
-    let (mut response, stop, effective_route) = match dispatch {
-        Ok(response) => response,
-        Err(error) => (
-            sinomo_core::network::ObjectRpcSessionResponse::value(
-                sinomo_core::network::ObjectRpcResponse::encode_error(&route, error.to_string())?,
-            ),
-            false,
-            route,
-        ),
-    };
-    // A persistent channel authenticates its physical peer once instead of
-    // signing every response head. Carry the final responder identity on each
-    // logical result so an upstream relay can distinguish target delivery
-    // from relay-generated feedback. Resolve the identity once per physical
-    // channel; the hot path only performs the insert-only metadata update, so
-    // a forwarding hop preserves an existing target identity.
-    if let Some(responder_node_id) = responder_node_id {
-        response
-            .response
-            .mark_responder_node_id(responder_node_id.as_ref().to_string());
-    }
-    if stop {
-        // The identity mutation has already committed by the time dispatch
-        // asks us to stop. Give its response a physical write/flush attempt,
-        // then schedule the required restart even if the peer disconnects or
-        // the write fails; otherwise applied identity state can remain behind
-        // a daemon that continues running with its old process identity.
-        let response_result = responder.respond_and_wait_written(response).await;
-        crate::service_adapter::mark_cluster_identity_restart_after_response(
-            &effective_route,
-            true,
-            Some(&paths),
-        );
-        response_result.map_err(DaemonError::from)?;
-        return Ok(DaemonObjectRpcChannelRequestDisposition::StopDaemon);
-    }
-    if retire_channel {
-        // Membership, role, and key changes revoke the principal fixed when
-        // this physical channel was admitted. Wait until the peer's error is
-        // handed to the channel writer, then end this carrier so a subsequent
-        // connection captures fresh KV-backed authority. A failed write still
-        // retires the now-invalid carrier.
-        if let Err(error) = responder.respond_and_wait_written(response).await {
-            tracing::debug!(
-                "stale-principal daemon object RPC error response was not written: {error}"
-            );
-        }
-        return Ok(DaemonObjectRpcChannelRequestDisposition::RetireChannel);
-    }
-    tokio::select! {
-        biased;
-        () = daemon_object_rpc_channel_cancellation(&mut cancellation) => {
-            return Ok(DaemonObjectRpcChannelRequestDisposition::Continue);
-        }
-        result = responder.respond(response) => result.map_err(DaemonError::from)?,
-    }
-    crate::service_adapter::mark_cluster_identity_restart_after_response(
-        &effective_route,
-        false,
-        Some(&paths),
-    );
-    Ok(DaemonObjectRpcChannelRequestDisposition::Continue)
-}
-
-fn record_daemon_channel_timeline_stage(
-    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
-    stage: u16,
-    started_ns: u64,
-    connection_id: u64,
-    call_id: u64,
-    success: bool,
-) {
-    let Some(trace) = timeline else {
-        return;
-    };
-    sinomo_core::network::record_network_timeline_event_now(
-        sinomo_core::network::NetworkTimelineEvent::new(
-            trace,
-            stage,
-            sinomo_core::network::network_timeline_flag::REQUEST
-                | if success {
-                    sinomo_core::network::network_timeline_flag::SUCCESS
-                } else {
-                    0
-                },
-            connection_id,
-            call_id,
-            0,
-            0,
-            0,
-            sinomo_core::network::network_timeline_monotonic_ns().saturating_sub(started_ns),
-        ),
-    );
-}
-
-async fn daemon_object_rpc_channel_cancellation(
-    cancellation: &mut tokio::sync::watch::Receiver<Option<String>>,
-) {
-    if cancellation.borrow().is_some() {
-        return;
-    }
-    loop {
-        match cancellation.changed().await {
-            Ok(()) if cancellation.borrow().is_some() => return,
-            Ok(()) => continue,
-            // Dropping the call state without a terminal response also makes
-            // further service work and response emission obsolete.
-            Err(_) => return,
-        }
-    }
 }
 
 async fn handle_daemon_local_stream_native_service_rpc_async(
@@ -3903,84 +3191,92 @@ async fn handle_daemon_local_stream_native_service_rpc_async(
     {
         return Err(DaemonError::AuthDenied);
     }
-    let context =
-        sinomo_core::network::__object_rpc_stream_contract::read_local_object_rpc_stream_prelude(
-            &mut stream,
-        )
-        .await?;
-    let (local_principal, responder_node_id) =
-        daemon_object_rpc_channel_principal(&paths, &DaemonObjectRpcChannelPeer::Loopback)?;
+    let context = sinomo_core::network::read_local_object_rpc_stream_prelude(&mut stream).await?;
+    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
+    let local_public_key = sinomo_core::network::cached_daemon_signing_public_key(&data_dir)
+        .map_err(DaemonError::from)?;
+    let local_public_key = sinomo_core::network::daemon_auth_encode_public_key(&local_public_key);
+    let responder_node_id = cluster_paths_from_daemon_paths(&paths)
+        .ok()
+        .and_then(|cluster_paths| {
+            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
+        })
+        .map(|state| Arc::<str>::from(state.local_node_id.as_str()));
     let local_node_id = responder_node_id
         .as_deref()
-        .unwrap_or(&local_principal.signer_node_id)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            NodeId::derived(
+                "sinomo.network.local-object-rpc-stream",
+                local_public_key.as_bytes(),
+            )
+            .to_string()
+        });
     let completion = Arc::new(Mutex::new(("<unavailable>".to_string(), false)));
     let handler_completion = Arc::clone(&completion);
     let handler_paths = paths.clone();
     let handler_host = service_host.clone();
     let handler_runtime = service_runtime.clone();
-    let result =
-        sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
-            stream,
-            &context,
-            sinomo_core::network::ObjectFrameIoOptions::default(),
-            move |request, peer| async move {
-                if !matches!(
-                    peer.identity,
-                    sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::UnauthenticatedLocal
-                ) {
-                    return Err(sinomo_core::network::NetworkError::AuthDenied);
-                }
-                let authenticated = crate::service_adapter::authenticate_daemon_control_request_via_registry(
+    let result = sinomo_core::network::serve_service_rpc_stream(
+        stream,
+        &context,
+        sinomo_core::network::ObjectFrameIoOptions::default(),
+        move |request, peer| async move {
+            if !matches!(
+                peer.identity,
+                sinomo_core::network::RpcPeerIdentity::UnauthenticatedLocal
+            ) {
+                return Err(sinomo_core::network::NetworkError::AuthDenied);
+            }
+            let authenticated =
+                crate::service_adapter::authenticate_daemon_control_request_via_registry(
                     &handler_paths,
                     &request.request,
                     &handler_host,
                 )
                 .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
-                if authenticated.signer != DaemonSignerAuthority::Local
-                    || authenticated.signer_public_key != local_principal.signer_public_key
-                    || responder_node_id.as_deref().is_some_and(|node_id| {
-                        authenticated.signer_node_id.as_str() != node_id
-                    })
-                {
-                    return Err(sinomo_core::network::NetworkError::AuthDenied);
-                }
-                let route = request.request.route.clone();
-                let dispatch = dispatch_daemon_object_rpc_session_request_async(
-                    &handler_paths,
-                    &handler_host,
-                    &handler_runtime,
-                    &authenticated,
-                    request,
-                )
-                .await;
-                let (mut response, stop, effective_route) = match dispatch {
-                    Ok(response) => response,
-                    Err(error) => (
-                        sinomo_core::network::ObjectRpcSessionResponse::value(
-                            sinomo_core::network::ObjectRpcResponse::encode_error(
-                                &route,
-                                error.to_string(),
-                            )?,
-                        ),
-                        false,
-                        route,
+            if authenticated.signer != DaemonSignerAuthority::Local
+                || authenticated.signer_public_key != local_public_key
+                || responder_node_id
+                    .as_deref()
+                    .is_some_and(|node_id| authenticated.signer_node_id.as_str() != node_id)
+            {
+                return Err(sinomo_core::network::NetworkError::AuthDenied);
+            }
+            let route = request.request.route.clone();
+            let dispatch = dispatch_daemon_object_rpc_call_request_async(
+                &handler_paths,
+                &handler_host,
+                &handler_runtime,
+                &authenticated,
+                request,
+            )
+            .await;
+            let (mut response, stop, effective_route) = match dispatch {
+                Ok(response) => response,
+                Err(error) => (
+                    sinomo_core::network::ObjectRpcOutgoingResponse::value(
+                        sinomo_core::network::ObjectRpcResponse::encode_error(
+                            &route,
+                            error.to_string(),
+                        )?,
                     ),
-                };
-                response
-                    .response
-                    .mark_responder_node_id(local_node_id);
-                *handler_completion.lock().map_err(|_| {
-                    sinomo_core::network::NetworkError::Io {
-                        operation: "record local stream-native service completion".to_string(),
-                        detail: "service completion lock poisoned".to_string(),
-                    }
+                    false,
+                    route,
+                ),
+            };
+            response.response.mark_responder_node_id(local_node_id);
+            *handler_completion
+                .lock()
+                .map_err(|_| sinomo_core::network::NetworkError::Io {
+                    operation: "record local stream-native service completion".to_string(),
+                    detail: "service completion lock poisoned".to_string(),
                 })? = (effective_route, stop);
-                Ok(response)
-            },
-        )
-        .await
-        .map_err(DaemonError::from);
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(DaemonError::from);
     let (effective_route, stop) = completion
         .lock()
         .map_err(|_| DaemonError::Parse {
@@ -4003,13 +3299,12 @@ async fn handle_daemon_stream_native_service_rpc_async(
 ) -> Result<bool, DaemonError> {
     let peer_node_id = stream.peer_node_id.clone();
     let local_node_id = stream.local_node_id.clone();
-    let context =
-        sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
-            local_node_id.clone(),
-            peer_node_id.clone(),
-            stream.session_id.clone(),
-            stream.channel_binding,
-        )?;
+    let context = sinomo_core::network::RpcPeerContext::authenticated(
+        local_node_id.clone(),
+        peer_node_id.clone(),
+        stream.session_id.clone(),
+        stream.channel_binding,
+    )?;
     let peer_directory_node = directory.node(&peer_node_id).ok_or_else(|| {
         sinomo_core::network::NetworkError::UnauthorizedNode {
             node_id: peer_node_id.clone(),
@@ -4026,13 +3321,13 @@ async fn handle_daemon_stream_native_service_rpc_async(
     let handler_runtime = service_runtime.clone();
     let handler_peer_node_id = peer_node_id.clone();
     let handler_peer_public_key = peer_public_key_encoded;
-    let result =
-        sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
-            stream,
-            &context,
-            sinomo_core::network::ObjectFrameIoOptions::default(),
-            move |request, peer| async move {
-                let authenticated = crate::service_adapter::authenticate_routed_daemon_control_request_via_registry(
+    let result = sinomo_core::network::serve_service_rpc_stream(
+        stream,
+        &context,
+        sinomo_core::network::ObjectFrameIoOptions::default(),
+        move |request, peer| async move {
+            let authenticated =
+                crate::service_adapter::authenticate_routed_daemon_control_request_via_registry(
                     &handler_paths,
                     &request.request,
                     &handler_host,
@@ -4041,60 +3336,59 @@ async fn handle_daemon_stream_native_service_rpc_async(
                     peer_is_raft_voter,
                 )
                 .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
-                let context_peer = match peer.identity {
-                    sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::Authenticated {
-                        peer_node_id,
-                        ..
-                    } => peer_node_id,
-                    sinomo_core::network::__object_rpc_stream_contract::RpcPeerIdentity::UnauthenticatedLocal => {
-                        return Err(sinomo_core::network::NetworkError::AuthDenied);
-                    }
-                };
-                let signer_public_key = sinomo_core::network::daemon_auth_decode_public_key(
-                    &authenticated.signer_public_key,
-                )?;
-                if context_peer != handler_peer_node_id
-                    || authenticated.signer_node_id != context_peer.as_str()
-                    || signer_public_key != peer_public_key
-                {
+            let context_peer = match peer.identity {
+                sinomo_core::network::RpcPeerIdentity::Authenticated { peer_node_id, .. } => {
+                    peer_node_id
+                }
+                sinomo_core::network::RpcPeerIdentity::UnauthenticatedLocal => {
                     return Err(sinomo_core::network::NetworkError::AuthDenied);
                 }
-                let route = request.request.route.clone();
-                let dispatch = dispatch_daemon_object_rpc_session_request_async(
-                    &handler_paths,
-                    &handler_host,
-                    &handler_runtime,
-                    &authenticated,
-                    request,
-                )
-                .await;
-                let (mut response, stop, effective_route) = match dispatch {
-                    Ok(response) => response,
-                    Err(error) => (
-                        sinomo_core::network::ObjectRpcSessionResponse::value(
-                            sinomo_core::network::ObjectRpcResponse::encode_error(
-                                &route,
-                                error.to_string(),
-                            )?,
-                        ),
-                        false,
-                        route,
+            };
+            let signer_public_key = sinomo_core::network::daemon_auth_decode_public_key(
+                &authenticated.signer_public_key,
+            )?;
+            if context_peer != handler_peer_node_id
+                || authenticated.signer_node_id != context_peer.as_str()
+                || signer_public_key != peer_public_key
+            {
+                return Err(sinomo_core::network::NetworkError::AuthDenied);
+            }
+            let route = request.request.route.clone();
+            let dispatch = dispatch_daemon_object_rpc_call_request_async(
+                &handler_paths,
+                &handler_host,
+                &handler_runtime,
+                &authenticated,
+                request,
+            )
+            .await;
+            let (mut response, stop, effective_route) = match dispatch {
+                Ok(response) => response,
+                Err(error) => (
+                    sinomo_core::network::ObjectRpcOutgoingResponse::value(
+                        sinomo_core::network::ObjectRpcResponse::encode_error(
+                            &route,
+                            error.to_string(),
+                        )?,
                     ),
-                };
-                response
-                    .response
-                    .mark_responder_node_id(local_node_id.to_string());
-                *handler_completion.lock().map_err(|_| {
-                    sinomo_core::network::NetworkError::Io {
-                        operation: "record stream-native service completion".to_string(),
-                        detail: "service completion lock poisoned".to_string(),
-                    }
+                    false,
+                    route,
+                ),
+            };
+            response
+                .response
+                .mark_responder_node_id(local_node_id.to_string());
+            *handler_completion
+                .lock()
+                .map_err(|_| sinomo_core::network::NetworkError::Io {
+                    operation: "record stream-native service completion".to_string(),
+                    detail: "service completion lock poisoned".to_string(),
                 })? = (effective_route, stop);
-                Ok(response)
-            },
-        )
-        .await
-        .map_err(DaemonError::from);
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(DaemonError::from);
     let (effective_route, stop) = completion
         .lock()
         .map_err(|_| DaemonError::Parse {
@@ -4102,161 +3396,6 @@ async fn handle_daemon_stream_native_service_rpc_async(
         })?
         .clone();
     finish_daemon_object_rpc_stream_response(&effective_route, stop, &paths, result)
-}
-
-/// Runs one transport-neutral canonical object-RPC session through the same
-/// authentication, authorization, registry, relay, and response path used by
-/// a directly accepted daemon TCP connection.
-pub(crate) async fn handle_daemon_object_rpc_stream_async(
-    stream: Box<dyn sinomo_core::network::NetworkDuplexStream>,
-    paths: DaemonPaths,
-    service_host: crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: tokio::runtime::Handle,
-) -> Result<bool, DaemonError> {
-    handle_daemon_object_rpc_stream_for_authenticated_peer_async(
-        stream,
-        paths,
-        service_host,
-        service_runtime,
-        None,
-    )
-    .await
-}
-
-async fn handle_daemon_object_rpc_stream_for_authenticated_peer_async(
-    stream: Box<dyn sinomo_core::network::NetworkDuplexStream>,
-    paths: DaemonPaths,
-    service_host: crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: tokio::runtime::Handle,
-    expected_transport_peer: Option<NodeId>,
-) -> Result<bool, DaemonError> {
-    let perf_enabled = crate::tcp_tunnel::network_perf_trace_enabled();
-    let accept_started = perf_enabled.then(Instant::now);
-    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(&paths)?);
-    let authenticated = Arc::new(Mutex::new(None::<AuthenticatedDaemonCommand>));
-    let authenticated_slot = Arc::clone(&authenticated);
-    let auth_paths = paths.clone();
-    let auth_service_host = service_host.clone();
-    let accepted = sinomo_core::network::accept_object_rpc_server_session(
-        stream,
-        data_dir,
-        sinomo_core::network::NetworkCallPolicy::default(),
-        move |request, claimed_link_node_id, claimed_link_public_key| {
-            let command = crate::service_adapter::authenticate_daemon_control_request_via_registry(
-                &auth_paths,
-                request,
-                &auth_service_host,
-            )
-            .map_err(|error| {
-                crate::cluster_join_trace(format_args!(
-                    "session auth denied route={} claimed_link_node={}: {error}",
-                    request.route, claimed_link_node_id
-                ));
-                sinomo_core::network::NetworkError::AuthDenied
-            })?;
-            authorize_daemon_session_link_peer(
-                &auth_paths,
-                request,
-                &command,
-                claimed_link_node_id,
-                claimed_link_public_key,
-            )
-            .inspect_err(|error| {
-                crate::cluster_join_trace(format_args!(
-                    "session link auth denied route={} origin_node={} claimed_link_node={} authority={:?}: {error}",
-                    request.route,
-                    command.signer_node_id,
-                    claimed_link_node_id,
-                    command.signer
-                ));
-            })?;
-            if expected_transport_peer
-                .as_ref()
-                .is_some_and(|expected| expected.as_str() != claimed_link_node_id)
-            {
-                crate::cluster_join_trace(format_args!(
-                    "session transport peer mismatch route={} claimed_link_node={} transport_peer={}",
-                    request.route,
-                    claimed_link_node_id,
-                    expected_transport_peer
-                        .as_ref()
-                        .expect("checked authenticated transport peer")
-                ));
-                return Err(sinomo_core::network::NetworkError::AuthDenied);
-            }
-            *authenticated_slot
-                .lock()
-                .map_err(|_| sinomo_core::network::NetworkError::Io {
-                    operation: "record authenticated object RPC session".to_string(),
-                    detail: "authenticated session slot lock poisoned".to_string(),
-                })? = Some(command);
-            Ok(())
-        },
-    )
-    .await
-    .map_err(DaemonError::from);
-    if let Some(started) = accept_started {
-        let route = accepted
-            .as_ref()
-            .map(|(request, _)| request.request.route.as_str())
-            .unwrap_or("<unavailable>");
-        tracing::info!(
-            target: "sinomo.network.perf",
-            stage = "server_session_accept_auth",
-            route,
-            ok = accepted.is_ok(),
-            elapsed_us = crate::tcp_tunnel::network_perf_trace_elapsed_us(started),
-        );
-    }
-    let (request, responder) = accepted?;
-    let authenticated = authenticated
-        .lock()
-        .map_err(|_| DaemonError::Parse {
-            detail: "authenticated object RPC session slot lock poisoned".to_string(),
-        })?
-        .take()
-        .ok_or(DaemonError::AuthDenied)?;
-
-    let route = request.request.route.clone();
-    let dispatch_started = perf_enabled.then(Instant::now);
-    let dispatch = dispatch_daemon_object_rpc_session_request_async(
-        &paths,
-        &service_host,
-        &service_runtime,
-        &authenticated,
-        request,
-    )
-    .await;
-    if let Some(started) = dispatch_started {
-        tracing::info!(
-            target: "sinomo.network.perf",
-            stage = "server_dispatch",
-            route = route.as_str(),
-            ok = dispatch.is_ok(),
-            elapsed_us = crate::tcp_tunnel::network_perf_trace_elapsed_us(started),
-        );
-    }
-    let (response, stop, effective_route) = match dispatch {
-        Ok(response) => response,
-        Err(error) => {
-            let response = sinomo_core::network::ObjectRpcSessionResponse::value(
-                sinomo_core::network::ObjectRpcResponse::encode_error(&route, error.to_string())?,
-            );
-            (response, false, route.clone())
-        }
-    };
-    let respond_started = perf_enabled.then(Instant::now);
-    let respond_result = responder.respond(response).await.map_err(DaemonError::from);
-    if let Some(started) = respond_started {
-        tracing::info!(
-            target: "sinomo.network.perf",
-            stage = "server_respond",
-            route = effective_route.as_str(),
-            ok = respond_result.is_ok(),
-            elapsed_us = crate::tcp_tunnel::network_perf_trace_elapsed_us(started),
-        );
-    }
-    finish_daemon_object_rpc_stream_response(&effective_route, stop, &paths, respond_result)
 }
 
 fn finish_daemon_object_rpc_stream_response(
@@ -4278,17 +3417,53 @@ fn finish_daemon_object_rpc_stream_response(
     Ok(stop)
 }
 
-async fn dispatch_daemon_object_rpc_session_request_async(
+fn record_daemon_stream_timeline_stage(
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+    stage: u16,
+    started_ns: u64,
+    success: bool,
+) {
+    let Some(trace) = timeline else {
+        return;
+    };
+    sinomo_core::network::record_network_timeline_event_now(
+        sinomo_core::network::NetworkTimelineEvent::new(
+            trace,
+            stage,
+            sinomo_core::network::network_timeline_flag::REQUEST
+                | if success {
+                    sinomo_core::network::network_timeline_flag::SUCCESS
+                } else {
+                    0
+                },
+            0,
+            0,
+            0,
+            0,
+            0,
+            sinomo_core::network::network_timeline_monotonic_ns().saturating_sub(started_ns),
+        ),
+    );
+}
+
+async fn dispatch_daemon_object_rpc_call_request_async(
     paths: &DaemonPaths,
     service_host: &crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: &tokio::runtime::Handle,
     authenticated: &AuthenticatedDaemonCommand,
-    request: sinomo_core::network::ObjectRpcSessionRequest,
-) -> Result<(sinomo_core::network::ObjectRpcSessionResponse, bool, String), DaemonError> {
+    request: sinomo_core::network::ObjectRpcIncomingRequest,
+) -> Result<
+    (
+        sinomo_core::network::ObjectRpcOutgoingResponse,
+        bool,
+        String,
+    ),
+    DaemonError,
+> {
     let route = request.request.route.clone();
     if route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE {
         let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(paths)?);
-        let response = crate::service_adapter::handle_daemon_cluster_network_ping_session_request(
+        let response = crate::service_adapter::handle_daemon_cluster_network_ping_request(
             paths, &data_dir, request,
         )
         .await
@@ -4322,17 +3497,15 @@ async fn dispatch_daemon_object_rpc_session_request_async(
             .request
             .decode_body::<crate::DaemonObjectRpcForwardRequest>()
             .map_err(DaemonError::from);
-        record_daemon_channel_timeline_stage(
+        record_daemon_stream_timeline_stage(
             timeline,
             sinomo_core::network::network_timeline_stage::FORWARD_DECODE,
             decode_started_ns,
-            0,
-            0,
             payload.is_ok(),
         );
         let payload = payload?;
         let (forwarded, body) =
-            crate::service_adapter::forward_object_rpc_session_from_daemon_control(
+            crate::service_adapter::forward_object_rpc_call_from_daemon_control(
                 paths,
                 payload,
                 request.body,
@@ -4346,28 +3519,22 @@ async fn dispatch_daemon_object_rpc_session_request_async(
         let response =
             sinomo_core::network::ObjectRpcResponse::encode_body(route.clone(), &forwarded)
                 .map_err(DaemonError::from);
-        record_daemon_channel_timeline_stage(
+        record_daemon_stream_timeline_stage(
             timeline,
             sinomo_core::network::network_timeline_stage::FORWARD_ENCODE,
             encode_started_ns,
-            0,
-            0,
             response.is_ok(),
         );
         let mut response = response?;
         // The generic registry adapter normally supplies this outer response
-        // attestation. Canonical sessions need it here; persistent channels
-        // retain the already-present identity.
+        // attestation; this specialized forwarding path supplies it here.
         crate::service_adapter::mark_daemon_rpc_response_responder(paths, &mut response);
         let response = if body.is_empty() {
-            sinomo_core::network::ObjectRpcSessionResponse::value(response)
+            sinomo_core::network::ObjectRpcOutgoingResponse::value(response)
         } else {
-            sinomo_core::network::ObjectRpcSessionResponse::new(response, body)
+            sinomo_core::network::ObjectRpcOutgoingResponse::new(response, body)
         };
         Ok((response, false, route))
-    } else if route == sinomo_core::network::CLUSTER_RELAY_ROUTE {
-        handle_daemon_cluster_relay_session_async(paths, service_host, service_runtime, request)
-            .await
     } else if crate::service_adapter::is_sandbox_stream_route(&request.request) {
         if !request.body.is_empty() {
             return Err(DaemonError::Parse {
@@ -4376,12 +3543,12 @@ async fn dispatch_daemon_object_rpc_session_request_async(
             });
         }
         Ok((
-            daemon_sandbox_stream_session_response(paths, request.request, service_runtime)?,
+            daemon_sandbox_stream_rpc_response(paths, request.request, service_runtime)?,
             false,
             route,
         ))
     } else {
-        crate::service_adapter::dispatch_rpc_via_registry_to_session_response_async(
+        crate::service_adapter::dispatch_rpc_via_registry_with_body_async(
             service_host,
             authenticated,
             request,
@@ -4392,11 +3559,11 @@ async fn dispatch_daemon_object_rpc_session_request_async(
     }
 }
 
-fn daemon_sandbox_stream_session_response(
+fn daemon_sandbox_stream_rpc_response(
     paths: &DaemonPaths,
     request: sinomo_core::network::ObjectRpcRequest,
     runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::network::ObjectRpcSessionResponse, DaemonError> {
+) -> Result<sinomo_core::network::ObjectRpcOutgoingResponse, DaemonError> {
     let route = request.route.clone();
     let response = sinomo_core::network::ObjectRpcResponse::encode_body(&route, &())
         .map_err(DaemonError::from)?;
@@ -4454,125 +3621,9 @@ fn daemon_sandbox_stream_session_response(
     let body = sinomo_core::network::ObjectRpcBodySource::async_reader(reader, None)
         .with_lifetime_guard(producer)
         .map_err(DaemonError::from)?;
-    Ok(sinomo_core::network::ObjectRpcSessionResponse::new(
+    Ok(sinomo_core::network::ObjectRpcOutgoingResponse::new(
         response, body,
     ))
-}
-
-fn authorize_daemon_session_link_peer(
-    paths: &DaemonPaths,
-    request: &sinomo_core::network::ObjectRpcRequest,
-    authenticated: &AuthenticatedDaemonCommand,
-    claimed_link_node_id: &str,
-    claimed_link_public_key: &[u8],
-) -> Result<(), sinomo_core::network::NetworkError> {
-    let origin_public_key =
-        sinomo_core::network::daemon_auth_decode_public_key(&authenticated.signer_public_key)?;
-    if authenticated.signer_node_id == claimed_link_node_id
-        && origin_public_key == claimed_link_public_key
-    {
-        return Ok(());
-    }
-    if request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE {
-        // The outer relay head is freshly signed by the immediate hop. Only a
-        // final-hop inner request may retain an origin signature while using a
-        // different, separately authorized link signer.
-        return Err(sinomo_core::network::NetworkError::AuthDenied);
-    }
-    let cluster_paths = cluster_paths_from_daemon_paths(paths).map_err(|error| {
-        sinomo_core::network::NetworkError::Io {
-            operation: "authorize daemon session link peer".to_string(),
-            detail: error.to_string(),
-        }
-    })?;
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let authorized = state.members.iter().any(|member| {
-        member.state.is_authorized()
-            && member.node_id.as_str() == claimed_link_node_id
-            && sinomo_core::network::daemon_auth_decode_public_key(&member.node_public_key)
-                .is_ok_and(|key| key == claimed_link_public_key)
-    });
-    if authorized {
-        Ok(())
-    } else {
-        Err(sinomo_core::network::NetworkError::AuthDenied)
-    }
-}
-
-async fn handle_daemon_cluster_relay_session_async(
-    paths: &DaemonPaths,
-    service_host: &crate::service_adapter::DaemonServiceRegistryHost,
-    service_runtime: &tokio::runtime::Handle,
-    request: sinomo_core::network::ObjectRpcSessionRequest,
-) -> Result<(sinomo_core::network::ObjectRpcSessionResponse, bool, String), DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)
-        .map_err(DaemonError::from)?;
-    match sinomo_core::network::cluster_relay_session_request_action(
-        state.as_ref(),
-        &request.request,
-    )
-    .map_err(DaemonError::from)?
-    {
-        sinomo_core::network::ClusterRelaySessionRequestAction::DeliverLocal(inner_request) => {
-            let request = request
-                .bind_signed_inner_request(inner_request)
-                .await
-                .map_err(DaemonError::from)?;
-            let authenticated =
-                crate::service_adapter::authenticate_daemon_control_request_via_registry(
-                    paths,
-                    &request.request,
-                    service_host,
-                )?;
-            // Re-enter the same dispatcher used by a directly addressed request.
-            // Besides keeping route semantics identical, this lets forwarded core
-            // routes such as network ping use their allocation-light fast path.
-            Box::pin(dispatch_daemon_object_rpc_session_request_async(
-                paths,
-                service_host,
-                service_runtime,
-                &authenticated,
-                request,
-            ))
-            .await
-        }
-        sinomo_core::network::ClusterRelaySessionRequestAction::Forward => {
-            let mut host =
-                crate::client::DaemonSignedObjectRpcAsyncHost::new(service_runtime, true)
-                    .with_paths(paths);
-            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
-                &mut host,
-                service_runtime,
-                &cluster_paths,
-            );
-            match client
-                .forward_relay(
-                    state.as_ref(),
-                    request,
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
-                )
-                .await
-            {
-                Ok(result) => Ok((
-                    result.into_relay_response().map_err(DaemonError::from)?,
-                    false,
-                    sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
-                )),
-                Err(error) => Ok((
-                    sinomo_core::network::ObjectRpcSessionResponse::value(
-                        sinomo_core::network::ObjectRpcResponse::encode_error(
-                            sinomo_core::network::CLUSTER_RELAY_ROUTE,
-                            format!("relay dropped while forwarding session: {error}"),
-                        )
-                        .map_err(DaemonError::from)?,
-                    ),
-                    false,
-                    sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
-                )),
-            }
-        }
-    }
 }
 
 async fn read_daemon_control_frame_async(
@@ -7359,7 +6410,6 @@ mod tests {
     use sinomo_dfs::DfsMetadataBackend;
     use std::fs;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -7431,10 +6481,10 @@ mod tests {
             8192,
         )
         .expect("request head");
-        let response = crate::service_adapter::handle_daemon_cluster_network_ping_session_request(
+        let response = crate::service_adapter::handle_daemon_cluster_network_ping_request(
             &paths,
             &data_dir,
-            sinomo_core::network::ObjectRpcSessionRequest::new(
+            sinomo_core::network::ObjectRpcIncomingRequest::new(
                 request_head,
                 sinomo_core::network::ObjectRpcIncomingBody::bytes(vec![0; 4096]),
             ),
@@ -7455,17 +6505,16 @@ mod tests {
                 0,
             )
             .expect("empty response request head");
-        let empty_response =
-            crate::service_adapter::handle_daemon_cluster_network_ping_session_request(
-                &paths,
-                &data_dir,
-                sinomo_core::network::ObjectRpcSessionRequest::new(
-                    empty_response_head,
-                    sinomo_core::network::ObjectRpcIncomingBody::bytes(vec![0; 16]),
-                ),
-            )
-            .await
-            .expect("zero-byte response attachment is valid");
+        let empty_response = crate::service_adapter::handle_daemon_cluster_network_ping_request(
+            &paths,
+            &data_dir,
+            sinomo_core::network::ObjectRpcIncomingRequest::new(
+                empty_response_head,
+                sinomo_core::network::ObjectRpcIncomingBody::bytes(vec![0; 16]),
+            ),
+        )
+        .await
+        .expect("zero-byte response attachment is valid");
         assert!(empty_response.body.is_empty());
 
         let mismatched_head = sinomo_core::cluster::cluster_network_ping_attachment_rpc_request(
@@ -7474,10 +6523,10 @@ mod tests {
             0,
         )
         .expect("mismatched request head");
-        let error = crate::service_adapter::handle_daemon_cluster_network_ping_session_request(
+        let error = crate::service_adapter::handle_daemon_cluster_network_ping_request(
             &paths,
             &data_dir,
-            sinomo_core::network::ObjectRpcSessionRequest::new(
+            sinomo_core::network::ObjectRpcIncomingRequest::new(
                 mismatched_head,
                 sinomo_core::network::ObjectRpcIncomingBody::bytes(vec![0; 2048]),
             ),
@@ -7505,87 +6554,6 @@ mod tests {
             .map(cluster_network_maintenance_subphase_name),
             ["tick_plan", "pending_work"]
         );
-    }
-
-    #[test]
-    fn cluster_maintenance_reasons_invalidate_only_owned_projections() {
-        use DaemonClusterMaintenanceReason as Reason;
-
-        let cases = [
-            (
-                Reason::LifecycleWake,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: 0,
-                    tunnel_reason: Some(
-                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::IdentityChanged,
-                    ),
-                },
-            ),
-            (
-                Reason::NetworkEnvironmentChanged,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
-                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
-                    tunnel_reason: Some(
-                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::NetworkEnvironmentChanged,
-                    ),
-                },
-            ),
-            (
-                Reason::JoinConnectivityPublishFailed,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
-                    tunnel_reason: None,
-                },
-            ),
-            (
-                Reason::JoinAccepted,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
-                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
-                    tunnel_reason: Some(
-                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::MembershipChanged,
-                    ),
-                },
-            ),
-            (
-                Reason::CommittedConnectivityTopologyChanged,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
-                    tunnel_reason: None,
-                },
-            ),
-            (
-                Reason::Rename,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
-                    tunnel_reason: None,
-                },
-            ),
-            (
-                Reason::RoleChanged,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
-                    tunnel_reason: Some(crate::tcp_tunnel::TcpTunnelMaintenanceReason::RoleChanged),
-                },
-            ),
-            (
-                Reason::ManualBroad,
-                DaemonClusterMaintenanceRequestPlan {
-                    dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH
-                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
-                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY
-                        | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
-                    tunnel_reason: Some(
-                        crate::tcp_tunnel::TcpTunnelMaintenanceReason::OperatorRefresh,
-                    ),
-                },
-            ),
-        ];
-
-        for (reason, expected) in cases {
-            assert_eq!(daemon_cluster_maintenance_request_plan(reason), expected);
-        }
     }
 
     #[test]
@@ -7911,12 +6879,12 @@ mod tests {
                 &payload,
             )
             .expect("outer request");
-            let error = dispatch_daemon_object_rpc_session_request_async(
+            let error = dispatch_daemon_object_rpc_call_request_async(
                 &paths,
                 &service_host,
                 &runtime,
                 &authenticated,
-                sinomo_core::network::ObjectRpcSessionRequest::value(request),
+                sinomo_core::network::ObjectRpcIncomingRequest::value(request),
             )
             .await
             .expect_err("wrong category must fail before target I/O");
@@ -7978,41 +6946,6 @@ mod tests {
             format!("{}\n", std::process::id()),
             "a committed identity mutation must restart even when its response is lost"
         );
-    }
-
-    #[test]
-    fn outer_relay_session_requires_request_signer_to_match_link_signer() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-relay-session-link-signer");
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        let origin_public_key = vec![1_u8; 32];
-        let claimed_link_public_key = vec![2_u8; 32];
-        let authenticated = AuthenticatedDaemonCommand {
-            route: sinomo_core::network::CLUSTER_RELAY_ROUTE.to_string(),
-            signer: crate::DaemonSignerAuthority::Member,
-            signer_node_id: "origin-node".to_string(),
-            signer_public_key: sinomo_core::network::daemon_auth_encode_public_key(
-                &origin_public_key,
-            ),
-        };
-        let request = sinomo_core::network::ObjectRpcRequest::from_encoded_body(
-            sinomo_core::network::CLUSTER_RELAY_ROUTE,
-            "cluster-relay",
-            Vec::new(),
-        );
-
-        let error = authorize_daemon_session_link_peer(
-            &paths,
-            &request,
-            &authenticated,
-            "different-link-node",
-            &claimed_link_public_key,
-        )
-        .expect_err("an outer relay must be signed by its immediate link peer");
-
-        assert!(matches!(
-            error,
-            sinomo_core::network::NetworkError::AuthDenied
-        ));
     }
 
     #[test]
@@ -8472,557 +7405,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct PendingChannelHandlerState {
-        active: AtomicUsize,
-        maximum_active: AtomicUsize,
-        dropped: AtomicUsize,
-        changed: tokio::sync::Notify,
-    }
-
-    impl PendingChannelHandlerState {
-        fn enter(self: &Arc<Self>) -> PendingChannelHandlerGuard {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.maximum_active.fetch_max(active, Ordering::SeqCst);
-            self.changed.notify_one();
-            PendingChannelHandlerGuard {
-                state: Arc::clone(self),
-            }
-        }
-
-        async fn wait_for(&self, expected_active: usize, expected_dropped: usize) {
-            let result = tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let changed = self.changed.notified();
-                    if self.active.load(Ordering::SeqCst) == expected_active
-                        && self.dropped.load(Ordering::SeqCst) >= expected_dropped
-                    {
-                        return;
-                    }
-                    changed.await;
-                }
-            })
-            .await;
-            assert!(
-                result.is_ok(),
-                "pending channel handler state transition expected active={expected_active} dropped>={expected_dropped}, actual active={} dropped={} max={}",
-                self.active.load(Ordering::SeqCst),
-                self.dropped.load(Ordering::SeqCst),
-                self.maximum_active.load(Ordering::SeqCst),
-            );
-        }
-    }
-
-    struct PendingChannelHandlerGuard {
-        state: Arc<PendingChannelHandlerState>,
-    }
-
-    impl Drop for PendingChannelHandlerGuard {
-        fn drop(&mut self) {
-            self.state.active.fetch_sub(1, Ordering::SeqCst);
-            self.state.dropped.fetch_add(1, Ordering::SeqCst);
-            self.state.changed.notify_one();
-        }
-    }
-
-    struct PendingChannelRegistryService {
-        state: Arc<PendingChannelHandlerState>,
-    }
-
-    impl sinomo_core::service::Service for PendingChannelRegistryService {
-        fn name(&self) -> &'static str {
-            "pending-channel-registry"
-        }
-
-        fn routes(&self) -> &'static [&'static str] {
-            &["/benchmarks/cancel-probe"]
-        }
-
-        fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
-            vec![
-                sinomo_core::service::ServiceRoute::new("/benchmarks/cancel-probe", "benchmarks")
-                    .with_concurrency_limit(64),
-            ]
-        }
-
-        fn handle(
-            &self,
-            _ctx: sinomo_core::service::ServiceContext,
-            _request: sinomo_core::network::ObjectRpcRequest,
-        ) -> sinomo_core::service::ServiceFuture<'_> {
-            let state = Arc::clone(&self.state);
-            Box::pin(async move {
-                let _active = state.enter();
-                std::future::pending::<
-                    Result<
-                        sinomo_core::service::ServiceDisposition,
-                        sinomo_core::service::ServiceError,
-                    >,
-                >()
-                .await
-            })
-        }
-    }
-
-    struct StopChannelRegistryService;
-
-    impl sinomo_core::service::Service for StopChannelRegistryService {
-        fn name(&self) -> &'static str {
-            "stop-channel-registry"
-        }
-
-        fn routes(&self) -> &'static [&'static str] {
-            &["/benchmarks/stop-channel-probe"]
-        }
-
-        fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
-            vec![
-                sinomo_core::service::ServiceRoute::new(
-                    "/benchmarks/stop-channel-probe",
-                    "benchmarks",
-                )
-                .with_auth_scope("authenticated"),
-            ]
-        }
-
-        fn handle(
-            &self,
-            mut ctx: sinomo_core::service::ServiceContext,
-            request: sinomo_core::network::ObjectRpcRequest,
-        ) -> sinomo_core::service::ServiceFuture<'_> {
-            Box::pin(async move {
-                let _: () = request.decode_body()?;
-                ctx.respond(sinomo_core::network::ObjectRpcResponse::encode_body(
-                    request.route,
-                    &"stopping".to_string(),
-                )?)?;
-                Ok(sinomo_core::service::ServiceDisposition::Stop)
-            })
-        }
-    }
-
-    struct LinkedDaemonObjectRpcChannel {
-        client: sinomo_core::network::ObjectRpcChannelClient,
-        server: Option<sinomo_core::network::ObjectRpcChannelServer>,
-        left_ingress: sinomo_core::network::ObjectRpcChannelIngress,
-        right_ingress: sinomo_core::network::ObjectRpcChannelIngress,
-        pumps: Vec<tokio::task::JoinHandle<()>>,
-    }
-
-    impl LinkedDaemonObjectRpcChannel {
-        fn new() -> Self {
-            let left = sinomo_core::network::ObjectRpcChannelEndpoint::new(
-                sinomo_core::network::ObjectRpcChannelRole::Dialer,
-                sinomo_core::network::ObjectRpcChannelConfig::default(),
-            )
-            .expect("left object RPC channel");
-            let right = sinomo_core::network::ObjectRpcChannelEndpoint::new(
-                sinomo_core::network::ObjectRpcChannelRole::Acceptor,
-                sinomo_core::network::ObjectRpcChannelConfig::default(),
-            )
-            .expect("right object RPC channel");
-            let sinomo_core::network::ObjectRpcChannelEndpoint {
-                client,
-                server: _left_server,
-                ingress: left_ingress,
-                egress: mut left_egress,
-            } = left;
-            let sinomo_core::network::ObjectRpcChannelEndpoint {
-                client: _right_client,
-                server,
-                ingress: right_ingress,
-                egress: mut right_egress,
-            } = right;
-            let right_wire_ingress = right_ingress.clone();
-            let left_to_right = tokio::spawn(async move {
-                while let Some(frame) = left_egress.next_transport_frame().await {
-                    let result = match frame {
-                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Control(frame) => right_wire_ingress.receive_control(frame),
-                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Data(frame) => right_wire_ingress.receive_data(frame),
-                    };
-                    left_egress.complete_frame_write(result.is_ok());
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            });
-            let left_wire_ingress = left_ingress.clone();
-            let right_to_left = tokio::spawn(async move {
-                while let Some(frame) = right_egress.next_transport_frame().await {
-                    let result = match frame {
-                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Control(frame) => left_wire_ingress.receive_control(frame),
-                        sinomo_core::network::__channel_carrier::ObjectRpcChannelTransportFrame::Data(frame) => left_wire_ingress.receive_data(frame),
-                    };
-                    right_egress.complete_frame_write(result.is_ok());
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            });
-            Self {
-                client,
-                server: Some(server),
-                left_ingress,
-                right_ingress,
-                pumps: vec![left_to_right, right_to_left],
-            }
-        }
-
-        fn take_server(&mut self) -> sinomo_core::network::ObjectRpcChannelServer {
-            self.server.take().expect("one channel server")
-        }
-
-        fn close(&self, detail: &str) {
-            self.left_ingress.close(detail.to_string());
-            self.right_ingress.close(detail.to_string());
-        }
-    }
-
-    impl Drop for LinkedDaemonObjectRpcChannel {
-        fn drop(&mut self) {
-            self.close("linked daemon object RPC channel dropped");
-            for pump in &self.pumps {
-                pump.abort();
-            }
-        }
-    }
-
-    #[test]
-    fn multiplexed_channel_principal_tracks_membership_role_and_key_changes() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-channel-principal-refresh");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data dir");
-        let paths = DaemonPaths::new(&data_dir);
-        paths.ensure().expect("daemon paths");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("channel_principal_refresh_cluster")
-                .expect("cluster id");
-        let local_node =
-            NodeId::from_legacy_named("channel_principal_refresh_local").expect("local node");
-        let peer_node =
-            NodeId::from_legacy_named("channel_principal_refresh_peer").expect("peer node");
-        let now = time::OffsetDateTime::now_utc();
-        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "channel principal refresh",
-            local_node,
-            "local",
-            "local-public-key",
-            now,
-        );
-        let peer_member = sinomo_core::ClusterMemberRecord::local_voter(
-            cluster_id.clone(),
-            peer_node.clone(),
-            "peer",
-            "peer-public-key",
-            now,
-        );
-        let peer_key = match sinomo_core::cluster::cluster_member_put_command(&peer_member)
-            .expect("peer KV command")
-        {
-            sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Put { key, .. }) => key,
-            other => panic!("unexpected peer KV command: {other:?}"),
-        };
-        state.members.push(peer_member.clone());
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("voter state");
-        let mut kv_state = state.clone();
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &kv_state)
-            .expect("sync voter KV membership");
-
-        let (mut principal, responder_node_id) = daemon_object_rpc_channel_principal(
-            &paths,
-            &DaemonObjectRpcChannelPeer::ClusterNode(peer_node.clone()),
-        )
-        .expect("capture current voter principal");
-        assert_eq!(principal.signer, DaemonSignerAuthority::Voter);
-        assert_eq!(principal.signer_public_key, "peer-public-key");
-        assert_eq!(
-            responder_node_id.as_deref(),
-            Some(state.local_node_id.as_str())
-        );
-        validate_daemon_object_rpc_channel_principal(&paths, &principal)
-            .expect("current voter principal");
-
-        let mut delegated_request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
-            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-            &(),
-        )
-        .expect("delegated request")
-        .with_auth(b"canonical-fallback-proof".to_vec());
-        delegated_request.metadata.insert(
-            sinomo_core::network::CLUSTER_RELAY_ORIGIN_NODE_ID_METADATA_KEY.to_string(),
-            state.local_node_id.to_string(),
-        );
-        let delegated = daemon_object_rpc_channel_delegated_origin_principal(
-            &paths,
-            &principal,
-            &delegated_request,
-        )
-        .expect("resolve delegated origin")
-        .expect("delegated origin principal");
-        assert_eq!(delegated.signer, DaemonSignerAuthority::Voter);
-        assert_eq!(delegated.signer_node_id, state.local_node_id.as_str());
-        assert_eq!(delegated.signer_public_key, "local-public-key");
-
-        kv_state
-            .members
-            .retain(|member| member.node_id != peer_node);
-        kv_state
-            .members
-            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
-                cluster_id,
-                peer_node.clone(),
-                "peer",
-                "peer-public-key",
-                now,
-            ));
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &kv_state)
-            .expect("sync member KV membership");
-        assert!(matches!(
-            validate_daemon_object_rpc_channel_principal(&paths, &principal),
-            Err(DaemonError::AuthDenied)
-        ));
-        (principal, _) = daemon_object_rpc_channel_principal(
-            &paths,
-            &DaemonObjectRpcChannelPeer::ClusterNode(peer_node.clone()),
-        )
-        .expect("capture current member principal");
-        assert_eq!(principal.signer, DaemonSignerAuthority::Member);
-        validate_daemon_object_rpc_channel_principal(&paths, &principal)
-            .expect("updated member principal");
-
-        kv_state
-            .members
-            .iter_mut()
-            .find(|member| member.node_id == peer_node)
-            .expect("peer KV member")
-            .node_public_key = "rotated-peer-public-key".to_string();
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &kv_state)
-            .expect("sync rotated KV membership");
-        assert!(matches!(
-            validate_daemon_object_rpc_channel_principal(&paths, &principal),
-            Err(DaemonError::AuthDenied)
-        ));
-        (principal, _) = daemon_object_rpc_channel_principal(
-            &paths,
-            &DaemonObjectRpcChannelPeer::ClusterNode(peer_node.clone()),
-        )
-        .expect("capture rotated member principal");
-        assert_eq!(principal.signer_public_key, "rotated-peer-public-key");
-        validate_daemon_object_rpc_channel_principal(&paths, &principal)
-            .expect("rotated member principal");
-
-        kv_state
-            .members
-            .retain(|member| member.node_id != peer_node);
-        sinomo_core::cluster::append_cluster_raft_command(
-            &cluster_paths,
-            &kv_state.local_node_id,
-            sinomo_core::kv::KvCommand::Op(sinomo_core::kv::KvOp::Delete { key: peer_key }),
-        )
-        .expect("commit removed KV membership");
-        assert!(matches!(
-            validate_daemon_object_rpc_channel_principal(&paths, &principal),
-            Err(DaemonError::AuthDenied)
-        ));
-        assert!(matches!(
-            daemon_object_rpc_channel_principal(
-                &paths,
-                &DaemonObjectRpcChannelPeer::ClusterNode(peer_node)
-            ),
-            Err(DaemonError::AuthDenied)
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stale_multiplexed_principal_flushes_error_retires_and_fresh_principal_succeeds() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-stale-channel-principal");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data dir");
-        let paths = DaemonPaths::new(&data_dir);
-        paths.ensure().expect("daemon paths");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("stale_channel_principal_cluster")
-                .expect("cluster id");
-        let local_node =
-            NodeId::from_legacy_named("stale_channel_principal_local").expect("local node");
-        let peer_node =
-            NodeId::from_legacy_named("stale_channel_principal_peer").expect("peer node");
-        let now = time::OffsetDateTime::now_utc();
-        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "stale channel principal",
-            local_node.clone(),
-            "local",
-            "local-public-key",
-            now,
-        );
-        state
-            .members
-            .push(sinomo_core::ClusterMemberRecord::local_voter(
-                cluster_id.clone(),
-                peer_node.clone(),
-                "peer",
-                "peer-public-key",
-                now,
-            ));
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("initial cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("initial KV membership");
-
-        let (stale_principal, stale_responder_node_id) = daemon_object_rpc_channel_principal(
-            &paths,
-            &DaemonObjectRpcChannelPeer::ClusterNode(peer_node.clone()),
-        )
-        .expect("capture admitted voter principal");
-        assert_eq!(stale_principal.signer, DaemonSignerAuthority::Voter);
-
-        let mut current_state = state.clone();
-        current_state
-            .members
-            .retain(|member| member.node_id != peer_node);
-        current_state
-            .members
-            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
-                cluster_id,
-                peer_node.clone(),
-                "peer",
-                "rotated-peer-public-key",
-                now,
-            ));
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
-            &cluster_paths,
-            &current_state,
-        )
-        .expect("changed KV membership");
-        assert!(matches!(
-            validate_daemon_object_rpc_channel_principal(&paths, &stale_principal),
-            Err(DaemonError::AuthDenied)
-        ));
-        let (fresh_principal, fresh_responder_node_id) = daemon_object_rpc_channel_principal(
-            &paths,
-            &DaemonObjectRpcChannelPeer::ClusterNode(peer_node),
-        )
-        .expect("capture refreshed member principal");
-        assert_eq!(fresh_principal.signer, DaemonSignerAuthority::Member);
-        assert_eq!(fresh_principal.signer_public_key, "rotated-peer-public-key");
-
-        let service_runtime = tokio::runtime::Handle::current();
-        let service_host =
-            crate::service_adapter::DaemonServiceRegistryHost::from_registry_for_test(
-                sinomo_core::service::ServiceRegistry::builder().build(),
-                &paths,
-            )
-            .expect("service host");
-        let ping_request = |nonce: &str| {
-            sinomo_core::network::ObjectRpcRequest::encode_body(
-                sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
-                sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-                &sinomo_core::cluster::ClusterNetworkPingRequest {
-                    nonce: nonce.to_string(),
-                    payload: Vec::new(),
-                    response_payload_bytes: 0,
-                    payload_mode: sinomo_core::cluster::ClusterNetworkPingPayloadMode::EmbeddedSobj,
-                    request_attachment_bytes: 0,
-                    response_attachment_bytes: 0,
-                },
-            )
-            .expect("ping request")
-        };
-
-        let mut stale_link = LinkedDaemonObjectRpcChannel::new();
-        let stale_server = stale_link.take_server();
-        let stale_paths = paths.clone();
-        let stale_service_host = service_host.clone();
-        let stale_runtime = service_runtime.clone();
-        let stale_dispatch = tokio::spawn(async move {
-            drive_daemon_object_rpc_channel_async(
-                stale_server,
-                stale_paths,
-                stale_service_host,
-                stale_runtime,
-                stale_principal,
-                stale_responder_node_id,
-            )
-            .await
-        });
-        let stale_call = stale_link
-            .client
-            .call(sinomo_core::network::ObjectRpcSessionCall::value(
-                ping_request("stale-principal"),
-            ))
-            .await
-            .expect("stale principal call");
-        let stale_result = tokio::time::timeout(Duration::from_secs(2), stale_call.result())
-            .await
-            .expect("stale principal response timeout")
-            .expect("stale principal response");
-        let error = stale_result
-            .response
-            .error_detail()
-            .expect_err("stale principal must receive an error response");
-        assert!(
-            matches!(error, sinomo_core::network::NetworkError::AuthDenied),
-            "unexpected stale-principal error: {error}"
-        );
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(2), stale_dispatch)
-                .await
-                .expect("stale carrier retirement timeout")
-                .expect("stale carrier dispatcher task")
-                .expect("stale carrier dispatcher"),
-            "stale authority retires only its physical carrier"
-        );
-
-        let mut fresh_link = LinkedDaemonObjectRpcChannel::new();
-        let fresh_server = fresh_link.take_server();
-        let fresh_paths = paths.clone();
-        let fresh_service_host = service_host.clone();
-        let fresh_runtime = service_runtime.clone();
-        let fresh_dispatch = tokio::spawn(async move {
-            drive_daemon_object_rpc_channel_async(
-                fresh_server,
-                fresh_paths,
-                fresh_service_host,
-                fresh_runtime,
-                fresh_principal,
-                fresh_responder_node_id,
-            )
-            .await
-        });
-        let fresh_call = fresh_link
-            .client
-            .call(sinomo_core::network::ObjectRpcSessionCall::value(
-                ping_request("fresh-principal"),
-            ))
-            .await
-            .expect("fresh principal call");
-        let fresh_result = tokio::time::timeout(Duration::from_secs(2), fresh_call.result())
-            .await
-            .expect("fresh principal response timeout")
-            .expect("fresh principal response");
-        let response: sinomo_core::cluster::ClusterNetworkPingResponse = fresh_result
-            .response
-            .decode_body()
-            .expect("fresh principal ping response");
-        assert_eq!(response.nonce, "fresh-principal");
-        assert_eq!(response.responder_node_id, local_node);
-
-        fresh_link.close("test complete");
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(2), fresh_dispatch)
-                .await
-                .expect("fresh carrier close timeout")
-                .expect("fresh carrier dispatcher task")
-                .expect("fresh carrier dispatcher"),
-            "closing a fresh channel must not request daemon shutdown"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_transport_prelude_is_detected_without_consumption() {
         let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
@@ -9061,261 +7443,6 @@ mod tests {
             expected
         );
         client.await.expect("client task");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn loopback_object_rpc_channel_is_detected_and_dispatched() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-loopback-channel");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
-            .expect("node identity");
-        let paths = DaemonPaths::new(&data_dir);
-        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let service_runtime = tokio::runtime::Handle::current();
-        let service_host =
-            crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
-                paths.clone(),
-                service_runtime.clone(),
-                vec![crate::DaemonServiceRegistryHook::new(|builder| {
-                    builder.register(FailingRegistryService)
-                })],
-            )
-            .await
-            .expect("service host");
-        let server_address = address.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            handle_daemon_connection_async(
-                stream,
-                paths,
-                service_host,
-                service_runtime,
-                server_address,
-            )
-            .await
-        });
-
-        let connected = sinomo_core::network::connect_local_object_rpc_channel_async(
-            &data_dir,
-            &address,
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
-        )
-        .await
-        .expect("connect channel")
-        .expect("channel accepted");
-        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            "/benchmarks/cancel-probe",
-            "benchmarks",
-            &(),
-        )
-        .expect("request");
-        let result = connected
-            .client
-            .call(sinomo_core::network::ObjectRpcSessionCall::value(request))
-            .await
-            .expect("channel call")
-            .result()
-            .await
-            .expect("channel result");
-        let error = result
-            .response
-            .error_detail()
-            .expect_err("registry failure response");
-        assert!(error.to_string().contains("injected registry failure"));
-
-        connected.transport.close("test complete");
-        assert!(!server.await.expect("server task").expect("dispatch"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn loopback_channel_cancellation_drops_pending_service_handlers() {
-        const BATCH_SIZE: usize = 32;
-        const BATCHES: usize = 8;
-
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-loopback-channel-cancellation");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
-            .expect("node identity");
-        let paths = DaemonPaths::new(&data_dir);
-        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let state = Arc::new(PendingChannelHandlerState::default());
-        let registration_state = Arc::clone(&state);
-        let service_runtime = tokio::runtime::Handle::current();
-        let service_host =
-            crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
-                paths.clone(),
-                service_runtime.clone(),
-                vec![crate::DaemonServiceRegistryHook::new(move |builder| {
-                    builder.register(PendingChannelRegistryService {
-                        state: Arc::clone(&registration_state),
-                    })
-                })],
-            )
-            .await
-            .expect("service host");
-        let server_address = address.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            handle_daemon_connection_async(
-                stream,
-                paths,
-                service_host,
-                service_runtime,
-                server_address,
-            )
-            .await
-        });
-        let connected = sinomo_core::network::connect_local_object_rpc_channel_async(
-            &data_dir,
-            &address,
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
-        )
-        .await
-        .expect("connect channel")
-        .expect("channel accepted");
-
-        for batch in 0..BATCHES {
-            let mut pending = Vec::with_capacity(BATCH_SIZE);
-            for index in 0..BATCH_SIZE {
-                let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-                    "/benchmarks/cancel-probe",
-                    "benchmarks",
-                    &(batch, index),
-                )
-                .expect("request");
-                pending.push(
-                    connected
-                        .client
-                        .call(sinomo_core::network::ObjectRpcSessionCall::value(request))
-                        .await
-                        .expect("pending channel call"),
-                );
-            }
-            state.wait_for(BATCH_SIZE, batch * BATCH_SIZE).await;
-            for call in &mut pending {
-                call.cancel("deterministic cancellation test");
-            }
-            state.wait_for(0, (batch + 1) * BATCH_SIZE).await;
-        }
-
-        assert_eq!(state.active.load(Ordering::SeqCst), 0);
-        assert_eq!(state.dropped.load(Ordering::SeqCst), BATCH_SIZE * BATCHES);
-        assert_eq!(state.maximum_active.load(Ordering::SeqCst), BATCH_SIZE);
-        assert_eq!(connected.client.queue_snapshot().active_calls, 0);
-
-        connected.transport.close("test complete");
-        assert!(!server.await.expect("server task").expect("dispatch"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn loopback_channel_stop_delivers_response_and_cancels_siblings() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-loopback-channel-stop");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
-            .expect("node identity");
-        let paths = DaemonPaths::new(&data_dir);
-        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr_string().expect("listener address");
-        let state = Arc::new(PendingChannelHandlerState::default());
-        let registration_state = Arc::clone(&state);
-        let service_runtime = tokio::runtime::Handle::current();
-        let service_host =
-            crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
-                paths.clone(),
-                service_runtime.clone(),
-                vec![crate::DaemonServiceRegistryHook::new(move |builder| {
-                    builder
-                        .register(PendingChannelRegistryService {
-                            state: Arc::clone(&registration_state),
-                        })
-                        .register(StopChannelRegistryService)
-                })],
-            )
-            .await
-            .expect("service host");
-        let server_address = address.clone();
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            handle_daemon_connection_async(
-                stream,
-                paths,
-                service_host,
-                service_runtime,
-                server_address,
-            )
-            .await
-        });
-        let connected = sinomo_core::network::connect_local_object_rpc_channel_async(
-            &data_dir,
-            &address,
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
-        )
-        .await
-        .expect("connect channel")
-        .expect("channel accepted");
-
-        let pending_request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            "/benchmarks/cancel-probe",
-            "benchmarks",
-            &(),
-        )
-        .expect("pending request");
-        let pending_call = connected
-            .client
-            .call(sinomo_core::network::ObjectRpcSessionCall::value(
-                pending_request,
-            ))
-            .await
-            .expect("pending call");
-        state.wait_for(1, 0).await;
-
-        let stop_request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            "/benchmarks/stop-channel-probe",
-            "benchmarks",
-            &(),
-        )
-        .expect("stop request");
-        let stop_result = connected
-            .client
-            .call(sinomo_core::network::ObjectRpcSessionCall::value(
-                stop_request,
-            ))
-            .await
-            .expect("stop call")
-            .result()
-            .await
-            .expect("stop response");
-        let stop_body: String = stop_result.response.decode_body().expect("stop body");
-        assert_eq!(stop_body, "stopping");
-
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), server)
-                .await
-                .expect("server stops")
-                .expect("server task")
-                .expect("channel dispatch"),
-            "stop disposition must stop the channel after writing its response"
-        );
-        state.wait_for(0, 1).await;
-        let pending_error = pending_call
-            .result()
-            .await
-            .expect_err("stopped channel must cancel a pending sibling");
-        assert!(
-            pending_error.to_string().contains("channel"),
-            "unexpected pending sibling error: {pending_error}"
-        );
     }
 
     #[test]
@@ -9383,7 +7510,7 @@ mod tests {
                     .call_loopback(
                         &data_dir,
                         &address,
-                        sinomo_core::network::ObjectRpcSessionCall::value(request),
+                        sinomo_core::network::ObjectRpcCall::value(request),
                         sinomo_core::network::ClusterObjectRpcOptions::new(
                             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
                                 Duration::from_secs(2),
@@ -9464,7 +7591,7 @@ mod tests {
                     .call_loopback(
                         &data_dir,
                         &address,
-                        sinomo_core::network::ObjectRpcSessionCall::value(request),
+                        sinomo_core::network::ObjectRpcCall::value(request),
                         sinomo_core::network::ClusterObjectRpcOptions::new(
                             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
                                 Duration::from_secs(2),
@@ -9480,14 +7607,14 @@ mod tests {
         assert!(
             !error
                 .to_string()
-                .contains("session reader stopped before the response head"),
+                .contains("expected object RPC response head"),
             "permission denial regressed to transport EOF: {error}"
         );
         server.join().expect("server thread");
     }
 
     #[test]
-    fn signed_dfs_status_dispatches_through_canonical_session_for_cluster_member() {
+    fn signed_dfs_status_dispatches_through_stream_native_rpc_for_cluster_member() {
         let target_root = sinomo_testdir::TestDir::new("sinomo-daemon-control-dfs-status-target");
         let target_data_dir = SinomoDataDir::new(&target_root);
         target_data_dir.ensure_root_layout().expect("target layout");
@@ -9584,14 +7711,14 @@ mod tests {
             .expect("authenticate cluster member");
         let (response, stop) = runtime
             .block_on(
-                crate::service_adapter::dispatch_rpc_via_registry_to_session_response_async(
+                crate::service_adapter::dispatch_rpc_via_registry_with_body_async(
                     &service_host,
                     &authenticated,
-                    sinomo_core::network::ObjectRpcSessionRequest::value(request),
+                    sinomo_core::network::ObjectRpcIncomingRequest::value(request),
                     Some(&target_daemon_paths),
                 ),
             )
-            .expect("canonical daemon session dispatch");
+            .expect("stream-native daemon RPC dispatch");
 
         assert!(!stop);
         assert!(response.body.is_empty());
@@ -11658,7 +9785,7 @@ mod tests {
             sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host).call_loopback(
                 data_dir,
                 address,
-                sinomo_core::network::ObjectRpcSessionCall::value(request),
+                sinomo_core::network::ObjectRpcCall::value(request),
                 sinomo_core::network::ClusterObjectRpcOptions::new(
                     sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
                 ),

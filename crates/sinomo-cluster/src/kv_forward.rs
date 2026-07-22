@@ -12,7 +12,7 @@ use sinomo_network::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
 use sinomo_network::{NetworkDeliveryState, NetworkError};
-use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall};
+use sinomo_network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
 
@@ -322,7 +322,6 @@ where
             break;
         }
         match forward_cluster_kv_txn_to_state_authority_node_async_with_host(
-            runtime,
             paths,
             state,
             target,
@@ -417,12 +416,12 @@ where
             ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
                 .with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
-        let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
+        let mut client = ClusterObjectRpcClient::routed(host, paths);
         match client
             .call_target(
                 state,
                 target,
-                ObjectRpcSessionCall::value(request),
+                ObjectRpcCall::value(request),
                 ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
             )
             .await
@@ -508,7 +507,6 @@ fn verified_non_leader_rejects_preferred_authority(
 }
 
 async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
-    runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
@@ -525,12 +523,12 @@ where
         txn_payload.category,
         txn_payload.body,
     );
-    let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
+    let mut client = ClusterObjectRpcClient::routed(host, paths);
     let txn_response = client
         .call_target(
             state,
             target_node_id,
-            ObjectRpcSessionCall::value(txn_request),
+            ObjectRpcCall::value(txn_request),
             ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;

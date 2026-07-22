@@ -149,7 +149,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_native_dylib_module as daemon_send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint as daemon_send_daemon_rollout_native_dylib_module_to_endpoint,
     send_daemon_rpc as daemon_send_daemon_rpc,
-    send_daemon_rpc_session_async as daemon_send_daemon_rpc_session_async,
+    send_daemon_rpc_call_async as daemon_send_daemon_rpc_call_async,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
@@ -1522,7 +1522,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
 
 fn remote_management_cli_rpc(
     target_node_id: Option<String>,
-    call: network::ObjectRpcSessionCall,
+    call: network::ObjectRpcCall,
 ) -> sinomo_runtime::remote_management::RemoteManagementCliRpcFuture {
     Box::pin(async move {
         // Shell capture may run for five minutes and file sessions may be
@@ -1570,7 +1570,7 @@ fn remote_management_cli_rpc(
             .as_ref()
             .is_some_and(|cluster| cluster.node_id == target_node_id)
         {
-            daemon_send_daemon_rpc_session_async(&status.address, call, options, &runtime)
+            daemon_send_daemon_rpc_call_async(&status.address, call, options, &runtime)
                 .await
                 .map_err(|source| source.to_string())
         } else {
@@ -1579,7 +1579,7 @@ fn remote_management_cli_rpc(
             // so forwarding must cross the authenticated loopback daemon
             // boundary instead of constructing a routed client here.
             DaemonApiClient::at_address(status.address)
-                .object_rpc_session_to_target_with_transport_timeouts_async(
+                .object_rpc_call_to_target_with_transport_timeouts_async(
                     &target_node_id,
                     call,
                     timeouts,
@@ -5285,7 +5285,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         sinomo_agent::TargetAwareAgentRemoteObjectRpcTransport::new(
             |target_node_id: Option<String>,
              route_key: Option<String>,
-             call: network::ObjectRpcSessionCall|
+             call: network::ObjectRpcCall|
              -> sinomo_agent::AgentRemoteObjectRpcFuture<'static> {
                 if route_key.is_some() {
                     return Box::pin(async {

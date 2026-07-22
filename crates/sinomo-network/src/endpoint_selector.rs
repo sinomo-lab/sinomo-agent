@@ -1,9 +1,7 @@
 use crate::ClusterPaths;
 use crate::NetworkError;
 use crate::directory::cluster_directory_for;
-use crate::endpoint_records::{
-    cluster_endpoint_uses_tcp_tunnel_address, locally_learned_bridge_route_endpoint,
-};
+use crate::endpoint_records::locally_learned_bridge_route_endpoint;
 use crate::is_loopback_connect_address;
 use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
@@ -285,7 +283,6 @@ fn cluster_endpoint_transport_is_currently_dialable(transport: &ClusterTransport
 
 fn cluster_endpoint_is_currently_dialable(endpoint: &ClusterEndpointRecord) -> bool {
     cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
-        && !cluster_endpoint_uses_tcp_tunnel_address(endpoint)
 }
 
 fn cluster_endpoint_is_rollout_candidate(endpoint: &ClusterEndpointRecord) -> bool {
@@ -1320,7 +1317,6 @@ pub(crate) fn try_cluster_member_publish_targets_impl(
         let Some(endpoint) =
             graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
                 !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
-                    && !cluster_endpoint_uses_tcp_tunnel_address(endpoint)
             })
         else {
             continue;
@@ -1332,9 +1328,7 @@ pub(crate) fn try_cluster_member_publish_targets_impl(
         .into_iter()
         .chain(try_cluster_voter_command_targets_impl(paths, state)?)
     {
-        if endpoint.node_id == state.local_node_id
-            || cluster_endpoint_uses_tcp_tunnel_address(&endpoint)
-        {
+        if endpoint.node_id == state.local_node_id {
             continue;
         }
         push_unique_cluster_endpoint(&mut targets, &mut seen, &endpoint)?;
@@ -2152,65 +2146,6 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.address == "lan-remote.test:21353"),
             "the static LAN endpoint remains available as a fallback"
-        );
-    }
-
-    #[test]
-    fn member_publish_targets_do_not_directly_select_synthetic_tcp_tunnel() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-skip-tunnel");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("root layout");
-        let paths = ClusterPaths::new(&data_dir);
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_member_publish_skip_tunnel").expect("cluster id");
-        let local =
-            NodeId::from_legacy_named("node_member_publish_skip_tunnel_local").expect("local node");
-        let remote = NodeId::from_legacy_named("node_member_publish_skip_tunnel_remote")
-            .expect("remote node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "member publish synthetic tunnel skip",
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let tunnel_endpoint = selector_test_endpoint(
-            &remote,
-            "tcp-tunnel://node-member-publish-skip-tunnel-remote",
-            ClusterEndpointPrivacy::Lan,
-            0,
-        );
-        let mut member =
-            ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
-        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
-        member.endpoints = vec![tunnel_endpoint.clone()];
-        state.members.push(member);
-        let connectivity = crate::connectivity::cluster_connectivity_record(
-            &state,
-            &tunnel_endpoint,
-            ClusterConnectivityState::Healthy,
-            Some(1),
-            0,
-            Some(now.to_string()),
-            None,
-            now,
-            60,
-        );
-        crate::connectivity_store::write_local_cluster_connectivity_records(
-            &paths,
-            &local,
-            &[connectivity],
-        )
-        .expect("write local connectivity");
-
-        let targets = try_cluster_member_publish_targets_impl(&paths, &state)
-            .expect("member publish targets");
-
-        assert!(
-            targets.is_empty(),
-            "synthetic tcp-tunnel route endpoints are route-layer evidence, not raw bootstrap sockets"
         );
     }
 
