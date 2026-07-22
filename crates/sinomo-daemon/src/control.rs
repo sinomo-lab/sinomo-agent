@@ -3182,9 +3182,9 @@ async fn handle_daemon_authenticated_transport_stream_async(
                 %routed_peer_node_id,
                 transport = ?metadata.transport,
                 %stream_address,
-                "accepted authenticated routed-session destination stream"
+                "accepted authenticated routed-session carrier"
             );
-            handle_daemon_stream_native_service_rpc_async(
+            handle_daemon_routed_stream_carrier_async(
                 stream,
                 directory,
                 paths,
@@ -3208,6 +3208,80 @@ async fn handle_daemon_authenticated_transport_stream_async(
             Ok(false)
         }
     }
+}
+
+async fn handle_daemon_routed_stream_carrier_async(
+    carrier: sinomo_core::network::PeerStream,
+    directory: sinomo_core::network::DirectorySnapshot,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
+    let mut acceptor = sinomo_core::network::accept_routed_stream_carrier(carrier);
+    let mut handlers = tokio::task::JoinSet::new();
+    let mut carrier_open = true;
+    while carrier_open || !handlers.is_empty() {
+        if !carrier_open {
+            let Some(joined) = handlers.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok(Ok(true)) => return Ok(true),
+                Ok(Ok(false)) => continue,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "routed logical service RPC failed");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "routed logical service RPC task failed");
+                    continue;
+                }
+            }
+        }
+
+        tokio::select! {
+            accepted = acceptor.accept() => {
+                match accepted? {
+                    Some(stream) => {
+                        let handler_directory = directory.clone();
+                        let handler_paths = paths.clone();
+                        let handler_host = service_host.clone();
+                        let handler_runtime = service_runtime.clone();
+                        handlers.spawn(async move {
+                            handle_daemon_stream_native_service_rpc_async(
+                                stream,
+                                handler_directory,
+                                handler_paths,
+                                handler_host,
+                                handler_runtime,
+                            )
+                            .await
+                        });
+                    }
+                    None => carrier_open = false,
+                }
+            }
+            joined = handlers.join_next(), if !handlers.is_empty() => {
+                let Some(joined) = joined else {
+                    continue;
+                };
+                match joined {
+                    Ok(Ok(true)) => {
+                        handlers.abort_all();
+                        return Ok(true);
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "routed logical service RPC failed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "routed logical service RPC task failed");
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn daemon_control_stream_uses_local_object_rpc_channel(

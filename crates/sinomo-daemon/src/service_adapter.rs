@@ -11493,56 +11493,53 @@ mod tests {
         let relay_source_node = local_node.clone();
         let relay_target_node = target_node.clone();
         let relay_server = tokio::spawn(async move {
-            for _ in 0..3 {
-                let mut stream = relay_listener
-                    .accept()
-                    .await
-                    .expect("relay accept")
-                    .into_inner();
-                let metadata =
-                    sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
-                        .await
-                        .expect("relay authenticated transport prelude");
-                let source_node =
-                    sinomo_core::network::verify_builtin_authenticated_transport_metadata(
-                        &metadata,
-                        &server_relay_node,
-                        &relay_directory,
-                        relay_routed_identity.as_ref(),
-                    )
-                    .expect("relay adjacent source");
-                assert_eq!(source_node, relay_source_node);
-                let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
-                    Box::new(stream),
-                    server_relay_node.clone(),
-                    source_node,
-                    sinomo_core::Id::generate(),
-                    metadata.channel_binding,
-                    metadata.capabilities,
-                )
-                .expect("relay direct stream");
-                let report = match sinomo_core::network::accept_or_relay_routed_session(
-                    direct,
+            let mut stream = relay_listener
+                .accept()
+                .await
+                .expect("relay accept")
+                .into_inner();
+            let metadata = sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                .await
+                .expect("relay authenticated transport prelude");
+            let source_node =
+                sinomo_core::network::verify_builtin_authenticated_transport_metadata(
+                    &metadata,
+                    &server_relay_node,
                     &relay_directory,
                     relay_routed_identity.as_ref(),
-                    &relay_link_provider,
-                    None,
                 )
-                .await
-                .expect("relay routed session")
-                {
-                    sinomo_core::network::RoutedSessionDisposition::Relayed(report) => report,
-                    sinomo_core::network::RoutedSessionDisposition::Destination(_) => {
-                        panic!("intermediate node terminated the stream instead of relaying it")
-                    }
-                };
-                assert_eq!(report.source_node_id, relay_source_node);
-                assert_eq!(report.destination_node_id, relay_target_node);
-                assert_eq!(report.relay_node_id, server_relay_node);
-                assert_eq!(report.next_node_id, relay_target_node);
-                assert!(report.bytes_toward_destination > 0);
-                assert!(report.bytes_toward_source > 0);
-            }
+                .expect("relay adjacent source");
+            assert_eq!(source_node, relay_source_node);
+            let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
+                Box::new(stream),
+                server_relay_node.clone(),
+                source_node,
+                sinomo_core::Id::generate(),
+                metadata.channel_binding,
+                metadata.capabilities,
+            )
+            .expect("relay direct stream");
+            let report = match sinomo_core::network::accept_or_relay_routed_session(
+                direct,
+                &relay_directory,
+                relay_routed_identity.as_ref(),
+                &relay_link_provider,
+                None,
+            )
+            .await
+            .expect("relay routed session")
+            {
+                sinomo_core::network::RoutedSessionDisposition::Relayed(report) => report,
+                sinomo_core::network::RoutedSessionDisposition::Destination(_) => {
+                    panic!("intermediate node terminated the stream instead of relaying it")
+                }
+            };
+            assert_eq!(report.source_node_id, relay_source_node);
+            assert_eq!(report.destination_node_id, relay_target_node);
+            assert_eq!(report.relay_node_id, server_relay_node);
+            assert_eq!(report.next_node_id, relay_target_node);
+            assert!(report.bytes_toward_destination > 0);
+            assert!(report.bytes_toward_source > 0);
         });
         let target_routed_identity = Arc::new(
             sinomo_core::network::DaemonRoutedSessionIdentity::new(
@@ -11561,54 +11558,60 @@ mod tests {
         let target_adjacent_node = relay_node.clone();
         let target_source_node = local_node.clone();
         let target_server = tokio::spawn(async move {
+            let mut stream = target_listener
+                .accept()
+                .await
+                .expect("target accept")
+                .into_inner();
+            let metadata = sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                .await
+                .expect("target authenticated transport prelude");
+            let source_node =
+                sinomo_core::network::verify_builtin_authenticated_transport_metadata(
+                    &metadata,
+                    &server_target_node,
+                    &target_directory,
+                    target_routed_identity.as_ref(),
+                )
+                .expect("target adjacent source");
+            assert_eq!(source_node, target_adjacent_node);
+            let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
+                Box::new(stream),
+                server_target_node.clone(),
+                source_node,
+                sinomo_core::Id::generate(),
+                metadata.channel_binding,
+                metadata.capabilities,
+            )
+            .expect("target direct stream");
+            let carrier = match sinomo_core::network::accept_or_relay_routed_session(
+                direct,
+                &target_directory,
+                target_routed_identity.as_ref(),
+                &target_link_provider,
+                None,
+            )
+            .await
+            .expect("target routed session")
+            {
+                sinomo_core::network::RoutedSessionDisposition::Destination(stream) => stream,
+                sinomo_core::network::RoutedSessionDisposition::Relayed(_) => {
+                    panic!("final forwarding target continued as a relay")
+                }
+            };
+            assert_eq!(carrier.peer_node_id, target_source_node);
+            let mut acceptor = sinomo_core::network::accept_routed_stream_carrier(carrier);
             for (index, ((expected_route, expected_request), response_body)) in target_routes
                 .into_iter()
                 .zip(target_expected_requests)
                 .zip(target_responses)
                 .enumerate()
             {
-                let mut stream = target_listener
+                let routed = acceptor
                     .accept()
                     .await
-                    .expect("target accept")
-                    .into_inner();
-                let metadata =
-                    sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
-                        .await
-                        .expect("target authenticated transport prelude");
-                let source_node =
-                    sinomo_core::network::verify_builtin_authenticated_transport_metadata(
-                        &metadata,
-                        &server_target_node,
-                        &target_directory,
-                        target_routed_identity.as_ref(),
-                    )
-                    .expect("target adjacent source");
-                assert_eq!(source_node, target_adjacent_node);
-                let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
-                    Box::new(stream),
-                    server_target_node.clone(),
-                    source_node,
-                    sinomo_core::Id::generate(),
-                    metadata.channel_binding,
-                    metadata.capabilities,
-                )
-                .expect("target direct stream");
-                let routed = match sinomo_core::network::accept_or_relay_routed_session(
-                    direct,
-                    &target_directory,
-                    target_routed_identity.as_ref(),
-                    &target_link_provider,
-                    None,
-                )
-                .await
-                .expect("target routed session")
-                {
-                    sinomo_core::network::RoutedSessionDisposition::Destination(stream) => stream,
-                    sinomo_core::network::RoutedSessionDisposition::Relayed(_) => {
-                        panic!("final forwarding target continued as a relay")
-                    }
-                };
+                    .expect("accept target logical stream")
+                    .expect("target logical stream");
                 assert_eq!(routed.peer_node_id, target_source_node);
                 let context = sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
                     routed.local_node_id.clone(),
@@ -11655,6 +11658,14 @@ mod tests {
                     .await
                     .expect("target stream-native service response");
             }
+            assert!(
+                acceptor
+                    .accept()
+                    .await
+                    .expect("finish target routed carrier")
+                    .is_none(),
+                "the source must retire the carrier after the final logical stream"
+            );
         });
 
         let outer_listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
@@ -11802,6 +11813,11 @@ mod tests {
         }
 
         outer_server.await.expect("outer server");
+        assert_eq!(
+            sinomo_core::network::retire_pooled_routed_streams(&state.cluster_id.to_string()).await,
+            1,
+            "the three forwarded calls must share one routed carrier"
+        );
         relay_server.await.expect("relay server");
         target_server.await.expect("target server");
     }

@@ -44,6 +44,7 @@ mod roaming;
 mod route;
 mod route_graph_read_model;
 mod routed_identity;
+mod routed_stream_pool;
 mod routing;
 mod rpc;
 mod rpc_future;
@@ -276,6 +277,10 @@ pub use route_graph_read_model::{
     read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
 };
 pub use routed_identity::DaemonRoutedSessionIdentity;
+pub use routed_stream_pool::{
+    RoutedStreamAcceptor, accept_routed_stream_carrier, open_pooled_routed_stream,
+    retire_pooled_routed_streams,
+};
 pub use routing::{
     CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
     MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop, RouteTrace,

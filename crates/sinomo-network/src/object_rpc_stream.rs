@@ -648,6 +648,14 @@ impl ObjectRpcStreamIncomingBody {
         self.verifier.clone()
     }
 
+    /// Materializes the complete authenticated body without imposing a size
+    /// policy. Allocation remains fallible, so a body larger than the process
+    /// can represent or reserve returns `ResourceExhausted` instead of
+    /// aborting the daemon.
+    pub async fn materialize_to_vec(self) -> Result<Vec<u8>, NetworkError> {
+        self.collect_to_vec(usize::MAX).await
+    }
+
     pub async fn collect_to_vec(mut self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
         if let Some(total_bytes) = self.total_bytes {
             let declared = usize::try_from(total_bytes).unwrap_or(usize::MAX);
@@ -659,7 +667,27 @@ impl ObjectRpcStreamIncomingBody {
             }
         }
         let mut output = Vec::new();
-        let mut chunk = vec![0_u8; OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES];
+        if let Some(total_bytes) = self.total_bytes {
+            let declared =
+                usize::try_from(total_bytes).map_err(|_| NetworkError::ResourceExhausted {
+                    operation: "materialize object RPC stream body".to_string(),
+                    requested_bytes: usize::MAX,
+                })?;
+            output
+                .try_reserve_exact(declared)
+                .map_err(|_| NetworkError::ResourceExhausted {
+                    operation: "materialize object RPC stream body".to_string(),
+                    requested_bytes: declared,
+                })?;
+        }
+        let mut chunk = Vec::new();
+        chunk
+            .try_reserve_exact(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES)
+            .map_err(|_| NetworkError::ResourceExhausted {
+                operation: "allocate object RPC stream materialization buffer".to_string(),
+                requested_bytes: OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES,
+            })?;
+        chunk.resize(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES, 0);
         loop {
             let read = self.read(&mut chunk).await.map_err(|error| {
                 delivery_error("read object RPC stream body", error.to_string())
@@ -667,12 +695,26 @@ impl ObjectRpcStreamIncomingBody {
             if read == 0 {
                 break;
             }
-            if output.len().saturating_add(read) > max_bytes {
+            let next =
+                output
+                    .len()
+                    .checked_add(read)
+                    .ok_or_else(|| NetworkError::ResourceExhausted {
+                        operation: "materialize object RPC stream body".to_string(),
+                        requested_bytes: usize::MAX,
+                    })?;
+            if next > max_bytes {
                 return Err(NetworkError::FrameTooLarge {
-                    actual_bytes: output.len().saturating_add(read),
+                    actual_bytes: next,
                     max_bytes,
                 });
             }
+            output
+                .try_reserve(read)
+                .map_err(|_| NetworkError::ResourceExhausted {
+                    operation: "materialize object RPC stream body".to_string(),
+                    requested_bytes: next,
+                })?;
             output.extend_from_slice(&chunk[..read]);
         }
         self.verifier.verify().await?;
@@ -2214,6 +2256,30 @@ mod tests {
             RpcPeerContext::authenticated(server, client, session_id, binding)
                 .expect("server context"),
         )
+    }
+
+    #[tokio::test]
+    async fn unlimited_materialization_reports_unrepresentable_allocation() {
+        let (_sender, receiver) = mpsc::channel(1);
+        let (_verification_sender, verification_receiver) = watch::channel(None);
+        let body = ObjectRpcStreamIncomingBody {
+            receiver,
+            current: None,
+            total_bytes: Some(u64::MAX),
+            verifier: ObjectRpcStreamBodyVerifier {
+                receiver: verification_receiver,
+            },
+        };
+
+        let error = body
+            .materialize_to_vec()
+            .await
+            .expect_err("an unrepresentable body must fail without aborting");
+
+        assert!(
+            matches!(error, NetworkError::ResourceExhausted { .. }),
+            "unexpected materialization error: {error:?}"
+        );
     }
 
     fn body_bytes(size: usize, salt: u8) -> Vec<u8> {

@@ -2612,9 +2612,18 @@ where
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let started = Instant::now();
         let request_head_bytes = call.request.body.len();
-        let result = self
-            .call_endpoint_inner(state, endpoint, call, options)
-            .await;
+        let deadline = ClusterEndpointRpcDeadline::new(options.requested_overall_timeout());
+        let timeout_error = deadline.timeout_error(
+            "cluster endpoint object RPC",
+            NetworkTimeoutPhase::Overall,
+            NetworkDeliveryState::PossiblyApplied,
+        );
+        let result = cluster_object_rpc_call_with_deadline(
+            self.call_endpoint_inner(state, endpoint, call, options, deadline),
+            deadline,
+            timeout_error,
+        )
+        .await;
         record_network_rpc_metrics("endpoint", started, request_head_bytes, &result);
         result
     }
@@ -2625,11 +2634,11 @@ where
         endpoint: &ClusterEndpointRecord,
         mut call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
+        deadline: ClusterEndpointRpcDeadline,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
         prepare_call_for_active_network_timeline(&mut call);
         let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
         let policy = options.session_call_policy();
-        let deadline = ClusterEndpointRpcDeadline::new(policy.overall_timeout);
         let request_auth = cluster_object_rpc_sign_with_deadline(
             self.host.sign_object_rpc_request_async(&call.request),
             deadline,
@@ -2649,15 +2658,55 @@ where
             policy.health,
         )?;
         let started = Instant::now();
-        let stream = crate::connect_direct_routed_endpoint(
-            &directory,
-            endpoint,
-            &provider,
-            identity.as_ref(),
-            crate::ConnectOptions {
-                constraints: stream_native_service_route_constraints(),
-                timeout: policy.health.connect_timeout,
-            },
+        let connect_timeout = match deadline.checked_remaining() {
+            Some(Some(remaining)) => remaining.min(policy.health.connect_timeout),
+            Some(None) => policy.health.connect_timeout,
+            None => {
+                return Err(deadline.timeout_error(
+                    "establish direct routed endpoint session",
+                    NetworkTimeoutPhase::Overall,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                ));
+            }
+        };
+        let constraints = stream_native_service_route_constraints();
+        let target_public_key = &directory
+            .node(&endpoint.node_id)
+            .ok_or_else(|| NetworkError::UnauthorizedNode {
+                node_id: endpoint.node_id.clone(),
+            })?
+            .public_key;
+        let mut endpoint_pool_identity = blake3::Hasher::new();
+        for field in [
+            endpoint.endpoint_id.as_str(),
+            endpoint.address.as_str(),
+            target_public_key.as_str(),
+        ] {
+            endpoint_pool_identity.update(&(field.len() as u64).to_be_bytes());
+            endpoint_pool_identity.update(field.as_bytes());
+        }
+        endpoint_pool_identity.update(format!("{:?}", endpoint.transport).as_bytes());
+        let stream = crate::open_pooled_routed_stream(
+            format!(
+                "{}:direct-endpoint:{}",
+                state.cluster_id,
+                endpoint_pool_identity.finalize().to_hex()
+            ),
+            directory.version().0,
+            constraints,
+            state.local_node_id.clone(),
+            endpoint.node_id.clone(),
+            connect_timeout,
+            crate::connect_direct_routed_endpoint(
+                &directory,
+                endpoint,
+                &provider,
+                identity.as_ref(),
+                crate::ConnectOptions {
+                    constraints,
+                    timeout: connect_timeout,
+                },
+            ),
         )
         .await;
         let mut authenticated_stream_established = false;
@@ -2720,9 +2769,18 @@ where
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
         let started = Instant::now();
         let request_head_bytes = call.request.body.len();
-        let result = self
-            .call_loopback_inner(data_dir, address, call, options)
-            .await;
+        let deadline = ClusterEndpointRpcDeadline::new(options.requested_overall_timeout());
+        let timeout_error = deadline.timeout_error(
+            "local object RPC",
+            NetworkTimeoutPhase::Overall,
+            NetworkDeliveryState::PossiblyApplied,
+        );
+        let result = cluster_object_rpc_call_with_deadline(
+            self.call_loopback_inner(data_dir, address, call, options, deadline),
+            deadline,
+            timeout_error,
+        )
+        .await;
         record_network_rpc_metrics("loopback", started, request_head_bytes, &result);
         result
     }
@@ -2733,6 +2791,7 @@ where
         address: &str,
         mut call: ObjectRpcSessionCall,
         options: ClusterObjectRpcOptions,
+        deadline: ClusterEndpointRpcDeadline,
     ) -> Result<ObjectRpcSessionResult, NetworkError> {
         if !crate::is_loopback_connect_address(address) {
             return Err(NetworkError::Io {
@@ -2752,7 +2811,6 @@ where
         );
         prepare_call_for_active_network_timeline(&mut call);
         let policy = options.session_call_policy();
-        let deadline = ClusterEndpointRpcDeadline::new(policy.overall_timeout);
         let request_auth = cluster_object_rpc_sign_with_deadline(
             self.host.sign_object_rpc_request_async(&call.request),
             deadline,
@@ -2890,6 +2948,7 @@ where
         )?);
         let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
         let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
+        let directory_generation = directory_snapshot.version().0;
         let connector = crate::MultiHopRoutedConnector::from_snapshot(
             state.local_node_id.clone(),
             directory_snapshot,
@@ -2909,13 +2968,22 @@ where
                 ));
             }
         };
-        let stream = crate::RoutedConnector::connect(
-            &connector,
+        let constraints = stream_native_service_route_constraints();
+        let stream = crate::open_pooled_routed_stream(
+            state.cluster_id.to_string(),
+            directory_generation,
+            constraints,
+            state.local_node_id.clone(),
             target_node_id.clone(),
-            crate::ConnectOptions {
-                constraints: stream_native_service_route_constraints(),
-                timeout: connect_timeout,
-            },
+            connect_timeout,
+            crate::RoutedConnector::connect(
+                &connector,
+                target_node_id.clone(),
+                crate::ConnectOptions {
+                    constraints,
+                    timeout: connect_timeout,
+                },
+            ),
         )
         .await?;
         let context = crate::object_rpc_stream::RpcPeerContext::authenticated(
@@ -4462,6 +4530,7 @@ mod tests {
         session_server_data_dir: Option<sinomo_local::SinomoDataDir>,
         session_response_body: Option<Vec<u8>>,
         consume_session_request_body: bool,
+        stall_session_response: Option<Duration>,
         consumed_session_request_bytes: Arc<AtomicUsize>,
         consumed_session_request_body: Arc<Mutex<Vec<u8>>>,
         stall_first_sign: Option<Duration>,
@@ -4543,6 +4612,7 @@ mod tests {
                     endpoint.transport == sinomo_base::ClusterTransportKind::Loopback;
                 let response_body = self.session_response_body.clone();
                 let consume_request_body = self.consume_session_request_body;
+                let stall_session_response = self.stall_session_response;
                 let consumed_request_bytes = Arc::clone(&self.consumed_session_request_bytes);
                 let consumed_request_body = Arc::clone(&self.consumed_session_request_body);
                 tokio::spawn(async move {
@@ -4601,6 +4671,9 @@ mod tests {
                                 *consumed_request_body
                                     .lock()
                                     .expect("record consumed test request body") = body;
+                            }
+                            if let Some(stall) = stall_session_response {
+                                tokio::time::sleep(stall).await;
                             }
                             let response = match response_body {
                                 Some(body) => ObjectRpcResponse::from_encoded_body(
@@ -5072,6 +5145,55 @@ mod tests {
 
         assert_eq!(result.response.body, expected);
         assert!(result.body.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loopback_session_overall_deadline_covers_response_wait() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-loopback-response-deadline");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let request =
+            ObjectRpcRequest::encode_body("/test/loopback-response-deadline", "test", &"request")
+                .expect("request");
+        let mut host = RecordingSignedHost {
+            session_server_data_dir: Some(data_dir.clone()),
+            stall_session_response: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let overall_timeout = Duration::from_millis(100);
+        let started_at = tokio::time::Instant::now();
+
+        let error = {
+            let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
+            client
+                .call_loopback(
+                    &data_dir,
+                    "127.0.0.1:21353",
+                    ObjectRpcSessionCall::value(request),
+                    ClusterObjectRpcOptions::new(DaemonRpcTimeouts::none())
+                        .with_overall_timeout(overall_timeout),
+                )
+                .await
+                .expect_err("response wait must be bounded by the whole-call deadline")
+        };
+
+        assert!(
+            matches!(
+                &error,
+                NetworkError::Timeout {
+                    phase: NetworkTimeoutPhase::Overall,
+                    delivery_state: NetworkDeliveryState::PossiblyApplied,
+                    ..
+                }
+            ),
+            "unexpected loopback response deadline error: {error:?}"
+        );
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            overall_timeout
+        );
+        assert_eq!(host.session_opens, 1);
+        assert_eq!(host.signed_requests.len(), 1);
     }
 
     #[tokio::test]

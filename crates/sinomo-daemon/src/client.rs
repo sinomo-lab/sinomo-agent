@@ -4458,6 +4458,13 @@ mod tests {
                         panic!("two-node route terminated as relay")
                     }
                 };
+                let mut acceptor =
+                    sinomo_core::network::accept_routed_stream_carrier(routed);
+                let routed = acceptor
+                    .accept()
+                    .await
+                    .expect("accept routed logical stream")
+                    .expect("routed logical stream");
                 let context = sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
                     routed.local_node_id.clone(),
                     routed.peer_node_id.clone(),

@@ -150,7 +150,7 @@ async fn service_request_from_stream(
                     detail: "service RPC value is present in both head and stream".to_string(),
                 });
             }
-            head.request.body = body.collect_to_vec(usize::MAX).await?;
+            head.request.body = body.materialize_to_vec().await?;
             Ok(ObjectRpcSessionRequest::value(head.request))
         }
         ObjectRpcSessionBodyRole::Attachment => Ok(ObjectRpcSessionRequest::new(
@@ -196,7 +196,7 @@ async fn service_result_from_stream(
                         .to_string(),
                 });
             }
-            head.response.body = response.body.collect_to_vec(usize::MAX).await?;
+            head.response.body = response.body.materialize_to_vec().await?;
             Ok(ObjectRpcSessionResult::value(head.response))
         }
         ObjectRpcSessionBodyRole::Attachment => Ok(ObjectRpcSessionResult::new(

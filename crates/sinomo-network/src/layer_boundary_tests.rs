@@ -43,23 +43,27 @@ fn connectivity_snapshot_does_not_import_routing_or_rpc() {
 
 #[test]
 fn routing_does_not_import_sobj_rpc_or_service_catalogs() {
-    let source = include_str!("routing.rs");
-    assert_no_dependencies(
-        "routing",
-        source,
-        &[
-            "crate::object_rpc_stream",
-            "crate::rpc",
-            "crate::object",
-            "sinomo_object",
-            "sinomo_service",
-        ],
-    );
-    for forbidden_type in ["ObjectRpc", "SinomoObject", "ServiceCatalog"] {
-        assert!(
-            !source.contains(forbidden_type),
-            "routing must not mention application type `{forbidden_type}`"
+    for (module, source) in [
+        ("routing", include_str!("routing.rs")),
+        ("routed_stream_pool", include_str!("routed_stream_pool.rs")),
+    ] {
+        assert_no_dependencies(
+            module,
+            source,
+            &[
+                "crate::object_rpc_stream",
+                "crate::rpc",
+                "crate::object",
+                "sinomo_object",
+                "sinomo_service",
+            ],
         );
+        for forbidden_type in ["ObjectRpc", "SinomoObject", "ServiceCatalog"] {
+            assert!(
+                !source.contains(forbidden_type),
+                "{module} must not mention application type `{forbidden_type}`"
+            );
+        }
     }
 }
 
