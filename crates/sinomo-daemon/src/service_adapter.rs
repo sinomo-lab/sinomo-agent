@@ -5550,6 +5550,55 @@ pub(crate) fn authenticate_daemon_control_request_via_registry(
     }
 }
 
+/// Applies the live route catalog after the routed-session layer has already
+/// authenticated the exact origin node and membership record for this stream.
+pub(crate) fn authenticate_routed_daemon_control_request_via_registry(
+    paths: &DaemonPaths,
+    request: &DaemonControlRequest,
+    service_host: &DaemonServiceRegistryHost,
+    peer_node_id: &str,
+    peer_public_key: &str,
+    peer_is_raft_voter: bool,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) else {
+        return crate::auth::authenticate_verified_cluster_peer_request(
+            paths,
+            request,
+            peer_node_id,
+            peer_public_key,
+            peer_is_raft_voter,
+            true,
+        );
+    };
+    if descriptor.auth_scope.is_none() {
+        let authenticated = crate::auth::authenticate_verified_cluster_peer_request(
+            paths,
+            request,
+            peer_node_id,
+            peer_public_key,
+            peer_is_raft_voter,
+            true,
+        )?;
+        return daemon_route_local_permissions_are_granted(paths, &descriptor)
+            .then_some(authenticated)
+            .ok_or(DaemonError::AuthDenied);
+    }
+    let authenticated = crate::auth::authenticate_verified_cluster_peer_request(
+        paths,
+        request,
+        peer_node_id,
+        peer_public_key,
+        peer_is_raft_voter,
+        false,
+    )?;
+    if daemon_authenticated_command_authorizes_route_descriptor(paths, &authenticated, &descriptor)
+    {
+        Ok(authenticated)
+    } else {
+        Err(DaemonError::AuthDenied)
+    }
+}
+
 /// Applies the same live route policy to a caller whose identity was already
 /// established by a persistent physical channel. This deliberately performs
 /// no request signature or nonce work: the channel principal is fixed when
@@ -11222,7 +11271,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn daemon_generic_dfs_and_membership_forward_across_two_authenticated_hops() {
+    async fn daemon_services_forward_across_a_stream_native_relay() {
         crate::cluster::ensure_cluster_directory_installed();
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-session-forward-bodies");
         let data_dir = SinomoDataDir::new(&root);
@@ -11240,12 +11289,28 @@ mod tests {
         let target_address = target_listener
             .local_addr_string()
             .expect("target listener address");
+        let relay_listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay listener");
+        let relay_address = relay_listener
+            .local_addr_string()
+            .expect("relay listener address");
         let local_node =
             sinomo_core::node::NodeId::from_legacy_named("node_daemon_dfs_session_forward_local")
                 .expect("local node");
+        let relay_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_daemon_dfs_session_forward_relay")
+                .expect("relay node");
         let target_node =
             sinomo_core::node::NodeId::from_legacy_named("node_daemon_dfs_session_forward_target")
                 .expect("target node");
+        let relay_data_dir = SinomoDataDir::new(root.join("relay-node"));
+        relay_data_dir
+            .ensure_root_layout()
+            .expect("relay data directory");
+        let relay_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&relay_data_dir.root())
+                .expect("relay identity");
         let target_data_dir = SinomoDataDir::new(root.join("target-node"));
         target_data_dir
             .ensure_root_layout()
@@ -11265,6 +11330,29 @@ mod tests {
             identity.public_key,
             now,
         );
+        let mut relay_member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            relay_node.clone(),
+            "relay",
+            relay_identity.public_key,
+            now,
+        );
+        relay_member
+            .endpoints
+            .push(sinomo_core::ClusterEndpointRecord {
+                endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                    "endpoint_daemon_dfs_session_forward_relay",
+                )
+                .expect("endpoint id"),
+                node_id: relay_node.clone(),
+                transport: sinomo_core::ClusterTransportKind::LanTcp,
+                address: relay_address,
+                source: sinomo_core::ClusterEndpointSource::Static,
+                privacy: sinomo_core::ClusterEndpointPrivacy::Lan,
+                priority: 0,
+                last_observed_latency_ms: None,
+            });
+        let relay_endpoint = relay_member.endpoints[0].clone();
         let mut target_member = sinomo_core::ClusterMemberRecord::local_non_voting(
             cluster_id,
             target_node.clone(),
@@ -11288,16 +11376,50 @@ mod tests {
                 last_observed_latency_ms: None,
             });
         let target_endpoint = target_member.endpoints[0].clone();
+        state.members.push(relay_member);
         state.members.push(target_member);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster directory state");
-        let directory = sinomo_core::network::cluster_directory_for(&cluster_paths)
-            .snapshot()
-            .expect("cluster directory snapshot");
+        // Do not mirror membership into cluster KV here. Accepted join state
+        // can lead that projection, and this test must exercise that exact
+        // production bootstrap window through the Stage-F route.
+        let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+            sinomo_core::network::cluster_directory_for(&cluster_paths),
+            &state,
+        )
+        .snapshot()
+        .expect("bootstrap-aware cluster directory snapshot");
         assert!(directory.is_authorized(&local_node));
+        assert!(directory.is_authorized(&relay_node));
         assert!(directory.is_authorized(&target_node));
-        let connectivity = sinomo_core::network::cluster_connectivity_record(
+        let local_to_relay = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &relay_endpoint,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let local_to_target = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &target_endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            None,
+            1,
+            None,
+            Some(now.to_string()),
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_records(
+            &cluster_paths,
+            &local_node,
+            &[local_to_relay, local_to_target],
+        )
+        .expect("local relay connectivity");
+        let mut relay_to_target = sinomo_core::network::cluster_connectivity_record(
             &state,
             &target_endpoint,
             sinomo_core::network::ClusterConnectivityState::Healthy,
@@ -11308,18 +11430,27 @@ mod tests {
             now,
             sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
         );
+        relay_to_target.source_node_id = relay_node.clone();
         sinomo_core::network::write_local_cluster_connectivity_records(
             &cluster_paths,
-            &local_node,
-            std::slice::from_ref(&connectivity),
+            &relay_node,
+            std::slice::from_ref(&relay_to_target),
         )
-        .expect("local target connectivity");
+        .expect("relay target connectivity");
+        let relay_cluster_paths = ClusterPaths::new(&relay_data_dir);
+        let mut relay_state = state.clone();
+        relay_state.local_node_id = relay_node.clone();
+        sinomo_core::cluster::write_cluster_state(&relay_cluster_paths, &relay_state)
+            .expect("relay cluster state");
         let target_cluster_paths = ClusterPaths::new(&target_data_dir);
         let mut target_state = state.clone();
         target_state.local_node_id = target_node.clone();
         sinomo_core::cluster::write_cluster_state(&target_cluster_paths, &target_state)
             .expect("target cluster state");
 
+        // Every fake network peer below understands only SAT1, routed-session,
+        // and Stage-E service frames. Any legacy message/tunnel fallback fails
+        // at its first wire prefix instead of accidentally satisfying the test.
         // Case zero exercises bodies in both directions. Case one proves that
         // a head-only DFS request still receives a streamed response. Case two
         // carries the membership challenge route used when a bridge relays a
@@ -11344,6 +11475,75 @@ mod tests {
             std::iter::once(target_endpoint),
         )
         .expect("target directory");
+        let relay_directory = target_directory.clone();
+        let relay_routed_identity = Arc::new(
+            sinomo_core::network::DaemonRoutedSessionIdentity::new(
+                relay_node.clone(),
+                relay_data_dir,
+            )
+            .expect("relay routed identity"),
+        );
+        let relay_link_provider = sinomo_core::network::ClusterLinkProvider::new(
+            relay_node.clone(),
+            relay_routed_identity.clone(),
+            sinomo_core::network::NetworkHealthPolicy::default(),
+        )
+        .expect("relay link provider");
+        let server_relay_node = relay_node.clone();
+        let relay_source_node = local_node.clone();
+        let relay_target_node = target_node.clone();
+        let relay_server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let mut stream = relay_listener
+                    .accept()
+                    .await
+                    .expect("relay accept")
+                    .into_inner();
+                let metadata =
+                    sinomo_core::network::read_authenticated_transport_prelude(&mut stream)
+                        .await
+                        .expect("relay authenticated transport prelude");
+                let source_node =
+                    sinomo_core::network::verify_builtin_authenticated_transport_metadata(
+                        &metadata,
+                        &server_relay_node,
+                        &relay_directory,
+                        relay_routed_identity.as_ref(),
+                    )
+                    .expect("relay adjacent source");
+                assert_eq!(source_node, relay_source_node);
+                let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
+                    Box::new(stream),
+                    server_relay_node.clone(),
+                    source_node,
+                    sinomo_core::Id::generate(),
+                    metadata.channel_binding,
+                    metadata.capabilities,
+                )
+                .expect("relay direct stream");
+                let report = match sinomo_core::network::accept_or_relay_routed_session(
+                    direct,
+                    &relay_directory,
+                    relay_routed_identity.as_ref(),
+                    &relay_link_provider,
+                    None,
+                )
+                .await
+                .expect("relay routed session")
+                {
+                    sinomo_core::network::RoutedSessionDisposition::Relayed(report) => report,
+                    sinomo_core::network::RoutedSessionDisposition::Destination(_) => {
+                        panic!("intermediate node terminated the stream instead of relaying it")
+                    }
+                };
+                assert_eq!(report.source_node_id, relay_source_node);
+                assert_eq!(report.destination_node_id, relay_target_node);
+                assert_eq!(report.relay_node_id, server_relay_node);
+                assert_eq!(report.next_node_id, relay_target_node);
+                assert!(report.bytes_toward_destination > 0);
+                assert!(report.bytes_toward_source > 0);
+            }
+        });
         let target_routed_identity = Arc::new(
             sinomo_core::network::DaemonRoutedSessionIdentity::new(
                 target_node.clone(),
@@ -11358,6 +11558,8 @@ mod tests {
         )
         .expect("target link provider");
         let server_target_node = target_node.clone();
+        let target_adjacent_node = relay_node.clone();
+        let target_source_node = local_node.clone();
         let target_server = tokio::spawn(async move {
             for (index, ((expected_route, expected_request), response_body)) in target_routes
                 .into_iter()
@@ -11382,6 +11584,7 @@ mod tests {
                         target_routed_identity.as_ref(),
                     )
                     .expect("target adjacent source");
+                assert_eq!(source_node, target_adjacent_node);
                 let direct = sinomo_core::network::AuthenticatedDirectStream::accepted(
                     Box::new(stream),
                     server_target_node.clone(),
@@ -11403,9 +11606,10 @@ mod tests {
                 {
                     sinomo_core::network::RoutedSessionDisposition::Destination(stream) => stream,
                     sinomo_core::network::RoutedSessionDisposition::Relayed(_) => {
-                        panic!("two-node forwarding target terminated as relay")
+                        panic!("final forwarding target continued as a relay")
                     }
                 };
+                assert_eq!(routed.peer_node_id, target_source_node);
                 let context = sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext::authenticated(
                     routed.local_node_id.clone(),
                     routed.peer_node_id.clone(),
@@ -11598,6 +11802,7 @@ mod tests {
         }
 
         outer_server.await.expect("outer server");
+        relay_server.await.expect("relay server");
         target_server.await.expect("target server");
     }
 

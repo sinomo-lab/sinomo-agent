@@ -473,6 +473,18 @@ fn cached_cluster_metadata_backend(
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DEFAULT_DFS_METADATA_REPLICATION_MAX_CONCURRENT_TARGET_NODES: usize = 8;
 
+fn read_cluster_dfs_metadata_publish_state(
+    cluster_paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, DfsError> {
+    // Metadata replica targets are cluster membership, not bootstrap state.
+    // A joining node can retain a deliberately small bootstrap file while a
+    // newer accepted KV snapshot already contains the full member set. Using
+    // the bootstrap-only view here turns valid replica targets into
+    // `MissingRoute` and parks the retained publisher until another mutation
+    // happens to wake it.
+    sinomo_core::cluster::read_cluster_state(cluster_paths).map_err(DfsError::from_network)
+}
+
 pub fn publish_cluster_dfs_metadata_journal(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -486,8 +498,7 @@ pub fn publish_cluster_dfs_metadata_journal(
         });
     }
 
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
-        .map_err(DfsError::from_network)?;
+    let state = read_cluster_dfs_metadata_publish_state(cluster_paths)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
 
@@ -2867,8 +2878,7 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         });
     }
 
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-        .map_err(DfsError::from_network)?;
+    let state = read_cluster_dfs_metadata_publish_state(&cluster_paths)?;
     let file_system_id = only_lane
         .as_ref()
         .map(|(file_system_id, _)| file_system_id.clone())
@@ -2901,6 +2911,85 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         outcomes,
         targets,
     }))
+}
+
+#[cfg(test)]
+mod metadata_publish_membership_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_publish_peers_use_latest_observed_cluster_membership() {
+        let root = sinomo_testdir::TestDir::new("dfs-metadata-publish-latest-membership");
+        let data_dir = SinomoDataDir::new(root.path());
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_dfs_metadata_publish_latest_membership",
+        )
+        .expect("cluster id");
+        let local_node_id =
+            NodeId::from_legacy_named("node_dfs_metadata_publish_local").expect("local node");
+        let joined_node_id =
+            NodeId::from_legacy_named("node_dfs_metadata_publish_joined").expect("joined node");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "metadata publish latest membership",
+            local_node_id.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("initial cluster KV snapshot");
+
+        let stale_bootstrap = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("bootstrap-only state");
+        assert_eq!(
+            cluster_dfs_peer_node_ids(&stale_bootstrap),
+            vec![local_node_id.clone()],
+            "the regression requires bootstrap membership to trail KV membership"
+        );
+
+        let mut joined_member = sinomo_core::ClusterMemberRecord::pending_learner(
+            cluster_id,
+            joined_node_id.clone(),
+            "joined",
+            "pk-joined",
+            now,
+        );
+        joined_member.state = sinomo_core::ClusterMemberState::Learner;
+        let mut accepted = sinomo_core::kv::InProcessKvStore::restore(
+            sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
+                .expect("cached cluster KV snapshot"),
+        )
+        .expect("accepted KV store");
+        accepted
+            .put_serde(
+                sinomo_core::node::cluster_member_key(&joined_node_id),
+                &joined_member,
+                None,
+            )
+            .expect("joined member");
+        let accepted = accepted.try_snapshot().expect("accepted KV snapshot");
+        sinomo_core::kv::write_imported_cluster_kv_snapshot_if_changed(
+            &cluster_paths.kv_paths(),
+            &accepted,
+            |_| false,
+        )
+        .expect("import accepted KV snapshot");
+
+        let publish_state = read_cluster_dfs_metadata_publish_state(&cluster_paths)
+            .expect("metadata publish state");
+        assert_eq!(
+            cluster_dfs_peer_node_ids(&publish_state)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([local_node_id, joined_node_id]),
+            "metadata publishing must authorize peers from the latest accepted membership"
+        );
+    }
 }
 
 async fn prepare_cluster_dfs_metadata_journal_publish_async(

@@ -77,6 +77,7 @@ const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
+const DAEMON_DFS_EXTERNAL_AUTHORITY_SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(1);
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
 const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
@@ -188,7 +189,6 @@ struct DaemonDfsMetadataAuthorityProjection {
     entries: Vec<(String, Vec<u8>)>,
 }
 
-#[derive(Debug)]
 struct DaemonDfsMetadataAuthorityGeneration {
     projection: Mutex<DaemonDfsMetadataAuthorityProjection>,
     generation: AtomicU64,
@@ -196,6 +196,17 @@ struct DaemonDfsMetadataAuthorityGeneration {
     projection_rebuild_count: AtomicU64,
     publish_wake: Mutex<Option<DaemonDfsMetadataAuthorityPublishWake>>,
     subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>,
+    snapshot_watcher: OnceLock<notify::RecommendedWatcher>,
+}
+
+impl std::fmt::Debug for DaemonDfsMetadataAuthorityGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonDfsMetadataAuthorityGeneration")
+            .field("generation", &self.generation())
+            .field("snapshot_watcher", &self.snapshot_watcher.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +228,7 @@ impl DaemonDfsMetadataAuthorityGeneration {
             projection_rebuild_count: AtomicU64::new(0),
             publish_wake: Mutex::new(None),
             subscription: OnceLock::new(),
+            snapshot_watcher: OnceLock::new(),
         }
     }
 
@@ -315,6 +327,88 @@ impl DaemonDfsMetadataAuthorityGeneration {
             );
         }
     }
+}
+
+fn daemon_dfs_metadata_authority_snapshot_watcher(
+    cluster_paths: &ClusterPaths,
+    generation: Weak<DaemonDfsMetadataAuthorityGeneration>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<notify::RecommendedWatcher, sinomo_dfs::DfsError> {
+    let snapshot_path = cluster_paths.kv_paths().snapshot;
+    let callback_snapshot_path = snapshot_path.clone();
+    let callback_cluster_paths = cluster_paths.clone();
+    let callback_runtime = runtime.clone();
+    let event_generation = Arc::new(AtomicU64::new(0));
+    let mut watcher = notify::recommended_watcher(
+        move |result: Result<notify::Event, notify::Error>| match result {
+            Ok(event)
+                if event
+                    .paths
+                    .iter()
+                    .any(|path| path == &callback_snapshot_path) =>
+            {
+                let event_id = event_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                let event_generation = Arc::clone(&event_generation);
+                let generation = generation.clone();
+                let cluster_paths = callback_cluster_paths.clone();
+                let snapshot_path = callback_snapshot_path.clone();
+                callback_runtime.spawn(async move {
+                    tokio::time::sleep(DAEMON_DFS_EXTERNAL_AUTHORITY_SNAPSHOT_DEBOUNCE).await;
+                    if event_generation.load(Ordering::Acquire) != event_id {
+                        return;
+                    }
+                    let Some(generation) = generation.upgrade() else {
+                        return;
+                    };
+                    match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+                        &cluster_paths,
+                    ) {
+                        Ok(Some(snapshot)) => generation.observe(snapshot.as_ref()),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            target: "sinomo.dfs.metadata_authority",
+                            path = %snapshot_path.display(),
+                            "DFS metadata-authority snapshot change could not be read: {error}"
+                        ),
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "sinomo.dfs.metadata_authority",
+                path = %callback_snapshot_path.display(),
+                "DFS metadata-authority snapshot watcher failed: {error}"
+            ),
+        },
+    )
+    .map_err(|source| sinomo_dfs::DfsError::Network {
+        message: format!(
+            "cannot watch DFS metadata-authority snapshot {}: {source}",
+            snapshot_path.display()
+        ),
+    })?;
+    let watch_root = snapshot_path
+        .parent()
+        .ok_or_else(|| sinomo_dfs::DfsError::Network {
+            message: format!(
+                "DFS metadata-authority snapshot {} has no parent directory",
+                snapshot_path.display()
+            ),
+        })?;
+    notify::Watcher::watch(
+        &mut watcher,
+        watch_root,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .map_err(|source| sinomo_dfs::DfsError::Network {
+        message: format!(
+            "cannot watch DFS metadata-authority snapshot directory {}: {source}",
+            watch_root.display()
+        ),
+    })?;
+    Ok(watcher)
 }
 
 #[derive(Debug)]
@@ -2685,6 +2779,14 @@ fn daemon_dfs_metadata_authority_generation_for_identity(
         .subscription
         .set(subscription)
         .expect("new metadata-authority generation subscription");
+    if let Some(runtime) = runtime {
+        let watcher = daemon_dfs_metadata_authority_snapshot_watcher(
+            cluster_paths,
+            Arc::downgrade(&generation),
+            runtime,
+        )?;
+        let _ = generation.snapshot_watcher.set(watcher);
+    }
     if let Some(snapshot) =
         sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(cluster_paths)
             .map_err(daemon_dfs_network_error)?
@@ -4771,22 +4873,17 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
         })?;
     let lifecycle_outcome = lifecycle_result?;
 
-    if matches!(
-        lifecycle_outcome,
-        DaemonDefaultDfsLifecycleOutcome::Parked(_)
-    ) {
-        return Ok(lifecycle_outcome);
-    }
-
     let data_dir = SinomoDataDir::new(data_dir);
     if sinomo_dfs::take_default_cluster_dfs_materialization_immediate_retry(&data_dir) {
         notify_daemon_default_dfs_reconciliation_replica_progress(&ClusterPaths::new(&data_dir));
     }
 
-    // Default materialization and completed handoff activation append directly
-    // to local primary journals rather than passing through a served-message
-    // event. Wake the node-local replication lanes after their lifecycle guards
-    // have been released so those entries do not depend on broad maintenance.
+    // Default materialization and handoff activation append directly to local
+    // primary journals rather than passing through a served-message event. A
+    // lifecycle pass can append those entries and then park on the next exact
+    // handoff proof, so wake the node-local replication lanes before returning
+    // either outcome. Authority-change discovery may already have run before
+    // these entries existed and is not a substitute for this committed edge.
     schedule_daemon_dfs_metadata_publish_on_runtime(paths, &runtime, None)?;
     Ok(lifecycle_outcome)
 }
@@ -5277,8 +5374,13 @@ fn daemon_dfs_metadata_publish_discovery_lanes(
 ) -> Result<Vec<DaemonDfsMutationLaneKey>, String> {
     let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(|error| format!("DFS metadata lanes lack cluster state: {error}"))?;
-    let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
-        &cluster_paths.kv_paths(),
+    // Shard authority is committed Raft state. A voter's materialized snapshot
+    // can briefly trail its applied log, especially while a primary handoff is
+    // completing. Read the same latest-observed view used by DFS routing and
+    // status so a promotion wake cannot rediscover the retiring topology and
+    // drop the new primary's publish lane.
+    let entries = sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
+        cluster_paths,
         "/dfs/filesystems/",
     )
     .map_err(|error| format!("DFS metadata lanes lack shard topology: {error}"))?;
@@ -6005,6 +6107,78 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &other),
             "a blocked replica for one shard must not occupy another shard's reactor lane"
+        );
+    }
+
+    #[test]
+    fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapshot() {
+        let root = temp_root("metadata-publish-latest-observed-topology");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local =
+            NodeId::from_legacy_named("node_metadata_publish_promoted_local").expect("local node");
+        let remote = NodeId::from_legacy_named("node_metadata_publish_retiring_remote")
+            .expect("remote node");
+        write_test_cluster_state_with_remote_endpoint(
+            &data_root,
+            &local,
+            &remote,
+            "10.79.0.1:21353",
+        );
+        let stale_materialized =
+            sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
+                .expect("pre-promotion snapshot");
+        let file_system = distributed_sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote],
+            epoch: 2,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "services"),
+                    &shard,
+                    None,
+                )
+                .expect("promoted shard op"),
+            ),
+        )
+        .expect("commit promoted shard");
+
+        // Model the short production window where the local Raft state has
+        // applied the promotion but the derived materialized snapshot still
+        // describes the retiring topology.
+        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &stale_materialized)
+            .expect("restore stale materialized snapshot");
+        assert!(
+            sinomo_core::kv::read_cluster_kv_prefix_entries(
+                &cluster_paths.kv_paths(),
+                "/dfs/filesystems/",
+            )
+            .expect("stale materialized topology")
+            .is_empty(),
+            "the regression requires the materialized projection to trail Raft"
+        );
+
+        assert_eq!(
+            daemon_dfs_metadata_publish_discovery_lanes(&cluster_paths)
+                .expect("discover promoted primary lane"),
+            vec![DaemonDfsMutationLaneKey {
+                file_system_id: file_system.file_system_id,
+                shard_id: DfsMetadataShardId::new("services"),
+            }],
+            "promotion discovery must use applied authority rather than the stale materialized projection"
         );
     }
 
@@ -11105,6 +11279,151 @@ mod tests {
         assert!(
             daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) > initial_requests,
             "the authority edge must publish an inherited journal without another DFS mutation"
+        );
+    }
+
+    #[test]
+    fn external_snapshot_materialization_schedules_inherited_local_primary_backlog() {
+        let root = temp_root("daemon-dfs-external-authority-inherited-backlog");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local =
+            NodeId::from_legacy_named("node_dfs_external_inherited_backlog_local").expect("node");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_external_inherited_backlog_remote").expect("node");
+        write_test_cluster_state(&data_root, &local);
+        let file_system = distributed_sifs(local.clone());
+        let mut shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: remote.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &shard,
+                        None,
+                    )
+                    .expect("remote-primary shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("initial remote authority");
+        let mut inherited = sinomo_dfs::open_local_metadata_shard_backend(
+            &data_dir,
+            DfsMetadataShardId::new("root"),
+        )
+        .expect("local replica backend");
+        inherited
+            .put_file_system(&file_system)
+            .expect("replica filesystem");
+        let inherited_object = distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("inherited object");
+        inherited
+            .put_object(&inherited_object)
+            .expect("inherited journal entry");
+        drop(inherited);
+
+        let runtime = daemon_test_runtime("daemon-dfs-external-authority-inherited-backlog");
+        let paths = DaemonPaths::new(&data_dir);
+        let control_owner = Arc::new(
+            DaemonDataOwnerLock::acquire(&paths).expect("control-loop data-owner capability"),
+        );
+        register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+            .expect("register data-owner capability");
+        // Construct only the production filesystem edge: no in-process
+        // committed-snapshot subscription is installed in this regression.
+        let generation = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
+        let initial_snapshot =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+                &cluster_paths,
+            )
+            .expect("read initial authority")
+            .expect("initial authority snapshot");
+        generation.observe(initial_snapshot.as_ref());
+        generation.attach_publish_wake(&cluster_paths, Some(runtime.handle()));
+        let watcher = daemon_dfs_metadata_authority_snapshot_watcher(
+            &cluster_paths,
+            Arc::downgrade(&generation),
+            runtime.handle(),
+        )
+        .expect("authority snapshot watcher");
+        generation
+            .snapshot_watcher
+            .set(watcher)
+            .expect("retain authority snapshot watcher");
+        assert!(
+            generation.snapshot_watcher.get().is_some(),
+            "a live daemon authority observer must retain the cross-process snapshot watcher"
+        );
+        let initial_generation = generation.generation();
+        let lane = DaemonDfsMutationLaneKey {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let initial_requests = daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane);
+
+        shard.primary_node_id = local.clone();
+        shard.replica_node_ids = vec![remote];
+        shard.epoch = 2;
+        let current = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
+            .expect("current snapshot before external materialization");
+        let mut external_store =
+            sinomo_core::kv::InProcessKvStore::restore(current).expect("restore external store");
+        external_store
+            .put_serde(
+                metadata_shard_key(&file_system.file_system_id, "root"),
+                &shard,
+                None,
+            )
+            .expect("apply externally committed authority");
+        let external_snapshot = external_store.snapshot().expect("external snapshot");
+        // Write through the R0 materialized-snapshot API, deliberately bypassing
+        // sinomo-cluster's in-process committed-snapshot observer. This models
+        // a separate CLI process advancing the shared Docker data directory.
+        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &external_snapshot)
+            .expect("materialize external authority snapshot");
+
+        let external_write_at = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while generation.generation() == initial_generation && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(generation.generation(), initial_generation + 1);
+        assert!(
+            external_write_at.elapsed()
+                >= DAEMON_DFS_EXTERNAL_AUTHORITY_SNAPSHOT_DEBOUNCE
+                    .saturating_sub(Duration::from_millis(100)),
+            "the external write must be observed by the debounced filesystem edge, not an in-process fallback"
+        );
+        while daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) == initial_requests
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) > initial_requests,
+            "an authority snapshot materialized by another process must publish inherited backlog"
         );
     }
 

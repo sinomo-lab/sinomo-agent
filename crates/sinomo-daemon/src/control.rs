@@ -58,6 +58,9 @@ const DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration:
 // not make every node hold its local lane while asking a peer to enter theirs.
 const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT: Duration = Duration::from_secs(20);
 const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW: Duration = Duration::from_secs(300);
+// Reserve startup for liveness publication and one live doctor/readiness pass.
+// Rank-zero DFS work is intentionally not allowed to consume that same window.
+const DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE: Duration = Duration::from_secs(15);
 pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
@@ -2095,6 +2098,24 @@ fn daemon_sandbox_lifecycle_maintenance_allowed(
     label == "daemon" && startup_cluster_maintenance_attempted
 }
 
+fn daemon_dfs_maintenance_allowed(
+    maintain_default_dfs: bool,
+    startup_cluster_maintenance_attempted: bool,
+) -> bool {
+    maintain_default_dfs && startup_cluster_maintenance_attempted
+}
+
+fn daemon_dfs_initial_maintenance_delay(
+    member_phase: Duration,
+    maintain_cluster_runtime: bool,
+) -> Duration {
+    if maintain_cluster_runtime {
+        member_phase.saturating_add(DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE)
+    } else {
+        member_phase
+    }
+}
+
 async fn run_daemon_background_maintenance_loop(
     paths: DaemonPaths,
     options: crate::DaemonRunOptions,
@@ -2166,8 +2187,12 @@ async fn run_daemon_background_maintenance_loop(
     } else {
         Duration::ZERO
     };
+    let initial_dfs_maintenance_delay = daemon_dfs_initial_maintenance_delay(
+        initial_dfs_maintenance_phase,
+        maintain_cluster_runtime,
+    );
     let initial_dfs_maintenance_not_before = maintenance_started
-        .checked_add(initial_dfs_maintenance_phase)
+        .checked_add(initial_dfs_maintenance_delay)
         .unwrap_or(maintenance_started);
     let mut last_dfs_maintenance = maintenance_started
         .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
@@ -2183,7 +2208,6 @@ async fn run_daemon_background_maintenance_loop(
     // A clustered replacement must publish its startup liveness before broad
     // sandbox recovery can consume a transport timeout reaching DFS peers.
     // Unclustered daemons retain the existing immediate recovery opportunity.
-    #[cfg(feature = "sandbox")]
     let mut startup_cluster_maintenance_attempted = !maintain_cluster_runtime;
     let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
     let cluster_maintenance_notify = daemon_cluster_maintenance_notify();
@@ -2369,8 +2393,10 @@ async fn run_daemon_background_maintenance_loop(
                 };
         }
 
-        if maintain_default_dfs
-            && dfs_maintenance_task.is_none()
+        if daemon_dfs_maintenance_allowed(
+            maintain_default_dfs,
+            startup_cluster_maintenance_attempted,
+        ) && dfs_maintenance_task.is_none()
             && !dfs_triggered_maintenance_requested
             && daemon_dfs_maintenance_probe_is_due(Instant::now(), next_dfs_maintenance_probe)
         {
@@ -2411,7 +2437,12 @@ async fn run_daemon_background_maintenance_loop(
             dfs_immediate_continuation_requested,
         )
         .is_some_and(|due_in| due_in.is_zero());
-        if maintain_default_dfs && dfs_maintenance_task.is_none() && dfs_triggered_maintenance_due {
+        if daemon_dfs_maintenance_allowed(
+            maintain_default_dfs,
+            startup_cluster_maintenance_attempted,
+        ) && dfs_maintenance_task.is_none()
+            && dfs_triggered_maintenance_due
+        {
             // A trigger is a durable-work classification observed at an
             // earlier point in time. Revalidate it at the launch boundary so
             // resolved work never acquires the broad DFS service lane or its
@@ -2503,10 +2534,7 @@ async fn run_daemon_background_maintenance_loop(
             // The first bounded network pass has now had its opportunity to
             // publish node status. Restore the ordinary sandbox recovery
             // cadence even when planning was partial or timed out.
-            #[cfg(feature = "sandbox")]
-            {
-                startup_cluster_maintenance_attempted = true;
-            }
+            startup_cluster_maintenance_attempted = true;
 
             if let Some(pending_work) = pending_work {
                 let pending_work_deadline = Instant::now()
@@ -2982,12 +3010,17 @@ async fn daemon_control_stream_uses_authenticated_transport_prelude(
 
 fn resolve_authenticated_transport_peer(
     paths: &DaemonPaths,
+    state: &sinomo_core::ClusterBootstrapState,
     metadata: &sinomo_core::network::AuthenticatedTransportMetadata,
     local_node_id: &NodeId,
     identity: &dyn sinomo_core::network::RoutedSessionIdentity,
 ) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let directory = sinomo_core::network::cluster_directory_for(&cluster_paths).snapshot()?;
+    let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+        sinomo_core::network::cluster_directory_for(&cluster_paths),
+        state,
+    )
+    .snapshot()?;
     if matches!(
         metadata.transport,
         sinomo_core::base::ClusterTransportKind::Loopback
@@ -3089,8 +3122,13 @@ async fn handle_daemon_authenticated_transport_stream_async(
         local_node_id.clone(),
         data_dir,
     )?);
-    let (peer_node_id, directory) =
-        resolve_authenticated_transport_peer(&paths, &metadata, &local_node_id, identity.as_ref())?;
+    let (peer_node_id, directory) = resolve_authenticated_transport_peer(
+        &paths,
+        &state,
+        &metadata,
+        &local_node_id,
+        identity.as_ref(),
+    )?;
     let mut link_identity = Vec::new();
     link_identity.extend_from_slice(local_node_id.as_str().as_bytes());
     link_identity.push(0);
@@ -3139,6 +3177,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
             );
             handle_daemon_stream_native_service_rpc_async(
                 stream,
+                directory,
                 paths,
                 service_host,
                 service_runtime,
@@ -3948,6 +3987,7 @@ async fn handle_daemon_local_stream_native_service_rpc_async(
 /// source before consulting the service registry.
 async fn handle_daemon_stream_native_service_rpc_async(
     stream: sinomo_core::network::PeerStream,
+    directory: sinomo_core::network::DirectorySnapshot,
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
@@ -3961,30 +4001,35 @@ async fn handle_daemon_stream_native_service_rpc_async(
             stream.session_id.clone(),
             stream.channel_binding,
         )?;
-    let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
-    let directory = sinomo_core::network::cluster_directory_for(&cluster_paths).snapshot()?;
-    let peer_public_key = directory
-        .node(&peer_node_id)
-        .ok_or_else(|| sinomo_core::network::NetworkError::UnauthorizedNode {
+    let peer_directory_node = directory.node(&peer_node_id).ok_or_else(|| {
+        sinomo_core::network::NetworkError::UnauthorizedNode {
             node_id: peer_node_id.clone(),
-        })
-        .and_then(|node| sinomo_core::network::daemon_auth_decode_public_key(&node.public_key))?;
+        }
+    })?;
+    let peer_public_key_encoded = peer_directory_node.public_key.clone();
+    let peer_public_key =
+        sinomo_core::network::daemon_auth_decode_public_key(&peer_public_key_encoded)?;
+    let peer_is_raft_voter = peer_directory_node.has_raft_vote();
     let completion = Arc::new(Mutex::new(("<unavailable>".to_string(), false)));
     let handler_completion = Arc::clone(&completion);
     let handler_paths = paths.clone();
     let handler_host = service_host.clone();
     let handler_runtime = service_runtime.clone();
     let handler_peer_node_id = peer_node_id.clone();
+    let handler_peer_public_key = peer_public_key_encoded;
     let result =
         sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
             stream,
             &context,
             sinomo_core::network::ObjectFrameIoOptions::default(),
             move |request, peer| async move {
-                let authenticated = crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                let authenticated = crate::service_adapter::authenticate_routed_daemon_control_request_via_registry(
                     &handler_paths,
                     &request.request,
                     &handler_host,
+                    handler_peer_node_id.as_str(),
+                    &handler_peer_public_key,
+                    peer_is_raft_voter,
                 )
                 .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
                 let context_peer = match peer.identity {
@@ -10981,6 +11026,34 @@ mod tests {
             !telemetry_reconciliation
                 .contains("run_daemon_module_rollout_desired_reconciliation_tick"),
             "telemetry source reconciliation must not poll or own desired rollout state"
+        );
+    }
+
+    #[test]
+    fn clustered_startup_network_pass_precedes_dfs_maintenance() {
+        assert!(
+            !daemon_dfs_maintenance_allowed(true, false),
+            "a clustered replacement must publish its first network-liveness pass before DFS work"
+        );
+        assert!(
+            daemon_dfs_maintenance_allowed(true, true),
+            "DFS maintenance resumes after the bounded startup network pass"
+        );
+        assert!(!daemon_dfs_maintenance_allowed(false, true));
+        assert_eq!(
+            daemon_dfs_initial_maintenance_delay(Duration::ZERO, true),
+            DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE,
+            "rank-zero DFS work must leave the startup liveness window idle"
+        );
+        assert_eq!(
+            daemon_dfs_initial_maintenance_delay(Duration::from_secs(20), true),
+            DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE + Duration::from_secs(20),
+            "membership staggering starts after the common liveness window"
+        );
+        assert_eq!(
+            daemon_dfs_initial_maintenance_delay(Duration::from_secs(20), false),
+            Duration::from_secs(20),
+            "unclustered processes do not reserve a cluster-liveness window"
         );
     }
 

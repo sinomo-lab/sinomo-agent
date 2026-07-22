@@ -179,6 +179,47 @@ pub(crate) fn authenticate_daemon_control_request_without_nonce(
     authenticate_daemon_control_request_inner(paths, request, false, true)
 }
 
+/// Verifies an origin-signed request whose exact cluster identity was already
+/// authenticated by the routed-session directory snapshot.
+///
+/// This deliberately does not consult the daemon's independent membership
+/// cache. Doing so would let projection lag disagree with the transport
+/// authorization decision made for the same stream.
+pub(crate) fn authenticate_verified_cluster_peer_request(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+    expected_node_id: &str,
+    expected_public_key: &str,
+    is_raft_voter: bool,
+    authorize_route: bool,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
+    let envelope: SignedDaemonCommand =
+        sinomo_core::network::SinomoObjectCodec::default().decode(auth)?;
+    verify_daemon_rpc_body_binding(&envelope, request)?;
+    verify_signed_daemon_command_signature(&envelope, request)?;
+    let signer_public_key =
+        sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
+    if envelope.node_id != expected_node_id || signer_public_key != expected_public_key {
+        return Err(DaemonError::AuthDenied);
+    }
+    remember_daemon_auth_nonce(paths, &envelope)?;
+    let authenticated = AuthenticatedDaemonCommand {
+        route: request.route.clone(),
+        signer: if is_raft_voter {
+            DaemonSignerAuthority::Voter
+        } else {
+            DaemonSignerAuthority::Member
+        },
+        signer_node_id: envelope.node_id,
+        signer_public_key,
+    };
+    if authorize_route {
+        authorize_authenticated_daemon_command_at_node(paths, &authenticated)?;
+    }
+    Ok(authenticated)
+}
+
 fn authenticate_daemon_control_request_inner(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
@@ -569,6 +610,14 @@ fn verify_signed_daemon_command(
     envelope: &SignedDaemonCommand,
     request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
+    verify_signed_daemon_command_signature(envelope, request)?;
+    authorize_daemon_signer(paths, envelope, request)
+}
+
+fn verify_signed_daemon_command_signature(
+    envelope: &SignedDaemonCommand,
+    request: &sinomo_core::network::ObjectRpcRequest,
+) -> Result<(), DaemonError> {
     if envelope.protocol != DAEMON_AUTH_PROTOCOL {
         return Err(DaemonError::AuthDenied);
     }
@@ -594,7 +643,7 @@ fn verify_signed_daemon_command(
     UnparsedPublicKey::new(&ED25519, &envelope.public_key)
         .verify(&signing_payload, &envelope.signature)
         .map_err(|_| DaemonError::AuthDenied)?;
-    authorize_daemon_signer(paths, envelope, request)
+    Ok(())
 }
 
 fn authorize_daemon_signer(
@@ -1365,6 +1414,60 @@ mod tests {
         .expect("catalog will authorize the route descriptor separately");
         assert_eq!(authenticated.route, "/test/dynamic-module-route");
         assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+    }
+
+    #[test]
+    fn routed_peer_authentication_uses_the_transport_verified_identity() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-routed-peer");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let paths = DaemonPaths::new(&data_dir);
+        let mut request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_dfs::DFS_STATUS_ROUTE,
+            sinomo_dfs::DFS_RPC_CATEGORY,
+            &(),
+        )
+        .expect("routed request");
+        request.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                .expect("sign routed request"),
+        );
+        let envelope: SignedDaemonCommand = sinomo_core::network::SinomoObjectCodec::default()
+            .decode(request.auth.as_deref().expect("request auth"))
+            .expect("decode routed auth");
+        let public_key = sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
+
+        let authenticated = authenticate_verified_cluster_peer_request(
+            &paths,
+            &request,
+            &envelope.node_id,
+            &public_key,
+            false,
+            true,
+        )
+        .expect("transport-verified cluster member");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Member);
+
+        let mut mismatched = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_dfs::DFS_STATUS_ROUTE,
+            sinomo_dfs::DFS_RPC_CATEGORY,
+            &(),
+        )
+        .expect("mismatched request");
+        mismatched.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &mismatched)
+                .expect("sign mismatched request"),
+        );
+        assert!(matches!(
+            authenticate_verified_cluster_peer_request(
+                &paths,
+                &mismatched,
+                "different-node",
+                &public_key,
+                false,
+                true,
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
     }
 
     #[test]
