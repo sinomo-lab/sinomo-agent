@@ -27,28 +27,29 @@ use super::{
     build_cluster_raft_append_request_from_next_index,
     cli_cluster_state_authority_reachability_options, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
-    cluster_invite_has_remote_usable_introducer, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave,
-    cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cli_default_main_daemon_status, cli_invocation_force_local_mode, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_has_remote_usable_introducer,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
+    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
     data_dir_storage_contract_findings, default_dfs_file_system_id, ensure_rollout_layout,
-    expire_cluster_network_records_in_kv, explicit_rollout_targets_from_state,
-    format_rollout_progress_line, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
-    install_prepared_native_dylib_modules, install_should_update_binary, install_with_layout,
-    load_tui_model_runtime_config, local_daemon_matches_cluster_state,
-    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
-    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
+    enter_cli_default_main_daemon_status, expire_cluster_network_records_in_kv,
+    explicit_rollout_targets_from_state, format_rollout_progress_line,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
+    handle_daemon_rollout_build_request, install_prepared_native_dylib_modules,
+    install_should_update_binary, install_with_layout, load_tui_model_runtime_config,
+    local_daemon_matches_cluster_state, main_agent_config_tool_registry,
+    main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_join_invite_argument, parse_cluster_schema_for_test,
     parse_daemon_schema_for_test, parse_dfs_schema_for_test, parse_install_schema_for_test,
     parse_models_command, parse_provider_schema_for_test, parse_rollout_schema_for_test,
     parse_slash_command, parse_test_schema_for_test, parse_uninstall_schema_for_test,
-    parse_usage_schema_for_test, read_cluster_rollout_status,
+    parse_usage_schema_for_test, probe_daemon_status_until_settled, read_cluster_rollout_status,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
     rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_missing_status_grace,
     rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
@@ -5583,7 +5584,9 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
             agent: "coding-agent".to_string(),
             agent_explicit: true,
             provider: "codex".to_string(),
+            provider_explicit: true,
             model: "gpt-5.2-codex".to_string(),
+            model_explicit: true,
             account: Some("work".to_string()),
             session_id: Some(session_id),
             compact_after: true,
@@ -5595,9 +5598,64 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
         super::parse_agent_run_schema_for_test(&["hello".to_string()]).expect("default agent run");
     assert_eq!(defaults.agent, "main-agent");
     assert!(!defaults.agent_explicit);
+    assert!(!defaults.provider_explicit);
+    assert!(!defaults.model_explicit);
     assert!(defaults.session_id.is_none());
     assert!(!defaults.compact_after);
     assert!(!defaults.json);
+}
+
+#[test]
+fn agent_run_model_policy_applies_unless_cli_flags_are_explicit() {
+    let mut definition = sinomo_agent::AgentDefinition::custom(
+        "model-agent",
+        sinomo_agent::AgentRole::Deliberation,
+        "Use the package model.",
+    );
+    definition.model_policy.provider = Some("openai".to_string());
+    definition.model_policy.model = Some("gpt-package".to_string());
+    let defaults =
+        super::parse_agent_run_schema_for_test(&["hello".to_string()]).expect("defaults");
+    assert_eq!(
+        super::resolve_agent_run_model_selection(&defaults, &definition),
+        ("openai".to_string(), "gpt-package".to_string())
+    );
+
+    let explicit = super::parse_agent_run_schema_for_test(&[
+        "--provider".to_string(),
+        "codex".to_string(),
+        "--model".to_string(),
+        "gpt-explicit".to_string(),
+        "hello".to_string(),
+    ])
+    .expect("explicit selection");
+    assert_eq!(
+        super::resolve_agent_run_model_selection(&explicit, &definition),
+        ("codex".to_string(), "gpt-explicit".to_string())
+    );
+}
+
+#[test]
+fn agent_package_placement_accepts_local_and_rejects_remote_nodes() {
+    let local = NodeId::from_legacy_named("local-agent-node").expect("local node");
+    let mut local_definition = sinomo_agent::AgentDefinition::custom(
+        "local-agent",
+        sinomo_agent::AgentRole::Main,
+        "Stay local.",
+    )
+    .with_home_server_node_id(local.to_string())
+    .with_sandbox_runtime_node_id(local.to_string());
+    super::validate_agent_local_placement(&local_definition, &local)
+        .expect("matching local placement");
+
+    local_definition.tool_runtime.sandbox_node_id = Some("remote-agent-node".to_string());
+    let error = super::validate_agent_local_placement(&local_definition, &local)
+        .expect_err("remote placement must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("remote agent routing is unavailable")
+    );
 }
 
 #[test]
@@ -7412,6 +7470,86 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
         None,
     ));
 }
+#[test]
+fn cli_invocation_daemon_status_cache_is_scoped_and_nested() {
+    assert_eq!(cli_default_main_daemon_status(), None);
+    let status = DaemonStatus {
+        pid: 4242,
+        host: "127.0.0.1".to_string(),
+        port: 21_353,
+        address: "127.0.0.1:21353".to_string(),
+        version: daemon_package_version(),
+        commit: None,
+        target_os: Some(std::env::consts::OS.to_string()),
+        target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
+        executable: None,
+        rollout: None,
+        started_at: "2026-07-22T00:00:00Z".to_string(),
+        data_dir: PathBuf::from("data"),
+        lock_file: PathBuf::from("data/daemon/daemon.lock"),
+        cluster: None,
+        idle_stats: None,
+    };
+
+    {
+        let _outer = enter_cli_default_main_daemon_status(status.clone());
+        assert_eq!(cli_default_main_daemon_status(), Some(status.clone()));
+        {
+            let mut nested = status.clone();
+            nested.pid = 4343;
+            let _inner = enter_cli_default_main_daemon_status(nested.clone());
+            assert_eq!(cli_default_main_daemon_status(), Some(nested));
+        }
+        assert_eq!(cli_default_main_daemon_status(), Some(status));
+    }
+    assert_eq!(cli_default_main_daemon_status(), None);
+}
+
+#[test]
+fn daemon_preflight_retries_locked_listener_transition_but_not_absence() {
+    let status = DaemonStatus {
+        pid: 4242,
+        host: "127.0.0.1".to_string(),
+        port: 21_353,
+        address: "127.0.0.1:21353".to_string(),
+        version: daemon_package_version(),
+        commit: None,
+        target_os: Some(std::env::consts::OS.to_string()),
+        target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
+        executable: None,
+        rollout: None,
+        started_at: "2026-07-22T00:00:00Z".to_string(),
+        data_dir: PathBuf::from("data"),
+        lock_file: PathBuf::from("data/daemon/daemon.lock"),
+        cluster: None,
+        idle_stats: None,
+    };
+    let mut attempts = 0;
+    let resolved =
+        probe_daemon_status_until_settled(Duration::from_millis(20), Duration::ZERO, |_| {
+            attempts += 1;
+            if attempts < 3 {
+                DaemonProbeStatus::Locked { status: None }
+            } else {
+                DaemonProbeStatus::Running(status.clone())
+            }
+        });
+    assert_eq!(resolved, Some(status));
+    assert_eq!(attempts, 3);
+
+    attempts = 0;
+    assert_eq!(
+        probe_daemon_status_until_settled(Duration::from_secs(1), Duration::ZERO, |_| {
+            attempts += 1;
+            DaemonProbeStatus::NotRunning
+        },),
+        None
+    );
+    assert_eq!(attempts, 1, "a genuinely absent daemon fails immediately");
+}
+
 #[test]
 fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-daemon-guard");

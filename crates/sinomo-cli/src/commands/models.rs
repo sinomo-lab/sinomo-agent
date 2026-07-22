@@ -8,6 +8,8 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 
+const MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelDefaultOptions {
     pub(crate) provider: String,
@@ -1041,11 +1043,19 @@ pub(crate) fn load_model_config_for_node(
 
 pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     let _ = paths;
-    if let Some(status) = default_main_daemon_status()?
-        && let Ok(snapshot) =
-            daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
-    {
-        return Ok(snapshot.value);
+    if let Some(status) = default_main_daemon_status()? {
+        match daemon_fetch_cluster_kv_authoritative_snapshot(
+            &status.address,
+            MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT,
+        ) {
+            Ok(snapshot) => return Ok(snapshot.value),
+            Err(error) => {
+                #[cfg(not(test))]
+                return Err(error.into());
+                #[cfg(test)]
+                let _ = error;
+            }
+        }
     }
     #[cfg(test)]
     {

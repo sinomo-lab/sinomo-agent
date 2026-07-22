@@ -4608,6 +4608,28 @@ impl AgentChat {
             resolve_agent(&self.data_dir, agent_key).ok_or_else(|| CliError::Parse {
                 detail: format!("unknown agent `{agent_key}`"),
             })?;
+        if !definition.supports_interactive_chat() {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent `{agent_key}` has role `{:?}` and is not available on interactive chat surfaces",
+                    definition.role
+                ),
+            });
+        }
+        match read_cli_cluster_state(&ClusterPaths::new(&self.data_dir)) {
+            Ok(state) => crate::validate_agent_local_placement(&definition, &state.local_node_id)?,
+            Err(_)
+                if definition.placement.home_server_node_id.is_some()
+                    || definition.tool_runtime.sandbox_node_id.is_some() =>
+            {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "agent `{agent_key}` declares node placement, but the local node identity is unavailable"
+                    ),
+                });
+            }
+            Err(_) => {}
+        }
         let info = if self.channel.channel_kind == AgentChannelKind::Channel {
             // Adding/enabling a channel participant must not pair the outer
             // handler's existing session with a different definition. Each
@@ -6446,6 +6468,7 @@ pub fn built_in_agent_summaries() -> Vec<AgentSummary> {
 fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
     catalog
         .list()
+        .filter(|definition| definition.supports_interactive_chat())
         .map(|definition| AgentSummary {
             key: definition.key().to_string(),
             name: if definition.name.is_empty() {
@@ -8446,6 +8469,16 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn chat_agent_summaries_expose_only_interactive_roles() {
+        let ids = built_in_agent_summaries()
+            .into_iter()
+            .map(|summary| summary.key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["coding-agent", "main-agent"]);
+    }
 
     #[test]
     fn remote_sifs_reads_retry_only_transient_browser_admission_failures() {
@@ -10512,7 +10545,7 @@ mod tests {
     }
 
     #[test]
-    fn app_chat_new_chat_uses_agent_tool_runtime_default() {
+    fn app_chat_rejects_agent_placement_without_local_node_identity() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-agent-tool-runtime");
         let data_dir = SinomoDataDir::new(&root);
         let definition =
@@ -10524,20 +10557,13 @@ mod tests {
             .expect("save agent definition");
 
         let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
-        chat.set_agent("worker-agent").expect("set agent");
-
-        assert_eq!(
-            chat.tool_runtime().sandbox_node_id.as_deref(),
-            Some("worker-node")
-        );
-        let participant = chat
-            .participants()
-            .into_iter()
-            .find(|participant| participant.agent_key == "worker-agent")
-            .expect("worker participant");
-        assert_eq!(
-            participant.tool_runtime.sandbox_node_id.as_deref(),
-            Some("worker-node")
+        let error = chat
+            .set_agent("worker-agent")
+            .expect_err("placement cannot be silently ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("local node identity is unavailable")
         );
     }
 
@@ -10807,7 +10833,7 @@ mod tests {
     }
 
     #[test]
-    fn app_chat_channel_set_agent_stamps_agent_tool_runtime_default() {
+    fn app_chat_channel_rejects_unenforceable_agent_tool_runtime_default() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-agent-tool-runtime");
         let data_dir = SinomoDataDir::new(&root);
         let definition =
@@ -10835,7 +10861,14 @@ mod tests {
             .expect("outer session snapshot")
             .expect("outer session")
             .agent_definition_key;
-        chat.set_agent("worker-agent").expect("set channel agent");
+        let error = chat
+            .set_agent("worker-agent")
+            .expect_err("channel participant placement cannot be silently ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("local node identity is unavailable")
+        );
         assert_eq!(chat.runtime_info().agent, outer_agent);
         assert_eq!(
             chat.runtime
@@ -10853,14 +10886,11 @@ mod tests {
             .load_channel(&channel_id)
             .expect("load channel")
             .expect("channel saved");
-        let participant = saved
-            .enabled_participants_in_order()
-            .into_iter()
-            .find(|participant| participant.agent_key == "worker-agent")
-            .expect("worker participant");
-        assert_eq!(
-            participant.tool_runtime.sandbox_node_id.as_deref(),
-            Some("worker-node")
+        assert!(
+            saved
+                .enabled_participants_in_order()
+                .into_iter()
+                .all(|participant| participant.agent_key != "worker-agent")
         );
     }
 

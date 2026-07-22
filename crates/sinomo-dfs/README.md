@@ -72,10 +72,14 @@ Object versions can be represented as manifests over extents. Full-object writes
 Visible metadata commits and namespace transactions are written as replayable records before materialization, so reopening the backend can complete an interrupted operation without duplicating already-materialized table batches.
 
 Mutating namespace RPCs first persist a request record keyed by authenticated
-requester and request id with the exact command digest. A completed record
-replays its terminal result across restart. Reuse with a different command is
-rejected, and a request left `Pending` by interruption is reported as
-indeterminate rather than executed again.
+requester and request id with the semantic operation, stable operation id, and
+exact authority shard. A request-owned hidden prepare commits the namespace
+transaction and canonical terminal result in one table batch. Startup and
+reactive maintenance resume admissions interrupted before a prepare, while
+prepared transactions and durable namespace jobs follow their existing
+recovery paths. A completed record replays its result across restart, reuse
+with a different semantic operation is rejected, and `Pending` is an internal
+automatically recovering state rather than an operator action.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 

@@ -1031,7 +1031,16 @@ fn acquire_daemon_sandbox_lifecycle_lease(
                 sinomo_dfs::DfsWriteOptions::replicated_eventual(replica_candidates),
             ) {
                 Ok(stat) => stat,
-                Err(_) => dfs.posix_stat_distributed(&anchor_path)?,
+                Err(write_error) => match dfs.posix_stat_distributed(&anchor_path) {
+                    Ok(stat) => stat,
+                    Err(stat_error) => {
+                        return Err(DaemonError::Parse {
+                            detail: format!(
+                                "failed to create sandbox lifecycle lock anchor {anchor_path}: {write_error}; post-write stat also failed: {stat_error}"
+                            ),
+                        });
+                    }
+                },
             }
         }
         Err(error) => return Err(error.into()),
@@ -4827,12 +4836,36 @@ pub fn handle_daemon_sandbox_create(
     handle_daemon_sandbox_create_on_runtime(paths, request, None)
 }
 
+fn daemon_sandbox_create_limits(
+    request: &sinomo_sandbox::SandboxCreateInstanceRequest,
+    policy_max: &sinomo_sandbox::SandboxResourceLimits,
+) -> sinomo_sandbox::SandboxResourceLimits {
+    sinomo_sandbox::SandboxResourceLimits {
+        memory_mb: request.memory_mb.unwrap_or(policy_max.memory_mb),
+        wall_time_ms: request.wall_time_ms.unwrap_or(policy_max.wall_time_ms),
+        max_input_bytes: request
+            .max_input_bytes
+            .unwrap_or(policy_max.max_input_bytes),
+        max_output_bytes: request
+            .max_output_bytes
+            .unwrap_or(policy_max.max_output_bytes),
+        max_workspace_bytes: request
+            .max_workspace_bytes
+            .unwrap_or(policy_max.max_workspace_bytes),
+        max_written_bytes_per_command: request
+            .max_written_bytes_per_command
+            .unwrap_or(policy_max.max_written_bytes_per_command),
+        max_file_count: request.max_file_count.unwrap_or(policy_max.max_file_count),
+    }
+}
+
 pub(crate) fn handle_daemon_sandbox_create_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxCreateInstanceRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxCreateInstanceResponse, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
+    let create_limits = daemon_sandbox_create_limits(&request, &config.policy.max_limits);
     let mut dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
     let execution_node_id = dfs.node_id().clone();
     let replica_candidates = daemon_sandbox_replica_candidates(paths, &execution_node_id);
@@ -4850,27 +4883,7 @@ pub(crate) fn handle_daemon_sandbox_create_on_runtime(
         detail: source.to_string(),
     })?;
     manifest.temp_policy = request.temp_policy;
-    if let Some(memory_mb) = request.memory_mb {
-        manifest.limits.memory_mb = memory_mb;
-    }
-    if let Some(wall_time_ms) = request.wall_time_ms {
-        manifest.limits.wall_time_ms = wall_time_ms;
-    }
-    if let Some(max_input_bytes) = request.max_input_bytes {
-        manifest.limits.max_input_bytes = max_input_bytes;
-    }
-    if let Some(max_output_bytes) = request.max_output_bytes {
-        manifest.limits.max_output_bytes = max_output_bytes;
-    }
-    if let Some(max_workspace_bytes) = request.max_workspace_bytes {
-        manifest.limits.max_workspace_bytes = max_workspace_bytes;
-    }
-    if let Some(max_written_bytes_per_command) = request.max_written_bytes_per_command {
-        manifest.limits.max_written_bytes_per_command = max_written_bytes_per_command;
-    }
-    if let Some(max_file_count) = request.max_file_count {
-        manifest.limits.max_file_count = max_file_count;
-    }
+    manifest.limits = create_limits;
     manifest.mounts = request.mounts;
     if let Err(denial) = config
         .policy
@@ -7348,6 +7361,48 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn sandbox_create_omitted_limits_inherit_policy_ceiling() {
+        let policy_max = sinomo_sandbox::SandboxResourceLimits {
+            memory_mb: 31_811,
+            wall_time_ms: 60_000,
+            max_input_bytes: 1_000,
+            max_output_bytes: 2_000,
+            max_workspace_bytes: 3_000,
+            max_written_bytes_per_command: 4_000,
+            max_file_count: 5_000,
+        };
+        let request = sinomo_sandbox::SandboxCreateInstanceRequest {
+            sandbox_id: None,
+            toolchain_id: sinomo_sandbox::SandboxToolchainId::from_legacy_named(
+                "sandbox_create_policy_defaults",
+            )
+            .expect("toolchain id"),
+            temp_policy: sinomo_sandbox::SandboxTempPolicy::RetainAcrossSessions,
+            memory_mb: None,
+            wall_time_ms: Some(12_345),
+            max_input_bytes: None,
+            max_output_bytes: None,
+            max_workspace_bytes: None,
+            max_written_bytes_per_command: None,
+            max_file_count: Some(42),
+            mounts: Vec::new(),
+        };
+
+        let limits = daemon_sandbox_create_limits(&request, &policy_max);
+
+        assert_eq!(limits.memory_mb, policy_max.memory_mb);
+        assert_eq!(limits.wall_time_ms, 12_345);
+        assert_eq!(limits.max_input_bytes, policy_max.max_input_bytes);
+        assert_eq!(limits.max_output_bytes, policy_max.max_output_bytes);
+        assert_eq!(limits.max_workspace_bytes, policy_max.max_workspace_bytes);
+        assert_eq!(
+            limits.max_written_bytes_per_command,
+            policy_max.max_written_bytes_per_command
+        );
+        assert_eq!(limits.max_file_count, 42);
+    }
 
     #[tokio::test]
     async fn cluster_network_ping_semantic_attachment_is_streamed_and_length_checked() {

@@ -439,19 +439,6 @@ pub trait ClusterKvQuorumAsyncHost: Send {
 }
 
 pub trait ClusterRaftQuorumAsyncHost: Send {
-    fn last_local_raft_log_index_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
-    ) -> ClusterMembershipRpcFuture<'a, u64>;
-
-    fn build_raft_append_request_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
-        next_index: u64,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest>;
-
     fn send_raft_append_to_node_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -534,23 +521,6 @@ impl<T> ClusterRaftQuorumAsyncHost for T
 where
     T: ClusterKvQuorumAsyncHost,
 {
-    fn last_local_raft_log_index_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
-    ) -> ClusterMembershipRpcFuture<'a, u64> {
-        self.last_local_kv_replication_index_async(paths, state)
-    }
-
-    fn build_raft_append_request_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a ClusterBootstrapState,
-        next_index: u64,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
-        self.build_kv_replication_request_async(paths, state, next_index)
-    }
-
     fn send_raft_append_to_node_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -612,6 +582,17 @@ where
 }
 
 pub trait ClusterRaftQuorumTransportHost {
+    fn local_has_verified_raft_leadership(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        paths
+            .kv_paths()
+            .locked_raft_local_is_leader(state)
+            .map_err(kv_err)
+    }
+
     fn replicate_cluster_raft_to_node(
         &mut self,
         paths: &ClusterPaths,
@@ -840,6 +821,14 @@ where
     F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<NodeId>),
     O: FnMut(),
 {
+    fn local_has_verified_raft_leadership(
+        &mut self,
+        _paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        self.storage.local_is_leader(state)
+    }
+
     fn replicate_cluster_raft_to_node(
         &mut self,
         paths: &ClusterPaths,
@@ -1149,6 +1138,14 @@ impl<T> ClusterRaftQuorumTransportHost for DriverRaftQuorumCommitHost<'_, T>
 where
     T: ClusterControlPlaneTransport,
 {
+    fn local_has_verified_raft_leadership(
+        &mut self,
+        _paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        self.storage.local_is_leader(state)
+    }
+
     fn replicate_cluster_raft_to_node(
         &mut self,
         paths: &ClusterPaths,
@@ -1443,10 +1440,8 @@ where
         &mut self,
         state: &ClusterBootstrapState,
     ) -> Result<bool, NetworkError> {
-        self.paths
-            .kv_paths()
-            .locked_raft_local_is_leader(state)
-            .map_err(kv_err)
+        self.host
+            .local_has_verified_raft_leadership(self.paths, state)
     }
 
     fn remote_voter_targets(
@@ -1630,7 +1625,9 @@ fn commit_cluster_raft_command_with_quorum_driver_and_trace(
 }
 
 struct AsyncNodeRaftAppendReplicationHost<'a, H> {
+    runtime: &'a tokio::runtime::Handle,
     paths: &'a ClusterPaths,
+    storage: SharedLocalClusterRaftCommandStorage,
     options: ClusterRaftAppendReplicationOptions,
     host: &'a mut H,
 }
@@ -1649,9 +1646,25 @@ where
 
     fn last_local_raft_log_index_async<'a>(
         &'a mut self,
-        state: &'a ClusterBootstrapState,
+        _state: &'a ClusterBootstrapState,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
-        self.host.last_local_raft_log_index_async(self.paths, state)
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "read resident local Raft log index",
+                    )?
+                    .last_log_index()
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "read resident local raft log index".to_string(),
+                    detail: format!("local raft log-index task failed: {source}"),
+                })?
+        })
     }
 
     fn raft_peer_progress_next_index_hint_async<'a>(
@@ -1681,8 +1694,24 @@ where
         state: &'a ClusterBootstrapState,
         next_index: u64,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendRequest, Self::Error> {
-        self.host
-            .build_raft_append_request_async(self.paths, state, next_index)
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        let state = state.clone();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "build resident local Raft append request",
+                    )?
+                    .build_raft_append_request(&state, next_index)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "build resident local raft append request".to_string(),
+                    detail: format!("local raft append-request task failed: {source}"),
+                })?
+        })
     }
 
     fn append_attempt_timeout(
@@ -2094,11 +2123,15 @@ where
         timeout: Duration,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, NetworkError> {
         let paths = self.paths;
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
         let append_options = self.append_options;
         let host = &mut *self.host;
         Box::pin(async move {
             let mut node_host = AsyncNodeRaftAppendReplicationHost {
+                runtime,
                 paths,
+                storage,
                 options: ClusterRaftAppendReplicationOptions {
                     timeout,
                     ..append_options

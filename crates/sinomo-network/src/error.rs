@@ -95,6 +95,8 @@ pub enum NetworkError {
     },
     #[error("cluster is read-only: {detail}")]
     ClusterReadOnly { detail: String },
+    #[error("authenticated cluster voter {node_id} confirmed it is not leader: {detail}")]
+    VerifiedClusterNonLeader { node_id: NodeId, detail: String },
     #[error("invalid cluster command: {detail}")]
     InvalidClusterCommand { detail: String },
     #[error(

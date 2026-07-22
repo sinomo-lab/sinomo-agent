@@ -3939,6 +3939,48 @@ mod tests {
     }
 
     #[test]
+    fn served_message_transport_propagates_operation_deadline_to_peer_sends() {
+        let local = node_id("node_served_deadline_local");
+        let remote = node_id("node_served_deadline_remote");
+        let observed_options = Arc::new(Mutex::new(Vec::new()));
+        let sender_options = Arc::clone(&observed_options);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, options| {
+            sender_options.lock().expect("options").push(options);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeServedMessageTransport::new_with_message_sender_for_nodes(
+            local.clone(),
+            vec![remote.clone()],
+            sender,
+            None,
+            Duration::from_secs(60),
+        );
+        let deadline = Instant::now() + Duration::from_millis(100);
+
+        assert_eq!(transport.set_operation_deadline(Some(deadline)), None);
+        assert_eq!(transport.operation_deadline(), Some(deadline));
+        transport
+            .send_routed_call(
+                &remote,
+                DfsRoutedCall::value(test_message(&local, &remote, 1)),
+            )
+            .expect("served peer send");
+
+        let observed = observed_options.lock().expect("options");
+        let options = observed.first().expect("served peer send options");
+        assert_eq!(options.connect_timeout, Duration::from_secs(60));
+        assert!(
+            options.overall_timeout.is_some_and(|timeout| {
+                !timeout.is_zero() && timeout <= Duration::from_millis(100)
+            }),
+            "served peer send must inherit the DFS operation deadline: {options:?}"
+        );
+    }
+
+    #[test]
     fn detached_send_recomputes_remaining_operation_budget_when_flushed() {
         let local = node_id("node_detached_deadline_local");
         let remote = node_id("node_detached_deadline_remote");
@@ -6457,6 +6499,14 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
         self.return_node_id
             .as_ref()
             .is_some_and(|return_node_id| return_node_id != target_node_id)
+    }
+
+    fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+        self.node_transport.set_operation_deadline(deadline)
+    }
+
+    fn operation_deadline(&self) -> Option<Instant> {
+        self.node_transport.operation_deadline()
     }
 }
 

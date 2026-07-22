@@ -2,7 +2,11 @@ use crate::internal::*;
 
 pub(crate) const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
-pub(crate) const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
+// A quorum command retains this lock while it replicates over the network. A
+// concurrent local maintenance/read path must tolerate that normal WAN-sized
+// critical section, but the wait remains below the outer control-plane timeout
+// so genuine lock leaks still fail in bounded time.
+pub(crate) const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const RAFT_NODE_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 pub(crate) const RAFT_NODE_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 pub(crate) static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

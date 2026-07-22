@@ -1142,6 +1142,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Release an exact hidden namespace prepare without publishing it.
+    ///
+    /// The digest and owner epoch fence operation-id reuse. Implementations
+    /// must reject a committed prepare and durably move a prepared record to
+    /// `Aborted`, releasing its active object/path footprint atomically with
+    /// the journaled terminal marker.
+    fn abort_prepared_namespace_transaction(
+        &mut self,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry>;
+
     /// Fetch a durable hidden namespace prepare by operation id.
     fn get_namespace_prepare(
         &self,
@@ -1213,22 +1226,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         shard_id: &DfsMetadataShardId,
         request: &DfsNamespaceRequestRecord,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let _ = (shard_id, request);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support durable namespace request admission".to_string(),
-        ))
-    }
+    ) -> Result<DfsMetadataJournalEntry>;
 
     /// Fetch a durable namespace request by authenticated requester and id.
     fn get_namespace_request(
         &self,
         requester_node_id: &NodeId,
         request_id: &str,
-    ) -> Result<Option<DfsNamespaceRequestRecord>> {
-        let _ = (requester_node_id, request_id);
-        Ok(None)
-    }
+    ) -> Result<Option<DfsNamespaceRequestRecord>>;
+
+    /// Return durable routed namespace requests for bounded autonomous
+    /// recovery. Concrete backends return a stable requester/request-id order.
+    fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>>;
 
     /// Create or replace a namespace maintenance job.
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {

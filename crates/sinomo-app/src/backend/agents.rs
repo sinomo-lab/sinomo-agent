@@ -245,22 +245,34 @@ impl Backend {
             },
         });
 
-        let sandbox_node = definition.tool_runtime.sandbox_node_id.as_deref();
-        let node_ready = sandbox_node.is_none_or(|node_id| {
-            node_id == self.node.node_id.as_str()
-                || self
-                    .cluster_snapshot()
-                    .nodes
-                    .iter()
-                    .any(|node| node.node_id == node_id)
+        let home_server = definition.placement.home_server_node_id.as_deref();
+        let home_server_ready =
+            home_server.is_none_or(|node_id| node_id == self.node.node_id.as_str());
+        report.checks.push(AgentValidationCheck {
+            name: "Agent placement".to_string(),
+            passed: home_server_ready,
+            detail: match home_server {
+                None => "Uses the local agent runtime".to_string(),
+                Some(node_id) if home_server_ready => {
+                    format!("Home server `{node_id}` is local")
+                }
+                Some(node_id) => format!(
+                    "Home server `{node_id}` is remote; remote agent routing is unavailable"
+                ),
+            },
         });
+
+        let sandbox_node = definition.tool_runtime.sandbox_node_id.as_deref();
+        let node_ready = sandbox_node.is_none_or(|node_id| node_id == self.node.node_id.as_str());
         report.checks.push(AgentValidationCheck {
             name: "Sandbox placement".to_string(),
             passed: node_ready,
             detail: match sandbox_node {
                 None => "Uses the local runtime placement".to_string(),
-                Some(node_id) if node_ready => format!("Sandbox node `{node_id}` is available"),
-                Some(node_id) => format!("Sandbox node `{node_id}` is not in the cluster"),
+                Some(node_id) if node_ready => format!("Sandbox node `{node_id}` is local"),
+                Some(node_id) => format!(
+                    "Sandbox node `{node_id}` is remote; automatic remote sandbox routing is unavailable"
+                ),
             },
         });
 

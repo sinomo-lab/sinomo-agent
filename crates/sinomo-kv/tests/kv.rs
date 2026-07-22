@@ -7195,7 +7195,11 @@ mod tests {
             let _node =
                 DurableRaftKvNode::open(holder_node_id, holder_paths).expect("hold raft node");
             held_tx.send(()).expect("notify lock held");
-            std::thread::sleep(Duration::from_millis(100));
+            // Quorum command storage holds the node lock across network
+            // replication. Exercise a critical section longer than the former
+            // two-second admission bound so a legitimate overlapping operation
+            // does not fail spuriously as `Busy`.
+            std::thread::sleep(Duration::from_millis(2_100));
         });
         held_rx.recv().expect("wait for holder");
 
@@ -10256,6 +10260,7 @@ mod tests {
                 max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
             },
         );
+        let concurrent_operation_store = store.clone();
         let mut storage = ClusterKvRaftLocalCommandStorage::new(store, node_id.clone(), |_| false);
 
         let entry = match storage
@@ -10307,6 +10312,30 @@ mod tests {
         assert!(discarded.get("/raft-local-storage/discarded").is_none());
         assert_eq!(storage.take_last_snapshot_publish_wrote(), Some(false));
 
+        let (operation_started_tx, operation_started_rx) = std::sync::mpsc::channel();
+        let (operation_finished_tx, operation_finished_rx) = std::sync::mpsc::channel();
+        let operation_node_id = node_id.clone();
+        let concurrent_operation = std::thread::spawn(move || {
+            operation_started_tx
+                .send(())
+                .expect("notify concurrent operation started");
+            let leader = concurrent_operation_store
+                .locked_known_leader_id(&operation_node_id)
+                .expect("read leader after command session");
+            operation_finished_tx
+                .send(leader)
+                .expect("report concurrent operation result");
+        });
+        operation_started_rx
+            .recv()
+            .expect("wait for concurrent operation attempt");
+        assert!(
+            operation_finished_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the command session must retain the operation permit between phases"
+        );
+
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (opened_tx, opened_rx) = std::sync::mpsc::channel();
         let wal_paths = paths.raft_wal_paths(&node_id);
@@ -10326,11 +10355,20 @@ mod tests {
         );
         drop(storage);
         assert_eq!(
+            operation_finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("concurrent operation after command session drops"),
+            None
+        );
+        assert_eq!(
             opened_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("reopen after command session drops"),
             1
         );
+        concurrent_operation
+            .join()
+            .expect("join concurrent operation thread");
         reopen.join().expect("join reopen thread");
     }
 

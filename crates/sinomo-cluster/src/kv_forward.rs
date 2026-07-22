@@ -16,6 +16,27 @@ use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall};
 use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
 
+const FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL: &str =
+    "forwarded cluster KV transaction reached a non-leader voter";
+const FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL: &str =
+    "forwarded authoritative cluster KV read reached a non-leader voter";
+
+fn verified_cluster_non_leader_error(target_node_id: &NodeId, error: NetworkError) -> NetworkError {
+    let NetworkError::ClusterReadOnly { detail } = error else {
+        return error;
+    };
+    if detail.contains(FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL)
+        || detail.contains(FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL)
+    {
+        NetworkError::VerifiedClusterNonLeader {
+            node_id: target_node_id.clone(),
+            detail,
+        }
+    } else {
+        NetworkError::ClusterReadOnly { detail }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterKvTxnForwardOptions {
     pub timeout: Duration,
@@ -177,7 +198,9 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         match host.call_node_object_rpc(state, target, &request, timeout) {
             Ok(response) => {
-                response.error_detail()?;
+                response
+                    .error_detail()
+                    .map_err(|error| verified_cluster_non_leader_error(target, error))?;
                 let read =
                     sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
                         .map_err(kv_err)?;
@@ -212,7 +235,9 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         txn_payload.body,
     );
     let txn_response = host.call_node_object_rpc(state, target_node_id, &txn_request, timeout)?;
-    txn_response.error_detail()?;
+    txn_response
+        .error_detail()
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
     validate_forwarded_cluster_kv_txn_response(request, response)
 }
@@ -377,7 +402,10 @@ where
             .await
         {
             Ok(response) if response.body.is_empty() => {
-                response.response.error_detail()?;
+                response
+                    .response
+                    .error_detail()
+                    .map_err(|error| verified_cluster_non_leader_error(target, error))?;
                 let read = sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
                     &response.response.body,
                 )
@@ -456,7 +484,9 @@ where
         });
     }
     let txn_response = txn_response.response;
-    txn_response.error_detail()?;
+    txn_response
+        .error_detail()
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
     validate_forwarded_cluster_kv_txn_response(request, response)
 }
@@ -483,6 +513,33 @@ mod tests {
     use sinomo_kv::{KvAuthorityBasis, KvAuthorityProof, KvRevision, KvTxn, KvTxnResponse};
     use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
     use time::OffsetDateTime;
+
+    #[test]
+    fn authenticated_forwarded_non_leader_response_retains_responder_identity() {
+        let target = NodeId::from_legacy_named("verified_non_leader_target").expect("node");
+        let error = verified_cluster_non_leader_error(
+            &target,
+            NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "{FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL}; forwarded requests do not start elections"
+                ),
+            },
+        );
+
+        assert!(matches!(
+            error,
+            NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == target
+        ));
+        assert!(matches!(
+            verified_cluster_non_leader_error(
+                &target,
+                NetworkError::ClusterReadOnly {
+                    detail: "quorum is temporarily unavailable".to_string(),
+                },
+            ),
+            NetworkError::ClusterReadOnly { .. }
+        ));
+    }
 
     #[test]
     fn kv_forward_does_not_try_another_authority_after_ambiguous_delivery() {

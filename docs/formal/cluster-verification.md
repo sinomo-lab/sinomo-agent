@@ -1560,17 +1560,19 @@ primary-side namespace-request admission and the requester cancellation
 boundary:
 
 - the durable ledger key is transport requester plus request id, while the row
-  retains a digest-equivalent copy of the complete `DfsNamespaceCommand`;
+  retains the semantic operation independently of response journal options;
 - a fresh mutating request durably enters `Pending` before it receives the one
-  transient execution permit;
-- successful completion replaces that row with `Completed` and the terminal
-  result, so an exact retry returns the durable result without another
-  namespace effect, including after process restart;
-- reusing the same requester/request identity with a changed command is
+  execution permit;
+- request-owned namespace prepares atomically materialize the visible
+  transaction and `Completed` terminal result, while durable jobs and
+  cross-shard sagas refine the same boundary through resumable progress;
+- an exact retry returns the durable result without another namespace effect,
+  including after process restart;
+- reusing the same requester/request identity with a changed semantic mutation is
   rejected instead of being interpreted as new work;
-- restart after admission but before terminal result publication leaves an
-  indeterminate `Pending` row; an exact retry is rejected and never recreates
-  the execution permit;
+- restart after admission but before a prepare leaves a recoverable `Pending`
+  row; startup or maintenance recreates the execution permit for that exact
+  operation without waiting for a requester;
 - cancellation removes the requester-side wait but cannot retract an already
   admitted command; and
 - a cancelled call retried with a fresh request id is explicitly new work.
@@ -1580,9 +1582,9 @@ This maps to `NetworkedDfsService::handle_namespace_request`,
 metadata backend's namespace-request table, process restart, and fresh
 request-id allocation. Named witnesses cover exact completed replay,
 changed-payload rejection, cancellation, completed replay after restart, and
-the fail-safe interrupted-`Pending` boundary. The Rust regressions
+automatic interrupted-`Pending` recovery. The Rust regressions
 `durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse`
-and `durable_pending_namespace_request_is_not_reexecuted_after_restart` cover
+and `durable_pending_namespace_request_recovers_automatically_after_restart` cover
 the two restart-sensitive paths.
 
 The `dfs_repair_content_validation_safety.safety` invariant combines these properties:
@@ -2196,8 +2198,7 @@ This slice does not yet model:
   full-duplex session retry budgets, concrete transport nonce entropy, unbounded
   wall-clock fairness, and dynamic module enable/disable races;
 - directory fragments, local-owned owner routing, owner-inclusion replica-set
-  normalization, automated resolution of an interrupted namespace-request
-  `Pending` outcome, cross-primary repair handoff progress, router-local recovery after
+  normalization, cross-primary repair handoff progress, router-local recovery after
   sharded namespace index write failures, patch offset/base semantics,
   read-memory assembly details, distributed anti-entropy repair scheduling
   progress, wall-clock timeout fairness, concrete lock-lease clock bounds,

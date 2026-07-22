@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
+use crate::posix::locks::DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT;
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockConflict, DfsAdvisoryLockGrant, DfsAdvisoryLockMode,
     DfsAdvisoryLockOutcome, DfsAdvisoryLockRequestId, DfsAdvisoryLockSessionId,
@@ -24,8 +25,11 @@ use crate::{
 pub const DEFAULT_DFS_RENEWABLE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Overall budget shared by service-lane admission, the first command attempt,
-/// and one exact retry.
-pub const DEFAULT_DFS_RENEWABLE_LEASE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// and one exact retry. Advisory-lock transitions synchronously replicate their
+/// exact metadata prefix, so the lease wrapper must preserve the full lock RPC
+/// budget instead of imposing a shorter WAN-incompatible ceiling.
+pub const DEFAULT_DFS_RENEWABLE_LEASE_COMMAND_TIMEOUT: Duration =
+    DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT;
 
 /// Maximum wall-clock budget for all best-effort lease cleanup. Unlock and
 /// session-close share this one deadline so cleanup cannot add two independent
@@ -868,6 +872,14 @@ mod tests {
             renew_interval: Duration::from_millis(20),
             command_timeout: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn default_command_timeout_preserves_full_advisory_lock_rpc_budget() {
+        assert_eq!(
+            DfsRenewableLeaseConfig::default().command_timeout,
+            DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT
+        );
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool) {

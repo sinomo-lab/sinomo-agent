@@ -1415,6 +1415,32 @@ pub(crate) fn cli_force_local_mode() -> bool {
     CLI_FORCE_LOCAL_MODE.with(Cell::get)
 }
 
+thread_local! {
+    static CLI_DEFAULT_MAIN_DAEMON_STATUS: std::cell::RefCell<Option<DaemonStatus>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct CliDefaultMainDaemonStatusGuard {
+    previous: Option<DaemonStatus>,
+}
+
+impl Drop for CliDefaultMainDaemonStatusGuard {
+    fn drop(&mut self) {
+        CLI_DEFAULT_MAIN_DAEMON_STATUS.with(|status| {
+            status.replace(self.previous.take());
+        });
+    }
+}
+
+fn enter_cli_default_main_daemon_status(status: DaemonStatus) -> CliDefaultMainDaemonStatusGuard {
+    let previous = CLI_DEFAULT_MAIN_DAEMON_STATUS.with(|cached| cached.replace(Some(status)));
+    CliDefaultMainDaemonStatusGuard { previous }
+}
+
+pub(crate) fn cli_default_main_daemon_status() -> Option<DaemonStatus> {
+    CLI_DEFAULT_MAIN_DAEMON_STATUS.with(|status| status.borrow().clone())
+}
+
 fn enter_cli_force_local_mode(force_local: bool) -> CliLocalModeGuard {
     let previous = cli_force_local_mode();
     CLI_FORCE_LOCAL_MODE.with(|mode| mode.set(previous || force_local));
@@ -1782,7 +1808,9 @@ pub(crate) struct AgentRunOptions {
     pub agent: String,
     pub agent_explicit: bool,
     pub provider: String,
+    pub provider_explicit: bool,
     pub model: String,
+    pub model_explicit: bool,
     pub account: Option<String>,
     pub session_id: Option<SessionId>,
     pub compact_after: bool,
@@ -2188,6 +2216,8 @@ fn parse_agent_run_matches(matches: &CliCommandMatches) -> Result<AgentRunOption
             detail: "agent run requires --prompt <text>".to_string(),
         })?;
     let agent_explicit = matches.contains("--agent");
+    let provider_explicit = matches.contains("--provider");
+    let model_explicit = matches.contains("--model");
     let session_id = matches
         .value("--session")
         .map(parse_agent_session_id)
@@ -2201,10 +2231,12 @@ fn parse_agent_run_matches(matches: &CliCommandMatches) -> Result<AgentRunOption
             .value("--provider")
             .unwrap_or(CODEX_PROVIDER_ID)
             .to_string(),
+        provider_explicit,
         model: matches
             .value("--model")
             .unwrap_or(CODEX_DEFAULT_MODEL)
             .to_string(),
+        model_explicit,
         account: matches.value("--account").map(str::to_string),
         session_id,
         compact_after: matches.contains("--compact-after"),
@@ -4174,6 +4206,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     };
     let catalog = load_agent_catalog_for_cli()?;
     let definition = agent_definition_from_catalog(&catalog, &agent_name)?.clone();
+    let (provider, model) = resolve_agent_run_model_selection(&options, &definition);
     let current_root = std::env::current_dir().map_err(|source| CliError::Io {
         path: "current directory".to_string(),
         detail: source.to_string(),
@@ -4207,7 +4240,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     };
     let account = if let Some(account_name) = options.account.as_deref() {
         let config = load_model_config(&ModelPaths::new(&data_dir))?;
-        provider_account_config(&config, &options.provider, Some(account_name)).cloned()
+        provider_account_config(&config, &provider, Some(account_name)).cloned()
     } else {
         None
     };
@@ -4225,6 +4258,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         }
         Err(error) => return Err(error),
     };
+    validate_agent_local_placement(&definition, &node_id)?;
     if agent_session.sandbox_attachment.is_none() {
         agent_session
             .attach_sandbox(sinomo_agent::AgentSessionSandboxAttachment {
@@ -4264,15 +4298,19 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         context_attachments: Vec::new(),
         tool_specs: Vec::new(),
     };
-    let provider = options.provider.clone();
-    let model = options.model.clone();
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
+    let sandbox_node_id = definition
+        .tool_runtime
+        .sandbox_node_id
+        .as_deref()
+        .map(parse_agent_package_node_id)
+        .transpose()?;
     let tool_registry = agent_tool_registry_for_workspace(
         &data_dir,
         &workspace_root,
         &definition,
         Some(&session_id),
-        None,
+        sandbox_node_id,
         true,
     )?;
     let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
@@ -4471,6 +4509,69 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         eprintln!(
             "session: {session_id} (resume with `sinomo agent run --session {session_id} --prompt <text>`)"
         );
+    }
+    Ok(())
+}
+
+fn resolve_agent_run_model_selection(
+    options: &AgentRunOptions,
+    definition: &AgentDefinition,
+) -> (String, String) {
+    let provider = if options.provider_explicit {
+        options.provider.clone()
+    } else {
+        definition
+            .model_policy
+            .provider
+            .clone()
+            .unwrap_or_else(|| options.provider.clone())
+    };
+    let model = if options.model_explicit {
+        options.model.clone()
+    } else if let Some(model) = definition.model_policy.model.clone() {
+        model
+    } else if provider != options.provider {
+        sinomo_lm::PROVIDER_DEFAULT_MODEL.to_string()
+    } else {
+        options.model.clone()
+    };
+    (provider, model)
+}
+
+fn parse_agent_package_node_id(value: &str) -> Result<NodeId, CliError> {
+    NodeId::new(value.to_string())
+        .or_else(|_| NodeId::from_legacy_named(value.to_string()))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid agent package node id `{value}`: {source}"),
+        })
+}
+
+fn validate_agent_local_placement(
+    definition: &AgentDefinition,
+    local_node_id: &NodeId,
+) -> Result<(), CliError> {
+    for (field, configured) in [
+        (
+            "home server",
+            definition.placement.home_server_node_id.as_deref(),
+        ),
+        (
+            "sandbox runtime",
+            definition.tool_runtime.sandbox_node_id.as_deref(),
+        ),
+    ] {
+        let Some(configured) = configured else {
+            continue;
+        };
+        let configured_node_id = parse_agent_package_node_id(configured)?;
+        if &configured_node_id != local_node_id {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent `{}` requests {field} node `{configured_node_id}`, but this execution path is local to `{local_node_id}` and remote agent routing is unavailable",
+                    definition.key()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -5504,6 +5605,10 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
     } else {
         default_main_daemon_status()?
     };
+    // Cache only a successful probe. Daemon absence is transient (for example,
+    // while a busy local control endpoint exceeds the short preflight timeout),
+    // so downstream operations must retain the opportunity to probe again.
+    let _daemon_status_guard = daemon.clone().map(enter_cli_default_main_daemon_status);
     let local_cluster_quorum = if invocation.options.force_local || command_is_help {
         None
     } else {
@@ -5544,6 +5649,8 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
 }
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const DAEMON_LOCKED_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_LOCKED_REPROBE_INTERVAL: Duration = Duration::from_millis(50);
 // Candidate startup includes mandatory DFS recovery and native-module loading.
 // Cold, resource-constrained nodes can legitimately need more than one minute;
 // keep the controller and shadow supervisor on the same generous deadline.

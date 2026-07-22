@@ -782,6 +782,29 @@ impl AgentDefinition {
         }
     }
 
+    /// Whether this definition is backed by the user-facing chat runtime.
+    /// Background and evolution roles have dedicated execution paths and must
+    /// not be presented as ordinary chat participants.
+    pub fn supports_interactive_chat(&self) -> bool {
+        matches!(self.role, AgentRole::Main | AgentRole::Deliberation)
+    }
+
+    /// Validate that a catalog entry cannot replace one of the built-in
+    /// principals. Built-in ids also key durable recall state, so accepting a
+    /// different package under the same id would cross an identity boundary.
+    pub fn validate_catalog_identity(&self) -> Result<(), AgentDefinitionValidationError> {
+        let Some(canonical) = Self::built_in(self.key()) else {
+            return Ok(());
+        };
+        if self == &canonical {
+            Ok(())
+        } else {
+            Err(AgentDefinitionValidationError::ReservedBuiltInId {
+                id: self.key().to_string(),
+            })
+        }
+    }
+
     pub fn custom(
         name: impl Into<String>,
         role: AgentRole,
@@ -1002,6 +1025,8 @@ pub enum AgentDefinitionValidationError {
     MissingId,
     #[error("agent definition id `{id}` contains unsupported characters")]
     InvalidId { id: String },
+    #[error("agent definition id `{id}` is reserved for an immutable built-in principal")]
+    ReservedBuiltInId { id: String },
     #[error("agent definition `{id}` has an empty name")]
     MissingName { id: String },
     #[error("agent definition `{id}` has an empty system prompt")]
@@ -1024,6 +1049,10 @@ pub enum AgentDefinitionValidationError {
     InvalidSkill { id: String, skill: String },
     #[error("agent definition `{id}` references invalid context provider `{provider}`")]
     InvalidContextProvider { id: String, provider: String },
+    #[error(
+        "agent definition `{id}` declares context providers, but pluggable context providers are not supported by this runtime"
+    )]
+    UnsupportedContextProviders { id: String },
     #[error("agent definition `{id}` references invalid model preference `{value}` in `{field}`")]
     InvalidModelPreference {
         id: String,
@@ -1040,6 +1069,10 @@ pub enum AgentDefinitionValidationError {
         "agent definition `{id}` has conflicting `{field}` values in legacy fields and model_policy"
     )]
     ConflictingModelPolicyField { id: String, field: String },
+    #[error(
+        "agent definition `{id}` declares model vendor options, but package vendor options are not supported by this runtime"
+    )]
+    UnsupportedModelVendorOptions { id: String },
     #[error("agent definition `{id}` has invalid runtime limit `{field}`")]
     InvalidRuntimeLimit { id: String, field: String },
     #[error("agent definition `{id}` has invalid sandbox runtime node id `{node_id}`")]
@@ -1162,6 +1195,11 @@ impl AgentDefinitionValidator {
                 });
             }
         }
+        if !definition.context.providers.is_empty() {
+            return Err(
+                AgentDefinitionValidationError::UnsupportedContextProviders { id: id.to_string() },
+            );
+        }
         if let Some(provider) = definition.model_policy.provider.as_deref() {
             validate_model_preference(id, "provider", provider)?;
         }
@@ -1182,6 +1220,13 @@ impl AgentDefinitionValidator {
                 AgentDefinitionValidationError::ConflictingModelPolicyField {
                     id: id.to_string(),
                     field: "temperature".to_string(),
+                },
+            );
+        }
+        if !definition.model_policy.vendor_options.is_null() {
+            return Err(
+                AgentDefinitionValidationError::UnsupportedModelVendorOptions {
+                    id: id.to_string(),
                 },
             );
         }
@@ -1390,6 +1435,7 @@ impl AgentCatalog {
             definition.id = definition.name.clone();
         }
         definition.validate()?;
+        definition.validate_catalog_identity()?;
         Ok(self
             .definitions
             .insert(definition.key().to_string(), definition))
@@ -1508,6 +1554,13 @@ impl AgentDefinitionStore for AgentDefinitionSifsStore {
             definition.id = definition.name.clone();
         }
         definition.validate()?;
+        if AgentDefinition::built_in(definition.key()).is_some() {
+            return Err(AgentDefinitionStoreError::Validation(
+                AgentDefinitionValidationError::ReservedBuiltInId {
+                    id: definition.key().to_string(),
+                },
+            ));
+        }
         self.validate_definition_id(definition.key())?;
         self.objects
             .save(definition.key(), &definition)
@@ -1515,6 +1568,11 @@ impl AgentDefinitionStore for AgentDefinitionSifsStore {
     }
 
     fn delete_definition(&self, id: &str) -> Result<bool, AgentDefinitionStoreError> {
+        if AgentDefinition::built_in(id).is_some() {
+            return Err(AgentDefinitionStoreError::Validation(
+                AgentDefinitionValidationError::ReservedBuiltInId { id: id.to_string() },
+            ));
+        }
         self.validate_definition_id(id)?;
         self.objects.delete(id).map_err(agent_definition_vfs_error)
     }
@@ -2919,6 +2977,54 @@ mod tests {
     }
 
     #[test]
+    fn built_in_ids_are_reserved_catalog_principals() {
+        let mut catalog = AgentCatalog::built_ins();
+        let forged = AgentDefinition::custom("main-agent", AgentRole::Main, "Steal recall.");
+
+        let error = catalog.upsert(forged).expect_err("reserved id must fail");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::ReservedBuiltInId { ref id }
+                if id == "main-agent"
+        ));
+        assert_eq!(catalog.get("main-agent"), Some(&AgentDefinition::main()));
+    }
+
+    #[test]
+    fn persistent_store_rejects_reserved_built_in_ids() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-reserved-definition-store");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let store = AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open store");
+
+        let save_error = store
+            .save_definition(&AgentDefinition::main())
+            .expect_err("built-ins must not be persisted");
+        assert!(matches!(
+            save_error,
+            AgentDefinitionStoreError::Validation(
+                AgentDefinitionValidationError::ReservedBuiltInId { .. }
+            )
+        ));
+        let delete_error = store
+            .delete_definition("main-agent")
+            .expect_err("built-ins must not be deleted");
+        assert!(matches!(
+            delete_error,
+            AgentDefinitionStoreError::Validation(
+                AgentDefinitionValidationError::ReservedBuiltInId { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn only_main_and_deliberation_roles_support_interactive_chat() {
+        assert!(AgentDefinition::main().supports_interactive_chat());
+        assert!(AgentDefinition::coding().supports_interactive_chat());
+        assert!(!AgentDefinition::background().supports_interactive_chat());
+        assert!(!AgentDefinition::evolution().supports_interactive_chat());
+    }
+
+    #[test]
     fn built_in_agents_leave_temperature_to_the_model_default() {
         for definition in [
             AgentDefinition::main(),
@@ -3099,6 +3205,23 @@ mod tests {
         assert!(matches!(
             error,
             AgentDefinitionValidationError::InvalidHomeServerNodeId { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_definition_rejects_declared_policy_fields_without_runtime_enforcement() {
+        let mut context = AgentDefinition::custom("context-agent", AgentRole::Main, "Be helpful.");
+        context.context.providers = vec!["context.provider.valid".to_string()];
+        assert!(matches!(
+            context.validate(),
+            Err(AgentDefinitionValidationError::UnsupportedContextProviders { .. })
+        ));
+
+        let mut vendor = AgentDefinition::custom("vendor-agent", AgentRole::Main, "Be helpful.");
+        vendor.model_policy.vendor_options = serde_json::json!({"reasoning": "high"});
+        assert!(matches!(
+            vendor.validate(),
+            Err(AgentDefinitionValidationError::UnsupportedModelVendorOptions { .. })
         ));
     }
 

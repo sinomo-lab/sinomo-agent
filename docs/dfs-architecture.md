@@ -473,6 +473,20 @@ own change.
 Operations contained within one authority are atomic. Recursive work is split
 into bounded durable jobs that resume after restart.
 
+Every mutating routed request is first recorded on its exact authority shard
+under the authenticated requester and request id. The record retains the
+semantic operation, a stable operation id, and recovery diagnostics; response
+journal options are not part of mutation identity. A request-owned hidden
+prepare carries the canonical terminal result, so committing a transaction
+materializes both the visible namespace change and `Completed` request record
+in one table batch. If a crash occurs before any prepare is durable, startup or
+reactive maintenance resumes the stored operation. Prepared transactions,
+cross-shard handoffs, and bounded namespace jobs use their existing durable
+recovery paths. Consequently `Pending` is an internal, automatically retried
+state rather than an operator reconciliation boundary. Exact retries either
+join that recovery or replay the durable terminal result without another
+namespace effect.
+
 Retained namespace-prepare history requires transaction identity to bind the
 immutable mutation generation, not only the operation kind and stable
 object/path. A directory recreated from a selected tombstone may deliberately

@@ -1115,6 +1115,7 @@ pub(crate) fn metadata_namespace_prepare_payload_digest(
         &prepare.expected_object_versions,
         &prepare.expected_path_occupants,
         &prepare.transaction,
+        &prepare.completed_request,
     ))
 }
 
@@ -1873,6 +1874,7 @@ mod authority_probe_tests {
                 advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::now_utc(),
             },
+            completed_request: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =

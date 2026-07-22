@@ -32,7 +32,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn posix_set_mode_local(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
         self.posix_update_metadata_target(path, true, |target| {
-            target.mode = mode & 0o7777;
+            let mode = mode & 0o7777;
+            if target.mode == mode {
+                return false;
+            }
+            target.mode = mode;
             true
         })
     }
@@ -76,6 +80,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         gid: u32,
     ) -> Result<DfsStat> {
         self.posix_update_metadata_target(path, true, |target| {
+            if target.uid == uid && target.gid == gid {
+                return false;
+            }
             target.uid = uid;
             target.gid = gid;
             true
@@ -89,6 +96,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         gid: u32,
     ) -> Result<DfsStat> {
         self.posix_update_metadata_target(path, false, |target| {
+            if target.uid == uid && target.gid == gid {
+                return false;
+            }
             target.uid = uid;
             target.gid = gid;
             true
@@ -171,11 +181,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         self.posix_update_metadata_target(path, follow_final, |target| {
             let mut changed = false;
-            if let Some(accessed_at_unix_nanos) = accessed_at_unix_nanos {
+            if let Some(accessed_at_unix_nanos) = accessed_at_unix_nanos
+                && target.accessed_at_unix_nanos != accessed_at_unix_nanos
+            {
                 target.accessed_at_unix_nanos = accessed_at_unix_nanos;
                 changed = true;
             }
-            if let Some(modified_at_unix_nanos) = modified_at_unix_nanos {
+            if let Some(modified_at_unix_nanos) = modified_at_unix_nanos
+                && target.modified_at_unix_nanos != modified_at_unix_nanos
+            {
                 target.modified_at_unix_nanos = modified_at_unix_nanos;
                 changed = true;
             }

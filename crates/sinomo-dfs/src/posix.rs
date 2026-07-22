@@ -136,6 +136,28 @@ fn select_posix_write_replica_candidates(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn with_posix_commit_operation_deadline<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let requested_deadline = Instant::now() + POSIX_WAIT_FOR_COMMIT_TIMEOUT;
+        let observed_previous_deadline = self.transport.operation_deadline();
+        let replaced_previous_deadline = self
+            .transport
+            .set_operation_deadline(Some(requested_deadline));
+        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
+        let effective_deadline = previous_deadline
+            .map(|deadline| deadline.min(requested_deadline))
+            .unwrap_or(requested_deadline);
+        if effective_deadline != requested_deadline {
+            self.transport
+                .set_operation_deadline(Some(effective_deadline));
+        }
+        let result = operation(self);
+        self.transport.set_operation_deadline(previous_deadline);
+        result
+    }
+
     fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,
@@ -167,12 +189,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
-                // With a caller deadline the write is already committed: leave
-                // best-effort repair to maintenance instead of extending the
-                // foreground operation with local recovery scans. Unbudgeted
-                // legacy callers preserve their eager-repair behavior.
-                if foreground_replica_repair && caller_deadline.is_none() {
-                    let (_, repair_events) = self.retry_pending_repairs_best_effort();
+                // Preserve the foreground repair pass after commit, but keep it
+                // bounded when the caller (or the POSIX wrapper) installed an
+                // operation deadline. This retains repair-failure evidence
+                // without allowing recovery scans to outlive the write budget.
+                if foreground_replica_repair && Instant::now() < settle_deadline {
+                    let (_, repair_events) = if caller_deadline.is_some() {
+                        self.retry_pending_repairs_best_effort_bounded(
+                            POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS,
+                        )
+                    } else {
+                        self.retry_pending_repairs_best_effort()
+                    };
                     if !repair_events.is_empty() {
                         events.extend(repair_events);
                         self.last_events = events;
@@ -579,6 +607,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_mkdir_all_with_current_deadline(path)
+        })
+    }
+
+    fn posix_mkdir_all_with_current_deadline(&mut self, path: &str) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
@@ -606,6 +640,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir_all_without_local_replay(&mut self, path: &str) -> Result<()> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_mkdir_all_without_local_replay_with_current_deadline(path)
+        })
+    }
+
+    fn posix_mkdir_all_without_local_replay_with_current_deadline(
+        &mut self,
+        path: &str,
+    ) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
@@ -1628,41 +1671,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final_for_exclusive_create: bool,
     ) -> Result<DfsStat> {
         let started_at = Instant::now();
-        let retry_deadline = self
+        let requested_deadline = started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT;
+        let observed_previous_deadline = self.transport.operation_deadline();
+        let replaced_previous_deadline = self
             .transport
-            .operation_deadline()
-            .map(|deadline| deadline.min(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT))
-            .unwrap_or(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT);
-        loop {
-            match self.posix_write_file_bytes_checked_parent_once(
-                path,
-                bytes,
-                options.clone(),
-                check_parent,
-                touch_parent_on_create,
-                replay_response_journal,
-                create_attrs,
-                exclusive_create,
-                follow_final_for_exclusive_create,
-                None,
-                true,
-            ) {
-                Ok(stat) => return Ok(stat),
-                Err(error) if posix_error_is_retryable_write_serialization(&error) => {
-                    self.check_cancelled("POSIX blind-write serialization retry")?;
-                    let now = Instant::now();
-                    if now >= retry_deadline {
-                        return Err(error);
-                    }
-                    std::thread::sleep(
-                        POSIX_WRITE_SERIALIZATION_RETRY_IDLE_SLEEP
-                            .min(retry_deadline.saturating_duration_since(now)),
-                    );
-                    self.hydrate_from_metadata_backend()?;
-                }
-                Err(error) => return Err(error),
-            }
+            .set_operation_deadline(Some(requested_deadline));
+        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
+        let write_deadline = previous_deadline
+            .map(|deadline| deadline.min(requested_deadline))
+            .unwrap_or(requested_deadline);
+        if write_deadline != requested_deadline {
+            self.transport.set_operation_deadline(Some(write_deadline));
         }
+        let result = (|| {
+            loop {
+                match self.posix_write_file_bytes_checked_parent_once(
+                    path,
+                    bytes,
+                    options.clone(),
+                    check_parent,
+                    touch_parent_on_create,
+                    replay_response_journal,
+                    create_attrs,
+                    exclusive_create,
+                    follow_final_for_exclusive_create,
+                    None,
+                    true,
+                ) {
+                    Ok(stat) => return Ok(stat),
+                    Err(error) if posix_error_is_retryable_write_serialization(&error) => {
+                        self.check_cancelled("POSIX blind-write serialization retry")?;
+                        let now = Instant::now();
+                        if now >= write_deadline {
+                            return Err(error);
+                        }
+                        std::thread::sleep(
+                            POSIX_WRITE_SERIALIZATION_RETRY_IDLE_SLEEP
+                                .min(write_deadline.saturating_duration_since(now)),
+                        );
+                        self.hydrate_from_metadata_backend()?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })();
+        self.transport.set_operation_deadline(previous_deadline);
+        result
     }
 
     fn posix_write_file_bytes_checked_parent_once(

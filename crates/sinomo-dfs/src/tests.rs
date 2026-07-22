@@ -1311,7 +1311,8 @@ impl DfsTransportIdentity for DroppingSendTransport {
 
 struct DeadlineDroppingSendTransport {
     local_node_id: NodeId,
-    operation_deadline: Instant,
+    operation_deadline: Option<Instant>,
+    observed_deadline_sets: Arc<Mutex<Vec<Option<Instant>>>>,
 }
 
 impl DfsTransportIdentity for DeadlineDroppingSendTransport {
@@ -1337,8 +1338,16 @@ impl DfsMessageTransport for DeadlineDroppingSendTransport {
         Ok(Some(0))
     }
 
+    fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+        self.observed_deadline_sets
+            .lock()
+            .expect("deadline sets")
+            .push(deadline);
+        std::mem::replace(&mut self.operation_deadline, deadline)
+    }
+
     fn operation_deadline(&self) -> Option<Instant> {
-        Some(self.operation_deadline)
+        self.operation_deadline
     }
 }
 
@@ -3941,9 +3950,11 @@ fn posix_wait_for_commit_uses_transport_operation_deadline() {
     let local = NodeId::from_legacy_named("node_posix_wait_deadline_local").expect("local");
     let remote = NodeId::from_legacy_named("node_posix_wait_deadline_remote").expect("remote");
     let operation_deadline = Instant::now() + Duration::from_millis(30);
+    let observed_deadline_sets = Arc::new(Mutex::new(Vec::new()));
     let transport = DeadlineDroppingSendTransport {
         local_node_id: local.clone(),
-        operation_deadline,
+        operation_deadline: Some(operation_deadline),
+        observed_deadline_sets: Arc::clone(&observed_deadline_sets),
     };
     let content = LocalContentStore::new(root.join("content")).expect("content store");
     let mut dfs = NetworkedDfsService::new(transport, content);
@@ -3972,6 +3983,117 @@ fn posix_wait_for_commit_uses_transport_operation_deadline() {
         started_at.elapsed() < Duration::from_millis(500),
         "the caller deadline must bound the 45-second POSIX settle loop"
     );
+    assert_eq!(
+        dfs.transport.operation_deadline,
+        Some(operation_deadline),
+        "the caller's earlier deadline must be restored after the write"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_write_installs_and_restores_its_commit_deadline() {
+    let root = temp_root("posix-write-installs-deadline");
+    let local = NodeId::from_legacy_named("node_posix_write_deadline_local").expect("local");
+    let observed_deadline_sets = Arc::new(Mutex::new(Vec::new()));
+    let transport = DeadlineDroppingSendTransport {
+        local_node_id: local.clone(),
+        operation_deadline: None,
+        observed_deadline_sets: Arc::clone(&observed_deadline_sets),
+    };
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(transport, content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services").expect("services dir");
+    observed_deadline_sets
+        .lock()
+        .expect("deadline sets")
+        .clear();
+
+    let started_at = Instant::now();
+    dfs.posix_write_file(
+        "/services/deadline.txt",
+        b"bounded bytes",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            replica_candidates: vec![local],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    )
+    .expect("local bounded write");
+
+    let observed = observed_deadline_sets.lock().expect("deadline sets");
+    assert_eq!(observed.len(), 2, "install then restore the write deadline");
+    let installed = observed[0].expect("installed write deadline");
+    assert!(installed > started_at + Duration::from_secs(40));
+    assert!(installed <= started_at + Duration::from_secs(46));
+    assert_eq!(observed[1], None, "restore the unbounded caller state");
+    assert_eq!(dfs.transport.operation_deadline, None);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_sandbox_create_namespace_mutations_install_and_restore_commit_deadlines() {
+    let root = temp_root("posix-sandbox-create-mutation-deadlines");
+    let local = NodeId::from_legacy_named("node_posix_sandbox_deadline_local").expect("local");
+    let observed_deadline_sets = Arc::new(Mutex::new(Vec::new()));
+    let transport = DeadlineDroppingSendTransport {
+        local_node_id: local.clone(),
+        operation_deadline: None,
+        observed_deadline_sets: Arc::clone(&observed_deadline_sets),
+    };
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(transport, content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    observed_deadline_sets
+        .lock()
+        .expect("deadline sets")
+        .clear();
+
+    let started_at = Instant::now();
+    dfs.posix_mkdir_all("/services/sandbox/instances")
+        .expect("sandbox directory chain");
+    dfs.posix_symlink(
+        "/services/sandbox/generation",
+        "/services/sandbox/instances/swap",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            replica_candidates: vec![local],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    )
+    .expect("sandbox generation link");
+    dfs.posix_rename_single_namespace_atomic(
+        "/services/sandbox/instances/swap",
+        "/services/sandbox/instances/stable",
+    )
+    .expect("publish stable generation link");
+
+    let observed = observed_deadline_sets.lock().expect("deadline sets");
+    assert!(
+        observed.len() >= 6,
+        "the three mutations must each install then restore a deadline: {observed:?}"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|deadline| deadline.is_none())
+            .count(),
+        3,
+        "each top-level mutation restores the unbounded caller state"
+    );
+    assert!(
+        observed
+            .iter()
+            .flatten()
+            .filter(|deadline| **deadline > started_at + Duration::from_secs(40))
+            .count()
+            >= 3,
+        "each top-level mutation installs the 45-second commit budget"
+    );
+    assert_eq!(dfs.transport.operation_deadline, None);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -10423,6 +10545,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         }],
         content_receipts: Vec::new(),
         transaction,
+        completed_request: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -10618,6 +10741,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::now_utc(),
         },
+        completed_request: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -11034,6 +11158,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         },
+        completed_request: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -36504,8 +36629,14 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
     )
     .expect("attach restarted services metadata");
 
+    let mut replay_command = command;
+    replay_command.include_metadata_journal_batches = false;
+    replay_command.metadata_journal_after_sequences = vec![DfsNamespaceShardCursor {
+        shard_id: DfsMetadataShardId::new("services"),
+        after_sequence: u64::MAX,
+    }];
     let replay = services_primary
-        .handle_namespace_request(replica_node.clone(), command)
+        .handle_namespace_request(replica_node.clone(), replay_command)
         .expect("replay identical rename");
     assert!(matches!(
         replay,
@@ -36563,7 +36694,7 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
 }
 
 #[test]
-fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
+fn durable_pending_namespace_request_recovers_automatically_after_restart() {
     let cluster = sifs_two_primary_cluster("sifs-namespace-pending-restart");
     let SifsTwoPrimaryCluster {
         root,
@@ -36598,16 +36729,26 @@ fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
             to: destination.to_string(),
         },
     };
-    let encoded = serde_json::to_vec(&command).expect("encode command digest");
+    let encoded = serde_json::to_vec(&(
+        &command.file_system_id,
+        &command.requesting_node_id,
+        &command.operation,
+    ))
+    .expect("encode command digest");
     let now = OffsetDateTime::now_utc();
     let pending = DfsNamespaceRequestRecord {
         file_system_id: command.file_system_id.clone(),
         requester_node_id: replica_node.clone(),
         request_id: command.request_id.clone(),
+        operation_id: "req-pending-restart".to_string(),
+        authority_shard_id: DfsMetadataShardId::new("services"),
+        operation: command.operation.clone(),
         command_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
         status: DfsNamespaceRequestStatus::Pending,
         result: None,
         posix_coordination_result: None,
+        recovery_attempts: 0,
+        last_recovery_error: None,
         created_at: now,
         updated_at: now,
     };
@@ -36642,21 +36783,31 @@ fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
     )
     .expect("attach restarted services metadata");
 
+    assert!(matches!(
+        services_primary.posix_stat(source),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(services_primary.posix_stat(destination).is_ok());
+    let recovered = services_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&replica_node, &command.request_id)
+        .expect("recovered request")
+        .expect("durable request");
+    assert_eq!(recovered.status, DfsNamespaceRequestStatus::Completed);
+    assert_eq!(recovered.result, Some(DfsNamespaceResult::Applied));
+
     let event = services_primary
         .handle_namespace_request(replica_node, command)
-        .expect("serve interrupted request retry");
+        .expect("replay automatically recovered request");
     assert!(matches!(
         event,
         NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            result: DfsNamespaceResult::Rejected { ref reason, .. },
+            result: DfsNamespaceResult::Applied,
             mutates_metadata: false,
             ..
-        } if reason.contains("indeterminate durable outcome")
-    ));
-    assert!(services_primary.posix_stat(source).is_ok());
-    assert!(matches!(
-        services_primary.posix_stat(destination),
-        Err(DfsPosixError::NotFound { .. })
+        }
     ));
 
     drop(replica);

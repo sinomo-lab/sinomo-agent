@@ -1158,7 +1158,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &transaction,
                 )?;
             trace_expectations_ms = expectations_started.elapsed().as_millis();
-            let operation_id = if transaction.transaction_id.is_empty() {
+            let completed_request = self.durable_namespace_request_completion_for_transaction(
+                &transaction,
+                &prepare_shard_id,
+            );
+            let operation_id = if let Some(request) = &completed_request {
+                format!(
+                    "namespace-request:{}:{}",
+                    request.operation_id, transaction.transaction_id
+                )
+            } else if transaction.transaction_id.is_empty() {
                 format!("namespace:{}", sinomo_core::Id::generate())
             } else {
                 format!("namespace:{}", transaction.transaction_id)
@@ -1173,6 +1182,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 expected_path_occupants,
                 content_receipts,
                 transaction: transaction.clone(),
+                completed_request,
                 status: DfsNamespacePrepareStatus::Prepared,
             };
             prepare.operation_digest =

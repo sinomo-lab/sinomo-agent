@@ -13,10 +13,10 @@ use crate::{
     DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
     DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
     DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataStore, DfsNamespaceResult, DfsObjectId, DfsObjectMetadata, DfsOutboundAttachment,
-    DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
-    DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator, DistributedRepairJob,
-    LocalContentStore, ObjectVersionReader,
+    DfsMetadataStore, DfsNamespaceRequestRecord, DfsNamespaceResult, DfsObjectId,
+    DfsObjectMetadata, DfsOutboundAttachment, DfsPosixCoordinationResult, DfsReadData,
+    DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord, DfsVersion,
+    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
 };
 
 pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -139,6 +139,10 @@ pub struct NetworkedDfsService<T> {
     pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
     pub(crate) deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
+    /// Routed request whose exact transaction is currently being planned.
+    /// `apply_namespace_transaction_with_selected_shard` uses this context to
+    /// place the terminal request result in the same durable prepare commit.
+    pub(crate) active_durable_namespace_request: Option<DfsNamespaceRequestRecord>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,

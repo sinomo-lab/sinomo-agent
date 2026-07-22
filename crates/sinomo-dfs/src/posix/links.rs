@@ -42,6 +42,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_symlink_with_create_attrs_with_current_deadline(
+                target, link_path, options, attrs,
+            )
+        })
+    }
+
+    fn posix_symlink_with_create_attrs_with_current_deadline(
+        &mut self,
+        target: &str,
+        link_path: &str,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<DfsStat> {
         validate_posix_symlink_target(target)?;
         let (link_path, requires_directory) =
             normalize_posix_path_with_trailing_directory(link_path)?;
