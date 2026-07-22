@@ -103,6 +103,8 @@ use sinomo_runtime::{
 };
 
 use crate::backend::Backend;
+#[cfg(not(test))]
+use crate::backend::chat_engine::ChatRealtimeHandoff;
 use crate::backend::chat_engine::{
     ChatCommand, ChatEvent, ChatEventWake, ChatHandle, ChatRole, RuntimeInfo,
 };
@@ -710,6 +712,13 @@ impl StableRealtimeTextAccumulator {
                 self.push_transcript_text(delta);
                 None
             }
+            sinomo_lm::RealtimeAudioEvent::OutputTranscriptDone { transcript, .. } => {
+                if !transcript.trim().is_empty() {
+                    self.ensure_identity();
+                    self.transcript_text = transcript.clone();
+                }
+                None
+            }
             sinomo_lm::RealtimeAudioEvent::ResponseDone => self.flush(true),
             sinomo_lm::RealtimeAudioEvent::Closed { .. }
             | sinomo_lm::RealtimeAudioEvent::Error { .. } => self.flush(true),
@@ -718,6 +727,8 @@ impl StableRealtimeTextAccumulator {
                 self.last_end_of_turn_text = None;
                 None
             }
+            sinomo_lm::RealtimeAudioEvent::InputTranscriptDelta { .. }
+            | sinomo_lm::RealtimeAudioEvent::InputTranscriptDone { .. } => None,
             _ => None,
         }
     }
@@ -808,6 +819,10 @@ fn stable_realtime_text_continuation(previous: &str, current: &str) -> Option<St
 
 const STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE: &str =
     "stable chat history unavailable; media call continues";
+#[cfg(not(test))]
+const REALTIME_BACKGROUND_AGENT_TOOL_NAME: &str = "background_agent";
+#[cfg(not(test))]
+const REALTIME_BACKGROUND_AGENT_TOOL_DESCRIPTION: &str = "Send a user request to Sinomo's regular agent runtime. Use this for work that benefits from the full chat agent, including coding, file operations, research, or longer-running tasks. Pass the user's request without paraphrasing it; the final result is returned to this voice session.";
 
 type StableRealtimeTurnWriter = Box<dyn FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send>;
 
@@ -1049,6 +1064,48 @@ impl ChatRealtimeSessionRuntime {
         Ok(())
     }
 
+    fn dispatch_handoff(
+        &self,
+        handoff: ChatRealtimeHandoff,
+        call_id: String,
+        input: Result<String, String>,
+    ) -> Result<(), String> {
+        if call_id.trim().is_empty() {
+            return Err("realtime handoff is missing its provider call id".to_string());
+        }
+        let result_tx = self.tool_result_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = input.and_then(|input| handoff.run(input));
+            let (output, summary) = match result {
+                Ok(answer) => (
+                    serde_json::json!({
+                        "status": "completed",
+                        "summary": "regular agent handoff completed",
+                        "output": { "answer": answer },
+                    })
+                    .to_string(),
+                    "regular agent handoff completed".to_string(),
+                ),
+                Err(detail) => (
+                    serde_json::json!({
+                        "status": "failed",
+                        "summary": "regular agent handoff failed",
+                        "output": { "error": "agent_handoff_failed", "detail": detail },
+                    })
+                    .to_string(),
+                    "regular agent handoff failed".to_string(),
+                ),
+            };
+            let _ = result_tx.blocking_send(ChatRealtimeToolResult {
+                call_id,
+                tool: REALTIME_BACKGROUND_AGENT_TOOL_NAME.to_string(),
+                output,
+                summary,
+            });
+        });
+        Ok(())
+    }
+
     fn cancel_tools(&self) {
         if let Ok(cancellations) = self.tool_cancellations.lock() {
             for cancellation in cancellations.values() {
@@ -1086,26 +1143,44 @@ impl Drop for ChatRealtimeSessionRuntime {
 
 #[cfg(not(test))]
 fn realtime_audio_tool_definitions(
-    context: &AgentChatToolContext,
+    context: Option<&AgentChatToolContext>,
 ) -> Vec<sinomo_lm::RealtimeAudioToolDefinition> {
-    context
-        .descriptors()
-        .iter()
-        .map(|descriptor| {
-            let parameters = if descriptor.input_schema.is_object() {
-                descriptor.input_schema.clone()
-            } else {
-                serde_json::json!({ "type": "object", "properties": {} })
-            };
-            let mut tool = sinomo_lm::RealtimeAudioToolDefinition::new(
-                descriptor.spec.name.clone(),
-                parameters,
-            );
-            if !descriptor.spec.description.trim().is_empty() {
-                tool.description = Some(descriptor.spec.description.clone());
-            }
-            tool
-        })
+    let mut background = sinomo_lm::RealtimeAudioToolDefinition::new(
+        REALTIME_BACKGROUND_AGENT_TOOL_NAME,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The user's request to delegate to the regular agent."
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }),
+    );
+    background.description = Some(REALTIME_BACKGROUND_AGENT_TOOL_DESCRIPTION.to_string());
+    std::iter::once(background)
+        .chain(
+            context
+                .into_iter()
+                .flat_map(AgentChatToolContext::descriptors)
+                .map(|descriptor| {
+                    let parameters = if descriptor.input_schema.is_object() {
+                        descriptor.input_schema.clone()
+                    } else {
+                        serde_json::json!({ "type": "object", "properties": {} })
+                    };
+                    let mut tool = sinomo_lm::RealtimeAudioToolDefinition::new(
+                        descriptor.spec.name.clone(),
+                        parameters,
+                    );
+                    if !descriptor.spec.description.trim().is_empty() {
+                        tool.description = Some(descriptor.spec.description.clone());
+                    }
+                    tool
+                }),
+        )
         .collect()
 }
 
@@ -1136,6 +1211,37 @@ fn realtime_agent_tool_call(
         r#async: false,
         summary: format!("realtime model called `{name}`"),
     })
+}
+
+fn realtime_background_agent_prompt(
+    arguments: &str,
+    transcript: &[sinomo_lm::RealtimeAudioTranscriptEntry],
+) -> Result<String, String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments)
+        .map_err(|error| format!("background-agent arguments are not valid JSON: {error}"))?;
+    let request = ["prompt", "input_transcript", "input", "text", "query"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|request| !request.is_empty())
+        .ok_or_else(|| "background-agent handoff is missing the user request".to_string())?;
+    let mut prompt = String::from("Voice handoff to the regular Sinomo agent.\n\n");
+    if !transcript.is_empty() {
+        prompt.push_str("Conversation since the previous handoff:\n");
+        for entry in transcript {
+            let text = entry.text.trim();
+            if !text.is_empty() {
+                prompt.push_str(entry.role.as_str());
+                prompt.push_str(": ");
+                prompt.push_str(text);
+                prompt.push('\n');
+            }
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("Requested work:\n");
+    prompt.push_str(request);
+    Ok(prompt)
 }
 
 fn chat_media_requested_input_available(
@@ -4806,6 +4912,17 @@ impl ChatState {
             self.push_activity("media call", detail, ActivityTone::Warn);
             return;
         }
+        let supports_realtime = self.current_provider().is_some_and(|provider| {
+            provider.capabilities.realtime_websocket || provider.capabilities.realtime_webrtc
+        });
+        if !supports_realtime {
+            let detail = format!("{provider} does not advertise a realtime voice transport");
+            self.media_call_details_open = true;
+            self.media_call.notice = Some(detail.clone());
+            self.notice = Some(detail.clone());
+            self.push_activity("media call", detail, ActivityTone::Warn);
+            return;
+        }
 
         let setup_shutdown = self.media_setup.begin_shutdown();
         let (started, native_notice) =
@@ -4908,6 +5025,7 @@ impl ChatState {
             };
             let sifs_daemon = self.sifs_daemon.clone();
             let tool_context = self.handle.tool_context();
+            let realtime_handoff = self.handle.realtime_handoff(channel_id_text.clone());
             let (event_tx, event_rx) = mpsc::channel();
             let (control_tx, control_rx) = mpsc::channel();
             let snapshots = Arc::new(Mutex::new(ChatMediaSnapshots::default()));
@@ -4939,6 +5057,7 @@ impl ChatState {
                         camera_surface,
                         stable_chat,
                         tool_context,
+                        realtime_handoff,
                         sifs_daemon,
                         worker_waker,
                     );
@@ -7927,6 +8046,7 @@ fn run_chat_media_call_worker(
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
     stable_chat: StableRealtimeChatTarget,
     tool_context: Option<AgentChatToolContext>,
+    realtime_handoff: ChatRealtimeHandoff,
     sifs_daemon: Option<SifsDaemonAccess>,
     waker: Option<sui::UiHandle>,
 ) {
@@ -7987,6 +8107,7 @@ fn run_chat_media_call_worker(
             camera_requested,
             camera_surface,
             tool_context,
+            realtime_handoff,
             stable_projection,
             waker.clone(),
         ))
@@ -8293,6 +8414,7 @@ async fn run_chat_media_call_async(
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
     tool_context: Option<AgentChatToolContext>,
+    realtime_handoff: ChatRealtimeHandoff,
     mut stable_projection: StableRealtimeChatProjection,
     waker: Option<sui::UiHandle>,
 ) -> Result<(), String> {
@@ -8303,10 +8425,14 @@ async fn run_chat_media_call_async(
     } = start_config;
     let provider = sinomo_lm::RealtimeAudioProvider::from_id(&provider_id)
         .ok_or_else(|| format!("unsupported realtime provider `{provider_id}`"))?;
-    let model = if model.trim().is_empty() {
-        provider.default_model().to_string()
-    } else {
-        model
+    let model = match provider {
+        sinomo_lm::RealtimeAudioProvider::OpenAi
+            if !model.to_ascii_lowercase().contains("realtime") =>
+        {
+            provider.default_model().to_string()
+        }
+        _ if model.trim().is_empty() => provider.default_model().to_string(),
+        _ => model,
     };
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
@@ -8316,8 +8442,8 @@ async fn run_chat_media_call_async(
     } else {
         None
     };
-    if let Some(context) = tool_context.as_ref() {
-        config.tools = realtime_audio_tool_definitions(context);
+    if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
+        config.tools = realtime_audio_tool_definitions(tool_context.as_ref());
         if !config.tools.is_empty() {
             config.tool_choice = Some("auto".to_string());
         }
@@ -8578,6 +8704,7 @@ async fn run_chat_media_call_async(
     let mut realtime_session = ChatRealtimeSessionRuntime::spawn(session);
     let mut audio_backpressure_notice_shown = false;
     let mut camera_frame_failures = 0_u8;
+    let mut realtime_transcript = sinomo_lm::RealtimeAudioTranscript::default();
 
     loop {
         let controls =
@@ -8755,20 +8882,29 @@ async fn run_chat_media_call_async(
             progressed = true;
             match event {
                 ChatRealtimeSessionEvent::Realtime(event) => {
+                    realtime_transcript.observe(&event);
                     if let sinomo_lm::RealtimeAudioEvent::ToolCallCompleted {
                         call_id,
                         name,
                         arguments,
                         ..
                     } = &event
-                        && let Some(context) = tool_context.as_ref()
                     {
-                        realtime_session.dispatch_tool_call(
-                            context.clone(),
-                            call_id.clone(),
-                            name.clone(),
-                            arguments.clone(),
-                        )?;
+                        if name == REALTIME_BACKGROUND_AGENT_TOOL_NAME {
+                            let tail = realtime_transcript.take_handoff_tail();
+                            realtime_session.dispatch_handoff(
+                                realtime_handoff.clone(),
+                                call_id.clone(),
+                                realtime_background_agent_prompt(arguments, &tail),
+                            )?;
+                        } else if let Some(context) = tool_context.as_ref() {
+                            realtime_session.dispatch_tool_call(
+                                context.clone(),
+                                call_id.clone(),
+                                name.clone(),
+                                arguments.clone(),
+                            )?;
+                        }
                     }
                     let handled = handle_chat_media_realtime_event(
                         event,
@@ -9172,6 +9308,24 @@ fn handle_chat_media_realtime_event(
         sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta, .. } => {
             if !delta.trim().is_empty() {
                 publish_chat_media_notice(snapshots, waker, delta.clone());
+            }
+            Ok(false)
+        }
+        sinomo_lm::RealtimeAudioEvent::InputTranscriptDelta { delta, .. } => {
+            if !delta.trim().is_empty() {
+                publish_chat_media_notice(snapshots, waker, format!("heard: {delta}"));
+            }
+            Ok(false)
+        }
+        sinomo_lm::RealtimeAudioEvent::InputTranscriptDone { transcript, .. } => {
+            if !transcript.trim().is_empty() {
+                publish_chat_media_notice(snapshots, waker, format!("heard: {transcript}"));
+            }
+            Ok(false)
+        }
+        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDone { transcript, .. } => {
+            if !transcript.trim().is_empty() {
+                publish_chat_media_notice(snapshots, waker, transcript.clone());
             }
             Ok(false)
         }
@@ -18137,6 +18291,7 @@ mod tests {
                 account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
                 name: "OpenAI".to_string(),
                 models: vec!["gpt-5".to_string()],
+                capabilities: sinomo_lm::provider_capabilities("openai"),
             });
         }
         state.models_loading = false;
@@ -24097,6 +24252,31 @@ mod tests {
     }
 
     #[test]
+    fn realtime_background_handoff_preserves_role_bearing_tail_and_user_request() {
+        let prompt = realtime_background_agent_prompt(
+            r#"{"prompt":"Please update the parser and run its tests."}"#,
+            &[
+                sinomo_lm::RealtimeAudioTranscriptEntry {
+                    role: sinomo_lm::RealtimeAudioTranscriptRole::User,
+                    text: "Can you inspect the parser?".to_string(),
+                    item_id: Some("user-1".to_string()),
+                },
+                sinomo_lm::RealtimeAudioTranscriptEntry {
+                    role: sinomo_lm::RealtimeAudioTranscriptRole::Assistant,
+                    text: "I found one issue.".to_string(),
+                    item_id: Some("assistant-1".to_string()),
+                },
+            ],
+        )
+        .expect("handoff prompt");
+
+        assert!(prompt.contains("user: Can you inspect the parser?"));
+        assert!(prompt.contains("assistant: I found one issue."));
+        assert!(prompt.ends_with("Please update the parser and run its tests."));
+        assert!(realtime_background_agent_prompt("{}", &[]).is_err());
+    }
+
+    #[test]
     fn media_call_access_event_clears_snapshot_taken_before_device_stop() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -27297,6 +27477,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
+            capabilities: sinomo_lm::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 0;
@@ -27325,6 +27506,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
+            capabilities: sinomo_lm::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 99;
@@ -27360,6 +27542,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
+            capabilities: sinomo_lm::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 0;
@@ -27399,6 +27582,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: Vec::new(),
+            capabilities: sinomo_lm::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 0;

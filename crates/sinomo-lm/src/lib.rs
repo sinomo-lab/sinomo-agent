@@ -9,6 +9,7 @@ mod codex_cli;
 mod deepseek;
 mod gemini;
 mod github_copilot;
+mod local_responses;
 mod nvidia;
 mod openai;
 mod realtime_audio;
@@ -47,12 +48,22 @@ pub use github_copilot::{
     GITHUB_COPILOT_CLIENT_ID, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
     GitHubCopilotConfig, GitHubCopilotProvider, GitHubDeviceCode, GitHubDevicePoll,
 };
+pub use local_responses::{
+    LM_STUDIO_DEFAULT_API_BASE_URL, LM_STUDIO_DEFAULT_MODEL, LM_STUDIO_PROVIDER_ID,
+    LocalResponsesConfig, LocalResponsesProvider, LocalResponsesRuntime,
+    OLLAMA_DEFAULT_API_BASE_URL, OLLAMA_DEFAULT_MODEL, OLLAMA_PROVIDER_ID,
+};
 pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_nvidia_model_id};
-pub use openai::{OpenAiConfig, OpenAiProvider};
+pub use openai::{
+    OPENAI_DEFAULT_IMAGE_MODEL, OPENAI_DEFAULT_WEB_SEARCH_MODEL, OpenAiConfig, OpenAiImageRequest,
+    OpenAiImageResponse, OpenAiProvider, OpenAiWebSearchContextSize, OpenAiWebSearchRequest,
+    OpenAiWebSearchResponse, OpenAiWebSearchSource,
+};
 pub use realtime_audio::{
     RealtimeAudioError, RealtimeAudioEvent, RealtimeAudioInputChunk, RealtimeAudioProvider,
     RealtimeAudioSampleFormat, RealtimeAudioSession, RealtimeAudioSessionConfig,
-    RealtimeAudioToolDefinition, RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput,
+    RealtimeAudioToolDefinition, RealtimeAudioTranscript, RealtimeAudioTranscriptEntry,
+    RealtimeAudioTranscriptRole, RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput,
     RealtimeVideoFrameDetail, RealtimeVideoFrameFormat, RealtimeVideoFrameInput,
     RealtimeVideoInputConfig, RealtimeVideoPixelFormat, minicpm_input_audio_append_payload,
     minicpm_input_video_frame_payload, minicpm_realtime_ws_url, minicpm_realtime_ws_url_for_video,
@@ -2255,6 +2266,8 @@ pub fn effective_model_name(provider: &str, configured_model: &str) -> String {
         ClaudeCodeProvider::PROVIDER_ID => CLAUDE_CODE_DEFAULT_MODEL.to_string(),
         AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
         OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
+        OLLAMA_PROVIDER_ID => OLLAMA_DEFAULT_MODEL.to_string(),
+        LM_STUDIO_PROVIDER_ID => LM_STUDIO_DEFAULT_MODEL.to_string(),
         DeepSeekProvider::PROVIDER_ID => DeepSeekConfig::default().default_model,
         GeminiProvider::PROVIDER_ID => GeminiConfig::default().default_model,
         NvidiaProvider::PROVIDER_ID => NvidiaConfig::default().default_model,
@@ -2279,6 +2292,8 @@ pub fn default_model_provider_ids() -> &'static [&'static str] {
         ClaudeCodeProvider::PROVIDER_ID,
         AnthropicProvider::PROVIDER_ID,
         OpenAiProvider::PROVIDER_ID,
+        OLLAMA_PROVIDER_ID,
+        LM_STUDIO_PROVIDER_ID,
         DeepSeekProvider::PROVIDER_ID,
         GeminiProvider::PROVIDER_ID,
         NvidiaProvider::PROVIDER_ID,
@@ -2301,6 +2316,8 @@ pub fn normalize_model_provider(provider: &str) -> Option<String> {
         }
         AnthropicProvider::PROVIDER_ID => Some(AnthropicProvider::PROVIDER_ID.to_string()),
         OpenAiProvider::PROVIDER_ID | "openai-api" => Some(OpenAiProvider::PROVIDER_ID.to_string()),
+        OLLAMA_PROVIDER_ID => Some(OLLAMA_PROVIDER_ID.to_string()),
+        LM_STUDIO_PROVIDER_ID | "lm-studio" => Some(LM_STUDIO_PROVIDER_ID.to_string()),
         DeepSeekProvider::PROVIDER_ID | "deepseek-api" => {
             Some(DeepSeekProvider::PROVIDER_ID.to_string())
         }
@@ -2309,6 +2326,19 @@ pub fn normalize_model_provider(provider: &str) -> Option<String> {
         }
         NvidiaProvider::PROVIDER_ID | "nvidia-nim" => Some(NvidiaProvider::PROVIDER_ID.to_string()),
         _ => None,
+    }
+}
+
+pub fn provider_capabilities(provider: &str) -> LanguageModelProviderCapabilities {
+    if let Some(provider) = RealtimeAudioProvider::from_id(provider) {
+        return provider.capabilities();
+    }
+    match normalize_model_provider(provider).as_deref() {
+        Some(CODEX_PROVIDER_ID) => LanguageModelProviderCapabilities::responses_http(),
+        Some(OLLAMA_PROVIDER_ID | LM_STUDIO_PROVIDER_ID) => {
+            LanguageModelProviderCapabilities::local_responses()
+        }
+        _ => LanguageModelProviderCapabilities::default(),
     }
 }
 
@@ -2357,6 +2387,14 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
             let (provider, _) = openai_provider()?;
             provider.api_key()?;
             Ok(vec![OpenAiConfig::default().default_model])
+        }
+        OLLAMA_PROVIDER_ID => {
+            LocalResponsesProvider::new(LocalResponsesConfig::new(LocalResponsesRuntime::Ollama))
+                .list_models()
+        }
+        LM_STUDIO_PROVIDER_ID => {
+            LocalResponsesProvider::new(LocalResponsesConfig::new(LocalResponsesRuntime::LmStudio))
+                .list_models()
         }
         DeepSeekProvider::PROVIDER_ID => {
             let (provider, _) = deepseek_provider()?;
@@ -2416,6 +2454,25 @@ pub fn provider_available_model_ids_for_account(
             let provider = OpenAiProvider::new(config.clone());
             provider.api_key()?;
             vec![config.default_model]
+        }
+        OLLAMA_PROVIDER_ID | LM_STUDIO_PROVIDER_ID => {
+            let runtime = if provider == OLLAMA_PROVIDER_ID {
+                LocalResponsesRuntime::Ollama
+            } else {
+                LocalResponsesRuntime::LmStudio
+            };
+            let mut config = LocalResponsesConfig::new(runtime);
+            if let Some(base_url) = account
+                .and_then(|account| account.api_base_url.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                config.api_base_url = base_url.to_string();
+            }
+            if let Some(model) = configured_model.as_deref() {
+                config.default_model = model.to_string();
+            }
+            LocalResponsesProvider::new(config).list_models()?
         }
         DeepSeekProvider::PROVIDER_ID => {
             let mut config = DeepSeekConfig::default();
@@ -2894,6 +2951,24 @@ fn configured_model_provider(
                 options: provider_options.clone(),
             });
             Ok(Box::new(provider))
+        }
+        OLLAMA_PROVIDER_ID | LM_STUDIO_PROVIDER_ID => {
+            let runtime = if provider == OLLAMA_PROVIDER_ID {
+                LocalResponsesRuntime::Ollama
+            } else {
+                LocalResponsesRuntime::LmStudio
+            };
+            let mut config = LocalResponsesConfig::new(runtime);
+            if let Some(base_url) = account
+                .and_then(|account| account.api_base_url.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                config.api_base_url = base_url.to_string();
+            }
+            config.default_model = model_or_default(model, config.default_model);
+            config.options = provider_options.clone();
+            Ok(Box::new(LocalResponsesProvider::new(config)))
         }
         DeepSeekProvider::PROVIDER_ID => {
             let credentials_path =
@@ -3749,8 +3824,99 @@ pub struct LanguageModelProviderInfo {
     /// `unrestricted` so older or incomplete capability records fail closed.
     #[serde(default)]
     pub host_access: LanguageModelHostAccess,
+    /// Provider-owned upper bound on optional model/runtime surfaces that
+    /// Sinomo has an implementation for. Agent policy, tool invocation mode,
+    /// and node-local authority may further reduce what is exposed.
+    #[serde(default)]
+    pub capabilities: LanguageModelProviderCapabilities,
     pub supports_json_object: bool,
     pub supports_tool_permissions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LanguageModelProviderCapabilities {
+    #[serde(default)]
+    pub responses_http: bool,
+    #[serde(default)]
+    pub responses_websocket: bool,
+    #[serde(default)]
+    pub realtime_websocket: bool,
+    #[serde(default)]
+    pub realtime_webrtc: bool,
+    #[serde(default)]
+    pub web_search: bool,
+    #[serde(default)]
+    pub image_generation: bool,
+    #[serde(default)]
+    pub image_editing: bool,
+    #[serde(default)]
+    pub transcription: bool,
+    #[serde(default)]
+    pub local_model_management: bool,
+    #[serde(default)]
+    pub mcp: bool,
+}
+
+impl LanguageModelProviderCapabilities {
+    pub const fn responses_http() -> Self {
+        Self {
+            responses_http: true,
+            responses_websocket: false,
+            realtime_websocket: false,
+            realtime_webrtc: false,
+            web_search: false,
+            image_generation: false,
+            image_editing: false,
+            transcription: false,
+            local_model_management: false,
+            mcp: false,
+        }
+    }
+
+    pub const fn openai() -> Self {
+        Self {
+            responses_http: true,
+            responses_websocket: false,
+            realtime_websocket: true,
+            realtime_webrtc: false,
+            web_search: true,
+            image_generation: true,
+            image_editing: true,
+            transcription: true,
+            local_model_management: false,
+            mcp: false,
+        }
+    }
+
+    pub const fn local_responses() -> Self {
+        Self {
+            responses_http: true,
+            responses_websocket: false,
+            realtime_websocket: false,
+            realtime_webrtc: false,
+            web_search: false,
+            image_generation: false,
+            image_editing: false,
+            transcription: false,
+            local_model_management: true,
+            mcp: false,
+        }
+    }
+
+    pub const fn minicpm_realtime() -> Self {
+        Self {
+            responses_http: false,
+            responses_websocket: false,
+            realtime_websocket: true,
+            realtime_webrtc: false,
+            web_search: false,
+            image_generation: false,
+            image_editing: false,
+            transcription: false,
+            local_model_management: false,
+            mcp: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -3960,6 +4126,7 @@ impl LanguageModelProvider for CommandLanguageModelProvider {
             default_model: self.model.clone(),
             invocation: LanguageModelInvocation::Process,
             host_access: LanguageModelHostAccess::Unrestricted,
+            capabilities: LanguageModelProviderCapabilities::default(),
             supports_json_object: matches!(self.prompt_mode, CommandPromptMode::JsonRequest),
             supports_tool_permissions: false,
         }
@@ -5622,5 +5789,14 @@ mod tests {
         assert_eq!(info.invocation, LanguageModelInvocation::Http);
         assert!(info.supports_json_object);
         assert!(!info.supports_tool_permissions);
+    }
+
+    #[test]
+    fn provider_capabilities_preserve_existing_minicpm_realtime_aliases() {
+        for provider in ["minicpm", "minicpm-o", "modelbest", "minicpm-o-4.5"] {
+            let capabilities = provider_capabilities(provider);
+            assert!(capabilities.realtime_websocket, "provider={provider}");
+            assert!(!capabilities.responses_http, "provider={provider}");
+        }
     }
 }

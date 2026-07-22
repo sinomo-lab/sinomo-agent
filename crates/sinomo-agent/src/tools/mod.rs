@@ -1,3 +1,4 @@
+mod hosted_model;
 pub mod memory_notes;
 mod memory_notes_sifs;
 mod registry;
@@ -10,6 +11,10 @@ pub mod config;
 pub mod local_workspace;
 
 pub use config::{ConfigAgentToolConfig, config_tool_descriptors};
+pub use hosted_model::{
+    HostedModelAgentToolConfig, HostedModelToolBackend, image_generation_descriptor,
+    register_hosted_model_tools, web_search_descriptor,
+};
 pub use local_workspace::{
     LocalWorkspaceAgentConfig, LocalWorkspaceCommandRuntime, LocalWorkspaceGitToolMode,
     agent_home_sifs_path_for_id,

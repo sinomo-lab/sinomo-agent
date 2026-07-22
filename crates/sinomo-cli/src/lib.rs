@@ -42,20 +42,22 @@ use sinomo_agent::{
     AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentTool, AgentToolDescriptor,
     AgentToolEvidence, AgentToolKind, AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest,
     AgentToolResult, AgentToolSpec, ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore,
-    FileAgentTraceStore, InteractionModel, InteractionOutput, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig, SkillActivationScope,
-    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogSourceKind,
-    SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef, interaction_event,
-    render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
+    FileAgentTraceStore, HostedModelAgentToolConfig, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
+    SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef,
+    interaction_event, register_hosted_model_tools, render_common_skill_markdown,
+    run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
     DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
     LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KEY,
-    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelCancellation, LanguageModelError,
+    LM_RUNTIME_CONFIG_KV_KEY, LM_STUDIO_PROVIDER_ID, LanguageModelCancellation, LanguageModelError,
     LanguageModelModelOptions, LanguageModelProviderOptions, LanguageModelProviderUsage,
-    LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths,
-    ModelRuntimeConfig, NvidiaProvider, OpenAiProvider, ProviderAccountConfig,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent, LocalResponsesConfig,
+    LocalResponsesProvider, LocalResponsesRuntime, ModelConfig, ModelPaths, ModelRuntimeConfig,
+    NvidiaProvider, OLLAMA_PROVIDER_ID, OpenAiConfig, OpenAiProvider, ProviderAccountConfig,
     ProviderReasoningEffort, ProviderTextVerbosity, claude_provider, codex_provider,
     collect_provider_model_catalogs, collect_provider_usage,
     complete_configured_model_request_streaming_events_with_account,
@@ -69,8 +71,8 @@ use sinomo_lm::{
     normalize_model_provider, normalize_provider_account_name, provider_account_config,
     provider_api_key_from_env, provider_options_for_model, resolve_default_model,
     save_provider_api_key_in_model_config, stored_provider_api_key,
-    subscription_usage_provider_ids, test_provider_account_credentials, test_provider_credentials,
-    write_default_model_config,
+    stored_provider_api_key_in_data_dir, subscription_usage_provider_ids,
+    test_provider_account_credentials, test_provider_credentials, write_default_model_config,
 };
 use sinomo_pytorch::{
     MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, ManagedPytorchServer, ManagedPytorchServerConfig,
@@ -5280,6 +5282,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         registry,
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
+    register_openai_hosted_tools_for_workspace(registry, data_dir, resolved_workspace_roots);
     registry.replace_registered_tools_from(&recall_tools);
     let remote_transport: Arc<dyn sinomo_agent::AgentRemoteObjectRpcTransport> = Arc::new(
         sinomo_agent::TargetAwareAgentRemoteObjectRpcTransport::new(
@@ -5302,6 +5305,42 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     sinomo_agent::register_remote_management_agent_tools(registry, remote_transport);
     registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+fn register_openai_hosted_tools_for_workspace(
+    registry: &AgentToolRegistry,
+    data_dir: &SinomoDataDir,
+    workspace_roots: &[PathBuf],
+) {
+    let api_key = provider_api_key_from_env(OpenAiProvider::PROVIDER_ID)
+        .map(|(api_key, _source)| api_key)
+        .or_else(|| {
+            stored_provider_api_key_in_data_dir(data_dir, OpenAiProvider::PROVIDER_ID)
+                .ok()
+                .flatten()
+        });
+    let Some(api_key) = api_key else {
+        return;
+    };
+    let defaults = OpenAiConfig::default();
+    let provider = OpenAiProvider::new(OpenAiConfig {
+        api_base_url: defaults.api_base_url,
+        default_model: defaults.default_model,
+        api_key: Some(api_key),
+        credentials_path: None,
+        options: defaults.options,
+    });
+    let artifact_root = data_dir
+        .root()
+        .join("events")
+        .join("agent")
+        .join("evidence")
+        .join("generated-images");
+    register_hosted_model_tools(
+        registry,
+        HostedModelAgentToolConfig::new(Arc::new(provider), artifact_root)
+            .with_allowed_image_roots(workspace_roots.iter().cloned()),
+    );
 }
 
 fn agent_recall_tool_registry(

@@ -15169,6 +15169,43 @@ fn model_list_parser_accepts_optional_provider() {
 }
 
 #[test]
+fn local_model_lifecycle_parser_accepts_only_local_providers() {
+    assert_eq!(
+        parse_models_args(&[
+            "pull",
+            "--provider",
+            "ollama",
+            "--account",
+            "desktop",
+            "--model",
+            "gpt-oss:20b",
+        ])
+        .expect("ollama pull"),
+        ModelsCliCommand::Pull(super::LocalModelActionOptions {
+            provider: "ollama".to_string(),
+            account: "desktop".to_string(),
+            model: "gpt-oss:20b".to_string(),
+        })
+    );
+    assert_eq!(
+        parse_models_args(&[
+            "load",
+            "--provider",
+            "lm-studio",
+            "--model",
+            "openai/gpt-oss-20b",
+        ])
+        .expect("LM Studio load"),
+        ModelsCliCommand::Load(super::LocalModelActionOptions {
+            provider: "lmstudio".to_string(),
+            account: "default".to_string(),
+            model: "openai/gpt-oss-20b".to_string(),
+        })
+    );
+    assert!(parse_models_args(&["load", "--provider", "openai", "--model", "gpt-5.6",]).is_err());
+}
+
+#[test]
 fn usage_parser_accepts_provider_and_json() {
     let options = parse_usage_schema_for_test(&[
         "--provider".to_string(),

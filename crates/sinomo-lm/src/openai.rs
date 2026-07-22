@@ -10,9 +10,16 @@ use crate::{
     apply_provider_vendor_options_to_payload, read_server_sent_events, render_plain_prompt,
     selected_model,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+pub const OPENAI_DEFAULT_WEB_SEARCH_MODEL: &str = "gpt-5.6-luna";
+pub const OPENAI_DEFAULT_IMAGE_MODEL: &str = "gpt-image-2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenAiConfig {
@@ -42,6 +49,62 @@ impl Default for OpenAiConfig {
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     http: Client,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAiWebSearchContextSize {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct OpenAiWebSearchRequest {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub context_size: OpenAiWebSearchContextSize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct OpenAiWebSearchSource {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct OpenAiWebSearchResponse {
+    pub model: String,
+    pub text: String,
+    pub sources: Vec<OpenAiWebSearchSource>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct OpenAiImageRequest {
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub referenced_images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenAiImageResponse {
+    pub model: String,
+    pub bytes: Vec<u8>,
+    pub media_type: String,
+    pub output_format: String,
+    pub size: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -96,6 +159,114 @@ impl OpenAiProvider {
         };
         self.complete(&request).map(|_| ())
     }
+
+    pub fn web_search(
+        &self,
+        request: &OpenAiWebSearchRequest,
+    ) -> Result<OpenAiWebSearchResponse, LanguageModelError> {
+        let query = request.query.trim();
+        if query.is_empty() {
+            return Err(openai_hosted_tool_error(
+                OPENAI_DEFAULT_WEB_SEARCH_MODEL,
+                "web search query must not be empty",
+            ));
+        }
+        let model = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(OPENAI_DEFAULT_WEB_SEARCH_MODEL)
+            .to_string();
+        let api_key = self.api_key()?;
+        let url = format!(
+            "{}/responses",
+            self.config.api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .post(url)
+            .headers(openai_headers(&api_key, Self::PROVIDER_ID, &model)?)
+            .json(&openai_web_search_payload(request, &model))
+            .send()
+            .map_err(|source| openai_hosted_tool_error(&model, source))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(openai_hosted_tool_error(
+                &model,
+                format!("OpenAI web search failed: HTTP {status}: {body}"),
+            ));
+        }
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| openai_hosted_tool_error(&model, source))?;
+        Ok(OpenAiWebSearchResponse {
+            model,
+            text: extract_openai_response_text(&value),
+            sources: extract_openai_web_search_sources(&value),
+        })
+    }
+
+    pub fn generate_or_edit_image(
+        &self,
+        request: &OpenAiImageRequest,
+    ) -> Result<OpenAiImageResponse, LanguageModelError> {
+        let prompt = request.prompt.trim();
+        if prompt.is_empty() {
+            return Err(openai_hosted_tool_error(
+                OPENAI_DEFAULT_IMAGE_MODEL,
+                "image prompt must not be empty",
+            ));
+        }
+        if request.referenced_images.len() > 5 {
+            return Err(openai_hosted_tool_error(
+                OPENAI_DEFAULT_IMAGE_MODEL,
+                "image edits accept at most five reference images",
+            ));
+        }
+        let api_key = self.api_key()?;
+        let operation = if request.referenced_images.is_empty() {
+            "generations"
+        } else {
+            "edits"
+        };
+        let url = format!(
+            "{}/images/{operation}",
+            self.config.api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .post(url)
+            .headers(openai_headers(
+                &api_key,
+                Self::PROVIDER_ID,
+                OPENAI_DEFAULT_IMAGE_MODEL,
+            )?)
+            .json(&openai_image_payload(request))
+            .send()
+            .map_err(|source| openai_hosted_tool_error(OPENAI_DEFAULT_IMAGE_MODEL, source))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(openai_hosted_tool_error(
+                OPENAI_DEFAULT_IMAGE_MODEL,
+                format!("OpenAI image {operation} failed: HTTP {status}: {body}"),
+            ));
+        }
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| openai_hosted_tool_error(OPENAI_DEFAULT_IMAGE_MODEL, source))?;
+        openai_image_response(&value)
+    }
+}
+
+fn openai_hosted_tool_error(model: &str, detail: impl std::fmt::Display) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: OpenAiProvider::PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        detail: detail.to_string(),
+    }
 }
 
 impl Default for OpenAiProvider {
@@ -131,6 +302,7 @@ impl LanguageModelProvider for OpenAiProvider {
             default_model: self.config.default_model.clone(),
             invocation: LanguageModelInvocation::Http,
             host_access: crate::LanguageModelHostAccess::NetworkOnly,
+            capabilities: crate::LanguageModelProviderCapabilities::openai(),
             supports_json_object: true,
             supports_tool_permissions: false,
         }
@@ -250,7 +422,7 @@ impl LanguageModelProvider for OpenAiProvider {
     }
 }
 
-fn openai_headers(
+pub(crate) fn openai_headers(
     api_key: &str,
     provider: &str,
     model: &str,
@@ -272,7 +444,7 @@ fn openai_headers(
     Ok(headers)
 }
 
-fn openai_responses_payload(
+pub(crate) fn openai_responses_payload(
     request: &LanguageModelRequest,
     model: &str,
     options: &LanguageModelProviderOptions,
@@ -336,6 +508,186 @@ fn openai_responses_payload(
     }
     apply_provider_vendor_options_to_payload(&mut payload, options);
     payload
+}
+
+fn openai_web_search_payload(request: &OpenAiWebSearchRequest, model: &str) -> serde_json::Value {
+    let mut tool = serde_json::json!({
+        "type": "web_search",
+        "search_context_size": match request.context_size {
+            OpenAiWebSearchContextSize::Low => "low",
+            OpenAiWebSearchContextSize::Medium => "medium",
+            OpenAiWebSearchContextSize::High => "high",
+        },
+    });
+    let allowed_domains = request
+        .allowed_domains
+        .iter()
+        .map(|domain| domain.trim())
+        .filter(|domain| !domain.is_empty())
+        .collect::<Vec<_>>();
+    if !allowed_domains.is_empty() {
+        tool["filters"] = serde_json::json!({ "allowed_domains": allowed_domains });
+    }
+    serde_json::json!({
+        "model": model,
+        "input": request.query.trim(),
+        "store": false,
+        "tools": [tool],
+        "include": ["web_search_call.action.sources"],
+    })
+}
+
+fn extract_openai_web_search_sources(value: &serde_json::Value) -> Vec<OpenAiWebSearchSource> {
+    let mut sources = BTreeMap::<String, Option<String>>::new();
+    for item in value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for source in item
+            .get("action")
+            .and_then(|action| action.get("sources"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            insert_openai_web_source(&mut sources, source);
+        }
+        for content in item
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for annotation in content
+                .get("annotations")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                insert_openai_web_source(&mut sources, annotation);
+            }
+        }
+    }
+    sources
+        .into_iter()
+        .map(|(url, title)| OpenAiWebSearchSource { url, title })
+        .collect()
+}
+
+fn insert_openai_web_source(
+    sources: &mut BTreeMap<String, Option<String>>,
+    value: &serde_json::Value,
+) {
+    let Some(url) = value
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return;
+    };
+    let title = value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+    sources
+        .entry(url.to_string())
+        .and_modify(|existing| {
+            if existing.is_none() {
+                *existing = title.clone();
+            }
+        })
+        .or_insert(title);
+}
+
+fn openai_image_payload(request: &OpenAiImageRequest) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "model": OPENAI_DEFAULT_IMAGE_MODEL,
+        "prompt": request.prompt.trim(),
+    });
+    if !request.referenced_images.is_empty() {
+        payload["images"] = serde_json::json!(
+            request
+                .referenced_images
+                .iter()
+                .map(|image_url| serde_json::json!({ "image_url": image_url }))
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(size) = request
+        .size
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["size"] = serde_json::json!(size);
+    }
+    if let Some(quality) = request
+        .quality
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["quality"] = serde_json::json!(quality);
+    }
+    if let Some(background) = request
+        .background
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["background"] = serde_json::json!(background);
+    }
+    payload
+}
+
+fn openai_image_response(
+    value: &serde_json::Value,
+) -> Result<OpenAiImageResponse, LanguageModelError> {
+    let encoded = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|data| data.get("b64_json"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            openai_hosted_tool_error(
+                OPENAI_DEFAULT_IMAGE_MODEL,
+                "OpenAI image response did not include image data",
+            )
+        })?;
+    let bytes = BASE64_STANDARD.decode(encoded.trim()).map_err(|source| {
+        openai_hosted_tool_error(
+            OPENAI_DEFAULT_IMAGE_MODEL,
+            format!("OpenAI image response contained invalid base64 data: {source}"),
+        )
+    })?;
+    let output_format = value
+        .get("output_format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("png")
+        .trim()
+        .to_ascii_lowercase();
+    let media_type = match output_format.as_str() {
+        "jpeg" | "jpg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/png",
+    }
+    .to_string();
+    Ok(OpenAiImageResponse {
+        model: OPENAI_DEFAULT_IMAGE_MODEL.to_string(),
+        bytes,
+        media_type,
+        output_format,
+        size: value
+            .get("size")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 fn openai_responses_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value {
@@ -555,7 +907,7 @@ fn render_openai_input_prompt(request: &LanguageModelRequest) -> String {
     }
 }
 
-fn extract_openai_response_text(value: &serde_json::Value) -> String {
+pub(crate) fn extract_openai_response_text(value: &serde_json::Value) -> String {
     if let Some(output_text) = value.get("output_text").and_then(serde_json::Value::as_str) {
         return output_text.to_string();
     }
@@ -579,7 +931,7 @@ fn extract_openai_response_text(value: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-fn stream_openai_responses_response(
+pub(crate) fn stream_openai_responses_response(
     response: reqwest::blocking::Response,
     provider: &str,
     model: &str,
@@ -732,7 +1084,7 @@ fn stream_openai_responses_response(
     })
 }
 
-fn extract_openai_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
+pub(crate) fn extract_openai_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
     value.get("usage").map(|usage| LanguageModelUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -769,7 +1121,7 @@ fn openai_responses_event_error_message(value: &serde_json::Value) -> Option<Str
         .map(str::to_string)
 }
 
-fn extract_openai_tool_calls(value: &serde_json::Value) -> Vec<LanguageModelToolCall> {
+pub(crate) fn extract_openai_tool_calls(value: &serde_json::Value) -> Vec<LanguageModelToolCall> {
     value
         .get("output")
         .and_then(serde_json::Value::as_array)
@@ -1114,6 +1466,82 @@ mod tests {
         assert_eq!(info.provider, OpenAiProvider::PROVIDER_ID);
         assert_eq!(info.invocation, LanguageModelInvocation::Http);
         assert!(info.supports_json_object);
+        assert!(info.capabilities.responses_http);
+        assert!(info.capabilities.realtime_websocket);
+        assert!(info.capabilities.web_search);
+        assert!(info.capabilities.image_generation);
+        assert!(info.capabilities.image_editing);
+    }
+
+    #[test]
+    fn web_search_payload_and_sources_preserve_public_controls_and_citations() {
+        let request = OpenAiWebSearchRequest {
+            query: " latest release ".to_string(),
+            model: None,
+            allowed_domains: vec!["example.com".to_string(), " ".to_string()],
+            context_size: OpenAiWebSearchContextSize::High,
+        };
+        let payload = openai_web_search_payload(&request, OPENAI_DEFAULT_WEB_SEARCH_MODEL);
+        assert_eq!(payload["tools"][0]["type"], "web_search");
+        assert_eq!(payload["tools"][0]["search_context_size"], "high");
+        assert_eq!(
+            payload["tools"][0]["filters"]["allowed_domains"][0],
+            "example.com"
+        );
+        assert_eq!(payload["input"], "latest release");
+
+        let sources = extract_openai_web_search_sources(&serde_json::json!({
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": { "sources": [
+                        { "url": "https://example.com/release", "title": "Release" }
+                    ] }
+                },
+                {
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "annotations": [
+                            { "type": "url_citation", "url": "https://example.com/release" },
+                            { "type": "url_citation", "url": "https://example.org/note", "title": "Note" }
+                        ]
+                    }]
+                }
+            ]
+        }));
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].url, "https://example.com/release");
+        assert_eq!(sources[0].title.as_deref(), Some("Release"));
+        assert_eq!(sources[1].url, "https://example.org/note");
+    }
+
+    #[test]
+    fn image_payload_selects_generation_or_edit_shape_and_decodes_result() {
+        let request = OpenAiImageRequest {
+            prompt: " add a hat ".to_string(),
+            referenced_images: vec!["data:image/png;base64,AA==".to_string()],
+            size: Some("1024x1024".to_string()),
+            quality: Some("medium".to_string()),
+            background: Some("auto".to_string()),
+        };
+        let payload = openai_image_payload(&request);
+        assert_eq!(payload["model"], OPENAI_DEFAULT_IMAGE_MODEL);
+        assert_eq!(payload["prompt"], "add a hat");
+        assert_eq!(
+            payload["images"][0]["image_url"],
+            "data:image/png;base64,AA=="
+        );
+
+        let response = openai_image_response(&serde_json::json!({
+            "data": [{ "b64_json": "aW1hZ2U=" }],
+            "output_format": "webp",
+            "size": "1024x1024"
+        }))
+        .expect("decode image response");
+        assert_eq!(response.bytes, b"image");
+        assert_eq!(response.media_type, "image/webp");
+        assert_eq!(response.size.as_deref(), Some("1024x1024"));
     }
 
     #[test]

@@ -366,6 +366,8 @@ pub enum AgentToolKind {
     SkillActivate,
     SkillUpdate,
     ModuleObjectRpc,
+    WebSearch,
+    ImageGeneration,
     ReadSifs,
     WriteSifs,
     ListSifs,
@@ -2668,6 +2670,7 @@ mod tests {
                 default_model: "probe".to_string(),
                 invocation: sinomo_lm::LanguageModelInvocation::InProcess,
                 host_access: sinomo_lm::LanguageModelHostAccess::Bounded,
+                capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
                 supports_json_object: false,
                 supports_tool_permissions: false,
             }

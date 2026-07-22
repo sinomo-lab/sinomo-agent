@@ -370,6 +370,7 @@ impl LanguageModelProvider for GitHubCopilotProvider {
             default_model: self.config.default_model.clone(),
             invocation: LanguageModelInvocation::Http,
             host_access: crate::LanguageModelHostAccess::NetworkOnly,
+            capabilities: crate::LanguageModelProviderCapabilities::default(),
             supports_json_object: true,
             supports_tool_permissions: false,
         }
@@ -628,6 +629,7 @@ impl LanguageModelProvider for GitHubCopilotCliProvider {
             default_model: self.config.model.clone(),
             invocation: LanguageModelInvocation::Process,
             host_access: crate::LanguageModelHostAccess::Unrestricted,
+            capabilities: crate::LanguageModelProviderCapabilities::default(),
             supports_json_object: false,
             supports_tool_permissions: true,
         }

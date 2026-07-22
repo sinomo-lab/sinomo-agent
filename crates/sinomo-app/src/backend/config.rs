@@ -220,6 +220,7 @@ pub fn cluster_provider_summaries(client: &dyn ConfigClient) -> Vec<ProviderSumm
             models: vec![account.default_model.clone().unwrap_or_else(|| {
                 sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
             })],
+            capabilities: sinomo_lm::provider_capabilities(&provider),
         });
     }
     summaries

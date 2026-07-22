@@ -316,6 +316,7 @@ impl LanguageModelProvider for PythonPytorchRuntime {
             default_model: self.config.model.clone(),
             invocation: sinomo_lm::LanguageModelInvocation::Process,
             host_access: sinomo_lm::LanguageModelHostAccess::Unrestricted,
+            capabilities: sinomo_lm::LanguageModelProviderCapabilities::minicpm_realtime(),
             supports_json_object: false,
             supports_tool_permissions: false,
         }
@@ -752,6 +753,7 @@ impl LanguageModelProvider for RemotePytorchRuntime {
             default_model: PYTORCH_DEFAULT_MODEL.to_string(),
             invocation: sinomo_lm::LanguageModelInvocation::Http,
             host_access: sinomo_lm::LanguageModelHostAccess::NetworkOnly,
+            capabilities: sinomo_lm::LanguageModelProviderCapabilities::minicpm_realtime(),
             supports_json_object: false,
             supports_tool_permissions: false,
         }

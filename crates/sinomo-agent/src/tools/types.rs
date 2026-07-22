@@ -157,6 +157,8 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::RunShellCommand => vec!["core", "coding", "local"],
         AgentToolKind::ChangedFiles | AgentToolKind::GitDiff => vec!["version_control"],
         AgentToolKind::ModuleObjectRpc => vec!["module", "object_rpc"],
+        AgentToolKind::WebSearch => vec!["core", "research", "network"],
+        AgentToolKind::ImageGeneration => vec!["core", "media", "creative"],
         AgentToolKind::RequestUserInput => vec!["core", "interactive"],
         AgentToolKind::ToolSearch
         | AgentToolKind::ToolDescribe

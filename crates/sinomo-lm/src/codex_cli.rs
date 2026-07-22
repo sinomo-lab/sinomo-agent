@@ -187,6 +187,7 @@ impl LanguageModelProvider for CodexCliProvider {
             default_model: self.config.model.clone(),
             invocation: LanguageModelInvocation::Process,
             host_access: self.host_access(),
+            capabilities: crate::LanguageModelProviderCapabilities::default(),
             supports_json_object: false,
             supports_tool_permissions: true,
         }

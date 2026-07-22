@@ -60,6 +60,13 @@ impl RealtimeAudioProvider {
             Self::MiniCpmO => MINICPM_DEFAULT_REALTIME_BASE_URL,
         }
     }
+
+    pub fn capabilities(self) -> crate::LanguageModelProviderCapabilities {
+        match self {
+            Self::OpenAi => crate::LanguageModelProviderCapabilities::openai(),
+            Self::MiniCpmO => crate::LanguageModelProviderCapabilities::minicpm_realtime(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -226,6 +233,10 @@ pub struct RealtimeAudioSessionConfig {
     pub safety_identifier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
+    /// Optional provider-side speech-to-text model used to produce stable user
+    /// transcript events for history and regular-agent handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_transcription_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_video: Option<RealtimeVideoInputConfig>,
     pub input_sample_rate_hz: u32,
@@ -277,6 +288,8 @@ impl RealtimeAudioSessionConfig {
             websocket_url: None,
             safety_identifier: None,
             voice: None,
+            input_transcription_model: (provider == RealtimeAudioProvider::OpenAi)
+                .then(|| "gpt-4o-mini-transcribe".to_string()),
             input_video: None,
             input_sample_rate_hz,
             output_sample_rate_hz,
@@ -524,6 +537,16 @@ pub enum RealtimeAudioEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
     },
+    InputTranscriptDelta {
+        delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
+    InputTranscriptDone {
+        transcript: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
     OutputAudioDelta {
         text: String,
         audio: Vec<u8>,
@@ -535,6 +558,11 @@ pub enum RealtimeAudioEvent {
     },
     OutputTranscriptDelta {
         delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+    },
+    OutputTranscriptDone {
+        transcript: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
     },
@@ -580,6 +608,172 @@ pub enum RealtimeAudioEvent {
         event_type: String,
         value: serde_json::Value,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeAudioTranscriptRole {
+    User,
+    Assistant,
+}
+
+impl RealtimeAudioTranscriptRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RealtimeAudioTranscriptEntry {
+    pub role: RealtimeAudioTranscriptRole,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+}
+
+/// Provider-neutral, bounded handoff cursor over a realtime conversation.
+///
+/// Deltas are coalesced into role-bearing entries and completion events replace
+/// their partial text. `take_handoff_tail` returns each entry at most once so a
+/// regular agent receives the new voice context without repeatedly replaying
+/// the whole call.
+#[derive(Clone, Debug, Default)]
+pub struct RealtimeAudioTranscript {
+    entries: Vec<RealtimeAudioTranscriptEntry>,
+    handoff_cursor: usize,
+    new_input_entry: bool,
+    new_output_entry: bool,
+}
+
+impl RealtimeAudioTranscript {
+    pub fn entries(&self) -> &[RealtimeAudioTranscriptEntry] {
+        &self.entries
+    }
+
+    pub fn observe(&mut self, event: &RealtimeAudioEvent) {
+        match event {
+            RealtimeAudioEvent::InputSpeechStarted { .. } => self.new_input_entry = true,
+            RealtimeAudioEvent::InputTranscriptDelta { delta, item_id } => {
+                append_realtime_transcript_delta(
+                    &mut self.entries,
+                    RealtimeAudioTranscriptRole::User,
+                    item_id.as_deref(),
+                    delta,
+                    self.new_input_entry,
+                );
+                self.new_input_entry = false;
+            }
+            RealtimeAudioEvent::InputTranscriptDone {
+                transcript,
+                item_id,
+            } => {
+                apply_realtime_transcript_done(
+                    &mut self.entries,
+                    RealtimeAudioTranscriptRole::User,
+                    item_id.as_deref(),
+                    transcript,
+                    self.new_input_entry,
+                );
+                self.new_input_entry = false;
+            }
+            RealtimeAudioEvent::OutputTranscriptDelta { delta, item_id } => {
+                append_realtime_transcript_delta(
+                    &mut self.entries,
+                    RealtimeAudioTranscriptRole::Assistant,
+                    item_id.as_deref(),
+                    delta,
+                    self.new_output_entry,
+                );
+                self.new_output_entry = false;
+            }
+            RealtimeAudioEvent::OutputTranscriptDone {
+                transcript,
+                item_id,
+            } => {
+                apply_realtime_transcript_done(
+                    &mut self.entries,
+                    RealtimeAudioTranscriptRole::Assistant,
+                    item_id.as_deref(),
+                    transcript,
+                    self.new_output_entry,
+                );
+                self.new_output_entry = false;
+            }
+            RealtimeAudioEvent::ResponseDone | RealtimeAudioEvent::ResponseCancelled { .. } => {
+                self.new_output_entry = true;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn take_handoff_tail(&mut self) -> Vec<RealtimeAudioTranscriptEntry> {
+        let tail = self.entries[self.handoff_cursor..].to_vec();
+        self.handoff_cursor = self.entries.len();
+        tail
+    }
+}
+
+fn append_realtime_transcript_delta(
+    entries: &mut Vec<RealtimeAudioTranscriptEntry>,
+    role: RealtimeAudioTranscriptRole,
+    item_id: Option<&str>,
+    delta: &str,
+    force_new: bool,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    if !force_new
+        && let Some(entry) = entries.last_mut()
+        && entry.role == role
+        && realtime_transcript_item_matches(entry.item_id.as_deref(), item_id)
+    {
+        entry.text.push_str(delta);
+        if entry.item_id.is_none() {
+            entry.item_id = item_id.map(str::to_string);
+        }
+        return;
+    }
+    entries.push(RealtimeAudioTranscriptEntry {
+        role,
+        text: delta.to_string(),
+        item_id: item_id.map(str::to_string),
+    });
+}
+
+fn apply_realtime_transcript_done(
+    entries: &mut Vec<RealtimeAudioTranscriptEntry>,
+    role: RealtimeAudioTranscriptRole,
+    item_id: Option<&str>,
+    text: &str,
+    force_new: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if !force_new
+        && let Some(entry) = entries.last_mut()
+        && entry.role == role
+        && realtime_transcript_item_matches(entry.item_id.as_deref(), item_id)
+    {
+        entry.text = text.to_string();
+        if entry.item_id.is_none() {
+            entry.item_id = item_id.map(str::to_string);
+        }
+        return;
+    }
+    entries.push(RealtimeAudioTranscriptEntry {
+        role,
+        text: text.to_string(),
+        item_id: item_id.map(str::to_string),
+    });
+}
+
+fn realtime_transcript_item_matches(left: Option<&str>, right: Option<&str>) -> bool {
+    left.is_none() || right.is_none() || left == right
 }
 
 impl RealtimeAudioEvent {
@@ -1016,6 +1210,16 @@ pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> ser
             });
         }
     }
+    if let Some(model) = config
+        .input_transcription_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        session["audio"]["input"]["transcription"] = serde_json::json!({
+            "model": model
+        });
+    }
     if !config.tools.is_empty() {
         session["tools"] = serde_json::Value::Array(
             config
@@ -1359,12 +1563,50 @@ pub fn realtime_audio_event_from_value(
                 .and_then(serde_json::Value::as_u64),
             item_id: optional_string(&value, "item_id"),
         },
+        "conversation.item.input_audio_transcription.delta" => {
+            RealtimeAudioEvent::InputTranscriptDelta {
+                delta: value
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                item_id: optional_string(&value, "item_id"),
+            }
+        }
+        "conversation.item.input_audio_transcription.completed" => {
+            RealtimeAudioEvent::InputTranscriptDone {
+                transcript: value
+                    .get("transcript")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                item_id: optional_string(&value, "item_id"),
+            }
+        }
         "response.output_audio.delta" | "response.audio.delta" => {
             output_audio_delta(provider, &value)?
         }
-        "response.output_audio_transcript.delta" => RealtimeAudioEvent::OutputTranscriptDelta {
-            delta: value
-                .get("delta")
+        "response.output_audio_transcript.delta" | "response.output_text.delta" => {
+            RealtimeAudioEvent::OutputTranscriptDelta {
+                delta: value
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                item_id: optional_string(&value, "item_id"),
+            }
+        }
+        "response.output_audio_transcript.done" => RealtimeAudioEvent::OutputTranscriptDone {
+            transcript: value
+                .get("transcript")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            item_id: optional_string(&value, "item_id"),
+        },
+        "response.output_text.done" => RealtimeAudioEvent::OutputTranscriptDone {
+            transcript: value
+                .get("text")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
@@ -1572,6 +1814,10 @@ mod tests {
             payload["session"]["audio"]["input"]["turn_detection"]["type"],
             "semantic_vad"
         );
+        assert_eq!(
+            payload["session"]["audio"]["input"]["transcription"]["model"],
+            "gpt-4o-mini-transcribe"
+        );
     }
 
     #[test]
@@ -1670,6 +1916,69 @@ mod tests {
             RealtimeAudioEvent::InputSpeechStarted {
                 audio_start_ms: Some(825),
                 item_id: Some("item_audio".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn realtime_transcript_coalesces_deltas_and_returns_each_handoff_tail_once() {
+        let mut transcript = RealtimeAudioTranscript::default();
+        transcript.observe(&RealtimeAudioEvent::InputSpeechStarted {
+            audio_start_ms: Some(10),
+            item_id: Some("user-1".to_string()),
+        });
+        transcript.observe(&RealtimeAudioEvent::InputTranscriptDelta {
+            delta: "edit ".to_string(),
+            item_id: Some("user-1".to_string()),
+        });
+        transcript.observe(&RealtimeAudioEvent::InputTranscriptDelta {
+            delta: "the file".to_string(),
+            item_id: Some("user-1".to_string()),
+        });
+        transcript.observe(&RealtimeAudioEvent::InputTranscriptDone {
+            transcript: "Edit the file.".to_string(),
+            item_id: Some("user-1".to_string()),
+        });
+        transcript.observe(&RealtimeAudioEvent::OutputTranscriptDone {
+            transcript: "I'll handle that.".to_string(),
+            item_id: Some("assistant-1".to_string()),
+        });
+
+        assert_eq!(
+            transcript.take_handoff_tail(),
+            vec![
+                RealtimeAudioTranscriptEntry {
+                    role: RealtimeAudioTranscriptRole::User,
+                    text: "Edit the file.".to_string(),
+                    item_id: Some("user-1".to_string()),
+                },
+                RealtimeAudioTranscriptEntry {
+                    role: RealtimeAudioTranscriptRole::Assistant,
+                    text: "I'll handle that.".to_string(),
+                    item_id: Some("assistant-1".to_string()),
+                },
+            ]
+        );
+        assert!(transcript.take_handoff_tail().is_empty());
+    }
+
+    #[test]
+    fn parses_openai_input_transcript_completion() {
+        let event = realtime_audio_event_from_value(
+            RealtimeAudioProvider::OpenAi,
+            serde_json::json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "user-7",
+                "transcript": "Please inspect the build."
+            }),
+        )
+        .expect("event");
+
+        assert_eq!(
+            event,
+            RealtimeAudioEvent::InputTranscriptDone {
+                transcript: "Please inspect the build.".to_string(),
+                item_id: Some("user-7".to_string()),
             }
         );
     }

@@ -525,6 +525,7 @@ impl LanguageModelProvider for ClaudeProvider {
             default_model: self.config.default_model.clone(),
             invocation: LanguageModelInvocation::Http,
             host_access: crate::LanguageModelHostAccess::NetworkOnly,
+            capabilities: crate::LanguageModelProviderCapabilities::default(),
             supports_json_object: false,
             supports_tool_permissions: false,
         }
