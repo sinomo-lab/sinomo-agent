@@ -1,6 +1,6 @@
 use super::{
-    AgentTool, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence, AgentToolRequest,
-    AgentToolResult,
+    AgentTool, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
+    AgentToolInvocationMode, AgentToolRequest, AgentToolResult,
 };
 use crate::{AgentCancellationToken, AgentToolKind, AgentToolSpec, TaskId};
 use serde::{Deserialize, Serialize};
@@ -544,6 +544,7 @@ fn session_history_search_descriptor_with_limit(max_result_limit: usize) -> Agen
         "Search chats, channels, and background activities the current agent engaged in using bounded excerpts and an opaque continuation cursor. Raw model-session records are never exposed.",
         false,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_toolsets(["core", "memory"])
     .with_capabilities([AgentToolCapability::ReadSessionHistory])
     .supporting_parallel(true)

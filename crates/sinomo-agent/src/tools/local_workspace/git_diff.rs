@@ -129,7 +129,7 @@ impl AgentTool for GitDiffTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::GitDiff))
+    descriptor_for_kind(AgentToolKind::GitDiff)
         .with_toolsets(["version_control"])
         .with_capabilities([
             AgentToolCapability::ReadWorkspace,

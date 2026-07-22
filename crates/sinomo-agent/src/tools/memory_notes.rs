@@ -1,6 +1,6 @@
 use super::{
-    AgentTool, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence, AgentToolRequest,
-    AgentToolResult,
+    AgentTool, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
+    AgentToolInvocationMode, AgentToolRequest, AgentToolResult,
 };
 use crate::{AgentCancellationToken, AgentToolCall, AgentToolKind, AgentToolSpec};
 use std::fmt;
@@ -847,6 +847,7 @@ fn memory_search_descriptor() -> AgentToolDescriptor {
         "Search the current agent's Markdown memory notes with bounded results.",
         false,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_toolsets(["core", "memory"])
     .with_capabilities([AgentToolCapability::ReadMemory])
     .with_input_schema(serde_json::json!({
@@ -892,6 +893,7 @@ fn memory_read_descriptor() -> AgentToolDescriptor {
         "Read one bounded byte range from a versioned Markdown note in the current agent's memory-note root.",
         false,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_toolsets(["core", "memory"])
     .with_capabilities([AgentToolCapability::ReadMemory])
     .with_input_schema(serde_json::json!({
@@ -943,6 +945,7 @@ fn memory_write_descriptor() -> AgentToolDescriptor {
         "Create or replace one tool-bounded complete Markdown note with an exact version precondition.",
         true,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_toolsets(["core", "memory"])
     .with_capabilities([AgentToolCapability::WriteMemory])
     .with_input_schema(serde_json::json!({

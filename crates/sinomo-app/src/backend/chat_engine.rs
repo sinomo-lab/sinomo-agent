@@ -7,7 +7,7 @@
 
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 #[cfg(test)]
 use std::thread::JoinHandle;
@@ -19,12 +19,12 @@ use sinomo_agent::{
     AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, TaskId,
 };
 use sinomo_cli::app_api::{
-    AgentChat, AgentChatSifsStorage, ChatAttachmentInput, ChatContextSnapshot, ChatControlState,
-    ChatControlStatus, ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker,
-    ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, SifsAgentChannelStore, chat_queued_input_from_events,
-    chat_queued_inputs_from_session, chat_removed_input_id_from_events,
-    project_accepted_chat_control_input,
+    AgentChat, AgentChatSifsStorage, AgentChatToolContext, ChatAttachmentInput,
+    ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatHistoryMessage,
+    ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker, ChatStreamEvent, ChatTaskSnapshot,
+    ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot, SifsAgentChannelStore,
+    chat_queued_input_from_events, chat_queued_inputs_from_session,
+    chat_removed_input_id_from_events, project_accepted_chat_control_input,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -252,6 +252,7 @@ pub struct ChatHandle {
     tx: Sender<ChatCommand>,
     rx: Receiver<ChatEvent>,
     direct_control: DirectControl,
+    tool_context: Arc<RwLock<Option<AgentChatToolContext>>>,
     #[cfg(test)]
     worker: Option<JoinHandle<()>>,
 }
@@ -269,6 +270,7 @@ impl ChatHandle {
         let (evt_tx, evt_rx) = channel::<ChatEvent>();
         let evt_tx = ChatEventSink::new(evt_tx, event_wake);
         let active_session_id = Arc::new(Mutex::new(None));
+        let tool_context = Arc::new(RwLock::new(None));
         let direct_control = DirectControl {
             data_dir: data_dir.clone(),
             sifs_storage: sifs_storage.clone(),
@@ -276,6 +278,7 @@ impl ChatHandle {
             active_session_id: active_session_id.clone(),
             evt_tx: evt_tx.clone(),
         };
+        let worker_tool_context = tool_context.clone();
         let worker = thread::Builder::new()
             .name("sinomo-chat".to_string())
             .spawn(move || {
@@ -285,6 +288,7 @@ impl ChatHandle {
                     runtime_control_registry,
                     sifs_storage,
                     active_session_id,
+                    worker_tool_context,
                     cmd_rx,
                     evt_tx,
                 )
@@ -296,6 +300,7 @@ impl ChatHandle {
             tx: cmd_tx,
             rx: evt_rx,
             direct_control,
+            tool_context,
             #[cfg(test)]
             worker: Some(worker),
         }
@@ -327,6 +332,10 @@ impl ChatHandle {
                 let _ = self.tx.send(command);
             }
         }
+    }
+
+    pub fn tool_context(&self) -> Option<AgentChatToolContext> {
+        self.tool_context.read().ok()?.clone()
     }
 
     /// Drain all currently-available events without blocking.
@@ -672,6 +681,7 @@ fn worker(
     runtime_control_registry: AgentRuntimeControlRegistry,
     sifs_storage: Option<AgentChatSifsStorage>,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
+    tool_context: Arc<RwLock<Option<AgentChatToolContext>>>,
     cmd_rx: Receiver<ChatCommand>,
     evt_tx: ChatEventSink,
 ) {
@@ -699,6 +709,7 @@ fn worker(
         }
     };
     set_active_session_id(&active_session_id, &evt_tx, chat.session_id());
+    refresh_tool_context(&tool_context, &chat);
 
     let _ = evt_tx.send(ChatEvent::Ready {
         session_id: chat.session_id(),
@@ -1014,6 +1025,13 @@ fn worker(
             }
             ChatCommand::Shutdown => break,
         }
+        refresh_tool_context(&tool_context, &chat);
+    }
+}
+
+fn refresh_tool_context(slot: &Arc<RwLock<Option<AgentChatToolContext>>>, chat: &AgentChat) {
+    if let Ok(mut context) = slot.write() {
+        *context = Some(chat.tool_context());
     }
 }
 
@@ -1042,6 +1060,15 @@ mod tests {
         let ChatEvent::Ready { session_id, .. } = ready else {
             unreachable!("matched ready");
         };
+        let tool_context = handle.tool_context().expect("shared chat tool context");
+        let read_file = tool_context
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.spec.name == "read_file")
+            .expect("main chat read_file is realtime-compatible");
+        assert!(
+            read_file.supports_invocation_mode(sinomo_agent::AgentToolInvocationMode::Realtime)
+        );
         let stable_channel_id = SessionId::from_str(&session_id).expect("stable channel id");
         SifsAgentChannelStore::open(&temp.data_dir)
             .expect("stable channel store")
@@ -1235,6 +1262,49 @@ mod tests {
     }
 
     #[test]
+    fn chat_worker_realtime_context_executes_the_shared_workspace_tool() {
+        let temp = TempDataDir::new("chat-worker-realtime-tools");
+        let workspace = temp.path.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(workspace.join("voice.txt"), "shared implementation")
+            .expect("write workspace fixture");
+        let workspace = std::fs::canonicalize(workspace).expect("canonical workspace");
+        let handle = ChatHandle::spawn(
+            temp.data_dir.clone(),
+            false,
+            AgentRuntimeControlRegistry::new(),
+            None,
+            None,
+        );
+        wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
+            .expect("ready event");
+        handle.send_command(ChatCommand::SetToolRuntime {
+            selection: ChatToolRuntimeSelection {
+                workspace_root: Some(workspace),
+                ..ChatToolRuntimeSelection::default()
+            },
+        });
+        wait_for_event(&handle, |event| matches!(event, ChatEvent::ToolRuntime(_)))
+            .expect("workspace tool runtime event");
+
+        let context = handle.tool_context().expect("shared chat tool context");
+        let outcome = context.execute(
+            0,
+            &sinomo_agent::AgentToolCall {
+                call_id: Some("realtime-call-1".to_string()),
+                tool: "read_file".to_string(),
+                input: serde_json::json!({ "path": "voice.txt" }),
+                r#async: false,
+                summary: "read through realtime adapter".to_string(),
+            },
+            sinomo_agent::AgentCancellationToken::new(),
+        );
+
+        assert_eq!(outcome.status, sinomo_agent::AgentToolStatus::Succeeded);
+        assert_eq!(outcome.output["content"], "shared implementation");
+    }
+
+    #[test]
     fn chat_worker_node_only_rebind_does_not_replay_workspace_authority() {
         let temp = TempDataDir::new("chat-worker-node-only-rebind");
         let workspace = temp.path.join("workspace");
@@ -1296,6 +1366,7 @@ mod tests {
                 active_session_id: Arc::new(Mutex::new(Some(session_id.clone()))),
                 evt_tx: ChatEventSink::new(evt_tx, None),
             },
+            tool_context: Arc::new(RwLock::new(None)),
             worker: None,
         };
 

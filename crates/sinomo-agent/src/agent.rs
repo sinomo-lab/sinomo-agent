@@ -6,9 +6,9 @@ use crate::tools::{
     AGENT_CODING_EVIDENCE_KIND, AGENT_SKILL_USAGE_EVIDENCE_KIND, AgentCodingToolEvidence,
     AgentModuleToolProjection, AgentSkillDescriptor, AgentSkillPlan, AgentTool,
     AgentToolAvailabilityDecision, AgentToolCapability, AgentToolCustomFormat, AgentToolCustomSpec,
-    AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner,
-    AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry,
-    AgentToolStatus, is_tool_disclosure_bridge_name,
+    AgentToolDescriptor, AgentToolEvidence, AgentToolInvocationMode, AgentToolOutcome,
+    AgentToolPlan, AgentToolPlanner, AgentToolProgressEvent, AgentToolProgressSink,
+    AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus, is_tool_disclosure_bridge_name,
 };
 use crate::{
     AgentCancellationToken, AgentCompactionEngine, AgentCompactionRequest, AgentDefinition,
@@ -9877,6 +9877,7 @@ impl<M: InteractionModel> Agent<M> {
             self.config.visible_toolsets.clone(),
             self.tools.generation(),
         )
+        .for_invocation_mode(AgentToolInvocationMode::TurnBased)
     }
 
     fn skill_plan(&self) -> AgentSkillPlan {

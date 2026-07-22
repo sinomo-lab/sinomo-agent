@@ -22,6 +22,14 @@ pub struct AgentToolDescriptor {
     pub toolsets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<AgentToolCapability>,
+    /// Model interaction modes through which this implementation may be
+    /// exposed. Tool behavior, authority checks, and execution stay shared;
+    /// this only controls which model-facing adapters may advertise it.
+    #[serde(
+        default = "default_agent_tool_invocation_modes",
+        skip_serializing_if = "agent_tool_invocation_modes_are_default"
+    )]
+    pub invocation_modes: Vec<AgentToolInvocationMode>,
     /// Host-local authority grants required at the final tool execution
     /// boundary. These opaque names are parsed strictly by the registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -43,6 +51,7 @@ impl AgentToolDescriptor {
             output_schema: serde_json::Value::Null,
             toolsets,
             capabilities: Vec::new(),
+            invocation_modes: default_agent_tool_invocation_modes(),
             required_local_permissions: Vec::new(),
             supports_parallel: false,
             provider_specs: Vec::new(),
@@ -70,6 +79,18 @@ impl AgentToolDescriptor {
     ) -> Self {
         self.capabilities = capabilities.into_iter().collect();
         self
+    }
+
+    pub fn with_invocation_modes(
+        mut self,
+        invocation_modes: impl IntoIterator<Item = AgentToolInvocationMode>,
+    ) -> Self {
+        self.invocation_modes = invocation_modes.into_iter().collect();
+        self
+    }
+
+    pub fn supports_invocation_mode(&self, invocation_mode: AgentToolInvocationMode) -> bool {
+        self.invocation_modes.contains(&invocation_mode)
     }
 
     pub fn with_required_local_permissions(
@@ -101,6 +122,27 @@ impl AgentToolDescriptor {
     pub(crate) fn from_spec(spec: AgentToolSpec) -> Self {
         Self::new(spec)
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolInvocationMode {
+    TurnBased,
+    Realtime,
+}
+
+impl AgentToolInvocationMode {
+    pub const fn all() -> [Self; 2] {
+        [Self::TurnBased, Self::Realtime]
+    }
+}
+
+fn default_agent_tool_invocation_modes() -> Vec<AgentToolInvocationMode> {
+    vec![AgentToolInvocationMode::TurnBased]
+}
+
+fn agent_tool_invocation_modes_are_default(modes: &[AgentToolInvocationMode]) -> bool {
+    modes == [AgentToolInvocationMode::TurnBased]
 }
 
 fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
@@ -333,6 +375,12 @@ impl AgentToolPlan {
                 ),
             })
             .collect()
+    }
+
+    pub fn for_invocation_mode(mut self, invocation_mode: AgentToolInvocationMode) -> Self {
+        self.entries
+            .retain(|entry| entry.descriptor.supports_invocation_mode(invocation_mode));
+        self
     }
 }
 
@@ -1392,6 +1440,56 @@ pub enum AgentToolProgressEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_descriptor(name: &str) -> AgentToolDescriptor {
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            name,
+            name,
+            false,
+        ))
+    }
+
+    #[test]
+    fn tool_descriptors_default_to_turn_based_and_round_trip_legacy_json() {
+        let descriptor = test_descriptor("legacy_tool");
+        assert!(descriptor.supports_invocation_mode(AgentToolInvocationMode::TurnBased));
+        assert!(!descriptor.supports_invocation_mode(AgentToolInvocationMode::Realtime));
+
+        let value = serde_json::to_value(&descriptor).expect("serialize descriptor");
+        assert!(value.get("invocation_modes").is_none());
+        let restored: AgentToolDescriptor =
+            serde_json::from_value(value).expect("deserialize legacy descriptor");
+        assert_eq!(
+            restored.invocation_modes,
+            vec![AgentToolInvocationMode::TurnBased]
+        );
+    }
+
+    #[test]
+    fn tool_plan_filters_exposure_without_replacing_implementations() {
+        let plan = AgentToolPlan {
+            entries: vec![
+                AgentToolPlanEntry {
+                    descriptor: test_descriptor("turn_only"),
+                    source: AgentToolPlanSource::Runtime,
+                    executable: true,
+                },
+                AgentToolPlanEntry {
+                    descriptor: test_descriptor("shared")
+                        .with_invocation_modes(AgentToolInvocationMode::all()),
+                    source: AgentToolPlanSource::Runtime,
+                    executable: true,
+                },
+            ],
+            ..AgentToolPlan::default()
+        };
+
+        let realtime = plan.for_invocation_mode(AgentToolInvocationMode::Realtime);
+        assert_eq!(realtime.entries.len(), 1);
+        assert_eq!(realtime.entries[0].descriptor.spec.name, "shared");
+        assert!(realtime.entries[0].executable);
+    }
 
     #[test]
     fn module_tool_projection_preserves_route_local_permissions() {

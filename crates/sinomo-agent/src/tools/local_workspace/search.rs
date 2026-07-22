@@ -80,7 +80,7 @@ impl AgentTool for SearchFilesTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::SearchFiles))
+    descriptor_for_kind(AgentToolKind::SearchFiles)
         .with_capabilities([AgentToolCapability::ReadWorkspace])
         .with_input_schema(serde_json::json!({
             "type": "object",
