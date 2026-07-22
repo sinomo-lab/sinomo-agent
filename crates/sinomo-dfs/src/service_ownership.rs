@@ -122,8 +122,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|pending| pending.content_hash.clone());
         let intent = self.coordinator.abort_intent(intent_id)?;
         self.put_metadata_intent(&intent, content_hash.as_deref())?;
+        self.abort_create_namespace_prepare(&intent)?;
         self.remove_pending_write_state(intent_id);
         Ok(intent)
+    }
+
+    fn abort_create_namespace_prepare(
+        &mut self,
+        intent: &DistributedWriteIntent,
+    ) -> Result<(), DfsError> {
+        if !intent.touch_parent_on_create {
+            return Ok(());
+        }
+        let operation_id = format!("namespace:create:{}", intent.intent_id);
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(());
+        };
+        let Some(prepare) = backend.get_namespace_prepare(&operation_id)? else {
+            return Ok(());
+        };
+        match prepare.status {
+            DfsNamespacePrepareStatus::Prepared => {
+                backend.abort_prepared_namespace_transaction(
+                    &operation_id,
+                    &prepare.operation_digest,
+                    prepare.owner_epoch,
+                )?;
+                Ok(())
+            }
+            DfsNamespacePrepareStatus::Aborted => Ok(()),
+            DfsNamespacePrepareStatus::Committed => Err(DfsError::Metadata {
+                message: format!(
+                    "cannot abort write intent {} because namespace prepare {operation_id} is committed",
+                    intent.intent_id
+                ),
+            }),
+        }
     }
 
     pub fn handoff_object_owner(

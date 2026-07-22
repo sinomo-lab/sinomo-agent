@@ -4968,6 +4968,49 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )
     }
 
+    fn abort_prepared_namespace_transaction(
+        &mut self,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.begin_metadata_write()?;
+        let mut prepare = self
+            .tables
+            .namespace_prepares
+            .get(operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "namespace prepare {operation_id} does not exist"
+                ))
+            })?;
+        if prepare.operation_digest != expected_operation_digest
+            || prepare.owner_epoch != expected_owner_epoch
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {operation_id} digest/epoch fence mismatch"
+            )));
+        }
+        if prepare.status == DfsNamespacePrepareStatus::Committed {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {operation_id} is already committed"
+            )));
+        }
+        prepare.status = DfsNamespacePrepareStatus::Aborted;
+        let mut table_ops =
+            namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
+        if table_ops.is_empty() {
+            table_ops.push(DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: prepare.clone(),
+            });
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_namespace_prepare(&prepare),
+            table_ops,
+        )
+    }
+
     fn get_namespace_prepare(
         &self,
         operation_id: &str,
@@ -6314,6 +6357,102 @@ mod tests {
             .expect("terminal history must not block its released footprint after reopen");
         assert_eq!(namespace_prepare_history_scan_calls(), 0);
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_namespace_prepare_abort_is_fenced_durable_and_releases_footprint() {
+        let root = temp_root("local_backend_namespace_prepare_abort");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let file_system = file_system();
+        let current = object(version("version_prepare_abort_1"));
+        let mut hidden = current.clone();
+        hidden.version = version("version_prepare_abort_2");
+        hidden.changed_at_unix_nanos = 2;
+        let prepare = namespace_prepare("operation-abort", &shard_id.0, &current, hidden.clone());
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("prepare namespace transaction");
+
+        let fence_error = backend
+            .abort_prepared_namespace_transaction(
+                &prepare.operation_id,
+                "blake3:different-operation",
+                prepare.owner_epoch,
+            )
+            .expect_err("digest reuse must be fenced");
+        assert!(fence_error.to_string().contains("digest/epoch fence"));
+
+        let abort_entry = backend
+            .abort_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("abort namespace transaction");
+        assert!(matches!(
+            abort_entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                status: DfsNamespacePrepareStatus::Aborted,
+                ..
+            }
+        ));
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("visible object"),
+            Some(current.clone()),
+            "aborting a hidden prepare must not publish its transaction"
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_prepare_footprint_indexes_match_history()
+        );
+
+        let commit_error = backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect_err("an aborted prepare cannot commit");
+        assert!(commit_error.to_string().contains("is aborted"));
+        backend
+            .abort_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("repeated abort is idempotent");
+
+        let mut replacement = prepare.clone();
+        replacement.operation_id = "operation-after-abort".to_string();
+        replacement.transaction.transaction_id = "transaction:after-abort".to_string();
+        replacement.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&replacement)
+                .expect("replacement digest");
+        backend
+            .prepare_namespace_transaction(&replacement)
+            .expect("aborted footprint is reusable");
+
+        drop(backend);
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen backend");
+        assert_eq!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("aborted prepare")
+                .map(|record| record.status),
+            Some(DfsNamespacePrepareStatus::Aborted)
+        );
+        assert!(
+            reopened
+                .tables
+                .namespace_prepare_footprint_indexes_match_history()
+        );
         cleanup(&root);
     }
 

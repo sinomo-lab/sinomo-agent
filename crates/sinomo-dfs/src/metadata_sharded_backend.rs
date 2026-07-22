@@ -2288,6 +2288,34 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(entry)
     }
 
+    fn abort_prepared_namespace_transaction(
+        &mut self,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let mut found_shard_id = None;
+        for (shard_id, backend) in &self.shards {
+            if backend.get_namespace_prepare(operation_id)?.is_some() {
+                if found_shard_id.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {operation_id} exists on multiple local shards"
+                    )));
+                }
+                found_shard_id = Some(shard_id.clone());
+            }
+        }
+        let shard_id = found_shard_id.ok_or_else(|| {
+            MetadataBackendError::Serde(format!("namespace prepare {operation_id} does not exist"))
+        })?;
+        self.shard_backend_mut(&shard_id)?
+            .abort_prepared_namespace_transaction(
+                operation_id,
+                expected_operation_digest,
+                expected_owner_epoch,
+            )
+    }
+
     fn evict_object_record_for_foreign_shard_move(
         &mut self,
         moved_object: &DfsObjectMetadata,

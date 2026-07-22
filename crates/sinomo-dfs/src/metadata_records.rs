@@ -759,12 +759,14 @@ pub struct DfsNamespacePrepareRecord {
     /// visible namespace transaction. Namespace-only operations leave this
     /// empty; typed content commits must provide one receipt per visible file
     /// version before the prepare can commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_receipts: Vec<DfsReplicaReceiptRecord>,
     pub transaction: DfsNamespaceTransaction,
     /// Terminal routed-request result materialized atomically with the visible
     /// namespace transaction. Standalone and write-intent prepares leave this
     /// empty; request-owned namespace prepares use it to close the crash window
     /// between applying metadata and recording the canonical RPC outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_request: Option<DfsNamespaceRequestRecord>,
     pub status: DfsNamespacePrepareStatus,
 }
@@ -1354,6 +1356,7 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     pub(crate) namespace_prepares: Vec<DfsNamespacePrepareRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_jobs: Vec<DfsNamespaceJobRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_requests: Vec<DfsNamespaceRequestRecord>,
 }
 
@@ -1845,6 +1848,47 @@ mod tests {
             !decoded.touch_parent_on_create,
             "legacy raw write intents must not invent POSIX parent effects"
         );
+    }
+
+    #[test]
+    fn legacy_namespace_prepare_defaults_new_atomic_commit_fields() {
+        let prepare = DfsNamespacePrepareRecord {
+            operation_id: "legacy-namespace-prepare".to_string(),
+            file_system_id: file_system_id(),
+            shard_id: DfsMetadataShardId::new("shard-root"),
+            owner_epoch: 1,
+            operation_digest: "blake3:legacy".to_string(),
+            expected_object_versions: Vec::new(),
+            expected_path_occupants: Vec::new(),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "legacy-namespace-transaction".to_string(),
+                file_system_id: file_system_id(),
+                objects: Vec::new(),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        let mut encoded = serde_json::to_value(prepare).expect("serialize namespace prepare");
+        let encoded = encoded.as_object_mut().expect("namespace prepare object");
+        encoded.remove("content_receipts");
+        encoded.remove("completed_request");
+
+        let decoded: DfsNamespacePrepareRecord =
+            serde_json::from_value(serde_json::Value::Object(encoded.clone()))
+                .expect("deserialize legacy namespace prepare");
+        assert!(decoded.content_receipts.is_empty());
+        assert!(decoded.completed_request.is_none());
+    }
+
+    #[test]
+    fn legacy_metadata_table_snapshot_defaults_namespace_requests() {
+        let decoded: DfsMetadataTableSnapshotTables = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize legacy metadata table snapshot");
+        assert!(decoded.namespace_requests.is_empty());
     }
 
     #[test]

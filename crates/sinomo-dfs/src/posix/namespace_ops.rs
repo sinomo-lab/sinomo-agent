@@ -36,6 +36,12 @@ fn ensure_same_atomic_namespace_shard(
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_unlink_with_current_deadline(path)
+        })
+    }
+
+    fn posix_unlink_with_current_deadline(&mut self, path: &str) -> Result<DfsStat> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
@@ -204,6 +210,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// symlink pointers: callers get one namespace transaction or a fail-closed
     /// rejection, never the cross-shard adoption protocol or recursive job.
     pub fn posix_rename_single_namespace_atomic(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_rename_single_namespace_atomic_with_current_deadline(from, to)
+        })
+    }
+
+    fn posix_rename_single_namespace_atomic_with_current_deadline(
         &mut self,
         from: &str,
         to: &str,

@@ -1142,6 +1142,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Release an exact hidden namespace prepare without publishing it.
+    ///
+    /// The digest and owner epoch fence operation-id reuse. Implementations
+    /// must reject a committed prepare and durably move a prepared record to
+    /// `Aborted`, releasing its active object/path footprint atomically with
+    /// the journaled terminal marker.
+    fn abort_prepared_namespace_transaction(
+        &mut self,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry>;
+
     /// Fetch a durable hidden namespace prepare by operation id.
     fn get_namespace_prepare(
         &self,

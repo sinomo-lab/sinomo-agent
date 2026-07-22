@@ -167,9 +167,6 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     pending: Option<&DfsMetadataShardMembershipHandoff>,
     proof: Option<&DfsMetadataShardMembershipHandoffProof>,
 ) -> Result<bool, DfsError> {
-    if active.primary_node_id != *local_node_id {
-        return Ok(false);
-    }
     let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
     if backend.metadata_shard_write_freeze(&shard_id)?.is_none() {
         return Ok(false);
@@ -212,7 +209,21 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     {
         return Ok(false);
     }
-    Ok(backend.clear_metadata_shard_membership_handoff_freeze(
+    if active.primary_node_id == *local_node_id {
+        return Ok(backend.clear_metadata_shard_membership_handoff_freeze(
+            &shard_id,
+            &freeze.handoff_id,
+            active.epoch,
+        )?);
+    }
+
+    // The completing process can crash after the control-plane CAS commits
+    // but before it marks the retiring backend's local freeze as activated.
+    // On restart this node is no longer the primary, so it must not bind the
+    // successor epoch. It still has to advance the exact durable marker:
+    // activated retired markers accept replica ingest from the successor and
+    // can be superseded by a later proof-bound handoff.
+    Ok(backend.mark_metadata_shard_membership_handoff_activated(
         &shard_id,
         &freeze.handoff_id,
         active.epoch,
@@ -3709,6 +3720,97 @@ mod tests {
             ))
             .expect_err("retiring primary must not bind the promoted epoch");
         assert!(error.to_string().contains("frozen"));
+    }
+
+    #[test]
+    fn completed_primary_rotation_recovers_retiring_marker_after_restart() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-retiring-handoff-restart");
+        let retiring_primary = node("node_handoff_restart_retiring");
+        let promoted_primary = node("node_handoff_restart_promoted");
+        let file_system_id = sifs_file_system_id();
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: retiring_primary.clone(),
+            replica_node_ids: vec![promoted_primary.clone()],
+            epoch: 15,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let active = DfsMetadataShardConfig {
+            primary_node_id: promoted_primary.clone(),
+            replica_node_ids: vec![retiring_primary.clone()],
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        let shard_id = DfsMetadataShardId::new("root");
+        let metadata_root = root.path().join("metadata");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
+            .expect("retiring backend");
+        backend
+            .put_file_system(&DfsFileSystem::sifs(retiring_primary.clone()))
+            .expect("filesystem");
+        backend
+            .put_object(&directory_object("/", retiring_primary.clone()))
+            .expect("root object");
+        let handoff_id = "handoff-completed-before-retiring-marker";
+        let freeze = backend
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, retiring.epoch)
+            .expect("freeze retiring generation")
+            .expect("local shard");
+        drop(backend);
+
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
+            .expect("restart with pending retiring marker");
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff_id.to_string(),
+            retiring_shard: retiring,
+            desired_shard: active.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint,
+            acknowledged_node_ids: vec![retiring_primary.clone(), promoted_primary],
+        };
+
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut reopened,
+                &retiring_primary,
+                &active,
+                None,
+                Some(&proof),
+            )
+            .expect("recover completed retiring marker")
+        );
+        let activated = reopened
+            .metadata_shard_write_freeze(&shard_id)
+            .expect("read recovered marker")
+            .expect("durable recovered marker");
+        assert_eq!(activated.handoff_id, handoff_id);
+        assert_eq!(activated.activated_epoch, Some(active.epoch));
+        assert!(
+            reopened
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("retiring authority remains fenced"),
+            "recovering a retired marker must not grant successor write authority"
+        );
+        assert!(matches!(
+            reopened.put_object(&directory_object(
+                "/retiring-restart-must-stay-fenced",
+                retiring_primary,
+            )),
+            Err(crate::MetadataBackendError::MembershipHandoffFrozen { .. })
+        ));
+
+        let next = reopened
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "handoff-after-retiring-restart",
+                active.epoch,
+            )
+            .expect("later handoff may supersede completed marker")
+            .expect("local shard");
+        assert_eq!(next.handoff_id, "handoff-after-retiring-restart");
+        assert_eq!(next.activated_epoch, None);
     }
 
     #[test]

@@ -1311,7 +1311,8 @@ impl DfsTransportIdentity for DroppingSendTransport {
 
 struct DeadlineDroppingSendTransport {
     local_node_id: NodeId,
-    operation_deadline: Instant,
+    operation_deadline: Option<Instant>,
+    observed_deadline_sets: Arc<Mutex<Vec<Option<Instant>>>>,
 }
 
 impl DfsTransportIdentity for DeadlineDroppingSendTransport {
@@ -1337,8 +1338,16 @@ impl DfsMessageTransport for DeadlineDroppingSendTransport {
         Ok(Some(0))
     }
 
+    fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+        self.observed_deadline_sets
+            .lock()
+            .expect("deadline sets")
+            .push(deadline);
+        std::mem::replace(&mut self.operation_deadline, deadline)
+    }
+
     fn operation_deadline(&self) -> Option<Instant> {
-        Some(self.operation_deadline)
+        self.operation_deadline
     }
 }
 
@@ -3941,9 +3950,11 @@ fn posix_wait_for_commit_uses_transport_operation_deadline() {
     let local = NodeId::from_legacy_named("node_posix_wait_deadline_local").expect("local");
     let remote = NodeId::from_legacy_named("node_posix_wait_deadline_remote").expect("remote");
     let operation_deadline = Instant::now() + Duration::from_millis(30);
+    let observed_deadline_sets = Arc::new(Mutex::new(Vec::new()));
     let transport = DeadlineDroppingSendTransport {
         local_node_id: local.clone(),
-        operation_deadline,
+        operation_deadline: Some(operation_deadline),
+        observed_deadline_sets: Arc::clone(&observed_deadline_sets),
     };
     let content = LocalContentStore::new(root.join("content")).expect("content store");
     let mut dfs = NetworkedDfsService::new(transport, content);
@@ -3972,6 +3983,117 @@ fn posix_wait_for_commit_uses_transport_operation_deadline() {
         started_at.elapsed() < Duration::from_millis(500),
         "the caller deadline must bound the 45-second POSIX settle loop"
     );
+    assert_eq!(
+        dfs.transport.operation_deadline,
+        Some(operation_deadline),
+        "the caller's earlier deadline must be restored after the write"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_write_installs_and_restores_its_commit_deadline() {
+    let root = temp_root("posix-write-installs-deadline");
+    let local = NodeId::from_legacy_named("node_posix_write_deadline_local").expect("local");
+    let observed_deadline_sets = Arc::new(Mutex::new(Vec::new()));
+    let transport = DeadlineDroppingSendTransport {
+        local_node_id: local.clone(),
+        operation_deadline: None,
+        observed_deadline_sets: Arc::clone(&observed_deadline_sets),
+    };
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(transport, content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services").expect("services dir");
+    observed_deadline_sets
+        .lock()
+        .expect("deadline sets")
+        .clear();
+
+    let started_at = Instant::now();
+    dfs.posix_write_file(
+        "/services/deadline.txt",
+        b"bounded bytes",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            replica_candidates: vec![local],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    )
+    .expect("local bounded write");
+
+    let observed = observed_deadline_sets.lock().expect("deadline sets");
+    assert_eq!(observed.len(), 2, "install then restore the write deadline");
+    let installed = observed[0].expect("installed write deadline");
+    assert!(installed > started_at + Duration::from_secs(40));
+    assert!(installed <= started_at + Duration::from_secs(46));
+    assert_eq!(observed[1], None, "restore the unbounded caller state");
+    assert_eq!(dfs.transport.operation_deadline, None);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_sandbox_create_namespace_mutations_install_and_restore_commit_deadlines() {
+    let root = temp_root("posix-sandbox-create-mutation-deadlines");
+    let local = NodeId::from_legacy_named("node_posix_sandbox_deadline_local").expect("local");
+    let observed_deadline_sets = Arc::new(Mutex::new(Vec::new()));
+    let transport = DeadlineDroppingSendTransport {
+        local_node_id: local.clone(),
+        operation_deadline: None,
+        observed_deadline_sets: Arc::clone(&observed_deadline_sets),
+    };
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(transport, content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    observed_deadline_sets
+        .lock()
+        .expect("deadline sets")
+        .clear();
+
+    let started_at = Instant::now();
+    dfs.posix_mkdir_all("/services/sandbox/instances")
+        .expect("sandbox directory chain");
+    dfs.posix_symlink(
+        "/services/sandbox/generation",
+        "/services/sandbox/instances/swap",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            replica_candidates: vec![local],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    )
+    .expect("sandbox generation link");
+    dfs.posix_rename_single_namespace_atomic(
+        "/services/sandbox/instances/swap",
+        "/services/sandbox/instances/stable",
+    )
+    .expect("publish stable generation link");
+
+    let observed = observed_deadline_sets.lock().expect("deadline sets");
+    assert!(
+        observed.len() >= 6,
+        "the three mutations must each install then restore a deadline: {observed:?}"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|deadline| deadline.is_none())
+            .count(),
+        3,
+        "each top-level mutation restores the unbounded caller state"
+    );
+    assert!(
+        observed
+            .iter()
+            .flatten()
+            .filter(|deadline| **deadline > started_at + Duration::from_secs(40))
+            .count()
+            >= 3,
+        "each top-level mutation installs the 45-second commit budget"
+    );
+    assert_eq!(dfs.transport.operation_deadline, None);
     std::fs::remove_dir_all(root).ok();
 }
 
