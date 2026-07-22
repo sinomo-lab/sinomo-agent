@@ -46,6 +46,7 @@ use std::thread;
 
 const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO: f32 = 0.80;
 const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: usize = 4;
+const DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: usize = 32 * 1024;
 const DEFAULT_RETRIEVED_MEMORY_RECORDS: usize = 8;
 const DEFAULT_RETRIEVED_MEMORY_BYTES: usize = 16 * 1024;
 
@@ -80,10 +81,13 @@ impl Default for AgentContextBudget {
 
 impl AgentContextBudget {
     pub fn for_loaded_model(provider: &str, model: &str, max_output_tokens: Option<u32>) -> Self {
+        let window_tokens = inferred_model_context_window_tokens(provider, model)
+            .unwrap_or(DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
         Self {
-            max_context_bytes: inferred_model_context_window_tokens(provider, model).map(
-                |window_tokens| context_max_bytes_for_window(window_tokens, max_output_tokens),
-            ),
+            max_context_bytes: Some(context_max_bytes_for_window(
+                window_tokens,
+                max_output_tokens,
+            )),
             compaction_threshold_ratio: Some(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO),
             retained_tail_items: None,
         }
@@ -4474,6 +4478,8 @@ impl AgentConfig {
         let definition = AgentDefinition::main();
         let visible_toolsets =
             default_visible_toolsets_for_role_and_provider(&definition.role, &provider);
+        let context_budget =
+            AgentContextBudget::for_loaded_model(&provider, &model, definition.max_output_tokens);
         Self {
             provider,
             model,
@@ -4499,7 +4505,7 @@ impl AgentConfig {
             prompt_reference_max_entries: Some(DEFAULT_PROMPT_REFERENCE_DIRECTORY_ENTRIES),
             context_attachment_max_bytes: Some(DEFAULT_CONTEXT_ATTACHMENT_PAYLOAD_BYTES),
             async_update_max_bytes: Some(DEFAULT_ASYNC_UPDATE_BYTES),
-            context_budget: AgentContextBudget::default(),
+            context_budget,
         }
     }
 
@@ -4507,12 +4513,26 @@ impl AgentConfig {
         let previous_default_toolsets = default_visible_toolsets_for_role(&self.definition.role);
         let previous_provider_default_toolsets =
             default_visible_toolsets_for_role_and_provider(&self.definition.role, &self.provider);
+        let previous_derived_context_budget = AgentContextBudget::for_loaded_model(
+            &self.provider,
+            &self.model,
+            self.max_output_tokens,
+        );
         self.temperature = definition
             .temperature
             .or(definition.model_policy.temperature);
         self.max_output_tokens = definition
             .max_output_tokens
             .or(definition.model_policy.max_output_tokens);
+        if self.context_budget == previous_derived_context_budget
+            || self.context_budget == AgentContextBudget::default()
+        {
+            self.context_budget = AgentContextBudget::for_loaded_model(
+                &self.provider,
+                &self.model,
+                self.max_output_tokens,
+            );
+        }
         if !definition.tool_surface.visible_toolsets.is_empty() {
             self.visible_toolsets = definition.tool_surface.visible_toolsets.clone();
         } else if self.visible_toolsets == previous_default_toolsets
@@ -6953,6 +6973,12 @@ impl AgentToolSurface {
         Self::new(format!("{}-default", role.surface_label()), role)
     }
 
+    pub fn for_definition(definition: &AgentDefinition) -> Self {
+        Self::default_for_role(definition.role.clone())
+            .with_allowed_tools(definition.tool_surface.allow_tools.iter().cloned())
+            .with_denied_tools(definition.tool_surface.deny_tools.iter().cloned())
+    }
+
     pub fn surface_id(&self) -> &str {
         &self.surface_id
     }
@@ -8102,7 +8128,7 @@ impl<M: InteractionModel> Agent<M> {
         let provider = provider.into();
         let model_id = model_id.into();
         let config = AgentConfig::new(provider, model_id);
-        let tool_surface = AgentToolSurface::default_for_role(config.definition.role.clone());
+        let tool_surface = AgentToolSurface::for_definition(&config.definition);
         Self {
             model,
             config,
@@ -8121,21 +8147,29 @@ impl<M: InteractionModel> Agent<M> {
         }
     }
 
-    pub fn with_config(mut self, config: AgentConfig) -> Self {
-        let previous_default_surface =
-            AgentToolSurface::default_for_role(self.config.definition.role.clone());
+    pub fn with_config(mut self, mut config: AgentConfig) -> Self {
+        if config.context_budget == AgentContextBudget::default() {
+            config.context_budget = AgentContextBudget::for_loaded_model(
+                &config.provider,
+                &config.model,
+                config.max_output_tokens,
+            );
+        }
+        let previous_default_surface = AgentToolSurface::for_definition(&self.config.definition);
         if self.tool_surface == previous_default_surface {
-            self.tool_surface = AgentToolSurface::default_for_role(config.definition.role.clone());
+            self.tool_surface = AgentToolSurface::for_definition(&config.definition);
+        }
+        if self.compactor == AgentCompactor::default() {
+            self.compactor.retained_tail_count = config.definition.compaction.retained_tail_items;
         }
         self.config = config;
         self
     }
 
     pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
-        let previous_default_surface =
-            AgentToolSurface::default_for_role(self.config.definition.role.clone());
+        let previous_default_surface = AgentToolSurface::for_definition(&self.config.definition);
         if self.tool_surface == previous_default_surface {
-            self.tool_surface = AgentToolSurface::default_for_role(definition.role.clone());
+            self.tool_surface = AgentToolSurface::for_definition(&definition);
         }
         if self.compactor == AgentCompactor::default() {
             self.compactor.retained_tail_count = definition.compaction.retained_tail_items;
@@ -12148,7 +12182,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_config_defaults_to_unlimited_runtime_limits() {
+    fn agent_config_defaults_to_model_derived_context_bounds() {
         let config = AgentConfig::new("fake", "fake");
 
         assert_eq!(config.definition.name, "main-agent");
@@ -12180,8 +12214,29 @@ mod tests {
             config.async_update_max_bytes,
             Some(DEFAULT_ASYNC_UPDATE_BYTES)
         );
-        assert_eq!(config.context_budget.max_context_bytes, None);
-        assert_eq!(config.context_budget.compaction_threshold_bytes(), None);
+        assert_eq!(
+            config.context_budget.max_context_bytes,
+            Some((DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS - 1600) * 4)
+        );
+        assert!(config.context_budget.compaction_threshold_bytes().is_some());
+    }
+
+    #[test]
+    fn agent_normalizes_legacy_unbounded_context_config_before_execution() {
+        let mut config = AgentConfig::new("fake", "fake");
+        config.context_budget = AgentContextBudget::default();
+
+        let agent = Agent::new(SequencedModel::new(Vec::<String>::new()), "fake", "fake")
+            .with_config(config);
+
+        assert!(agent.config.context_budget.max_context_bytes.is_some());
+        assert!(
+            agent
+                .config
+                .context_budget
+                .compaction_threshold_bytes()
+                .is_some()
+        );
     }
 
     #[test]
@@ -12548,6 +12603,55 @@ mod tests {
             retained_tail_items: Some(8),
         };
         assert_eq!(custom.compaction_threshold_bytes(), Some(5_000));
+
+        let unknown = AgentContextBudget::for_loaded_model("unknown", "unknown", Some(1_600));
+        assert_eq!(
+            unknown.max_context_bytes,
+            Some((DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS - 1_600) * 4)
+        );
+    }
+
+    #[test]
+    fn package_tool_allow_and_deny_lists_drive_the_runtime_surface() {
+        let mut definition =
+            AgentDefinition::custom("restricted-agent", AgentRole::Deliberation, "Stay bounded.");
+        definition.tool_surface.allow_tools = vec!["memory_read".to_string()];
+        definition.tool_surface.deny_tools = vec!["run_command".to_string()];
+        definition.compaction.retained_tail_items = Some(7);
+        let config = AgentConfig::new("fake", "fake").with_agent_definition(definition.clone());
+        let agent = Agent::new(SequencedModel::new(Vec::<String>::new()), "fake", "fake")
+            .with_config(config);
+        let call = |tool: &str| AgentToolCall {
+            call_id: None,
+            tool: tool.to_string(),
+            input: serde_json::json!({}),
+            r#async: false,
+            summary: String::new(),
+        };
+
+        assert_eq!(
+            agent.tool_surface,
+            AgentToolSurface::for_definition(&definition)
+        );
+        assert_eq!(agent.compactor.retained_tail_count, Some(7));
+        assert!(
+            agent
+                .tool_surface
+                .evaluate_tool_call(None, &call("memory_read"))
+                .allowed
+        );
+        assert!(
+            !agent
+                .tool_surface
+                .evaluate_tool_call(None, &call("run_command"))
+                .allowed
+        );
+        assert!(
+            !agent
+                .tool_surface
+                .evaluate_tool_call(None, &call("memory_write"))
+                .allowed
+        );
     }
 
     #[test]
@@ -16912,7 +17016,7 @@ mod tests {
             .join("\n");
         assert!(request_text.contains("\"truncated\": true"));
         assert!(!request_text.contains(tail), "{request_text}");
-        assert_eq!(context.budget_estimate.max_context_bytes, None);
+        assert!(context.budget_estimate.max_context_bytes.is_some());
     }
 
     #[test]
@@ -16938,7 +17042,7 @@ mod tests {
         assert_eq!(context.loaded_instruction_files[0].original_bytes, None);
         assert!(!context.loaded_instruction_files[0].truncated);
         assert_eq!(context.loaded_instruction_files[0].content, content);
-        assert_eq!(context.budget_estimate.max_context_bytes, None);
+        assert!(context.budget_estimate.max_context_bytes.is_some());
     }
 
     #[test]

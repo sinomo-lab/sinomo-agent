@@ -70,13 +70,35 @@ Built-in packages use built-in provenance. Custom and imported package
 definitions are cluster-wide agent configuration and are stored in SIFS under
 `/services/sinomo/agents/*.json`; the importing node only contributes the source
 path recorded in provenance. Module-projected packages receive module provenance
-from the module registration id and version.
+from the module registration id and version. The four built-in ids are reserved
+principals: stored, imported, and module-projected packages cannot replace them.
+This is an identity boundary because the definition id also selects durable
+session-history and memory namespaces.
 
 Package validation rejects malformed ids, package versions, duplicate tools,
 invalid tool names, invalid tool-surface entries, invalid skills, invalid
 context providers, blank model preferences, invalid temperatures, conflicting
 legacy/model-policy fields, zero runtime limits, and unknown context or
 compaction strategies before the package enters the catalog.
+
+Package policy is enforced at runtime, not treated as advisory metadata:
+
+- toolset visibility feeds planning and package allow/deny lists feed the
+  pre-execution `AgentToolSurface`;
+- provider/model preferences select the runtime model unless an explicit CLI
+  override owns that selection;
+- temperature, output limits, runtime caps, compaction tail, and output format
+  feed the corresponding runtime controls;
+- home-server and sandbox-node preferences are accepted only when the selected
+  execution path can honor them; the current local chat/CLI path rejects remote
+  placement until remote agent routing exists;
+- unknown context/compaction strategies are rejected, and non-empty context
+  provider or vendor-option extensions are rejected until an executor exists.
+
+Every `AgentConfig` also receives a model-derived per-turn context-byte bound.
+Known models use `sinomo-lm` context-window metadata; unknown models use a
+conservative 32K-token fallback. The model output allowance is reserved before
+the 80-percent compaction threshold is calculated.
 
 ## Skill Catalog
 
@@ -511,15 +533,19 @@ helpers rather than a public process flag.
 
 ## Background Agent and Cluster Operations
 
-The main and background agents are logical roles. The current generic runtime
-supports both through packages and tool surfaces.
+Agent roles determine their product exposure. `main` and `deliberation` packages
+are available to interactive chat selectors. `background` and `evolution`
+packages are intentionally hidden and rejected by interactive switching because
+their authority and lifecycle belong to dedicated background/service and
+self-evolution paths. Package inspection and validation surfaces still show all
+four roles.
 
 Main-agent defaults:
 
 - user-facing interaction;
 - session/task state tracking;
 - local live inference when available;
-- handoff of cluster maintenance by default;
+- typed background-handoff requests when a dispatcher is available;
 - bounded direct workspace work when visible tools allow it.
 
 Background-agent defaults:

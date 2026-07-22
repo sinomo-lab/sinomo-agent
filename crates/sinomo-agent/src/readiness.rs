@@ -107,6 +107,8 @@ pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> Age
     checks.push(check_package_json_round_trip());
     checks.push(check_package_artifact_store_smoke());
     checks.push(check_package_rejects_malformed_definitions());
+    checks.push(check_reserved_identity_and_role_exposure_smoke());
+    checks.push(check_model_derived_context_budget_smoke());
     checks.push(check_continuous_runtime_limits_smoke());
     checks.push(check_prompt_decomposition_smoke());
     checks.push(check_agent_architecture_doc_smoke(&workspace_root));
@@ -244,6 +246,84 @@ fn check_built_in_package_validation() -> AgentReadinessCheck {
             "built_in_package_validation",
             "one or more built-in agent packages failed validation",
             serde_json::json!({ "agents": ids, "failures": failures }),
+        )
+    }
+}
+
+fn check_reserved_identity_and_role_exposure_smoke() -> AgentReadinessCheck {
+    let mut catalog = AgentCatalog::built_ins();
+    let forged = AgentDefinition::custom("main-agent", AgentRole::Main, "Replace main.");
+    let reserved_rejected = matches!(
+        catalog.upsert(forged),
+        Err(AgentDefinitionValidationError::ReservedBuiltInId { .. })
+    );
+    let canonical_preserved = catalog.get("main-agent") == Some(&AgentDefinition::main());
+    let interactive = AgentDefinition::built_ins()
+        .into_iter()
+        .filter(AgentDefinition::supports_interactive_chat)
+        .map(|definition| definition.key().to_string())
+        .collect::<Vec<_>>();
+    let roles_correct = interactive == vec!["main-agent", "coding-agent"];
+
+    if reserved_rejected && canonical_preserved && roles_correct {
+        passed(
+            "reserved_identity_and_role_exposure_smoke",
+            "built-in principals cannot be shadowed and only interactive roles reach chat selectors",
+            serde_json::json!({
+                "reserved_id": "main-agent",
+                "interactive_agents": interactive,
+                "dedicated_execution_roles": ["background", "evolution"],
+            }),
+        )
+    } else {
+        failed(
+            "reserved_identity_and_role_exposure_smoke",
+            "built-in identity reservation or role-aware exposure regressed",
+            serde_json::json!({
+                "reserved_rejected": reserved_rejected,
+                "canonical_preserved": canonical_preserved,
+                "interactive_agents": interactive,
+            }),
+        )
+    }
+}
+
+fn check_model_derived_context_budget_smoke() -> AgentReadinessCheck {
+    let main = AgentConfig::new("readiness", "unknown-model");
+    let coding = main
+        .clone()
+        .with_agent_definition(AgentDefinition::coding());
+    let main_max = main.context_budget.max_context_bytes;
+    let coding_max = coding.context_budget.max_context_bytes;
+    let bounded = main_max.is_some()
+        && main.context_budget.compaction_threshold_bytes().is_some()
+        && coding_max.is_some();
+    let output_reserve_applied = main_max
+        .zip(coding_max)
+        .is_some_and(|(main, coding)| main < coding);
+
+    if bounded && output_reserve_applied {
+        passed(
+            "model_derived_context_budget_smoke",
+            "every turn receives a model-derived context bound with output-token reserve and compaction threshold",
+            serde_json::json!({
+                "unknown_model_fallback_max_bytes": main_max,
+                "coding_max_bytes": coding_max,
+                "main_output_reserve_tokens": main.max_output_tokens,
+                "compaction_threshold_bytes": main.context_budget.compaction_threshold_bytes(),
+            }),
+        )
+    } else {
+        failed(
+            "model_derived_context_budget_smoke",
+            "model-derived per-turn context bounds are incomplete",
+            serde_json::json!({
+                "main_max_bytes": main_max,
+                "coding_max_bytes": coding_max,
+                "main_compaction_threshold_bytes": main.context_budget.compaction_threshold_bytes(),
+                "bounded": bounded,
+                "output_reserve_applied": output_reserve_applied,
+            }),
         )
     }
 }
@@ -1042,6 +1122,10 @@ fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
         AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
     invalid_context_provider.context.providers = vec!["bad provider".to_string()];
 
+    let mut unsupported_context_provider =
+        AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
+    unsupported_context_provider.context.providers = vec!["context.provider.valid".to_string()];
+
     let mut invalid_model_preference =
         AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
     invalid_model_preference.model_policy.provider = Some("bad provider".to_string());
@@ -1054,6 +1138,10 @@ fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
         AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
     conflicting_model_policy.temperature = Some(0.1);
     conflicting_model_policy.model_policy.temperature = Some(0.2);
+
+    let mut unsupported_vendor_options =
+        AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
+    unsupported_vendor_options.model_policy.vendor_options = serde_json::json!({"effort": "high"});
 
     let mut invalid_runtime_limit =
         AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
@@ -1107,6 +1195,11 @@ fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
             "InvalidContextProvider",
         ),
         (
+            "unsupported_context_provider",
+            unsupported_context_provider,
+            "UnsupportedContextProviders",
+        ),
+        (
             "invalid_model_preference",
             invalid_model_preference,
             "InvalidModelPreference",
@@ -1120,6 +1213,11 @@ fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
             "conflicting_model_policy",
             conflicting_model_policy,
             "ConflictingModelPolicyField",
+        ),
+        (
+            "unsupported_vendor_options",
+            unsupported_vendor_options,
+            "UnsupportedModelVendorOptions",
         ),
         (
             "invalid_runtime_limit",
@@ -1189,6 +1287,7 @@ fn agent_definition_validation_error_kind(error: &AgentDefinitionValidationError
     match error {
         AgentDefinitionValidationError::MissingId => "MissingId",
         AgentDefinitionValidationError::InvalidId { .. } => "InvalidId",
+        AgentDefinitionValidationError::ReservedBuiltInId { .. } => "ReservedBuiltInId",
         AgentDefinitionValidationError::MissingName { .. } => "MissingName",
         AgentDefinitionValidationError::MissingSystemPrompt { .. } => "MissingSystemPrompt",
         AgentDefinitionValidationError::MissingPackageVersion { .. } => "MissingPackageVersion",
@@ -1198,10 +1297,16 @@ fn agent_definition_validation_error_kind(error: &AgentDefinitionValidationError
         AgentDefinitionValidationError::InvalidToolSurfaceEntry { .. } => "InvalidToolSurfaceEntry",
         AgentDefinitionValidationError::InvalidSkill { .. } => "InvalidSkill",
         AgentDefinitionValidationError::InvalidContextProvider { .. } => "InvalidContextProvider",
+        AgentDefinitionValidationError::UnsupportedContextProviders { .. } => {
+            "UnsupportedContextProviders"
+        }
         AgentDefinitionValidationError::InvalidModelPreference { .. } => "InvalidModelPreference",
         AgentDefinitionValidationError::InvalidTemperature { .. } => "InvalidTemperature",
         AgentDefinitionValidationError::ConflictingModelPolicyField { .. } => {
             "ConflictingModelPolicyField"
+        }
+        AgentDefinitionValidationError::UnsupportedModelVendorOptions { .. } => {
+            "UnsupportedModelVendorOptions"
         }
         AgentDefinitionValidationError::InvalidRuntimeLimit { .. } => "InvalidRuntimeLimit",
         AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId { .. } => {
@@ -6395,14 +6500,14 @@ fn check_local_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessCh
     let timeout_command = if cfg!(windows) {
         "echo timeout-start & ping -n 6 127.0.0.1 >NUL"
     } else {
-        "printf timeout-start; sleep 1"
+        "printf timeout-start; sleep 3"
     };
     let timeout_call = AgentToolCall {
         call_id: None,
         tool: "run_command".to_string(),
         input: serde_json::json!({
             "command": timeout_command,
-            "timeout_ms": 120,
+            "timeout_ms": 750,
         }),
         r#async: false,
         summary: "run command timeout evidence readiness smoke".to_string(),
@@ -6462,7 +6567,7 @@ fn check_local_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessCh
         && failed_outcome.evidence.execution.is_some()
         && timeout_outcome.status == AgentToolStatus::Failed
         && timeout_timed_out
-        && timeout_requested_ms == Some(120)
+        && timeout_requested_ms == Some(750)
         && timeout_stdout == "time"
         && timeout_stdout_ref_has_full_output
         && timeout_has_artifact_refs

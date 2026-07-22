@@ -3358,7 +3358,10 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
         TuiSlashCommand::Agent(TuiAgentCommand::List) => {
             let catalog = load_tui_agent_catalog(data_dir)?;
             let mut outputs = Vec::new();
-            for definition in catalog.list() {
+            for definition in catalog
+                .list()
+                .filter(|definition| definition.supports_interactive_chat())
+            {
                 outputs.push(InteractionOutput::Line(format!(
                     "{} [{}] - {}",
                     definition.key(),
@@ -6746,7 +6749,30 @@ mod tui_tests {
     }
 
     #[test]
-    fn tui_agent_switch_replaces_active_handler_definition() {
+    fn tui_agent_switch_applies_package_model_preference() {
+        let root = temp_file_browser_root("agent-model-policy-switch");
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let mut definition =
+            AgentDefinition::custom("review-agent", AgentRole::Deliberation, "Review changes.");
+        definition.model_policy.provider = Some("codex".to_string());
+        definition.model_policy.model = Some("gpt-5".to_string());
+
+        let info = handler
+            .switch_tui_agent(&data_dir, false, definition)
+            .expect("switch agent and model");
+
+        assert_eq!(info.agent, "review-agent");
+        assert_eq!(info.provider, "codex");
+        assert_eq!(info.model, "gpt-5");
+    }
+
+    #[test]
+    fn tui_agent_switch_rejects_roles_without_interactive_execution() {
         let root = temp_file_browser_root("agent-switch");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
         let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
@@ -6757,12 +6783,16 @@ mod tui_tests {
         let definition =
             AgentDefinition::custom("ops-agent", AgentRole::Background, "Handle ops status.");
 
-        let info = handler
+        let error = handler
             .switch_tui_agent(&data_dir, false, definition)
-            .expect("switch");
+            .expect_err("background roles must use the background executor");
 
-        assert_eq!(info.agent, "ops-agent");
-        assert_eq!(handler.tui_agent_runtime_info().agent, "ops-agent");
+        assert!(
+            error
+                .to_string()
+                .contains("not available on interactive chat surfaces")
+        );
+        assert_eq!(handler.tui_agent_runtime_info().agent, "main-agent");
     }
 
     #[test]
@@ -8101,6 +8131,15 @@ where
         definition.validate().map_err(|source| CliError::Parse {
             detail: source.to_string(),
         })?;
+        if !definition.supports_interactive_chat() {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent `{}` has role `{:?}` and is not available on interactive chat surfaces",
+                    definition.key(),
+                    definition.role
+                ),
+            });
+        }
         Ok(definition)
     }
 
@@ -8489,6 +8528,18 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         rebind_agent_identity: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         let definition = self.validate_agent_definition(definition)?;
+        if let Ok(state) = read_cluster_state(&ClusterPaths::new(data_dir)) {
+            validate_agent_local_placement(&definition, &state.local_node_id)?;
+        } else if definition.placement.home_server_node_id.is_some()
+            || definition.tool_runtime.sandbox_node_id.is_some()
+        {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent `{}` declares node placement, but the local node identity is unavailable",
+                    definition.key()
+                ),
+            });
+        }
         // Build every fallible principal-bound executor before changing the
         // live definition/session. The model switch removes the old bundle
         // while the runtime-control route is detached, then publishes the new
@@ -8498,14 +8549,30 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 AgentRecallToolTransition::stage(data_dir, &self.agent_definition, &definition)
             })
             .transpose()?;
-        let previous_definition = std::mem::replace(&mut self.agent_definition, definition);
-        let selection = TuiModelSelection {
-            provider: self.provider.clone(),
-            model: self.model_name.clone(),
-            account: self
-                .account
+        let previous_definition = std::mem::replace(&mut self.agent_definition, definition.clone());
+        let provider = definition
+            .model_policy
+            .provider
+            .clone()
+            .unwrap_or_else(|| self.provider.clone());
+        let model = definition.model_policy.model.clone().unwrap_or_else(|| {
+            if provider == self.provider {
+                self.model_name.clone()
+            } else {
+                sinomo_lm::PROVIDER_DEFAULT_MODEL.to_string()
+            }
+        });
+        let account = if provider == self.provider {
+            self.account
                 .clone()
-                .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+                .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string())
+        } else {
+            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()
+        };
+        let selection = TuiModelSelection {
+            provider,
+            model,
+            account,
         };
         match self.switch_to_selection_with_agent_rebind(
             data_dir,
