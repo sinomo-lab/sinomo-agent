@@ -774,6 +774,40 @@ fn linux_process_start_time_ticks(process_id: u32) -> Option<u64> {
     fields.skip(19).next()?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
+fn linux_process_state_and_group(stat: &str) -> Option<(char, i32)> {
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    fields.next()?;
+    let process_group_id = fields.next()?.parse().ok()?;
+    Some((state, process_group_id))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_members(process_group_id: i32) -> Option<bool> {
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let Some(process_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let (state, observed_process_group_id) = linux_process_state_and_group(&stat)?;
+        if observed_process_group_id == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn linux_process_start_time_ticks(_process_id: u32) -> Option<u64> {
     None
@@ -801,6 +835,9 @@ fn cleanup_linux_process_group(
     if probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
         return Ok(());
     }
+    if linux_process_group_has_live_members(process_group_id) == Some(false) {
+        return Ok(());
+    }
     unsafe {
         libc::kill(group, libc::SIGKILL);
     }
@@ -808,6 +845,9 @@ fn cleanup_linux_process_group(
     loop {
         let result = unsafe { libc::kill(group, 0) };
         if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        if linux_process_group_has_live_members(process_group_id) == Some(false) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -941,6 +981,25 @@ fn local_execution_io_error(path: &Path, source: impl std::fmt::Display) -> Sand
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_group_liveness_ignores_zombies_but_not_live_members() {
+        assert_eq!(
+            linux_process_state_and_group("123 (sleep worker) Z 1 77 77 0"),
+            Some(('Z', 77))
+        );
+        assert_eq!(
+            linux_process_state_and_group("124 (sleep worker) S 1 77 77 0"),
+            Some(('S', 77))
+        );
+        let current_process_group = unsafe { libc::getpgrp() };
+        assert_eq!(
+            linux_process_group_has_live_members(current_process_group),
+            Some(true)
+        );
+        assert_eq!(linux_process_group_has_live_members(i32::MAX), Some(false));
+    }
 
     fn create_sandbox(
         root: &sinomo_testdir::TestDir,

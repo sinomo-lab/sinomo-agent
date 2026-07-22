@@ -1147,6 +1147,10 @@ fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
         AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
     invalid_runtime_limit.runtime_limits.max_steps = Some(0);
 
+    let exhausted_context_window =
+        AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.")
+            .with_max_output_tokens(Some(32 * 1024));
+
     let mut invalid_tool_call_limit =
         AgentDefinition::custom("malformed-agent", AgentRole::Main, "Be helpful.");
     invalid_tool_call_limit
@@ -1223,6 +1227,11 @@ fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
             "invalid_runtime_limit",
             invalid_runtime_limit,
             "InvalidRuntimeLimit",
+        ),
+        (
+            "exhausted_context_window",
+            exhausted_context_window,
+            "OutputReserveExhaustsContextWindow",
         ),
         (
             "invalid_tool_call_limit",
@@ -1309,6 +1318,9 @@ fn agent_definition_validation_error_kind(error: &AgentDefinitionValidationError
             "UnsupportedModelVendorOptions"
         }
         AgentDefinitionValidationError::InvalidRuntimeLimit { .. } => "InvalidRuntimeLimit",
+        AgentDefinitionValidationError::OutputReserveExhaustsContextWindow { .. } => {
+            "OutputReserveExhaustsContextWindow"
+        }
         AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId { .. } => {
             "InvalidSandboxRuntimeNodeId"
         }

@@ -1131,6 +1131,7 @@ fn sandbox_active_cancel_prerequisite_missing(detail: &str) -> bool {
         || detail.contains("toolchain is not signed")
         || detail.contains("command-capability-unsupported")
         || detail.contains("requires a real child-process execution substrate")
+        || detail.contains("daemon-hosted dynamic sifs wasix commands were removed")
         || detail.contains("sandbox filesystem unavailable")
         || detail.contains("routed namespace journal replay failed")
         || detail.contains("duplicate dfs write intent")
@@ -1218,6 +1219,9 @@ mod tests {
         assert!(sandbox_active_cancel_prerequisite_missing(detail));
 
         let detail = "sandbox filesystem unavailable: DFS error: distributed DFS error: routed namespace journal replay failed: distributed DFS error: duplicate DFS write intent for object at version";
+        assert!(sandbox_active_cancel_prerequisite_missing(detail));
+
+        let detail = "daemon-hosted dynamic SIFS WASIX commands were removed; execute through direct-SIFS WASIX or the live DFS/FUSE simple sandbox";
         assert!(sandbox_active_cancel_prerequisite_missing(detail));
     }
 }
