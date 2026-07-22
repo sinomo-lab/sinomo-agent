@@ -1075,6 +1075,14 @@ pub enum AgentDefinitionValidationError {
     UnsupportedModelVendorOptions { id: String },
     #[error("agent definition `{id}` has invalid runtime limit `{field}`")]
     InvalidRuntimeLimit { id: String, field: String },
+    #[error(
+        "agent definition `{id}` reserves {max_output_tokens} output tokens, leaving no input capacity in the resolved {context_window_tokens}-token model window"
+    )]
+    OutputReserveExhaustsContextWindow {
+        id: String,
+        max_output_tokens: u32,
+        context_window_tokens: usize,
+    },
     #[error("agent definition `{id}` has invalid sandbox runtime node id `{node_id}`")]
     InvalidSandboxRuntimeNodeId { id: String, node_id: String },
     #[error("agent definition `{id}` has invalid home server node id `{node_id}`")]
@@ -1256,6 +1264,24 @@ impl AgentDefinitionValidator {
                     field: "max_output_tokens".to_string(),
                 },
             );
+        }
+        if let Some(max_output_tokens) = definition
+            .max_output_tokens
+            .or(definition.model_policy.max_output_tokens)
+        {
+            let provider = definition.model_policy.provider.as_deref().unwrap_or("");
+            let model = definition.model_policy.model.as_deref().unwrap_or("");
+            let context_window_tokens =
+                agent::resolved_model_context_window_tokens(provider, model);
+            if max_output_tokens as usize >= context_window_tokens {
+                return Err(
+                    AgentDefinitionValidationError::OutputReserveExhaustsContextWindow {
+                        id: id.to_string(),
+                        max_output_tokens,
+                        context_window_tokens,
+                    },
+                );
+            }
         }
         if let Some(max_steps) = definition.runtime_limits.max_steps
             && max_steps == 0
@@ -3186,6 +3212,27 @@ mod tests {
         assert!(matches!(
             error,
             AgentDefinitionValidationError::InvalidRuntimeLimit { .. }
+        ));
+
+        let definition =
+            AgentDefinition::custom("large-output-agent", AgentRole::Main, "Be helpful.")
+                .with_max_output_tokens(Some(30_000));
+        definition
+            .validate()
+            .expect("output reserve below the conservative unknown-model window validates");
+
+        let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_max_output_tokens(Some(32 * 1024));
+        let error = definition
+            .validate()
+            .expect_err("output reserve must leave input capacity");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::OutputReserveExhaustsContextWindow {
+                max_output_tokens: 32_768,
+                context_window_tokens: 32_768,
+                ..
+            }
         ));
 
         let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")

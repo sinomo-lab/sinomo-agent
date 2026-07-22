@@ -81,8 +81,7 @@ impl Default for AgentContextBudget {
 
 impl AgentContextBudget {
     pub fn for_loaded_model(provider: &str, model: &str, max_output_tokens: Option<u32>) -> Self {
-        let window_tokens = inferred_model_context_window_tokens(provider, model)
-            .unwrap_or(DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+        let window_tokens = resolved_model_context_window_tokens(provider, model);
         Self {
             max_context_bytes: Some(context_max_bytes_for_window(
                 window_tokens,
@@ -107,10 +106,13 @@ impl AgentContextBudget {
 
 fn context_max_bytes_for_window(window_tokens: usize, max_output_tokens: Option<u32>) -> usize {
     let output_reserve = max_output_tokens.unwrap_or_default() as usize;
-    let input_tokens = window_tokens
-        .saturating_sub(output_reserve)
-        .max(window_tokens / 2);
+    let input_tokens = window_tokens.saturating_sub(output_reserve);
     input_tokens.saturating_mul(CONTEXT_ESTIMATE_BYTES_PER_TOKEN)
+}
+
+pub(crate) fn resolved_model_context_window_tokens(provider: &str, model: &str) -> usize {
+    inferred_model_context_window_tokens(provider, model)
+        .unwrap_or(DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS)
 }
 
 fn is_false(value: &bool) -> bool {
@@ -12219,6 +12221,17 @@ mod tests {
             Some((DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS - 1600) * 4)
         );
         assert!(config.context_budget.compaction_threshold_bytes().is_some());
+    }
+
+    #[test]
+    fn unknown_model_context_budget_fully_reserves_requested_output() {
+        let budget =
+            AgentContextBudget::for_loaded_model("unknown-provider", "unknown-model", Some(30_000));
+
+        assert_eq!(
+            budget.max_context_bytes,
+            Some((DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS - 30_000) * 4)
+        );
     }
 
     #[test]
