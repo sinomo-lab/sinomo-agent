@@ -13,8 +13,147 @@ use sinomo_network::NetworkError;
 use sinomo_network::cleanup_member_endpoint_duplicates;
 use sinomo_network::{ClusterConnectivityRecord, cluster_network_record_live};
 use sinomo_node::{ClusterCapabilityPolicyRecord, NodeId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use time::OffsetDateTime;
+
+const MAX_CLUSTER_DIRECTORY_PROJECTION_CACHE_ENTRIES: usize = 128;
+
+static CLUSTER_DIRECTORY_PROJECTION_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_DIRECTORY_PROJECTIONS: LazyLock<
+    Mutex<HashMap<PathBuf, ClusterDirectoryProjectionCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct ClusterDirectoryProjection {
+    members: Vec<ClusterMemberRecord>,
+    endpoints: Vec<ClusterEndpointRecord>,
+    connectivity_records: Vec<ClusterConnectivityRecord>,
+}
+
+impl ClusterDirectoryProjection {
+    fn live_connectivity_records(&self, now: OffsetDateTime) -> Vec<ClusterConnectivityRecord> {
+        self.connectivity_records
+            .iter()
+            .filter(|record| cluster_network_record_live(record.expires_at, now))
+            .cloned()
+            .collect()
+    }
+}
+
+struct ClusterDirectoryProjectionCacheEntry {
+    snapshot: Arc<KvSnapshot>,
+    mark: blake3::Hash,
+    projection: Arc<ClusterDirectoryProjection>,
+    last_used: u64,
+}
+
+fn cluster_directory_projection_cache_tick() -> u64 {
+    CLUSTER_DIRECTORY_PROJECTION_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn cluster_directory_projection_mark(snapshot: &KvSnapshot) -> Result<blake3::Hash, NetworkError> {
+    const ROUTE_PREFIXES: [&str; 4] = [
+        "/cluster/members/",
+        "/cluster/endpoints/",
+        "/cluster/policy/capabilities/",
+        "/cluster/network/connectivity/",
+    ];
+    let mut hasher = blake3::Hasher::new();
+    for prefix in ROUTE_PREFIXES {
+        hasher.update(&(prefix.len() as u64).to_le_bytes());
+        hasher.update(prefix.as_bytes());
+        for (index, entry) in snapshot.prefix_entries(prefix).enumerate() {
+            if index >= CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+                return Err(NetworkError::Directory {
+                    detail: format!(
+                        "cluster directory projection prefix {prefix} exceeds the {} entry limit",
+                        CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES
+                    ),
+                });
+            }
+            hasher.update(&(entry.key.len() as u64).to_le_bytes());
+            hasher.update(entry.key.as_bytes());
+            hasher.update(&(entry.value.len() as u64).to_le_bytes());
+            hasher.update(&entry.value);
+        }
+    }
+    Ok(hasher.finalize())
+}
+
+fn read_cluster_directory_projection(
+    paths: &ClusterPaths,
+    snapshot: Arc<KvSnapshot>,
+) -> Result<Arc<ClusterDirectoryProjection>, NetworkError> {
+    if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
+        && let Some(entry) = cache.get_mut(&paths.root)
+        && Arc::ptr_eq(&entry.snapshot, &snapshot)
+    {
+        entry.last_used = cluster_directory_projection_cache_tick();
+        return Ok(Arc::clone(&entry.projection));
+    }
+
+    // Most cluster-KV revisions touch application or control-plane keys that do
+    // not affect routing. Hash the exact serialized route inputs so those
+    // revisions can retain the decoded projection while still invalidating on
+    // any membership, endpoint, capability, or connectivity change.
+    let mark = cluster_directory_projection_mark(snapshot.as_ref())?;
+    if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
+        && let Some(entry) = cache.get_mut(&paths.root)
+        && entry.mark == mark
+    {
+        entry.snapshot = snapshot;
+        entry.last_used = cluster_directory_projection_cache_tick();
+        return Ok(Arc::clone(&entry.projection));
+    }
+
+    let projection = Arc::new(ClusterDirectoryProjection {
+        members: read_cluster_members_from_snapshot(snapshot.as_ref())?,
+        endpoints: read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
+            .into_values()
+            .flatten()
+            .collect(),
+        // Keep the decoded records, not their time-dependent live view. Route
+        // capture filters lease expiry on every call below.
+        connectivity_records: read_all_cluster_connectivity_records_from_snapshot(
+            snapshot.as_ref(),
+        )?,
+    });
+
+    let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() else {
+        return Ok(projection);
+    };
+    // Another reader may have populated this exact generation while the
+    // projection was decoded outside the cache lock. Reuse its allocation.
+    if let Some(entry) = cache.get_mut(&paths.root)
+        && entry.mark == mark
+    {
+        entry.snapshot = snapshot;
+        entry.last_used = cluster_directory_projection_cache_tick();
+        return Ok(Arc::clone(&entry.projection));
+    }
+    if !cache.contains_key(&paths.root)
+        && cache.len() >= MAX_CLUSTER_DIRECTORY_PROJECTION_CACHE_ENTRIES
+        && let Some(eviction_path) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(path, _)| path.clone())
+    {
+        cache.remove(&eviction_path);
+    }
+    cache.insert(
+        paths.root.clone(),
+        ClusterDirectoryProjectionCacheEntry {
+            snapshot,
+            mark,
+            projection: Arc::clone(&projection),
+            last_used: cluster_directory_projection_cache_tick(),
+        },
+    );
+    Ok(projection)
+}
 
 pub fn read_cluster_members_from_kv(
     paths: &ClusterPaths,
@@ -215,6 +354,17 @@ fn read_cluster_connectivity_graph_from_snapshot(
     snapshot: &KvSnapshot,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let now = OffsetDateTime::now_utc();
+    Ok(
+        read_all_cluster_connectivity_records_from_snapshot(snapshot)?
+            .into_iter()
+            .filter(|record| cluster_network_record_live(record.expires_at, now))
+            .collect(),
+    )
+}
+
+fn read_all_cluster_connectivity_records_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in snapshot
         .range_prefix_limited(
@@ -224,9 +374,7 @@ fn read_cluster_connectivity_graph_from_snapshot(
         .map_err(kv_err)?
     {
         let record: ClusterConnectivityRecord = entry.decode().map_err(kv_err)?;
-        if cluster_network_record_live(record.expires_at, now) {
-            records.push(record);
-        }
+        records.push(record);
     }
     records.sort_by(|left, right| {
         (
@@ -309,15 +457,12 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
                 Vec::new(),
             ));
         };
-        let members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
-        let endpoints = read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
-            .into_values()
-            .flatten()
-            .collect();
+        let version = sinomo_network::DirectoryVersion(snapshot.revision.0);
+        let projection = read_cluster_directory_projection(&self.paths, snapshot)?;
         Ok(sinomo_network::DirectoryRecordsSnapshot::new(
-            sinomo_network::DirectoryVersion(snapshot.revision.0),
-            members,
-            endpoints,
+            version,
+            projection.members.clone(),
+            projection.endpoints.clone(),
         ))
     }
 
@@ -333,18 +478,13 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
                 Vec::new(),
             ));
         };
-        let members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
-        let endpoints = read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
-            .into_values()
-            .flatten()
-            .collect();
-        let connectivity_records =
-            read_cluster_connectivity_graph_from_snapshot(snapshot.as_ref())?;
+        let version = sinomo_network::DirectoryVersion(snapshot.revision.0);
+        let projection = read_cluster_directory_projection(&self.paths, snapshot)?;
         Ok(sinomo_network::DirectoryRoutingRecordsSnapshot::new(
-            sinomo_network::DirectoryVersion(snapshot.revision.0),
-            members,
-            endpoints,
-            connectivity_records,
+            version,
+            projection.members.clone(),
+            projection.endpoints.clone(),
+            projection.live_connectivity_records(OffsetDateTime::now_utc()),
         ))
     }
 }
@@ -353,8 +493,9 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
 mod tests {
     use super::*;
     use crate::keyspace::{cluster_endpoint_key, cluster_member_key};
+    use sinomo_base::ClusterTransportKind;
     use sinomo_kv::{InProcessKvStore, KvCommand, KvOp};
-    use sinomo_network::ClusterDirectory as _;
+    use sinomo_network::{ClusterConnectivityState, ClusterDirectory as _, ClusterEndpointId};
     use sinomo_node::ClusterId;
 
     #[test]
@@ -395,6 +536,107 @@ mod tests {
 
         let endpoints = read_cluster_endpoints_from_snapshot(&snapshot).expect("read endpoints");
         assert_eq!(endpoints.get(&node_id), Some(&vec![public]));
+    }
+
+    #[test]
+    fn directory_projection_cache_reuses_only_equal_route_inputs() {
+        let root = sinomo_testdir::TestDir::new("kv-read-model-directory-projection-cache");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(root.path()));
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_kv_read_model_cache").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_kv_read_model_cache").expect("node");
+        let member =
+            ClusterMemberRecord::local_voter(cluster_id, node_id.clone(), "node", "pk-node", now);
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(cluster_member_key(&node_id), &member, None)
+            .expect("put member");
+        let snapshot = Arc::new(store.try_snapshot().expect("snapshot"));
+
+        let first = read_cluster_directory_projection(&paths, Arc::clone(&snapshot))
+            .expect("first projection");
+        let second = read_cluster_directory_projection(&paths, Arc::clone(&snapshot))
+            .expect("cached projection");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let replacement = Arc::new((*snapshot).clone());
+        let same_route =
+            read_cluster_directory_projection(&paths, replacement).expect("replacement projection");
+        assert!(
+            Arc::ptr_eq(&first, &same_route),
+            "a new snapshot allocation with identical route inputs should reuse the decoded projection"
+        );
+
+        store
+            .put("/tests/unrelated", b"application state".to_vec(), None)
+            .expect("put unrelated state");
+        let unrelated_snapshot = Arc::new(store.try_snapshot().expect("unrelated snapshot"));
+        let unrelated_revision = read_cluster_directory_projection(&paths, unrelated_snapshot)
+            .expect("unrelated revision projection");
+        assert!(
+            Arc::ptr_eq(&first, &unrelated_revision),
+            "an unrelated KV revision should reuse the decoded route projection"
+        );
+
+        let another_node =
+            NodeId::from_legacy_named("node_kv_read_model_cache_changed").expect("another node");
+        let another_member = ClusterMemberRecord::local_non_voting(
+            member.cluster_id.clone(),
+            another_node.clone(),
+            "another node",
+            "pk-another-node",
+            now,
+        );
+        store
+            .put_serde(cluster_member_key(&another_node), &another_member, None)
+            .expect("put changed route member");
+        let changed_snapshot = Arc::new(store.try_snapshot().expect("changed snapshot"));
+        let rebuilt = read_cluster_directory_projection(&paths, changed_snapshot)
+            .expect("changed route projection");
+        assert!(
+            !Arc::ptr_eq(&first, &rebuilt),
+            "a route-relevant KV change must invalidate the decoded projection"
+        );
+    }
+
+    #[test]
+    fn cached_directory_projection_rechecks_connectivity_expiry() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_kv_read_model_expiry").expect("cluster");
+        let source = NodeId::from_legacy_named("node_kv_read_model_expiry_source").expect("source");
+        let target = NodeId::from_legacy_named("node_kv_read_model_expiry_target").expect("target");
+        let record = ClusterConnectivityRecord {
+            cluster_id,
+            source_node_id: source,
+            target_node_id: target,
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_kv_read_model_expiry")
+                .expect("endpoint"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.2:21353".to_string(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(1),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(1),
+        };
+        let projection = ClusterDirectoryProjection {
+            members: Vec::new(),
+            endpoints: Vec::new(),
+            connectivity_records: vec![record.clone()],
+        };
+
+        assert_eq!(projection.live_connectivity_records(now), vec![record]);
+        assert!(
+            projection
+                .live_connectivity_records(now + time::Duration::seconds(2))
+                .is_empty(),
+            "a cache hit must not extend a connectivity lease"
+        );
     }
 
     #[test]
