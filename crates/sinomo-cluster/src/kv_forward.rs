@@ -96,7 +96,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
         .known_kv_state_authority_id(paths, state)
         .ok()
         .flatten();
-    match known_authority_id {
+    let preferred_authority_id = match known_authority_id {
         Some(authority_id)
             if !cluster_node_blocks_leader_preference(paths, state, &authority_id) =>
         {
@@ -104,12 +104,13 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
                 return Ok(None);
             }
             prefer_known_state_authority_node(&mut targets, &authority_id);
+            Some(authority_id)
         }
         _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
             return Ok(None);
         }
-        _ => {}
-    }
+        _ => None,
+    };
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
@@ -134,7 +135,12 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             Ok(response) => return Ok(Some(response)),
             Err(error) => {
                 failures.push(format!("node {target} failed: {error}"));
-                if !cluster_kv_forward_error_allows_next_authority(&error) {
+                if verified_non_leader_rejects_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
+                {
                     return Err(error);
                 }
             }
@@ -165,7 +171,7 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
     if targets.is_empty() {
         return Ok(None);
     }
-    match host
+    let preferred_authority_id = match host
         .known_kv_state_authority_id(paths, state)
         .ok()
         .flatten()
@@ -177,10 +183,11 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
                 return Ok(None);
             }
             prefer_known_state_authority_node(&mut targets, &authority_id);
+            Some(authority_id)
         }
         _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
-        _ => {}
-    }
+        _ => None,
+    };
 
     let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
@@ -198,9 +205,21 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         match host.call_node_object_rpc(state, target, &request, timeout) {
             Ok(response) => {
-                response
+                if let Err(error) = response
                     .error_detail()
-                    .map_err(|error| verified_cluster_non_leader_error(target, error))?;
+                    .map_err(|error| verified_cluster_non_leader_error(target, error))
+                {
+                    failures.push(format!("node {target} failed: {error}"));
+                    if verified_non_leader_rejects_preferred_authority(
+                        &error,
+                        preferred_authority_id.as_ref(),
+                        target,
+                    ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
+                    {
+                        return Err(error);
+                    }
+                    continue;
+                }
                 let read =
                     sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
                         .map_err(kv_err)?;
@@ -267,7 +286,7 @@ where
         .await
         .ok()
         .flatten();
-    match known_authority_id {
+    let preferred_authority_id = match known_authority_id {
         Some(authority_id)
             if !cluster_node_blocks_leader_preference_async(
                 runtime,
@@ -281,12 +300,13 @@ where
                 return Ok(None);
             }
             prefer_known_state_authority_node(&mut targets, &authority_id);
+            Some(authority_id)
         }
         _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
             return Ok(None);
         }
-        _ => {}
-    }
+        _ => None,
+    };
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
@@ -315,7 +335,12 @@ where
             Ok(response) => return Ok(Some(response)),
             Err(error) => {
                 failures.push(format!("node {target} failed: {error}"));
-                if !cluster_kv_forward_error_allows_next_authority(&error) {
+                if verified_non_leader_rejects_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
+                {
                     return Err(error);
                 }
             }
@@ -354,7 +379,7 @@ where
     if targets.is_empty() {
         return Ok(None);
     }
-    match locked_kv_state_authority_id_async(runtime, paths, state)
+    let preferred_authority_id = match locked_kv_state_authority_id_async(runtime, paths, state)
         .await
         .ok()
         .flatten()
@@ -372,10 +397,11 @@ where
                 return Ok(None);
             }
             prefer_known_state_authority_node(&mut targets, &authority_id);
+            Some(authority_id)
         }
         _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
-        _ => {}
-    }
+        _ => None,
+    };
 
     let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
@@ -402,10 +428,22 @@ where
             .await
         {
             Ok(response) if response.body.is_empty() => {
-                response
+                if let Err(error) = response
                     .response
                     .error_detail()
-                    .map_err(|error| verified_cluster_non_leader_error(target, error))?;
+                    .map_err(|error| verified_cluster_non_leader_error(target, error))
+                {
+                    failures.push(format!("node {target} failed: {error}"));
+                    if verified_non_leader_rejects_preferred_authority(
+                        &error,
+                        preferred_authority_id.as_ref(),
+                        target,
+                    ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
+                    {
+                        return Err(error);
+                    }
+                    continue;
+                }
                 let read = sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
                     &response.response.body,
                 )
@@ -447,8 +485,26 @@ fn prefer_known_state_authority_node(targets: &mut Vec<NodeId>, authority_id: &N
     *targets = preferred;
 }
 
-fn cluster_kv_forward_error_allows_next_authority(error: &NetworkError) -> bool {
-    error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent)
+fn cluster_kv_forward_error_allows_next_authority(
+    error: &NetworkError,
+    target_node_id: &NodeId,
+) -> bool {
+    matches!(
+        error,
+        NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == target_node_id
+    ) || error.delivery_state() == Some(NetworkDeliveryState::DefinitelyNotSent)
+}
+
+fn verified_non_leader_rejects_preferred_authority(
+    error: &NetworkError,
+    preferred_authority_id: Option<&NodeId>,
+    target_node_id: &NodeId,
+) -> bool {
+    matches!(
+        error,
+        NetworkError::VerifiedClusterNonLeader { node_id, .. }
+            if node_id == target_node_id && preferred_authority_id == Some(target_node_id)
+    )
 }
 
 async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
@@ -543,6 +599,8 @@ mod tests {
 
     #[test]
     fn kv_forward_does_not_try_another_authority_after_ambiguous_delivery() {
+        let rejected_node =
+            NodeId::from_legacy_named("node_kv_forward_rejected").expect("rejected node");
         let ambiguous = NetworkError::outcome_unknown(
             "cluster KV transaction",
             None,
@@ -554,19 +612,51 @@ mod tests {
             "connect failed",
         );
 
-        assert!(!cluster_kv_forward_error_allows_next_authority(&ambiguous));
-        assert!(cluster_kv_forward_error_allows_next_authority(&not_sent));
+        assert!(!cluster_kv_forward_error_allows_next_authority(
+            &ambiguous,
+            &rejected_node,
+        ));
+        assert!(cluster_kv_forward_error_allows_next_authority(
+            &not_sent,
+            &rejected_node,
+        ));
+        let verified_non_leader = NetworkError::VerifiedClusterNonLeader {
+            node_id: rejected_node.clone(),
+            detail: "target rejected forwarded request as a non-leader".to_string(),
+        };
+        assert!(cluster_kv_forward_error_allows_next_authority(
+            &verified_non_leader,
+            &rejected_node,
+        ));
+        assert!(verified_non_leader_rejects_preferred_authority(
+            &verified_non_leader,
+            Some(&rejected_node),
+            &rejected_node,
+        ));
+        assert!(!verified_non_leader_rejects_preferred_authority(
+            &verified_non_leader,
+            None,
+            &rejected_node,
+        ));
+        let different_node =
+            NodeId::from_legacy_named("node_kv_forward_different").expect("different node");
+        assert!(!cluster_kv_forward_error_allows_next_authority(
+            &verified_non_leader,
+            &different_node,
+        ));
         assert!(!cluster_kv_forward_error_allows_next_authority(
             &NetworkError::Io {
                 operation: "legacy KV forward host".to_string(),
                 detail: "delivery state unavailable".to_string(),
-            }
+            },
+            &rejected_node,
         ));
         assert!(!cluster_kv_forward_error_allows_next_authority(
             &NetworkError::ObjectRpc {
                 route: "/cluster/kv/txn".to_string(),
                 detail: "authority returned a definitive application error".to_string(),
-            }
+            },
+            &rejected_node,
         ));
     }
 
@@ -592,6 +682,36 @@ mod tests {
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
             self.calls = self.calls.saturating_add(1);
+            if request.route == sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE {
+                let snapshot = KvSnapshot {
+                    revision: KvRevision(1),
+                    compacted_revision: KvRevision(0),
+                    entries: Vec::new(),
+                    leases: Vec::new(),
+                    events: Vec::new(),
+                    committed_requests: Vec::new(),
+                    expired_requests: Vec::new(),
+                };
+                let response = KvAuthoritativeRead {
+                    authority: KvAuthorityProof {
+                        term: 1,
+                        commit_index: 1,
+                        revision: snapshot.revision,
+                        basis: KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                    value: snapshot,
+                };
+                let payload =
+                    sinomo_kv::cluster_kv_authoritative_snapshot_response_rpc_payload(&response)
+                        .expect("authoritative response payload");
+                return Ok(ObjectRpcResponse::from_encoded_body(
+                    payload.route,
+                    payload.body,
+                ));
+            }
             if request.route == sinomo_kv::CLUSTER_KV_TXN_ROUTE {
                 let submitted = sinomo_kv::decode_cluster_kv_txn_rpc_request_body(&request.body)
                     .expect("transaction request");
@@ -639,6 +759,48 @@ mod tests {
                 NetworkDeliveryState::DefinitelyNotSent,
                 "snapshot endpoint unavailable",
             ))
+        }
+    }
+
+    struct NonLeaderThenCommittedHost {
+        known_authority: Option<NodeId>,
+        calls: usize,
+    }
+
+    impl ClusterKvTxnForwardHost for NonLeaderThenCommittedHost {
+        fn known_kv_state_authority_id(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<NodeId>, NetworkError> {
+            Ok(self.known_authority.clone())
+        }
+
+        fn call_node_object_rpc(
+            &mut self,
+            state: &ClusterBootstrapState,
+            target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.calls = self.calls.saturating_add(1);
+            if self.calls == 1 {
+                let detail = if request.route == sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE
+                {
+                    FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL
+                } else {
+                    FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL
+                };
+                return ObjectRpcResponse::encode_error(
+                    request.route.clone(),
+                    format!("cluster is read-only: {detail}"),
+                );
+            }
+            CommittedResponseHost {
+                calls: 0,
+                mismatch_request_id: false,
+            }
+            .call_node_object_rpc(state, target_node_id, request, timeout)
         }
     }
 
@@ -717,6 +879,29 @@ mod tests {
         )];
         state.members.push(remote_member);
         (root, state)
+    }
+
+    fn add_second_remote_voter(state: &mut ClusterBootstrapState) -> NodeId {
+        let now = OffsetDateTime::now_utc();
+        let remote =
+            NodeId::from_legacy_named("node_kv_forward_remote_second").expect("remote node");
+        let mut member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            remote.clone(),
+            "remote-second",
+            "pk-remote-second",
+            now,
+        );
+        member.capabilities =
+            vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("main daemon capability")];
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![sinomo_network::daemon_lan_endpoint(
+            &remote,
+            "10.0.0.3:21353".to_string(),
+            0,
+        )];
+        state.members.push(member);
+        remote
     }
 
     fn test_txn() -> KvTxn {
@@ -842,5 +1027,87 @@ mod tests {
             Err(NetworkError::ClusterReadOnly { .. })
         ));
         assert_eq!(host.calls, 1);
+    }
+
+    #[test]
+    fn non_voter_skips_verified_non_leader_when_no_authority_is_preferred() {
+        let (root, mut state) = forward_test_state(false);
+        add_second_remote_voter(&mut state);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let request = KvTxnRequest::generated(test_txn());
+        let mut host = NonLeaderThenCommittedHost {
+            known_authority: None,
+            calls: 0,
+        };
+
+        let response = forward_cluster_kv_txn_to_state_authority_with_host(
+            &paths,
+            &state,
+            &request,
+            forward_options(),
+            &mut host,
+        )
+        .expect("forward after verified rejection")
+        .expect("committed response");
+
+        assert_eq!(host.calls, 2);
+        assert_eq!(response.request_id, request.request_id);
+    }
+
+    #[test]
+    fn preferred_authority_rejection_returns_before_trying_another_voter() {
+        let (root, mut state) = forward_test_state(false);
+        add_second_remote_voter(&mut state);
+        let preferred = state.members[1].node_id.clone();
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut host = NonLeaderThenCommittedHost {
+            known_authority: Some(preferred.clone()),
+            calls: 0,
+        };
+
+        let error = forward_cluster_kv_txn_to_state_authority_with_host(
+            &paths,
+            &state,
+            &KvTxnRequest::generated(test_txn()),
+            forward_options(),
+            &mut host,
+        )
+        .expect_err("preferred authority rejection must invalidate durable authority first");
+
+        assert_eq!(host.calls, 1);
+        assert!(matches!(
+            error,
+            NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == preferred
+        ));
+    }
+
+    #[test]
+    fn authoritative_read_skips_verified_non_leader_when_no_authority_is_preferred() {
+        let (root, mut state) = forward_test_state(false);
+        add_second_remote_voter(&mut state);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut host = NonLeaderThenCommittedHost {
+            known_authority: None,
+            calls: 0,
+        };
+
+        let read = forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+            &paths,
+            &state,
+            forward_options(),
+            &mut host,
+        )
+        .expect("forward read after verified rejection")
+        .expect("authoritative read");
+
+        assert_eq!(host.calls, 2);
+        assert_eq!(read.value.revision, KvRevision(1));
+        assert_eq!(read.authority.revision, KvRevision(1));
     }
 }
