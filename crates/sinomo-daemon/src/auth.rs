@@ -26,10 +26,11 @@ use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
     ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -37,8 +38,6 @@ use time::format_description::well_known::Rfc3339;
 pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_core::network::DAEMON_AUTH_PROTOCOL;
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
-const DAEMON_AUTH_NONCE_PRUNE_INTERVAL_SECONDS: i64 = 1;
-const DAEMON_AUTH_NONCE_PRUNE_MAX_ENTRIES: usize = 8_192;
 const DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE: Duration = Duration::from_secs(1);
 pub use sinomo_core::network::SignedDaemonCommand;
 /// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
@@ -80,15 +79,44 @@ struct DaemonAuthFileMark {
 
 #[derive(Debug)]
 struct DaemonAuthNonceSet {
-    nonces: BTreeMap<Vec<u8>, OffsetDateTime>,
-    last_pruned_at: OffsetDateTime,
+    // Membership and expiry ordering are separate so a high request rate never
+    // turns pruning into a full live-set scan on every authenticated request.
+    nonces: HashSet<Arc<[u8]>>,
+    expirations: BinaryHeap<Reverse<(OffsetDateTime, Arc<[u8]>)>>,
 }
 
 impl DaemonAuthNonceSet {
-    fn new(now: OffsetDateTime) -> Self {
+    fn new() -> Self {
         Self {
-            nonces: BTreeMap::new(),
-            last_pruned_at: now,
+            nonces: HashSet::new(),
+            expirations: BinaryHeap::new(),
+        }
+    }
+
+    fn remember(
+        &mut self,
+        nonce_key: Vec<u8>,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> bool {
+        self.prune_expired(now);
+        let nonce_key = Arc::<[u8]>::from(nonce_key);
+        if !self.nonces.insert(Arc::clone(&nonce_key)) {
+            return false;
+        }
+        self.expirations.push(Reverse((expires_at, nonce_key)));
+        true
+    }
+
+    fn prune_expired(&mut self, now: OffsetDateTime) {
+        while self
+            .expirations
+            .peek()
+            .is_some_and(|Reverse((expires_at, _))| now > *expires_at)
+        {
+            let Reverse((_expires_at, nonce_key)) =
+                self.expirations.pop().expect("checked nonce expiration");
+            self.nonces.remove(&nonce_key);
         }
     }
 }
@@ -1182,6 +1210,9 @@ fn remember_daemon_auth_nonce(
     // The signing timestamp is the nonce's freshness anchor; reject malformed ones.
     let signed_at = OffsetDateTime::parse(&envelope.timestamp, &Rfc3339)
         .map_err(|_| DaemonError::AuthDenied)?;
+    let expires_at = signed_at
+        .checked_add(time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS))
+        .ok_or(DaemonError::AuthDenied)?;
     let mut guard = DAEMON_AUTH_NONCES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -1191,23 +1222,11 @@ fn remember_daemon_auth_nonce(
         })?;
     let nonce_set = guard
         .entry(paths.root.clone())
-        .or_insert_with(|| DaemonAuthNonceSet::new(now));
-    let prune_due = (now - nonce_set.last_pruned_at).whole_seconds().abs()
-        >= DAEMON_AUTH_NONCE_PRUNE_INTERVAL_SECONDS
-        || nonce_set.nonces.len() >= DAEMON_AUTH_NONCE_PRUNE_MAX_ENTRIES;
-    if prune_due {
-        // Drop nonces older than the retention window so the set stays bounded; anything
-        // that old is already rejected by the clock-skew freshness check.
-        nonce_set.nonces.retain(|_, seen_at| {
-            (now - *seen_at).whole_seconds().abs() <= DAEMON_AUTH_NONCE_RETENTION_SECONDS
-        });
-        nonce_set.last_pruned_at = now;
-    }
+        .or_insert_with(DaemonAuthNonceSet::new);
     let nonce_key = daemon_auth_nonce_key(envelope);
-    if nonce_set.nonces.contains_key(&nonce_key) {
+    if !nonce_set.remember(nonce_key, expires_at, now) {
         return Err(DaemonError::AuthDenied);
     }
-    nonce_set.nonces.insert(nonce_key, signed_at);
     Ok(())
 }
 
@@ -1450,6 +1469,39 @@ mod tests {
         ));
         // ...but a different daemon root tracks its nonces independently.
         remember_daemon_auth_nonce(&paths_b, &nonce).expect("distinct root accepts nonce");
+    }
+
+    #[test]
+    fn daemon_auth_nonce_bookkeeping_stays_incremental_past_legacy_trigger() {
+        const LEGACY_PRUNE_TRIGGER: usize = 8_192;
+        const EXTRA_NONCES: usize = 1_024;
+
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS);
+        let mut nonce_set = DaemonAuthNonceSet::new();
+        for index in 0..LEGACY_PRUNE_TRIGGER + EXTRA_NONCES {
+            let nonce = format!("nonce-{index}").into_bytes();
+            assert!(nonce_set.remember(nonce, expires_at, now));
+        }
+
+        assert_eq!(nonce_set.nonces.len(), LEGACY_PRUNE_TRIGGER + EXTRA_NONCES);
+        assert_eq!(
+            nonce_set.expirations.len(),
+            LEGACY_PRUNE_TRIGGER + EXTRA_NONCES
+        );
+        assert!(
+            !nonce_set.remember(b"nonce-0".to_vec(), expires_at, now),
+            "crossing the former trigger must not weaken replay rejection"
+        );
+
+        let after_expiry = expires_at + time::Duration::nanoseconds(1);
+        assert!(nonce_set.remember(
+            b"post-expiry".to_vec(),
+            after_expiry + time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS),
+            after_expiry,
+        ));
+        assert_eq!(nonce_set.nonces.len(), 1);
+        assert_eq!(nonce_set.expirations.len(), 1);
     }
 
     #[test]
