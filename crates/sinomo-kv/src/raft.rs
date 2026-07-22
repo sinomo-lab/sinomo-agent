@@ -2272,8 +2272,29 @@ where
                 .forward_cluster_kv_txn_to_voter_async(state, &request)
                 .await?
         {
-            validate_cluster_kv_txn_commit_response(state, &request, &response)
-                .map_err(H::kv_error)?;
+            // A forwarded response carries the full bounded snapshot. Its
+            // synchronous structural validation is intentionally kept off the
+            // async worker's deeply nested stream/RPC/quorum poll stack. This
+            // is a scheduling boundary, not a larger-stack workaround: the
+            // validator starts with an ordinary clean blocking-task stack and
+            // returns the same owned response only after validation succeeds.
+            let validation_state = state.clone();
+            let validation_request = request.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                validate_cluster_kv_txn_commit_response(
+                    &validation_state,
+                    &validation_request,
+                    &response,
+                )?;
+                Ok::<_, KvError>(response)
+            })
+            .await
+            .map_err(|source| {
+                H::kv_error(KvError::Serialization {
+                    detail: format!("cluster KV commit response validation task failed: {source}"),
+                })
+            })?
+            .map_err(H::kv_error)?;
             return Ok(response);
         }
         let reachable_voters = host.reachable_voter_count_async(state).await?;

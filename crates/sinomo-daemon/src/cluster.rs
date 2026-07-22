@@ -342,6 +342,44 @@ struct ClusterNodeStatusPendingRefresh {
     label: &'static str,
 }
 
+/// Owns the separately scheduled node-presence publication.
+///
+/// Remote quorum commits traverse the complete stream-native service stack.
+/// Polling that future inline beneath the maintenance state machine leaves too
+/// little of Tokio's normal worker stack for response validation in debug
+/// builds. A task boundary starts that path from a clean worker stack. Abort on
+/// drop keeps deadline cancellation from detaching an uncertain KV mutation.
+struct OwnedNodeStatusPublishTask {
+    task: Option<tokio::task::JoinHandle<Result<NodeStatusPublishOutcome, DaemonError>>>,
+}
+
+impl OwnedNodeStatusPublishTask {
+    fn new(task: tokio::task::JoinHandle<Result<NodeStatusPublishOutcome, DaemonError>>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(&mut self) -> Result<NodeStatusPublishOutcome, DaemonError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("node-status publish task is joined once")
+            .await;
+        self.task.take();
+        result.map_err(|source| DaemonError::Network {
+            address: "cluster node-status publish task".to_string(),
+            detail: source.to_string(),
+        })?
+    }
+}
+
+impl Drop for OwnedNodeStatusPublishTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
     OnceLock::new();
 static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusRecord>>> =
@@ -3950,9 +3988,12 @@ impl ClusterNetworkMaintenance {
         let mut publish_succeeded = !publish_planning_failed;
         let mut publish_followup_needed = false;
         let mut probe_succeeded = true;
-        // Fresh local observations must run before graph-dependent publishes.
-        // Otherwise stale routes can make those publishes consume the entire
-        // phase and starve the probe that would repair the next attempt.
+        // A main daemon's presence is part of join realization, not optional
+        // graph maintenance. Publish it before probing so unreachable shadow
+        // endpoints cannot leave a successfully joined main absent from the
+        // cluster health read model for an entire maintenance deadline.
+        // Connectivity-derived member/service publishes remain behind the
+        // fresh local observation that can repair their routes.
         let connectivity_probe_scheduled = connectivity_probe.is_some();
         let connectivity_publish_scheduled = connectivity_publish.is_some();
         let connectivity_probe_deadline = if connectivity_probe_scheduled
@@ -3968,6 +4009,16 @@ impl ClusterNetworkMaintenance {
         } else {
             deadline
         };
+        for refresh in node_status_refreshes {
+            publish_succeeded &= cluster_network_pending_step_with_deadline(
+                "node status refresh",
+                CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
+                deadline,
+                self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
+            )
+            .await
+                == Some(true);
+        }
         if let Some(probe) = connectivity_probe {
             let probe_result = self
                 .run_pending_connectivity_probe_async(
@@ -4008,16 +4059,6 @@ impl ClusterNetworkMaintenance {
             // A claimed exact retry must never disappear silently if planning
             // produced no carrier operation.
             self.record_connectivity_publish_failure();
-        }
-        for refresh in node_status_refreshes {
-            publish_succeeded &= cluster_network_pending_step_with_deadline(
-                "node status refresh",
-                CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
-                deadline,
-                self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
-            )
-            .await
-                == Some(true);
         }
         for publish in member_publishes {
             publish_succeeded &= cluster_network_pending_step_with_deadline(
@@ -4243,19 +4284,23 @@ impl ClusterNetworkMaintenance {
         pending: ClusterNodeStatusPendingRefresh,
         runtime: tokio::runtime::Handle,
     ) -> bool {
-        match refresh_daemon_node_status_in_kv_async_with_timeouts(
-            &pending.paths,
-            runtime,
-            cluster_control_plane_timeouts(),
-        )
-        .await
-        {
+        let label = pending.label;
+        let task_runtime = runtime.clone();
+        let mut task = OwnedNodeStatusPublishTask::new(runtime.spawn(async move {
+            refresh_daemon_node_status_in_kv_async_with_timeouts(
+                &pending.paths,
+                task_runtime,
+                cluster_control_plane_timeouts(),
+            )
+            .await
+        }));
+        match task.join().await {
             Ok(published) => {
                 self.record_node_status_publish(&published);
                 true
             }
             Err(error) => {
-                tracing::warn!("sinomo daemon {} publish failed: {error}", pending.label);
+                tracing::warn!("sinomo daemon {label} publish failed: {error}");
                 false
             }
         }
@@ -14471,7 +14516,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_connectivity_probe_preserves_followup_node_status_publish_budget() {
+    fn initial_node_status_publish_precedes_stalled_connectivity_probe() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("blackhole listener");
         listener
             .set_nonblocking(true)
@@ -14608,7 +14653,7 @@ mod tests {
             }),
             node_status_refreshes: vec![ClusterNodeStatusPendingRefresh {
                 paths: daemon_paths.clone(),
-                label: "node status after stalled probe",
+                label: "node status before stalled probe",
             }],
             ..ClusterNetworkMaintenancePendingWork::default()
         };
@@ -14631,13 +14676,13 @@ mod tests {
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "the probe must yield at its reserved deadline instead of consuming the followup tail"
+            "the probe must yield at its bounded deadline after the presence publish"
         );
         let statuses = sinomo_core::cluster::read_cluster_node_statuses_from_kv(&cluster_paths)
             .expect("node statuses");
         assert!(
             statuses.iter().any(|status| status.node_id == local_node),
-            "node-status publication must execute after the stalled probe; statuses={statuses:?} idle={:?} failures={}",
+            "join-critical node-status publication must execute before the stalled probe; statuses={statuses:?} idle={:?} failures={}",
             maintenance.idle_stats.snapshot(),
             maintenance.publish_failure_streak,
         );

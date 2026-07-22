@@ -7733,6 +7733,8 @@ mod tests {
     struct TxnQuorumDriverTestHost {
         local_leader: bool,
         forwarded: Option<ClusterKvTxnCommitResult>,
+        sync_forward_calls: usize,
+        async_forward_calls: usize,
         committed_txns: usize,
         election_calls: usize,
         current_term: u64,
@@ -7758,6 +7760,7 @@ mod tests {
             _state: &ClusterBootstrapState,
             _request: &KvTxnRequest,
         ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error> {
+            self.sync_forward_calls = self.sync_forward_calls.saturating_add(1);
             Ok(self.forwarded.clone())
         }
 
@@ -7820,7 +7823,10 @@ mod tests {
             _state: &'a ClusterBootstrapState,
             _request: &'a KvTxnRequest,
         ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error> {
-            Box::pin(async move { Ok(self.forwarded.clone()) })
+            Box::pin(async move {
+                self.async_forward_calls = self.async_forward_calls.saturating_add(1);
+                Ok(self.forwarded.clone())
+            })
         }
 
         fn elect_cluster_raft_leader_async<'a>(
@@ -8216,6 +8222,69 @@ mod tests {
         .expect("forward learner txn");
 
         assert_eq!(result, forwarded);
+        assert_eq!(host.committed_txns, 0);
+        assert_eq!(host.election_calls, 0);
+    }
+
+    #[test]
+    fn kv_txn_quorum_async_driver_validates_forwarded_learner_response_off_worker_stack() {
+        let local = NodeId::from_legacy_named("node_txn_async_learner").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_async_voter").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members[0].role = ClusterMemberRole::Learner;
+        state.members[0].state = ClusterMemberState::Learner;
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/kv/txn-driver/async-forwarded".to_string(),
+                value: b"forwarded".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let mut store = InProcessKvStore::new();
+        let txn_response = store
+            .txn(request.txn.clone())
+            .expect("seed forwarded response");
+        let forwarded = ClusterKvTxnCommitResult {
+            request_id: request.request_id.clone(),
+            snapshot: store.snapshot().expect("snapshot"),
+            txn_response: Some(txn_response),
+            authority: KvAuthorityProof {
+                term: 1,
+                commit_index: 7,
+                revision: store.revision(),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 1,
+                    required_quorum: 1,
+                },
+            },
+            replayed_committed_request: false,
+        };
+        let mut host = TxnQuorumDriverTestHost {
+            forwarded: Some(forwarded.clone()),
+            reachable_voters: 1,
+            ..TxnQuorumDriverTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(commit_cluster_kv_txn_with_quorum_async_with_host(
+                &mut state,
+                request,
+                ClusterKvTxnQuorumDriverOptions {
+                    allow_forwarding: true,
+                },
+                &mut host,
+            ))
+            .expect("forward learner txn through async driver");
+
+        assert_eq!(result, forwarded);
+        assert_eq!(host.async_forward_calls, 1);
+        assert_eq!(host.sync_forward_calls, 0);
         assert_eq!(host.committed_txns, 0);
         assert_eq!(host.election_calls, 0);
     }
