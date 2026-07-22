@@ -544,6 +544,13 @@ fn validate_namespace_prepare_shape(
             prepare.operation_id, prepare.transaction.transaction_id
         )));
     }
+    if prepare.operation_id.starts_with("namespace-request:") && prepare.completed_request.is_none()
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "namespace prepare {} is request-owned but has no completed request attachment",
+            prepare.operation_id
+        )));
+    }
     if let Some(completed_request) = &prepare.completed_request {
         validate_namespace_request_shape(completed_request)?;
         if completed_request.status != DfsNamespaceRequestStatus::Completed
@@ -6180,6 +6187,36 @@ mod tests {
             "different journal payloads must not share a proof"
         );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_rejects_request_owned_prepare_without_completion_attachment() {
+        let root = temp_root("local_backend_request_prepare_requires_completion");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let file_system = file_system();
+        let current = object(version("version_request_prepare_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_request_prepare_2");
+        let prepare = namespace_prepare(
+            "namespace-request:mkdir:attempt-1",
+            &shard_id.0,
+            &current,
+            committed,
+        );
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+
+        let error = backend
+            .prepare_namespace_transaction(&prepare)
+            .expect_err("request-owned prepare without completion must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("request-owned but has no completed request attachment")
+        );
         cleanup(&root);
     }
 

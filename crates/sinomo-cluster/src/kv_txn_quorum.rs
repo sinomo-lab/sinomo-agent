@@ -1,6 +1,7 @@
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::control_plane_options::ClusterKvTxnQuorumOptions;
 use crate::kv_forward::{
+    ClusterKvTxnForwardOptions,
     forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host,
     forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host,
     forward_cluster_kv_txn_to_state_authority_async_with_host,
@@ -46,7 +47,7 @@ use sinomo_network::ClusterPaths;
 use sinomo_network::ClusterSignedObjectRpcAsyncHost;
 use sinomo_network::NetworkError;
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub trait ClusterKvTxnQuorumHost {
     fn refresh_current_cluster_kv_store(
@@ -325,6 +326,7 @@ where
         state: &ClusterBootstrapState,
         request: &KvTxnRequest,
     ) -> Result<Option<sinomo_kv::ClusterKvTxnCommitResult>, Self::Error> {
+        let deadline = Instant::now() + self.options.forward_options.timeout;
         let result = self.host.forward_cluster_kv_txn_to_state_authority(
             self.paths,
             state,
@@ -332,7 +334,21 @@ where
             self.options,
         );
         if let Err(error) = &result {
-            clear_verified_stale_cluster_raft_leader(self.paths, state, error)?;
+            if clear_verified_stale_cluster_raft_leader(self.paths, state, error)?
+                && let Some(forward_options) = cluster_kv_forward_options_before_deadline(
+                    self.options.forward_options,
+                    deadline,
+                )
+            {
+                let mut retry_options = self.options;
+                retry_options.forward_options = forward_options;
+                return self.host.forward_cluster_kv_txn_to_state_authority(
+                    self.paths,
+                    state,
+                    request,
+                    retry_options,
+                );
+            }
         }
         result
     }
@@ -493,13 +509,12 @@ fn read_cluster_kv_authoritative_snapshot_with_consensus_state(
 ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
     if !sinomo_kv::cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
-            && let Some(read) =
-                forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
-                    paths,
-                    state,
-                    options.forward_options,
-                    host,
-                )?
+            && let Some(read) = forward_cluster_kv_authoritative_snapshot_recovering_stale_leader(
+                paths,
+                state,
+                options.forward_options,
+                host,
+            )?
         {
             return validate_forwarded_authoritative_read(read, state);
         }
@@ -510,7 +525,7 @@ fn read_cluster_kv_authoritative_snapshot_with_consensus_state(
     }
     if !host.local_is_kv_state_authority(paths, state)? {
         let forwarding_failure = if options.allow_forwarding {
-            match forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+            match forward_cluster_kv_authoritative_snapshot_recovering_stale_leader(
                 paths,
                 state,
                 options.forward_options,
@@ -518,10 +533,7 @@ fn read_cluster_kv_authoritative_snapshot_with_consensus_state(
             ) {
                 Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
                 Ok(None) => None,
-                Err(error) => {
-                    clear_verified_stale_cluster_raft_leader(paths, state, &error)?;
-                    Some(error)
-                }
+                Err(error) => Some(error),
             }
         } else {
             None
@@ -598,7 +610,7 @@ fn clear_verified_stale_cluster_raft_leader(
     let NetworkError::VerifiedClusterNonLeader { node_id, .. } = error else {
         return Ok(false);
     };
-    if node_id == &state.local_node_id || !sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+    if node_id == &state.local_node_id {
         return Ok(false);
     }
     let store = paths.kv_paths().raft_store();
@@ -610,6 +622,39 @@ fn clear_verified_stale_cluster_raft_leader(
         .clear_leader_and_write_snapshot_if_changed(&state.local_node_id)
         .map_err(kv_err)?;
     Ok(true)
+}
+
+fn forward_cluster_kv_authoritative_snapshot_recovering_stale_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvTxnForwardOptions,
+    host: &mut impl ClusterKvTxnQuorumHost,
+) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError> {
+    let deadline = Instant::now() + options.timeout;
+    let result = forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+        paths, state, options, host,
+    );
+    if let Err(error) = &result
+        && clear_verified_stale_cluster_raft_leader(paths, state, error)?
+        && let Some(options) = cluster_kv_forward_options_before_deadline(options, deadline)
+    {
+        return forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+            paths, state, options, host,
+        );
+    }
+    result
+}
+
+fn cluster_kv_forward_options_before_deadline(
+    mut options: ClusterKvTxnForwardOptions,
+    deadline: Instant,
+) -> Option<ClusterKvTxnForwardOptions> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    options.timeout = remaining;
+    Some(options)
 }
 
 async fn clear_verified_stale_cluster_raft_leader_async(
@@ -628,6 +673,33 @@ async fn clear_verified_stale_cluster_raft_leader_async(
             operation: "clear rejected cluster Raft leader".to_string(),
             detail: format!("stale leader clear task failed: {source}"),
         })?
+}
+
+async fn forward_cluster_kv_authoritative_snapshot_recovering_stale_leader_async<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvTxnForwardOptions,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let deadline = Instant::now() + options.timeout;
+    let result = forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host(
+        runtime, paths, state, options, host,
+    )
+    .await;
+    if let Err(error) = &result
+        && clear_verified_stale_cluster_raft_leader_async(runtime, paths, state, error).await?
+        && let Some(options) = cluster_kv_forward_options_before_deadline(options, deadline)
+    {
+        return forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host(
+            runtime, paths, state, options, host,
+        )
+        .await;
+    }
+    result
 }
 
 async fn locked_cluster_raft_local_is_leader_async(
@@ -705,13 +777,22 @@ where
         let options = self.options.forward_options;
         let host = &mut *self.host;
         Box::pin(async move {
+            let deadline = Instant::now() + options.timeout;
             let result = forward_cluster_kv_txn_to_state_authority_async_with_host(
                 runtime, paths, state, request, options, host,
             )
             .await;
             if let Err(error) = &result {
-                clear_verified_stale_cluster_raft_leader_async(runtime, paths, state, error)
-                    .await?;
+                if clear_verified_stale_cluster_raft_leader_async(runtime, paths, state, error)
+                    .await?
+                    && let Some(options) =
+                        cluster_kv_forward_options_before_deadline(options, deadline)
+                {
+                    return forward_cluster_kv_txn_to_state_authority_async_with_host(
+                        runtime, paths, state, request, options, host,
+                    )
+                    .await;
+                }
             }
             result
         })
@@ -900,7 +981,7 @@ where
     if !sinomo_kv::cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(read) =
-                forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host(
+                forward_cluster_kv_authoritative_snapshot_recovering_stale_leader_async(
                     runtime,
                     paths,
                     state,
@@ -918,7 +999,7 @@ where
     }
     if !locked_cluster_raft_local_is_leader_async(runtime, paths, state).await? {
         let forwarding_failure = if options.allow_forwarding {
-            match forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host(
+            match forward_cluster_kv_authoritative_snapshot_recovering_stale_leader_async(
                 runtime,
                 paths,
                 state,
@@ -929,11 +1010,7 @@ where
             {
                 Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
                 Ok(None) => None,
-                Err(error) => {
-                    clear_verified_stale_cluster_raft_leader_async(runtime, paths, state, &error)
-                        .await?;
-                    Some(error)
-                }
+                Err(error) => Some(error),
             }
         } else {
             None
@@ -1038,17 +1115,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_base::ClusterMemberRecord;
+    use sinomo_base::{ClusterMemberRecord, ClusterMemberState};
     use sinomo_kv::{InProcessKvStore, KvAuthorityProof, KvRevision};
     use sinomo_node::ClusterId;
     use time::OffsetDateTime;
 
     #[test]
     fn verified_non_leader_response_clears_only_the_matching_durable_leader() {
-        let root = sinomo_testdir::TestDir::new("sinomo-cluster-verified-non-leader");
+        assert_verified_non_leader_clears_matching_durable_leader(
+            "sinomo-cluster-verified-non-leader-voter",
+            three_voter_state(),
+        );
+    }
+
+    #[test]
+    fn non_voter_clears_matching_durable_leader_after_verified_rejection() {
+        let mut state = three_voter_state();
+        state.members[0].state = ClusterMemberState::NonVoting;
+        assert!(!sinomo_kv::cluster_kv_raft_local_is_voter(&state));
+        assert_verified_non_leader_clears_matching_durable_leader(
+            "sinomo-cluster-verified-non-leader-non-voter",
+            state,
+        );
+    }
+
+    fn assert_verified_non_leader_clears_matching_durable_leader(
+        test_name: &str,
+        state: ClusterBootstrapState,
+    ) {
+        let root = sinomo_testdir::TestDir::new(test_name);
         let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
         paths.ensure().expect("cluster paths");
-        let state = three_voter_state();
         crate::write_cluster_state(&paths, &state).expect("cluster state");
         crate::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("seed cluster raft");
