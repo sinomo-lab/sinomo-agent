@@ -30,8 +30,8 @@ pub const OBJECT_RPC_STREAM_INLINE_BODY_BYTES: usize = 8 * 1024;
 pub const OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES: usize = 64 * 1024;
 pub const OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES: usize = 256 * 1024;
 
-const OBJECT_RPC_STREAM_PROTOCOL: &str = "sinomo.object-rpc.stream.v1";
-const OBJECT_RPC_STREAM_WIRE_MAGIC: [u8; 4] = *b"SOR1";
+const OBJECT_RPC_STREAM_PROTOCOL: &str = "sinomo.object-rpc.stream.v2";
+const OBJECT_RPC_STREAM_WIRE_MAGIC: [u8; 4] = *b"SOR2";
 const LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC: [u8; 4] = *b"SOL1";
 const LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES: usize = 128;
 const OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES: usize = 9;
@@ -41,6 +41,7 @@ const OBJECT_RPC_STREAM_BODY_CHANNEL_DEPTH: usize =
     OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES / OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES;
 const OBJECT_RPC_STREAM_MAX_HEAD_CLOCK_SKEW_MILLIS: u64 = 5 * 60 * 1000;
 const OBJECT_RPC_STREAM_MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(10);
+const AUTHENTICATED_CONTROL_TAG_BYTES: usize = 32;
 
 const FRAME_REQUEST_HEAD: u8 = 1;
 const FRAME_REQUEST_DATA: u8 = 2;
@@ -51,12 +52,12 @@ const FRAME_RESPONSE_FINISH: u8 = 6;
 const FRAME_REQUEST_PROGRESS: u8 = 7;
 const FRAME_RESPONSE_PROGRESS: u8 = 8;
 
-const AUTH_REQUEST_HEAD: &[u8] = b"sinomo-object-rpc-request-head-v1";
-const AUTH_REQUEST_FINISH: &[u8] = b"sinomo-object-rpc-request-finish-v1";
-const AUTH_RESPONSE_HEAD: &[u8] = b"sinomo-object-rpc-response-head-v1";
-const AUTH_RESPONSE_FINISH: &[u8] = b"sinomo-object-rpc-response-finish-v1";
-const AUTH_REQUEST_PROGRESS: &[u8] = b"sinomo-object-rpc-request-progress-v1";
-const AUTH_RESPONSE_PROGRESS: &[u8] = b"sinomo-object-rpc-response-progress-v1";
+const AUTH_REQUEST_HEAD: &[u8] = b"sinomo-object-rpc-request-head-v2";
+const AUTH_REQUEST_FINISH: &[u8] = b"sinomo-object-rpc-request-finish-v2";
+const AUTH_RESPONSE_HEAD: &[u8] = b"sinomo-object-rpc-response-head-v2";
+const AUTH_RESPONSE_FINISH: &[u8] = b"sinomo-object-rpc-response-finish-v2";
+const AUTH_REQUEST_PROGRESS: &[u8] = b"sinomo-object-rpc-request-progress-v2";
+const AUTH_RESPONSE_PROGRESS: &[u8] = b"sinomo-object-rpc-response-progress-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RpcPeerIdentity {
@@ -501,12 +502,6 @@ struct RequestHeadUnsigned {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct RequestHead {
-    unsigned: RequestHeadUnsigned,
-    authentication_tag: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ResponseDisposition {
     Accepted {
         metadata: BTreeMap<String, String>,
@@ -533,12 +528,6 @@ struct ResponseHeadUnsigned {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ResponseHead {
-    unsigned: ResponseHeadUnsigned,
-    authentication_tag: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct StreamProgressUnsigned {
     protocol: String,
     origin_node_id: Option<NodeId>,
@@ -548,12 +537,6 @@ struct StreamProgressUnsigned {
     request_id: Id,
     head_digest: [u8; 32],
     nonce: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct StreamProgress {
-    unsigned: StreamProgressUnsigned,
-    authentication_tag: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -573,12 +556,6 @@ struct BodyFinishUnsigned {
     length: u64,
     content_digest: [u8; 32],
     status: FinishStatus,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BodyFinish {
-    unsigned: BodyFinishUnsigned,
-    authentication_tag: [u8; 32],
 }
 
 struct PreparedOutgoingBody {
@@ -824,44 +801,69 @@ fn now_unix_millis() -> Result<u64, NetworkError> {
         .map_err(|_| serialization_error("current Unix time does not fit u64 milliseconds"))
 }
 
-fn encode_control<T: Serialize>(value: &T, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
-    let payload = SinomoObjectCodec::network_frame().encode(value)?;
-    if payload.len() > max_bytes {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: payload.len(),
-            max_bytes,
-        });
-    }
-    Ok(payload)
-}
-
 fn decode_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, NetworkError> {
     SinomoObjectCodec::network_frame().decode(payload)
 }
 
-fn authenticated_tag<T: Serialize>(
+fn authenticated_control_tag(
     channel_binding: &[u8; 32],
     domain: &[u8],
-    value: &T,
-) -> Result<[u8; 32], NetworkError> {
-    let encoded = SinomoObjectCodec::network_frame().encode(value)?;
-    let mut transcript = Vec::with_capacity(domain.len().saturating_add(encoded.len()));
-    transcript.extend_from_slice(domain);
-    transcript.extend_from_slice(&encoded);
-    Ok(*blake3::keyed_hash(channel_binding, &transcript).as_bytes())
+    unsigned_payload: &[u8],
+) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new_keyed(channel_binding);
+    hasher.update(domain);
+    hasher.update(unsigned_payload);
+    hasher.finalize()
 }
 
-fn authenticate<T: Serialize>(
+/// Encodes an authenticated control as `tag || canonical unsigned SOBJ`.
+///
+/// The unsigned value is deliberately serialized exactly once. The receiver
+/// authenticates those same wire bytes before asking SOBJ to decode them, so
+/// neither side has to reconstruct the authentication transcript.
+fn encode_authenticated_control<T: Serialize>(
     channel_binding: &[u8; 32],
     domain: &[u8],
     value: &T,
-    actual: &[u8; 32],
-) -> Result<(), NetworkError> {
-    let expected = authenticated_tag(channel_binding, domain, value)?;
-    if expected != *actual {
+    max_bytes: usize,
+) -> Result<Vec<u8>, NetworkError> {
+    let unsigned_payload = SinomoObjectCodec::network_frame().encode(value)?;
+    let payload_len = AUTHENTICATED_CONTROL_TAG_BYTES
+        .checked_add(unsigned_payload.len())
+        .ok_or(NetworkError::FrameTooLarge {
+            actual_bytes: usize::MAX,
+            max_bytes,
+        })?;
+    if payload_len > max_bytes {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: payload_len,
+            max_bytes,
+        });
+    }
+    let authentication_tag = authenticated_control_tag(channel_binding, domain, &unsigned_payload);
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.extend_from_slice(authentication_tag.as_bytes());
+    payload.extend_from_slice(&unsigned_payload);
+    Ok(payload)
+}
+
+fn decode_authenticated_control<T: serde::de::DeserializeOwned>(
+    channel_binding: &[u8; 32],
+    domain: &[u8],
+    payload: &[u8],
+) -> Result<T, NetworkError> {
+    if payload.len() < AUTHENTICATED_CONTROL_TAG_BYTES {
+        return Err(serialization_error(
+            "authenticated object RPC control is shorter than its tag",
+        ));
+    }
+    let (actual_tag, unsigned_payload) = payload.split_at(AUTHENTICATED_CONTROL_TAG_BYTES);
+    let expected_tag = authenticated_control_tag(channel_binding, domain, unsigned_payload);
+    // `blake3::Hash` compares byte slices in constant time.
+    if !expected_tag.eq(actual_tag) {
         return Err(NetworkError::AuthDenied);
     }
-    Ok(())
+    decode_control(unsigned_payload)
 }
 
 async fn write_all_counted<W: AsyncWrite + Unpin>(
@@ -1325,10 +1327,13 @@ async fn pump_incoming_body<R: AsyncRead + Unpin>(
                 "unexpected object RPC stream frame kind {kind} in {direction:?} body"
             )));
         }
-        let finish: BodyFinish = decode_control(&payload)?;
+        let finish: BodyFinishUnsigned = decode_authenticated_control(
+            &context.channel_binding,
+            direction.finish_domain(),
+            &payload,
+        )?;
         validate_incoming_finish(
             context,
-            direction,
             request_id,
             head_digest,
             observed_length,
@@ -1339,45 +1344,36 @@ async fn pump_incoming_body<R: AsyncRead + Unpin>(
         drop(sender);
         let verification = ObjectRpcBodyVerification {
             length: observed_length,
-            digest: finish.unsigned.content_digest,
+            digest: finish.content_digest,
         };
-        return Ok(match finish.unsigned.status {
+        return Ok(match finish.status {
             FinishStatus::Completed => IncomingTerminal::Completed(verification),
             FinishStatus::Rejected { detail } => IncomingTerminal::Rejected(detail),
         });
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_incoming_finish(
     context: &RpcPeerContext,
-    direction: IncomingDirection,
     request_id: &Id,
     head_digest: [u8; 32],
     observed_length: u64,
     observed_digest: &blake3::Hash,
     descriptor: &BodyDescriptor,
-    finish: &BodyFinish,
+    finish: &BodyFinishUnsigned,
 ) -> Result<(), NetworkError> {
     let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
-    let unsigned = &finish.unsigned;
-    if &unsigned.request_id != request_id
-        || unsigned.session_id != context.session_id
-        || unsigned.channel_binding != context.channel_binding
-        || unsigned.origin_node_id.as_ref() != expected_origin
-        || unsigned.destination_node_id.as_ref() != expected_destination
-        || unsigned.head_digest != head_digest
-        || unsigned.length != observed_length
-        || unsigned.content_digest.as_slice() != observed_digest.as_bytes()
+    if &finish.request_id != request_id
+        || finish.session_id != context.session_id
+        || finish.channel_binding != context.channel_binding
+        || finish.origin_node_id.as_ref() != expected_origin
+        || finish.destination_node_id.as_ref() != expected_destination
+        || finish.head_digest != head_digest
+        || finish.length != observed_length
+        || finish.content_digest.as_slice() != observed_digest.as_bytes()
     {
         return Err(NetworkError::AuthDenied);
     }
-    authenticate(
-        &context.channel_binding,
-        direction.finish_domain(),
-        unsigned,
-        &finish.authentication_tag,
-    )?;
     match descriptor {
         BodyDescriptor::Inline { length, digest, .. }
         | BodyDescriptor::Known { length, digest } => {
@@ -1508,17 +1504,15 @@ async fn write_prepared_body_data<W: AsyncWrite + Unpin>(
     Ok(ObjectRpcBodyVerification { length, digest })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn make_finish(
     context: &RpcPeerContext,
     request_id: Id,
     head_digest: [u8; 32],
     verification: ObjectRpcBodyVerification,
     status: FinishStatus,
-    domain: &[u8],
-) -> Result<BodyFinish, NetworkError> {
+) -> BodyFinishUnsigned {
     let (origin_node_id, destination_node_id) = context.wire_endpoints();
-    let unsigned = BodyFinishUnsigned {
+    BodyFinishUnsigned {
         request_id,
         session_id: context.session_id.clone(),
         channel_binding: context.channel_binding,
@@ -1528,26 +1522,26 @@ fn make_finish(
         length: verification.length,
         content_digest: verification.digest,
         status,
-    };
-    let authentication_tag = authenticated_tag(&context.channel_binding, domain, &unsigned)?;
-    Ok(BodyFinish {
-        unsigned,
-        authentication_tag,
-    })
+    }
 }
 
 async fn write_finish<W: AsyncWrite + Unpin>(
     writer: &mut W,
+    context: &RpcPeerContext,
     kind: u8,
-    finish: &BodyFinish,
+    domain: &[u8],
+    finish: &BodyFinishUnsigned,
 ) -> Result<(), SendFailure> {
-    let payload =
-        encode_control(finish, OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES).map_err(|error| {
-            SendFailure {
-                error,
-                wrote_any: false,
-            }
-        })?;
+    let payload = encode_authenticated_control(
+        &context.channel_binding,
+        domain,
+        finish,
+        OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
+    )
+    .map_err(|error| SendFailure {
+        error,
+        wrote_any: false,
+    })?;
     write_wire_frame(writer, kind, &payload, "write object RPC body finish").await
 }
 
@@ -1560,7 +1554,7 @@ fn request_head(
     application_head: Vec<u8>,
     options: ObjectFrameIoOptions,
     body: &PreparedOutgoingBody,
-) -> Result<(RequestHead, Vec<u8>), NetworkError> {
+) -> Result<(RequestHeadUnsigned, Vec<u8>), NetworkError> {
     let (origin_node_id, destination_node_id) = context.wire_endpoints();
     let unsigned = RequestHeadUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
@@ -1578,18 +1572,19 @@ fn request_head(
         descriptor: body.descriptor,
         inline_body: body.inline_body.clone(),
     };
-    let authentication_tag =
-        authenticated_tag(&context.channel_binding, AUTH_REQUEST_HEAD, &unsigned)?;
-    let head = RequestHead {
-        unsigned,
-        authentication_tag,
-    };
-    let payload = encode_control(&head, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)?;
-    Ok((head, payload))
+    let payload = encode_authenticated_control(
+        &context.channel_binding,
+        AUTH_REQUEST_HEAD,
+        &unsigned,
+        OBJECT_RPC_STREAM_MAX_HEAD_BYTES,
+    )?;
+    Ok((unsigned, payload))
 }
 
-fn validate_request_head(context: &RpcPeerContext, head: &RequestHead) -> Result<(), NetworkError> {
-    let unsigned = &head.unsigned;
+fn validate_request_head(
+    context: &RpcPeerContext,
+    unsigned: &RequestHeadUnsigned,
+) -> Result<(), NetworkError> {
     let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
     if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL
         || unsigned.origin_node_id.as_ref() != expected_origin
@@ -1601,12 +1596,6 @@ fn validate_request_head(context: &RpcPeerContext, head: &RequestHead) -> Result
         return Err(NetworkError::AuthDenied);
     }
     validate_descriptor_inline(&unsigned.descriptor, &unsigned.inline_body)?;
-    authenticate(
-        &context.channel_binding,
-        AUTH_REQUEST_HEAD,
-        unsigned,
-        &head.authentication_tag,
-    )?;
     let now = now_unix_millis()?;
     if unsigned.issued_at_unix_millis
         > now.saturating_add(OBJECT_RPC_STREAM_MAX_HEAD_CLOCK_SKEW_MILLIS)
@@ -1625,7 +1614,7 @@ fn response_head(
     request_id: Id,
     request_head_digest: [u8; 32],
     disposition: ResponseDisposition,
-) -> Result<(ResponseHead, Vec<u8>), NetworkError> {
+) -> Result<(ResponseHeadUnsigned, Vec<u8>), NetworkError> {
     let (origin_node_id, destination_node_id) = context.wire_endpoints();
     let unsigned = ResponseHeadUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
@@ -1637,23 +1626,21 @@ fn response_head(
         request_head_digest,
         disposition,
     };
-    let authentication_tag =
-        authenticated_tag(&context.channel_binding, AUTH_RESPONSE_HEAD, &unsigned)?;
-    let head = ResponseHead {
-        unsigned,
-        authentication_tag,
-    };
-    let payload = encode_control(&head, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)?;
-    Ok((head, payload))
+    let payload = encode_authenticated_control(
+        &context.channel_binding,
+        AUTH_RESPONSE_HEAD,
+        &unsigned,
+        OBJECT_RPC_STREAM_MAX_HEAD_BYTES,
+    )?;
+    Ok((unsigned, payload))
 }
 
 fn validate_response_head(
     context: &RpcPeerContext,
     request_id: &Id,
     request_head_digest: [u8; 32],
-    head: &ResponseHead,
+    unsigned: &ResponseHeadUnsigned,
 ) -> Result<(), NetworkError> {
-    let unsigned = &head.unsigned;
     let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
     if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL
         || unsigned.origin_node_id.as_ref() != expected_origin
@@ -1673,12 +1660,7 @@ fn validate_response_head(
     {
         validate_descriptor_inline(descriptor, inline_body)?;
     }
-    authenticate(
-        &context.channel_binding,
-        AUTH_RESPONSE_HEAD,
-        unsigned,
-        &head.authentication_tag,
-    )
+    Ok(())
 }
 
 fn stream_progress(
@@ -1699,16 +1681,10 @@ fn stream_progress(
         head_digest,
         nonce,
     };
-    let authentication_tag = authenticated_tag(
+    encode_authenticated_control(
         &context.channel_binding,
         direction.progress_domain(),
         &unsigned,
-    )?;
-    encode_control(
-        &StreamProgress {
-            unsigned,
-            authentication_tag,
-        },
         OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
     )
 }
@@ -1721,8 +1697,11 @@ fn validate_stream_progress(
     last_nonce: &mut u64,
     payload: &[u8],
 ) -> Result<(), NetworkError> {
-    let progress: StreamProgress = decode_control(payload)?;
-    let unsigned = &progress.unsigned;
+    let unsigned: StreamProgressUnsigned = decode_authenticated_control(
+        &context.channel_binding,
+        direction.progress_domain(),
+        payload,
+    )?;
     let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
     if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL
         || unsigned.origin_node_id.as_ref() != expected_origin
@@ -1736,12 +1715,6 @@ fn validate_stream_progress(
     {
         return Err(NetworkError::AuthDenied);
     }
-    authenticate(
-        &context.channel_binding,
-        direction.progress_domain(),
-        unsigned,
-        &progress.authentication_tag,
-    )?;
     *last_nonce = unsigned.nonce;
     Ok(())
 }
@@ -1941,18 +1914,19 @@ async fn write_request_frames<W: AsyncWrite + Unpin>(
         request_head_digest,
         verification,
         FinishStatus::Completed,
+    );
+    write_finish(
+        writer,
+        context,
+        FRAME_REQUEST_FINISH,
         AUTH_REQUEST_FINISH,
+        &finish,
     )
-    .map_err(|error| SendFailure {
-        error,
+    .await
+    .map_err(|failure| SendFailure {
+        error: failure.error,
         wrote_any: true,
     })?;
-    write_finish(writer, FRAME_REQUEST_FINISH, &finish)
-        .await
-        .map_err(|failure| SendFailure {
-            error: failure.error,
-            wrote_any: true,
-        })?;
     Ok(())
 }
 
@@ -2109,7 +2083,11 @@ where
             error: serialization_error("expected object RPC response head"),
         };
     }
-    let response_head: ResponseHead = match decode_control(&response_frame.1) {
+    let response_head: ResponseHeadUnsigned = match decode_authenticated_control(
+        &context.channel_binding,
+        AUTH_RESPONSE_HEAD,
+        &response_frame.1,
+    ) {
         Ok(head) => head,
         Err(error) => {
             if let Some(task) = &send_task {
@@ -2127,21 +2105,20 @@ where
         return RpcDeliveryOutcome::PossiblyApplied { error };
     }
     let response_head_digest = *blake3::hash(&response_frame.1).as_bytes();
-    let (metadata, application_head, descriptor, inline_body) =
-        match response_head.unsigned.disposition {
-            ResponseDisposition::Accepted {
-                metadata,
-                application_head,
-                descriptor,
-                inline_body,
-            } => (metadata, application_head, descriptor, inline_body),
-            ResponseDisposition::Rejected { detail } => {
-                if let Some(task) = &send_task {
-                    task.abort();
-                }
-                return RpcDeliveryOutcome::Rejected { detail };
+    let (metadata, application_head, descriptor, inline_body) = match response_head.disposition {
+        ResponseDisposition::Accepted {
+            metadata,
+            application_head,
+            descriptor,
+            inline_body,
+        } => (metadata, application_head, descriptor, inline_body),
+        ResponseDisposition::Rejected { detail } => {
+            if let Some(task) = &send_task {
+                task.abort();
             }
-        };
+            return RpcDeliveryOutcome::Rejected { detail };
+        }
+    };
     let (body, _verifier, receive_task) = make_incoming_body(
         reader,
         options,
@@ -2293,13 +2270,14 @@ where
     if kind != FRAME_REQUEST_HEAD {
         return Err(serialization_error("expected object RPC request head"));
     }
-    let head: RequestHead = decode_control(&head_payload)?;
+    let head: RequestHeadUnsigned =
+        decode_authenticated_control(&context.channel_binding, AUTH_REQUEST_HEAD, &head_payload)?;
     validate_request_head(context, &head)?;
-    let request_is_inline = matches!(head.unsigned.descriptor, BodyDescriptor::Inline { .. });
+    let request_is_inline = matches!(head.descriptor, BodyDescriptor::Inline { .. });
     let request_head_digest = *blake3::hash(&head_payload).as_bytes();
-    let request_id = head.unsigned.request_id.clone();
+    let request_id = head.request_id.clone();
     let negotiated_response_progress_interval =
-        response_progress_interval(options, head.unsigned.response_progress_interval_millis);
+        response_progress_interval(options, head.response_progress_interval_millis);
     let (body, request_verifier, request_task) = make_incoming_body(
         reader,
         options,
@@ -2310,18 +2288,18 @@ where
             head_digest: request_head_digest,
             progress_head_digest: request_head_digest,
             last_progress_nonce: 0,
-            descriptor: head.unsigned.descriptor,
-            inline_body: head.unsigned.inline_body,
+            descriptor: head.descriptor,
+            inline_body: head.inline_body,
         },
         true,
     )
     .await;
     let incoming = ObjectRpcStreamIncomingCall {
         request_id: request_id.clone(),
-        method: head.unsigned.method,
-        operation_id: head.unsigned.operation_id,
-        metadata: head.unsigned.metadata,
-        application_head: head.unsigned.application_head,
+        method: head.method,
+        operation_id: head.operation_id,
+        metadata: head.metadata,
+        application_head: head.application_head,
         body,
     };
     let mut response_progress_nonce = 1;
@@ -2484,11 +2462,16 @@ where
         response_head_digest,
         response_verification,
         finish_status,
+    );
+    write_finish(
+        &mut writer,
+        context,
+        FRAME_RESPONSE_FINISH,
         AUTH_RESPONSE_FINISH,
-    )?;
-    write_finish(&mut writer, FRAME_RESPONSE_FINISH, &finish)
-        .await
-        .map_err(|failure| failure.error)?;
+        &finish,
+    )
+    .await
+    .map_err(|failure| failure.error)?;
     writer.shutdown().await.map_err(|error| {
         delivery_error("finish object RPC response direction", error.to_string())
     })?;
@@ -2511,7 +2494,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -2533,6 +2516,94 @@ mod tests {
             RpcPeerContext::authenticated(server, client, session_id, binding)
                 .expect("server context"),
         )
+    }
+
+    #[test]
+    fn authenticated_control_serializes_once_and_authenticates_wire_bytes() {
+        struct Counted<'a> {
+            value: &'a StreamProgressUnsigned,
+            serializations: &'a AtomicUsize,
+        }
+
+        impl Serialize for Counted<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                self.serializations.fetch_add(1, Ordering::Relaxed);
+                self.value.serialize(serializer)
+            }
+        }
+
+        let (client_context, _) = peer_contexts();
+        let (origin_node_id, destination_node_id) = client_context.wire_endpoints();
+        let unsigned = StreamProgressUnsigned {
+            protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
+            origin_node_id,
+            destination_node_id,
+            session_id: client_context.session_id.clone(),
+            channel_binding: client_context.channel_binding,
+            request_id: Id::from_legacy_named("request_authenticated_control").expect("request id"),
+            head_digest: [0x41; 32],
+            nonce: 1,
+        };
+        let serializations = AtomicUsize::new(0);
+        let payload = encode_authenticated_control(
+            &client_context.channel_binding,
+            AUTH_REQUEST_PROGRESS,
+            &Counted {
+                value: &unsigned,
+                serializations: &serializations,
+            },
+            OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
+        )
+        .expect("authenticated control");
+
+        assert_eq!(serializations.load(Ordering::Relaxed), 1);
+        let canonical_unsigned = SinomoObjectCodec::network_frame()
+            .encode(&unsigned)
+            .expect("canonical unsigned control");
+        assert_eq!(
+            &payload[AUTHENTICATED_CONTROL_TAG_BYTES..],
+            canonical_unsigned
+        );
+        assert_eq!(
+            &payload[..AUTHENTICATED_CONTROL_TAG_BYTES],
+            authenticated_control_tag(
+                &client_context.channel_binding,
+                AUTH_REQUEST_PROGRESS,
+                &canonical_unsigned,
+            )
+            .as_bytes()
+        );
+        let decoded: StreamProgressUnsigned = decode_authenticated_control(
+            &client_context.channel_binding,
+            AUTH_REQUEST_PROGRESS,
+            &payload,
+        )
+        .expect("verified control");
+        assert_eq!(decoded, unsigned);
+
+        let mut tampered_tag = payload.clone();
+        tampered_tag[0] ^= 1;
+        assert_eq!(
+            decode_authenticated_control::<StreamProgressUnsigned>(
+                &client_context.channel_binding,
+                AUTH_REQUEST_PROGRESS,
+                &tampered_tag,
+            ),
+            Err(NetworkError::AuthDenied)
+        );
+        let mut tampered_unsigned = payload;
+        tampered_unsigned[AUTHENTICATED_CONTROL_TAG_BYTES] ^= 1;
+        assert_eq!(
+            decode_authenticated_control::<StreamProgressUnsigned>(
+                &client_context.channel_binding,
+                AUTH_REQUEST_PROGRESS,
+                &tampered_unsigned,
+            ),
+            Err(NetworkError::AuthDenied)
+        );
     }
 
     #[tokio::test]
@@ -2704,15 +2775,22 @@ mod tests {
             &body,
         )
         .expect("head");
-        head.unsigned.issued_at_unix_millis = 0;
-        head.authentication_tag = authenticated_tag(
+        head.issued_at_unix_millis = 0;
+        let payload = encode_authenticated_control(
             &client_context.channel_binding,
             AUTH_REQUEST_HEAD,
-            &head.unsigned,
+            &head,
+            OBJECT_RPC_STREAM_MAX_HEAD_BYTES,
         )
-        .expect("tag");
+        .expect("authenticated head");
+        let decoded: RequestHeadUnsigned = decode_authenticated_control(
+            &server_context.channel_binding,
+            AUTH_REQUEST_HEAD,
+            &payload,
+        )
+        .expect("verified head");
         assert_eq!(
-            validate_request_head(&server_context, &head),
+            validate_request_head(&server_context, &decoded),
             Err(NetworkError::AuthExpired)
         );
     }
@@ -3245,28 +3323,43 @@ mod tests {
             [0x11; 32],
             verification,
             FinishStatus::Completed,
+        );
+        let payload = encode_authenticated_control(
+            &client_context.channel_binding,
             AUTH_REQUEST_FINISH,
+            &finish,
+            OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
         )
-        .expect("finish");
+        .expect("finish payload");
         let mut tampered = finish.clone();
-        tampered.unsigned.destination_node_id = Some(node("node_wrong_destination"));
+        tampered.destination_node_id = Some(node("node_wrong_destination"));
+        let mut tampered_payload = payload[..AUTHENTICATED_CONTROL_TAG_BYTES].to_vec();
+        tampered_payload.extend(
+            SinomoObjectCodec::network_frame()
+                .encode(&tampered)
+                .expect("tampered finish"),
+        );
         assert_eq!(
-            authenticate(
+            decode_authenticated_control::<BodyFinishUnsigned>(
                 &client_context.channel_binding,
                 AUTH_REQUEST_FINISH,
-                &tampered.unsigned,
-                &tampered.authentication_tag,
+                &tampered_payload,
             ),
             Err(NetworkError::AuthDenied)
         );
         let mut tampered = finish;
-        tampered.unsigned.channel_binding = [0x99; 32];
+        tampered.channel_binding = [0x99; 32];
+        let mut tampered_payload = payload[..AUTHENTICATED_CONTROL_TAG_BYTES].to_vec();
+        tampered_payload.extend(
+            SinomoObjectCodec::network_frame()
+                .encode(&tampered)
+                .expect("tampered finish"),
+        );
         assert_eq!(
-            authenticate(
+            decode_authenticated_control::<BodyFinishUnsigned>(
                 &client_context.channel_binding,
                 AUTH_REQUEST_FINISH,
-                &tampered.unsigned,
-                &tampered.authentication_tag,
+                &tampered_payload,
             ),
             Err(NetworkError::AuthDenied)
         );

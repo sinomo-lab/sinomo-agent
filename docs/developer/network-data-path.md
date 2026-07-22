@@ -62,7 +62,7 @@ bytes have entered a stream, routing does not replay them on another path.
 
 ## Object-RPC Framing and Backpressure
 
-`object_rpc_stream.rs` implements `sinomo.object-rpc.stream.v1`. One duplex
+`object_rpc_stream.rs` implements `sinomo.object-rpc.stream.v2`. One duplex
 stream carries exactly one request and one response. The current resource
 bounds are:
 
@@ -78,7 +78,9 @@ network layer does not spool application bodies to temporary files.
 Authenticated progress frames distinguish transport health from application
 silence. Dropping an incoming body cancels or drains the same call; it does not
 switch to another protocol. Request and response completion remain bound to the
-peer context and verified body transcript.
+peer context and verified body transcript. Every authenticated control payload
+is encoded as its fixed-size tag followed by the canonical unsigned SOBJ bytes;
+the tag is verified over those exact bytes before SOBJ decoding.
 
 ## Retry Boundary
 

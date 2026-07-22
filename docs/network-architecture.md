@@ -367,6 +367,11 @@ server may respond before consuming the complete request body. Independent
 calls use independent logical streams; object RPC does not implement another
 connection multiplexer.
 
+Authenticated control records carry a fixed authentication tag followed by
+the canonical unsigned SOBJ bytes covered by that tag. Receivers authenticate
+the transmitted bytes before decoding them; they do not decode and re-encode a
+control value to reconstruct its authentication transcript.
+
 Object RPC owns:
 
 - protocol negotiation for the RPC contract only;
@@ -466,9 +471,9 @@ contract change migrates every producer and consumer as one coordinated change,
 then deletes the old parser, negotiation branch, framing, tests, and
 documentation. Routing never chooses an RPC protocol based on payload shape.
 
-The current consolidated implementation protocol v1 described in the
-[data-path reference](developer/network-data-path.md) predates this separation.
-It is migration input, not the version number of every contract above.
+The routed-session and transport layers retain their consolidated
+implementation protocol v1. Object RPC evolves in its separate namespace, as
+described in the [data-path reference](developer/network-data-path.md).
 
 ## Transport Modules
 
