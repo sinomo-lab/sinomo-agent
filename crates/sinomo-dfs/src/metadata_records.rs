@@ -16,9 +16,9 @@ use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::{
-    DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceResult, DfsObjectId,
-    DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult, DfsReplicationPolicy, DfsVersion,
-    normalize_current_locations,
+    DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceOperation,
+    DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
+    DfsReplicationPolicy, DfsVersion, normalize_current_locations,
 };
 
 /// Stable identifier for a DFS metadata shard.
@@ -761,6 +761,11 @@ pub struct DfsNamespacePrepareRecord {
     /// version before the prepare can commit.
     pub content_receipts: Vec<DfsReplicaReceiptRecord>,
     pub transaction: DfsNamespaceTransaction,
+    /// Terminal routed-request result materialized atomically with the visible
+    /// namespace transaction. Standalone and write-intent prepares leave this
+    /// empty; request-owned namespace prepares use it to close the crash window
+    /// between applying metadata and recording the canonical RPC outcome.
+    pub completed_request: Option<DfsNamespaceRequestRecord>,
     pub status: DfsNamespacePrepareStatus,
 }
 
@@ -771,20 +776,28 @@ pub enum DfsNamespaceRequestStatus {
     Completed,
 }
 
-/// Durable at-most-once admission record for one routed namespace mutation.
+/// Durable, autonomously recoverable admission record for one routed namespace
+/// mutation.
 ///
-/// `Pending` is journaled before execution. A restart may report an
-/// indeterminate outcome for such a record, but must never blindly execute it
-/// again. `Completed` carries the canonical result returned on exact retries.
+/// `Pending` contains the exact semantic operation and authority shard needed
+/// to resume it. Namespace transactions may atomically advance this record to
+/// `Completed`; jobs and cross-shard sagas are resumed by maintenance until
+/// they can record their canonical terminal result. Exact retries never create
+/// a second request identity.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceRequestRecord {
     pub file_system_id: DfsFileSystemId,
     pub requester_node_id: NodeId,
     pub request_id: String,
+    pub operation_id: String,
+    pub authority_shard_id: DfsMetadataShardId,
+    pub operation: DfsNamespaceOperation,
     pub command_digest: String,
     pub status: DfsNamespaceRequestStatus,
     pub result: Option<DfsNamespaceResult>,
     pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
+    pub recovery_attempts: u32,
+    pub last_recovery_error: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]

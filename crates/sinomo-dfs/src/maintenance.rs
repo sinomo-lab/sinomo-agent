@@ -1469,6 +1469,9 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     } else {
         options.namespace_job_max_jobs
     };
+    let _namespace_requests = service.recover_pending_namespace_requests_bounded(
+        crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
+    )?;
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
             namespace_job_max_jobs,
@@ -1582,6 +1585,9 @@ where
     } else {
         options.namespace_job_max_jobs
     };
+    let _namespace_requests = service.recover_pending_namespace_requests_bounded(
+        crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
+    )?;
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
             namespace_job_max_jobs,

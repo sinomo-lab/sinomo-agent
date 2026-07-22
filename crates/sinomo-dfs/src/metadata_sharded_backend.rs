@@ -2404,6 +2404,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(found)
     }
 
+    fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
+        let mut requests = BTreeMap::new();
+        for backend in self.shards.values() {
+            for request in backend.list_namespace_requests()? {
+                let key = (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                );
+                if requests.insert(key, request).is_some() {
+                    return Err(MetadataBackendError::Serde(
+                        "namespace request exists on multiple local shards".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(requests.into_values().collect())
+    }
+
     fn get_namespace_transaction(
         &self,
         transaction_id: &str,

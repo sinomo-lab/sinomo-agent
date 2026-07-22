@@ -3782,6 +3782,7 @@ mod tests {
                 advisory_lock_states: Vec::new(),
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
             },
+            completed_request: None,
             status: crate::DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =

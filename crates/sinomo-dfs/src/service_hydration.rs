@@ -454,6 +454,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
         }
 
+        // Request-owned namespace prepares were completed before the object
+        // scan above. Any admission which crashed before it could persist a
+        // prepare is now safe to resume from its exact durable operation. The
+        // bounded pass keeps service open finite; reactive maintenance repeats
+        // it until no locally authoritative request remains pending.
+        let _ = self.recover_pending_namespace_requests_bounded(
+            crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
+        )?;
         self.seed_local_metadata_journal_cursors_from_backend()?;
         Ok(())
     }

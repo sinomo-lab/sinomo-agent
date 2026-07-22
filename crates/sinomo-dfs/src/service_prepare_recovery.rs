@@ -421,6 +421,7 @@ mod tests {
                 advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
+            completed_request: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =
@@ -439,13 +440,48 @@ mod tests {
         let mut committed = current.clone();
         committed.version = version("version_prepare_recovery_2");
         committed.changed_at_unix_nanos += 1;
-        let prepare = namespace_prepare_for_recovery(&current, committed.clone(), 1);
+        let operation = DfsNamespaceOperation::SetMode {
+            path: current.path.clone(),
+            mode: committed.mode,
+        };
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pending_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: old_primary.clone(),
+            request_id: "request-prepare-recovery".to_string(),
+            operation_id: "req-prepare-recovery".to_string(),
+            authority_shard_id: DfsMetadataShardId::new("root"),
+            operation,
+            command_digest: "blake3:prepare-recovery".to_string(),
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut completed_request = pending_request.clone();
+        completed_request.status = DfsNamespaceRequestStatus::Completed;
+        completed_request.result = Some(DfsNamespaceResult::Applied);
+        let mut prepare = namespace_prepare_for_recovery(&current, committed.clone(), 1);
+        prepare.operation_id = format!(
+            "namespace-request:{}:{}",
+            completed_request.operation_id, prepare.transaction.transaction_id
+        );
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
         let metadata_root = root.join("metadata");
         let mut backend =
             LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
                 .expect("backend");
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&current).expect("current object");
+        backend
+            .put_namespace_request_on_shard(&DfsMetadataShardId::new("root"), &pending_request)
+            .expect("pending request");
         backend
             .prepare_namespace_transaction(&prepare)
             .expect("durable prepare");
@@ -481,6 +517,15 @@ mod tests {
         assert_eq!(durable.owner_epoch, 2);
         assert_eq!(durable.status, DfsNamespacePrepareStatus::Committed);
         assert_eq!(durable.transaction, prepare.transaction);
+        assert_eq!(
+            recovered
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_request(&old_primary, &pending_request.request_id)
+                .expect("request")
+                .expect("durable request"),
+            completed_request
+        );
     }
 
     #[test]
@@ -720,6 +765,7 @@ mod tests {
                 advisory_lock_states: Vec::new(),
                 created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(123),
             },
+            completed_request: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =

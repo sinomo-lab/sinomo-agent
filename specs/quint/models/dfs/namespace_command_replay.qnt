@@ -6,19 +6,19 @@
 /// `complete_durable_namespace_request`.
 ///
 /// Mutating namespace commands are admitted through a durable record keyed by
-/// `(transport requester, request id)`. The record stores a digest-equivalent
-/// complete command. A fresh identity is first persisted as `Pending`; the
-/// namespace effect may run only under the transient execution permit created
-/// by that admission. Completion durably replaces the record with `Completed`
-/// and its terminal result. Exact completed retries replay that result, reuse
-/// of the identity with any changed command is rejected, and a `Pending`
-/// record without its original execution permit is reported as indeterminate
-/// instead of being executed again.
+/// `(transport requester, request id)`. The record stores the semantic mutation
+/// independently of response journal options. A fresh identity is first
+/// persisted as `Pending`; the namespace effect may run only under an execution
+/// permit created by admission or autonomous recovery. Transaction-backed
+/// effects atomically publish their terminal request result, while durable jobs
+/// and sagas resume until they can do the same. Exact completed retries replay
+/// that result and reuse of the identity with a changed mutation is rejected.
 ///
 /// A process restart clears only transient delivery, wait, and execution state.
-/// The admission ledger remains. Cancellation is requester-local: it removes
-/// the pending wait but cannot retract an admitted command. A retry with a new
-/// request id is a new operation identity.
+/// The admission ledger remains. Recovery recreates the permit for the exact
+/// durable mutation without requiring a client retry. Cancellation is
+/// requester-local: it removes the pending wait but cannot retract an admitted
+/// command. A retry with a new request id is a new operation identity.
 module dfs_namespace_command_replay {
   import common.* from "../../lib/common"
 
@@ -73,7 +73,7 @@ module dfs_namespace_command_replay {
     | CommandCompleted(RoutedCommand)
     | ResponseReplayed(RoutedCommand)
     | ChangedPayloadRejected(RoutedCommand)
-    | PendingOutcomeRejected(RoutedCommand)
+    | PendingRecoveryStarted(RoutedCommand)
     | WaitCancelled(RoutedCommand)
     | ServerRestarted
 
@@ -144,13 +144,21 @@ module dfs_namespace_command_replay {
   ): Option[AdmissionRecord] =
     ledger.get(keyFor(request))
 
+  pure def sameSemanticCommand(
+    left: NamespaceCommand,
+    right: NamespaceCommand,
+  ): bool = all {
+    left.requestId == right.requestId,
+    left.mutation == right.mutation,
+  }
+
   pure def isExactPending(
     record: Option[AdmissionRecord],
     command: NamespaceCommand,
   ): bool =
     match record {
       | Some(value) => all {
-          value.command == command,
+          sameSemanticCommand(value.command, command),
           value.status == AdmissionPending,
           value.response == None,
         }
@@ -163,7 +171,7 @@ module dfs_namespace_command_replay {
   ): bool =
     match record {
       | Some(value) => all {
-          value.command == command,
+          sameSemanticCommand(value.command, command),
           value.status == AdmissionCompleted,
           isSome(value.response),
         }
@@ -240,8 +248,9 @@ module dfs_namespace_command_replay {
   }
 
   /// Namespace execution and durable terminal-result publication are one
-  /// abstract completion step. A concrete crash between those byte-level
-  /// operations is conservatively represented by the surviving `Pending` row.
+  /// abstract completion step. Concrete transaction-backed operations commit
+  /// the effect and terminal row in one durable prepare batch; resumable jobs
+  /// refine the same step through their own durable progress records.
   action completeAdmitted: bool = {
     val request = unwrapOr(replay.executionPermit, defaultRequest)
     val key = keyFor(request)
@@ -316,11 +325,11 @@ module dfs_namespace_command_replay {
       replay.inFlight != None,
       replay.executionPermit == None,
       isSome(before),
-      unwrapOr(before, {
+      not(sameSemanticCommand(unwrapOr(before, {
         command: defaultCommand,
         status: AdmissionPending,
         response: None,
-      }).command != request.command,
+      }).command, request.command)),
       replay' = replay
         .with("inFlight", None)
         .with("waitingFor", None)
@@ -337,28 +346,34 @@ module dfs_namespace_command_replay {
     }
   }
 
-  /// A surviving `Pending` record has an unknown outcome. It never recreates
-  /// the lost execution permit.
-  action rejectIndeterminatePending: bool = {
+  /// An exact retry of a surviving `Pending` record resumes the same durable
+  /// operation identity rather than creating new work.
+  action recoverPendingInFlight: bool = {
     val request = unwrapOr(replay.inFlight, defaultRequest)
-    val before = recordFor(replay.ledger, request)
     all {
       replay.inFlight != None,
       replay.executionPermit == None,
-      isExactPending(before, request.command),
+      isExactPending(recordFor(replay.ledger, request), request.command),
       replay' = replay
-        .with("inFlight", None)
-        .with("waitingFor", None)
-        .with("lastServe", Some({
-          request: request,
-          recordBefore: before,
-          response: None,
-          waitWasActive: true,
-          responseDelivered: true,
-          effectCountBefore: replay.effectCount,
-          effectCountAfter: replay.effectCount,
-        }))
-        .with("lastLifecycle", PendingOutcomeRejected(request)),
+        .with("executionPermit", Some(request))
+        .with("lastLifecycle", PendingRecoveryStarted(request)),
+    }
+  }
+
+  /// Maintenance resumes an interrupted admission even when no requester is
+  /// waiting for the result.
+  action recoverInterruptedPending: bool = {
+    val request = unwrapOr(replay.interruptedPending, defaultRequest)
+    all {
+      replay.interruptedPending != None,
+      replay.inFlight == None,
+      replay.waitingFor == None,
+      replay.executionPermit == None,
+      isExactPending(recordFor(replay.ledger, request), request.command),
+      replay' = replay
+        .with("inFlight", Some(request))
+        .with("executionPermit", Some(request))
+        .with("lastLifecycle", PendingRecoveryStarted(request)),
     }
   }
 
@@ -469,7 +484,8 @@ module dfs_namespace_command_replay {
     completeAdmitted,
     replayCompleted,
     rejectChangedPayload,
-    rejectIndeterminatePending,
+    recoverPendingInFlight,
+    recoverInterruptedPending,
     cancelWait,
     restartServer,
     retryLastCompletedExact,

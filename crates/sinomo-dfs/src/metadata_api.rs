@@ -1213,22 +1213,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         shard_id: &DfsMetadataShardId,
         request: &DfsNamespaceRequestRecord,
-    ) -> Result<DfsMetadataJournalEntry> {
-        let _ = (shard_id, request);
-        Err(MetadataBackendError::Serde(
-            "metadata backend does not support durable namespace request admission".to_string(),
-        ))
-    }
+    ) -> Result<DfsMetadataJournalEntry>;
 
     /// Fetch a durable namespace request by authenticated requester and id.
     fn get_namespace_request(
         &self,
         requester_node_id: &NodeId,
         request_id: &str,
-    ) -> Result<Option<DfsNamespaceRequestRecord>> {
-        let _ = (requester_node_id, request_id);
-        Ok(None)
-    }
+    ) -> Result<Option<DfsNamespaceRequestRecord>>;
+
+    /// Return durable routed namespace requests for bounded autonomous
+    /// recovery. Concrete backends return a stable requester/request-id order.
+    fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>>;
 
     /// Create or replace a namespace maintenance job.
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {

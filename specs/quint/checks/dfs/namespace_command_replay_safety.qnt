@@ -120,38 +120,26 @@ module dfs_namespace_command_replay_safety {
           all {
             audit.request == request,
             isSome(audit.recordBefore),
-            unwrapOr(audit.recordBefore, {
+            not(sameSemanticCommand(unwrapOr(audit.recordBefore, {
               command: defaultCommand,
               status: AdmissionPending,
               response: None,
-            }).command != request.command,
-            audit.effectCountAfter == audit.effectCountBefore,
-          }
-        }
-      | PendingOutcomeRejected(request) => {
-          val audit = unwrapOr(replay.lastServe, {
-            request: defaultRequest,
-            recordBefore: None,
-            response: None,
-            waitWasActive: false,
-            responseDelivered: false,
-            effectCountBefore: 0,
-            effectCountAfter: 0,
-          })
-          all {
-            audit.request == request,
-            isExactPending(audit.recordBefore, request.command),
+            }).command, request.command)),
             audit.effectCountAfter == audit.effectCountBefore,
           }
         }
       | _ => true
     }
 
-  def interruptedPendingNeverExecuted: bool =
+  def interruptedPendingIsSafelyPendingOrCompleted: bool =
     match replay.interruptedPending {
-      | Some(request) => all {
-          isExactPending(recordFor(replay.ledger, request), request.command),
-          not(replay.executedKeys.contains(keyFor(request))),
+      | Some(request) => match recordFor(replay.ledger, request) {
+          | Some(record) => if (record.status == AdmissionPending) {
+              not(replay.executedKeys.contains(keyFor(request)))
+            } else {
+              replay.executedKeys.contains(keyFor(request))
+            }
+          | None => false
         }
       | None => true
     }
@@ -220,11 +208,13 @@ module dfs_namespace_command_replay_safety {
       | _ => false
     }
 
-  def witnessRestartedPendingRetryRejected: bool =
+  def witnessRestartedPendingRecoversAutomatically: bool =
     match replay.lastLifecycle {
-      | PendingOutcomeRejected(request) => all {
+      | CommandCompleted(request) => all {
+          replay.restartCount > 0,
           replay.interruptedPending == Some(request),
-          not(replay.executedKeys.contains(keyFor(request))),
+          replay.executedKeys.contains(keyFor(request)),
+          isExactCompleted(recordFor(replay.ledger, request), request.command),
         }
       | _ => false
     }
@@ -260,7 +250,7 @@ module dfs_namespace_command_replay_safety {
     completionRequiresPendingAndAddsOneEffect,
     replayRequiresCompletedAndAddsNoEffect,
     rejectionPreservesEffectCount,
-    interruptedPendingNeverExecuted,
+    interruptedPendingIsSafelyPendingOrCompleted,
     completedBeforeRestartRemainsCompleted,
     countersStayInsideModelBounds,
   }

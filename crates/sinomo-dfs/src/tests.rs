@@ -10423,6 +10423,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         }],
         content_receipts: Vec::new(),
         transaction,
+        completed_request: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -10618,6 +10619,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::now_utc(),
         },
+        completed_request: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -11034,6 +11036,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         },
+        completed_request: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -36504,8 +36507,14 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
     )
     .expect("attach restarted services metadata");
 
+    let mut replay_command = command;
+    replay_command.include_metadata_journal_batches = false;
+    replay_command.metadata_journal_after_sequences = vec![DfsNamespaceShardCursor {
+        shard_id: DfsMetadataShardId::new("services"),
+        after_sequence: u64::MAX,
+    }];
     let replay = services_primary
-        .handle_namespace_request(replica_node.clone(), command)
+        .handle_namespace_request(replica_node.clone(), replay_command)
         .expect("replay identical rename");
     assert!(matches!(
         replay,
@@ -36563,7 +36572,7 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
 }
 
 #[test]
-fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
+fn durable_pending_namespace_request_recovers_automatically_after_restart() {
     let cluster = sifs_two_primary_cluster("sifs-namespace-pending-restart");
     let SifsTwoPrimaryCluster {
         root,
@@ -36598,16 +36607,26 @@ fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
             to: destination.to_string(),
         },
     };
-    let encoded = serde_json::to_vec(&command).expect("encode command digest");
+    let encoded = serde_json::to_vec(&(
+        &command.file_system_id,
+        &command.requesting_node_id,
+        &command.operation,
+    ))
+    .expect("encode command digest");
     let now = OffsetDateTime::now_utc();
     let pending = DfsNamespaceRequestRecord {
         file_system_id: command.file_system_id.clone(),
         requester_node_id: replica_node.clone(),
         request_id: command.request_id.clone(),
+        operation_id: "req-pending-restart".to_string(),
+        authority_shard_id: DfsMetadataShardId::new("services"),
+        operation: command.operation.clone(),
         command_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
         status: DfsNamespaceRequestStatus::Pending,
         result: None,
         posix_coordination_result: None,
+        recovery_attempts: 0,
+        last_recovery_error: None,
         created_at: now,
         updated_at: now,
     };
@@ -36642,21 +36661,31 @@ fn durable_pending_namespace_request_is_not_reexecuted_after_restart() {
     )
     .expect("attach restarted services metadata");
 
+    assert!(matches!(
+        services_primary.posix_stat(source),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(services_primary.posix_stat(destination).is_ok());
+    let recovered = services_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&replica_node, &command.request_id)
+        .expect("recovered request")
+        .expect("durable request");
+    assert_eq!(recovered.status, DfsNamespaceRequestStatus::Completed);
+    assert_eq!(recovered.result, Some(DfsNamespaceResult::Applied));
+
     let event = services_primary
         .handle_namespace_request(replica_node, command)
-        .expect("serve interrupted request retry");
+        .expect("replay automatically recovered request");
     assert!(matches!(
         event,
         NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            result: DfsNamespaceResult::Rejected { ref reason, .. },
+            result: DfsNamespaceResult::Applied,
             mutates_metadata: false,
             ..
-        } if reason.contains("indeterminate durable outcome")
-    ));
-    assert!(services_primary.posix_stat(source).is_ok());
-    assert!(matches!(
-        services_primary.posix_stat(destination),
-        Err(DfsPosixError::NotFound { .. })
+        }
     ));
 
     drop(replica);
