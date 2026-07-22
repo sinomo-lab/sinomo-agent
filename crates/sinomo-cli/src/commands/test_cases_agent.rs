@@ -37,6 +37,7 @@ use crate::app_api::SifsAgentChannelStore;
 
 const BENCHMARK_CANCEL_PROBE_ROUTE: &str = "/benchmarks/cancel-probe";
 const BENCHMARK_RPC_CATEGORY: &str = "benchmarks";
+const BENCHMARK_MODULE_ID: &str = "module.benchmarks";
 const DAEMON_OBJECT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_CHANNEL_EXPECT_DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const AGENT_CHANNEL_EXPECT_MAX_TIMEOUT_SECONDS: u64 = 300;
@@ -55,6 +56,18 @@ struct BenchmarkCancelProbeResponse {
     cancelled: bool,
     elapsed_ms: u64,
     polls: u64,
+}
+
+pub(super) fn native_dylib_runtime_capability(
+    module_id: &sinomo_runtime::module::ModuleId,
+) -> String {
+    format!("module.native-dylib:{module_id}")
+}
+
+fn benchmark_native_dylib_runtime_capability() -> String {
+    let module_id = sinomo_runtime::module::ModuleId::from_legacy_named(BENCHMARK_MODULE_ID)
+        .expect("benchmark module id");
+    native_dylib_runtime_capability(&module_id)
 }
 
 pub fn register_agent_cluster_test_cases(
@@ -134,8 +147,11 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn module_native_dylib_active_cancel(ctx) {
         id: "cluster.agent.module-native-dylib-active-cancel",
         summary: "Daemon-hosted native-dylib module work observes operation-id cancellation",
-        tags: ["cluster-agent", "agent-readiness", "module-cancellation"],
-        requirements: [SinomoTestRequirement::ClusterRuntime],
+        tags: ["cluster-agent", "agent-readiness-extended", "module-cancellation"],
+        requirements: [
+            SinomoTestRequirement::ClusterRuntime,
+            SinomoTestRequirement::runtime_capability(benchmark_native_dylib_runtime_capability()),
+        ],
         run: {
             run_module_native_dylib_active_cancel(ctx)
         }
@@ -851,29 +867,10 @@ fn module_active_cancel_early_run_outcome(
             "native dylib module run completed before cancellation; cancelled={} elapsed_ms={} polls={}",
             response.cancelled, response.elapsed_ms, response.polls
         )),
-        Err(error) => {
-            let detail = error.to_string();
-            if module_active_cancel_prerequisite_missing(&detail) {
-                SinomoTestOutcome::skipped(format!(
-                    "native dylib module active-cancel probe skipped before run became active: {detail}"
-                ))
-            } else {
-                SinomoTestOutcome::failed(format!(
-                    "native dylib module run failed before cancellation: {detail}"
-                ))
-            }
-        }
+        Err(error) => SinomoTestOutcome::failed(format!(
+            "native dylib module run failed before cancellation: {error}"
+        )),
     }
-}
-
-fn module_active_cancel_prerequisite_missing(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("unknown route")
-        || detail.contains("/benchmarks/cancel-probe")
-        || detail.contains("module.benchmarks")
-        || detail.contains("native dylib module")
-        || detail.contains("does not support operation")
-        || detail.contains("unsupported benchmark module operation")
 }
 
 #[cfg(test)]

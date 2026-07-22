@@ -41,6 +41,7 @@ pub enum SinomoTestRequirement {
     ClusterRuntime,
     LiveNetwork,
     ProviderAccount { provider: String },
+    RuntimeCapability { capability: String },
 }
 
 impl SinomoTestRequirement {
@@ -50,11 +51,20 @@ impl SinomoTestRequirement {
         }
     }
 
+    pub fn runtime_capability(capability: impl Into<String>) -> Self {
+        Self::RuntimeCapability {
+            capability: capability.into(),
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::ClusterRuntime => "cluster-runtime".to_string(),
             Self::LiveNetwork => "live-network".to_string(),
             Self::ProviderAccount { provider } => format!("provider-account:{provider}"),
+            Self::RuntimeCapability { capability } => {
+                format!("runtime-capability:{capability}")
+            }
         }
     }
 }
@@ -142,6 +152,13 @@ impl SinomoTestCase {
                         return Some(SinomoTestOutcome::failed(detail));
                     }
                     return Some(SinomoTestOutcome::skipped(detail));
+                }
+                SinomoTestRequirement::RuntimeCapability { capability }
+                    if !context.runtime_capabilities.contains(capability) =>
+                {
+                    return Some(SinomoTestOutcome::skipped(format!(
+                        "requires runtime capability `{capability}`"
+                    )));
                 }
                 _ => {}
             }
@@ -233,6 +250,7 @@ pub struct SinomoTestContext {
     require_cluster: bool,
     cluster_snapshot: Option<sinomo_core::kv::KvSnapshot>,
     cluster_config_source: Option<PathBuf>,
+    runtime_capabilities: BTreeSet<String>,
     diagnostics: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -245,6 +263,7 @@ impl SinomoTestContext {
             require_cluster: false,
             cluster_snapshot: None,
             cluster_config_source: None,
+            runtime_capabilities: BTreeSet::new(),
             diagnostics: Default::default(),
         }
     }
@@ -284,6 +303,20 @@ impl SinomoTestContext {
         self
     }
 
+    pub fn with_runtime_capability(mut self, capability: impl Into<String>) -> Self {
+        self.runtime_capabilities.insert(capability.into());
+        self
+    }
+
+    pub fn with_runtime_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.runtime_capabilities
+            .extend(capabilities.into_iter().map(Into::into));
+        self
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -314,6 +347,10 @@ impl SinomoTestContext {
 
     pub fn cluster_config_source(&self) -> Option<&Path> {
         self.cluster_config_source.as_deref()
+    }
+
+    pub fn runtime_capabilities(&self) -> &BTreeSet<String> {
+        &self.runtime_capabilities
     }
 
     pub fn record(&mut self, key: impl Into<String>, value: impl Serialize) {
@@ -481,5 +518,31 @@ mod tests {
         let report = case.run(&mut context);
 
         assert_eq!(report.status, SinomoTestStatus::Skipped);
+    }
+
+    #[test]
+    fn runtime_capability_requirement_uses_explicit_context_inventory() {
+        fn run(_: &mut SinomoTestContext) -> SinomoTestResult {
+            Ok(SinomoTestOutcome::passed("capability available"))
+        }
+        let capability = "module.native-dylib:module.example";
+        let case = SinomoTestCase::new(
+            "sample.capability",
+            "runtime capability",
+            ["capability"],
+            [SinomoTestRequirement::runtime_capability(capability)],
+            run,
+        );
+        let mut missing = SinomoTestContext::new("/tmp/sinomo-test");
+        let mut available =
+            SinomoTestContext::new("/tmp/sinomo-test").with_runtime_capability(capability);
+
+        let skipped = case.run(&mut missing);
+        let passed = case.run(&mut available);
+
+        assert_eq!(skipped.status, SinomoTestStatus::Skipped);
+        assert!(skipped.summary.contains(capability));
+        assert_eq!(passed.status, SinomoTestStatus::Passed);
+        assert!(available.runtime_capabilities().contains(capability));
     }
 }

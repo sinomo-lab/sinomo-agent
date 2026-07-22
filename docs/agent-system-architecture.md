@@ -463,14 +463,18 @@ It covers package and catalog validation, provider-boundary behavior, context
 budgets, progressive disclosure, tool evidence, cancellation, compaction,
 session resume, and live-control semantics.
 
-Cluster-dependent checks run through the normal `sinomo test` harness under the
-`agent-readiness` tag. Exact cases belong in the test registry rather than this
-architecture document.
+Cluster-dependent required checks run through the normal `sinomo test` harness
+under the `agent-readiness` tag. That baseline contains only capabilities every
+supported agent node must provide and is expected to finish without skips.
+Fixture-backed checks, such as active native-dylib cancellation, use the
+`agent-readiness-extended` tag and declare their runtime capabilities explicitly.
+Exact cases belong in the test registry rather than this architecture document.
 
 Skipped selected cases are reported as `skipped` in text and JSON output. The
 suite command can still exit successfully when a live prerequisite is absent, so
 readiness consumers must treat `skipped` as incomplete gate evidence rather than
-as a pass.
+as a pass. The single-node debug image activates the extended readiness fixtures
+before daemon startup so both readiness tags can complete without skips.
 
 ## Compaction
 
