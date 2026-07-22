@@ -113,6 +113,7 @@ aggregate score:
 | SIFS/DFS | `crates/sinomo-dfs/benches/`, `modules/benchmark/sinomo-benchmarks/sifs/` | Algorithm scale plus real mounted correctness/performance |
 | Coding agents | `modules/benchmark/sinomo-benchmarks/swebench/` | Contained SWE-bench execution and official evaluation integration |
 | Realtime embodied tasks | `modules/benchmark/sinomo-benchmarks/mcu/` and `minestudio/` | Vision/action and full-duplex task adapters |
+| Realtime voice agents | `modules/benchmark/sinomo-benchmarks/tau3/` | Revision-pinned tau3-bench full-duplex task success, tool use, interruption, and interaction-quality evaluation |
 | Runtime tests | `sinomo test list` | Discoverable product checks with explicit live/cluster requirements |
 
 External datasets are not silently downloaded or vendored. Individual harness

@@ -170,7 +170,7 @@ fn voice_cli_spec() -> CliCommandSpec {
                     "--turn",
                     "turn detection mode",
                     "mode",
-                    &["manual", "none", "semantic-vad", "vad"],
+                    &["manual", "none", "server-vad", "semantic-vad", "vad"],
                 )
                 .with_aliases(["--turn-detection"]),
                 free("--receive-timeout-ms", "receive timeout", "milliseconds"),
@@ -338,6 +338,7 @@ fn parse_audio_format(value: &str) -> Result<sinomo_lm::RealtimeAudioSampleForma
 fn parse_turn_detection(value: &str) -> Result<sinomo_lm::RealtimeAudioTurnDetection, CliError> {
     match value {
         "manual" | "none" => Ok(sinomo_lm::RealtimeAudioTurnDetection::Manual),
+        "server-vad" => Ok(sinomo_lm::RealtimeAudioTurnDetection::ServerVad),
         "semantic-vad" | "vad" => Ok(sinomo_lm::RealtimeAudioTurnDetection::SemanticVad),
         _ => Err(CliError::Parse {
             detail: format!("unsupported turn detection `{value}`"),
@@ -1201,6 +1202,7 @@ fn handle_voice_event(
             audio,
             end_of_turn,
             kv_cache_length,
+            ..
         } => {
             if !text.trim().is_empty() {
                 ::std::eprintln!("voice> {text}");
@@ -1240,7 +1242,7 @@ fn handle_voice_event(
                 return Ok(true);
             }
         }
-        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
+        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta, .. } => {
             if !delta.trim().is_empty() {
                 ::std::eprintln!("voice> {delta}");
             }
@@ -1389,6 +1391,25 @@ mod tests {
         assert_eq!(options.input_sample_rate_hz, Some(16_000));
         assert_eq!(options.chunk_ms, 100);
         assert!(!options.pace);
+    }
+
+    #[test]
+    fn voice_call_options_accept_server_vad() {
+        let command = parse_voice_schema_for_test(&[
+            "call".to_string(),
+            "--provider".to_string(),
+            "openai".to_string(),
+            "--turn".to_string(),
+            "server-vad".to_string(),
+        ])
+        .expect("voice command");
+        let VoiceCliCommand::Call(options) = command else {
+            panic!("expected call");
+        };
+        assert_eq!(
+            options.turn_detection,
+            sinomo_lm::RealtimeAudioTurnDetection::ServerVad
+        );
     }
 
     #[test]

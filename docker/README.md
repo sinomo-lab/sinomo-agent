@@ -19,7 +19,11 @@ docker compose -f docker/docker-compose.single-node.yml down -v
 
 `sinomo-single` keeps state in the persistent `single-node-data` volume. The smoke
 service uses container-local data and is discarded after each run so repeated
-smoke tests remain a true one-node cluster.
+smoke tests remain a true one-node cluster. This debug image also builds and
+activates the optional `module.benchmarks` native-dylib fixture before daemon
+startup. It supports strict `agent-readiness` and fixture-backed
+`agent-readiness-extended` cancellation gates without making the benchmark
+module a production default.
 
 # Segmented dev cluster — network-hardening test bed
 

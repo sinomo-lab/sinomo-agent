@@ -2,8 +2,8 @@
 //!
 //! These run on a live cluster node (`sinomo test run <id> --require-cluster`)
 //! and probe the node's daemon-hosted agent RPC surface without creating a
-//! model session. The sandbox active-cancel probe creates and destroys a
-//! temporary sandbox instance under the daemon-hosted sandbox service.
+//! model session. Agent command cancellation is verified through the supported
+//! local-workspace simple-sandbox path on the cluster node.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use sinomo_agent::{
     AGENT_CHANNEL_APP_USER_ID, AGENT_OBJECT_RPC_ROUTES, AGENT_SESSION_INSPECT_ROUTE,
     AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, AgentChannel,
-    AgentChannelSource, AgentChannelStore, AgentEvent, AgentEventPayload, AgentRole, AgentSession,
-    AgentSessionControlEventCursor, AgentSessionControlSnapshot, AgentSessionInspectRequest,
-    AgentSessionInspectResponse, AgentSessionProgressRequest, AgentSessionProgressResponse,
-    AgentSessionStore, AgentSessionStoreRecord, AgentSessionStoreRecordKind,
-    AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
-    AgentTaskLifecycleStatus, AgentTaskRef, AgentTaskSnapshot, FileAgentSessionStore, TaskId,
+    AgentChannelSource, AgentChannelStore, AgentEvent, AgentEventPayload,
+    AgentReadinessCheckStatus, AgentRole, AgentSession, AgentSessionControlEventCursor,
+    AgentSessionControlSnapshot, AgentSessionInspectRequest, AgentSessionInspectResponse,
+    AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionStore,
+    AgentSessionStoreRecord, AgentSessionStoreRecordKind, AgentSessionTerminalResultsRequest,
+    AgentSessionTerminalResultsResponse, AgentTaskLifecycleStatus, AgentTaskRef, AgentTaskSnapshot,
+    FileAgentSessionStore, TaskId, run_agent_simple_sandbox_active_cancellation_readiness,
 };
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
@@ -27,13 +28,6 @@ use sinomo_runtime::network::{
     ClusterPaths, ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest,
     ObjectRpcResponse,
 };
-use sinomo_runtime::sandbox::{
-    BUSYBOX_TOOLCHAIN_LEGACY_ID, SANDBOX_CREATE_ROUTE, SANDBOX_DESTROY_ROUTE, SANDBOX_RPC_CATEGORY,
-    SANDBOX_RUN_CANCEL_ROUTE, SANDBOX_RUN_TOOLCHAIN_ROUTE, SANDBOX_UNLIMITED_WALL_TIME_MS,
-    SandboxCreateInstanceRequest, SandboxCreateInstanceResponse, SandboxDestroyRequest, SandboxId,
-    SandboxLocalCommandOutcome, SandboxRunCancelResponse, SandboxRunToolchainRequest,
-    SandboxTempPolicy, SandboxToolchainId,
-};
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
@@ -43,10 +37,8 @@ use crate::app_api::SifsAgentChannelStore;
 
 const BENCHMARK_CANCEL_PROBE_ROUTE: &str = "/benchmarks/cancel-probe";
 const BENCHMARK_RPC_CATEGORY: &str = "benchmarks";
+const BENCHMARK_MODULE_ID: &str = "module.benchmarks";
 const DAEMON_OBJECT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
-const SANDBOX_ACTIVE_CANCEL_SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(45);
-const SANDBOX_ACTIVE_CANCEL_RUN_RPC_TIMEOUT: Duration = Duration::from_secs(45);
-const SANDBOX_ACTIVE_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_CHANNEL_EXPECT_DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const AGENT_CHANNEL_EXPECT_MAX_TIMEOUT_SECONDS: u64 = 300;
 const AGENT_CHANNEL_EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -66,6 +58,18 @@ struct BenchmarkCancelProbeResponse {
     polls: u64,
 }
 
+pub(super) fn native_dylib_runtime_capability(
+    module_id: &sinomo_runtime::module::ModuleId,
+) -> String {
+    format!("module.native-dylib:{module_id}")
+}
+
+fn benchmark_native_dylib_runtime_capability() -> String {
+    let module_id = sinomo_runtime::module::ModuleId::from_legacy_named(BENCHMARK_MODULE_ID)
+        .expect("benchmark module id");
+    native_dylib_runtime_capability(&module_id)
+}
+
 pub fn register_agent_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
 ) -> SinomoTestRegistryBuilder {
@@ -76,8 +80,7 @@ pub fn register_agent_cluster_test_cases(
         .register(agent_channel_expect())
         .register(module_native_dylib_cancel_route())
         .register(module_native_dylib_active_cancel())
-        .register(sandbox_run_cancel_route())
-        .register(sandbox_active_cancel())
+        .register(agent_simple_sandbox_active_cancel())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -144,8 +147,11 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn module_native_dylib_active_cancel(ctx) {
         id: "cluster.agent.module-native-dylib-active-cancel",
         summary: "Daemon-hosted native-dylib module work observes operation-id cancellation",
-        tags: ["cluster-agent", "agent-readiness", "module-cancellation"],
-        requirements: [SinomoTestRequirement::ClusterRuntime],
+        tags: ["cluster-agent", "agent-readiness-extended", "module-cancellation"],
+        requirements: [
+            SinomoTestRequirement::ClusterRuntime,
+            SinomoTestRequirement::runtime_capability(benchmark_native_dylib_runtime_capability()),
+        ],
         run: {
             run_module_native_dylib_active_cancel(ctx)
         }
@@ -153,25 +159,13 @@ sinomo_runtime::test::sinomo_test_case! {
 }
 
 sinomo_runtime::test::sinomo_test_case! {
-    pub fn sandbox_run_cancel_route(ctx) {
-        id: "cluster.agent.sandbox-cancel-route",
-        summary: "Daemon-hosted sandbox run cancellation route is reachable on this cluster node",
+    pub fn agent_simple_sandbox_active_cancel(ctx) {
+        id: "cluster.agent.simple-sandbox-active-cancel",
+        summary: "Agent local-workspace simple-sandbox execution observes active cancellation",
         tags: ["cluster-agent", "agent-readiness", "sandbox-cancellation"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
-            run_sandbox_run_cancel_route(ctx)
-        }
-    }
-}
-
-sinomo_runtime::test::sinomo_test_case! {
-    pub fn sandbox_active_cancel(ctx) {
-        id: "cluster.agent.sandbox-active-cancel",
-        summary: "Daemon-hosted sandbox run cancellation interrupts active sandbox work by operation id",
-        tags: ["cluster-agent", "agent-readiness", "sandbox-cancellation"],
-        requirements: [SinomoTestRequirement::ClusterRuntime],
-        run: {
-            run_sandbox_active_cancel(ctx)
+            run_agent_simple_sandbox_active_cancel(ctx)
         }
     }
 }
@@ -812,201 +806,17 @@ fn run_module_native_dylib_active_cancel(ctx: &mut SinomoTestContext) -> SinomoT
     }
 }
 
-fn run_sandbox_run_cancel_route(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let operation_id = "agent_cluster_sandbox_cancel_route_probe";
-    ctx.record("operation_id", operation_id);
-    let request = ObjectRpcRequest::encode_body(
-        SANDBOX_RUN_CANCEL_ROUTE,
-        SANDBOX_RPC_CATEGORY,
-        &ObjectRpcCancelRequest::new(operation_id, "cluster readiness route probe"),
-    )
-    .map_err(|source| SinomoTestError::failed(source.to_string()))?
-    .with_cancels_operation_id(operation_id);
-    let response: SandboxRunCancelResponse =
-        probe_daemon_object_rpc(&request).map_err(|source| {
-            SinomoTestError::failed(format!("sandbox cancel RPC route failed: {source}"))
-        })?;
-    ctx.record("cancel_response", &response);
-
-    if response.operation_id != operation_id {
-        return Ok(SinomoTestOutcome::failed(
-            "sandbox cancel route returned the wrong operation id",
-        ));
-    }
-    if response.cancelled {
-        return Ok(SinomoTestOutcome::failed(
-            "synthetic sandbox cancel probe unexpectedly cancelled active work",
-        ));
-    }
-    if !response
-        .detail
-        .contains("sandbox run operation is not active")
-    {
-        return Ok(SinomoTestOutcome::failed(
-            "sandbox cancel route returned an unexpected inactive-operation detail",
-        ));
-    }
-
-    Ok(SinomoTestOutcome::passed(format!(
-        "sandbox run cancel route is reachable on {}",
-        ctx.cluster_config_source()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "cluster runtime".to_string())
-    )))
-}
-
-fn run_sandbox_active_cancel(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let toolchain_id = SandboxToolchainId::from_legacy_named(BUSYBOX_TOOLCHAIN_LEGACY_ID)
-        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
-    let sandbox_id = SandboxId::generate();
-    let operation_id = format!("agent_cluster_sandbox_active_cancel_{}", sandbox_id);
-    ctx.record("sandbox_id", &sandbox_id);
-    ctx.record("operation_id", &operation_id);
-    ctx.record("toolchain_id", &toolchain_id);
-
-    let create = SandboxCreateInstanceRequest {
-        sandbox_id: Some(sandbox_id.clone()),
-        toolchain_id,
-        temp_policy: SandboxTempPolicy::RetainAcrossSessions,
-        memory_mb: None,
-        wall_time_ms: Some(30_000),
-        max_input_bytes: None,
-        max_output_bytes: None,
-        max_workspace_bytes: None,
-        max_written_bytes_per_command: None,
-        max_file_count: None,
-        mounts: Vec::new(),
-    };
-    let create_request =
-        ObjectRpcRequest::encode_body(SANDBOX_CREATE_ROUTE, SANDBOX_RPC_CATEGORY, &create)
-            .map_err(|source| SinomoTestError::failed(source.to_string()))?;
-    match probe_daemon_object_rpc_with_timeout::<SandboxCreateInstanceResponse>(
-        &create_request,
-        SANDBOX_ACTIVE_CANCEL_SETUP_RPC_TIMEOUT,
-    ) {
-        Ok(response) => ctx.record("created_sandbox", &response.manifest.sandbox_id),
-        Err(error) => {
-            return Ok(sandbox_active_cancel_setup_outcome(
-                "create temporary sandbox",
-                &error.to_string(),
-            ));
+fn run_agent_simple_sandbox_active_cancel(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let check = run_agent_simple_sandbox_active_cancellation_readiness();
+    ctx.record("agent_readiness_check", &check);
+    Ok(match check.status {
+        AgentReadinessCheckStatus::Passed => {
+            SinomoTestOutcome::passed(check.summary).with_diagnostics(check.evidence)
         }
-    }
-
-    let run = SandboxRunToolchainRequest {
-        sandbox_id: sandbox_id.clone(),
-        command_name: "sleep".to_string(),
-        argv: vec!["sleep".to_string(), "30".to_string()],
-        stdin: None,
-        timeout_ms: SANDBOX_UNLIMITED_WALL_TIME_MS,
-    };
-    let run_request =
-        ObjectRpcRequest::encode_body(SANDBOX_RUN_TOOLCHAIN_ROUTE, SANDBOX_RPC_CATEGORY, &run)
-            .map_err(|source| SinomoTestError::failed(source.to_string()))?
-            .with_operation_id(operation_id.clone());
-
-    let (run_sender, run_receiver) =
-        mpsc::channel::<Result<SandboxLocalCommandOutcome, crate::CliError>>();
-    std::thread::spawn(move || {
-        let result = probe_daemon_object_rpc_with_timeout::<SandboxLocalCommandOutcome>(
-            &run_request,
-            SANDBOX_ACTIVE_CANCEL_RUN_RPC_TIMEOUT,
-        );
-        let _ = run_sender.send(result);
-    });
-
-    let mut inactive_responses = 0_u64;
-    let cancel_response = loop {
-        match run_receiver.try_recv() {
-            Ok(result) => {
-                cleanup_sandbox(&sandbox_id);
-                return Ok(sandbox_active_cancel_early_run_outcome(result));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                cleanup_sandbox(&sandbox_id);
-                return Ok(SinomoTestOutcome::failed(
-                    "sandbox run worker disconnected before cancellation",
-                ));
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
+        AgentReadinessCheckStatus::Failed => {
+            SinomoTestOutcome::failed(check.summary).with_diagnostics(check.evidence)
         }
-
-        let cancel_request = ObjectRpcRequest::encode_body(
-            SANDBOX_RUN_CANCEL_ROUTE,
-            SANDBOX_RPC_CATEGORY,
-            &ObjectRpcCancelRequest::new(&operation_id, "active sandbox cancellation probe"),
-        )
-        .map_err(|source| SinomoTestError::failed(source.to_string()))?
-        .with_cancels_operation_id(&operation_id);
-        let response: SandboxRunCancelResponse =
-            match probe_daemon_object_rpc::<SandboxRunCancelResponse>(&cancel_request) {
-                Ok(response) => response,
-                Err(error) => {
-                    cleanup_sandbox(&sandbox_id);
-                    return Ok(SinomoTestOutcome::failed(format!(
-                        "sandbox cancel RPC failed while run was active: {error}"
-                    )));
-                }
-            };
-        ctx.record("last_cancel_response", &response);
-        if response.cancelled {
-            break response;
-        }
-        inactive_responses = inactive_responses.saturating_add(1);
-        if inactive_responses > 100 {
-            cleanup_sandbox(&sandbox_id);
-            return Ok(SinomoTestOutcome::failed(
-                "sandbox run did not become cancellable before the probe deadline",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-
-    ctx.record("cancel_response", &cancel_response);
-    match run_receiver.recv_timeout(SANDBOX_ACTIVE_CANCEL_SETTLE_TIMEOUT) {
-        Ok(Err(error)) if is_sandbox_cancel_error(&error.to_string()) => {
-            cleanup_sandbox(&sandbox_id);
-            Ok(SinomoTestOutcome::passed(
-                "active sandbox run was interrupted by operation-id cancellation",
-            )
-            .with_diagnostics(serde_json::json!({
-                "operation_id": operation_id,
-                "cancel_response": cancel_response,
-                "inactive_cancel_responses_before_active": inactive_responses,
-            })))
-        }
-        Ok(Err(error)) => {
-            cleanup_sandbox(&sandbox_id);
-            let detail = error.to_string();
-            if sandbox_active_cancel_prerequisite_missing(&detail) {
-                return Ok(SinomoTestOutcome::skipped(format!(
-                    "sandbox active-cancel probe skipped after cancel was accepted: {detail}"
-                )));
-            }
-            Ok(SinomoTestOutcome::failed(format!(
-                "sandbox run ended with a non-cancel error after cancel was accepted: {detail}"
-            )))
-        }
-        Ok(Ok(outcome)) => {
-            cleanup_sandbox(&sandbox_id);
-            Ok(SinomoTestOutcome::failed(format!(
-                "sandbox run completed instead of cancelling; exit status {}",
-                outcome.response.exit_status
-            )))
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            cleanup_sandbox(&sandbox_id);
-            Ok(SinomoTestOutcome::failed(
-                "sandbox run did not finish within 30s after cancel was accepted",
-            ))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            cleanup_sandbox(&sandbox_id);
-            Ok(SinomoTestOutcome::failed(
-                "sandbox run worker disconnected after cancel was accepted",
-            ))
-        }
-    }
+    })
 }
 
 fn probe_agent_session_route<Req, Resp>(route: &str, body: &Req) -> Result<Resp, SinomoTestError>
@@ -1037,12 +847,6 @@ where
     response.decode_body().map_err(crate::CliError::from)
 }
 
-fn send_daemon_object_rpc(
-    request: &ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, crate::CliError> {
-    send_daemon_object_rpc_with_timeout(request, DAEMON_OBJECT_RPC_TIMEOUT)
-}
-
 fn send_daemon_object_rpc_with_timeout(
     request: &ObjectRpcRequest,
     timeout: Duration,
@@ -1063,98 +867,10 @@ fn module_active_cancel_early_run_outcome(
             "native dylib module run completed before cancellation; cancelled={} elapsed_ms={} polls={}",
             response.cancelled, response.elapsed_ms, response.polls
         )),
-        Err(error) => {
-            let detail = error.to_string();
-            if module_active_cancel_prerequisite_missing(&detail) {
-                SinomoTestOutcome::skipped(format!(
-                    "native dylib module active-cancel probe skipped before run became active: {detail}"
-                ))
-            } else {
-                SinomoTestOutcome::failed(format!(
-                    "native dylib module run failed before cancellation: {detail}"
-                ))
-            }
-        }
-    }
-}
-
-fn module_active_cancel_prerequisite_missing(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("unknown route")
-        || detail.contains("/benchmarks/cancel-probe")
-        || detail.contains("module.benchmarks")
-        || detail.contains("native dylib module")
-        || detail.contains("does not support operation")
-        || detail.contains("unsupported benchmark module operation")
-}
-
-fn sandbox_active_cancel_setup_outcome(action: &str, detail: &str) -> SinomoTestOutcome {
-    if sandbox_active_cancel_prerequisite_missing(detail) {
-        return SinomoTestOutcome::skipped(format!(
-            "sandbox active-cancel probe skipped during {action}: {detail}"
-        ));
-    }
-    SinomoTestOutcome::failed(format!(
-        "sandbox active-cancel probe failed during {action}: {detail}"
-    ))
-}
-
-fn sandbox_active_cancel_early_run_outcome(
-    result: Result<SandboxLocalCommandOutcome, crate::CliError>,
-) -> SinomoTestOutcome {
-    match result {
-        Ok(outcome) => SinomoTestOutcome::failed(format!(
-            "sandbox run completed before cancellation; exit status {}",
-            outcome.response.exit_status
+        Err(error) => SinomoTestOutcome::failed(format!(
+            "native dylib module run failed before cancellation: {error}"
         )),
-        Err(error) => {
-            let detail = error.to_string();
-            if sandbox_active_cancel_prerequisite_missing(&detail) {
-                SinomoTestOutcome::skipped(format!(
-                    "sandbox active-cancel probe skipped before run became active: {detail}"
-                ))
-            } else {
-                SinomoTestOutcome::failed(format!(
-                    "sandbox run failed before cancellation: {detail}"
-                ))
-            }
-        }
     }
-}
-
-fn sandbox_active_cancel_prerequisite_missing(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("sandbox runtime not compiled")
-        || detail.contains("sandbox toolchain not found")
-        || detail.contains("sandbox toolchain command not found")
-        || detail.contains("toolchain-unsigned-denied")
-        || detail.contains("toolchain is not signed")
-        || detail.contains("command-capability-unsupported")
-        || detail.contains("requires a real child-process execution substrate")
-        || detail.contains("daemon-hosted dynamic sifs wasix commands were removed")
-        || detail.contains("sandbox filesystem unavailable")
-        || detail.contains("routed namespace journal replay failed")
-        || detail.contains("duplicate dfs write intent")
-        || detail.contains("module does not support")
-        || detail.contains("wasix module")
-}
-
-fn is_sandbox_cancel_error(detail: &str) -> bool {
-    detail.to_ascii_lowercase().contains("cancelled")
-}
-
-fn cleanup_sandbox(sandbox_id: &SandboxId) {
-    let request = match ObjectRpcRequest::encode_body(
-        SANDBOX_DESTROY_ROUTE,
-        SANDBOX_RPC_CATEGORY,
-        &SandboxDestroyRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    ) {
-        Ok(request) => request,
-        Err(_) => return,
-    };
-    let _ = send_daemon_object_rpc(&request);
 }
 
 #[cfg(test)]
@@ -1208,20 +924,5 @@ mod tests {
             .with_parameter("timeout", "10")
             .with_parameter("timeout-seconds", "10");
         assert!(agent_channel_expect_timeout(&ambiguous).is_err());
-    }
-
-    #[test]
-    fn sandbox_active_cancel_treats_unsigned_toolchain_denial_as_prerequisite() {
-        let detail = "sandbox policy denied: SandboxPolicyDenial { code: \"toolchain-unsigned-denied\", detail: \"toolchain 086wdctfpphb26n9k2cg751qqs is not signed\" }";
-        assert!(sandbox_active_cancel_prerequisite_missing(detail));
-
-        let detail = "sandbox policy denied: SandboxPolicyDenial { code: \"command-capability-unsupported\", detail: \"command sh requires a real child-process execution substrate, but the Wasix sandbox runtime does not support it\" }";
-        assert!(sandbox_active_cancel_prerequisite_missing(detail));
-
-        let detail = "sandbox filesystem unavailable: DFS error: distributed DFS error: routed namespace journal replay failed: distributed DFS error: duplicate DFS write intent for object at version";
-        assert!(sandbox_active_cancel_prerequisite_missing(detail));
-
-        let detail = "daemon-hosted dynamic SIFS WASIX commands were removed; execute through direct-SIFS WASIX or the live DFS/FUSE simple sandbox";
-        assert!(sandbox_active_cancel_prerequisite_missing(detail));
     }
 }

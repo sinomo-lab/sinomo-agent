@@ -696,14 +696,14 @@ impl StableRealtimeTextAccumulator {
                     None
                 }
             }
-            sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
+            sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta, .. } => {
                 self.push_transcript_text(delta);
                 None
             }
             sinomo_lm::RealtimeAudioEvent::ResponseDone => self.flush(true),
             sinomo_lm::RealtimeAudioEvent::Closed { .. }
             | sinomo_lm::RealtimeAudioEvent::Error { .. } => self.flush(true),
-            sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
+            sinomo_lm::RealtimeAudioEvent::InputSpeechStarted { .. } => {
                 // A new input turn proves any prior end-of-turn guard is stale.
                 self.last_end_of_turn_text = None;
                 None
@@ -8918,11 +8918,11 @@ fn handle_chat_media_realtime_event(
             publish_chat_media_notice(snapshots, waker, "model listening".to_string());
             Ok(false)
         }
-        sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
+        sinomo_lm::RealtimeAudioEvent::InputSpeechStarted { .. } => {
             publish_chat_media_notice(snapshots, waker, "speech detected".to_string());
             Ok(false)
         }
-        sinomo_lm::RealtimeAudioEvent::InputSpeechStopped => {
+        sinomo_lm::RealtimeAudioEvent::InputSpeechStopped { .. } => {
             publish_chat_media_notice(snapshots, waker, "speech ended".to_string());
             Ok(false)
         }
@@ -8954,7 +8954,7 @@ fn handle_chat_media_realtime_event(
             }
             Ok(false)
         }
-        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
+        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta, .. } => {
             if !delta.trim().is_empty() {
                 publish_chat_media_notice(snapshots, waker, delta.clone());
             }
@@ -8971,6 +8971,11 @@ fn handle_chat_media_realtime_event(
         sinomo_lm::RealtimeAudioEvent::Error { code, message } => {
             Err(format!("realtime error {code}: {message}"))
         }
+        sinomo_lm::RealtimeAudioEvent::ToolCallStarted { .. }
+        | sinomo_lm::RealtimeAudioEvent::ToolCallArgumentsDelta { .. }
+        | sinomo_lm::RealtimeAudioEvent::ToolCallCompleted { .. }
+        | sinomo_lm::RealtimeAudioEvent::ResponseCancelled { .. }
+        | sinomo_lm::RealtimeAudioEvent::OutputTruncated { .. } => Ok(false),
         sinomo_lm::RealtimeAudioEvent::Raw { .. } => Ok(false),
     };
     report_stable_realtime_projection_notice(stable_projection.observe(&event), event_tx, waker);
@@ -23430,6 +23435,7 @@ mod tests {
                 text: "Hello ".to_string(),
                 audio: Vec::new(),
                 end_of_turn: false,
+                item_id: None,
                 kv_cache_length: None,
             })
             .is_none()
@@ -23437,6 +23443,7 @@ mod tests {
         assert!(
             text.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
                 delta: "Hello there".to_string(),
+                item_id: None,
             })
             .is_none()
         );
@@ -23460,6 +23467,7 @@ mod tests {
                 text: "Hello".to_string(),
                 audio: Vec::new(),
                 end_of_turn: true,
+                item_id: None,
                 kv_cache_length: None,
             })
             .expect("audio turn boundary flushes fallback text");
@@ -23467,6 +23475,7 @@ mod tests {
         assert!(
             text.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
                 delta: "Hello there".to_string(),
+                item_id: None,
             })
             .is_none()
         );
@@ -23494,6 +23503,7 @@ mod tests {
                 text: "Hello there".to_string(),
                 audio: Vec::new(),
                 end_of_turn: true,
+                item_id: None,
                 kv_cache_length: None,
             })
             .expect("audio turn boundary flushes fallback text");
@@ -23501,6 +23511,7 @@ mod tests {
         assert!(
             text.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
                 delta: "hello there".to_string(),
+                item_id: None,
             })
             .is_none()
         );
@@ -23519,6 +23530,7 @@ mod tests {
                 text: "MiniCPM ".to_string(),
                 audio: Vec::new(),
                 end_of_turn: false,
+                item_id: None,
                 kv_cache_length: None,
             })
             .is_none()
@@ -23528,6 +23540,7 @@ mod tests {
                 text: "audio-only reply".to_string(),
                 audio: Vec::new(),
                 end_of_turn: true,
+                item_id: None,
                 kv_cache_length: None,
             })
             .expect("audio-only end_of_turn is itself a persistence boundary");
@@ -23539,18 +23552,25 @@ mod tests {
         let mut closed = StableRealtimeTextAccumulator::default();
         assert!(
             closed
-                .observe(&sinomo_lm::RealtimeAudioEvent::InputSpeechStarted)
+                .observe(&sinomo_lm::RealtimeAudioEvent::InputSpeechStarted {
+                    audio_start_ms: None,
+                    item_id: None,
+                })
                 .is_none()
         );
         assert!(
             closed
-                .observe(&sinomo_lm::RealtimeAudioEvent::InputSpeechStopped)
+                .observe(&sinomo_lm::RealtimeAudioEvent::InputSpeechStopped {
+                    audio_end_ms: None,
+                    item_id: None,
+                })
                 .is_none()
         );
         assert!(
             closed
                 .observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
                     delta: "partial before close".to_string(),
+                    item_id: None,
                 })
                 .is_none()
         );
@@ -23568,6 +23588,7 @@ mod tests {
                     text: "partial before error".to_string(),
                     audio: Vec::new(),
                     end_of_turn: false,
+                    item_id: None,
                     kv_cache_length: None,
                 })
                 .is_none()
@@ -23594,6 +23615,7 @@ mod tests {
             text: "visible reply".to_string(),
             audio: Vec::new(),
             end_of_turn: true,
+            item_id: None,
             kv_cache_length: None,
         });
         assert_eq!(notice, Some(STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE));
@@ -23604,6 +23626,7 @@ mod tests {
                 text: "later reply".to_string(),
                 audio: Vec::new(),
                 end_of_turn: true,
+                item_id: None,
                 kv_cache_length: None,
             }),
             None,
@@ -23623,6 +23646,7 @@ mod tests {
         assert_eq!(
             projection.observe(&sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta {
                 delta: "call remains live".to_string(),
+                item_id: None,
             }),
             None
         );

@@ -52,12 +52,13 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use realtime_audio::{
     RealtimeAudioError, RealtimeAudioEvent, RealtimeAudioInputChunk, RealtimeAudioProvider,
     RealtimeAudioSampleFormat, RealtimeAudioSession, RealtimeAudioSessionConfig,
-    RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput, RealtimeVideoFrameDetail,
-    RealtimeVideoFrameFormat, RealtimeVideoFrameInput, RealtimeVideoInputConfig,
-    RealtimeVideoPixelFormat, minicpm_input_audio_append_payload,
+    RealtimeAudioToolDefinition, RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput,
+    RealtimeVideoFrameDetail, RealtimeVideoFrameFormat, RealtimeVideoFrameInput,
+    RealtimeVideoInputConfig, RealtimeVideoPixelFormat, minicpm_input_audio_append_payload,
     minicpm_input_video_frame_payload, minicpm_realtime_ws_url, minicpm_realtime_ws_url_for_video,
     minicpm_session_update_payload, openai_input_audio_append_payload,
-    openai_input_video_frame_payload, openai_realtime_ws_url, openai_session_update_payload,
+    openai_input_video_frame_payload, openai_output_truncate_payload, openai_realtime_ws_url,
+    openai_response_cancel_payload, openai_session_update_payload, openai_tool_result_payload,
     parse_realtime_audio_event, realtime_audio_event_from_value,
 };
 pub use test_cases::register_lm_test_cases;

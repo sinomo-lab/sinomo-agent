@@ -511,6 +511,16 @@ fn test_context(
     for (key, value) in params {
         context = context.with_parameter(key.clone(), value.clone());
     }
+    let native_dylib_capabilities =
+        sinomo_runtime::module::read_native_dylib_module_loader_states(&data_dir.root())
+            .map_err(|source| CliError::Parse {
+                detail: format!("read active native-dylib test capabilities: {source}"),
+            })?
+            .into_iter()
+            .map(|state| {
+                super::test_cases_agent::native_dylib_runtime_capability(&state.module_id)
+            });
+    context = context.with_runtime_capabilities(native_dylib_capabilities);
     if model_config_uses_cluster(&data_dir) {
         let paths = ClusterPaths::new(&data_dir);
         let snapshot = model_config_cluster_snapshot(&paths)?;
@@ -857,8 +867,8 @@ mod tests {
         );
         assert!(
             ids.iter()
-                .any(|candidate| candidate == "cluster.agent.sandbox-cancel-route"),
-            "missing cluster.agent.sandbox-cancel-route"
+                .any(|candidate| candidate == "cluster.agent.simple-sandbox-active-cancel"),
+            "missing cluster.agent.simple-sandbox-active-cancel"
         );
         assert!(
             ids.iter()
@@ -870,10 +880,39 @@ mod tests {
                 .any(|candidate| candidate == "cluster.agent.module-native-dylib-active-cancel"),
             "missing cluster.agent.module-native-dylib-active-cancel"
         );
+    }
+
+    #[test]
+    fn agent_readiness_tags_separate_required_and_fixture_backed_checks() {
+        let registry = test_registry().expect("registry");
+        let metadata = registry.metadata();
+        let sandbox = metadata
+            .iter()
+            .find(|case| case.id == "cluster.agent.simple-sandbox-active-cancel")
+            .expect("simple-sandbox cancellation case");
+        assert!(sandbox.tags.iter().any(|tag| tag == "agent-readiness"));
         assert!(
-            ids.iter()
-                .any(|candidate| candidate == "cluster.agent.sandbox-active-cancel"),
-            "missing cluster.agent.sandbox-active-cancel"
+            !sandbox
+                .tags
+                .iter()
+                .any(|tag| tag == "agent-readiness-extended")
         );
+
+        let native = metadata
+            .iter()
+            .find(|case| case.id == "cluster.agent.module-native-dylib-active-cancel")
+            .expect("native-dylib cancellation case");
+        assert!(
+            native
+                .tags
+                .iter()
+                .any(|tag| tag == "agent-readiness-extended")
+        );
+        assert!(!native.tags.iter().any(|tag| tag == "agent-readiness"));
+        assert!(native.requirements.iter().any(|requirement| matches!(
+            requirement,
+            sinomo_runtime::test::SinomoTestRequirement::RuntimeCapability { capability }
+                if capability.starts_with("module.native-dylib:")
+        )));
     }
 }

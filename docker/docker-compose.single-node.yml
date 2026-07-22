@@ -26,6 +26,7 @@ services:
       CLUSTER_NAME: single-node-evolution
       SINOMO_SINGLE_NODE_ID: "01hxy6qa9k0t9vr4g9n8d3q5bf"
       SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_AGENT_READINESS_FIXTURES: "1"
       SINOMO_SINGLE_NODE_MODE: run
     ports:
       - "21353:21353"
@@ -41,6 +42,7 @@ services:
       CLUSTER_NAME: single-node-evolution-smoke
       SINOMO_SINGLE_NODE_ID: "01hxy6qa9k0t9vr4g9n8d3q5bg"
       SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_AGENT_READINESS_FIXTURES: "1"
       SINOMO_SINGLE_NODE_MODE: smoke
 
 volumes:

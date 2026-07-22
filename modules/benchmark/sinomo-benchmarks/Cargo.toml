@@ -6,7 +6,7 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "build.rs", "Cargo.toml", "agent/**", "harbor/**", "mcu/**", "minestudio/**", "sifs/**", "swebench/**"]
+include = ["**/*.rs", "build.rs", "Cargo.toml", "agent/**", "harbor/**", "mcu/**", "minestudio/**", "sifs/**", "swebench/**", "tau3/**"]
 
 [package.metadata.sinomo]
 ring = "application"
@@ -23,6 +23,7 @@ default = []
 env-bench = []
 memory-tools-bench = ["dep:sinomo-cli", "dep:time"]
 sifs-fuse-bench = ["dep:blake3", "dep:libc", "dep:sinomo-dfs-fuse"]
+tau3-voice-bench = ["dep:base64", "dep:tokio"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -37,7 +38,13 @@ name = "sinomo-memory-tools-bench"
 path = "src/bin/sinomo-memory-tools-bench.rs"
 required-features = ["memory-tools-bench"]
 
+[[bin]]
+name = "sinomo-tau3-voice-bridge"
+path = "src/bin/sinomo-tau3-voice-bridge.rs"
+required-features = ["tau3-voice-bench"]
+
 [dependencies]
+base64 = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 libc = { version = "0.2.186", optional = true }
 serde.workspace = true
@@ -50,3 +57,4 @@ sinomo-lm = { path = "../../../crates/sinomo-lm" }
 sinomo-pytorch = { path = "../../../crates/sinomo-pytorch" }
 sinomo-runtime = { path = "../../../crates/sinomo-runtime" }
 time = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
